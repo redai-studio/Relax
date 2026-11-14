@@ -105,6 +105,8 @@ def _create_version_publisher(actor, process_group, config, store):
         encode_workers=config.encode_workers,
         anchor_interval=config.anchor_interval,
         full_only=config.full_only,
+        source_delta=config.source_delta,
+        source_patch=config.source_patch,
         source_cache_root=config.source_cache_root,
         source_limits=config.source_limits,
         source_io_timeout=config.source_io_timeout,

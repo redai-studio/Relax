@@ -20,6 +20,8 @@ class PublicationConfig:
     compression: bool = False
     encode_workers: int = 4
     full_only: bool = False
+    source_delta: bool = False
+    source_patch: bool = True
     source_cache_root: str | None = None
     canonical_blocks: bool = True
     canonical_root: str | None = None
@@ -52,7 +54,10 @@ class PublicationConfig:
             not isinstance(self.source_cache_root, str) or not self.source_cache_root
         ):
             raise ValueError("source_cache_root must be a directory")
-        if any(type(getattr(self, name)) is not bool for name in ("compression", "full_only", "canonical_blocks")):
+        if any(
+            type(getattr(self, name)) is not bool
+            for name in ("compression", "full_only", "source_delta", "source_patch", "canonical_blocks")
+        ):
             raise ValueError("Compression, FULL selection and source selection must be boolean")
         if self.canonical_root is not None:
             if not isinstance(self.canonical_root, str) or not self.canonical_root:

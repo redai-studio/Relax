@@ -39,8 +39,12 @@ def _encode_replacement(current: bytes, base: bytes | None, width: int, limit: i
     record_dtype = np.dtype([("index", "<u4"), ("value", f"V{width}")])
     raw_cost = _stored_size("raw", len(current))
     budget = raw_cost if limit is None else min(raw_cost, limit)
-    for start in range(0, len(values), 65536):
-        changed = current_bits[start : start + 65536] != previous_bits[start : start + 65536]
+    # Bound the comparison mask to 1 MiB while amortizing NumPy dispatch and
+    # record construction across large sparse model blocks. The budget test
+    # still runs before allocating replacement records, with identical bytes.
+    window = 1 << 20
+    for start in range(0, len(values), window):
+        changed = current_bits[start : start + window] != previous_bits[start : start + window]
         count = np.count_nonzero(changed)
         if not count:
             continue

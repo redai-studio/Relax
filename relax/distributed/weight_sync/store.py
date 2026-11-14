@@ -15,8 +15,9 @@ import tempfile
 import threading
 import time
 import zlib
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from typing import Iterator
 
@@ -169,7 +170,20 @@ def ensure_directory(path: Path) -> None:
 
 
 _deferred_directory_sync = ContextVar("weight_store_deferred_directory_sync", default=frozenset())
+_deferred_file_sync = ContextVar("weight_store_deferred_file_sync", default=None)
 _held_content_locks = ContextVar("weight_store_content_locks", default=frozenset())
+# Only the current encoder's immutable byte objects may carry a digest through
+# the two storage calls. No path, mutable buffer, later chunk or disk readback
+# inherits this evidence. The tuple is reset before the worker returns.
+_publication_bytes = ContextVar("weight_store_publication_bytes", default=())
+
+
+def _content_digest(value: bytes) -> str:
+    if type(value) is bytes:
+        for original, result in _publication_bytes.get():
+            if value is original:
+                return result
+    return digest(value)
 
 
 class _ControlCapacityRequired(Exception):
@@ -194,22 +208,160 @@ def durable_directory_batch(directory: Path) -> Iterator[None]:
         _deferred_directory_sync.reset(token)
 
 
+class _FileSyncBatch:
+    """Bound open files while overlapping per-file fsync with producer work.
+
+    Only immutable publication directories participate. Each file still has
+    fsync-before-rename ordering; the batch drains before directory fsync and
+    the independent commit readback. No durability or checksum is inferred from
+    a queued/completed future.
+    """
+
+    def __init__(self, directories, workers):
+        self.directories = frozenset(directories)
+        self.limit = workers * 2
+        self.condition = threading.Condition()
+        self.pending = {}
+        self.error = None
+        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="weight-file-sync")
+
+    def wait_path(self, path):
+        with self.condition:
+            self.condition.wait_for(lambda: path not in self.pending)
+            if self.error is not None:
+                raise self.error
+
+    def submit(self, path, temporary, out):
+        def persist():
+            try:
+                check_deadline("publication file sync")
+                os.fsync(out.fileno())
+                os.replace(temporary, path)
+            finally:
+                try:
+                    out.close()
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+
+        def complete(future):
+            with self.condition:
+                self.pending.pop(path)
+                if self.error is None:
+                    self.error = future.exception()
+                self.condition.notify_all()
+
+        with self.condition:
+            self.condition.wait_for(lambda: len(self.pending) < self.limit or self.error is not None)
+            if self.error is not None:
+                raise self.error
+            if path in self.pending:
+                raise RuntimeError("Concurrent immutable file replacement")
+            future = self.pool.submit(copy_context().run, persist)
+            self.pending[path] = future
+            future.add_done_callback(complete)
+
+    def close(self):
+        # Never cancel these tasks: each owns an open file and its temporary.
+        # Failed publication cleanup runs only after all accepted files drain.
+        self.pool.shutdown(wait=True)
+        if self.error is not None:
+            raise self.error
+
+
+@contextmanager
+def durable_file_batch(directories, workers):
+    batch = _FileSyncBatch(directories, workers)
+    token = _deferred_file_sync.set(batch)
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        _deferred_file_sync.reset(token)
+        try:
+            batch.close()
+        except BaseException:
+            if not failed:
+                raise
+
+
+def _wait_file_sync(path):
+    batch = _deferred_file_sync.get()
+    if batch is not None and path.parent in batch.directories:
+        batch.wait_path(path)
+
+
 def atomic_write(path: Path, data: bytes) -> None:
     from .traffic import file_write
 
     ensure_directory(path.parent)
     fd, temporary = tempfile.mkstemp(prefix=".partial-", dir=path.parent)
+    out = None
     try:
-        with os.fdopen(fd, "wb") as out:
-            written = out.write(data)
-            file_write(path, written)
-            out.flush()
+        out = os.fdopen(fd, "wb")
+        written = out.write(data)
+        file_write(path, written)
+        out.flush()
+        batch = _deferred_file_sync.get()
+        if batch is not None and path.parent in batch.directories:
+            batch.submit(path, temporary, out)
+            # The sync worker now owns both descriptors and cleanup. The
+            # publication scope waits for it before any manifest is visible.
+            temporary = out = None
+        else:
             os.fsync(out.fileno())
-        os.replace(temporary, path)
-        if path.parent not in _deferred_directory_sync.get():
-            sync_directory(path.parent)
+            out.close()
+            os.replace(temporary, path)
+            if path.parent not in _deferred_directory_sync.get():
+                sync_directory(path.parent)
     finally:
-        Path(temporary).unlink(missing_ok=True)
+        try:
+            if out is not None:
+                out.close()
+            elif temporary is not None:
+                os.close(fd)
+        finally:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
+
+
+def _publish_map(function, values, workers):
+    """Refill independent block work as it finishes, with bounded ownership.
+
+    Results are small chunk descriptors, not tensor buffers. Publication sorts
+    those descriptors before committing; a slow earlier block must not idle
+    workers that could read/hash/write later blocks. The pool always drains
+    before publication cleanup can remove inputs or unfinished durable names.
+    """
+    if workers == 1:
+        yield from map(function, values)
+        return
+    iterator = iter(values)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="weight-block-io") as pool:
+        pending = set()
+
+        def submit_next():
+            try:
+                value = next(iterator)
+            except StopIteration:
+                return
+            pending.add(pool.submit(copy_context().run, function, value))
+
+        try:
+            for _ in range(workers):
+                submit_next()
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    pending.remove(future)
+                    result = future.result()
+                    submit_next()
+                    yield result
+        finally:
+            for future in pending:
+                future.cancel()
 
 
 @contextmanager
@@ -799,9 +951,10 @@ class VersionStore:
     def put_object(self, key: str, payload: bytes) -> None:
         lock = self._content_locks[int(valid_hash(key)[:8], 16) % len(self._content_locks)]
         with lock:
-            if len(payload) > MAX_CHUNK_BYTES or digest(payload) != key:
+            if len(payload) > MAX_CHUNK_BYTES or _content_digest(payload) != key:
                 raise ValueError("Object integrity mismatch")
             path = self.object_path(key)
+            _wait_file_sync(path)
             if path.exists() and path.stat().st_size > MAX_CHUNK_BYTES:
                 raise ValueError("Existing object exceeds the size bound")
             if path.exists() and digest(path.read_bytes()) == key:
@@ -824,8 +977,16 @@ class VersionStore:
 
         # Bound both concurrent reads and live block buffers. All checks finish
         # before metadata becomes visible; worker failures retain that boundary.
-        chunks = (chunk for tensor in m["tensors"] for chunk in tensor["chunks"])
-        for _ in ordered_map(verify_object, chunks, 8):
+        # COPY and repeated tensors can reference the same immutable object
+        # thousands of times. Verify each physical object once at this commit
+        # boundary, while rejecting inconsistent sizes for a shared identity.
+        objects = {}
+        for tensor in m["tensors"]:
+            for chunk in tensor["chunks"]:
+                previous = objects.setdefault(chunk["object"], chunk)
+                if previous["encoded_size"] != chunk["encoded_size"]:
+                    raise ValueError("Conflicting sizes for one durable object")
+        for _ in ordered_map(verify_object, objects.values(), 8):
             pass
         with writer_lock(self.root / ".writer", timeout=30):
             self._commit_metadata(m, encoded)
@@ -869,17 +1030,21 @@ class VersionStore:
     def _put_raw_block(self, value: bytes, output: str) -> None:
         lock = self._content_locks[int(valid_hash(output)[:8], 16) % len(self._content_locks)]
         with lock:
-            if digest(value) != output:
+            if _content_digest(value) != output:
                 raise ValueError("Canonical block content mismatch")
             path = self.raw_block_path(output)
+            _wait_file_sync(path)
             if path.is_file() and path.stat().st_size == len(value) and digest(path.read_bytes()) == output:
                 return
             self._reserve_canonical(len(value))
             atomic_write(path, value)
 
     def read_chunk(self, stream: str, version: int, name: str, chunk: dict) -> bytes:
-        if self.canonical_blocks and self.raw_block_path(chunk["output"]).is_file():
+        path = None
+        if self.canonical_blocks:
             path = self.raw_block_path(chunk["output"])
+            _wait_file_sync(path)
+        if path is not None and path.is_file():
             if path.stat().st_size != chunk["size"]:
                 raise ValueError("Canonical block size differs from the manifest")
             value = path.read_bytes()
@@ -1227,12 +1392,16 @@ class VersionStore:
                 kind, payload = encode(current, prior, DTYPES[tensor["dtype"]], compression=compression)
                 output = digest(current)
                 key = output if kind == "raw" else digest(payload)
-                self.put_object(key, payload)
-                if self.canonical_blocks:
-                    # Retain the bytes already read for this immutable input.
-                    # Both stores still validate their payloads and sync files;
-                    # commit independently verifies the durable encoded bytes.
-                    self._put_raw_block(current, output)
+                token = _publication_bytes.set(((current, output), (payload, key)))
+                try:
+                    self.put_object(key, payload)
+                    if self.canonical_blocks:
+                        # The same immutable bytes were hashed immediately
+                        # above; avoid hashing them again in each insertion.
+                        # Existing files and commit still read/hash from disk.
+                        self._put_raw_block(current, output)
+                finally:
+                    _publication_bytes.reset(token)
                 return (
                     tensor,
                     {
@@ -1248,14 +1417,27 @@ class VersionStore:
             # Immutable objects may complete out of order. Per-content locks
             # deduplicate writes, budget reservations are serialized, and one
             # owner assembles the ordered manifest after all writes complete.
+            # Refill on completion instead of blocking on the oldest job:
+            # hashing and reads can continue during an unrelated file's fsync.
             canonical_batch = (
                 durable_directory_batch(self.canonical_directory / "blocks")
                 if self.canonical_blocks
                 else nullcontext()
             )
-            with durable_directory_batch(self.root / "objects"), canonical_batch:
-                for tensor, chunk in ordered_map(encode_chunk, jobs, encode_workers):
+            directories = {self.root / "objects"}
+            if self.canonical_blocks:
+                directories.add(self.canonical_directory / "blocks")
+            # Four CPU encoders can feed bounded filesystem sync work while
+            # GPFS waits for remote durability. IO workers perform no encoding.
+            with (
+                durable_directory_batch(self.root / "objects"),
+                canonical_batch,
+                durable_file_batch(directories, min(32, encode_workers * 4)),
+            ):
+                for tensor, chunk in _publish_map(encode_chunk, jobs, encode_workers):
                     tensor["chunks"].append(chunk)
+            for tensor in m["tensors"]:
+                tensor["chunks"].sort(key=lambda chunk: chunk["offset"])
             # Inputs belong to the caller until publication returns. Detect
             # same-size rewrites and path replacement as well as truncation;
             # ctime also catches writes that restore the original mtime.

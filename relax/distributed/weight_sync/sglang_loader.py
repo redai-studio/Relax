@@ -15,6 +15,8 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
 
 from relax.utils.logging_utils import get_logger
@@ -26,6 +28,165 @@ from .model_config import configuration_signature, configured_experts, unpacked_
 
 
 logger = get_logger(__name__)
+
+# Per-call telemetry, isolated between concurrent verifications. CUDA enqueue
+# timings are host times; byte_compare_sync includes queued GPU work and sync.
+_verification_timings = ContextVar("weight_verification_timings", default=None)
+
+
+def _record_verification_phase(name: str, started: float) -> None:
+    timings = _verification_timings.get()
+    if timings is not None:
+        timings[name] = timings.get(name, 0.0) + time.perf_counter() - started
+
+
+# One verification owns two bounded staging slots. No target data or result is
+# trusted across invocations; every byte is compared on the live CUDA device.
+_verification_comparator = ContextVar("weight_verification_comparator", default=None)
+
+
+class _AsyncByteComparator:
+    def __init__(self, device, *, chunk_bytes=8 * 1024**2, slots=2, batch_size=128):
+        import torch
+
+        self.device, self.chunk_bytes, self.batch_size = device, chunk_bytes, batch_size
+        self.slots, self.index, self.closed = [], 0, False
+        self.copiers = ThreadPoolExecutor(max_workers=slots, thread_name_prefix="weight-stage")
+        self.metrics = dict(
+            h2d_bytes=0,
+            windows=0,
+            h2d_device_seconds=0.0,
+            compare_device_seconds=0.0,
+            reuse_wait_seconds=0.0,
+            cpu_copy_worker_seconds=0.0,
+            host_staging_bytes=slots * chunk_bytes,
+            device_staging_bytes=slots * (2 * chunk_bytes + batch_size),
+        )
+        for _ in range(slots):
+            self.slots.append(
+                dict(
+                    host=torch.empty(chunk_bytes, dtype=torch.uint8, pin_memory=True),
+                    reference=torch.empty(chunk_bytes, dtype=torch.uint8, device=device),
+                    different=torch.empty(chunk_bytes, dtype=torch.bool, device=device),
+                    flags=torch.empty(batch_size, dtype=torch.bool, device=device),
+                    host_flags=torch.empty(batch_size, dtype=torch.bool, pin_memory=True),
+                    stream=torch.cuda.Stream(device=device),
+                    events=[torch.cuda.Event(enable_timing=True) for _ in range(3)],
+                    pending=False,
+                    transfer=False,
+                    labels=[],
+                    staged=None,
+                )
+            )
+
+    def _wait(self, slot):
+        if not slot["pending"]:
+            return
+        started = time.perf_counter()
+        first, copied, done = slot["events"]
+        if not done.query():
+            done.synchronize()  # only before reusing a still-busy pinned slot
+        self.metrics["reuse_wait_seconds"] += time.perf_counter() - started
+        if slot["transfer"]:
+            self.metrics["h2d_device_seconds"] += first.elapsed_time(copied) / 1000
+        self.metrics["compare_device_seconds"] += copied.elapsed_time(done) / 1000
+        slot["pending"] = False
+        _record_verification_phase("staging_slot_wait", started)
+
+    def _collect(self, slot, mismatches):
+        self._wait(slot)
+        if not slot["labels"]:
+            return
+        import torch
+
+        started = time.perf_counter()
+        count = len(slot["labels"])
+        with torch.cuda.stream(slot["stream"]):
+            slot["host_flags"][:count].copy_(slot["flags"][:count], non_blocking=True)
+        slot["stream"].synchronize()
+        mismatches.extend(
+            label for label, failed in zip(slot["labels"], slot["host_flags"][:count].tolist(), strict=True) if failed
+        )
+        slot["labels"].clear()
+        _record_verification_phase("byte_compare_sync", started)
+
+    @staticmethod
+    def _copy_host(destination, source):
+        started = time.perf_counter()
+        destination.copy_(source)
+        return time.perf_counter() - started
+
+    def _submit_staged(self, slot):
+        staged = slot["staged"]
+        if staged is not None:
+            future, left, right, label = staged
+            started = time.perf_counter()
+            self.metrics["cpu_copy_worker_seconds"] += future.result()
+            _record_verification_phase("reference_staging_wait", started)
+            self._enqueue(slot, left, slot["host"][: left.numel()], label, transfer=True)
+            slot["staged"] = None
+
+    def compare(self, left, right, label, mismatches):
+        slot = self.slots[self.index % len(self.slots)]
+        self.index += 1
+        self._submit_staged(slot)
+        self._wait(slot)
+        if len(slot["labels"]) == self.batch_size:
+            self._collect(slot, mismatches)
+        size = left.numel()
+        if size > self.chunk_bytes:
+            raise ValueError("Comparison exceeds its bounded staging slot")
+        if right.device.type == "cpu":
+            # Two tasks at most: overlap mmap faults/CPU copies with the other
+            # slot's H2D and comparison without retaining whole-model buffers.
+            future = self.copiers.submit(self._copy_host, slot["host"][:size], right.reshape(-1))
+            slot["staged"] = (future, left, right, label)
+            self.metrics["h2d_bytes"] += size
+            for other in self.slots:
+                if other is not slot and other["staged"] is not None and other["staged"][0].done():
+                    self._submit_staged(other)
+        else:
+            self._enqueue(slot, left, right.reshape(-1), label, transfer=False)
+        self.metrics["windows"] += 1
+
+    def _enqueue(self, slot, left, source, label, *, transfer):
+        import torch
+
+        size = left.numel()
+        started = time.perf_counter()
+        stream = slot["stream"]
+        # Covers noncontiguous physical views and packed experts created on
+        # the caller's stream. Model mutation stays fenced by the worker RPC.
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            slot["events"][0].record()
+            slot["reference"][:size].copy_(source, non_blocking=True)
+            slot["events"][1].record()
+            _record_verification_phase("reference_transfer_enqueue", started)
+            started = time.perf_counter()
+            torch.ne(left.reshape(-1), slot["reference"][:size], out=slot["different"][:size])
+            torch.any(slot["different"][:size], out=slot["flags"][len(slot["labels"])])
+            slot["events"][2].record()
+        left.record_stream(stream)
+        if source.device.type == "cuda":
+            source.record_stream(stream)
+        slot["pending"], slot["transfer"] = True, transfer
+        slot["labels"].append(label)
+        _record_verification_phase("byte_compare_enqueue", started)
+
+    def finish(self, mismatches):
+        for slot in self.slots:
+            self._submit_staged(slot)
+            self._collect(slot, mismatches)
+
+    def close(self):
+        # Also drains enqueued copies when layout validation/deadlines fail.
+        # Host buffers cannot be released while DMA still reads their bytes.
+        if not self.closed:
+            self.copiers.shutdown(wait=True)
+            for slot in self.slots:
+                slot["stream"].synchronize()
+            self.closed = True
 
 
 def _compare_bytes(
@@ -49,14 +210,35 @@ def _compare_bytes(
     rows = max(1, chunk_bytes // row_bytes)
     for start in range(0, actual.shape[0], rows):
         check_deadline("physical tensor verification")
+        started = time.perf_counter()
         left = actual[start : start + rows].detach().contiguous().view(torch.uint8)
+        _record_verification_phase("physical_contiguous_enqueue", started)
+        started = time.perf_counter()
         right = wanted[start : start + rows].contiguous().view(torch.uint8)
+        _record_verification_phase(
+            "reference_contiguous_cpu" if wanted.device.type == "cpu" else "reference_contiguous_device_enqueue",
+            started,
+        )
+        comparator = _verification_comparator.get()
+        if comparator is not None and left.device == comparator.device and left.numel() <= comparator.chunk_bytes:
+            comparator.compare(
+                left,
+                right,
+                f"Physical weight mismatch: {label}, row window [{start}, {start + len(left)})",
+                mismatches,
+            )
+            continue
         # Exact bit comparison (including signed zero and NaN payloads) on
         # the live device avoids copying and scanning the model on the CPU.
         # Only one bounded row window is staged; no full model GPU copy is
         # retained. torch.equal synchronizes before reporting a result.
+        started = time.perf_counter()
         right = right.to(device=left.device)
-        if not torch.equal(left, right):
+        _record_verification_phase("reference_transfer", started)
+        started = time.perf_counter()
+        matches = torch.equal(left, right)
+        _record_verification_phase("byte_compare_sync", started)
+        if not matches:
             mismatches.append(f"Physical weight mismatch: {label}, row window [{start}, {start + len(left)})")
             return
 
@@ -69,6 +251,47 @@ def _compare_stacked(actual, parts, label: str, mismatches: list[str], *, schema
         offset += size
     if actual.shape[0] != offset:
         mismatches.append(f"Physical fused dimension mismatch: {label}; actual={actual.shape[0]}, expected={offset}")
+
+
+def _compare_packed_expert(
+    actual,
+    wanted,
+    label: str,
+    mismatches: list[str],
+    *,
+    fused_gate: bool,
+    tp_size: int,
+    tp_rank: int,
+    schema_only: bool = False,
+    chunk_bytes: int = 8 * 1024**2,
+) -> None:
+    # HF stores [input, output]. Transfer that contiguous storage once for a
+    # bounded expert, then transpose/split on its live device. Splitting first
+    # makes CPU gate/up views strided and repeatedly copies the same pages.
+    # Larger experts retain the bounded row-window path below.
+    if (
+        not schema_only
+        and actual.device.type == "cuda"
+        and wanted.device.type == "cpu"
+        and wanted.numel() * wanted.element_size() <= chunk_bytes
+        and wanted.transpose(-1, -2).is_contiguous()
+    ):
+        check_deadline("packed expert verification transfer")
+        started = time.perf_counter()
+        wanted = wanted.transpose(-1, -2).to(device=actual.device).transpose(-1, -2)
+        _record_verification_phase("packed_expert_transfer", started)
+    if fused_gate:
+        parts = (part.chunk(tp_size, dim=0)[tp_rank] for part in wanted.chunk(2, dim=0))
+        _compare_stacked(actual, parts, label, mismatches, schema_only=schema_only)
+    else:
+        _compare_bytes(
+            actual,
+            wanted.chunk(tp_size, dim=1)[tp_rank],
+            label,
+            mismatches,
+            chunk_bytes=chunk_bytes,
+            schema_only=schema_only,
+        )
 
 
 class CheckpointTensors(Mapping):
@@ -95,6 +318,14 @@ class CheckpointTensors(Mapping):
                     self.schema[name] = (tuple(view.get_shape()), dtype)
 
     def __getitem__(self, key: str) -> object:
+        started = time.perf_counter()
+        try:
+            return self._get_tensor(key)
+        finally:
+            # mmap page faults during later copies belong to those copy times.
+            _record_verification_phase("checkpoint_tensor_mapping", started)
+
+    def _get_tensor(self, key: str) -> object:
         from safetensors import safe_open
 
         if self.metadata_only:
@@ -140,6 +371,30 @@ class CheckpointTensors(Mapping):
         return len(self.paths)
 
 
+class _CheckpointInspection:
+    """Single-load metadata reuse, bound to unchanged local file identities.
+
+    This never replaces checkpoint hashing or worker byte verification. Each
+    session preflight constructs a new inspection, and load consumes it once.
+    """
+
+    def __init__(self, checkpoint: Path, tensors: CheckpointTensors):
+        self.checkpoint = checkpoint.resolve()
+        self.paths = [self.checkpoint, self.checkpoint / "config.json", *sorted(set(tensors.paths.values()))]
+        self.names = set(tensors)
+        self.identity = self._identity()
+
+    def _identity(self):
+        return tuple(
+            (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            for path in self.paths
+            for stat in [path.stat()]
+        )
+
+    def matches(self, checkpoint):
+        return Path(checkpoint).resolve() == self.checkpoint and self._identity() == self.identity
+
+
 def validate_tied_embeddings(config: dict, tensors: CheckpointTensors) -> tuple[str, ...]:
     text = config.get("text_config", config)
     if not config.get("tie_word_embeddings", text.get("tie_word_embeddings", False)):
@@ -166,6 +421,7 @@ def verify_qwen3_dense(
     worker_rank: int | None = None,
     schema_only: bool = False,
     timings: dict | None = None,
+    pipeline_metrics: dict | None = None,
 ) -> dict:
     """Compare all saved physical parameters to an independent HF layout map.
 
@@ -176,25 +432,46 @@ def verify_qwen3_dense(
     # Reopening it per tensor reparses the entire header quadratically. Keep
     # at most four mmap readers during this verification, never across targets.
     started = time.perf_counter()
-    with CheckpointTensors(checkpoint, metadata_only=schema_only) as expected:
-        inventory_seconds = time.perf_counter() - started
-        result = _verify_qwen3_dense(
-            checkpoint,
-            dump,
-            expected=expected,
-            tp_size=tp_size,
-            pp_size=pp_size,
-            layouts=layouts,
-            physical_tensors=physical_tensors,
-            worker_rank=worker_rank,
-            schema_only=schema_only,
-        )
-    if timings is not None:
-        timings.update(
-            checkpoint_inventory=inventory_seconds,
-            layout_and_content=time.perf_counter() - started - inventory_seconds,
-        )
-    return result
+    phases = {} if timings is not None else None
+    comparator = None
+    if not schema_only and physical_tensors:
+        devices = {value.device for value in physical_tensors.values()}
+        if len(devices) == 1 and next(iter(devices)).type == "cuda":
+            comparator = _AsyncByteComparator(next(iter(devices)))
+    token = _verification_timings.set(phases)
+    comparison_token = _verification_comparator.set(comparator)
+    try:
+        with CheckpointTensors(checkpoint, metadata_only=schema_only) as expected:
+            inventory_seconds = time.perf_counter() - started
+            result = _verify_qwen3_dense(
+                checkpoint,
+                dump,
+                expected=expected,
+                tp_size=tp_size,
+                pp_size=pp_size,
+                layouts=layouts,
+                physical_tensors=physical_tensors,
+                worker_rank=worker_rank,
+                schema_only=schema_only,
+            )
+        if timings is not None:
+            layout_seconds = time.perf_counter() - started - inventory_seconds
+            timings.update(
+                checkpoint_inventory=inventory_seconds,
+                layout_and_content=layout_seconds,
+                layout_and_dispatch=layout_seconds - sum(phases.values()),
+                **phases,
+            )
+        if pipeline_metrics is not None and comparator is not None:
+            pipeline_metrics.update(comparator.metrics)
+        return result
+    finally:
+        try:
+            if comparator is not None:
+                comparator.close()
+        finally:
+            _verification_comparator.reset(comparison_token)
+            _verification_timings.reset(token)
 
 
 def _verify_qwen3_dense(
@@ -361,11 +638,21 @@ def _verify_qwen3_dense(
                 covered.add(packed_key)
             for local_expert in range(local_experts):
                 expert = ep_rank * local_experts + local_expert
+                if packed is not None:
+                    _compare_packed_expert(
+                        actual[local_expert],
+                        packed[expert],
+                        f"{label} expert={expert}",
+                        mismatches,
+                        fused_gate=fused_gate,
+                        tp_size=moe_tp_size,
+                        tp_rank=moe_tp_rank,
+                        schema_only=schema_only,
+                    )
+                    continue
                 if fused_gate:
                     keys = [f"{prefix}.{expert}.{part}.weight" for part in ("gate_proj", "up_proj")]
-                    logical_parts = (
-                        packed[expert].chunk(2, dim=0) if packed is not None else (expected[key] for key in keys)
-                    )
+                    logical_parts = (expected[key] for key in keys)
                     _compare_stacked(
                         actual[local_expert],
                         (part.chunk(moe_tp_size, dim=0)[moe_tp_rank] for part in logical_parts),
@@ -375,7 +662,7 @@ def _verify_qwen3_dense(
                     )
                 else:
                     keys = [f"{prefix}.{expert}.down_proj.weight"]
-                    logical_down = packed[expert] if packed is not None else expected[keys[0]]
+                    logical_down = expected[keys[0]]
                     _compare_bytes(
                         actual[local_expert],
                         logical_down.chunk(moe_tp_size, dim=1)[moe_tp_rank],
@@ -383,8 +670,7 @@ def _verify_qwen3_dense(
                         mismatches,
                         schema_only=schema_only,
                     )
-                if packed is None:
-                    covered.update(keys)
+                covered.update(keys)
         elif ".qkv_proj." in name:
             parts = []
             for part in ("q_proj", "k_proj", "v_proj"):
@@ -422,6 +708,9 @@ def _verify_qwen3_dense(
         elif wanted is not None:
             _compare_bytes(actual, wanted, label, mismatches, schema_only=schema_only)
         checked += actual.numel() * actual.element_size()
+    comparator = _verification_comparator.get()
+    if comparator is not None:
+        comparator.finish(mismatches)
     if mismatches:
         raise ValueError("; ".join(mismatches))
     if covered.intersection(tied_aliases):
@@ -655,12 +944,20 @@ class EmbeddedSGLangGroup:
             schema_only=True,
             tied_aliases=aliases,
         )
+        self._pending_preflight = _CheckpointInspection(Path(checkpoint), tensors)
 
     def load(self, checkpoint: Path, version: str) -> None:
-        self.preflight(checkpoint)
+        inspection = getattr(self, "_pending_preflight", None)
+        if inspection is None or not inspection.matches(checkpoint):
+            self.preflight(checkpoint)
+            inspection = self._pending_preflight
+        # Consume before the RPC: a lost reply cannot leave reusable permission.
+        self._pending_preflight = None
+        self._loaded_inspection = None
         self._rpc("load", command_id="load", checkpoint=str(checkpoint), version=version)
         self.load_receipts = self.worker_receipts
         self._loaded_version = version
+        self._loaded_inspection = inspection
 
     def verify(self, checkpoint: Path) -> None:
         self._rpc(
@@ -673,7 +970,13 @@ class EmbeddedSGLangGroup:
         )
         results = {item["rank"]: item["result"]["verification"] for item in self.worker_receipts}
         covered = {name for item in results.values() for name in item["covered_logical_names"]}
-        expected = set(CheckpointTensors(checkpoint))
+        inspection = getattr(self, "_loaded_inspection", None)
+        if inspection is not None:
+            if not inspection.matches(checkpoint):
+                raise ValueError("Checkpoint files changed during device installation/verification")
+            expected = inspection.names
+        else:
+            expected = set(CheckpointTensors(checkpoint))
         if covered != expected:
             raise ValueError(f"Worker verification has incomplete logical coverage: {sorted(expected - covered)}")
         for pp in range(self.pp_size):

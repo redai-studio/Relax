@@ -45,6 +45,8 @@ class MegatronVersionPublisher:
         encode_workers: int = 4,
         anchor_interval: int = 20,
         full_only: bool = False,
+        source_delta: bool = False,
+        source_patch: bool = True,
         source_cache_root: str | Path | None = None,
         source_limits: dict[str, int] | None = None,
         source_io_timeout: float = 3600,
@@ -64,6 +66,7 @@ class MegatronVersionPublisher:
         self.encode_workers = encode_workers
         self.source_io_timeout = source_io_timeout
         self.model_metadata_bytes = len(canonical(model_config))
+        self.source_exporter = None
         self.anchor_interval, self.full_only = anchor_interval, full_only
         self.identity = digest(
             canonical(
@@ -75,6 +78,8 @@ class MegatronVersionPublisher:
                     "encode_workers": encode_workers,
                     "anchor_interval": anchor_interval,
                     "full_only": full_only,
+                    "source_delta": source_delta,
+                    "source_patch": source_patch,
                     "source_io_timeout": source_io_timeout,
                 }
             )
@@ -92,9 +97,40 @@ class MegatronVersionPublisher:
             if self.export_workspace:
                 self.export_workspace.close()
             raise
-        # Admit every rank's workspace before initializing the publication owner.
+        # Bridge configuration exchanges use PP collectives. Admit every
+        # rank's workspace before any rank can enter those exchanges.
         error = None
         try:
+            if source_delta:
+                from .adaptive_source import AdaptiveSourceExporter
+                from .hf_weight_iterator_bridge import HfWeightIteratorBridge
+                from .hf_weight_iterator_direct import HfWeightIteratorDirect
+
+                if isinstance(iterator, HfWeightIteratorDirect):
+                    self.source_exporter = AdaptiveSourceExporter(
+                        iterator,
+                        process_group,
+                        self.source_cache_root,
+                        stream=stream,
+                        io_timeout=source_io_timeout,
+                        allow_patch=source_patch,
+                    )
+                elif isinstance(iterator, HfWeightIteratorBridge):
+                    from .bridge_source import BridgeSourceAdapter
+
+                    self.source_exporter = AdaptiveSourceExporter(
+                        BridgeSourceAdapter(iterator),
+                        process_group,
+                        self.source_cache_root,
+                        stream=stream,
+                        io_timeout=source_io_timeout,
+                        allow_patch=source_patch,
+                    )
+                elif self.rank == 0:
+                    logger.info(
+                        "Source optimization uses complete export for %s; publication and consumption are unchanged.",
+                        type(iterator).__name__,
+                    )
             if self.rank == 0:
                 self.publisher = VersionPublisher(
                     store,
@@ -115,6 +151,8 @@ class MegatronVersionPublisher:
             # setup fails. Keep the healthy control group active while its
             # owner waits for the background writer to release the lease.
             self._owner_io(lambda: self.publisher.close(finalize=False) if self.publisher else None)
+            if self.source_exporter:
+                self.source_exporter.close()
             self.export_workspace.close()
             raise RuntimeError(f"Source publication initialization failed: {failures}")
         pending = self._broadcast(
@@ -212,11 +250,13 @@ class MegatronVersionPublisher:
 
             from relax.distributed.weight_sync.source_budget import source_demand, source_preflight_record
 
+            if self.source_exporter:
+                self._file_io(self.source_exporter.discard, stage="source candidate cleanup")
             weights = self.weights_getter()
             size = sum(value.numel() * value.element_size() for value in weights.values())
             if size > self.store.max_weight_bytes:
                 raise ValueError("Source snapshot exceeds configured weight limit")
-            iterator = self.iterator
+            iterator = self.source_exporter.iterator if self.source_exporter else self.iterator
             buckets = getattr(iterator, "megatron_local_param_info_buckets", None)
             if buckets is None:
                 buckets = getattr(iterator, "_expert_buckets", []) + getattr(iterator, "_non_expert_buckets", [])
@@ -256,7 +296,7 @@ class MegatronVersionPublisher:
                 size,
                 self.store.max_weight_bytes if self.rank == 0 else 0,
                 largest,
-                adaptive=False,
+                adaptive=bool(self.source_exporter),
                 bridge=bridge,
                 gathered_source_bytes=sum(bucket_sizes) if self.rank == 0 else 0,
                 encode_workers=self.encode_workers if self.rank == 0 else 1,
@@ -313,24 +353,33 @@ class MegatronVersionPublisher:
         try:
             with traffic.capture(self.metrics), self.metrics.stage("source_conversion", path=self.scratch):
                 traffic.emit("G", 0, "source_conversion_entered")
-                checked = getattr(self.iterator, "get_hf_weight_chunks_checked", None)
-                buckets = checked(frozen, self._check) if checked else self.iterator.get_hf_weight_chunks(frozen)
-                for bucket in buckets:
-                    host, copy_error = None, None
-                    try:
-                        if self.rank == 0:
-                            host = [(name, tensor.detach().contiguous().cpu()) for name, tensor in bucket]
-                    except Exception as caught:
-                        copy_error = f"{type(caught).__name__}: {caught}"
-                    self._check(copy_error)
+                if self.source_exporter:
+                    normalize = getattr(self.source_exporter.iterator, "normalize_weights", None)
+                    if normalize:
+                        frozen = normalize(frozen)
+                    version = self._owner_io(lambda: self.publisher.next_version())
+                    table = self.source_exporter.prepare(
+                        frozen, force_full=self.full_only or version % self.anchor_interval == 0
+                    )
+                else:
+                    checked = getattr(self.iterator, "get_hf_weight_chunks_checked", None)
+                    buckets = checked(frozen, self._check) if checked else self.iterator.get_hf_weight_chunks(frozen)
+                    for bucket in buckets:
+                        host, copy_error = None, None
+                        try:
+                            if self.rank == 0:
+                                host = [(name, tensor.detach().contiguous().cpu()) for name, tensor in bucket]
+                        except Exception as caught:
+                            copy_error = f"{type(caught).__name__}: {caught}"
+                        self._check(copy_error)
 
-                    def write_export():
-                        exported = snapshot_tensors(host, temporary)
-                        if set(table) & set(exported):
-                            raise ValueError("Converter produced duplicate logical tensors")
-                        table.update(exported)
+                        def write_export():
+                            exported = snapshot_tensors(host, temporary)
+                            if set(table) & set(exported):
+                                raise ValueError("Converter produced duplicate logical tensors")
+                            table.update(exported)
 
-                    self._file_io(write_export if self.rank == 0 else None, stage="logical export write")
+                        self._file_io(write_export if self.rank == 0 else None, stage="logical export write")
             failures = self._agree(local_error)
             if any(failures):
                 raise RuntimeError(f"Logical export failed: {failures}")
@@ -396,10 +445,17 @@ class MegatronVersionPublisher:
             )
             self._owner_io(lambda: self.publisher.confirm(handle, published))
         self.pending = None
+        if self.source_exporter:
+            self._file_io(self.source_exporter.confirm, stage="source cache confirmation", committing=True)
         # SOURCE_CONFIRMED is already durable on every participant. Diagnostic
         # I/O must not turn this completed publication into a rank-local error.
         try:
             self.metrics.save(self.scratch / f"metrics-v{published.version}-rank-{self.rank}.json")
+            if self.source_exporter:
+                save_diagnostic(
+                    self.scratch / f"source-routes-v{published.version}-rank-{self.rank}.json",
+                    canonical(self.source_exporter.statistics),
+                )
         except OSError:
             logger.warning(
                 "Version %s is published; diagnostic output failed on rank %s. Check scratch capacity and permissions.",
@@ -446,4 +502,6 @@ class MegatronVersionPublisher:
             # Cleanup after a failed collective must retain the pending record.
             if self.publisher:
                 self.publisher.close(finalize=False)
+            if self.source_exporter:
+                self.source_exporter.close()
             self.export_workspace.close()

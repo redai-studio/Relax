@@ -9,7 +9,7 @@ import struct
 import sys
 import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -125,7 +125,13 @@ def snapshot_checkpoint(source: str | Path, destination: str | Path, *, max_weig
     return result
 
 
-def snapshot_tensors(tensors: object, directory: str | Path, *, hashes: dict | None = None) -> dict:
+def snapshot_tensors(
+    tensors: object,
+    directory: str | Path,
+    *,
+    hashes: dict | None = None,
+    hash_executor: Executor | None = None,
+) -> dict:
     """Snapshot iterable (name, torch.Tensor) at a quiescent update boundary.
 
     Conversion may synchronize the device; this is an explicit checkpoint
@@ -135,6 +141,8 @@ def snapshot_tensors(tensors: object, directory: str | Path, *, hashes: dict | N
     they do not certify an independent disk readback. Publish/consumer storage
     checks still verify actual files. The supplied mapping changes only after
     every tensor has been written successfully; the returned table is unchanged.
+    A supplied hash_executor is borrowed, never shut down here. This call drains
+    its own submitted work even when writing fails, before releasing CPU views.
     """
     import torch
 
@@ -157,7 +165,11 @@ def snapshot_tensors(tensors: object, directory: str | Path, *, hashes: dict | N
     result = {}
     written_hashes = {}
     workers = (
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix="weight-snapshot-hash")
+        (
+            nullcontext(hash_executor)
+            if hash_executor is not None
+            else ThreadPoolExecutor(max_workers=1, thread_name_prefix="weight-snapshot-hash")
+        )
         if hashes is not None
         else nullcontext(None)
     )
@@ -173,9 +185,19 @@ def snapshot_tensors(tensors: object, directory: str | Path, *, hashes: dict | N
             # One hashing worker overlaps this same view's write. Its result is
             # drained before advancing to another tensor, bounding retained memory.
             future = pool.submit(digest, value) if pool is not None else None
-            with path.open("wb") as out:
-                if out.write(value) != value.nbytes:
-                    raise OSError("Incomplete tensor snapshot write")
+            try:
+                with path.open("wb") as out:
+                    if out.write(value) != value.nbytes:
+                        raise OSError("Incomplete tensor snapshot write")
+            except BaseException:
+                # The borrowed executor may outlive this call. Drain only our
+                # task and preserve the original write error if hashing fails too.
+                if future is not None:
+                    try:
+                        future.result()
+                    except BaseException:
+                        pass
+                raise
             if future is not None:
                 written_hashes[name] = future.result()
             file_write(path, host.numel() * host.element_size())

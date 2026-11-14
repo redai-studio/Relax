@@ -126,7 +126,14 @@ def worker_rpc(scheduler, payload: str) -> None:
                     raise ValueError("Physical model inventory changed since installation preparation")
                 inventory_seconds = time.perf_counter() - started
                 verification_timings = {}
-                with time_budget(float(request.get("timeout", 120))):
+                verification_pipeline = {}
+                torch.cuda.synchronize()
+                baseline = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                with (
+                    IOObservation(path=request["checkpoint"]) as observation,
+                    time_budget(float(request.get("timeout", 120))),
+                ):
                     verification = verify_qwen3_dense(
                         Path(request["checkpoint"]),
                         None,
@@ -136,6 +143,7 @@ def worker_rpc(scheduler, payload: str) -> None:
                         physical_tensors={(rank, name): value for name, value in physical.items()},
                         worker_rank=rank,
                         timings=verification_timings,
+                        pipeline_metrics=verification_pipeline,
                     )
             elif phase == "flush":
                 from sglang.srt.managers import mm_utils
@@ -157,6 +165,7 @@ def worker_rpc(scheduler, payload: str) -> None:
             if phase == "verify":
                 result["phase_seconds"]["physical_inventory"] = inventory_seconds
                 result["phase_seconds"].update(verification_timings)
+                result["verification_pipeline"] = verification_pipeline
             if multimodal_cache is not None:
                 result["multimodal_cache"] = multimodal_cache
             if observation is not None:
@@ -164,7 +173,7 @@ def worker_rpc(scheduler, payload: str) -> None:
             if verification is not None:
                 result["verification"] = verification
             if baseline is not None:
-                result["loader_memory"] = {
+                result["verification_memory" if phase == "verify" else "loader_memory"] = {
                     "allocated_before_bytes": baseline,
                     "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                     "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
