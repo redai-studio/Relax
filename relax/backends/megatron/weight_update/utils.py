@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Check Actor/SGLang sync support and coordinate errors across Actor ranks."""
 
+import torch
+
 from relax.backends.sglang.weight_loader import NATIVE_SYNC_FENCE_LOADER
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.env import Envs
@@ -74,7 +76,13 @@ def validate_actor_weight_retention(
 
 
 def agree_actor_weight_retention(
-    reason: str | None, group, *, requested: bool, active: bool = False, records: list | None = None
+    reason: str | None,
+    group,
+    *,
+    requested: bool,
+    active: bool = False,
+    records: list | None = None,
+    shard_p2p: bool = False,
 ) -> bool:
     """Agree across Actor ranks whether to keep GPU weights for sync.
 
@@ -87,6 +95,7 @@ def agree_actor_weight_retention(
     mode = (
         requested,
         Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP,
+        shard_p2p,
     )
     if records is None:
         records = [None] * dist.get_world_size(group)
@@ -201,3 +210,42 @@ def run_rank0_rpc_calls(calls, group) -> None:
             raise
 
     run_with_distributed_error_check(invoke, group)
+
+
+def snapshot_digests(weights: dict[str, torch.Tensor]) -> dict[str, str]:
+    """Byte digests for cold qualification of source replicas."""
+    import hashlib
+
+    return {
+        name: hashlib.sha256(
+            tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+        ).hexdigest()
+        for name, tensor in weights.items()
+    }
+
+
+def validate_native_colocate_devices(actors: list[dict], engines: list[list[dict]]) -> None:
+    """Prove physical GPU reuse from actual CUDA worker incarnations."""
+    from relax.distributed.checkpoint_service.backends.shard_p2p.common import validate_worker_identity
+
+    if not actors or not engines or not engines[0]:
+        raise ValueError("Colocated device coverage requires complete worker inventories")
+    width = len(engines[0])
+    if len(actors) != len(engines) * width or any(len(engine) != width for engine in engines):
+        raise ValueError("Colocated device coverage differs from the Actor world")
+    for endpoint in [*actors, *(endpoint for engine in engines for endpoint in engine)]:
+        validate_worker_identity(endpoint)
+
+    def physical(endpoint: dict) -> tuple[str, str]:
+        return endpoint["boot_id"], endpoint["gpu_uuid"]
+
+    actor_devices = [physical(endpoint) for endpoint in actors]
+    receiver_devices = [physical(endpoint) for engine in engines for endpoint in engine]
+    if len(set(actor_devices)) != len(actors) or len(set(receiver_devices)) != len(actors):
+        raise ValueError("Colocated device coverage reuses a physical GPU")
+    for index, engine in enumerate(engines):
+        block = actors[index * width : (index + 1) * width]
+        if len({endpoint["boot_id"] for endpoint in engine}) != 1 or {physical(endpoint) for endpoint in engine} != {
+            physical(endpoint) for endpoint in block
+        }:
+            raise ValueError("Colocated receiver devices differ from their Actor block")
