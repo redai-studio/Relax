@@ -116,7 +116,17 @@ class FSDPSFTTrainer:
             "metadata_sha256": self.dataset.sha256,
             # CPU scheduling controls do not change samples or optimizer math.
             # Keep old checkpoints resumable when prefetch is toggled.
-            "config": {k: v for k, v in config.items() if k not in ("image_prefetch_depth", "image_prefetch_workers")},
+            "config": {
+                k: v
+                for k, v in config.items()
+                if k
+                not in (
+                    "image_prefetch_depth",
+                    "image_prefetch_workers",
+                    "baseline_stats_dir",
+                    "baseline_warmup_steps",
+                )
+            },
             "world_size": self.world,
             "global_batch_size": self.args.global_batch_size,
             "seed": self.args.seed,
@@ -170,6 +180,26 @@ class FSDPSFTTrainer:
                 depth,
                 workers,
             )
+        self.tracker = None
+        stats_dir = config.get("baseline_stats_dir")
+        if stats_dir:
+            from relax.engine.sft.condition_tracker import ConditionTracker
+
+            warmup_steps = int(config.get("baseline_warmup_steps", 5))
+            self.tracker = ConditionTracker(
+                rank=self.rank,
+                world_size=self.world,
+                micro_batches=self.args.global_batch_size // self.world,
+                dataset_size=int(config["dataset_size"]),
+                output_dir=Path(stats_dir),
+                warmup_steps=warmup_steps,
+                seed=int(self.args.seed),
+            )
+        pipe = getattr(actor.model, "pipe", None)
+        if pipe is not None:
+            pipe.tracker = self.tracker
+            if getattr(pipe, "dit", None) is not None:
+                pipe.dit.tracker = self.tracker
         self.profiler.on_init_end()
 
     def _resume(self) -> None:
@@ -205,6 +235,9 @@ class FSDPSFTTrainer:
     def close(self) -> None:
         if self.prefetch:
             self.prefetch.close()
+        tracker = getattr(self, "tracker", None)
+        if tracker is not None:
+            tracker.save_summary()
 
     def _train_step(self, step: int) -> None:
         from relax.backends.fsdp.actor import _collect_weight_sync_errors
@@ -229,6 +262,9 @@ class FSDPSFTTrainer:
             self.rank :: self.world
         ]
         started = time.monotonic()
+        tracker = getattr(self, "tracker", None)
+        if tracker is not None:
+            tracker.begin_step(step, self.actor.device)
         optimizer = self.actor.optimizer
         optimizer.zero_grad(set_to_none=True)
         loss_sum = torch.zeros((), device=self.actor.device, dtype=torch.float32)
@@ -246,13 +282,35 @@ class FSDPSFTTrainer:
                 if self.prefetch:
                     self.prefetch.close()
                 raise ValueError(f"Image decoding failed: {errors}")
+            if tracker is not None:
+                image = data["image"]
+                tracker.begin_micro(
+                    micro,
+                    sample_id,
+                    self.dataset.rows[sample_id],
+                    self.dataset.config,
+                    self.actor._trainable_mode,
+                    image.height,
+                    image.width,
+                )
             loss = self.actor.model(data)
             torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
-            (loss / len(ids)).backward()
+            scaled_loss = loss / len(ids)
+            if tracker is not None:
+                with tracker.gpu_stage("backward_ms"):
+                    scaled_loss.backward()
+            else:
+                scaled_loss.backward()
             loss_sum.add_(loss.detach().float() / len(ids))
-        norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
-        lr = optimizer.param_groups[0]["lr"]
-        optimizer.step()
+        if tracker is not None:
+            with tracker.gpu_stage("optimizer_ms"):
+                norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
+                lr = optimizer.param_groups[0]["lr"]
+                optimizer.step()
+        else:
+            norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
+            lr = optimizer.param_groups[0]["lr"]
+            optimizer.step()
         self.scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         self.step += 1
@@ -260,10 +318,15 @@ class FSDPSFTTrainer:
             self.prefetch.close()
         self.profiler.step(step)
         dist.all_reduce(loss_sum, group=self.group)
+        if tracker is not None:
+            alloc, reserved = tracker.consume_step_memory(self.actor.device)
+        else:
+            alloc = torch.cuda.max_memory_allocated(self.actor.device)
+            reserved = torch.cuda.max_memory_reserved(self.actor.device)
         peak_memory = torch.tensor(
             [
-                torch.cuda.max_memory_allocated(self.actor.device),
-                torch.cuda.max_memory_reserved(self.actor.device),
+                alloc,
+                reserved,
                 int(data_wait * 1e9),
             ],
             device=self.actor.device,
@@ -272,12 +335,17 @@ class FSDPSFTTrainer:
         dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX, group=self.group)
         metrics = torch.stack([loss_sum / self.world, norm]).cpu().tolist()
         peak_allocated, peak_reserved, max_data_wait_ns = peak_memory.cpu().tolist()
+        train_seconds = time.monotonic() - started
+        if tracker is not None:
+            tracker.end_step(step, data_wait, train_seconds)
+            if self.step == self.args.num_rollout:
+                tracker.save_summary()
         if self.rank == 0:
             values = {
                 "train/loss": metrics[0],
                 "train/grad_norm": metrics[1],
                 "train/lr": lr,
-                "perf/train_seconds": time.monotonic() - started,
+                "perf/train_seconds": train_seconds,
                 "perf/data_wait_seconds": max_data_wait_ns / 1e9,
                 "perf/peak_allocated_bytes": peak_allocated,
                 "perf/peak_reserved_bytes": peak_reserved,
