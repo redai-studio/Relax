@@ -495,6 +495,7 @@ class SGLangEngine(RayActor):
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._sync_nextn_draft = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -587,6 +588,9 @@ class SGLangEngine(RayActor):
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
+            self._sync_nextn_draft = server_args_dict.get(
+                "speculative_algorithm"
+            ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
             self._init_normal(server_args_dict)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
@@ -611,6 +615,7 @@ class SGLangEngine(RayActor):
                     metadata={
                         "num_gpus_per_engine": effective_num_gpus,
                         "actor_id": ray.get_runtime_context().get_actor_id(),
+                        "sync_nextn_draft": self._sync_nextn_draft,
                     },
                 )
             )
@@ -639,6 +644,14 @@ class SGLangEngine(RayActor):
         )
         actual_server_args = _get_actual_server_args()
         _sanity_check_server_args(actual_server_args, expect_server_args)
+        # SGLang may report NEXTN as EAGLE after resolving the server args.
+        self._sync_nextn_draft = (
+            expect_server_args.get("speculative_algorithm") == "NEXTN"
+            and actual_server_args.get("speculative_algorithm") in ("NEXTN", "EAGLE")
+            and "model_path" in actual_server_args
+            and "speculative_draft_model_path" in actual_server_args
+            and _uses_target_checkpoint_for_draft(actual_server_args)
+        )
 
         if not self._skip_router_registration:
             self.register_to_router()
@@ -1431,6 +1444,8 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if self._sync_nextn_draft:
+            payload["selector"] = "all"
         return self._make_request(
             "update_weights_from_distributed",
             payload,
@@ -1917,6 +1932,13 @@ class GenRMEngine(SGLangEngine):
             self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
+
+
+def _uses_target_checkpoint_for_draft(server_args: dict) -> bool:
+    draft_path = server_args.get("speculative_draft_model_path")
+    draft_revision = server_args.get("speculative_draft_model_revision") or "main"
+    target_revision = server_args.get("revision") or "main"
+    return draft_path is None or (draft_path == server_args["model_path"] and draft_revision == target_revision)
 
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:

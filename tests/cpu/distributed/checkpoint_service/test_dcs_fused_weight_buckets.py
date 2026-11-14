@@ -60,7 +60,8 @@ def test_http_failure_releases_dcs_lock_preserves_error_and_does_not_advance_pro
         lock=SimpleNamespace(
             acquire=SimpleNamespace(remote=lambda: True), release=SimpleNamespace(remote=lambda: "release")
         ),
-        _batch_request=lambda *args: "http",
+        rollout_topology={"0": {}},
+        _batch_request=lambda *args, **kwargs: "http",
     )
     progress = SimpleNamespace(update=lambda count: calls.append("progress"))
     with pytest.raises(RuntimeError) as error:

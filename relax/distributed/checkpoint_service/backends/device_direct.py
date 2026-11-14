@@ -1206,8 +1206,13 @@ class DeviceDirectBackend(CommBackend):
                 "weight_version": str(self.weight_version),
                 "flush_cache": False,
             }
-            # Send weight update to all rollout nodes via Ray actors
-            futures = self._batch_request("/update_weights_from_distributed", weight_payload)
+            weight_payloads = {
+                int(rank): {**weight_payload, "selector": "all"}
+                if (info.get("metadata") or {}).get("sync_nextn_draft")
+                else weight_payload
+                for rank, info in self.rollout_topology.items()
+            }
+            futures = self._batch_request("/update_weights_from_distributed", weight_payloads, get_rank=True)
 
             # Broadcast weights via PyTorch distributed
             handles = []
