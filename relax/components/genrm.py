@@ -173,17 +173,16 @@ class GenRM(Base):
             GENRM_SERVE_MAX_ONGOING_REQUESTS,
             _GENRM_HTTP_MAX_CONNECTIONS,
         )
+        from relax.distributed.ray.inference_handle import use_managed_auxiliary
+
+        self._managed = use_managed_auxiliary(config)
         self.config = config
         self.healthy = healthy
         self.role = role
 
         # {route_key: GenRMManager handle}. Single-instance configs (the legacy
         # --genrm-model-path path) resolve to exactly {"__default__": manager}.
-        self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
         self.instance_specs = config._genrm_instances_resolved
-
-        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
-        self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
         # many concurrent engine requests; keepalive_expiry >> the default 5s so
@@ -203,6 +202,14 @@ class GenRM(Base):
             key: load_tokenizer(spec["model_path"], trust_remote_code=True)
             for key, spec in self.instance_specs.items()
         }
+
+        # Load tokenizers before allocating engines: template/model errors
+        # must not strand already-started auxiliary managers.
+        self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
+        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
+        self._closed = False
+        self._inference_executors = {}
+        self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
 
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.
@@ -284,7 +291,10 @@ class GenRM(Base):
         Returns:
             Dict containing at least {"text": str} from the SGLang server.
         """
-        key, idx, host, port = self._pick_engine(route_key)
+        if self._managed:
+            key = self._resolve_instance_key(route_key)
+        else:
+            key, idx, host, port = self._pick_engine(route_key)
         spec = self.instance_specs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
@@ -328,6 +338,14 @@ class GenRM(Base):
             "sampling_params": default_sampling,
         }
 
+        if self._managed:
+            from relax.engine.inference.executor import InferenceRequestExecutor
+
+            executors = self.__dict__.setdefault("_inference_executors", {})
+            if key not in executors:
+                executors[key] = InferenceRequestExecutor("genrm", self.genrm_managers[key], self._http_client)
+            return await executors[key].generate_json(payload)
+
         # Retry transient resets (transport-level or 5xx) with short backoff so
         # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
         # (terminal) and a cancellation (caller timeout) is never retried.
@@ -362,7 +380,7 @@ class GenRM(Base):
         instances = {}
         for key, manager in self.genrm_managers.items():
             try:
-                is_healthy = ray.get(manager.health_check.remote())
+                is_healthy = await manager.health_check.remote()
                 instances[key] = {"status": "healthy" if is_healthy else "unhealthy"}
             except Exception as e:
                 self._logger.error(f"GenRM health check failed for instance '{key}': {e}")
@@ -389,6 +407,25 @@ class GenRM(Base):
         if list(instances) == [_DEFAULT_INSTANCE_KEY]:
             return {"service": "genrm", **instances[_DEFAULT_INSTANCE_KEY]}
         return {"service": "genrm", "instances": instances}
+
+    async def close(self) -> None:
+        """Drain auxiliary requests before Controller deletes this service."""
+        if self._closed:
+            return
+        failures = []
+        if self._managed:
+            for key, manager in tuple(self.genrm_managers.items()):
+                try:
+                    await manager.dispose.remote()
+                except Exception as exc:
+                    failures.append(exc)
+                else:
+                    ray.kill(manager)
+                    self.genrm_managers.pop(key)
+        await self._http_client.aclose()
+        if failures:
+            raise RuntimeError("Could not close every GenRM model") from failures[0]
+        self._closed = True
 
     def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
         """Get one GenRM manager by route key.

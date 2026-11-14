@@ -2,6 +2,12 @@
 
 在线策略蒸馏 (OPD) 通过在学生模型自身的回滚数据上训练学生，同时匹配教师的词元级对数概率，实现从大型教师模型到小型学生模型的知识迁移。OPD 与优势估计器正交——它作为 KL 惩罚项，可以与任何估计器结合使用，包括 PPO、GRPO、GSPO、SAPO、CISPO 和 REINFORCE++。
 
+## 独立资源与外部 Teacher
+
+未启用 `--colocate` 的标准 SGLang 任务通过公共推理管理器和请求执行链调用 Relax 管理的单 Teacher。副本恢复后，请求会读取当前端点；`--opd-teacher-timeout-s` 限制包括准入与响应读取在内的 Teacher 请求总时长。Teacher 保持自己的 checkpoint 权重，不接收 Actor 权重更新。自定义生命周期 hook、Agentic 任务以及 colocate Teacher 保留现有编排；托管多 Teacher 路由仍仅支持 colocate。
+
+使用 `--opd-teacher-url` 时，Teacher 为外部服务：Relax 发送请求，但不分配其 GPU，也不会在训练结束时关闭外部进程。原有外部 Teacher 路由继续适用。
+
 ## 关键参数
 
 | 参数                      | 描述                                                                                                             |

@@ -176,7 +176,7 @@ def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
 
     genrm_module.GenRMManager = FakeGenRMManager
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.genrm", genrm_module)
-    args = _elastic_args(tmp_path, offload_rollout=False)
+    args = _elastic_args(tmp_path, offload_rollout=False, colocate=True)
 
     placement_group_module.create_genrm_manager(args, "pg", runtime_env={"env_vars": {"A": "B"}})
 
@@ -258,6 +258,7 @@ def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
     args = _elastic_args(
         tmp_path,
         offload_rollout=False,
+        colocate=True,
         _genrm_instances_resolved={"quality": dict(spec), "safety": dict(spec)},
     )
 
@@ -292,3 +293,49 @@ def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):
     backend._create_rollout_engines({0: {"ip": "127.0.0.1", "port": 8000}})
 
     assert captured["options"] == {"resources": {"stable_cpu": 1}}
+
+
+def test_managed_genrm_routes_keep_names_offsets_and_stable_cpu(monkeypatch, tmp_path):
+    from relax.distributed.ray import inference_manager
+
+    captured_options = []
+    starts = []
+
+    class FakeInferenceManager(_FakeActorClass):
+        @classmethod
+        def options(cls, **options):
+            captured_options.append(options)
+            return cls
+
+        @classmethod
+        def remote(cls):
+            actor = MagicMock()
+            actor.start_static.remote.side_effect = lambda role, args, binding, options: starts.append(
+                (role, binding, options)
+            )
+            return actor
+
+    spec = dict(model_path="/model", num_gpus=1, num_gpus_per_engine=1, engine_config={}, sampling_config={})
+    args = _elastic_args(
+        tmp_path,
+        colocate=False,
+        _genrm_instances_resolved={"quality": dict(spec), "safety": dict(spec)},
+    )
+    monkeypatch.setattr(inference_manager, "InferenceManager", FakeInferenceManager)
+    monkeypatch.setattr(inference_manager.ray, "get", lambda ref: ref)
+    managers = placement_group_module.create_genrm_managers(args, "pg", runtime_env={"env_vars": {"A": "B"}})
+    assert set(managers) == {"quality", "safety"}
+    assert captured_options == [
+        dict(
+            name=f"relax_genrm_manager_{key}",
+            num_cpus=1,
+            num_gpus=0,
+            runtime_env={"env_vars": {"A": "B"}},
+            resources={"stable_cpu": 1},
+        )
+        for key in ("quality", "safety")
+    ]
+    assert starts == [
+        ("genrm", "pg", dict(model_id=key, bundle_offset=index, port_window_index=index))
+        for index, key in enumerate(("quality", "safety"))
+    ]

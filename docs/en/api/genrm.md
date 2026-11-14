@@ -25,6 +25,12 @@ The service uses SGLang engines to perform preference evaluation:
 3. Sends to SGLang engine with configurable sampling parameters
 4. Returns raw model response text
 
+### Dedicated GPU pools
+
+Standard SGLang tasks without `--colocate` use the common inference owner and request executor for GenRM. Each judge keeps its own checkpoint and GPU slice; Actor weight updates do not change judge weights. Requests resolve current replica addresses, so an engine replacement can change its port without leaving the service with a stale address cache. The existing `route_key` and sampling configuration remain applicable.
+
+Tasks with custom lifecycle or generation hooks, Agentic rollout, or external rollout engines retain their existing orchestration. Colocated tasks also retain their existing offload/onload coordination, including split bundles that the Actor reuses during training.
+
 ### Colocated Mode
 
 When colocated with the Actor (sharing GPU resources), GenRM supports offload/onload operations:

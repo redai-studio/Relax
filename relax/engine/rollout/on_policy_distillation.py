@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from typing import Any
 
 import aiohttp
 import numpy as np
@@ -361,6 +362,23 @@ class OpdManager:
 
         self._assemble_transfer(sample_list)
 
+    async def _post_managed_teacher(self, manager: Any, payload: dict) -> dict:
+        from relax.engine.inference.executor import InferenceRequestExecutor
+        from relax.utils import http_utils
+
+        if not hasattr(self, "_teacher_executor"):
+            self._teacher_executor = InferenceRequestExecutor("teacher", manager, http_utils._http_client)
+            limit = int(getattr(self.args, "opd_teacher_connector_limit", 256))
+            self._teacher_slots = asyncio.Semaphore(limit) if limit > 0 else None
+
+        async def generate() -> dict:
+            if self._teacher_slots is None:
+                return await self._teacher_executor.generate_json(payload)
+            async with self._teacher_slots:
+                return await self._teacher_executor.generate_json(payload)
+
+        return await asyncio.wait_for(generate(), timeout=float(self.args.opd_teacher_timeout_s))
+
     async def _post_logprob(
         self,
         session: aiohttp.ClientSession,
@@ -371,12 +389,18 @@ class OpdManager:
         expected_input_ids: list[int] | None = None,
     ) -> opd_main_worker.LogprobResponse | None:
         try:
-            async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error("OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, url, body[:2048])
-                    resp.raise_for_status()
-                data = await resp.json()
+            manager = getattr(self.args, "_teacher_inference_manager_handle", None)
+            if manager is not None and err_tag == "teacher prefill":
+                data = await self._post_managed_teacher(manager, payload)
+            else:
+                async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error(
+                            "OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, url, body[:2048]
+                        )
+                        resp.raise_for_status()
+                    data = await resp.json()
         except Exception as exc:
             logger.error(
                 "OPD %s fetch failed for sample_index=%s, error=%s",
