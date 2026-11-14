@@ -50,19 +50,6 @@ jobs:
             gh pr comment "$PR_NUMBER" --body "$1"
           }
 
-          # Match the configured fork as well as the target, branch, and PR state.
-          find_backport_pr() {
-            local state="$1"
-            local candidates
-            candidates=$(gh pr list --state "$state" --base "$TARGET_BRANCH" --head "$NEW_BRANCH" \
-              --json url,state,baseRefName,headRefName,headRepository) || return
-            jq -r --arg state "$state" --arg base "$TARGET_BRANCH" \
-              --arg head "$NEW_BRANCH" --arg repo "$REPO_NAME" '
-              map(select(.state == ($state | ascii_upcase) and .baseRefName == $base and
-                .headRefName == $head and .headRepository.nameWithOwner == $repo))[0].url // empty
-            ' <<< "$candidates"
-          }
-
           # Configure git for the original author
           echo "Fetching author info for $PR_AUTHOR..."
           AUTHOR_INFO=$(gh api "/users/$PR_AUTHOR" --jq '{email: .email, name: .name}')
@@ -85,47 +72,11 @@ jobs:
           ORIGINAL_HEAD_SHA=$(git rev-parse HEAD)
 
           # Get labels
-          PR_INFO=$(gh pr view "$PR_NUMBER" --json labels,commits,headRefOid)
-          LABELS=$(jq -r '.labels[].name' <<< "$PR_INFO")
+          LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
 
           if [ -z "$LABELS" ]; then
             echo "No labels found."
             exit 0
-          fi
-
-          # A single SHA must cover the whole PR, not just the last rebased commit.
-          if grep -q '^cherry-pick:' <<< "$LABELS"; then
-            COMMIT_COUNT=$(jq -er '.commits | length | select(. > 0)' <<< "$PR_INFO")
-            PARENT_LINE=$(git rev-list --parents -n 1 "$MERGE_COMMIT_SHA")
-            read -r -a PARENT_IDS <<< "$PARENT_LINE"
-            if [ "$COMMIT_COUNT" -gt 1 ] && [ "${#PARENT_IDS[@]}" -eq 2 ]; then
-              SOURCE_HEAD_SHA=$(jq -er '.headRefOid' <<< "$PR_INFO")
-              # Fetch only as data: never checkout or execute the PR head.
-              if ! git fetch origin "refs/pull/$PR_NUMBER/head"; then
-                post_comment "❌ Cherry-pick unsupported/ambiguous: Cannot read the original PR history. Please backport manually."
-                exit 1
-              fi
-              if [ "$(git rev-parse FETCH_HEAD)" != "$SOURCE_HEAD_SHA" ]; then
-                post_comment "❌ Cherry-pick unsupported/ambiguous: The original PR history changed. Please backport manually."
-                exit 1
-              fi
-              if ! SOURCE_BASE_SHA=$(git merge-base "$MERGE_COMMIT_SHA" "$SOURCE_HEAD_SHA"); then
-                post_comment "❌ Cherry-pick unsupported/ambiguous: Cannot establish the original PR base. Please backport manually."
-                exit 1
-              fi
-              DIFF_DIR=$(mktemp -d)
-              trap 'rm -rf "$DIFF_DIR"' EXIT
-              git diff --no-ext-diff --no-textconv --no-renames --binary --full-index \
-                "$SOURCE_BASE_SHA" "$SOURCE_HEAD_SHA" > "$DIFF_DIR/pr.patch"
-              git diff --no-ext-diff --no-textconv --no-renames --binary --full-index \
-                "$MERGE_COMMIT_SHA^" "$MERGE_COMMIT_SHA" > "$DIFF_DIR/merge.patch"
-              if ! cmp -s "$DIFF_DIR/pr.patch" "$DIFF_DIR/merge.patch"; then
-                post_comment "❌ Cherry-pick unsupported/ambiguous: The merge SHA does not exactly cover the original PR diff. Multi-commit rebase is unsupported; a squash with a changed file baseline may also be ambiguous. Please backport manually."
-                exit 1
-              fi
-              rm -rf "$DIFF_DIR"
-              trap - EXIT
-            fi
           fi
 
           # Loop through labels
@@ -150,12 +101,6 @@ jobs:
               # Create a new branch for the cherry-pick
               NEW_BRANCH="cherry-pick/$PR_NUMBER/$TARGET_BRANCH"
 
-              MERGED_PR=$(find_backport_pr merged)
-              if [ -n "$MERGED_PR" ]; then
-                post_comment "ℹ️ Cherry-pick PR is already merged: $MERGED_PR"
-                continue
-              fi
-
               # Clean up local branch if it exists (from previous run)
               if git show-ref --verify --quiet "refs/heads/$NEW_BRANCH"; then
                 git branch -D "$NEW_BRANCH"
@@ -171,10 +116,7 @@ jobs:
                 echo "Cherry-pick successful."
               else
                 echo "Standard cherry-pick failed, trying with -m 1 (for merge commits)..."
-                # A merge rejected without -m has no active cherry-pick to abort.
-                if git rev-parse --verify --quiet CHERRY_PICK_HEAD >/dev/null; then
-                  git cherry-pick --abort
-                fi
+                git cherry-pick --abort
                 if git cherry-pick -m 1 "$MERGE_COMMIT_SHA"; then
                   echo "Cherry-pick with -m 1 successful."
                 else
@@ -214,7 +156,7 @@ jobs:
               HEAD_REF="${BOT_USERNAME}:${NEW_BRANCH}"
 
               # Check if PR already exists
-              EXISTING_PR=$(find_backport_pr open)
+              EXISTING_PR=$(gh pr list --base "$TARGET_BRANCH" --head "$NEW_BRANCH" --json url --jq '.[0].url')
 
               if [ -n "$EXISTING_PR" ]; then
                 echo "PR already exists: $EXISTING_PR"
@@ -227,7 +169,7 @@ jobs:
                 sleep 2
 
                 # Search for the created PR
-                CREATED_PR_URL=$(find_backport_pr open)
+                CREATED_PR_URL=$(gh pr list --head "$NEW_BRANCH" --state all --json url --jq '.[0].url')
 
                 if [ -n "$CREATED_PR_URL" ]; then
                   echo "Created PR: $CREATED_PR_URL"
