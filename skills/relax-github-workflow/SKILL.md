@@ -56,6 +56,19 @@ Use a Draft PR while work is still in progress. Mark it ready when it is ready f
 
 Read the original review thread and the affected code. Apply reasonable findings, or explain a disagreement with evidence. Verify the fix, publish the intended update, and follow up in the original thread within the user's authorization. Reuse the existing thread for the same issue and avoid repeating settled findings.
 
+## Release branches
+
+Unless maintainers explicitly approve a special case, merge every change into `main` first. Do not merge changes into `release/*` that have not landed in `main`. Backport already merged changes through a separate PR targeting the intended release branch, not a direct push.
+
+Request automation on the original `main` PR:
+
+- Add a `cherry-pick: <branch>` label, for example `cherry-pick: release/0.2.0`. The label can be added before merge; `rai-studio-bot` waits until the source PR merges. Adding it after merge also requests a backport.
+- After the source PR has merged into `main`, a user with repository write access can comment `/cherry-pick <branch>`. This command assigns the corresponding existing label; it does not queue requests on unmerged PRs.
+
+The bot opens a cherry-pick PR; it does not merge it. Review and merge that PR into `release/*` through the normal protected-branch workflow. If the cherry-pick conflicts or the bot reports unsupported/ambiguous history, backport the complete already merged PR manually in your fork and open the release-targeted PR yourself, linking the original `main` PR. Do not include unrelated or not-yet-merged changes.
+
+See [Relax GitHub CI](../relax-github-ci/SKILL.md) for command permissions, required branch/label setup, and automation limits.
+
 ## Dependent PRs
 
 For dependent changes, consider using `gh-stack` to split the work into cohesive, independently reviewable PRs.
