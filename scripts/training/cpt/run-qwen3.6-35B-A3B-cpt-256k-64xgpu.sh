@@ -12,19 +12,6 @@ if [[ "${1:-}" == --dry-run || "${1:-}" == --render-env ]]; then
     export DRY_RUN=1
     shift
 fi
-# Capture the outer Ray Job before the entrypoint or tee can redirect its output.
-if [[ ! -v CPT_PARENT_SUBMISSION_ID ]]; then
-    export CPT_PARENT_SUBMISSION_ID="${RAY_JOB_SUBMISSION_ID:-}"
-    if [[ -z "$CPT_PARENT_SUBMISSION_ID" ]]; then
-        for fd in 1 2; do
-            parent_log="$(readlink -f "/proc/$$/fd/$fd" 2>/dev/null || true)"
-            if [[ "$parent_log" =~ /job-driver-(.+)\.(log|out|err)$ ]]; then
-                export CPT_PARENT_SUBMISSION_ID="${BASH_REMATCH[1]}"
-                break
-            fi
-        done
-    fi
-fi
 export RELAX_SKIP_CLUSTER_CLEANUP=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,10 +35,6 @@ EXP_NAME="${EXP_NAME:-qwen36-cpt-256k-64xB300}"  # gitleaks:allow -- stable expe
 now="$(date +%Y%m%d-%H%M%S)"
 TASK_NAME="${EXP_NAME}-${now}-$$"
 export SUBMISSION_ID="${SUBMISSION_ID:-$TASK_NAME}"
-if [[ -n "$CPT_PARENT_SUBMISSION_ID" && "$SUBMISSION_ID" == "$CPT_PARENT_SUBMISSION_ID" ]]; then
-    echo "Training submission ID must differ from the parent Ray Job ID" >&2
-    exit 1
-fi
 CHECKPOINT_DIR="${SAVE_DIR}/${EXP_NAME}"
 TRAIN_STEPS="${TRAIN_STEPS:-1000}"
 LR="${LR:-2e-5}"
@@ -202,7 +185,7 @@ CPT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
     --seq-length 262144
-    --global-batch-size 1600
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-1600}"
     --use-dynamic-batch-size
     --sft-packing-strategy binpack
     --balance-data
@@ -281,9 +264,17 @@ PERF_ARGS=(
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --max-tokens-per-gpu 262144
-    --sft-wholepack
     --custom-megatron-before-train-step-hook-path relax.models.qwen3_5.recipe.before_step
 )
+
+# Wholepack controls scheduling independently of the model optimization hook.
+case "${QWEN35_WHOLEPACK:-1}" in
+    1) OPTIMIZATION_WHOLEPACK_ARGS=(--sft-wholepack) ;;
+    0) OPTIMIZATION_WHOLEPACK_ARGS=(--sft-packing-strategy binpack) ;;
+    *) echo "QWEN35_WHOLEPACK must be 0 or 1" >&2; exit 2 ;;
+esac
+
+PERF_ARGS+=("${OPTIMIZATION_WHOLEPACK_ARGS[@]}")
 
 MONITOR_ARGS=(
     --use-clearml
@@ -328,81 +319,9 @@ PYRENDER
     exit 0
 fi
 
-# Refuse concurrent training, preserving the parent job and existing cluster.
-python3 -B - <<'PY_JOBS'
-import json
-import os
-import urllib.request
-with urllib.request.urlopen(os.environ["RAY_JOBS_ADDRESS"].rstrip("/") + "/api/jobs/", timeout=10) as response:
-    jobs = json.load(response)
-if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
-    raise RuntimeError("Unexpected Ray jobs API response")
-parent = os.environ["CPT_PARENT_SUBMISSION_ID"]
-active = [job.get("submission_id") for job in jobs if job.get("status") in ("RUNNING", "PENDING")
-          and not (parent and job.get("submission_id") == parent)
-          and job.get("entrypoint", "").strip() not in ("sleep inf", "sleep infinity")]
-if active:
-    raise RuntimeError(f"Cluster has active jobs; refusing submission: {active}")
-PY_JOBS
-GPU_COMPUTE_PIDS="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits)"
-if [[ -n "${GPU_COMPUTE_PIDS//[[:space:]]/}" ]]; then
-    echo "GPU compute processes remain; refusing submission: $GPU_COMPUTE_PIDS" >&2
-    exit 1
-fi
 RAY_ARGS=(job submit --address="$RAY_JOBS_ADDRESS" --submission-id="$SUBMISSION_ID"
     --runtime-env-json="$RUNTIME_ENV_JSON")
-# An outer Ray Job must stay alive and report the child's actual terminal status.
-if [[ -n "$RAY_NO_WAIT" || -n "$CPT_PARENT_SUBMISSION_ID" ]]; then RAY_ARGS+=(--no-wait); fi
+if [[ -n "$RAY_NO_WAIT" ]]; then RAY_ARGS+=(--no-wait); fi
 if [[ -n "${WORKING_DIR:-}" ]]; then RAY_ARGS+=(--working-dir "$WORKING_DIR"); fi
 mkdir -p "$SCRIPT_DIR/log"
-submit_result=0
-ray "${RAY_ARGS[@]}" -- "${TRAIN_ARGS[@]}" 2>&1 | tee "$SCRIPT_DIR/log/$TASK_NAME.log" || submit_result=$?
-if (( submit_result != 0 )); then
-    [[ -n "$CPT_PARENT_SUBMISSION_ID" ]] || exit "$submit_result"
-    echo "Submission acknowledgement failed ($submit_result); checking the fixed child ID before exiting" >&2
-fi
-
-if [[ -n "$CPT_PARENT_SUBMISSION_ID" ]]; then
-    echo "Training logs: ray job logs --address $RAY_JOBS_ADDRESS $SUBMISSION_ID --follow"
-    python3 -B - <<'PY_WAIT'
-import json
-import os
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-
-submission = os.environ["SUBMISSION_ID"]
-url = (os.environ["RAY_JOBS_ADDRESS"].rstrip("/") + "/api/jobs/"
-       + urllib.parse.quote(submission, safe=""))
-print(f"Waiting for training Job {submission}; parent={os.environ['CPT_PARENT_SUBMISSION_ID']}", flush=True)
-previous = None
-last_report = 0.0
-failures = 0
-while True:
-    try:
-        with urllib.request.urlopen(url, timeout=10) as response:
-            job = json.load(response)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
-        failures += 1
-        print(f"Training status unavailable ({failures}/60): {error}", flush=True)
-        if failures >= 60:
-            raise RuntimeError("Cannot determine training outcome; inspect the child Ray Job") from error
-        time.sleep(15)
-        continue
-    failures = 0
-    if job.get("submission_id") != submission:
-        raise RuntimeError("Unexpected Ray Job identity in status response")
-    status = job.get("status")
-    if status != previous or time.monotonic() - last_report >= 60:
-        print(f"Training Job {submission}: {status}", flush=True)
-        previous = status
-        last_report = time.monotonic()
-    if status in ("SUCCEEDED", "FAILED", "STOPPED"):
-        print(job.get("message") or "", flush=True)
-        raise SystemExit(0 if status == "SUCCEEDED" else 1)
-    if status not in ("PENDING", "RUNNING"):
-        raise RuntimeError(f"Unexpected Ray Job status: {status}")
-    time.sleep(15)
-PY_WAIT
-fi
+ray "${RAY_ARGS[@]}" -- "${TRAIN_ARGS[@]}" 2>&1 | tee "$SCRIPT_DIR/log/$TASK_NAME.log"

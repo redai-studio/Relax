@@ -35,7 +35,8 @@ def test_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped, async_mode
         ]
         param = shards[0].clone()
         param.tensor_model_parallel = True
-        param.partition_dim = 0
+        # Ascend can report non-row metadata for a GDN weight when TP=1.
+        param.partition_dim = -1 if tp == 1 and "self_attention" in name else 0
         param.partition_stride = 2 if "linear_fc1" in name else 1
         full_name = name.replace(".weight", ".to_wrap.weight") if wrapped else name
         inputs.append((SimpleNamespace(name=full_name), param))

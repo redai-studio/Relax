@@ -1057,6 +1057,50 @@ class VersionStore:
                     Path(temporary).unlink(missing_ok=True)
         return self.manifest(stream, version)
 
+    @contextmanager
+    def _publication_attempt(self) -> Iterator[None]:
+        # The caller holds the content-writer lock, so failed writes can be
+        # reclaimed without racing another publisher, fetch or reconstruction.
+        self._check_canonical_placement()
+        try:
+            yield
+        except Exception:
+            from relax.utils.logging_utils import get_logger
+
+            from .deadline import time_budget
+
+            try:
+                with time_budget(30, inherit=False), writer_lock(self.root / ".writer", timeout=30):
+                    manifests = [
+                        validate_manifest(load_json(path.read_bytes()), self.max_weight_bytes)
+                        for directory in ("versions", "full")
+                        for path in (self.root / directory).glob("*/*.json")
+                    ]
+                    live_objects = {c["object"] for m in manifests for t in m["tensors"] for c in t["chunks"]}
+                    live_blocks = {c["output"] for m in manifests for t in m["tensors"] for c in t["chunks"]}
+                    self._sweep_unpublished()
+                    for directory, retained in (
+                        (self.root / "objects", live_objects),
+                        (self.canonical_directory / "blocks", live_blocks),
+                    ):
+                        for path in directory.glob("*"):
+                            check_deadline("failed publication cleanup")
+                            if (
+                                path.is_file()
+                                and re.fullmatch(r"[0-9a-f]{64}", path.name)
+                                and path.name not in retained
+                            ):
+                                path.unlink()
+                        if directory.exists():
+                            sync_directory(directory)
+                    self.refresh_budget()
+            except Exception:
+                get_logger(__name__).warning(
+                    "Failed publication cleanup is incomplete; retry collect() after storage recovers",
+                    exc_info=True,
+                )
+            raise
+
     def publish(
         self,
         stream: str,
@@ -1087,8 +1131,7 @@ class VersionStore:
         # HF configurations may contain integer dictionary keys and tuples.
         # Bind the wire representation, which is also used after a restart.
         model_config = load_json(canonical(model_config))
-        with writer_lock(self.root / ".content-writer", timeout=120):
-            self._check_canonical_placement()
+        with writer_lock(self.root / ".content-writer", timeout=120), self._publication_attempt():
             self.refresh_budget()
             base = None
             if version and not full_only and version % anchor_interval:
@@ -1250,7 +1293,7 @@ class VersionStore:
 
     def ensure_full(self, stream: str, version: int) -> dict:
         """Build a same-target FULL package using retained canonical bytes."""
-        with writer_lock(self.root / ".content-writer", timeout=120):
+        with writer_lock(self.root / ".content-writer", timeout=120), self._publication_attempt():
             self.refresh_budget()
             original = self.manifest(stream, version, prefer_full=True)
             if original["kind"] == "full":

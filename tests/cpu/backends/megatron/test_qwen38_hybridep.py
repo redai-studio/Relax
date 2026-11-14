@@ -3,9 +3,6 @@
 """CPU checks of image-built HybridEP opt-in and collective preflight."""
 
 import importlib.util
-import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -15,7 +12,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[4]
-SCRIPT = ROOT / "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh"
 
 
 def load(name, path):
@@ -44,6 +40,7 @@ def preflight(monkeypatch, tmp_path):
     dist.get_world_size = lambda group: 32 if group is world else 8
     dist.get_rank = lambda group: 0
     dist.get_global_rank = lambda group, rank: rank
+    dist.get_process_group_ranks = lambda group: list(range(dist.get_world_size(group)))
 
     def gather(output, value, group):
         assert group is expert
@@ -81,17 +78,21 @@ def preflight(monkeypatch, tmp_path):
     return module, mpu, dist, detect, expert, logger
 
 
-@pytest.mark.parametrize("tp", [2, 8])
-def test_valid_group_uses_real_peer_detection(preflight, tp):
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+@pytest.mark.parametrize("pp", [2, 4])
+@pytest.mark.parametrize("world", [32, 64])
+def test_valid_group_uses_real_peer_detection(preflight, tp, pp, world):
     module, mpu, dist, detect, expert, logger = preflight
     mpu.get_tensor_model_parallel_world_size = lambda: tp
+    mpu.get_pipeline_model_parallel_world_size = lambda: pp
+    dist.get_world_size = lambda group: world if group is dist.group.WORLD else 8
     module.validate_hybridep_worker_group()
     detect.assert_called_once_with(expert)
     assert dist.all_gather_object.call_count == 2
     logger.info.assert_called_once()
 
 
-@pytest.mark.parametrize("tp", [2, 8])
+@pytest.mark.parametrize("tp", [2, 4, 8])
 def test_cross_node_group_is_rejected_before_peer_detection(preflight, tp):
     module, mpu, dist, detect, _, _ = preflight
     mpu.get_tensor_model_parallel_world_size = lambda: tp
@@ -153,54 +154,48 @@ def test_35b_ep4_requires_exact_layout_and_four_accessible_peers(preflight, fail
         logger.info.assert_called_once()
 
 
-def test_alignment_script_dry_run_preserves_baseline_and_worker_environment():
-    env = dict(
-        os.environ,
-        DRY_RUN="1",
-        MODEL_DIR="/model",
-        DATA_DIR="/data",
-        SAVE_DIR="/save",
-        MEGATRON="/image/megatron",
-        RELAX_HYBRID_EP_COMMIT="abc123def",
-        LD_LIBRARY_PATH="/image/nvshmem/lib",
-    )
-    result = subprocess.run(
-        ["bash", str(SCRIPT), "--num-rollout", "50"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    assert result.returncode == 0, result.stderr
-    config = json.loads(result.stdout)
-    argv = config["argv"]
+@pytest.mark.parametrize("value", ["", "0", "8"])
+def test_forced_peer_override_presence_is_rejected(preflight, monkeypatch, value):
+    module, _, _, detect, _, _ = preflight
+    monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", value)
+    with pytest.raises(RuntimeError, match="Forced HybridEP"):
+        module.validate_hybridep_worker_group()
+    detect.assert_not_called()
 
-    def value(flag):
-        return argv[len(argv) - 1 - argv[::-1].index(flag) + 1]
 
-    assert value("--num-rollout") == "50"
-    assert value("--tensor-model-parallel-size") == "2"
-    assert value("--pipeline-model-parallel-layout") == "Et*12|t*14|t*14|t*8mL"
-    assert value("--data-pad-size-multiplier") == "16384"
-    assert value("--lr-decay-iters") == "2023"
-    assert value("--eval-interval") == "100"
-    assert json.loads(value("--multimodal-keys")) == {"image": "images"}
-    assert value("--image-max-token-num") == "128"
-    assert "--sft-image-preprocess-on-rank" in argv
-    assert "--sft-packing-strategy" not in argv
-    assert value("--save") == value("--load")
-    assert value("--save-interval") == "50"
-    assert value("--max-actor-ckpt-to-keep") == "2"
-    actor = json.loads(value("--train-env-vars"))
-    driver = config["runtime_env"]["env_vars"]
-    for name, expected in {
-        "RELAX_HYBRID_EP_COMMIT": "abc123def",
-        "LD_LIBRARY_PATH": "/image/nvshmem/lib",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "32",
-        "RELAX_QWEN38_QSA_COMMUNITY_BACKEND": "mixed",
-        "RELAX_QWEN38_ROUTER_SORTED_REPLAY": "1",
-        "RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG": "1",
-        "RELAX_SFT_FUSED_LINEAR_CE": "1",
-        "RELAX_SFT_MTP_ACCEPTANCE_METRICS": "0",
-    }.items():
-        assert actor[name] == driver[name] == expected
+@pytest.mark.parametrize("failure", ["duplicate", "wrong_member", "size", "remote_import", "inconsistent_detection"])
+def test_actual_collective_members_are_validated(preflight, failure):
+    module, _, dist, detect, _, _ = preflight
+    if failure == "size":
+        dist.get_world_size = lambda group: 32 if group is dist.group.WORLD else 7
+
+    def gather(output, value, group):
+        if isinstance(value, dict):
+            output[:] = [dict(value, rank=i) for i in range(len(output))]
+            if failure == "duplicate":
+                output[-1]["rank"] = 0
+            elif failure == "wrong_member":
+                output[-1]["rank"] = 15
+            elif failure == "remote_import":
+                output[-1]["errors"] = ["Installed module validation failed"]
+        else:
+            output[:] = [value] * len(output)
+            if failure == "inconsistent_detection":
+                output[-1] = 4
+
+    dist.all_gather_object.side_effect = gather
+    with pytest.raises(RuntimeError):
+        module.validate_hybridep_worker_group()
+    if failure != "inconsistent_detection":
+        detect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "name,value", [("expert_tensor", 2), ("expert_model", 16), ("tensor_model", 3), ("pipeline_model", 0)]
+)
+def test_unsupported_or_nondivisible_geometry_fails(preflight, name, value):
+    module, mpu, _, detect, _, _ = preflight
+    setattr(mpu, "get_" + name + "_parallel_world_size", lambda: value)
+    with pytest.raises(RuntimeError, match="Unsupported topology"):
+        module.validate_hybridep_worker_group()
+    detect.assert_not_called()

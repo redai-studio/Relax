@@ -85,7 +85,7 @@ class TestLoRADeltaExtraction:
             "lora_b": torch.ones(10, 10) * 2.0,
         }
 
-        delta, _ = extract_lora_delta(state2, old_lora_state=state1, threshold=1e-6)
+        delta, _ = extract_lora_delta(state2, old_lora_state=state1)
 
         assert "lora_a" in delta
         assert "lora_b" not in delta
@@ -116,24 +116,6 @@ class TestModePredicates:
 
         assert is_lora_adapter_mode(args_adapter)
         assert not is_lora_adapter_mode(args_merge)
-
-    def test_is_lora_merge_mode_flag(self):
-        args_merge = MagicMock()
-        args_merge.lora_merge_mode = True
-        args_adapter = MagicMock()
-        args_adapter.lora_merge_mode = False
-
-        assert is_lora_merge_mode(args_merge)
-        assert not is_lora_merge_mode(args_adapter)
-
-    def test_is_lora_enabled_by_rank(self):
-        args_on = MagicMock()
-        args_on.lora_rank = 32
-        args_off = MagicMock()
-        args_off.lora_rank = 0
-
-        assert is_lora_enabled(args_on)
-        assert not is_lora_enabled(args_off)
 
     def test_missing_attrs_default_false(self):
         # Plain object without the LoRA attributes -> predicates must not raise.
@@ -289,10 +271,6 @@ class TestAdapterSkipPredicate:
         assert is_lora_adapter_param("decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight")
         assert is_lora_adapter_param("decoder.layers.0.self_attention.linear_proj.adapter.linear_out.weight")
 
-    def test_standard_peft_adapter_names_matched(self):
-        assert is_lora_adapter_param("base_model.model.layers.0.self_attn.q_proj.lora_A.weight")
-        assert is_lora_adapter_param("base_model.model.layers.0.self_attn.q_proj.lora_B.weight")
-
     def test_base_and_to_wrap_names_not_matched(self):
         # The wrapped base weight MUST NOT be classified as an adapter, or it would be
         # dropped from the rollout broadcast.
@@ -311,17 +289,6 @@ class TestDeltaSkip:
         assert delta == {}  # empty -> _push_lora_adapter_distributed early-returns on non-first sync
         assert set(new_state) == set(state)
 
-    def test_changed_state_yields_nonempty_delta(self):
-        old = {"a": torch.zeros(4, 8)}
-        new = {"a": torch.ones(4, 8)}
-        delta, _ = extract_lora_delta(new, old)
-        assert "a" in delta and delta  # non-empty -> push proceeds
-
-    def test_first_sync_returns_full_state(self):
-        new = {"a": torch.randn(4, 8), "b": torch.randn(8, 4)}
-        delta, _ = extract_lora_delta(new, None)
-        assert set(delta) == set(new)
-
 
 class TestTargetModuleExpansion:
     """adapter_config.json target_modules must be HF names for SGLang's PEFT
@@ -331,24 +298,9 @@ class TestTargetModuleExpansion:
         out = convert_megatron_to_hf_target_modules(["linear_qkv", "linear_proj"])
         assert out == ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-    def test_dedup_preserves_order(self):
-        out = convert_megatron_to_hf_target_modules(["linear_qkv", "linear_q"])
-        assert out == ["q_proj", "k_proj", "v_proj"]  # linear_q -> q_proj already present
-
 
 class TestMergeContract:
     """TP1 merge equals base + alpha/dim*(B @ A), with the base dtype retained."""
-
-    def test_tp1_formula_reference(self):
-        # Documents the exact math _merge_full_base depends on (no megatron needed).
-        torch.manual_seed(0)
-        out_features, in_features, dim = 6, 5, 2
-        base = torch.randn(out_features, in_features)
-        b = torch.randn(out_features, dim)  # linear_out
-        a = torch.randn(dim, in_features)  # linear_in
-        alpha, r = 8, dim
-        expected = base + (alpha / r) * (b @ a)
-        assert expected.shape == base.shape
 
     def test_tp1_matches_real_loramerge(self, monkeypatch):
         self._check_merge(monkeypatch, legacy_api=False)

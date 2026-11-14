@@ -186,6 +186,28 @@ def test_get_batch_by_indices_preserves_requested_physical_order(tmp_path):
     assert [sample.source_idx for sample in samples] == [4, 1, 5]
 
 
+def test_yaml_sft_source_ids_survive_reordering_and_tq(tmp_path):
+    for name in ("a", "b"):
+        _write_jsonl(
+            tmp_path / f"{name}.jsonl",
+            [{"messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": name}]}],
+        )
+    mixture = tmp_path / "mixture.yaml"
+    mixture.write_text("datasets:\n  a: a.jsonl\n  b: b.jsonl\n")
+    dataset = SFTStreamingDataset(
+        str(mixture), tokenizer=_FakeTokenizer(), prompt_key="messages", prefetch_max_cached=0
+    )
+    samples = dataset.get_batch_by_indices([1, 0, 1])
+    assert [(s.source_idx, s.dataset_id) for s in samples] == [(1, 1), (0, 0), (1, 1)]
+    td = dict_to_tensordict(pack_samples_for_tq(samples), batch_size=len(samples))
+    assert td["dataset_ids"].dtype == torch.long
+    assert td["dataset_ids"].tolist() == [1, 0, 1]
+    assert pack_samples_for_tq(samples[:1])["dataset_ids"] == [1]
+    samples[0].dataset_id = None
+    with pytest.raises(ValueError, match="every sample"):
+        pack_samples_for_tq(samples)
+
+
 class _FakeTokenizer:
     """Minimal tokenizer with generation-mask chat-template support."""
 
@@ -1713,8 +1735,42 @@ def test_html_media_tags_remain_literal_training_text(tmp_path, multimodal_keys)
         ds.stop()
 
 
+@pytest.mark.parametrize("with_tool_call", [False, True])
+def test_opt_in_preserves_assistant_literal_media_tags(tmp_path, monkeypatch, with_tool_call):
+    text = "Use <image> in the example."
+    path = tmp_path / "literal.jsonl"
+    messages = [{"role": "user", "content": "Show the tag."}]
+    tool_call = {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": {}}}
+    if with_tool_call:
+        messages.extend(
+            [
+                {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "content": "Example found.", "tool_call_id": "call-1"},
+            ]
+        )
+    messages.append({"role": "assistant", "content": text})
+    _write_jsonl(path, [{"messages": messages}])
+    ds = SFTStreamingDataset(
+        path=str(path), prompt_key="messages", multimodal_keys={"image": "images"}, prefetch_max_cached=0
+    )
+    try:
+        monkeypatch.delenv("RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT", raising=False)
+        with pytest.raises(SFTMultimodalContractError, match="contract mismatch"):
+            ds.get_canonical_sample(0)
+        monkeypatch.setenv("RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT", "1")
+        sample = ds.get_canonical_sample(0)
+        assert sample.messages[-1].content == text
+        assert sample.images is None
+        if with_tool_call:
+            assert sample.messages[1].content == ""
+            assert sample.messages[1].tool_calls == [tool_call]
+    finally:
+        ds.stop()
+
+
 @pytest.mark.parametrize("media_name", ["image", "audio", "video"])
-def test_configured_literal_media_still_requires_payload(tmp_path, media_name):
+def test_configured_literal_media_still_requires_payload(tmp_path, media_name, monkeypatch):
+    monkeypatch.setenv("RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT", "1")
     path = tmp_path / "missing.jsonl"
     _write_jsonl(
         path,
@@ -1825,11 +1881,15 @@ def test_normalize_tool_calls_rejects_non_object_arguments(arguments):
 
 def test_tool_normalization_rejects_malformed_json_and_preserves_empty_values():
     assert streaming_module._normalize_tools(None) is None
+    assert streaming_module._normalize_tools("") is None
+    assert streaming_module._normalize_tools(" \n\t") is None
     assert streaming_module._normalize_tools([]) == []
     assert streaming_module._normalize_tool_calls(None) is None
     assert streaming_module._normalize_tool_calls([]) == []
     with pytest.raises(json.JSONDecodeError):
         streaming_module._normalize_tools(["{invalid"])
+    with pytest.raises(json.JSONDecodeError):
+        streaming_module._normalize_tools("{invalid")
     with pytest.raises(json.JSONDecodeError):
         streaming_module._normalize_tool_calls([{"function": {"arguments": "{invalid"}}])
 

@@ -119,3 +119,91 @@ class VersionStorageTests(unittest.TestCase):
             header = json.loads(f.read(length))
             self.assertEqual(header["w"]["data_offsets"], [0, 128])
             self.assertEqual(f.read(), bytes(range(128)))
+
+
+def test_manifest_failure_can_retry_with_the_original_budget(tmp_path, monkeypatch):
+    import pytest
+
+    from relax.distributed.weight_sync import store as module
+
+    source = tmp_path / "input"
+    source.write_bytes(bytes(range(64)))
+    reference = VersionStore(tmp_path / "reference", disk_budget=10_000, max_weight_bytes=64)
+    reference.publish("s", 0, {"w": ("U8", [64], source)}, full_only=True)
+    required = sum(path.stat().st_size for path in reference.root.rglob("*") if path.is_file())
+    store = VersionStore(tmp_path / "store", disk_budget=required, max_weight_bytes=64)
+    atomic_write = module.atomic_write
+
+    def fail_manifest(path, data):
+        if path == store.manifest_path("s", 0):
+            raise OSError("injected manifest failure")
+        atomic_write(path, data)
+
+    monkeypatch.setattr(module, "atomic_write", fail_manifest)
+    with pytest.raises(OSError, match="injected manifest failure"):
+        store.publish("s", 0, {"w": ("U8", [64], source)}, full_only=True)
+    monkeypatch.setattr(module, "atomic_write", atomic_write)
+    result = store.publish("s", 0, {"w": ("U8", [64], source)}, full_only=True)
+    assert store.materialize("s", 0)["root"] == result["root"]
+    assert b"".join(store.iter_tensor(result, result["tensors"][0])) == source.read_bytes()
+
+
+def test_failed_publication_preserves_committed_versions_and_full_repairs(tmp_path, monkeypatch):
+    import pytest
+
+    from relax.distributed.weight_sync import store as module
+
+    for blocks in (False, True):
+        store = VersionStore(
+            tmp_path / str(blocks), disk_budget=100_000, max_weight_bytes=128, canonical_blocks=blocks
+        )
+        source = tmp_path / "input"
+        source.write_bytes(bytes(range(128)))
+        tensors = {"w": ("U8", [128], source)}
+        first = store.publish("s", 0, tensors)
+        source.write_bytes(b"x" + bytes(range(1, 128)))
+        second = store.publish("s", 1, tensors)
+        repaired = store.ensure_full("s", 1)
+        store.pin("s", 0, "reader")
+        atomic_write = module.atomic_write
+
+        def fail_manifest(path, data):
+            if path == store.manifest_path("s", 2):
+                raise OSError("injected manifest failure")
+            atomic_write(path, data)
+
+        monkeypatch.setattr(module, "atomic_write", fail_manifest)
+        source.write_bytes(b"z" * 128)
+        with pytest.raises(OSError, match="injected manifest failure"):
+            store.publish("s", 2, tensors)
+        monkeypatch.setattr(module, "atomic_write", atomic_write)
+        assert store.materialize("s", 0) == first
+        assert store.manifest("s", 1) == second
+        assert store.manifest("s", 1, prefer_full=True) == repaired
+        assert b"".join(store.iter_tensor(first, first["tensors"][0])) == bytes(range(128))
+        assert b"".join(store.iter_tensor(second, second["tensors"][0])) == b"x" + bytes(range(1, 128))
+        result = store.publish("s", 2, tensors)
+        assert b"".join(store.iter_tensor(result, result["tensors"][0])) == b"z" * 128
+
+
+def test_post_rename_error_preserves_visible_publication(tmp_path, monkeypatch):
+    import pytest
+
+    from relax.distributed.weight_sync import store as module
+
+    store = VersionStore(tmp_path / "store", disk_budget=10_000, max_weight_bytes=64)
+    source = tmp_path / "input"
+    source.write_bytes(bytes(range(64)))
+    atomic_write = module.atomic_write
+
+    def fail_after_manifest(path, data):
+        atomic_write(path, data)
+        if path == store.manifest_path("s", 0):
+            raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(module, "atomic_write", fail_after_manifest)
+    with pytest.raises(OSError, match="injected directory fsync failure"):
+        store.publish("s", 0, {"w": ("U8", [64], source)})
+    monkeypatch.setattr(module, "atomic_write", atomic_write)
+    assert store.materialize("s", 0)["version"] == 0
+    assert store.publish("s", 0, {"w": ("U8", [64], source)}) == store.manifest("s", 0)

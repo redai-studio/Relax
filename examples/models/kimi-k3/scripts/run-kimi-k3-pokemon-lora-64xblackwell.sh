@@ -47,7 +47,7 @@ export NVSHMEM_REMOTE_TRANSPORT="${NVSHMEM_REMOTE_TRANSPORT:-libfabric}"
 export TRAIN_ENV_VARS="{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\",\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"RELAX_KIMI_K3_EXPERT_SPLIT\":\"${RELAX_KIMI_K3_EXPERT_SPLIT:-1}\",\"RELAX_KIMI_K3_FUSED_SITU\":\"${RELAX_KIMI_K3_FUSED_SITU:-1}\",\"RELAX_KIMI_K3_FUSED_ATTN_RES\":\"${RELAX_KIMI_K3_FUSED_ATTN_RES:-1}\"}"
 
 OPTIMIZATION_ARGS=(
-    --attention-backend fused
+    --attention-backend "${ATTENTION_BACKEND:-fused}"
     --image-max-token-num 1024
     --data-pad-size-multiplier 4096
     --sft-max-in-flight-steps 4

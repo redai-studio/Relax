@@ -231,6 +231,7 @@ COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
 COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
+COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -242,10 +243,11 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch fully-reshardable-checkpoint-padding.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
@@ -281,18 +283,32 @@ RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2
         --patch /tmp/fla042.patch --manifest /etc/relax-fla042-runtime.json && \
     rm /tmp/fla042.patch
 COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
+COPY docker/patch/sglang/v0.5.17-transformers5-compat.patch /tmp/sglang-transformers5.patch
 COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
 COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
 # Apply after all pip installs; this cache specialization requires Frontend 1.27.0 / CuTe DSL 4.6.0.
 COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
 # Resolve late so existing compiled layers remain cached. NIXL packages both
 # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
+# Pin Qwen3.8 HF support without replacing the CUDA/Torch/TE/DeepEP stack.
 RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r /opt/relax/cu12-runtime-requirements.txt && \
     python /opt/relax/repair_te_wheel_metadata.py /opt/relax/te-wheel-tag.patch && \
     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
+    patch --batch --forward --fuzz=0 -d /sgl-workspace/sglang -p1 < /tmp/sglang-transformers5.patch && \
+    pip install --no-cache-dir setuptools-scm==9.2.2 && \
+    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
+        pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
+    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
+    rm /tmp/sglang-transformers5.patch && \
+    python -c 'from importlib.metadata import version; \
+        assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
+        assert version("sglang") == "0.5.17"; \
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
+        assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
+        import sglang.srt.configs.qwen3_asr' && \
     python /opt/relax/validate_hybridep_install.py && \
     CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
         assert m.version("nvidia-cudnn-frontend") == "1.27.0", "DSA SM90 patch requires cuDNN Frontend 1.27.0"; \

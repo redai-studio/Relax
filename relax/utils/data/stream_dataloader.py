@@ -329,8 +329,7 @@ class MicroBatchListIterator:
         return out, meta
 
     def get_buffer(self) -> List[Tuple[Dict[str, Any], Any]]:
-        """Return the full mb list — used by actor for end-of-rollout
-        logging."""
+        """Return cached batches, including VPP alignment padding."""
         return self.mbs
 
     def step(self, partition_id: str) -> None:  # noqa: ARG002
@@ -578,10 +577,11 @@ def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
             return tensor.to(dtype=dtype).contiguous()
         return torch.empty(shape, dtype=dtype)
 
-    # --- Step 1: CP broadcast (CP=0 -> other CP ranks of TP=0/PP=0) ---
-    # Only the global source's CP group has real data on its rank-0; the rest
-    # broadcast a placeholder that the TP / PP stages below overwrite.
-    if not cp_trivial:
+    # --- Step 1: CP broadcast among TP=0 peers ---
+    # TP is constant within a CP group. Other TP ranks receive real data in
+    # step 2, so their CP placeholders are unnecessary. Keep every PP stage:
+    # with broadcast_pp=False, each stage has its own (TP=0, CP=0) source.
+    if not cp_trivial and mpu.get_tensor_model_parallel_rank() == 0:
         tensor = _bcast(tensor, is_src, mpu.get_context_parallel_group())
 
     # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
@@ -1087,7 +1087,13 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Keep scalar metadata as Python values across the TensorDict boundary,
             # including NestedTensor values reconstructed by TransferQueue.
-            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
+            if k == "agentic_group_ids":
+                from relax.utils.agentic_obs.records import decode_group_ids
+
+                new_rollout_data[k] = decode_group_ids(v)
+            elif (
+                "lengths" in k or "reward" in k or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
+            ):
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path

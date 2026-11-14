@@ -54,8 +54,7 @@ def test_current_tracker_is_reduced_once_and_loss_keeps_microbatch_average(
     end = source.index("        # per train step log.", start)
     scope = {
         "torch": torch,
-        "num_microbatches": [2],
-        "step_id": 0,
+        "step_num_microbatches": 2,
         "mpu": types.SimpleNamespace(get_data_parallel_group=lambda **kwargs: "dp"),
         "args": types.SimpleNamespace(
             enable_mtp_training=True, ci_test=False, calculate_per_token_loss=True, mtp_loss_scaling_factor=0.1

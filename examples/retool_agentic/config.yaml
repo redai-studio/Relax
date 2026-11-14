@@ -1,0 +1,4 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+max_turns: 16
+policy_vocab_size: 151665
+enable_partial_rollout: false

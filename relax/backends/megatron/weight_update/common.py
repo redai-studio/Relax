@@ -38,6 +38,9 @@ def gdn_component_sizes(config, tp_size: int, name: str) -> tuple[int, ...] | No
 
 def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
     if split_sizes is not None:
+        # At TP=1 the gathered tensor already has every GDN component in order.
+        if len(partitions) == 1:
+            return partitions[0].contiguous()
         assert partition_dim == 0, "GDN components must be sharded along rows"
         components = [part.split(split_sizes, dim=0) for part in partitions]
         return torch.cat([parts[index] for index in range(len(split_sizes)) for parts in components], dim=0)

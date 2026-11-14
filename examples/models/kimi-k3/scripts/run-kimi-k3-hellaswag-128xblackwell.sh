@@ -177,13 +177,13 @@ METRICS_ARGS=(
 MISC_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
-    --attention-backend flash
+    --attention-backend "${ATTENTION_BACKEND:-fused}"
     # rng.seed: 1234 in the recipe.
     --seed "${SEED:-1234}"
 )
 
 TRAIN_ARGS=(
-    --train-env-vars "{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\"}"
+    --train-env-vars "{\"FLA_TILELANG\":\"${FLA_TILELANG:-0}\",\"RELAX_KIMI_K3_FUSED_SITU\":\"${RELAX_KIMI_K3_FUSED_SITU:-1}\",\"RELAX_KIMI_K3_FUSED_ATTN_RES\":\"${RELAX_KIMI_K3_FUSED_ATTN_RES:-1}\"}"
     --resource '{"sft": [1, 0], "actor": [1, 128]}'
     --sft-max-in-flight-steps 1
     --num-data-storage-units 16
@@ -207,6 +207,8 @@ fi
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${RELAX_ROOT}/scripts/entrypoint/ray-job.sh"
 fi
+# Prepare recipe defaults even when the outer entrypoint ran before this script.
+source "${RELAX_ROOT}/examples/models/kimi-k3/tools/configure_kernel_cache.sh" "$@"
 
 mkdir -p "${RELAX_ROOT}/log"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}" \

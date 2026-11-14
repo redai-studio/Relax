@@ -458,7 +458,7 @@ def test_health_manager_observer_binding_keeps_health_creation_available(monkeyp
     manager = health_system.HealthManager(fault_events=observer)
     assert manager.status is not None
     generation = {"valid": 0, "invalid": True}.get(binding)
-    assert created == [((), {"fault_generation": generation})]
+    assert created == [((), {"fault_generation": generation, "fault_seed": None})]
     assert bind.call_count == int(binding != "disabled")
     assert manager.status._fault_observation_error is (binding == "invalid")
     if binding == "raises":
@@ -669,7 +669,7 @@ def test_real_checker_runtime_fatal_records_only_discovery_upgrade_and_terminati
         ("role", "PRIVATE_ROLE", "role must be a supported service role"),
         ("source_generation", -1, "source_generation must be an unsigned 64-bit int"),
         ("reason", "PRIVATE_REASON", "reason must be a fault_detected reason code"),
-        ("fatal_event_id", new_id(), "a nonfatal fault has no fatal_event_id"),
+        ("fatal_event_id", "1" * 32, "a nonfatal fault has no fatal_event_id"),
     ],
 )
 def test_fault_context_error_names_constraint_without_value(field, value, constraint):
