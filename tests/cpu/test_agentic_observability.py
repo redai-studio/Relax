@@ -907,7 +907,7 @@ def test_shard_export_preserves_rollout_identity(tmp_path, rollout_module, rollo
     )
 
     async def scenario():
-        transport = shard._build_session_export_transport(
+        transport = await shard._build_session_export_transport(
             session=session, reward=1.0, metadata={}, output_records=(), finalize_events={}
         )
         await shard._trajectory_recorder.aclose()
@@ -1351,7 +1351,7 @@ def test_multiple_exports_publish_only_after_all_payloads_succeed(
 
     async def scenario():
         with pytest.raises((RuntimeError, service._NonFinalizableExportError)):
-            shard._build_session_export_transport(
+            await shard._build_session_export_transport(
                 session=session,
                 reward=1.0,
                 metadata={},
@@ -2112,7 +2112,7 @@ def test_all_six_streams_join_from_prompt_to_committed_update(tmp_path, rollout_
         forest.session_id = session.session_id
         session.forest = forest
         inventory.record_group("g", [Sample(prompt="hi", group_index=2, index=5)], ["s"])
-        transport = shard._build_session_export_transport(
+        transport = await shard._build_session_export_transport(
             session=session,
             reward={"score": 0.8, "judge": 0.9},
             metadata={},
