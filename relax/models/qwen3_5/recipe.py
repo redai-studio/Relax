@@ -30,10 +30,13 @@ def _check_args(args: Any) -> None:
     assert padding > 0 and args.max_tokens_per_gpu > 0 and args.max_tokens_per_gpu % padding == 0
     assert args.tensor_model_parallel_size == 4
     assert args.hidden_size == 2048 and args.num_experts == 256
-    assert args.bf16 and args.use_distributed_optimizer and args.sequence_parallel
+    assert args.bf16 and args.sequence_parallel
     assert not getattr(args, "use_megatron_fsdp", False)
-    assert getattr(args, "use_precision_aware_optimizer", False)
-    assert getattr(args, "optimizer_cpu_offload", False)
+    if args.optimizer == "muon":
+        assert args.use_distributed_optimizer or getattr(args, "use_layer_wise_distributed_optimizer", False)
+        assert not args.use_precision_aware_optimizer and not args.optimizer_cpu_offload
+    else:
+        assert args.use_distributed_optimizer and args.use_precision_aware_optimizer and args.optimizer_cpu_offload
     assert args.optimizer_offload_fraction == 0.0
 
 
@@ -97,7 +100,12 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     assert not any(chunk.ddp_config.check_for_nan_in_grad for chunk in model)
     args._selective_loss_head = args._qwen_fused_head = True
     prime_expert_communicators(args, model)
-    install_norm_guard(args, optimizer)
+    if args.optimizer == "muon":
+        # Muon owns its clipping. Relax installed the synchronized finite check during optimizer setup.
+        if not getattr(optimizer, "_relax_nonfinite_guard_installed", False):
+            raise RuntimeError("Muon requires the Relax synchronized pre-update finite check")
+    else:
+        install_norm_guard(args, optimizer)
     _ACTIVE = True
     install_ce_launches()
     import importlib.util
