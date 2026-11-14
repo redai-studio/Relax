@@ -364,6 +364,11 @@ class Controller:
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
+        flops_workload = None
+        if getattr(self.config, "balance_by_flops", False):
+            from relax.utils.data.flops_balancing import load_flops_workload
+
+            flops_workload = load_flops_workload(self.config)
         from relax.engine.sft.runtime import is_i2i_sft
 
         required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
@@ -386,7 +391,11 @@ class Controller:
         elif algo_key == "sft":
             from relax.utils.data.wholepack import WholepackSampler, config_contract, enabled
 
-            if enabled(self.config):
+            if flops_workload is not None:
+                from relax.utils.data.flops_sampler import FlopsBalancedSampler
+
+                sampler = FlopsBalancedSampler(dp_size=dp_size, workload=flops_workload)
+            elif enabled(self.config):
                 capacity, pad_size = config_contract(self.config)
                 sampler = WholepackSampler(
                     n_samples_per_prompt=self.config.n_samples_per_prompt,
@@ -401,9 +410,10 @@ class Controller:
                     n_samples_per_prompt=self.config.n_samples_per_prompt,
                     dp_size=dp_size,
                 )
-            logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
+            logger.info(f"Using {type(sampler).__name__} with dp_size={dp_size}")
         elif getattr(self.config, "balance_data", False):
-            sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
+            placement_kwargs = {} if flops_workload is None else {"workload": flops_workload}
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced", **placement_kwargs)
             logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")
         else:
             sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")

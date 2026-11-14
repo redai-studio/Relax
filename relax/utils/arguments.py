@@ -1603,6 +1603,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             parser.add_argument(
+                "--balance-by-flops",
+                action="store_true",
+                default=False,
+                help=(
+                    "Pack global microbatches by model-estimated FLOPs, then assign whole microbatches to DP ranks. "
+                    "Retains token limits; requires dynamic batching and enables --balance-data. "
+                    "Supports text SFT and synchronous RL."
+                ),
+            )
+            parser.add_argument(
                 "--use-dynamic-batch-size",
                 action="store_true",
                 default=False,
@@ -4790,6 +4800,10 @@ def slime_validate_args(args):
     # Custom YAML is applied late and may override any checkpoint option, so
     # validate this mutually exclusive mode only after those overrides settle.
     validate_save_lora_only_args(args)
+
+    from relax.utils.data.flops_balancing import validate_flops_balancing
+
+    validate_flops_balancing(args)
 
     if args.eval_max_context_len is None:
         logger.info(

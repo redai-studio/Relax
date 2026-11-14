@@ -16,6 +16,65 @@ This is a dominant-matmul model estimate, not a measurement of executed CUDA ins
 
 For K3 LoRA or custom `--freeze-params-name-list` / `--only-train-params-name-list`, FLOPs/MFU are omitted with a one-time warning because HF configuration alone cannot determine adapter and parameter trainability. Timing and token throughput remain available. Other model estimators retain their existing conventions.
 
+## FLOPs-aware scheduling
+
+`--balance-by-flops` estimates each sample's training cost from the model
+configuration and sequence length. It packs the complete optimizer batch before
+assigning microbatches to data-parallel ranks. Ranks may receive different numbers
+of samples while executing compatible microbatch counts. This is most useful
+when each rank receives few samples and lengths vary widely; large batches can
+already be well balanced by the existing length-based scheduler.
+
+Enable it alongside dynamic batching in a Megatron training script:
+
+```bash
+--balance-data
+--use-dynamic-batch-size
+--max-tokens-per-gpu 24576
+--balance-by-flops
+```
+
+The current implementation supports text-only Qwen2/Qwen3 dense and MoE models,
+and Qwen3.5 dense and MoE text workloads. It uses the existing model FLOPs
+estimators; Qwen3.5's quadratic attention cost counts its full-attention layers.
+The estimate excludes communication, optimizer work and hardware-specific kernel
+behavior, so estimated balance does not guarantee a throughput improvement.
+
+Use a training image containing the repository's TransferQueue
+`assignment_transform` patch. The sampler records a global plan in batch metadata,
+and training ranks validate and execute that plan. Restoring a cached plan requires
+unchanged DP and packing geometry. Disabling the flag retains the existing
+length-balanced and dynamic-packing paths; evaluation and separate forward-only
+budgets use those paths as well.
+
+Microbatch token capacity is checked after applicable packing alignment. An
+indivisible sample longer than the capacity remains a singleton under the existing
+oversize behavior; the budget is not an absolute memory bound for that case.
+DP/VPP alignment may introduce dummy microbatches, which copy a local real pack
+with zero contribution to loss. These copies still execute model work.
+Bounded sample moves and swaps refine capacity-safe fallback packs, then whole
+packs can swap between ranks without changing the aligned microbatch count.
+Refinement scores and debug logs include the estimated cost of local dummy
+copies. Tighter budgets and multiple microbatches per rank can reduce or reverse
+the benefit.
+
+Use polling TransferQueue with SFT (`n_samples_per_prompt=1`) or synchronous RL.
+The flag rejects fully asynchronous/hybrid training, wholepack, async prepacking,
+non-balanced SFT packing, debug-train-only, preference objectives, multimodal
+inputs and MTP. It also rejects microbatch-dependent M2PO/direct OPD losses and
+MoE auxiliary/z losses, Sinkhorn routing, expert capacity limits and dynamic
+expert bias, because regrouping can change those objectives or routing decisions.
+TP/PP/CP/EP combinations must also satisfy the model and Megatron constraints;
+for example, Qwen3.5 GDN CP requires zigzag packing and per-token normalization.
+
+To compare throughput, keep the checkpoint, effective batch, sample order,
+precision and parallel layout fixed. The baseline should retain `--balance-data`
+and dynamic batching. Use `perf/step_resp_token_per_s` for supervised-token
+throughput, and compare numerical behavior separately from timed runs.
+See [SFT Training](./sft-training.md)
+for data preparation and the profiling instructions below for communication and
+kernel analysis.
+
 ## Profiling
 
 Before tuning, identify the bottleneck. Relax provides three complementary profiling tools that cover **inference engine**, **training backend**, and **GPU memory**. All trace files are saved under `traces/<tb_experiment_name>/` by default, separated by subdirectory:

@@ -16,6 +16,50 @@ K3 分别计算 KDA 投影、卷积和状态递推；MLA 低秩/输出门投影�
 
 K3 使用 LoRA 或自定义 `--freeze-params-name-list` / `--only-train-params-name-list` 时，HF 配置无法独立确定 adapter 与参数的实际可训练状态，因此暂不报告 FLOPs/MFU，并打印一次说明；耗时和 token 吞吐继续保留。其他模型的估算口径不变。
 
+## FLOPs 感知调度
+
+`--balance-by-flops` 根据模型配置和样本长度估算训练计算量，先对完整的优化器
+batch 构造微批，再分配给数据并行 rank。各 rank 可以接收不同数量的样本，同时
+保持兼容的微批执行数量。每个 rank 的样本较少且长度差异较大时，更可能获得收益；
+大 batch 往往已被现有的长度调度充分均衡。
+
+在 Megatron 训练脚本中与动态打包一起启用：
+
+```bash
+--balance-data
+--use-dynamic-batch-size
+--max-tokens-per-gpu 24576
+--balance-by-flops
+```
+
+当前实现支持 Qwen2/Qwen3 Dense、MoE，以及 Qwen3.5 Dense、MoE 的纯文本训练。
+计算量沿用现有模型 FLOPs 估算器；Qwen3.5 的注意力二次项只计算全注意力层。
+估算不包含通信、优化器和硬件相关的算子行为，因此计算量更均衡不保证吞吐更高。
+
+训练镜像需要包含仓库提供的 TransferQueue `assignment_transform` 补丁。采样器
+将全局计划写入 batch 元数据，训练 rank 校验后按计划执行。恢复缓存计划时，DP
+和打包几何配置必须保持一致。关闭开关后使用原有的长度均衡和动态打包路径；评估
+以及使用独立预算的纯前向过程也沿用这些路径。
+
+微批容量检查考虑适用的对齐规则。按照既有的超长样本策略，无法拆分且长度超过
+容量的单条样本仍会单独成包，因此该情况下预算并不是绝对显存上限。DP/VPP 对齐
+可能加入 dummy 微批：复制本 rank 的真实微批，对 loss 的贡献为零，但仍执行模型计算。
+调度器在容量合法的回退结果上进行有界的样本移动和交换，再在 rank 之间交换完整微批，
+保持对齐后的微批数量不变。精修目标和调试日志会计入本 rank dummy 副本的估算计算量。
+预算较紧、每个 rank 需要执行多个微批时，收益可能缩小，也可能出现退化。
+
+该功能适用于轮询 TransferQueue 下的 SFT（`n_samples_per_prompt=1`）和同步 RL。
+它会拒绝 fully async/hybrid、wholepack、异步预打包、非 balanced SFT 打包、
+debug-train-only、偏好目标、多模态输入和 MTP。也不支持依赖微批构成的 M2PO、
+直接 OPD loss，以及 MoE auxiliary/z loss、Sinkhorn 路由、expert capacity 和动态
+expert bias，因为重新组批可能改变这些目标或路由决策。TP/PP/CP/EP 组合还须满足
+模型与 Megatron 的约束，例如 Qwen3.5 GDN 的 CP 要求 zigzag 打包和按 token 归一化。
+
+对比吞吐时，固定 checkpoint、有效 batch、样本顺序、精度和并行配置；基线保留
+`--balance-data` 和动态打包。监督 token 吞吐使用 `perf/step_resp_token_per_s`，
+数值验证与计时分别运行。数据准备见 [SFT 训练](./sft-training.md)，
+通信与算子分析可使用下文的 profiling 工具。
+
 ## 性能分析
 
 调优前先定位瓶颈。Relax 内置三套互补的 profiling 工具，覆盖 **推理引擎**、**训练后端** 和 **GPU 内存** 三个维度。所有 trace 文件默认保存在 `traces/<tb_experiment_name>/` 目录下，按子目录区分：
