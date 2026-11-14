@@ -356,6 +356,13 @@ async def _post_generation(
         if attempt and state.abort_event.is_set():
             raise GenerationAborted
         try:
+            manager = getattr(args, "_inference_manager_handle", None)
+            if manager is not None:
+                from relax.engine.inference.executor import InferenceRequestExecutor
+                from relax.utils import http_utils
+
+                executor = InferenceRequestExecutor("rollout", manager, http_utils._http_client)
+                return await executor.generate_json(payload, headers)
             return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):

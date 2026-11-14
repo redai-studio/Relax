@@ -370,6 +370,7 @@ class EngineGroup:
     eviction_requested: bool = False
     require_router_registration: bool = False  # Verify managed PD registration before publication
     engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
+    pending_shutdown_indices: set[int] = dataclasses.field(default_factory=set)
 
     @property
     def nodes_per_engine(self):
@@ -586,13 +587,16 @@ class EngineGroup:
         This removes the engines from the group and unregisters them from
         router and DCS.
         """
+        self.pending_shutdown_indices.update(indices)
+        failures = []
         for i in indices:
             engine = self.all_engines[i]
             if engine is not None:
                 try:
                     ray.get(engine.shutdown.remote(), timeout=10)
                 except Exception as e:
-                    logger.warning(f"Failed to shutdown engine {i}: {e}")
+                    failures.append((i, e))
+                    continue
                 try:
                     ray.get(engine.unregister_dcs.remote(), timeout=10)
                 except Exception as e:
@@ -606,7 +610,11 @@ class EngineGroup:
                 except Exception as e:
                     logger.warning(f"Failed to kill engine {i}: {e}")
             self.all_engines[i] = None
+            self.pending_shutdown_indices.discard(i)
             logger.info(f"Shutdown engine at index {i}")
+
+        if failures:
+            raise RuntimeError(f"Engine resource release is unconfirmed: {failures}") from failures[0][1]
 
 
 @dataclasses.dataclass
@@ -699,6 +707,10 @@ class RolloutServer:
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
         groups = list(self.engine_groups)
+        for group in groups:
+            if group.pending_shutdown_indices:
+                self.num_new_engines = 0
+                group.shutdown_engines(set(group.pending_shutdown_indices))
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
 
         # Managed PD retains static IDs outside the engine actor. Confirm old
@@ -818,10 +830,22 @@ class RolloutServer:
                 # replacement batch, including pending multi-node peers, so
                 # the next recovery cannot mistake those handles for ready
                 # engines. Keep the new generation's records for route cleanup.
-                for group, dead_indices in zip(groups, dead_per_group, strict=True):
-                    if group.pg is not None and dead_indices:
-                        group.shutdown_engines(set(dead_indices))
                 self.num_new_engines = 0
+                pending_cleanup = [
+                    (group, set(indices))
+                    for group, indices in zip(groups, dead_per_group, strict=True)
+                    if group.pg is not None and indices
+                ]
+                for group, indices in pending_cleanup:
+                    group.pending_shutdown_indices.update(indices)
+                failures = []
+                for group, indices in pending_cleanup:
+                    try:
+                        group.shutdown_engines(indices)
+                    except Exception as exc:
+                        failures.append(exc)
+                if failures:
+                    raise RuntimeError(f"Recovery resource release is unconfirmed: {failures}") from failures[0]
                 raise
 
         release_handles = []
@@ -906,7 +930,7 @@ class RolloutManager(ReloadableMixin):
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, data_source=None):
+    def __init__(self, args, pg, data_source=None, *, inference_only: bool = False):
         self.pg = pg
         self.args = args
         self._engine_actor_states = _get_engine_actor_states()
@@ -916,25 +940,28 @@ class RolloutManager(ReloadableMixin):
 
         self.data_source = data_source
 
-        self.data_system_client = attach_tq_client(
-            self.args.tq_config,
-            role="rollout_worker",
-        )
-
-        logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
-        logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
-        self.generate_rollout = load_function(self.args.rollout_function_path)
-        self.eval_generate_rollout = load_function(self.args.eval_function_path)
-        self.custom_reward_post_process_func = None
-        if self.args.custom_reward_post_process_path is not None:
-            self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
-        self.custom_convert_samples_to_train_data_func = None
-        if self.args.custom_convert_samples_to_train_data_path is not None:
-            self.custom_convert_samples_to_train_data_func = load_function(
-                self.args.custom_convert_samples_to_train_data_path
+        self.data_system_client = None
+        if not inference_only:
+            self.data_system_client = attach_tq_client(
+                self.args.tq_config,
+                role="rollout_worker",
             )
 
-        if self.args.use_agentic_rollout:
+        if not inference_only:
+            logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
+            logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
+            self.generate_rollout = load_function(self.args.rollout_function_path)
+            self.eval_generate_rollout = load_function(self.args.eval_function_path)
+            self.custom_reward_post_process_func = None
+            if self.args.custom_reward_post_process_path is not None:
+                self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
+            self.custom_convert_samples_to_train_data_func = None
+            if self.args.custom_convert_samples_to_train_data_path is not None:
+                self.custom_convert_samples_to_train_data_func = load_function(
+                    self.args.custom_convert_samples_to_train_data_path
+                )
+
+        if self.args.use_agentic_rollout and not inference_only:
             from relax.agentic.rollout import init_agentic_resident_pipeline
 
             init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
@@ -978,7 +1005,8 @@ class RolloutManager(ReloadableMixin):
         # any code that imports the module the normal way.
         import sys as _sys
 
-        _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
+        if not inference_only:
+            _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
@@ -1076,9 +1104,6 @@ class RolloutManager(ReloadableMixin):
         (scheduler, detokenizer, etc.) are properly terminated when training
         completes, instead of being orphaned.
         """
-        if not self.servers:
-            return
-
         all_engines = []
         for srv in self.servers.values():
             for group in srv.engine_groups:
@@ -1086,6 +1111,7 @@ class RolloutManager(ReloadableMixin):
                     if engine is not None:
                         all_engines.append(engine)
 
+        all_engines.extend(getattr(self, "_unconfirmed_rollback_engines", []))
         if not all_engines:
             return
 
@@ -1094,12 +1120,13 @@ class RolloutManager(ReloadableMixin):
         # Step 1: Call shutdown() on each engine to kill child processes
         # (sglang::scheduler, sglang::detokenizer, etc.)
         shutdown_refs = []
+        failures = []
         for engine in all_engines:
             try:
                 ref = engine.shutdown.remote()
                 shutdown_refs.append((engine, ref))
             except Exception as e:
-                logger.warning(f"[Shutdown] Failed to call shutdown on engine: {e}")
+                failures.append(e)
 
         # Bound the whole batch so router cleanup can finish before the driver's
         # signal-exit watchdog, even when every engine is unresponsive.
@@ -1108,12 +1135,9 @@ class RolloutManager(ReloadableMixin):
             try:
                 ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
             except Exception as e:
-                logger.warning(f"[Shutdown] Engine shutdown timed out or failed: {e}")
-                # Force-kill the Ray actor as a fallback
-                try:
-                    ray.kill(engine)
-                except Exception:
-                    pass
+                failures.append(e)
+        if failures:
+            raise RuntimeError(f"Engine resource release is unconfirmed: {failures}")
 
         logger.info(f"[Shutdown] All {len(all_engines)} SGLang engine(s) shut down.")
 
@@ -1990,10 +2014,8 @@ class RolloutManager(ReloadableMixin):
                             logger.exception(f"[ScaleOut] Unexpected exception during parallel bring-up: {result}")
                             failed_replica_ids.append(f"replica_{replica_idx_for_result}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED))
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
-                            except Exception:
-                                pass
+                            # Cleanup may itself have failed. Keep the PG reserved
+                            # until the retained actors confirm process exit.
                             continue
                         idx, success, reason, engine_offset = result
                         if success:
@@ -3307,7 +3329,7 @@ class RolloutManager(ReloadableMixin):
         Steps:
         1. Unregister from DCS coordinator
         2. Graceful shutdown (unregisters from router + kills sglang process)
-        3. Force-kill Ray actor only if shutdown fails
+        3. Retain actors and propagate failure if process exit is unconfirmed
 
         Args:
             engines_or_group: List of engines or EngineGroup
@@ -3317,28 +3339,28 @@ class RolloutManager(ReloadableMixin):
         else:
             engines = engines_or_group
 
+        retained = getattr(self, "_unconfirmed_rollback_engines", None)
+        if retained is None:
+            retained = self._unconfirmed_rollback_engines = []
+        # Register the entire batch before any await, including cancellation.
+        engines = [engine for engine in engines if engine is not None]
         for engine in engines:
-            if engine is None:
-                continue
+            if engine not in retained:
+                retained.append(engine)
+        failures = []
+        for engine in engines:
             try:
-                # Unregister from DCS coordinator
                 await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
             except Exception as e:
                 logger.warning(f"Failed to unregister DCS for engine during rollback: {e}")
-            shutdown_ok = False
             try:
-                # Graceful shutdown (unregisters from router + kills sglang process)
                 await asyncio.wait_for(engine.shutdown.remote(), timeout=30)
-                shutdown_ok = True
             except Exception as e:
-                logger.warning(f"Failed to shutdown engine during rollback: {e}")
-            # Force-kill Ray actor only as a last resort (if shutdown failed or
-            # we need to ensure the actor is fully cleaned up).
-            if not shutdown_ok:
-                try:
-                    ray.kill(engine)
-                except Exception as e:
-                    logger.warning(f"Failed to kill engine actor during rollback: {e}")
+                failures.append(e)
+            else:
+                retained.remove(engine)
+        if failures:
+            raise RuntimeError(f"Rollback resource release is unconfirmed: {failures}") from failures[0]
 
     @ray.method(concurrency_group="scale_out")
     def get_scale_out_status(self, request_id: str) -> Optional[dict]:
@@ -4176,13 +4198,11 @@ class RolloutManager(ReloadableMixin):
             *[_shutdown(engine) for _, engine in live_actors],
             return_exceptions=True,
         )
-        for (i, engine), result in zip(live_actors, shutdown_results):
-            if isinstance(result, BaseException):
-                logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {result}")
-                try:
-                    ray.kill(engine)
-                except Exception as e:
-                    logger.warning(f"[ScaleIn] Failed to kill engine actor {engine_id}[{i}]: {e}")
+        failures = [
+            (i, result) for (i, _), result in zip(live_actors, shutdown_results) if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise RuntimeError(f"Engine {engine_id} resource release is unconfirmed: {failures}")
 
         with self._engine_lifecycle_lock:
             for i, _ in live_actors:

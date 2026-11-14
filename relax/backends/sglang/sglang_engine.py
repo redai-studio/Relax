@@ -1038,15 +1038,36 @@ class SGLangEngine(RayActor):
 
     def shutdown(self):
         if self.args.rollout_external:
+            if self.unregister_from_router(wait_for_removal=True, timeout=5.0) is False:
+                raise RuntimeError("External worker router removal is unconfirmed")
             return
 
-        logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
+        logger.info(f"Shutdown engine {getattr(self, 'server_host', None)}:{getattr(self, 'server_port', None)}...")
         try:
-            self.unregister_from_router(timeout=5.0)
+            # Address allocation can fail before init creates server attributes.
+            if hasattr(self, "server_host") and hasattr(self, "server_port"):
+                if self.unregister_from_router(timeout=5.0) is False:
+                    raise RuntimeError("Worker router removal is unconfirmed")
         finally:
             process = getattr(self, "process", None)
-            if process is not None:
-                kill_process_tree(process.pid)
+            if process is not None and not getattr(self, "_server_exit_confirmed", False):
+                import psutil
+
+                # Freeze each parent before enumerating children so no scheduler
+                # can fork an untracked descendant between enumeration and kill.
+                processes = []
+                pending = [psutil.Process(process.pid)]
+                while pending:
+                    current = pending.pop()
+                    current.suspend()
+                    processes.append(current)
+                    pending.extend(current.children())
+                for current in reversed(processes):
+                    current.kill()
+                _, alive = psutil.wait_procs(processes, timeout=5)
+                if alive:
+                    raise RuntimeError(f"SGLang process exit unconfirmed: {[proc.pid for proc in alive]}")
+                self._server_exit_confirmed = True
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-

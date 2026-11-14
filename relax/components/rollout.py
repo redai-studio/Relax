@@ -15,7 +15,9 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.components.inference_gateway import InferenceGateway
 from relax.distributed.coordination import PeerStepBarrier
+from relax.distributed.ray.inference_handle import ManagedRolloutHandle
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
@@ -342,6 +344,11 @@ class Rollout(Base):
         )
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env
+        )
+        self._inference_gateway = (
+            InferenceGateway("rollout", manager_handle=self.rollout_manager.inference_manager)
+            if isinstance(self.rollout_manager, ManagedRolloutHandle)
+            else None
         )
         self.step = 0
         self.data_source = data_source
@@ -821,7 +828,11 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(self, model_name: Optional[str] = None):
+    async def get_engines(self, model_name: Optional[str] = None, schema_version: Optional[int] = None):
+        if schema_version == 2 and getattr(self, "_inference_gateway", None) is not None:
+            return await self._inference_gateway.engines(schema_version=2)
+        if schema_version not in (None, 1):
+            raise HTTPException(status_code=400, detail="Unsupported discovery schema_version")
         result = await self.rollout_manager.get_engines_info.remote(model_name)
         return result
 
@@ -922,6 +933,8 @@ class Rollout(Base):
 
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request):
+        if getattr(self, "_inference_gateway", None) is not None:
+            return await self._inference_gateway.proxy(request, "v1/chat/completions")
         body = await request.body()
         try:
             payload = ChatCompletionRequest.model_validate_json(body)
@@ -934,6 +947,12 @@ class Rollout(Base):
         if payload.stream:
             return await self._stream_chat_completions(client, sglang_url, body, dict(request.headers))
         return await self._non_stream_chat_completions(client, sglang_url, body, dict(request.headers))
+
+    @app.post("/generate")
+    async def generate_request(self, request: Request):
+        if getattr(self, "_inference_gateway", None) is None:
+            raise HTTPException(status_code=404, detail="Managed generation is unavailable for this task")
+        return await self._inference_gateway.proxy(request, "generate")
 
     async def _non_stream_chat_completions(
         self,
