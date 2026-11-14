@@ -63,6 +63,12 @@ _FUSED_PAIR_FRAGMENTS = (
 )
 _PAIR_SENTINEL = "\x00"
 _QWEN4EXP_PLE_TABLE_SUFFIX = ".per_layer_embedding.ple_embedding.ngram_embedding.weight"
+_OWNER_LOCAL_EXPERT_PARAM = re.compile(
+    r"(?:.*\.)?decoder\.layers\.(?P<layer>\d+)\.mlp\.experts\.linear_fc(?P<fc>[12])\.weight(?P<expert>\d+)"
+)
+_CANONICAL_HF_EXPERT_PARAM = re.compile(
+    r"model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)\.weight"
+)
 
 
 def _fused_pair_key(name: str) -> str | None:
@@ -233,6 +239,137 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._packed_expert_sync = True
         self._direct_expert_layout = layout
         return True
+
+    def iter_owner_local_expert_tensors(
+        self, megatron_local_weights: Mapping[str, torch.Tensor], *, grouped: bool = False
+    ) -> Iterator[tuple[int, int, str, torch.Tensor]]:
+        """Yield canonical HF expert tensors converted by their Megatron owner.
+
+        This path is restricted to BF16, PP1, VPP1, ETP1 MoE parameters. It
+        performs no collectives: callers must complete the local-expert phase
+        and its all-rank error gate before entering the non-expert iterator.
+        Each item is ``(owner_global_rank, global_expert_id, hf_name,
+        tensor)``.
+        """
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+        etp_size = mpu.get_expert_tensor_parallel_world_size()
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        if pp_size != 1 or vpp_size not in (None, 1) or etp_size != 1 or ep_size <= 1:
+            raise ValueError(
+                "Owner-local expert export requires PP=1, VPP=1, ETP=1, and EP>1; "
+                f"got PP={pp_size}, VPP={vpp_size}, ETP={etp_size}, EP={ep_size}"
+            )
+        if (
+            self.quantization_config
+            or self.lora_merge_mode
+            or self.lora_adapter_mode
+            or any(info.dtype != torch.bfloat16 for bucket in self._expert_buckets for info in bucket)
+        ):
+            raise ValueError("Owner-local expert export supports only unquantized BF16 experts without LoRA")
+
+        rank = dist.get_rank(group=dist.group.WORLD)
+        device = device_utils.make_current_torch_device()
+        buckets = self._expert_buckets
+        if grouped:
+            from .expert_gather import bucket_expert_projections
+
+            buckets = bucket_expert_projections(
+                [info for bucket in buckets for info in bucket],
+                self.args.num_experts,
+                dist.get_process_group_ranks(mpu.get_expert_model_parallel_group()),
+            )
+        for bucket in buckets:
+            for info in bucket:
+                match = _OWNER_LOCAL_EXPERT_PARAM.fullmatch(info.name)
+                if match is None:
+                    raise ValueError(f"Unsupported owner-local Megatron expert parameter: {info.name}")
+                expert_id = int(match.group("expert"))
+                if not 0 <= expert_id < self.args.num_experts:
+                    raise ValueError(f"Global expert id {expert_id} is out of range in {info.name}")
+                if info.src_rank != rank:
+                    continue
+
+                vanilla_key = self._vanilla_key_map.get(info.name)
+                if vanilla_key is None or vanilla_key not in megatron_local_weights:
+                    raise ValueError(f"Owner rank {rank} has no local backup tensor for {info.name}")
+                source = megatron_local_weights[vanilla_key]
+                if source.dtype != torch.bfloat16 or tuple(source.shape) != tuple(info.shape):
+                    raise ValueError(
+                        f"Owner tensor metadata mismatch for {info.name}: "
+                        f"dtype={source.dtype}, shape={tuple(source.shape)}"
+                    )
+                converted = self._bridge_converter.convert(
+                    info.name, source.detach().to(device=device, non_blocking=_NON_BLOCKING)
+                )
+                expected_projections = {"gate_proj", "up_proj"} if match.group("fc") == "1" else {"down_proj"}
+                seen_projections: set[str] = set()
+                try:
+                    for hf_name, tensor in converted:
+                        hf_match = _CANONICAL_HF_EXPERT_PARAM.fullmatch(hf_name)
+                        if hf_match is None:
+                            raise ValueError(f"Bridge emitted a non-canonical HF expert tensor: {hf_name}")
+                        if int(hf_match.group("expert")) != expert_id or hf_match.group("layer") != match.group(
+                            "layer"
+                        ):
+                            raise ValueError(f"Bridge expert identity mismatch for {info.name}: emitted {hf_name}")
+                        projection = hf_match.group("projection")
+                        if projection not in expected_projections or projection in seen_projections:
+                            raise ValueError(f"Unexpected or duplicate expert projection for {info.name}: {hf_name}")
+                        if tensor.dtype != torch.bfloat16:
+                            raise ValueError(f"Bridge changed BF16 expert dtype for {hf_name}: {tensor.dtype}")
+                        seen_projections.add(projection)
+                        yield rank, expert_id, hf_name, tensor
+                        del tensor
+                finally:
+                    del source, converted
+                if seen_projections != expected_projections:
+                    raise ValueError(
+                        f"Bridge emitted projections {sorted(seen_projections)} for {info.name}; "
+                        f"expected {sorted(expected_projections)}"
+                    )
+
+    def iter_gated_nonexpert_tensors(self, megatron_local_weights, *, error_gate):
+        """PP1 nonexpert conversion with gates around local failure boundaries.
+
+        Local source/allocator failures precede TP collectives; conversion and
+        output-capture failures cannot leave a peer entering the next bucket.
+        This explicit path leaves the default iterator unchanged.
+        """
+        from .common import all_gather_params_gated
+
+        if mpu.get_pipeline_model_parallel_world_size() != 1 or self.lora_merge_mode or self.lora_adapter_mode:
+            raise ValueError("Gated nonexpert conversion requires PP1 without LoRA")
+        rank = dist.get_rank(group=dist.group.WORLD)
+        device = device_utils.make_current_torch_device()
+        for infos in self._non_expert_buckets:
+            error, params = None, None
+            try:
+                for info in infos:
+                    if info.src_rank != rank or info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                        raise ValueError("Gated Qwen3.5 nonexperts must have a local PP1 owner")
+                    source = megatron_local_weights[self._vanilla_key_map[info.name]]
+                    if source.dtype != info.dtype or tuple(source.shape) != tuple(info.shape):
+                        raise ValueError(f"Nonexpert source metadata changed: {info.name}")
+                params = _load_to_gpu(infos, megatron_local_weights, self._vanilla_key_map, device, rank)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            error_gate(error)
+            gathered = all_gather_params_gated(
+                list(zip(infos, params, strict=True)),
+                error_gate=error_gate,
+                gdn_split_sizes=self._gdn_split_sizes,
+            )
+            for info, param in zip(infos, gathered, strict=True):
+                error, converted = None, None
+                try:
+                    converted = self._bridge_converter.convert(info.name, param)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                error_gate(error)
+                yield from converted
+                del converted
+            del params, gathered
 
     def configure_expert_routing(
         self,

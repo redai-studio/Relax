@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import torch
@@ -1611,7 +1612,8 @@ def train_one_step(
 
     valid_step = True
     skipped_nonfinite_grad = False
-    if _is_global_zero_token_step(losses_reduced):
+    zero_token_step = _is_global_zero_token_step(losses_reduced)
+    if zero_token_step:
         # No effective loss tokens anywhere in the global batch. Gradients are
         # exactly zero (the loss is zero-connected), so skip both the parameter
         # and LR scheduler updates; momentum / weight decay must not move the
@@ -1678,6 +1680,34 @@ def train_one_step(
             opt_param_scheduler.step(increment=step_global_batch_size)
         else:
             grad_norm = float("nan")
+
+    if (
+        getattr(args, "disk_weight_sync_config", None)
+        or getattr(args, "memory_weight_sync_config", None)
+        or getattr(args, "_dws_optimizer_observer", False)
+    ):
+        optimizer_updated = bool(update_successful)
+        if getattr(args, "_dws_optimizer_observer", False):
+            args._dws_optimizer_result = dict(
+                rollout=rollout_id,
+                step=step_id,
+                updated=optimizer_updated,
+                zero_tokens=zero_token_step,
+                observed_host_monotonic_s=monotonic(),
+                scope="Host optimizer result after LR scheduling; before reduced loss metrics and actor preparation; no added GPU fence",
+            )
+        logger.info(
+            "%s sync optimizer result: rollout=%d step=%d updated=%s zero_tokens=%s",
+            "Disk"
+            if getattr(args, "disk_weight_sync_config", None)
+            else "Memory"
+            if getattr(args, "memory_weight_sync_config", None)
+            else "NCCL",
+            rollout_id,
+            step_id,
+            optimizer_updated,
+            zero_token_step,
+        )
 
     if critic_value_head_snapshot is not None:
         from relax.backends.megatron.ci_utils import assert_critic_value_head_updated

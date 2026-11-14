@@ -721,6 +721,11 @@ class SGLangEngine(RayActor):
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
             raise
+        counter = getattr(self, "_dws_http_metrics", None)
+        if counter is not None:
+            from task_delta_weight_sync.sync_metrics import record_http
+
+            record_http(counter, endpoint, response)
         return response.json()
 
     def health_generate(self, timeout: float = 5.0) -> bool:
@@ -778,6 +783,149 @@ class SGLangEngine(RayActor):
             "update_weight_version", {"new_version": weight_version, "abort_all_requests": False}
         )
 
+    def prepare_disk_checkpoint(self, config_path: str, published: dict, reference: str) -> dict:
+        from .disk_weight_sync import prepare
+
+        return prepare(config_path, published, reference)
+
+    def install_memory_update(self, descriptor: dict, member: str, timeout: float, host_budget_bytes: int) -> dict:
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+
+        started = time.monotonic()
+        deadline = started + timeout
+        request_s: dict[str, float] = {}
+
+        def request(endpoint: str, payload: dict) -> dict:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Memory worker installation deadline exceeded")
+            request_started = time.monotonic()
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            request_s[endpoint] = time.monotonic() - request_started
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed: {response}")
+            return response
+
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        control = json.dumps(
+            dict(descriptor=descriptor, member=member, timeout_s=timeout, host_budget_bytes=host_budget_bytes)
+        )
+        serialized = MultiprocessingSerializer.serialize([(control, torch.empty(0))], output_str=True)
+        request(
+            "update_weights_from_tensor",
+            dict(serialized_named_tensors=[serialized], load_format=MEMORY_LOADER, flush_cache=True),
+        )
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=descriptor["update"], abort_all_requests=False))
+        return dict(
+            success=True,
+            engine=self.rank,
+            node_id=ray.get_runtime_context().get_node_id(),
+            install_s=time.monotonic() - started,
+            update=descriptor["update"],
+            request_s=request_s,
+        )
+
+    def install_sharded_memory_update(self, controls: list[dict], timeout: float) -> dict:
+        """Install one complete fixed-owner group on both TP workers."""
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+        if len(controls) != 2 or [item.get("tp_rank") for item in controls] != [0, 1]:
+            raise ValueError("Owner-local memory updates require two ordered TP controls")
+        identities = {(item["stream"], item["version"], item["group_update"]) for item in controls}
+        if len(identities) != 1:
+            raise ValueError("Engine TP workers received different group updates")
+        deadline = time.monotonic() + timeout
+
+        def request(endpoint: str, payload: dict) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Sharded memory engine installation deadline exceeded")
+            response = self._make_request(endpoint, payload, timeout=remaining)
+            if not isinstance(response, dict) or response.get("success") is not True:
+                raise RuntimeError(f"SGLang {endpoint} failed: {response}")
+
+        if _sglang_has_weight_update_session():
+            request("begin_weight_update", {})
+        serialized = []
+        for control in controls:
+            encoded = json.dumps(control)
+            if len(encoded) > 65536:
+                raise ValueError("Sharded memory control exceeds its bound")
+            serialized.append(MultiprocessingSerializer.serialize([(encoded, torch.empty(0))], output_str=True))
+        payload = dict(serialized_named_tensors=serialized, load_format=SHARDED_MEMORY_LOADER, flush_cache=True)
+        control_json_bytes = len(json.dumps(payload).encode())
+        request("update_weights_from_tensor", payload)
+        if _sglang_has_weight_update_session():
+            request("end_weight_update", {})
+        request("update_weight_version", dict(new_version=controls[0]["group_update"], abort_all_requests=False))
+        return dict(
+            success=True,
+            engine=self.rank,
+            version=controls[0]["version"],
+            update=controls[0]["group_update"],
+            control_json_bytes=control_json_bytes,
+        )
+
+    def run_memory_audit(self, control: dict, timeout: float) -> dict:
+        """Run an explicitly paused, per-TP audit control and wait for all
+        workers."""
+        import torch
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        from task_delta_weight_sync.sharded_gpu_audit import AUDIT_LOADER
+
+        command = control.get("command")
+        measuring = command in {"measure_start", "measure_end"}
+        if control.get("paused") is not True and not measuring:
+            raise ValueError("Pause the engine group before GPU auditing")
+        collected = None
+        if measuring:
+            if command == "measure_start" and getattr(self, "_dws_http_metrics", None) is not None:
+                raise RuntimeError("Synchronization measurement already active")
+            if command == "measure_end":
+                collected = self._dws_http_metrics
+                del self._dws_http_metrics  # Exclude the observation RPC itself.
+            control = dict(control, command="allocator_reset" if command == "measure_start" else "allocator_metrics")
+        serialized = []
+        for tp in range(2):
+            item = dict(control, member=f"{ray.get_runtime_context().get_actor_id()}:tp:{tp}", tp_rank=tp)
+            serialized.append(
+                MultiprocessingSerializer.serialize([(json.dumps(item), torch.empty(0))], output_str=True)
+            )
+        result = self._make_request(
+            "update_weights_from_tensor",
+            dict(serialized_named_tensors=serialized, load_format=AUDIT_LOADER, flush_cache=False),
+            timeout=timeout,
+        )
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise RuntimeError(f"SGLang audit failed: {result}")
+        if measuring and command == "measure_start":
+            self._dws_http_metrics = {}  # Exclude setup and allocator reset RPCs.
+        return dict(success=True, engine=self.rank, command=command, http=collected)
+
+    def install_disk_checkpoint(self, target: dict, published: dict, timeout: float) -> dict:
+        from .disk_weight_sync import install
+
+        return install(self, target, published, timeout)
+
+    def disk_weight_generation_probe(self, timeout: float) -> dict:
+        result = self._make_request(
+            "generate", {"input_ids": [1], "sampling_params": {"max_new_tokens": 1, "temperature": 0}}, timeout=timeout
+        )
+        if not isinstance(result, dict) or not result.get("meta_info", {}).get("output_token_ids", result.get("text")):
+            if not isinstance(result, dict) or result.get("meta_info", {}).get("completion_tokens", 0) < 1:
+                raise RuntimeError(f"Disk weight generation probe failed: {result}")
+        return {"success": True}
+
     def get_expert_weight_sync_layout(self) -> dict:
         """Return resolved layout settings for opt-in colocated expert routing
         and direct BF16 loading."""
@@ -788,6 +936,11 @@ class SGLangEngine(RayActor):
         for _ in range(2):
             response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
             response.raise_for_status()
+            counter = getattr(self, "_dws_http_metrics", None)
+            if counter is not None:
+                from task_delta_weight_sync.sync_metrics import record_http
+
+                record_http(counter, "server_info", response)
             info = response.json()
             # /server_info can time out fetching scheduler state while still
             # returning HTTP 200. Retry once before rejecting an unknown auto layout.
@@ -1719,6 +1872,11 @@ class SGLangEngine(RayActor):
             f"http://{self.server_host}:{self.server_port}/pause_generation", json={}, timeout=timeout
         )
         response.raise_for_status()
+        counter = getattr(self, "_dws_http_metrics", None)
+        if counter is not None:
+            from task_delta_weight_sync.sync_metrics import record_http
+
+            record_http(counter, "pause_generation", response)
         return response
 
     def continue_generation(self, timeout: float | None = None):
@@ -1726,6 +1884,11 @@ class SGLangEngine(RayActor):
             f"http://{self.server_host}:{self.server_port}/continue_generation", json={}, timeout=timeout
         )
         response.raise_for_status()
+        counter = getattr(self, "_dws_http_metrics", None)
+        if counter is not None:
+            from task_delta_weight_sync.sync_metrics import record_http
+
+            record_http(counter, "continue_generation", response)
         return response
 
     def begin_weight_update(self):
@@ -2228,6 +2391,19 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
+        if getattr(args, "disk_weight_sync_config", None):
+            from relax.backends.sglang.disk_weight_dump import DUMP_LOADER
+
+            if DUMP_LOADER not in loaders:
+                loaders.append(DUMP_LOADER)
+        if getattr(args, "memory_weight_sync_config", None):
+            from relax.backends.sglang.disk_weight_dump import DUMP_LOADER
+            from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+            from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+            for loader in (MEMORY_LOADER, SHARDED_MEMORY_LOADER, DUMP_LOADER):
+                if loader not in loaders:
+                    loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders
 
     if (

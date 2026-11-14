@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import threading
 import time
 from argparse import Namespace
@@ -109,8 +110,19 @@ class Actor(Base):
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
         self._peer_barrier: Optional[PeerStepBarrier] = None
 
-    def set_rollout_manager(self, rollout_manager: Any) -> None:
+    async def set_rollout_manager(self, rollout_manager: Any) -> None:
         """Set the rollout manager and initialize weights."""
+        if getattr(self.config, "disk_weight_sync_config", None) or getattr(
+            self.config, "memory_weight_sync_config", None
+        ):
+            # Initial capture, delivery and checked installation can be slow.
+            # Keep Serve's user event loop available to its health probe, while
+            # still awaiting completion (and propagating installation errors).
+            await asyncio.to_thread(self._set_rollout_manager_blocking, rollout_manager)
+        else:
+            self._set_rollout_manager_blocking(rollout_manager)
+
+    def _set_rollout_manager_blocking(self, rollout_manager: Any) -> None:
         self.rollout_manager = rollout_manager
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
