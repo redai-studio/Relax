@@ -1095,7 +1095,7 @@ def get_data_from_transfer_queue(
                 "lengths" in k or "reward" in k or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
             ):
                 new_rollout_data[k] = _tensor_to_python_values(v)
-            elif k in MULTIMODAL_PAYLOAD_FIELDS:
+            elif k in MULTIMODAL_PAYLOAD_FIELDS or k == "weight_version_audit":
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
                 # list of tensordicts / dicts; some entries may be None for

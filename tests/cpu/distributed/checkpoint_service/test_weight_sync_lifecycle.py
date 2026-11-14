@@ -115,6 +115,61 @@ def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_
     assert events == [("/pause_generation", None), "flush", "adapter", ("/continue_generation", None)]
 
 
+@pytest.mark.parametrize("rank", [0, 2])
+@pytest.mark.parametrize(
+    "receivers", [({"A"}, {"A"}), ({"A"}, {"B"}), ({"A", "B"}, {"B"}), (set(), set()), ({None}, {None})]
+)
+def test_agentic_publication_requires_complete_receivers_before_resume(rollout_backend, monkeypatch, receivers, rank):
+    from ray import serve
+
+    from relax.agentic.weight_audit import PublicationLedger, consumption_snapshot
+
+    backend, events, _ = rollout_backend
+    backend.args.use_agentic_rollout = True
+    backend._is_pp_src_rank = rank == 0
+    backend.rollout_topology = {i: {"metadata": {"actor_id": actor_id}} for i, actor_id in enumerate(receivers[0])}
+    monkeypatch.setattr(device_direct.dist, "get_rank", lambda *a, **kw: rank)
+    monkeypatch.setattr(device_direct.dist, "get_world_size", lambda **kw: 3)
+    gathered = []
+
+    def gather(out, local, **kwargs):
+        gathered.append(local)
+        out[:] = [*receivers, None]
+
+    monkeypatch.setattr(device_direct.dist, "all_gather_object", gather)
+    ledger = PublicationLedger()
+    ledger.record("policy", 1, "0")
+    if rank == 0:
+        backend._agentic_publication = ("policy", 1, "0")
+
+    def publish(epoch, sequence, version):
+        events.append("publish")
+        ledger.record(epoch, sequence, version)
+        return Mock()
+
+    handle = Mock()
+    handle.record_publication.remote.side_effect = publish
+    monkeypatch.setattr(serve, "get_app_handle", lambda name: handle)
+    backend.update_weights_for_rollout(rollout_only=True)
+    valid = bool(receivers[0]) and None not in receivers[0] and receivers[0] == receivers[1]
+    if valid and rank == 0:
+        assert consumption_snapshot(backend)["sequence"] == ledger.sequence == 2
+        assert events.index("push") < events.index("publish") < events.index(("/continue_generation", None))
+    else:
+        assert ledger.sequence == 1
+        assert consumption_snapshot(backend) == {"audit_valid": False}
+    assert gathered == [receivers[0] if rank == 0 else None]
+    if not valid:
+        # A later healthy topology cannot make stale completion snapshots comparable again.
+        receivers = ({"A"}, {"A"})
+        backend.rollout_topology = {0: {"metadata": {"actor_id": "A"}}}
+        backend.update_weights_for_rollout(rollout_only=True)
+        assert ledger.sequence == 1
+        assert consumption_snapshot(backend) == {"audit_valid": False}
+        if rank == 0:
+            assert backend._agentic_publication == ("policy", 1, "0")
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("endpoint", ["/post_process_weights", "/continue_generation"])
 def test_receiver_control_failure_reaches_every_training_rank(rollout_backend, monkeypatch, rank, endpoint):

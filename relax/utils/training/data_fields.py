@@ -84,6 +84,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return fields
 
     fields = _base_rollout_fields(args)
+    if consumer == "actor" and getattr(args, "use_agentic_rollout", False):
+        fields.append("weight_version_audit")
     if getattr(args, "advantage_estimator", None) == "score_centering":
         fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
     if getattr(args, "use_rollout_indexer_replay", False):

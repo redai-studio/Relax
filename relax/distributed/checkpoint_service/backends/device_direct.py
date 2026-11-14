@@ -871,6 +871,8 @@ class DeviceDirectBackend(CommBackend):
                     "/post_process_weights",
                     {"restore_weights_before_load": False, "post_process_quantization": True},
                 )
+            if not push_failed:
+                self._record_agentic_publication()
             self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
             if push_failed:
@@ -897,6 +899,30 @@ class DeviceDirectBackend(CommBackend):
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
+
+    def _record_agentic_publication(self) -> None:
+        """Confirm every PP source installed the same policy before
+        auditing."""
+        if not getattr(self.args, "use_agentic_rollout", False) or self._lora_adapter_mode:
+            return
+        group = get_gloo_group()
+        recipients = None
+        if self._is_pp_src_rank:
+            recipients = {(info.get("metadata") or {}).get("actor_id") for info in self.rollout_topology.values()}
+        all_recipients = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(all_recipients, recipients, group=group)
+        sources = [ids for ids in all_recipients if ids is not None]
+        # A nonempty intersection is insufficient: another resumed engine may
+        # have only some PP stages but still return the same raw version tag.
+        if not sources or any(not ids or None in ids or ids != sources[0] for ids in sources):
+            self._agentic_audit_valid = False
+            if dist.get_rank(group=group) == 0:
+                logger.warning("Agentic publication audit invalid: PP receivers are missing or inconsistent")
+            return
+        if dist.get_rank(group=group) == 0 and getattr(self, "_agentic_audit_valid", True):
+            from relax.agentic.weight_audit import record_publication
+
+            record_publication(self)
 
     def _rollout_control_request(self, endpoint: str, payload: Optional[Dict] = None) -> None:
         """Await receiver lifecycle operations and share failures with every
