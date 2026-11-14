@@ -6,6 +6,20 @@ from __future__ import annotations
 from typing import Any
 
 
+def _validate_indexer_qat_replay(enabled: bool, use_rollout_indexer_replay: bool) -> None:
+    """Reject native indexer QAT combined with rollout indexer replay.
+
+    ``install_indexer_qat`` also guards on the model config, but that flag is
+    only set later by ``fill_indexer_replay``. Checking the launch argument here
+    makes the rejection independent of initialization order.
+    """
+    if enabled and use_rollout_indexer_replay:
+        raise ValueError(
+            "DeepSeek-V4 MXFP4 native indexer QAT (RELAX_DSV4_FP4_MODE=native with "
+            "RELAX_DSV4_FP4_INDEXER=1) cannot be combined with --use-rollout-indexer-replay"
+        )
+
+
 def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> Any:
     from megatron.training.global_vars import get_args
 
@@ -16,12 +30,14 @@ def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage
     from relax.utils.env import Envs
     from relax.utils.logging_utils import get_logger
 
+    args = get_args()
     mode = _fp4_mode()
     enabled = mode == "native" and Envs.RELAX_DSV4_FP4_INDEXER
+    _validate_indexer_qat_replay(enabled, getattr(args, "use_rollout_indexer_replay", False))
     scores = Envs.RELAX_DSV4_FP4_BF16_SCORES
     select_process_mode(enabled=enabled, bf16_scores=scores)
     model = routed_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-    fp8 = install_native_fp8_weights(model, hf_checkpoint=get_args().hf_checkpoint) if mode == "native" else ()
+    fp8 = install_native_fp8_weights(model, hf_checkpoint=args.hf_checkpoint) if mode == "native" else ()
     indexer = ()
     if enabled:
         indexer = install_indexer_qat(model, bf16_scores=scores)
