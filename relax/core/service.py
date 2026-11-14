@@ -16,6 +16,7 @@ from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
 )
+from relax.utils.device import get_visible_devices_env_var
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.fault_events.recovery import observe_recovery
 from relax.utils.logging_utils import get_logger
@@ -122,9 +123,18 @@ class Service:
         Args:
             pgs: Placement group tuple or None.
         """
+        deployment_env = self.runtime_env
+        if self.role == "advantages" and self.num_gpus == 0:
+            # A CPU advantage worker must not initialize a training GPU when
+            # torch.compile inspects the current accelerator stream.
+            deployment_env = dict(self.runtime_env or {})
+            env_vars = dict(deployment_env.get("env_vars") or {})
+            if visible_devices := get_visible_devices_env_var():
+                env_vars[visible_devices] = ""
+            deployment_env["env_vars"] = env_vars
         ray_actor_options = with_control_plane_affinity(
             self.config,
-            {"runtime_env": self.runtime_env},
+            {"runtime_env": deployment_env},
         )
         data_node_ip = os.environ.get("RELAX_SFT_DATA_NODE_IP", "").strip()
         if self.role == "sft" and data_node_ip:

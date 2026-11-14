@@ -23,6 +23,7 @@ from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
 from relax.utils.agentic_obs.run_hooks import RunRecorder  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
+from relax.utils.http_utils import get_serve_http_port  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
@@ -184,7 +185,7 @@ def main(args):
             logger.info("Ray initialized successfully")
             try:
                 serve.start(
-                    http_options={"host": "0.0.0.0", "port": "8000"},
+                    http_options={"host": "0.0.0.0", "port": get_serve_http_port()},
                     detached=True,
                 )
             except RuntimeError:

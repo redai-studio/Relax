@@ -1683,6 +1683,11 @@ def train_one_step(
         else:
             grad_norm = float("nan")
 
+    if getattr(args, "weight_version_config", None):
+        from relax.distributed.weight_sync.provenance import record_optimizer_step
+
+        record_optimizer_step(args, rollout_id, step_id, update_successful)
+
     if critic_value_head_snapshot is not None:
         from relax.backends.megatron.ci_utils import assert_critic_value_head_updated
 

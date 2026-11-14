@@ -404,20 +404,21 @@ def test_sender_never_replaces_unconfirmed_request_and_queue_stays_bounded(monke
 
 
 @pytest.mark.parametrize("failure", ["creation", "enqueue"])
-def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exception(monkeypatch, failure):
+async def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exception(monkeypatch, failure):
     import ast
+    import asyncio
 
     from relax.utils.fault_events import receipts
 
     ROOT = Path(__file__).resolve().parents[3]
     source = ast.parse((ROOT / "relax/components/actor.py").read_text())
     cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "Actor")
-    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "update_weights_fully_async")
-    ns = {}
+    fn = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "update_weights_fully_async")
+    ns = {"asyncio": asyncio}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), "Actor", "exec"), ns)
     calls = []
     owner = SimpleNamespace(actor_model=SimpleNamespace(update_weights_fully_async=lambda *a, **k: calls.append(k)))
-    ns[fn.name](owner)
+    await ns[fn.name](owner)
     assert calls == [{"rollout_only": False, "actor_fwd_only": False}]
     assert not hasattr(owner, "_fault_receipt_sender")
 
@@ -432,11 +433,11 @@ def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exc
     else:
         owner._fault_receipt_sender = SimpleNamespace(emit=broken_sender)
     token = {"run_id": new_id(), "recovery_id": new_id(), "recovery_generation": 1}
-    ns[fn.name](owner, recovery_token=token)
+    await ns[fn.name](owner, recovery_token=token)
     assert len(calls) == 2
     owner.actor_model.update_weights_fully_async = broken_worker
     with pytest.raises(ValueError, match="original worker error"):
-        ns[fn.name](owner, recovery_token=token)
+        await ns[fn.name](owner, recovery_token=token)
 
 
 @pytest.mark.parametrize("field,value", [("token", {}), ("operation", "unknown"), ("outcome", True)])

@@ -16,6 +16,8 @@ Deployment options:
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -88,6 +90,7 @@ class SendWeightMetaRequest(BaseModel):
     dtypes: list
     shapes: list
     group_name: str
+    update_id: str = ""
 
 
 class GroupRanksResponse(BaseModel):
@@ -97,6 +100,9 @@ class GroupRanksResponse(BaseModel):
     world_size: int
     train_pp_size: int
     pp_groups: dict
+    topology_id: str = ""
+    update_id: str = ""
+    includes_reference: bool = False
 
 
 # ============================================================================
@@ -177,6 +183,7 @@ class DCSCoordinator:
         )
 
         self.weight_meta_buffer = []
+        self.weight_updates = {}
         self.recv_index_cache = 0
         self.target_world_size = 0
         self.recv_count = 0
@@ -373,81 +380,83 @@ class DCSCoordinator:
         return {"global_rank": global_rank}
 
     @app.get("/get_model_update_group_ranks", response_model=GroupRanksResponse)
-    async def get_model_update_group_ranks(self, role, rank, need_update_ref):
-        """Get model update communication group ranks."""
-        train_node = self.topology_manager.get_role_nodes("actor")
-        train_pp_size = train_node.get(0).metadata.get("pp_size", 1)
-        actor_fwd_node = self.topology_manager.get_role_nodes("actor_fwd")
-        ref_node = self.topology_manager.get_role_nodes("reference")
-        ref_world_size = len(ref_node)
-        actor_fwd_world_size = len(actor_fwd_node)
-
-        target_world_size = (
-            ref_world_size + actor_fwd_world_size if need_update_ref == "true" else actor_fwd_world_size
-        )
-        self.target_world_size = target_world_size
-        rank = int(rank)
+    async def get_model_update_group_ranks(
+        self, role, rank, need_update_ref, rollout_id: int = 0, occurrence: int = 0
+    ):
+        train_nodes = self.topology_manager.get_role_nodes("actor")
+        receivers = [
+            node
+            for target_role in (("actor_fwd", "reference") if need_update_ref == "true" else ("actor_fwd",))
+            for _, node in sorted(self.topology_manager.get_role_nodes(target_role).items())
+        ]
+        members = [node.model_dump() for _, node in sorted(train_nodes.items())] + [n.model_dump() for n in receivers]
+        topology_id = hashlib.sha256(json.dumps(members, sort_keys=True).encode()).hexdigest()[:24]
+        update_id = f"{topology_id}:{rollout_id}:{occurrence}"
+        expected = {node.node_id for node in receivers}
+        self.weight_updates.setdefault(update_id, {"expected": expected, "finished": set(), "metadata": []})
+        node_id = f"{role}_{int(rank)}"
         if role == "actor":
             global_rank = 0
-        elif role == "actor_fwd":
-            global_rank = 1 + rank
-        elif role == "reference":
-            global_rank = 1 + actor_fwd_world_size + rank
-
-        train_node.get(0).metadata.get("master_address")
+        elif node_id in expected:
+            global_rank = 1 + [node.node_id for node in receivers].index(node_id)
+        else:
+            raise HTTPException(409, "Role is outside this update's receiver set")
+        includes_reference = any(node.role_name == "reference" for node in receivers)
         pp_groups = {}
-        for rank, role in train_node.items():
-            metadata = role.metadata
+        for _, node in sorted(train_nodes.items()):
+            metadata = node.metadata
             if metadata.get("is_pp_src_rank"):
-                group_name = f"update_actor_pp_{metadata.get('pp_rank')}"
-                init_method = f"tcp://{_wrap_ipv6(metadata.get('master_address'))}:{metadata.get('master_port')}"
-                pp_groups[group_name] = init_method
-
+                port = metadata.get("reference_master_port") if includes_reference else metadata.get("master_port")
+                port = port or metadata.get("master_port")
+                name = f"update_actor_pp_{metadata['pp_rank']}_{topology_id}"
+                pp_groups[name] = f"tcp://{_wrap_ipv6(metadata['master_address'])}:{port}"
         return GroupRanksResponse(
             global_rank=global_rank,
-            world_size=1 + target_world_size,
-            train_pp_size=train_pp_size,
+            world_size=1 + len(receivers),
+            train_pp_size=train_nodes[0].metadata.get("pp_size", 1),
             pp_groups=pp_groups,
+            topology_id=topology_id,
+            update_id=update_id,
+            includes_reference=includes_reference,
         )
 
     @app.get("/recv_weight_meta")
-    async def recv_weight_meta(self, index: int, wait_timeout_s: float = 0.0):
-        """Receive weight metadata from the given index.
-
-        Args:
-            index: Start index in the internal weight metadata buffer.
-            wait_timeout_s: Optional long-poll timeout in seconds. If > 0 and no
-                new metadata is available, this endpoint waits up to the timeout
-                for new entries before returning.
-        """
-        if wait_timeout_s <= 0:
-            return self.weight_meta_buffer[index:]
-
+    async def recv_weight_meta(self, index: int, wait_timeout_s: float = 0.0, update_id: str = ""):
         deadline = time.monotonic() + wait_timeout_s
-        # Lightweight long-poll loop; event-driven sync can be added later if needed.
-        while time.monotonic() < deadline:
-            data = self.weight_meta_buffer[index:]
-            if data:
+        while True:
+            buffer = (
+                self.weight_updates.get(update_id, {}).get("metadata", []) if update_id else self.weight_meta_buffer
+            )
+            data = buffer[index:]
+            if data or time.monotonic() >= deadline:
                 return data
             await asyncio.sleep(0.01)
 
-        return self.weight_meta_buffer[index:]
-
     @app.get("/clear_weight_meta")
-    async def clear_weight_meta(self):
-        """clear_weight_meta."""
-        self.weight_meta_buffer.clear()
+    async def clear_weight_meta(self, update_id: str = "", receiver: str = ""):
+        if not update_id:
+            self.weight_meta_buffer.clear()
+            return
+        update = self.weight_updates.get(update_id)
+        if update is None:
+            return
+        if receiver not in update["expected"]:
+            raise HTTPException(409, "Unknown receiver for this update")
+        update["finished"].add(receiver)
+        if update["finished"] == update["expected"]:
+            del self.weight_updates[update_id]
 
     @app.post("/send_weight_meta", response_model=Response)
     async def send_weight_meta(self, request: SendWeightMetaRequest):
-        """send_weight_meta."""
         with self._lock:
-            self.weight_meta_buffer.append(request)
-
-        return Response(
-            status="success",
-            message="send_weight_meta",
-        )
+            if request.update_id:
+                update = self.weight_updates.get(request.update_id)
+                if update is None:
+                    raise HTTPException(409, "Unknown or completed update")
+                update["metadata"].append(request)
+            else:
+                self.weight_meta_buffer.append(request)
+        return Response(status="success", message="send_weight_meta")
 
     @app.get("/health")
     async def health_check(self):
