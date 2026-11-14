@@ -3252,7 +3252,13 @@ class MegatronTrainRayActor(TrainRayActor):
             calls = [self.rollout_manager.onload_kv.remote]
             if self.genrm_manager and not getattr(self.args, "defer_reward_to_post_process", False):
                 calls.extend(manager.onload.remote for manager in self.genrm_manager)
-            run_rank0_rpc_calls(calls, get_gloo_group())
+            # Teachers share the remaining Actor GPUs. Restore them only after
+            # all Actor weights and update buffers have been released above.
+            run_rank0_rpc_calls(
+                calls,
+                get_gloo_group(),
+                append_handles=lambda handles: append_managed_opd_teacher_onload_handle(handles, self),
+            )
         elif self.args.offload_rollout:
             self._onload_rollout_kv()
         if retain_actor_weights:
