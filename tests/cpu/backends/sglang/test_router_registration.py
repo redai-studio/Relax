@@ -793,3 +793,25 @@ def test_shutdown_requires_process_exit(monkeypatch, sglang_engine_module, alive
             assert engine._server_exit_confirmed
     finally:
         engine.process = None
+
+
+def test_shutdown_before_address_allocation_is_safe(sglang_engine_module):
+    engine = sglang_engine_module.SGLangEngine.__new__(sglang_engine_module.SGLangEngine)
+    engine.args = SimpleNamespace(rollout_external=False)
+    engine.shutdown()
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_external_shutdown_requires_router_removal(monkeypatch, sglang_engine_module, removed):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = True
+    unregister = Mock(return_value=removed)
+    monkeypatch.setattr(engine, "unregister_from_router", unregister)
+    if removed:
+        engine.shutdown()
+    else:
+        with pytest.raises(RuntimeError, match="removal is unconfirmed"):
+            engine.shutdown()
+    unregister.assert_called_once_with(wait_for_removal=True, timeout=5.0)

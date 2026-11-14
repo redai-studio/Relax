@@ -397,3 +397,75 @@ def test_unknown_release_preserves_slot_and_placement(_patch_ray, monkeypatch, o
     assert manager.all_engines == [engine]
     assert manager._engine_placements == placements
     assert engine not in _patch_ray.killed
+
+
+@pytest.mark.parametrize("failure", ["address", "init"])
+def test_recovery_init_and_cleanup_failure_never_marks_slot_ready(_patch_ray, monkeypatch, failure):
+    import relax.distributed.ray.multi_engine_manager as mem
+    from relax.distributed.ray.genrm import GenRMManager
+
+    manager = _FakeManager(num_slots=2)
+    manager.all_engines[0].dead_methods = frozenset({"release_memory_occupation"})
+    manager.offload()
+    original_get = mem.ray.get
+    original_allocate = manager._allocate_engine_addr_and_ports
+
+    def fail_get(ref, timeout=None):
+        if isinstance(ref, list) and failure == "init":
+            raise RuntimeError("init failed")
+        if isinstance(ref, tuple) and ref[0] is manager.all_engines[0] and ref[1] == "shutdown":
+            raise TimeoutError("cleanup unknown")
+        return original_get(ref, timeout=timeout)
+
+    if failure == "address":
+
+        def fail_address(**kwargs):
+            raise RuntimeError("address failed")
+
+        monkeypatch.setattr(manager, "_allocate_engine_addr_and_ports", fail_address)
+    monkeypatch.setattr(mem.ray, "get", fail_get)
+    with pytest.raises(RuntimeError, match="cleanup is unconfirmed"):
+        manager.onload()
+    retained = manager.all_engines[0]
+    assert retained is not None
+    assert not manager.is_onloaded()
+    assert manager.engines[0] is None
+    # Even a stale cached address cannot make the unfinished slot routable.
+    manager._engine_addr_and_ports[0] = {"host": "stale", "port": 123}
+    implementation = (
+        GenRMManager.__ray_metadata__.modified_class if hasattr(GenRMManager, "__ray_metadata__") else GenRMManager
+    )
+    addresses = implementation.get_engine_hosts_ports(manager)
+    assert ("stale", 123) not in addresses
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        manager.onload()
+    assert manager.all_engines[0] is retained
+    assert not manager.is_onloaded()
+
+    monkeypatch.setattr(mem.ray, "get", original_get)
+    monkeypatch.setattr(manager, "_allocate_engine_addr_and_ports", original_allocate)
+    manager.onload()
+    assert manager.is_onloaded()
+    assert not manager._unready_ranks
+    assert manager.engines[0] is not retained
+
+
+def test_failed_retirement_invalidates_whole_batch(_patch_ray, monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=2)
+    first, second = manager.all_engines
+    original_get = mem.ray.get
+
+    def get(ref, timeout=None):
+        if isinstance(ref, tuple) and ref == (first, "shutdown"):
+            assert manager.engines == [None, None]
+            raise TimeoutError("unknown")
+        return original_get(ref, timeout=timeout)
+
+    monkeypatch.setattr(mem.ray, "get", get)
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        manager.shutdown()
+    assert manager.all_engines == [first, None]
+    assert "shutdown" in second.calls
+    assert manager.engines == [None, None]

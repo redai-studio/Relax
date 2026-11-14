@@ -370,6 +370,7 @@ class EngineGroup:
     eviction_requested: bool = False
     require_router_registration: bool = False  # Verify managed PD registration before publication
     engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
+    pending_shutdown_indices: set[int] = dataclasses.field(default_factory=set)
 
     @property
     def nodes_per_engine(self):
@@ -586,13 +587,16 @@ class EngineGroup:
         This removes the engines from the group and unregisters them from
         router and DCS.
         """
+        self.pending_shutdown_indices.update(indices)
+        failures = []
         for i in indices:
             engine = self.all_engines[i]
             if engine is not None:
                 try:
                     ray.get(engine.shutdown.remote(), timeout=10)
                 except Exception as e:
-                    raise RuntimeError(f"Engine {i} resource release is unconfirmed") from e
+                    failures.append((i, e))
+                    continue
                 try:
                     ray.get(engine.unregister_dcs.remote(), timeout=10)
                 except Exception as e:
@@ -606,7 +610,11 @@ class EngineGroup:
                 except Exception as e:
                     logger.warning(f"Failed to kill engine {i}: {e}")
             self.all_engines[i] = None
+            self.pending_shutdown_indices.discard(i)
             logger.info(f"Shutdown engine at index {i}")
+
+        if failures:
+            raise RuntimeError(f"Engine resource release is unconfirmed: {failures}") from failures[0][1]
 
 
 @dataclasses.dataclass
@@ -699,6 +707,10 @@ class RolloutServer:
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
         groups = list(self.engine_groups)
+        for group in groups:
+            if group.pending_shutdown_indices:
+                self.num_new_engines = 0
+                group.shutdown_engines(set(group.pending_shutdown_indices))
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
 
         # Managed PD retains static IDs outside the engine actor. Confirm old
@@ -818,10 +830,22 @@ class RolloutServer:
                 # replacement batch, including pending multi-node peers, so
                 # the next recovery cannot mistake those handles for ready
                 # engines. Keep the new generation's records for route cleanup.
-                for group, dead_indices in zip(groups, dead_per_group, strict=True):
-                    if group.pg is not None and dead_indices:
-                        group.shutdown_engines(set(dead_indices))
                 self.num_new_engines = 0
+                pending_cleanup = [
+                    (group, set(indices))
+                    for group, indices in zip(groups, dead_per_group, strict=True)
+                    if group.pg is not None and indices
+                ]
+                for group, indices in pending_cleanup:
+                    group.pending_shutdown_indices.update(indices)
+                failures = []
+                for group, indices in pending_cleanup:
+                    try:
+                        group.shutdown_engines(indices)
+                    except Exception as exc:
+                        failures.append(exc)
+                if failures:
+                    raise RuntimeError(f"Recovery resource release is unconfirmed: {failures}") from failures[0]
                 raise
 
         release_handles = []
@@ -3315,24 +3339,28 @@ class RolloutManager(ReloadableMixin):
         else:
             engines = engines_or_group
 
+        retained = getattr(self, "_unconfirmed_rollback_engines", None)
+        if retained is None:
+            retained = self._unconfirmed_rollback_engines = []
+        # Register the entire batch before any await, including cancellation.
+        engines = [engine for engine in engines if engine is not None]
         for engine in engines:
-            if engine is None:
-                continue
+            if engine not in retained:
+                retained.append(engine)
+        failures = []
+        for engine in engines:
             try:
-                # Unregister from DCS coordinator
                 await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
             except Exception as e:
                 logger.warning(f"Failed to unregister DCS for engine during rollback: {e}")
-            retained = getattr(self, "_unconfirmed_rollback_engines", None)
-            if retained is None:
-                retained = self._unconfirmed_rollback_engines = []
-            if engine not in retained:
-                retained.append(engine)
             try:
                 await asyncio.wait_for(engine.shutdown.remote(), timeout=30)
             except Exception as e:
-                raise RuntimeError("Rollback resource release is unconfirmed") from e
-            retained.remove(engine)
+                failures.append(e)
+            else:
+                retained.remove(engine)
+        if failures:
+            raise RuntimeError(f"Rollback resource release is unconfirmed: {failures}") from failures[0]
 
     @ray.method(concurrency_group="scale_out")
     def get_scale_out_status(self, request_id: str) -> Optional[dict]:

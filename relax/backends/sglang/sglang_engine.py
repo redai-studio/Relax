@@ -1038,11 +1038,16 @@ class SGLangEngine(RayActor):
 
     def shutdown(self):
         if self.args.rollout_external:
+            if self.unregister_from_router(wait_for_removal=True, timeout=5.0) is False:
+                raise RuntimeError("External worker router removal is unconfirmed")
             return
 
-        logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
+        logger.info(f"Shutdown engine {getattr(self, 'server_host', None)}:{getattr(self, 'server_port', None)}...")
         try:
-            self.unregister_from_router(timeout=5.0)
+            # Address allocation can fail before init creates server attributes.
+            if hasattr(self, "server_host") and hasattr(self, "server_port"):
+                if self.unregister_from_router(timeout=5.0) is False:
+                    raise RuntimeError("Worker router removal is unconfirmed")
         finally:
             process = getattr(self, "process", None)
             if process is not None and not getattr(self, "_server_exit_confirmed", False):

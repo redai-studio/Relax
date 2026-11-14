@@ -916,3 +916,32 @@ async def test_rollback_unknown_release_retains_actor():
         await manager._rollback_engines([engine])
     assert manager._unconfirmed_rollback_engines == [engine]
     kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail_fails", [False, True])
+async def test_rollback_registers_entire_batch_before_await_and_cleans_tail(tail_fails):
+    manager = create_test_manager()
+    engines = [make_mock_engine() for _ in range(3)]
+
+    async def fail_first():
+        assert all(engine in manager._unconfirmed_rollback_engines for engine in engines)
+        raise TimeoutError("unknown")
+
+    def check_ownership():
+        assert all(engine in manager._unconfirmed_rollback_engines for engine in engines)
+        return AwaitableValue(None)
+
+    engines[0].unregister_dcs.remote.side_effect = check_ownership
+    engines[0].shutdown.remote.side_effect = fail_first
+    if tail_fails:
+        engines[2].shutdown.remote.side_effect = TimeoutError("tail unknown")
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        await manager._rollback_engines(engines)
+    assert manager._unconfirmed_rollback_engines == ([engines[0], engines[2]] if tail_fails else engines[:1])
+    for engine in engines:
+        engine.shutdown.remote.assert_called_once()
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        await manager._rollback_engines(engines)
+    for engine in engines:
+        assert engine.shutdown.remote.call_count == 2
