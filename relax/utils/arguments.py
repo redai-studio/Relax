@@ -1614,6 +1614,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--flops-microbatch-packing",
+                action="store_true",
+                default=False,
+                help="Use capacity-constrained FLOPs packing for text Qwen3.5 SFT microbatches (opt-in).",
+            )
+            parser.add_argument(
+                "--flops-dp-balancing",
+                action="store_true",
+                default=False,
+                help="Balance text Qwen3.5 SFT samples across DP ranks using estimated FLOPs (opt-in).",
+            )
+            parser.add_argument(
                 "--max-tokens-per-gpu",
                 type=int,
                 default=None,
@@ -4783,6 +4795,9 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    from relax.utils.data.flops_schedule import validate_flops_scheduling_args
+
+    validate_flops_scheduling_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

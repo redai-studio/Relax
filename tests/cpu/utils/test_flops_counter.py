@@ -6,7 +6,12 @@ import types
 
 import pytest
 
-from relax.utils.training.flops_counter import _DEVICE_FLOPS, FlopsCounter, get_device_peak_flops
+from relax.utils.training.flops_counter import (
+    _DEVICE_FLOPS,
+    FlopsCounter,
+    SequenceFlopsEstimator,
+    get_device_peak_flops,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -369,3 +374,183 @@ def test_unknown_model_type_missing_fields_returns_zero():
     counter = FlopsCounter(config)
     estimated, _ = counter.estimate([1024, 2048], delta_time=1.0)
     assert estimated == 0
+
+
+@pytest.fixture(params=["qwen3_5", "qwen3_5_moe"])
+def workload_config(request):
+    return Config(FLOPS_TEST_VL_CONFIGS[request.param]["config"])
+
+
+def test_sequence_workload_matches_fixed_text_flops(workload_config):
+    expected = {
+        "qwen3_5": [55409909956608, 224113540988928],
+        "qwen3_5_moe": [21725655859200, 89994999889920],
+    }[workload_config.model_type]
+    estimator = SequenceFlopsEstimator.from_config(workload_config)
+    assert estimator.estimate_per_sample([1024, 4096]) == expected
+    assert estimator.estimate([1024, 4096]) == sum(expected)
+    assert all(type(work) is int for work in estimator.estimate_per_sample([1024, 4096]))
+
+
+def test_sequence_workload_matches_legacy_text_formula(workload_config):
+    estimator = SequenceFlopsEstimator.from_config(workload_config)
+    lengths = [1, 512, 1024, 2048, 32768]
+    legacy_rate, _ = FlopsCounter(workload_config).estimate(lengths, delta_time=2.5)
+    assert math.isclose(estimator.estimate(lengths), legacy_rate * 2.5 * 1e12, rel_tol=1e-12)
+
+
+def test_sequence_workload_accepts_flat_text_config(workload_config):
+    flat = workload_config.text_config
+    flat.model_type = workload_config.model_type + "_text"
+    assert SequenceFlopsEstimator.from_config(flat) == SequenceFlopsEstimator.from_config(workload_config)
+
+
+def test_sequence_workload_empty_batch(workload_config):
+    estimator = SequenceFlopsEstimator.from_config(workload_config)
+    assert estimator.estimate_per_sample([]) == []
+    assert estimator.estimate([]) == 0
+
+
+def test_sequence_workload_does_not_query_device_or_reinspect_config(monkeypatch, workload_config):
+    import relax.utils.training.flops_counter as module
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Pure workload estimation must not query hardware or inspect signatures")
+
+    monkeypatch.setattr(module, "get_device_peak_flops", unexpected)
+    monkeypatch.setattr(module.inspect, "signature", unexpected)
+    estimator = SequenceFlopsEstimator.from_config(workload_config)
+    before = estimator.estimate([1024, 4096])
+    workload_config.text_config.hidden_size = 1
+    monkeypatch.setattr(module, "_compute_qwen3_5_text_flops_coefficients", unexpected)
+    assert estimator.estimate([1024, 4096]) == before
+
+
+@pytest.mark.parametrize("length", [0, -1])
+def test_sequence_workload_rejects_nonpositive_lengths(length, workload_config):
+    with pytest.raises(ValueError, match="positive"):
+        SequenceFlopsEstimator.from_config(workload_config).estimate_per_sample([1024, length])
+
+
+@pytest.mark.parametrize("length", [True, 1.5, float("nan"), float("inf"), "1024", None])
+def test_sequence_workload_rejects_noninteger_lengths(length, workload_config):
+    with pytest.raises(TypeError, match="integer"):
+        SequenceFlopsEstimator.from_config(workload_config).estimate_per_sample([length])
+
+
+def test_sequence_workload_rejects_unknown_model():
+    with pytest.raises(ValueError, match="Unsupported model_type"):
+        SequenceFlopsEstimator.from_config(Config({"model_type": "unknown_model_xyz"}))
+
+
+def test_qwen3_explicit_head_width_matches_dense_reporting():
+    config = Config(
+        dict(
+            model_type="qwen3",
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=6,
+            num_hidden_layers=2,
+            vocab_size=16,
+            intermediate_size=4,
+        )
+    )
+    estimator = SequenceFlopsEstimator.from_config(config)
+    assert estimator == SequenceFlopsEstimator(6144, 144)
+    lengths = [3, 17, 128]
+    assert estimator.estimate(lengths) == pytest.approx(FlopsCounter(config).estimate(lengths, 1)[0] * 1e12)
+    config.num_key_value_heads = 3
+    with pytest.raises(ValueError, match="head geometry"):
+        SequenceFlopsEstimator.from_config(config)
+
+
+def _olmoe_config():
+    return Config(
+        dict(
+            model_type="olmoe",
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_hidden_layers=2,
+            vocab_size=16,
+            intermediate_size=4,
+            num_experts=4,
+            num_experts_per_tok=2,
+        )
+    )
+
+
+def test_olmoe_counts_active_experts_and_matches_reported_flops():
+    config = _olmoe_config()
+    estimator = SequenceFlopsEstimator.from_config(config)
+    assert estimator == SequenceFlopsEstimator(6 * 1088, 96)
+    assert estimator.estimate_per_sample([3, 5]) == [20448, 35040]
+    counter = FlopsCounter(config)
+    achieved, _ = counter.estimate([3, 5], 2.0)
+    assert math.isclose(achieved * 2.0 * 1e12, 55488, rel_tol=1e-12)
+    config.num_experts = 8
+    more_experts = SequenceFlopsEstimator.from_config(config)
+    assert more_experts.linear_flops - estimator.linear_flops == 6 * 2 * 8 * 4
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_experts_per_tok", 5),
+        ("num_experts_per_tok", 0),
+        ("intermediate_size", -1),
+        ("hidden_size", 7),
+        ("num_key_value_heads", 3),
+    ],
+)
+def test_olmoe_rejects_invalid_geometry(field, value):
+    config = _olmoe_config()
+    setattr(config, field, value)
+    with pytest.raises(ValueError):
+        SequenceFlopsEstimator.from_config(config)
+
+
+@pytest.mark.parametrize("field,value", [("hidden_size", 0), ("num_hidden_layers", -1), ("head_dim", 1.5)])
+def test_sequence_workload_rejects_invalid_model_dimensions(field, value, workload_config):
+    setattr(workload_config.text_config, field, value)
+    with pytest.raises(ValueError, match=field):
+        SequenceFlopsEstimator.from_config(workload_config)
+
+
+def test_sequence_workload_rejects_missing_config_field(workload_config):
+    del workload_config.text_config.linear_key_head_dim
+    with pytest.raises(ValueError, match="linear_key_head_dim"):
+        SequenceFlopsEstimator.from_config(workload_config)
+
+
+@pytest.mark.parametrize("layer_types", [[], ["full_attention"], ["unknown"] * 32])
+def test_sequence_workload_rejects_invalid_layer_types(layer_types, workload_config):
+    workload_config.text_config.layer_types = layer_types
+    with pytest.raises(ValueError, match="layer_types"):
+        SequenceFlopsEstimator.from_config(workload_config)
+
+
+def test_sequence_workload_interval_matches_explicit_layers(workload_config):
+    expected = SequenceFlopsEstimator.from_config(workload_config)
+    del workload_config.text_config.layer_types
+    workload_config.text_config.full_attention_interval = 4
+    assert SequenceFlopsEstimator.from_config(workload_config) == expected
+    workload_config.text_config.full_attention_interval = 0
+    with pytest.raises(ValueError, match="full_attention_interval"):
+        SequenceFlopsEstimator.from_config(workload_config)
+
+
+def test_sequence_workload_all_gdn_has_no_quadratic_term(workload_config):
+    config = workload_config.text_config
+    config.layer_types = ["linear_attention"] * config.num_hidden_layers
+    estimator = SequenceFlopsEstimator.from_config(workload_config)
+    assert estimator.quadratic_flops == 0
+    assert estimator.estimate([4096]) == 4 * estimator.estimate([1024])
+
+
+def test_sequence_workload_rejects_invalid_moe_topk():
+    config = Config(FLOPS_TEST_VL_CONFIGS["qwen3_5_moe"]["config"])
+    config.text_config.num_experts_per_tok = config.text_config.num_experts + 1
+    with pytest.raises(ValueError, match="num_experts_per_tok"):
+        SequenceFlopsEstimator.from_config(config)

@@ -55,6 +55,13 @@ from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.agentic_obs.run_hooks import annotate_failure_stage
 from relax.utils.async_utils import run
 from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.flops_schedule import (
+    WorkloadMicrobatchPlan,
+    build_workload_microbatch_plan,
+    flops_microbatch_geometry,
+    get_flops_estimator,
+    validate_text_rollout,
+)
 from relax.utils.data.micro_batch_ring import (
     PrefetchedSFTWindow,
     SFTWindowPrefetcher,
@@ -222,7 +229,7 @@ def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
     return {k: _slice(v) for k, v in rollout_data.items()}
 
 
-def _select_rollout_samples(rollout_data: RolloutBatch, indices: list[int]) -> RolloutBatch:
+def _select_rollout_samples(rollout_data: RolloutBatch, indices: list[int], *, is_dummy: bool = False) -> RolloutBatch:
     """Slice a rollout batch to the given per-sample indices."""
     num_samples = len(rollout_data["total_lengths"])
 
@@ -235,7 +242,10 @@ def _select_rollout_samples(rollout_data: RolloutBatch, indices: list[int]) -> R
             return value[indices]
         return value
 
-    return {key: _select(value) for key, value in rollout_data.items()}
+    selected = {key: _select(value) for key, value in rollout_data.items()}
+    if is_dummy:
+        selected["__is_dummy__"] = True
+    return selected
 
 
 class _SFTPrefetchMiss(RuntimeError):
@@ -460,6 +470,7 @@ class MegatronTrainRayActor(TrainRayActor):
         from relax.utils.training.flops_counter import FlopsCounter
 
         self.flops_counter = FlopsCounter(self.hf_config)
+        get_flops_estimator(args, self.hf_config)
 
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
@@ -1509,6 +1520,13 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
             fetch_iter = 0
+            from relax.utils.data.flops_schedule import unequal_flops_dp_enabled
+
+            unequal_flops_training = unequal_flops_dp_enabled(self.args)
+            if unequal_flops_training:
+                dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+                if batch_size * dp_size != self.args.global_batch_size:
+                    raise ValueError("Variable-count FLOPs fetch must request the complete global batch")
             while batch_index < num_rollout_minis:
                 # ``get_meta`` marks a TQ partition consumed.  A CPU-prefetched
                 # SFT batch therefore looks consumed before the main training
@@ -1524,7 +1542,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 from relax.utils.data.wholepack import enabled as wholepack_enabled
 
                 drained = not has_prefetched_sft_batch and self.all_consumed(task_name, rollout_id)
-                if wholepack_enabled(self.args):
+                if wholepack_enabled(self.args) or unequal_flops_training:
                     drained = all_ready(drained)
                 if drained:
                     break
@@ -1540,6 +1558,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         batch_index,
                         prefetched_fetch=prefetched_fetch,
                         wholepack_training=wholepack_enabled(self.args),
+                        unequal_flops_training=unequal_flops_training,
                     )
                 if rollout_data is None:
                     if fetch_iter % 100 == 0:
@@ -1675,21 +1694,26 @@ class MegatronTrainRayActor(TrainRayActor):
         if local_k < max_k:
             try:
                 first_ready_event.synchronize()
-                capacity = _get_micro_batch_token_capacity(
-                    self.args, self.args.max_tokens_per_gpu, mpu.get_context_parallel_world_size()
-                )
-                micro_batch_indices = _get_capacity_safe_balanced_partitions(
-                    window.rollout_data["total_lengths"], max_k, capacity
-                )
+                if getattr(self.args, "flops_microbatch_packing", False):
+                    plan = self._plan_sft_flops_microbatches(window.rollout_data, max_k)
+                    micro_batch_indices, dummy_offsets = plan.partitions, plan.dummy_offsets
+                else:
+                    capacity = _get_micro_batch_token_capacity(
+                        self.args, self.args.max_tokens_per_gpu, mpu.get_context_parallel_world_size()
+                    )
+                    micro_batch_indices = _get_capacity_safe_balanced_partitions(
+                        window.rollout_data["total_lengths"], max_k, capacity
+                    )
+                    dummy_offsets = frozenset()
                 packed_micro_batches = [
                     (
                         prepack_sft_micro_batch_cpu(
                             self.args,
-                            _select_rollout_samples(window.rollout_data, indices),
+                            _select_rollout_samples(window.rollout_data, indices, is_dummy=offset in dummy_offsets),
                         ),
                         None,
                     )
-                    for indices in micro_batch_indices
+                    for offset, indices in enumerate(micro_batch_indices)
                 ]
 
                 assert self._sft_copy_stream is not None
@@ -1822,6 +1846,20 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return concat_rollout_batches(shard_batches)
 
+    def _plan_sft_flops_microbatches(
+        self, rollout_data: RolloutBatch, count: int | None = None
+    ) -> WorkloadMicrobatchPlan:
+        validate_text_rollout(rollout_data)
+        return build_workload_microbatch_plan(
+            rollout_data["total_lengths"],
+            get_flops_estimator(self.args),
+            self.args.max_tokens_per_gpu,
+            **flops_microbatch_geometry(
+                self.args, mpu.get_tensor_model_parallel_world_size(), mpu.get_context_parallel_world_size()
+            ),
+            num_microbatches=count,
+        )
+
     def _pack_sft_prepack_window(
         self,
         rollout_id: int,
@@ -1845,8 +1883,15 @@ class MegatronTrainRayActor(TrainRayActor):
         # but kept explicit to mirror get_data_iterator's formula.
         cp_size = mpu.get_context_parallel_world_size()
         max_tokens = _get_micro_batch_token_capacity(self.args, self.args.max_tokens_per_gpu, cp_size)
-        k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
-        micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens)
+        if getattr(self.args, "flops_dp_balancing", False) and not getattr(
+            self.args, "flops_microbatch_packing", False
+        ):
+            validate_text_rollout(rollout_data)
+        if getattr(self.args, "flops_microbatch_packing", False):
+            micro_batch_indices = self._plan_sft_flops_microbatches(rollout_data).partitions
+        else:
+            k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
+            micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens)
         packed_cpu = [
             (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
             for indices in micro_batch_indices
@@ -2093,6 +2138,28 @@ class MegatronTrainRayActor(TrainRayActor):
                 ]
 
         # Create data iterator for actor forward + routing replay + train.
+        capture_root = os.environ.get("RELAX_FLOPS_CAPTURE_DIR")
+        if capture_root and rollout_id == 0:
+            from pathlib import Path
+
+            from relax.utils.training.optimizer_step_capture import capture_rollout_inputs
+
+            capture_group = dist.group.WORLD
+            capture_rollout_inputs(
+                rollout_data,
+                Path(capture_root),
+                rank=dist.get_rank(capture_group),
+                topology={
+                    "dp": mpu.get_data_parallel_rank(with_context_parallel=False),
+                    "tp": mpu.get_tensor_model_parallel_rank(),
+                    "pp": mpu.get_pipeline_model_parallel_rank(),
+                    "cp": mpu.get_context_parallel_rank(),
+                },
+                normalization="token" if self.args.calculate_per_token_loss else "sample",
+                global_batch_size=self.args.global_batch_size,
+                device=device_utils.make_current_torch_device(),
+                group=capture_group,
+            )
         uses_prepared_sft_window = prepared_data_iterator is not None and prepared_num_microbatches is not None
         if not uses_prepared_sft_window:
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
@@ -3766,6 +3833,7 @@ class MegatronTrainRayActor(TrainRayActor):
         partition_id: str | None = None,
         prefetched_fetch: tuple[list, float] | None = None,
         wholepack_training: bool = False,
+        unequal_flops_training: bool = False,
     ):
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will recieve the data.
@@ -3815,7 +3883,7 @@ class MegatronTrainRayActor(TrainRayActor):
             prefetched_rollout_data=prefetched_rollout_data,
             prefetched_fetch_time_s=prefetched_fetch_time_s,
         )
-        if wholepack_training:
+        if wholepack_training or unequal_flops_training:
             from relax.utils.data.wholepack import agree, await_batch, restore_checked
 
             def retry_fetch():
@@ -3839,8 +3907,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 timeout_seconds=self.args.sft_tq_timeout_minutes * 60,
                 poll_seconds=Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0,
             )
-            if rollout_data is not None:
+            if rollout_data is not None and wholepack_training:
                 restore_checked(self.args, batch_meta, rollout_data, agree)
+            if rollout_data is not None and unequal_flops_training:
+                rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [len(rollout_data["total_lengths"])]
+                rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = [self.args.global_batch_size]
         if self._sft_image_preprocess_on_rank:
             # Swap image-ref descriptors for the CPU pixel tensors rebuilt by
             # the prefetch worker (or synchronously on paused/eval steps),

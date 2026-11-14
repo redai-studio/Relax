@@ -19,6 +19,13 @@ from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.flops_schedule import (
+    build_workload_microbatch_plan,
+    expand_workload_microbatch_plan,
+    flops_microbatch_geometry,
+    get_flops_estimator,
+    validate_text_rollout,
+)
 from relax.utils.data.packing import get_binpack_partitions
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.env import Envs
@@ -1377,27 +1384,71 @@ def get_data_iterator(
             samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
         step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()
-        for i in range(num_steps_per_rollout):
-            start = step_offsets[i]
-            end = step_offsets[i + 1]
-            if packing_strategy == "binpack":
-                num_microbatches.append(len(get_binpack_partitions(samples[start:end], micro_batch_token_capacity)))
-            else:
-                num_microbatches.append(
-                    get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity)
-                )
+        use_flops_packing = getattr(args, "flops_microbatch_packing", False)
+        coordinate_flops = use_flops_packing or getattr(args, "flops_dp_balancing", False)
+        flops_plans = []
+        planning_error = None
+        estimator = None
+        plan_kwargs = (
+            flops_microbatch_geometry(args, mpu.get_tensor_model_parallel_world_size(), cp_size)
+            if use_flops_packing
+            else {}
+        )
+        if coordinate_flops:
+            try:
+                estimator = get_flops_estimator(args) if use_flops_packing else None
+                validate_text_rollout(rollout_data)
+                for start, end in zip(step_offsets, step_offsets[1:]):
+                    if use_flops_packing:
+                        plan = build_workload_microbatch_plan(
+                            rollout_data["total_lengths"][start:end], estimator, _max_tokens, **plan_kwargs
+                        )
+                        flops_plans.append(plan)
+                        num_microbatches.append(len(plan.partitions))
+                    else:
+                        num_microbatches.append(
+                            len(get_binpack_partitions(samples[start:end], micro_batch_token_capacity))
+                            if packing_strategy == "binpack"
+                            else get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity)
+                        )
+            except Exception as exc:
+                planning_error = exc
+                num_microbatches = [0] * num_steps_per_rollout
+        else:
+            for i in range(num_steps_per_rollout):
+                start = step_offsets[i]
+                end = step_offsets[i + 1]
+                if packing_strategy == "binpack":
+                    num_microbatches.append(
+                        len(get_binpack_partitions(samples[start:end], micro_batch_token_capacity))
+                    )
+                else:
+                    num_microbatches.append(
+                        get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity)
+                    )
 
         required_num_microbatches = torch.tensor(
-            num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
+            [int(planning_error is not None), *num_microbatches] if coordinate_flops else num_microbatches,
+            dtype=torch.int,
+            device=device_utils.make_current_torch_device(),
         )
         dist.all_reduce(required_num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
         num_microbatches = required_num_microbatches
 
-        if vpp_size > 1:
+        if coordinate_flops:
+            agreed = num_microbatches.tolist()
+            if agreed[0]:
+                raise RuntimeError("FLOPs microbatch planning failed on a DP peer") from planning_error
+            num_microbatches = agreed[1:]
+            if vpp_size > 1:
+                group_size = microbatch_group_size_per_vp_stage
+                num_microbatches = [(count + group_size - 1) // group_size * group_size for count in num_microbatches]
+        elif vpp_size > 1:
             # vpp requires the number of microbatches to be divisible by vpp_size
             num_microbatches = _round_up_to_microbatch_group(num_microbatches, microbatch_group_size_per_vp_stage)
 
-        num_microbatches = num_microbatches.tolist()
+        if not coordinate_flops:
+            num_microbatches = num_microbatches.tolist()
 
         # Prefer Karmarkar-Karp balancing when it respects capacity. If it
         # overflows, first-fit reconstructs the schedule used to derive the
@@ -1409,12 +1460,18 @@ def get_data_iterator(
             start = step_offsets[i]
             end = step_offsets[i + 1]
             step_samples = samples[start:end]
-            partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
-                step_samples,
-                num_mbs,
-                micro_batch_token_capacity,
-                packing_strategy=packing_strategy,
-            )
+            if use_flops_packing:
+                plan = flops_plans[i]
+                if num_mbs != len(plan.partitions):
+                    plan = expand_workload_microbatch_plan(plan, num_mbs)
+                partitions, local_dummy_offsets = plan.partitions, plan.dummy_offsets
+            else:
+                partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
+                    step_samples,
+                    num_mbs,
+                    micro_batch_token_capacity,
+                    packing_strategy=packing_strategy,
+                )
             base_offset = len(micro_batch_indices)
             micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
             dummy_micro_batch_offsets.update(base_offset + offset for offset in local_dummy_offsets)

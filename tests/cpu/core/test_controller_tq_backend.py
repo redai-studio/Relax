@@ -268,6 +268,37 @@ def test_controller_hybrid_balance_selects_count_window_placement(
     assert selected == [placement]
 
 
+@pytest.mark.parametrize("packing,placement", [(False, False), (True, False), (False, True), (True, True)])
+def test_controller_sft_uses_flops_placement_only_when_requested(monkeypatch, packing, placement):
+    from transfer_queue import SeqlenBalancedSampler
+
+    from relax.utils.data.flops_sampler import FlopsBalancedSampler
+    from relax.utils.training.flops_counter import SequenceFlopsEstimator
+
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = _config(
+        tq_rdma_mode="off",
+        fully_async=False,
+        polling_mode=False,
+        loss_type="sft",
+        flops_microbatch_packing=packing,
+        flops_dp_balancing=placement,
+        _flops_workload_estimator=SequenceFlopsEstimator(10, 1),
+    )
+    monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _: "sft")
+    monkeypatch.setattr(controller, "compute_dp_size", lambda _: 2)
+    monkeypatch.setattr(controller, "with_control_plane_affinity", lambda _: {})
+    monkeypatch.setattr(controller, "reap_unusable_tq_controller", lambda: None)
+    monkeypatch.setattr(instance, "_resolve_tq_backend", lambda: {"storage_backend": "SimpleStorage"})
+    monkeypatch.setattr(controller.tq, "init", lambda conf: conf)
+
+    instance._initialize_data_system()
+
+    sampler = instance.config.tq_config.controller.sampler
+    assert type(sampler) is (FlopsBalancedSampler if placement else SeqlenBalancedSampler)
+    assert sampler.dp_size == 2 and sampler.n_samples_per_prompt == 1
+
+
 def test_cli_exposes_only_mode_and_device(arguments_module: Any) -> None:
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
