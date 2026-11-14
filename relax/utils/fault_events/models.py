@@ -13,7 +13,7 @@ from uuid import uuid4
 
 MAX_UINT = (1 << 64) - 1
 MAX_EVENT_BYTES = 1024
-ROLES = frozenset(("actor", "critic", "rollout", "advantages", "advantage", "reference", "actor_fwd", "sft", "genrm"))
+ROLES = frozenset(("actor", "critic", "rollout", "advantages", "reference", "actor_fwd", "sft", "genrm"))
 REASONS = MappingProxyType(
     {
         "fault_detected": ("reported_error", "heartbeat_timeout", "fatal_error"),

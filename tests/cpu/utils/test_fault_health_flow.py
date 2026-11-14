@@ -152,6 +152,11 @@ def test_service_role_rejects_non_enum_string_subclasses(formatted):
         service_role(role)
 
 
+def test_service_role_rejects_legacy_advantage_alias():
+    with pytest.raises(ValueError, match="^INVALID_ROLE: role must be a supported service role$"):
+        service_role("advantage")
+
+
 @pytest.mark.parametrize("generation", [-1, MAX_UINT + 1, True, "0", {}, 1.5])
 def test_fault_source_rejects_invalid_generation(generation):
     with pytest.raises(ValueError, match="^INVALID_GENERATION: "):
@@ -190,12 +195,12 @@ def test_fault_source_snapshot_is_bounded_and_never_restores_cleared_roles():
     roles = sorted(ROLES)
     for role in roles:
         source.error(role, "reported_error")
-    assert len(source.faults) == len(source.snapshot(roles)["faults"]) == 9
+    assert len(source.faults) == len(source.snapshot(roles)["faults"]) == len(ROLES)
     source.error("unsupported", "reported_error")
-    assert len(source.faults) == 9
+    assert len(source.faults) == len(ROLES)
     original_roles = roles + ["unsupported"]
     snapshot = source.snapshot(original_roles)
-    assert snapshot["roles"] is original_roles and len(snapshot["faults"]) <= 9
+    assert snapshot["roles"] is original_roles and len(snapshot["faults"]) <= len(ROLES)
     assert snapshot["observation_error"]
     source.clear("actor")
     empty = source.snapshot([])
