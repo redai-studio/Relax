@@ -25,12 +25,13 @@ def module(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode,failure",
-    [(mode, failure) for mode in ("expert", "ordinary", "mixed") for failure in (None, "prepare", "copy")]
-    + [("mixed", "warm_copy")],
+    "mode,failure,check_content",
+    [(mode, failure, False) for mode in ("expert", "ordinary", "mixed") for failure in (None, "prepare", "copy")]
+    + [("mixed", "warm_copy", False)]
+    + [(mode, None, True) for mode in ("expert", "ordinary", "mixed")],
 )
-def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, failure, mode):
-    monkeypatch.delenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", raising=False)
+def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, failure, mode, check_content):
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1" if check_content else "0")
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater.shard_p2p_requested = True
     updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = True
@@ -80,7 +81,11 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
         if failure == phase or failure == "warm_copy" and not helper.needs_seed:
             raise RuntimeError("expert " + phase + " failed")
 
-    helper.prepare = lambda current, **kwargs: transfer(current, "prepare")
+    def prepare(current, *, version, audit_native):
+        assert audit_native is check_content
+        transfer(current, "prepare")
+
+    helper.prepare = prepare
     helper.update = lambda current, **kwargs: transfer(current, "copy")
     updater._colocate_expert_ipc = helper
     monkeypatch.setattr(module.dist, "get_rank", lambda *args: 0)
@@ -98,7 +103,7 @@ def test_first_direct_update_uses_one_native_transaction(module, monkeypatch, fa
         assert events.count("end_weight_update") == events.count("update_weights_from_tensor") == 1
         assert events.count("update_weight_version") == 1
         assert events.index("update_weights_from_tensor") < events.index("update_weight_version")
-        assert ("full_native" in events) is (mode != "expert")
+        assert ("full_native" in events) is (mode == "ordinary" or check_content)
         if mode != "expert":
             assert events.index("begin_native_seed") < events.index("observe_native") < events.index("prepare")
             helper.needs_seed = False
@@ -157,6 +162,7 @@ def test_expert_source_lifetime_and_cleanup_failure_agreement(module, monkeypatc
     helper = object.__new__(ipc.ShardP2PSynchronizer)
     helper.geometry = dict(tp_size=2, source_world_size=8)
     helper.rank, helper.failed, helper.needs_seed = 0, False, False
+    helper._has_remote = False
     helper.completed_version, helper._pending = 6, None
     helper.session, helper._plan_hashes = "session", ["tp0", "tp1"]
     helper._source_device = torch.device("cuda", 0)
@@ -470,6 +476,13 @@ def test_source_role_reads_expert_dp_coordinates_not_dense_dp_or_global_order(mo
     role = helper.source_role()
     assert role[:2] == (ranks, replica)
     assert (role[1] == 0) == (helper.rank == 6)
+    views = {"expert": torch.ones(2, 2, dtype=torch.bfloat16)}
+    helper._replica_signature = role
+    helper.iterator = SimpleNamespace(_bridge_converter=SimpleNamespace(local_expert_views=lambda *a, **kw: views))
+    monkeypatch.setattr(ipc, "local_expert_parameters", lambda *a: list(views.items()))
+    for enabled in (False, True):
+        monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", str(int(enabled)))
+        assert (helper.replica_record({})["parameters"]["expert"][2] is not None) is enabled
     if replica:
         helper._replica_signature, helper.raw_recipe_enabled = role, False
         helper.iterator, helper.layout = object(), SimpleNamespace(tp_size=2)
