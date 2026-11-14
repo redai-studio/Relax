@@ -693,7 +693,7 @@ status、turn count、request timing、abort count 与 weight-version 信息。
 | `prompts/*.jsonl` | 原始数据行、`prompt_id`、数据集来源、原始 `input_payload`、可选引用和文本预览。 |
 | `groups/*.jsonl` | Runtime Group 创建信息、`group_id`、`group_index`、`prompt_id`、预期 Session 数、模式和创建时间。 |
 | `sessions/*.jsonl` | `session_id`、`group_id`、`prompt_id`、sample/replicate 索引、预期 Group 大小及合并后的采样默认值。 |
-| `trajectories/*.jsonl` | 导出的 lineage、`sample_export_id`、`session_id`、runtime `group_id`、`sample_index` 和 `exported_at`。同一 Sample 的多个 export 共享 sample index，各有独立 export ID。 |
+| `trajectories/*.jsonl` | 导出的 lineage、每 resp 节点的 `weight_version_spans`（token 区间 + 生成时版本，未知为 null）、`sample_export_id`、`session_id`、runtime `group_id`、`sample_index` 和 `exported_at`。同一 Sample 的多个 export 共享 sample index，各有独立 export ID。 |
 | `stages/*.jsonl` | 成对的 stage 边界，包含 `stage_id`、`record_id`、`scope`、`event_seq`、`occurred_at` 和 `is_terminal`。trajectory 阶段描述 reward、filter 和 transfer；rollout/update 事件包含 `group_ids` 和 `groups_finalized`。 |
 | `train/*.jsonl` | 每个真实 policy update 的 DP 分片：`update_id`、`train_generation_id`、`stage_id`、`capture_phase=training_input`、`samples[]`、`dp_rank`、`dp_world_size` 和 `input_complete`。 |
 
@@ -701,6 +701,7 @@ status、turn count、request timing、abort count 与 weight-version 信息。
 作用域为 `(run_id, train_generation_id)`；一个 rollout 可以包含多次 update。输入在 micro-batch 被实际消费时、
 packing 和 dynamic CP 切分前采集。Dummy batch 不计入，真实的全零 loss mask 样本仍保留。
 每个样本包含长度、有效 token 数，以及按 mask 计算的 advantage/return 统计。
+训练消费时刻的 actor 权重版本记为每样本 `consumed_weight_version`（未采集为 null）。
 Train schema `4.0.0` 将 `loss_mask.ranges` 保存为 response 空间中从零开始的
 左闭右开区间 `[start, end, value]`。按 `response_length` 还原完整长度，区间外填零。
 例如 `[1, 1, 0, 1]` 写成 `{"ranges": [[0, 2, 1], [3, 4, 1]]}`。
@@ -779,8 +780,9 @@ Daemon 队列同时限制条目数和字节数，正在写入的任务也计入�
 不能据此断言训练仍在等待或已被拒绝。
 Managed 日志在临时目录清理前提取本地最后 1 MiB 快照；`log_ref` 表示后台写入已接纳，
 读取端仍需检查文件是否存在。
-Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.0.0`。
-`train_schema_version` 标明 train 数据流的版本。读取端通过合并 DP 事实判断 update 结果。
+Manifest 使用 `record_format=agentic-observability-full-v3`、schema `3.2.0`。
+`train_schema_version` 标明 train 数据流的版本。读取端通过合并 DP 事实判断 update 结果，
+不能继续等待生产端写出的全局 commit 事件。
 
 Eager 和 streaming reader 在自定义 prompt 处理、模板渲染、过滤、打乱和复制之前保存来源身份。
 `source_row_id` 是从零开始的 JSONL 物理行号或 Parquet 行号，切片和多文件数据集也保留原行号。
@@ -871,6 +873,16 @@ call，不是 failed call。
 `--dump-agentic-obs-media` 还会保存按内容寻址的媒体字节。关闭时，prompt/trajectory 中的
 data URI 和原始二进制 payload 替换为摘要/大小引用。日志在 agent 临时目录被移除前复制；
 Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当前设计继续留到后续。
+
+#### 权重版本滞后审计
+
+对已产出的观测目录离线运行：
+
+```bash
+python -m relax.utils.agentic_obs.version_audit <run_dir> [--session S] [--group G] [--missing-only] [--jsonl]
+```
+
+输出 run 级汇总（各滞后均值/中位数/最大值、三口径缺失率）与样本级明细（session → turn → attempt → token 区间 → 来源版本 → 消费时年龄）。指标口径与容错行为详见[权重版本滞后审计](./weight-version-audit.md)。
 
 ### 常见问题
 

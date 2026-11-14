@@ -713,7 +713,7 @@ or use a shared output directory. Each JSONL row carries `schema_version` and
 | `prompts/*.jsonl` | Original source row, `prompt_id`, dataset provenance, raw `input_payload`, optional reference, and text preview. |
 | `groups/*.jsonl` | Runtime Group creation, `group_id`, `group_index`, `prompt_id`, expected Session count, mode, and creation time. |
 | `sessions/*.jsonl` | `session_id`, `group_id`, `prompt_id`, sample/replicate indices, expected Group size, and merged sampling defaults. |
-| `trajectories/*.jsonl` | Exported lineage, `sample_export_id`, `session_id`, runtime `group_id`, `sample_index`, and `exported_at`. Multiple exports share a sample index but have distinct export IDs. |
+| `trajectories/*.jsonl` | Exported lineage, per-resp-node `weight_version_spans` (token interval + generation-time version, null when unknown), `sample_export_id`, `session_id`, runtime `group_id`, `sample_index`, and `exported_at`. Multiple exports share a sample index but have distinct export IDs. |
 | `stages/*.jsonl` | Paired stage boundaries with `stage_id`, `record_id`, `scope`, `event_seq`, `occurred_at`, and `is_terminal`. Trajectory stages describe reward, filter and transfer; rollout/update events carry `group_ids` and `groups_finalized`. |
 | `train/*.jsonl` | One DP fragment per actual policy update: `update_id`, `train_generation_id`, `stage_id`, `capture_phase=training_input`, `samples[]`, `dp_rank`, `dp_world_size`, and `input_complete`. |
 
@@ -722,7 +722,9 @@ The current train producer covers the Megatron policy actor. An update ID is
 may contain several updates. Inputs are captured as micro-batches are consumed, before packing or
 dynamic CP splitting. Dummy batches are omitted, but real samples with zero
 loss masks remain. Each sample includes lengths, effective tokens, and masked
-advantage/return statistics. Train records with schema `4.0.0` encode
+advantage/return statistics. The actor's weight version at consumption time is
+stamped per sample as `consumed_weight_version` (null when not captured).
+Train records with schema `4.0.0` encode
 `loss_mask.ranges` as zero-based, half-open `[start, end, value]` intervals over
 the response. Fill uncovered positions with zero up to `response_length`.
 For example, `[1, 1, 0, 1]` becomes `{"ranges": [[0, 2, 1], [3, 4, 1]]}`.
@@ -819,9 +821,10 @@ Missing records, missing log files, unacknowledged export delivery, and partial 
 tails mean **unknown**, never proof of a pending or rejected training update.
 Managed logs snapshot the final 1 MiB locally before temporary-directory cleanup;
 `log_ref` names an accepted background write, so readers must check file availability.
-The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`.
+The manifest uses `record_format=agentic-observability-full-v3` and schema `3.2.0`.
 Its `train_schema_version` identifies the train stream's schema. Readers merge
-DP facts to determine the update outcome.
+DP facts to determine the update outcome instead of expecting a producer-side
+global commit event.
 
 Eager and streaming readers preserve source identity before custom prompt processing,
 templating, filtering, shuffling, or replication. `source_row_id` is the zero-based
@@ -927,6 +930,16 @@ it, data URIs and raw binary payloads in prompts/trajectories become digest/size
 references. Logs are copied before temporary agent directories are removed; abrupt
 Shard death can still prevent the final copy. `tokens.jsonl` remains deferred by
 the current design.
+
+#### Weight Version Staleness Audit
+
+Run offline against a produced observation directory:
+
+```bash
+python -m relax.utils.agentic_obs.version_audit <run_dir> [--session S] [--group G] [--missing-only] [--jsonl]
+```
+
+Emits a run-level summary (lag mean/median/max, three missing-rate facets) and per-sample detail lines (session → turn → attempt → token interval → source version → age at consumption). See [Weight Version Staleness Audit](./weight-version-audit.md) for metric definitions and fault-tolerance behavior.
 
 ### Common Problems
 

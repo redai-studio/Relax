@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
-from relax.utils.types import Sample
+from relax.utils.types import Sample, WeightVersionSpan
 
 
 MsgKind = Literal["obs", "resp"]
@@ -424,6 +424,7 @@ class MsgNode:
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
+    weight_version_spans: list[WeightVersionSpan] = field(default_factory=list)
     spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
@@ -458,6 +459,8 @@ class InflightRequest:
     pending_topk_token_ids_delta: list[np.ndarray] = field(default_factory=list)
     pending_topk_logprob_delta: list[np.ndarray] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
+    pending_weight_version_spans: list[WeightVersionSpan] = field(default_factory=list)
+    weight_version_attempt_count: int = 0
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
@@ -700,6 +703,7 @@ class SessionForest:
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
         weight_version_delta: list[str] | None = None,
+        weight_version_spans: list[WeightVersionSpan] | None = None,
         spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
@@ -738,6 +742,7 @@ class SessionForest:
                 topk_token_ids_delta=topk_token_ids_delta,
                 topk_logprob_delta=topk_logprob_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
+                weight_version_spans=list(weight_version_spans) if weight_version_spans else [],
                 spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
                 if prefix_cache_delta is not None
@@ -796,6 +801,11 @@ class SessionForest:
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
+        weight_version_spans: list[WeightVersionSpan] = []
+        # Train tokens committed by earlier resp nodes; flattened span coordinates
+        # index the concatenated resp-node tokens (the loss_mask=1 response), so
+        # interleaved obs tokens are not part of the flattened coordinate system.
+        resp_train_token_count: int = 0
         spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
@@ -825,6 +835,16 @@ class SessionForest:
                     topk_token_ids.append(node.topk_token_ids_delta)
                     topk_log_probs.append(node.topk_logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
+                weight_version_spans.extend(
+                    WeightVersionSpan(
+                        version=span.version,
+                        token_start=resp_train_token_count + span.token_start,
+                        token_end=resp_train_token_count + span.token_end,
+                        attempt_seq=span.attempt_seq,
+                    )
+                    for span in node.weight_version_spans
+                )
+                resp_train_token_count += len(node.train_token_delta)
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
@@ -882,6 +902,7 @@ class SessionForest:
             custom_advantage=response_node_spans,
             loss_mask=loss_mask,
             weight_versions=weight_versions,
+            weight_version_spans=weight_version_spans,
             rollout_log_probs=rollout_log_probs,
             rollout_topk_token_ids=np.concatenate(topk_token_ids) if topk_token_ids else None,
             rollout_topk_log_probs=np.concatenate(topk_log_probs) if topk_log_probs else None,

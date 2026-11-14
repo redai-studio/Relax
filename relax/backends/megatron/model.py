@@ -1753,6 +1753,8 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
+    *,
+    consumed_weight_version: str | None = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -1766,6 +1768,7 @@ def train(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         data_iterator (Sequence[DataIterator]): Iterable(s) yielding training batches.
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
+        consumed_weight_version (str | None): Weight version the actor consumed for this rollout.
     """
     args = get_args()
     is_data_iterator = isinstance(data_iterator[0], DataIterator)
@@ -1905,7 +1908,13 @@ def train(
         with log_step_peak_memory(rollout_id, rollout_id * num_steps_per_rollout + step_id, memory_ranks, memory_role):
             with (
                 timer(f"train_micro_batch_{step_id}", keep=False),
-                observe_train_step(args, rollout_id, step_id, role=getattr(model[0], "role", "actor")),
+                observe_train_step(
+                    args,
+                    rollout_id,
+                    step_id,
+                    role=getattr(model[0], "role", "actor"),
+                    consumed_weight_version=consumed_weight_version,
+                ),
             ):
                 loss_dict, grad_norm = train_one_step(
                     args,
