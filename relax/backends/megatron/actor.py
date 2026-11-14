@@ -30,6 +30,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.inference.lifecycle import managed_weight_update
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -3051,6 +3052,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("old_actor")
 
     @timer
+    @managed_weight_update
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return

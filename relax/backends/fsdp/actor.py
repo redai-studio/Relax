@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import torch
 
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.inference.lifecycle import managed_weight_update
 from relax.engine.sft.runtime import is_i2i_sft
 from relax.models import flow_grpo
 from relax.models.generative import GenerativeModelAdapter
@@ -1354,6 +1355,7 @@ class FSDPTrainRayActor(TrainRayActor):
             except Exception as e:  # flushing must never break training either
                 logger.warning(f"[rollout {rollout_id}] metric flush skipped ({e}).")
 
+    @managed_weight_update
     def update_weights(self, *, offload_after_sync: bool = True) -> bool:
         """Stream the full transformer to every rollout engine (design doc
         10.3)."""

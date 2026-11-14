@@ -906,7 +906,7 @@ class RolloutManager(ReloadableMixin):
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, data_source=None):
+    def __init__(self, args, pg, data_source=None, *, inference_only: bool = False):
         self.pg = pg
         self.args = args
         self._engine_actor_states = _get_engine_actor_states()
@@ -916,25 +916,28 @@ class RolloutManager(ReloadableMixin):
 
         self.data_source = data_source
 
-        self.data_system_client = attach_tq_client(
-            self.args.tq_config,
-            role="rollout_worker",
-        )
-
-        logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
-        logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
-        self.generate_rollout = load_function(self.args.rollout_function_path)
-        self.eval_generate_rollout = load_function(self.args.eval_function_path)
-        self.custom_reward_post_process_func = None
-        if self.args.custom_reward_post_process_path is not None:
-            self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
-        self.custom_convert_samples_to_train_data_func = None
-        if self.args.custom_convert_samples_to_train_data_path is not None:
-            self.custom_convert_samples_to_train_data_func = load_function(
-                self.args.custom_convert_samples_to_train_data_path
+        self.data_system_client = None
+        if not inference_only:
+            self.data_system_client = attach_tq_client(
+                self.args.tq_config,
+                role="rollout_worker",
             )
 
-        if self.args.use_agentic_rollout:
+        if not inference_only:
+            logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
+            logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
+            self.generate_rollout = load_function(self.args.rollout_function_path)
+            self.eval_generate_rollout = load_function(self.args.eval_function_path)
+            self.custom_reward_post_process_func = None
+            if self.args.custom_reward_post_process_path is not None:
+                self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
+            self.custom_convert_samples_to_train_data_func = None
+            if self.args.custom_convert_samples_to_train_data_path is not None:
+                self.custom_convert_samples_to_train_data_func = load_function(
+                    self.args.custom_convert_samples_to_train_data_path
+                )
+
+        if self.args.use_agentic_rollout and not inference_only:
             from relax.agentic.rollout import init_agentic_resident_pipeline
 
             init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
@@ -978,7 +981,8 @@ class RolloutManager(ReloadableMixin):
         # any code that imports the module the normal way.
         import sys as _sys
 
-        _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
+        if not inference_only:
+            _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
