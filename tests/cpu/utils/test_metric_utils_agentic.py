@@ -136,7 +136,7 @@ def test_compute_metrics_from_samples_reports_agentic_metrics():
         ),
     ]
 
-    args = SimpleNamespace(log_reward_category=None, reward_key=None, log_passrate=False, advantage_estimator="ppo")
+    args = SimpleNamespace(log_reward_category=None, reward_key=None, log_passrate=False, advantage_estimator="ppo", custom_reward_post_process_path=None, agentic_custom_advantage_path=None, sglang_speculative_algorithm=None)
     metrics = rollout_module.compute_metrics_from_samples(args, samples)
 
     assert metrics["stop_reason/env_done/count"] == 1
