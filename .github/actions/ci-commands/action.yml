@@ -1,13 +1,18 @@
 name: CI commands
-description: Rerun or cancel the current PR's CI and show command help
+description: Manage PR CI, request cherry-picks, and show command help
+inputs:
+  cherry-pick-token:
+    description: Bot PAT used only to assign a cherry-pick label and trigger its workflow
+    required: false
 runs:
   using: composite
   steps:
     - uses: actions/github-script@v8
       env:
         CI_COMMANDS_PATH: ${{ github.action_path }}
+        CHERRY_PICK_BOT_TOKEN: ${{ inputs.cherry-pick-token }}
       with:
         retries: 0
         script: |
           const { run } = await import(`${process.env.CI_COMMANDS_PATH}/index.mjs`);
-          await run({ github, context, core });
+          await run({ github, context, core, cherryPickToken: process.env.CHERRY_PICK_BOT_TOKEN });

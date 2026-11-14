@@ -272,6 +272,7 @@ PRs run pre-commit checks, CPU/GPU unit tests, and GPU/NPU integration tests in 
 | `/rerun <target>` | Rerun one check and its dependents; `all` reruns the complete CI workflow, including training integrations |
 | `/cancel all` | Cancel the unified CI workflow, including all its matrix jobs |
 | `/help` | Show commands and targets |
+| `/cherry-pick <branch>` | Request a backport of a PR already merged into `main` |
 | `/review` | Request a code review |
 
 Use a job target for a narrow rerun, such as `/rerun ci/pre-commit` or `/rerun gpu-unit/cpu`.

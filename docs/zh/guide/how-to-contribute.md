@@ -272,6 +272,7 @@ PR 在一个 CI workflow 内运行 pre-commit 检查、CPU/GPU 单元测试和 G
 | `/rerun <target>` | 重跑一个检查及其下游任务；`all` 重跑整套 CI，包括训练集成测试 |
 | `/cancel all` | 取消统一 CI workflow，包括其全部矩阵 job |
 | `/help` | 查看指令和 target |
+| `/cherry-pick <branch>` | 请求回移已合入 `main` 的 PR |
 | `/review` | 请求代码 review |
 
 窄范围重跑使用 job target，例如 `/rerun ci/pre-commit` 或 `/rerun gpu-unit/cpu`。
