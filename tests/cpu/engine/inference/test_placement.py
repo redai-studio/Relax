@@ -612,10 +612,49 @@ def test_info_probe_uses_node_visibility_before_ray_narrows_actor_devices(monkey
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(physical))
     monkeypatch.setattr(ray._private.worker.global_worker, "original_visible_accelerator_ids", {"GPU": ["4", "7"]})
     monkeypatch.setattr(module, "ray_get_device_ids", lambda: [physical])
+    monkeypatch.setattr(module.device_utils, "get_ray_accelerator_name", lambda: "GPU")
     monkeypatch.setattr(
         module.ray,
         "get_runtime_context",
-        lambda: SimpleNamespace(get_node_id=lambda: "node", get_accelerator_ids=lambda: {"GPU": [str(physical)]}),
+        lambda: SimpleNamespace(
+            get_node_id=lambda: "node", get_accelerator_ids=lambda: {"FURIOSA": [], "GPU": [str(physical)]}
+        ),
     )
     implementation = module.InfoActor.__ray_metadata__.modified_class
     assert implementation().get_binding() == ("node", physical, expected)
+
+
+def test_info_probe_with_unallocated_accelerator_preserves_valid_tp_layout(monkeypatch):
+    from types import SimpleNamespace
+
+    import ray._private.worker
+
+    from relax.distributed.ray import placement_group as module
+
+    monkeypatch.setattr(
+        ray._private.worker.global_worker,
+        "original_visible_accelerator_ids",
+        {"FURIOSA": None, "GPU": ["4", "7"]},
+    )
+    monkeypatch.setattr(module.device_utils, "get_ray_accelerator_name", lambda: "GPU")
+    implementation = module.InfoActor.__ray_metadata__.modified_class
+    bindings = []
+    for physical in (4, 7):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(physical))
+        monkeypatch.setattr(module, "ray_get_device_ids", lambda: [physical])
+        monkeypatch.setattr(
+            module.ray,
+            "get_runtime_context",
+            lambda: SimpleNamespace(
+                get_node_id=lambda: "node-a",
+                get_accelerator_ids=lambda: {"FURIOSA": [], "GPU": [str(physical)]},
+            ),
+        )
+        bindings.append(implementation().get_binding())
+    binding = PlacementBinding(
+        object(), (0, 1), tuple(b[1] for b in bindings), tuple(b[0] for b in bindings), tuple(b[2] for b in bindings)
+    )
+    view = PlacementGroupView.from_binding(binding, PlacementOwner.MANAGER)
+    assert view.local_gpu_ids == (0, 1)
+    (slice_,) = PlacementPlanner().plan((_request(num_gpus=2, num_gpus_per_engine=2, bundle_offset=0),), view)
+    assert slice_.gpu_ids == (4,)

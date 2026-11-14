@@ -67,7 +67,7 @@ class InfoActor:
         from ray._private.worker import global_worker
 
         physical = int(ray_get_device_ids()[0])
-        resource = next(iter(ray.get_runtime_context().get_accelerator_ids()))
+        resource = device_utils.get_ray_accelerator_name()
         visible = global_worker.original_visible_accelerator_ids.get(resource)
         local = [int(device) for device in visible].index(physical) if visible is not None else physical
         return ray.get_runtime_context().get_node_id(), physical, local
