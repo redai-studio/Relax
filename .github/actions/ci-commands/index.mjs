@@ -9,9 +9,9 @@ function parseCommand(body) {
 }
 
 function help(targets) {
-  const rows = Object.entries(targets).map(
-    ([name, target]) => `| \`${name}\` | ${target.job || target.workflow} |`
-  )
+  const rows = Object.entries(targets)
+    .filter(([, target]) => !target.bypassOnly)
+    .map(([name, target]) => `| \`${name}\` | ${target.job || target.workflow} |`)
   return [
     '## CI commands',
     '',
@@ -22,8 +22,9 @@ function help(targets) {
     '- `/cherry-pick <branch>`: label a PR merged into main for the Cherry Pick workflow.',
     '',
     'Rerun/cancel require PR authorship or repository write access. Put the command on the first line.',
-    'Targets use workflow or workflow/job names, such as ci or ci/pre-commit. Job targets support rerun only.',
-    '`ci` covers pre-commit checks; `all` covers every configured workflow.',
+    'Use job targets such as ci/pre-commit or gpu-unit/cpu for narrow reruns. Job targets support rerun only.',
+    '`all` selects the unified CI workflow, including GPU/NPU training integrations.',
+    '`ci`, `gpu-unit`, and `integration` remain independent bypass scopes, not rerun/cancel targets.',
     '',
     '| Target | Check / workflow |',
     '| --- | --- |',

@@ -12,6 +12,11 @@ function resolveTarget(args, config, command) {
   if (name === 'all' || (name === 'failed' && command === 'rerun')) return { name }
   const target = Object.hasOwn(config.targets, name) && config.targets[name]
   if (!target) throw new Error(`Unknown target. Use /help for /${command} syntax.`)
+  if (target.bypassOnly) {
+    throw new Error(
+      'This target is a bypass scope, not a rerun/cancel target. Use a job target or explicit all; /help lists targets.'
+    )
+  }
   if (command === 'cancel' && target.job) {
     throw new Error('/cancel accepts workflow targets only. Use /help to list targets.')
   }
