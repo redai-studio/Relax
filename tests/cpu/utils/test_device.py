@@ -10,6 +10,7 @@ should only require a new ``AcceleratorType`` member plus one ``_BACKEND`` row
 import sys
 import types
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -307,3 +308,91 @@ class TestDeviceCpuHost:
     def test_mod_unknown_attribute_raises(self) -> None:
         with pytest.raises(AttributeError):
             device_module.definitely_not_a_torch_api
+
+
+@pytest.fixture
+def numa_runtime(monkeypatch):
+    nvml = types.SimpleNamespace(
+        nvmlInit=Mock(),
+        nvmlShutdown=Mock(),
+        nvmlDeviceGetHandleByUUID=Mock(return_value="physical-gpu-4"),
+        nvmlDeviceGetCpuAffinity=Mock(return_value=[0, 0, 1 << 2]),
+    )
+    properties = Mock(return_value=types.SimpleNamespace(uuid="physical-gpu-4"))
+    # Sparse CPU IDs exercise masks spanning multiple 64-bit words.
+    affinity = {0: {0, 130, 131}, 10: {0, 130, 131}, 11: {130, 131}}
+
+    def get_affinity(tid):
+        if tid == 12:
+            raise ProcessLookupError("thread exited")
+        return affinity[tid]
+
+    host = types.SimpleNamespace(
+        sched_getaffinity=get_affinity,
+        sched_setaffinity=Mock(),
+        listdir=Mock(return_value=["10", "11", "12"]),
+    )
+    monkeypatch.setattr(device, "_detect_accelerator", lambda: AcceleratorType.CUDA)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    monkeypatch.setattr(device, "os", host)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    return nvml, properties, host, affinity
+
+
+@pytest.mark.parametrize("uuid", ["physical-gpu-4", "GPU-physical-gpu-4"])
+def test_numa_affinity_uses_visible_device_uuid_and_binds_threads(numa_runtime, uuid) -> None:
+    nvml, properties, host, _ = numa_runtime
+    properties.return_value.uuid = uuid
+
+    device.set_numa_affinity(2)
+
+    properties.assert_called_once_with(2)
+    nvml.nvmlDeviceGetHandleByUUID.assert_called_once_with("GPU-physical-gpu-4")
+    nvml.nvmlDeviceGetCpuAffinity.assert_called_once_with("physical-gpu-4", 3)
+    host.listdir.assert_called_once_with("/proc/self/task")
+    assert host.sched_setaffinity.call_args_list == [((10, {130}),), ((11, {130}),)]
+    nvml.nvmlShutdown.assert_called_once_with()
+
+
+def test_numa_affinity_preserves_thread_cpu_restrictions(numa_runtime) -> None:
+    nvml, _, host, affinity = numa_runtime
+    nvml.nvmlDeviceGetCpuAffinity.return_value = [1, 0, (1 << 2) | (1 << 3)]
+    affinity[11] = {131}
+
+    device.set_numa_affinity(2)
+
+    assert host.sched_setaffinity.call_args_list == [((10, {0, 130, 131}),), ((11, {131}),)]
+
+
+def test_numa_affinity_skips_disjoint_cpu_restrictions(numa_runtime) -> None:
+    nvml, _, host, _ = numa_runtime
+    nvml.nvmlDeviceGetCpuAffinity.return_value = [2, 0, 0]
+
+    device.set_numa_affinity(2)
+
+    host.sched_setaffinity.assert_not_called()
+    nvml.nvmlShutdown.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure", ["uuid", "topology", "binding"])
+def test_numa_affinity_failure_still_shuts_down_nvml(numa_runtime, failure) -> None:
+    nvml, _, host, _ = numa_runtime
+    operation = {
+        "uuid": nvml.nvmlDeviceGetHandleByUUID,
+        "topology": nvml.nvmlDeviceGetCpuAffinity,
+        "binding": host.sched_setaffinity,
+    }[failure]
+    operation.side_effect = RuntimeError("affinity unavailable")
+
+    device.set_numa_affinity(2)
+
+    nvml.nvmlShutdown.assert_called_once_with()
+
+
+def test_numa_affinity_without_nvml_is_optional(numa_runtime, monkeypatch) -> None:
+    _, _, host, _ = numa_runtime
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+
+    device.set_numa_affinity(2)
+
+    host.sched_setaffinity.assert_not_called()
