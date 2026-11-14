@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 
+from relax.models.frozen_conditions import FrozenConditionCache, image_condition_key
+
 
 LORA_TARGETS = (
     "q_proj_mot_gen",
@@ -35,8 +37,6 @@ def configure_attention(implementation: str, deterministic: bool = False) -> Non
     os.environ["RELAX_ATTENTION_IMPLEMENTATION"] = implementation
     os.environ["RELAX_DETERMINISTIC_ATTENTION"] = "1" if deterministic else "0"
     if deterministic:
-        if implementation != "flash_attention_2":
-            raise ValueError("Deterministic attention validation currently requires FlashAttention 2")
         # Masked prefix attention uses Torch SDPA, and vision uses cuDNN.
         # FA2's flag alone does not make full-parameter backward repeatable.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -86,6 +86,8 @@ class SenseNovaSFTModel(torch.nn.Module):
         self.pipe = pipe
         self.training_mode = training_mode
         self.prefix_gradient_checkpointing = prefix_gradient_checkpointing
+        self.condition_cache: FrozenConditionCache | None = None
+        self.prefix_frozen = training_mode == "lora"
         if training_mode == "full":
             self._mark_fine_grained_modules()
 
@@ -111,7 +113,12 @@ class SenseNovaSFTModel(torch.nn.Module):
                 module.model.embed_tokens._fsdp_fine_grained = True
                 module.lm_head._fsdp_fine_grained = True
 
+    def condition_key(self, data: dict[str, Any]) -> bytes:
+        return image_condition_key(data, version="sensenova-prefix-v1", dtype=self.pipe.torch_dtype)
+
     def forward(self, data: dict[str, Any]) -> torch.Tensor:
+        from .pipeline import SenseNovaU1ImageUnit_EditImageEmbedder, SenseNovaU1ImageUnit_PromptEmbedder
+
         image = data["image"]
         shared = {
             "input_image": image,
@@ -124,11 +131,31 @@ class SenseNovaSFTModel(torch.nn.Module):
             "use_gradient_checkpointing_offload": False,
         }
         inputs = (shared, {"prompt": data["prompt"], "is_positive": True}, {"prompt": "", "is_positive": False})
-        # Only generation projections have adapters. Prefix/vision are frozen;
-        # never checkpoint the mutable prefix cache in this LoRA-only path.
-        with torch.no_grad() if self.training_mode == "lora" else nullcontext():
+        request = data.get("condition_request")
+        cached = None if request is None else request.tensors
+        # Custom prefix LoRA must retain gradients, even in LoRA training mode.
+        with torch.no_grad() if self.prefix_frozen else nullcontext():
             for unit in self.pipe.units:
-                inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+                if cached is not None and isinstance(unit, SenseNovaU1ImageUnit_EditImageEmbedder):
+                    continue
+                if cached is not None and isinstance(unit, SenseNovaU1ImageUnit_PromptEmbedder):
+                    from transformers.cache_utils import DynamicCache
+
+                    prefix = DynamicCache()
+                    for layer in range((len(cached) - 1) // 2):
+                        prefix.update(cached[f"key.{layer}"], cached[f"value.{layer}"], layer)
+                    inputs[1].update(past_key_values=prefix, indexes_image=cached["indexes_image"])
+                    self.condition_cache.hits += 1
+                    continue
+                with torch.profiler.record_function(type(unit).__name__):
+                    inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+                if request is not None and isinstance(unit, SenseNovaU1ImageUnit_PromptEmbedder):
+                    tensors = {"indexes_image": inputs[1]["indexes_image"]}
+                    for index, layer in enumerate(inputs[1]["past_key_values"].layers):
+                        tensors[f"key.{index}"] = layer.keys
+                        tensors[f"value.{index}"] = layer.values
+                    self.condition_cache.encodes += 1
+                    self.condition_cache.put(request.key, tensors)
         return flow_matching_loss(self.pipe, {**inputs[0], **inputs[1]})
 
 
@@ -165,6 +192,16 @@ class SenseNovaSFTAdapter:
     def prepare_for_sharding(self, model: SenseNovaSFTModel) -> None:
         # Match the reference BF16 adapter initialization before FP32 masters.
         model.pipe.to(dtype=torch.bfloat16)
+        model.prefix_frozen = not any(
+            parameter.requires_grad
+            for name, parameter in model.pipe.dit.named_parameters(remove_duplicate=False)
+            if not name.startswith(("fm_modules.", "language_model.lm_head."))
+            and not any(part.endswith("_mot_gen") for part in name.split("."))
+        )
+
+    def validate_condition_cache(self, model: SenseNovaSFTModel) -> None:
+        if not model.prefix_frozen:
+            raise ValueError("SenseNova condition reuse requires frozen vision and understanding parameters")
 
     def on_device_ready(self, model: SenseNovaSFTModel, device: torch.device) -> None:
         # Never move the already sharded parameters through Module.to().
@@ -195,33 +232,8 @@ class SenseNovaSFTAdapter:
 
     @staticmethod
     def load_image(path: Path, max_pixels: int, fixed_pixels: int | None = None) -> Any:
-        from PIL import Image
-        from torchvision.transforms import InterpolationMode, functional
+        from relax.engine.sft.image import load_sft_image
 
         from .processing import PATCH_SIZE
 
-        with Image.open(path) as source:
-            image = source.convert("RGB")
-        width, height = image.size
-        if fixed_pixels is not None and fixed_pixels > 0:
-            # Bi-directional rescale to the pixel budget (small images are
-            # upscaled), keeping the aspect ratio; mirrors the inference-side
-            # fixed-pixels tier semantics.
-            scale = (width * height / fixed_pixels) ** 0.5
-            height, width = int(round(height / scale)), int(round(width / scale))
-        elif width * height > max_pixels:
-            scale = (width * height / max_pixels) ** 0.5
-            height, width = int(height / scale), int(width / scale)
-        height, width = height // PATCH_SIZE * PATCH_SIZE, width // PATCH_SIZE * PATCH_SIZE
-        if fixed_pixels is not None and fixed_pixels > 0:
-            # A fixed budget is approximate after patch alignment. Keep at least
-            # one patch per axis, including for tiny budgets and extreme ratios.
-            height, width = max(PATCH_SIZE, height), max(PATCH_SIZE, width)
-        if min(height, width) <= 0:
-            raise ValueError(f"Image is smaller than patch size: {path}")
-        old_width, old_height = image.size
-        scale = max(width / old_width, height / old_height)
-        image = functional.resize(
-            image, (round(old_height * scale), round(old_width * scale)), interpolation=InterpolationMode.BILINEAR
-        )
-        return functional.center_crop(image, (height, width))
+        return load_sft_image(path, max_pixels, patch_size=PATCH_SIZE, fixed_pixels=fixed_pixels)

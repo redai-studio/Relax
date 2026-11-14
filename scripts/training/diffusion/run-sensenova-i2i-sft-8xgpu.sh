@@ -17,7 +17,9 @@ PREFIX_GRADIENT_CHECKPOINTING="${PREFIX_GRADIENT_CHECKPOINTING:-1}"
 # Opt in after validating host-memory headroom; zero preserves synchronous decoding.
 IMAGE_PREFETCH_DEPTH="${IMAGE_PREFETCH_DEPTH:-0}"
 IMAGE_PREFETCH_WORKERS="${IMAGE_PREFETCH_WORKERS:-2}"
-export IMAGE_PREFETCH_DEPTH IMAGE_PREFETCH_WORKERS
+CONDITION_CACHE_BYTES="${CONDITION_CACHE_BYTES:-0}"
+CONDITION_CACHE_ENTRIES="${CONDITION_CACHE_ENTRIES:-128}"
+export IMAGE_PREFETCH_DEPTH IMAGE_PREFETCH_WORKERS CONDITION_CACHE_BYTES CONDITION_CACHE_ENTRIES
 if [[ "$MODE" == full ]]; then
     LORA_RANK=0
     LR="${LR:-1e-6}"
@@ -40,6 +42,8 @@ print(json.dumps({
     "prefix_gradient_checkpointing": sys.argv[7] == "1",
     "image_prefetch_depth": int(os.environ["IMAGE_PREFETCH_DEPTH"]),
     "image_prefetch_workers": int(os.environ["IMAGE_PREFETCH_WORKERS"]),
+    "condition_cache_bytes": int(os.environ["CONDITION_CACHE_BYTES"]),
+    "condition_cache_entries": int(os.environ["CONDITION_CACHE_ENTRIES"]),
 }))
 PY
 )

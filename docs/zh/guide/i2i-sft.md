@@ -5,9 +5,25 @@
 head 无需挂载模型和原始图片。模型目录、metadata 和图片必须在所有训练 worker 上可见，
 checkpoint 输出目录必须跨 worker 共享。
 
-当前模型适配为 SenseNova U1.5 MoT Edit，支持全参或 LoRA、单张 source 条件图，
+默认模型适配为 SenseNova U1.5 MoT Edit，支持全参或 LoRA、单张 source 条件图，
 以及按顺序提供 source 和 glyph 两张条件图。target 图片是监督目标，不计入条件图数量。
 1024² 是像素预算，图片保持长宽比并对齐到模型 patch 大小。
+
+Qwen-Image-Edit 可通过 `relax.models.qwen_image.edit_sft.QwenImageEditSFTAdapter`
+进行单张条件图的 DiT LoRA 训练。两个模型共享按字节数和条目数限制的冻结条件缓存；
+默认关闭，设置 `CONDITION_CACHE_BYTES`、`CONDITION_CACHE_ENTRIES` 可启用。
+缓存仅属于当前 worker 中加载的冻结模型，恢复 checkpoint 后重新建立；
+不缓存训练噪声或目标图像的随机 VAE 采样。任一卡未命中时，各卡统一在线编码，
+避免 FSDP 通信顺序不一致。容量限制不包含当前训练激活和 CUDA allocator 预留。
+
+两个适配都支持已有的有界 CPU 图像预取。在 `--i2i-sft-config` 中设置
+`image_prefetch_depth=4`、`image_prefetch_workers=2`，可让解码、缩放与训练重叠，
+不改变样本顺序或缓存键。预取默认关闭；对比缓存收益时，两组应使用相同预取设置。
+
+Qwen 仅支持原始 Qwen-Image-Edit（非 Edit-Plus）、DiT LoRA、单张参考图，
+不使用 SenseNova 的 fixed pixel tiers。导出使用同一个命令，但 `--output` 指向新目录，
+结果可通过 Diffusers `pipeline.load_lora_weights` 加载，并保留 LoRA alpha/rank 缩放。
+启动命令、缓存依赖及运行指标见[冻结条件指南](../../en/guide/frozen-conditions.md)。
 
 ## 数据
 
