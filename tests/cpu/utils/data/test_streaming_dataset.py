@@ -334,13 +334,20 @@ class TestSampleBuffer:
 class TestPrefetchBuffer:
     """Tests for PrefetchBuffer race behavior."""
 
-    def test_chunk_size_is_clamped_to_cache_capacity(self):
+    @pytest.mark.parametrize("prepared", [False, True])
+    def test_chunk_size_is_clamped_to_cache_capacity(self, prepared):
         from relax.utils.data.streaming_dataset import PrefetchBuffer
 
-        def process_fn(idx: int) -> str:
+        def process_fn(idx: int, row=None) -> str:
             return f"sample-{idx}"
 
-        buffer = PrefetchBuffer(process_fn, chunk_size=8, max_cached=1, num_workers=1)
+        buffer = PrefetchBuffer(
+            process_fn,
+            chunk_size=8,
+            max_cached=1,
+            num_workers=1,
+            prepare_fn=(lambda indices: dict.fromkeys(indices)) if prepared else None,
+        )
         buffer.set_index_order([0])
         try:
             assert buffer.wait_for(0, timeout=2)
@@ -575,7 +582,8 @@ class TestPrefetchBuffer:
             release.set()
             buffer.stop()
 
-    def test_submission_retry_does_not_duplicate_already_submitted_samples(self, monkeypatch):
+    @pytest.mark.parametrize("prepared", [False, True])
+    def test_submission_retry_does_not_duplicate_already_submitted_samples(self, monkeypatch, prepared):
         import relax.utils.data.streaming_dataset as module
 
         original = module.ThreadPoolExecutor
@@ -592,13 +600,19 @@ class TestPrefetchBuffer:
 
         monkeypatch.setattr(module, "ThreadPoolExecutor", FlakyExecutor)
 
-        def process(idx):
+        def process(idx, row=None):
             calls.append(idx)
             if idx == 1:
                 raise ValueError("bad sample")
             return idx
 
-        buffer = module.PrefetchBuffer(process, chunk_size=3, max_cached=3, num_workers=2)
+        buffer = module.PrefetchBuffer(
+            process,
+            chunk_size=3,
+            max_cached=3,
+            num_workers=2,
+            prepare_fn=(lambda indices: dict.fromkeys(indices)) if prepared else None,
+        )
         buffer.set_index_order([0, 1, 2])
         try:
             for idx, expected in [(0, 0), (1, None), (2, 2)]:
@@ -606,6 +620,112 @@ class TestPrefetchBuffer:
                 assert buffer.get_cached(idx) == (True, expected)
             assert sorted(calls) == [0, 1, 2]
         finally:
+            buffer.stop()
+
+    @pytest.mark.parametrize("fallback", [False, True])
+    def test_prepared_rows_are_released_before_refilling_the_window(self, fallback, monkeypatch):
+        from weakref import WeakSet
+
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        live = WeakSet()
+        windows = []
+        ready = threading.Event()
+        release = threading.Event()
+        fallback_done = threading.Event()
+        background_checked = threading.Event()
+        import relax.utils.data.streaming_dataset as module
+
+        original_wait = module.wait
+
+        def observed_wait(*args, **kwargs):
+            if fallback_done.is_set():
+                background_checked.set()
+            return original_wait(*args, **kwargs)
+
+        monkeypatch.setattr(module, "wait", observed_wait)
+
+        class Row:
+            pass
+
+        def prepare(indices):
+            # Catch retained raw windows even after their samples were consumed.
+            assert len(live) + len(indices) <= 4
+            rows = {idx: Row() for idx in indices}
+            live.update(rows.values())
+            windows.append(indices)
+            if len(windows) == 1:
+                ready.set()
+                assert release.wait(2)
+            return rows
+
+        buffer = PrefetchBuffer(
+            lambda idx, row=None: idx, chunk_size=2, max_cached=4, num_workers=1, prepare_fn=prepare
+        )
+        buffer.set_index_order(list(range(12)))
+        try:
+            if fallback:
+                assert ready.wait(2)
+                for idx in range(4):
+                    assert buffer.get(idx) == idx
+                fallback_done.set()
+                assert background_checked.wait(2)
+            release.set()
+            for idx in range(4 if fallback else 0, 12):
+                assert buffer.wait_for(idx, timeout=2)
+                assert buffer.get_cached(idx) == (True, idx)
+            assert windows[0] == [0, 1, 2, 3]
+        finally:
+            release.set()
+            buffer.stop()
+
+    def test_slow_next_preparation_does_not_hold_completed_samples(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        preparing = threading.Event()
+        release = threading.Event()
+
+        def prepare(indices):
+            if indices[0] >= 4:
+                preparing.set()
+                assert release.wait(3)
+            return dict.fromkeys(indices)
+
+        def process(idx, row):
+            if idx == 2:
+                assert preparing.wait(2)
+            return idx
+
+        buffer = PrefetchBuffer(process, chunk_size=2, max_cached=4, num_workers=2, prepare_fn=prepare)
+        buffer.set_index_order(list(range(8)))
+        try:
+            for idx in range(2):
+                assert buffer.wait_for(idx, timeout=2)
+                assert buffer.get_cached(idx) == (True, idx)
+            assert preparing.wait(2)
+            # Raw I/O for the next window must not hold completed work from
+            # the previous one.
+            assert buffer.wait_for(2, timeout=0.5)
+            assert buffer.get_cached(2) == (True, 2)
+        finally:
+            release.set()
+            buffer.stop()
+
+    def test_preparation_timeout_finishes_generation_and_wakes_waiters(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        release = threading.Event()
+        buffer = PrefetchBuffer(lambda idx, row: idx, prepare_fn=lambda indices: release.wait(2))
+        buffer._indices = [0]
+        buffer._finished = False
+        buffer._PROCESS_TIMEOUT_SECONDS = 0.05
+        try:
+            with pytest.raises(TimeoutError, match="preparation timed out"):
+                buffer._run(buffer._stop)
+            assert buffer._finished
+            assert buffer.wait_for(0, timeout=0) is False
+        finally:
+            release.set()
             buffer.stop()
 
 

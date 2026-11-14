@@ -329,12 +329,26 @@ class CompositeStreamingReader:
             reader_idx, local_idx = self._locate_reader(global_idx)
             groups.setdefault(reader_idx, []).append((original_pos, idx, local_idx))
 
-        results: list[Optional[tuple[int, dict]]] = [None] * len(indices)
-        for reader_idx, entries in groups.items():
+        def read_group(group):
+            reader_idx, entries = group
             local_indices = [local_idx for _, _, local_idx in entries]
             fetched = list(self.readers[reader_idx].iter_batch(local_indices))
-            for (original_pos, external_idx, _), (_, data) in zip(entries, fetched, strict=True):
-                results[original_pos] = (external_idx, data)
+            return [
+                (position, (external_idx, row))
+                for (position, external_idx, _), (_, row) in zip(entries, fetched, strict=True)
+            ]
+
+        results: list[Optional[tuple[int, dict]]] = [None] * len(indices)
+        if len(groups) > 1:
+            # Keep independent file reads concurrent without one open per row.
+            with ThreadPoolExecutor(max_workers=min(4, len(groups)), thread_name_prefix="jsonl-read") as pool:
+                for fetched in pool.map(read_group, groups.items()):
+                    for position, item in fetched:
+                        results[position] = item
+        else:
+            for group in groups.items():
+                for position, item in read_group(group):
+                    results[position] = item
 
         for result in results:
             yield result
@@ -571,6 +585,8 @@ class PrefetchBuffer:
         chunk_size: int = 32,
         max_cached: int = 256,
         num_workers: int = 4,
+        *,
+        prepare_fn=None,
     ):
         """Initialize the prefetch buffer.
 
@@ -582,11 +598,16 @@ class PrefetchBuffer:
                 before the prefetch thread pauses.
             num_workers: Number of parallel workers in the internal
                 ``ThreadPoolExecutor`` for I/O-bound decoding.
+            prepare_fn: Optional ``fn(indices) -> {idx: raw_sample}`` for
+                grouped I/O. In this mode ``process_fn(idx, raw_sample)``
+                receives the prepared row. Raw and processed rows share the
+                same sample capacity; only physical read order changes.
         """
         self._process_fn = process_fn
         self._chunk_size = max(1, min(chunk_size, max_cached)) if max_cached > 0 else max(1, chunk_size)
         self._max_cached = max_cached
         self._num_workers = num_workers
+        self._prepare_fn = prepare_fn
 
         # Thread-safe cache: idx -> Optional[Sample]
         self._cache: dict[int, Optional[Sample]] = {}
@@ -753,13 +774,22 @@ class PrefetchBuffer:
         expired: set[Future] = set()
         consecutive_failures = 0
         pool: ThreadPoolExecutor | None = None
+        read_pool: ThreadPoolExecutor | None = None
+        preparation: Future | None = None
+        to_prepare: list[int] = []
+        prepare_started = 0.0
+        prepared: dict[int, Any] = {}
+        prepare_pos = 0
+        processed_limit = (
+            max(self._chunk_size, self._max_cached // 2) if self._prepare_fn is not None else self._max_cached
+        )
 
-        def process(idx: int) -> Optional[Sample]:
+        def process(idx: int, row=None) -> Optional[Sample]:
             with self._lock:
                 if stop_event is not self._stop or stop_event.is_set():
                     return None
                 started_at[idx] = time.monotonic()
-            return self._process_fn(idx)
+            return self._process_fn(idx, row) if self._prepare_fn is not None else self._process_fn(idx)
 
         def publish(idx: int, sample: Optional[Sample]) -> None:
             # Called under the generation lock, including for skipped samples.
@@ -772,7 +802,40 @@ class PrefetchBuffer:
 
         try:
             pool = ThreadPoolExecutor(max_workers=self._num_workers, thread_name_prefix="pf")
+            if self._prepare_fn is not None:
+                read_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pf-read")
             while not stop_event.is_set():
+                if preparation is not None:
+                    if preparation.done():
+                        rows = preparation.result()
+                        if set(rows) != set(to_prepare):
+                            raise ValueError("Prepared prefetch rows must match the requested indices")
+                        prepared = rows
+                        # Drop the Future's result before reserving another
+                        # window, so it cannot retain an already consumed one.
+                        preparation = None
+                        rows = None
+                    elif time.monotonic() - prepare_started >= self._PROCESS_TIMEOUT_SECONDS:
+                        raise TimeoutError("Prefetch batch preparation timed out")
+                # Reserve the next read window without advancing the consumer's
+                # cursor. A smaller processed queue leaves space to amortize I/O
+                # across more than one rolling worker window.
+                if self._prepare_fn is not None and not prepared and preparation is None:
+                    to_prepare = []
+                    with self._lock:
+                        if stop_event is not self._stop or stop_event.is_set():
+                            return
+                        occupied = set(self._cache) | set(pending.values())
+                        while prepare_pos < len(self._indices) and len(occupied) < self._max_cached:
+                            idx = self._indices[prepare_pos]
+                            prepare_pos += 1
+                            if idx not in occupied and idx not in self._fallback_fetched_indices:
+                                to_prepare.append(idx)
+                                occupied.add(idx)
+                    if to_prepare:
+                        assert read_pool is not None
+                        preparation = read_pool.submit(self._prepare_fn, to_prepare)
+                        prepare_started = time.monotonic()
                 with self._cache_updated:
                     if stop_event is not self._stop or stop_event.is_set():
                         return
@@ -782,25 +845,34 @@ class PrefetchBuffer:
                     while (
                         self._pos < len(self._indices)
                         and len(pending) < self._chunk_size
-                        and len(occupied) < self._max_cached
+                        and len(occupied) < processed_limit
                     ):
                         idx = self._indices[self._pos]
                         if idx in self._cache or idx in pending.values():
+                            prepared.pop(idx, None)
                             self._pos += 1
                             continue
+                        if self._prepare_fn is not None and idx not in prepared:
+                            break
                         if idx in self._fallback_fetched_indices:
+                            prepared.pop(idx, None)
                             self._fallback_fetched_indices.discard(idx)
                             self._prefetch_stale_drops += 1
                             self._pos += 1
                             continue
                         try:
-                            future = pool.submit(process, idx)
+                            future = (
+                                pool.submit(process, idx, prepared[idx])
+                                if self._prepare_fn is not None
+                                else pool.submit(process, idx)
+                            )
                         except Exception:
                             consecutive_failures += 1
                             logger.exception("Prefetch task submission failed for index %s", idx)
                             if consecutive_failures >= 3:
                                 return
                             break
+                        prepared.pop(idx, None)
                         pending[future] = idx
                         occupied.add(idx)
                         self._pos += 1
@@ -809,11 +881,18 @@ class PrefetchBuffer:
                         return
                     self._space_available.clear()
 
-                if not pending:
+                waiting = [*pending]
+                if preparation is not None:
+                    waiting.append(preparation)
+                if not waiting:
                     self._space_available.wait(timeout=0.1)
                     continue
 
-                done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                # Publish completed processing even while the next raw read
+                # is in flight; slow I/O must not hold ready samples hostage.
+                done = wait(waiting, timeout=0.1, return_when=FIRST_COMPLETED)[0]
+                done.discard(preparation)
+                waiting.clear()
                 with self._cache_updated:
                     if stop_event is not self._stop or stop_event.is_set():
                         return
@@ -841,10 +920,15 @@ class PrefetchBuffer:
                             logger.warning("Prefetch processing timed out for index %s", idx)
                             expired.add(future)
                             publish(idx, None)
+        except Exception:
+            logger.exception("Prefetch preparation failed")
+            raise
         finally:
             # Running calls cannot be killed; they never publish into a new epoch.
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
+            if read_pool is not None:
+                read_pool.shutdown(wait=False, cancel_futures=True)
             with self._cache_updated:
                 if stop_event is self._stop:
                     self._finished = True
