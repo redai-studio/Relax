@@ -61,7 +61,16 @@ class InfoActor:
         return ray.util.get_node_ip_address(), ray_get_device_ids()[0]
 
     def get_binding(self):
-        return ray.get_runtime_context().get_node_id(), int(ray_get_device_ids()[0])
+        # Ray records the node worker's visibility before narrowing it to this
+        # actor's allocation. Engine actors disable that narrowing and inherit
+        # this original list, so their local index must use the same mapping.
+        from ray._private.worker import global_worker
+
+        physical = int(ray_get_device_ids()[0])
+        resource = next(iter(ray.get_runtime_context().get_accelerator_ids()))
+        visible = global_worker.original_visible_accelerator_ids.get(resource)
+        local = [int(device) for device in visible].index(physical) if visible is not None else physical
+        return ray.get_runtime_context().get_node_id(), physical, local
 
 
 def sort_key(x):
@@ -166,6 +175,7 @@ def create_placement_group(
         pg_reordered_bundle_indices,
         pg_reordered_gpu_ids,
         tuple(bindings[index][0] for index in pg_reordered_bundle_indices),
+        tuple(bindings[index][2] for index in pg_reordered_bundle_indices),
     )
 
 

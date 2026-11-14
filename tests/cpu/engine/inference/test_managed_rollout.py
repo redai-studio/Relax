@@ -434,3 +434,29 @@ async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
     assert closes == ["closed"]
     assert killed == [worker]
     assert owner.pool is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort_fails", [False, True])
+async def test_shutdown_closes_worker_with_dead_slots_or_abort_failure(monkeypatch, abort_fails):
+    from unittest.mock import AsyncMock, MagicMock
+
+    owner = manager()
+    pool = owner.pool
+    engine = MagicMock()
+    owner.pool.backend.rollout_engines = [None, engine]
+    worker = MagicMock()
+    worker.close.remote = AsyncMock()
+
+    def abort_result(*args, **kwargs):
+        if abort_fails:
+            raise RuntimeError("abort failed")
+
+    monkeypatch.setattr(ray, "get", abort_result)
+    kill = MagicMock()
+    monkeypatch.setattr(ray, "kill", kill)
+    await owner.dispose(worker)
+    engine.abort_requests.remote.assert_called_once()
+    worker.close.remote.assert_awaited_once()
+    kill.assert_called_once_with(worker)
+    assert pool.backend.status == "disposed"

@@ -271,7 +271,23 @@ class InferenceManager:
             await self.ledger.drain("recovery", timeout=120)
         result = await _blocking(getattr(backend, method), *args, **kwargs)
         if method in {"get_rollout_engines_and_lock", "recover_rollout_engines"}:
-            self._recipients = {engine._actor_id.hex() for engine in result[0] if engine is not None}
+            # The sync transport exposes only each replica's first node. Capture
+            # every node in those exact replica generations before publishing
+            # success; a later replacement must not inherit this confirmation.
+            recipients = {engine._actor_id.hex() for engine in result[0] if engine is not None}
+            with backend._engine_lifecycle_lock:
+                for server in backend.servers.values():
+                    for group in server.engine_groups:
+                        slots = group.all_engines
+                        for first in range(0, len(slots), group.nodes_per_engine):
+                            head = slots[first]
+                            if head is not None and head._actor_id.hex() in recipients:
+                                recipients.update(
+                                    engine._actor_id.hex()
+                                    for engine in slots[first : first + group.nodes_per_engine]
+                                    if engine is not None
+                                )
+            self._recipients = recipients
             if method == "recover_rollout_engines" and self._recipients <= self.pool.synced_actor_ids:
                 self.ledger.fences.discard("recovery")
         if method == "register_recovered_engines":
@@ -314,11 +330,16 @@ class InferenceManager:
             self._disposed = True
             self.ledger.fences.add("shutdown")
             try:
-                if self.pool is not None:
-                    # Abort residual backend work even if its HTTP caller disappeared.
-                    engines = self.pool.backend.rollout_engines
-                    if engines:
-                        await _blocking(ray.get, [engine.abort_requests.remote() for engine in engines], timeout=10)
+                try:
+                    if self.pool is not None:
+                        # Dead engines leave empty slots in the backend topology.
+                        engines = [engine for engine in self.pool.backend.rollout_engines if engine is not None]
+                        if engines:
+                            await _blocking(
+                                ray.get, [engine.abort_requests.remote() for engine in engines], timeout=10
+                            )
+                except Exception:
+                    logger.exception("Could not abort residual requests during shutdown")
                 if worker is not None:
                     await asyncio.wait_for(worker.close.remote(), timeout=30)
                 await self.ledger.drain("shutdown", timeout=10)

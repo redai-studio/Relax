@@ -115,7 +115,7 @@ def test_planning_uses_original_probes_without_allocating_gpu_actors(monkeypatch
         ),
     )
     pg = SimpleNamespace(bundle_count=2)
-    binding = ProbedPlacementGroup(pg, [1, 0], [2, 3], ("node", "node"))
+    binding = ProbedPlacementGroup(pg, [1, 0], [4, 7], ("node", "node"), (0, 1))
     restored = ray.cloudpickle.loads(ray.cloudpickle.dumps(binding))
     assert len(restored) == 3
     assert restored.node_ids == ("node", "node")
@@ -131,7 +131,8 @@ def test_planning_uses_original_probes_without_allocating_gpu_actors(monkeypatch
         planner,
     )
     assert planner.allocations()[0].bundle_indices == (1,)
-    assert planner.allocations()[0].gpu_ids == (2,)
+    assert restored.local_gpu_ids == (0, 1)
+    assert planner.allocations()[0].gpu_ids == (4,)
     assert planner.allocations()[0].reserved_size == 2
     assert planner.allocations()[0].gpus_per_slot == 2
 
@@ -177,3 +178,29 @@ def test_pool_startup_failure_cleans_partial_engine_and_lock_ownership(monkeypat
     with pytest.raises(RuntimeError, match="startup failed"):
         RolloutPool(SimpleNamespace(), None)
     assert set(events) == {"engines-stopped", "routers-stopped", "killed:topology-lock"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_secondary", [False, True])
+async def test_manager_recovery_confirms_captured_multinode_generation(pool, replace_secondary):
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    group = pool.backend.servers["default"].engine_groups[0]
+    group.nodes_per_engine = 2
+    group.all_engines = [actor("recovered-head"), actor("recovered-secondary")]
+    group.engine_init_records[1] = SimpleNamespace(pending_router_registration=False)
+    pool.backend.recover_rollout_engines = lambda: ([group.all_engines[0]], None, 1, [], [])
+    owner = InferenceManager.__ray_metadata__.modified_class()
+    owner.pool = pool
+    owner.memory_ready = True
+    owner.state = LifecycleState.READY
+    assert not (await owner.snapshot()).models[0].admission
+    await owner.pool_call("recover_rollout_engines")
+    token = await owner.begin_weight_update("test")
+    assert not (await owner.snapshot()).models[0].admission
+    if replace_secondary:
+        group.all_engines[1] = actor("later-secondary")
+    await owner.end_weight_update(token)
+    assert (await owner.snapshot()).models[0].admission is (not replace_secondary)
+    assert "recovered-secondary" in pool.synced_actor_ids
+    assert "later-secondary" not in pool.synced_actor_ids

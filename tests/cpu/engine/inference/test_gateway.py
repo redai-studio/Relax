@@ -634,3 +634,30 @@ async def test_internal_generation_cancel_aborts_and_returns_permit():
             await task
         executor.abort.assert_awaited_once()
     assert not owner.inflight
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ReadError, httpx.ReadTimeout])
+async def test_gateway_response_body_failure_returns_502(error):
+    class BrokenBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise error("body disconnected")
+            yield b""
+
+    owner = _owner(_snapshot)
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
+
+    def upstream(request):
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, stream=BrokenBody())
+        if request.url.path == "/workers":
+            return httpx.Response(200, json={"workers": []})
+        return httpx.Response(200, json={})
+
+    await _use_upstream(gateway, upstream)
+    try:
+        response = await gateway.proxy(_request({"model": "model-a", "messages": []}), "v1/chat/completions")
+        assert response.status_code == 502
+        assert owner.inflight == set()
+    finally:
+        await gateway.close()

@@ -242,7 +242,10 @@ class InferenceGateway:
             return _json_error(502, f"Failed to connect to inference router: {exc}", code="upstream_unavailable")
         if upstream.headers.get("content-type", "").startswith("text/event-stream"):
             return self._stream_response(upstream, admitted)
-        content = await self._executor.read(admitted, upstream)
+        try:
+            content = await self._executor.read(admitted, upstream)
+        except httpx.RequestError as exc:
+            return _json_error(502, f"Failed to read inference response: {exc}", code="upstream_unavailable")
         if wrap_response and upstream.is_success:
             data = {"response": json.loads(content).get("text", "").strip()}
             return JSONResponse(

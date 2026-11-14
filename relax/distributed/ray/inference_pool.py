@@ -29,6 +29,7 @@ def plan_rollout(args: Any, binding: Any, planner: PlacementPlanner) -> None:
         PlacementOwner.CONTROLLER,
         identity=pg,
         node_ids=binding.node_ids,
+        local_gpu_ids=binding.local_gpu_ids,
         bundle_count=pg.bundle_count,
     )
     requests = []

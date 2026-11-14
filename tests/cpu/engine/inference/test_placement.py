@@ -599,3 +599,23 @@ def test_placement_binding_carries_probed_visible_indices_into_the_view():
     view = PlacementGroupView.from_binding(binding, PlacementOwner.MANAGER)
 
     assert view.local_gpu_ids == (1, 0) and view.gpu_ids == (7, 4)
+
+
+@pytest.mark.parametrize("physical, expected", [(4, 0), (7, 1)])
+def test_info_probe_uses_node_visibility_before_ray_narrows_actor_devices(monkeypatch, physical, expected):
+    from types import SimpleNamespace
+
+    import ray._private.worker
+
+    from relax.distributed.ray import placement_group as module
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(physical))
+    monkeypatch.setattr(ray._private.worker.global_worker, "original_visible_accelerator_ids", {"GPU": ["4", "7"]})
+    monkeypatch.setattr(module, "ray_get_device_ids", lambda: [physical])
+    monkeypatch.setattr(
+        module.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_node_id=lambda: "node", get_accelerator_ids=lambda: {"GPU": [str(physical)]}),
+    )
+    implementation = module.InfoActor.__ray_metadata__.modified_class
+    assert implementation().get_binding() == ("node", physical, expected)

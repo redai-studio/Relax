@@ -35,13 +35,21 @@ class ProbedPlacementGroup(tuple):
     with a full-GPU actor at rollout startup would deadlock colocated jobs.
     """
 
-    def __new__(cls, pg: Any, bundle_indices: list[int], gpu_ids: list[int], node_ids: tuple[str, ...]):
+    def __new__(
+        cls,
+        pg: Any,
+        bundle_indices: list[int],
+        gpu_ids: list[int],
+        node_ids: tuple[str, ...],
+        local_gpu_ids: tuple[int, ...] | None = None,
+    ):
         value = super().__new__(cls, (pg, bundle_indices, gpu_ids))
         value.node_ids = node_ids
+        value.local_gpu_ids = local_gpu_ids
         return value
 
     def __getnewargs__(self) -> tuple:
-        return (*self, self.node_ids)
+        return (*self, self.node_ids, self.local_gpu_ids)
 
 
 class PlacementOwner(str, Enum):
