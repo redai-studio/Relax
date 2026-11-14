@@ -48,6 +48,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
+from relax.utils.straggler import note_microbatch_tokens, straggler_timers
 from relax.utils.timer import timer
 from relax.utils.training.nonfinite_grad import (
     NonFiniteGradientNormError,
@@ -605,13 +606,17 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    config.timers = None
+    config.timers = straggler_timers("train")
     _validate_vit_lr_trainable_params(args, model)
 
     if args.optimizer_cpu_offload:
-        from .compat import patch_hdo_group_steps
+        from .compat import patch_hdo_gpu_gradient_stream, patch_hdo_group_steps, patch_hdo_native_fp32_gradients
 
         patch_hdo_group_steps()
+        if patch_hdo_gpu_gradient_stream():
+            logger.info("Enabled HDO GPU gradient stream dependency.")
+        if patch_hdo_native_fp32_gradients():
+            logger.info("Enabled HDO native FP32 GPU gradients.")
 
     optimizer = get_megatron_optimizer(
         config=config,
@@ -1116,8 +1121,7 @@ def forward_only(
         custom_before_log_prob_hook(args, model, store_prefix)
 
     forward_backward_func = get_forward_backward_func()
-    # Don't care about timing during evaluation
-    config.timers = None
+    config.timers = straggler_timers("forward_only", model, num_microbatches)
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
@@ -1390,6 +1394,7 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        note_microbatch_tokens(batch.get("total_lengths"))
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1565,6 +1570,9 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
+    timers = straggler_timers("train", model, num_microbatches)
+    if timers is not None:
+        get_model_config(model[0]).timers = timers
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
@@ -2126,6 +2134,11 @@ def save(
         args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    # Checkpoint planning can initialize NCCL communicators outside PyTorch's
+    # allocator. Return unused training cache before those CUDA allocations.
+    memory_before = available_memory()
+    clear_memory()
+    logger.info("Checkpoint cache release: before=%s after=%s", memory_before, available_memory())
     save_checkpoint(
         iteration,
         model,

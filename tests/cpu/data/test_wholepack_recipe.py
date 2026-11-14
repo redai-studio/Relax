@@ -58,7 +58,28 @@ def test_wholepack_scope_requires_explicit_recipe():
 
 
 @pytest.mark.parametrize("oversize", [False, True])
-def test_wholepack_real_sampler_checkpoint_replay(oversize):
+@pytest.mark.parametrize(
+    "dp,gbs,tp,capacity,pad",
+    [
+        (4, 400, 4, 262144, None),
+        (2, 20, 4, 262144, None),
+        (4, 40, 2, 131072, None),
+        (4, 4, 2, 131072, None),
+        (4, 4, 4, 262144, None),
+        (8, 800, 4, 262144, None),
+        (8, 1600, 4, 262144, None),
+        (14, 1400, 4, 262144, None),
+        (16, 1600, 4, 262144, None),
+        (16, 2048, 4, 262144, None),
+        (16, 16, 4, 262144, None),
+        (32, 1600, 2, 262144, None),
+        (16, 800, 2, 131072, None),
+        (32, 3200, 4, 262144, None),
+        (4, 40, 4, 1024, 1024),
+        (32, 1600, None, 131072, None),
+    ],
+)
+def test_wholepack_real_sampler_checkpoint_replay(oversize, dp, gbs, tp, capacity, pad):
     import transfer_queue
 
     if vars(transfer_queue).get("__relax_ci_stub__", False) or not hasattr(transfer_queue, "SeqlenBalancedSampler"):
@@ -68,7 +89,7 @@ def test_wholepack_real_sampler_checkpoint_replay(oversize):
 
     class Partition:
         def __init__(self):
-            self.metadata = {i: {"total_lengths": 1800 + (i * 997) % 6000, "producer": i} for i in range(1600)}
+            self.metadata = {i: {"total_lengths": 1800 + (i * 997) % 6000, "producer": i} for i in range(gbs)}
             if oversize:
                 self.metadata[0]["total_lengths"] = 300000
 
@@ -79,36 +100,59 @@ def test_wholepack_real_sampler_checkpoint_replay(oversize):
             self.metadata.update(values)
 
     partition = Partition()
-    sampler = wp.WholepackSampler(dp_size=16, capacity=262144)
+    sampler = wp.WholepackSampler(dp_size=dp, capacity=capacity, pad_size=pad, tp_size=tp, global_batch_size=gbs)
+    assert sampler.tp_size == (2 if tp is None else tp)
     original = []
     hashes, waves = set(), set()
-    for rank in range(16):
+    for rank in range(dp):
         ids, consumed = sampler.sample(
-            list(range(1600)), 100, "sft_train", "rollout_0", dp_rank=rank, batch_index=0, partition=partition
+            list(range(gbs)), gbs // dp, "sft_train", "rollout_0", dp_rank=rank, batch_index=0, partition=partition
         )
         assert ids == consumed
         original.append(ids)
         data = {"total_lengths": [partition.metadata[i]["total_lengths"] for i in ids]}
         meta = SimpleNamespace(global_indexes=ids, get_all_custom_meta=lambda: [partition.metadata[i] for i in ids])
-        wp.restore_plan(meta, data)
+        wp.restore_plan(meta, data, gbs)
         hashes.add(data[wp.PLAN_KEY]["sha256"])
         waves.add(data[wp.PLAN_KEY]["K"])
-        assert data["rollout_mini_global_sample_counts"] == [1600]
+        assert data["rollout_mini_global_sample_counts"] == [gbs]
         assert all(partition.metadata[i]["producer"] == i for i in ids)
-    assert sorted(i for ids in original for i in ids) == list(range(1600))
+    assert sorted(i for ids in original for i in ids) == list(range(gbs))
     assert len(hashes) == len(waves) == 1
-    recovered = wp.WholepackSampler(dp_size=16, capacity=262144)
+    recovered = wp.WholepackSampler(dp_size=dp, capacity=capacity, pad_size=pad, tp_size=tp, global_batch_size=gbs)
+    if gbs == 2048:
+        incompatible = wp.WholepackSampler(
+            dp_size=dp, capacity=capacity, pad_size=pad, tp_size=tp, global_batch_size=1600
+        )
+        with pytest.raises(ValueError, match="GBS mismatch"):
+            incompatible.load_checkpoint(copy.deepcopy(sampler.save_checkpoint()))
+        corrupt = copy.deepcopy(sampler.save_checkpoint())
+        for updates in corrupt["wholepack_metadata"].values():
+            for meta in updates.values():
+                if "slots" in meta.get(wp.PLAN_KEY, {}):
+                    meta[wp.PLAN_KEY]["global_count"] = 1600
+        with pytest.raises(ValueError, match="padding geometry mismatch"):
+            recovered.load_checkpoint(corrupt)
     recovered.load_checkpoint(copy.deepcopy(sampler.save_checkpoint()))
     partition = Partition()
-    for rank in reversed(range(16)):
-        ids, _ = recovered.sample([], 100, "sft_train", "rollout_0", dp_rank=rank, batch_index=0, partition=partition)
+    for rank in reversed(range(dp)):
+        ids, _ = recovered.sample(
+            [], gbs // dp, "sft_train", "rollout_0", dp_rank=rank, batch_index=0, partition=partition
+        )
         assert ids == original[rank]
         assert wp.PLAN_KEY in partition.metadata[ids[0]]
     # Eval still uses the existing balanced sampler, even with a smaller batch.
+    eval_per_rank = min(10, gbs // dp)
     ids, _ = recovered.sample(
-        list(range(160)), 10, "sft_eval", "eval_0", dp_rank=0, batch_index=0, partition=partition
+        list(range(dp * eval_per_rank)),
+        eval_per_rank,
+        "sft_eval",
+        "eval_0",
+        dp_rank=0,
+        batch_index=0,
+        partition=partition,
     )
-    assert len(ids) == 10
+    assert len(ids) == eval_per_rank
     assert ("eval_0", "sft_eval", 0) not in recovered.plan_metadata
 
 
@@ -209,3 +253,77 @@ def test_real_assignment_api_owns_cache_and_checkpoint_replay(invalid):
     assert len(calls) == 1
     with pytest.raises(ValueError, match="DP geometry"):
         cls(n_samples_per_prompt=1, dp_size=4).load_checkpoint(sampler.save_checkpoint())
+
+
+@pytest.mark.parametrize("dp,gbs,tp", [(0, 400, 4), (3, 400, 4), (8, 801, 4), (8, 0, 4), (8, 800, 3), (16, 2047, 4)])
+def test_wholepack_rejects_incomplete_geometry(dp, gbs, tp):
+    with pytest.raises(ValueError):
+        wp.WholepackSampler(dp_size=dp, global_batch_size=gbs, tp_size=tp)
+
+
+@pytest.mark.parametrize("wholepack", [False, True])
+@pytest.mark.parametrize("optimized", [False, True])
+def test_model_recipe_and_wholepack_are_independent(wholepack, optimized):
+    from relax.models.qwen3_5 import recipe
+
+    args = SimpleNamespace(
+        sft_wholepack=wholepack, custom_megatron_before_train_step_hook_path=recipe.ENTRY if optimized else None
+    )
+    assert wp.enabled(args) is wholepack
+    assert recipe.enabled(args) is optimized
+
+
+@pytest.mark.parametrize("wholepack", [False, True])
+@pytest.mark.parametrize("gbs", [16, 1600, 2048])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholepack, gbs, multimodal):
+    from relax.models.qwen3_5 import recipe
+
+    args = SimpleNamespace(
+        custom_megatron_before_train_step_hook_path=recipe.ENTRY,
+        sft_wholepack=wholepack,
+        tensor_model_parallel_size=4,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        n_samples_per_prompt=1,
+        expert_model_parallel_size=8,
+        expert_tensor_parallel_size=1,
+        qkv_format="thd",
+        use_dynamic_batch_size=True,
+        global_batch_size=gbs,
+        loss_type="sft",
+        train_backend="megatron",
+        max_staleness=1,
+        distributed_backend="nccl",
+        multimodal_keys={"image": "images"} if multimodal else None,
+        data_pad_size_multiplier=1024,
+        max_tokens_per_gpu=262144,
+        hidden_size=2048,
+        num_experts=256,
+        bf16=True,
+        use_distributed_optimizer=True,
+        sequence_parallel=True,
+        use_precision_aware_optimizer=True,
+        optimizer_cpu_offload=True,
+        optimizer_offload_fraction=0.0,
+    )
+    from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
+
+    configure_sft_data_pipeline(args)
+    assert not args.sft_async_prepack
+    assert args.sft_train_data_prefetch
+    recipe._check_args(args)
+    for key, value in (
+        ("pipeline_model_parallel_size", 2),
+        ("context_parallel_size", 2),
+        ("expert_model_parallel_size", 4),
+        ("expert_tensor_parallel_size", 2),
+        ("sft_async_prepack", True),
+        ("use_dynamic_batch_size", False),
+        ("data_pad_size_multiplier", 0),
+        ("rollout_batch_size", gbs + 1),
+    ):
+        invalid = copy.copy(args)
+        setattr(invalid, key, value)
+        with pytest.raises((AssertionError, ValueError)):
+            recipe._check_args(invalid)

@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,8 +9,9 @@ import torch.nn.functional as F
 from relax.utils.training import fused_ce
 
 
-@pytest.mark.parametrize("batch,rows", [(1, 7), (2, 7), (1, 1)])
-def test_te_adapter_normalizes_offset_transposed_labels(monkeypatch, batch, rows):
+@pytest.mark.parametrize("batch,rows,tp_size", [(1, 7, 1), (2, 7, 1), (1, 1, 1), (1, 7, 4)])
+def test_te_adapter_normalizes_labels_and_forwards_tp_group(monkeypatch, batch, rows, tp_size):
+    tp_group = SimpleNamespace(size=lambda: tp_size)
     # Actual MTP layout: contiguous [rows,1] can retain stride (1,128).
     parent = torch.arange(batch * 128).reshape(batch, 128) % 17
     labels = parent[:, 5 : 5 + rows].transpose(0, 1)
@@ -22,11 +25,12 @@ def test_te_adapter_normalizes_offset_transposed_labels(monkeypatch, batch, rows
             assert x.stride(-2) == 17
         assert kwargs["is_cg_capturable"] is True
         assert kwargs["reduce_loss"] is False
+        assert kwargs["dist_process_group"] is (tp_group if tp_size > 1 else None)
         torch.testing.assert_close(target.flatten(), labels.reshape(-1))
         return F.cross_entropy(x[0], target[0], reduction="none").unsqueeze(0)
 
     monkeypatch.setattr(fused_ce, "_te_ce", lambda: checked_kernel)
-    actual = fused_ce.te_cross_entropy(logits, labels)
+    actual = fused_ce.te_cross_entropy(logits, labels, tp_group)
     expected = F.cross_entropy(logits.reshape(-1, 17), labels.reshape(-1), reduction="none").reshape_as(labels)
     torch.testing.assert_close(actual, expected)
     upstream = torch.randn_like(actual)

@@ -310,10 +310,11 @@ export default defineConfig({
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
                 { text: 'FLOPs-aware Scheduling', link: '/en/guide/flops-aware-scheduling' },
-                { text: 'Qwen3.8 Flash/NV QSA', link: '/en/guide/qwen38-qsa' },
+                { text: 'Qwen3.8 QSA Backends', link: '/en/guide/qwen38-qsa' },
                 { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
                 { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
+                { text: 'Straggler Analysis', link: '/en/guide/straggler-profiler' },
                 {
                   text: 'External Model Integration',
                   link: '/en/guide/external-model-integration',
@@ -445,10 +446,11 @@ export default defineConfig({
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
                 { text: 'FLOPs 感知调度', link: '/zh/guide/flops-aware-scheduling' },
-                { text: 'Qwen3.8 Flash/NV QSA', link: '/zh/guide/qwen38-qsa' },
+                { text: 'Qwen3.8 QSA 后端', link: '/zh/guide/qwen38-qsa' },
                 { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
                 { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
+                { text: 'Straggler 分析', link: '/zh/guide/straggler-profiler' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' },
               ],
             },

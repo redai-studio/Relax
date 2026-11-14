@@ -2,10 +2,14 @@
 #
 # FLOPS estimation adapted from verl (volcengine/verl) under Apache License 2.0.
 
+import importlib
 import inspect
+import math
 from typing import Any, Sequence
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.training.gemma4_flops import estimate_gemma4_flops
 from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
 from relax.utils.training.qwen38_flops import _estimate_qwen38_flops
 
@@ -25,7 +29,6 @@ _DEVICE_FLOPS = {
     "MI355X": 2500e12,
     "H100": 989e12,  # gitleaks:allow
     "H800": 989e12,
-    "L20Y": 989e12,
     "H200": 989e12,
     "A100": 312e12,
     "A800": 312e12,
@@ -54,7 +57,8 @@ def _unit_convert(value: float, target_unit: str) -> float:
 def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> float:
     """Get theoretical BF16 peak FLOPS for the current GPU.
 
-    Returns ``float('inf')`` for unknown GPUs (MFU silently skipped).
+    Prefer the optional telemetry hook's device mapping when available. Returns
+    ``float('inf')`` for unknown GPUs (MFU silently skipped).
     """
     if device_name is None:
         try:
@@ -63,6 +67,17 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
             device_name = device_module.get_device_properties().name
         except (AttributeError, ImportError):
             device_name = "CPU"
+
+    hook = Envs.RELAX_TELEMETRY_HOOK
+    if hook:
+        try:
+            get_peak = getattr(importlib.import_module(hook), "get_device_peak_flops", None)
+            if callable(get_peak):
+                peak = get_peak(unit=unit, device_name=device_name)
+                if peak is not None and math.isfinite(peak) and peak > 0:
+                    return peak
+        except Exception as e:
+            logger.warning("Telemetry hook %r failed to query device peak FLOPS: %s: %s", hook, type(e).__name__, e)
 
     flops = float("inf")
     for key, value in sorted(_DEVICE_FLOPS.items(), key=lambda x: len(x[0]), reverse=True):
@@ -507,7 +522,10 @@ def _estimate_fallback_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 _ESTIMATE_FUNC = {
+    "gemma4": estimate_gemma4_flops,
+    "gemma4_text": estimate_gemma4_flops,
     "kimi_k3": estimate_kimi_k3_flops,
+    "kimi_k31": estimate_kimi_k3_flops,
     # Dense transformers (SwiGLU + GQA)
     "qwen2": _estimate_qwen2_flops,
     "qwen3": _estimate_qwen2_flops,
@@ -568,9 +586,9 @@ class FlopsCounter:
     def estimate(self, batch_seqlens, delta_time, **kwargs):
         """Return (estimated_tflops, peak_device_tflops).
 
-        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``. K3
-        honors independent frozen-region flags; other estimators retain their
-        existing 3x-forward training convention.
+        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``.
+        K3/K3.1 honors independent frozen-region flags; other estimators retain
+        their existing 3x-forward training convention.
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
@@ -584,7 +602,7 @@ class FlopsCounter:
             ):
                 if not self._warned_unsupported_trainability:
                     logger.warning(
-                        "K3 FLOPs/MFU omitted for LoRA or custom parameter masks: "
+                        "K3/K3.1 FLOPs/MFU omitted for LoRA or custom parameter masks: "
                         "HF config cannot determine adapter dimensions and actual trainability. "
                         "Token throughput and timing remain available."
                     )
@@ -596,6 +614,14 @@ class FlopsCounter:
             estimated_tflops = func(self.config, tokens_sum, batch_seqlens, delta_time, **kwargs)
         else:
             estimated_tflops = func(self.config, tokens_sum, batch_seqlens, delta_time)
+        if func is estimate_gemma4_flops and not math.isfinite(estimated_tflops):
+            if not self._warned_unsupported_trainability:
+                logger.warning(
+                    "Gemma4 FLOPs/MFU omitted: the estimator supports full-parameter causal text training "
+                    "without PLE, cross-layer KV sharing, adapters, custom parameter masks or MTP. "
+                    "Image/audio batches require a separate modality formula. Token throughput and timing remain available."
+                )
+                self._warned_unsupported_trainability = True
         if forward_only and func is not estimate_kimi_k3_flops:
             estimated_tflops /= 3
         peak_tflops = get_device_peak_flops(unit="T")

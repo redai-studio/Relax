@@ -27,6 +27,21 @@ logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
 
 
+def _has_image_inputs(multimodal_train_inputs) -> bool:
+    """Detect image payloads without requiring model-specific grid metadata."""
+    if multimodal_train_inputs is None:
+        return False
+    inputs = [multimodal_train_inputs] if isinstance(multimodal_train_inputs, dict) else multimodal_train_inputs
+    for mm_input in inputs:
+        if mm_input is None:
+            continue
+        for key in ("pixel_values", "image_position_ids", "image_grid_thw"):
+            value = mm_input.get(key)
+            if value is not None and (value.numel() > 0 if isinstance(value, torch.Tensor) else len(value) > 0):
+                return True
+    return False
+
+
 def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
     """Keep original CPU (T,H,W) geometry for model-specific FLOPs estimates.
 
@@ -728,12 +743,26 @@ def get_serve_url(route_prefix: str = "") -> str:
     return serve_url
 
 
+def checkpoint_resume_step(path: str, ckpt_step: Optional[int] = None) -> int:
+    """Return the next rollout ID from the committed native checkpoint
+    tracker."""
+    root = Path(path)
+    tracker = (root / "latest_checkpointed_iteration.txt").read_text().strip()
+    if not tracker.isdecimal():
+        raise ValueError(f"Resuming training requires a numeric checkpoint tracker: {root}")
+    iteration = ckpt_step if ckpt_step is not None and ckpt_step > 0 else int(tracker)
+    if not (root / f"iter_{iteration:07d}").is_dir():
+        raise ValueError(f"Committed checkpoint directory is missing: {root}/iter_{iteration:07d}")
+    return iteration + 1
+
+
 def recovery_load_path(args: Namespace) -> Optional[str]:
     """Determine the checkpoint path to load for recovery, if applicable."""
     if args.save is not None and os.path.exists(os.path.join(args.save, "latest_checkpointed_iteration.txt")):
         args.no_load_optim = args.no_save_optim
         args.no_load_rng = args.no_save_rng
         args.finetune = False
+        # A save may finish before teardown; use the backend's actual loaded step.
         args.start_rollout_id = None
         args.load = args.save
 

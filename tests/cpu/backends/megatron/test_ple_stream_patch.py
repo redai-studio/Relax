@@ -97,11 +97,22 @@ def test_ple_stream_patch_matches_reference_forward_and_hidden_gradient(dtype, k
 
 
 @pytest.mark.parametrize("outer_reentrant", [False, True])
-def test_ple_stream_patch_full_forward_inside_outer_checkpoint(monkeypatch, outer_reentrant):
+@pytest.mark.parametrize("chunk_rows", [3, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_ple_stream_patch_full_forward_inside_outer_checkpoint(monkeypatch, outer_reentrant, chunk_rows, dtype):
     from megatron.core.ssm import mamba_context_parallel
 
     from relax.models.qwen3_8.ops import ple_stream as ple_stream_patch
 
+    monkeypatch.setattr(ple_stream_patch, "_STREAM_CHUNK_ROWS", chunk_rows)
+    original_stream_forward = ple_stream_patch._stream_forward
+    processed_rows = []
+
+    def tracked_stream_forward(ple, hidden, *args):
+        processed_rows.append(hidden.shape[0])
+        return original_stream_forward(ple, hidden, *args)
+
+    monkeypatch.setattr(ple_stream_patch, "_stream_forward", tracked_stream_forward)
     torch.manual_seed(11)
     streams, channels, sequence_length, batch_size = 4, 8, 13, 1
     embedding_dim = 12
@@ -120,23 +131,26 @@ def test_ple_stream_patch_full_forward_inside_outer_checkpoint(monkeypatch, oute
     ple.norm_query = nn.Module()
     ple.norm_conv = nn.Module()
     for name in ("norm_key", "norm_query", "norm_conv"):
-        getattr(ple, name).weight = nn.Parameter(torch.randn(streams * channels), requires_grad=False)
+        getattr(ple, name).weight = nn.Parameter(torch.randn(streams * channels).to(dtype), requires_grad=False)
     ple.conv1d = nn.Module()
-    ple.conv1d.weight = nn.Parameter(torch.randn(streams * channels, 1, ple.conv_kernel_size), requires_grad=False)
-    ple.key_proj = nn.Linear(embedding_dim, streams * channels, bias=False)
-    ple.value_proj = nn.Linear(embedding_dim, channels, bias=False)
+    ple.conv1d.weight = nn.Parameter(
+        torch.randn(streams * channels, 1, ple.conv_kernel_size).to(dtype), requires_grad=False
+    )
+    ple.key_proj = nn.Linear(embedding_dim, streams * channels, bias=False, dtype=dtype)
+    ple.value_proj = nn.Linear(embedding_dim, channels, bias=False, dtype=dtype)
     ple.key_proj.requires_grad_(False)
     ple.value_proj.requires_grad_(False)
-    embeddings = torch.randn(sequence_length, batch_size, embedding_dim)
+    embeddings = torch.randn(sequence_length, batch_size, embedding_dim, dtype=dtype)
     ple.ple_embedding = nn.Module()
     ple.ple_embedding.forward = lambda _ids: embeddings
     positions = torch.arange(sequence_length).view(-1, 1)
+    positions[7:] -= 7
     ple._local_positions = lambda _length: positions
     monkeypatch.setattr(ple_stream_patch.parallel_state, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(mamba_context_parallel, "reconstruct_tensor_cp", lambda tensor, *_args, **_kwargs: tensor)
     monkeypatch.setattr(mamba_context_parallel, "split_tensor_cp", lambda tensor, *_args, **_kwargs: tensor)
 
-    hidden = torch.randn(sequence_length, batch_size, streams * channels)
+    hidden = torch.randn(sequence_length, batch_size, streams * channels, dtype=dtype)
     reference_hidden = hidden.detach().requires_grad_(True)
     reference = _reference_ple(ple, reference_hidden, ple.key_proj(embeddings), ple.value_proj(embeddings), positions)
     upstream = torch.randn_like(reference)
@@ -148,5 +162,9 @@ def test_ple_stream_patch_full_forward_inside_outer_checkpoint(monkeypatch, oute
         use_reentrant=outer_reentrant,
     )
     streamed.backward(upstream)
-    torch.testing.assert_close(streamed, reference, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(streamed_hidden.grad, reference_hidden.grad, rtol=1e-6, atol=1e-6)
+    tolerance = 1e-6 if dtype == torch.float32 else 6e-3
+    torch.testing.assert_close(streamed, reference, rtol=tolerance, atol=tolerance)
+    # Overlapping halos change the BF16 gradient accumulation order by a few ULPs.
+    grad_rtol = 2e-2 if dtype == torch.bfloat16 and chunk_rows < sequence_length else tolerance
+    torch.testing.assert_close(streamed_hidden.grad, reference_hidden.grad, rtol=grad_rtol, atol=tolerance)
+    assert max(processed_rows) <= chunk_rows + ple.halo

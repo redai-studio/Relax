@@ -44,7 +44,7 @@ class HealthStatus:
 
     HEARTBEAT_TIMEOUT = 120.0
 
-    def __init__(self, fault_generation: int | None = None) -> None:
+    def __init__(self, fault_generation: int | None = None, fault_seed: dict | None = None) -> None:
         """Initialize with empty health state."""
         self.state: Dict[str, ServiceHealthState] = {}
         self._fault_generation = None
@@ -61,6 +61,21 @@ class HealthStatus:
                 self._fault_source = FaultSource(fault_generation)
             except Exception:
                 self._fault_observation_error = True
+        from relax.utils.fault_events.receipts import create_inbox
+
+        try:
+            self._fault_receipts = create_inbox(fault_seed, self._fault_generation)
+        except (ValueError, TypeError):
+            self._fault_receipts = None
+        self._fault_observation_error |= fault_seed is not None and self._fault_receipts is None
+
+    def record_recovery_receipt(self, token: dict, operation: str, outcome: str) -> str:
+        if self._fault_receipts is None:
+            return "invalid"
+        try:
+            return self._fault_receipts.receive(token, operation, outcome)
+        except (ValueError, TypeError):
+            return "invalid"
 
     def _observe(self, method: str, *args: Any) -> Any:
         if self._fault_source is None:
@@ -223,7 +238,7 @@ class HealthStatus:
         observed = self._observe("snapshot", roles.copy())
         return {
             "roles": roles,
-            **snapshot_details(observed, self._fault_generation, self._fault_observation_error),
+            **snapshot_details(observed, self._fault_generation, self._fault_observation_error, self._fault_receipts),
         }
 
     def get_stale_services(self) -> List[str]:
@@ -443,16 +458,22 @@ class HealthManager:
         check_interval: Seconds between health checks (default: 1.0)
     """
 
-    def __init__(self, check_interval: float = 1.0, config: Optional[Any] = None, fault_events: Any = None):
+    def __init__(
+        self,
+        check_interval: float = 1.0,
+        config: Optional[Any] = None,
+        fault_events: Any = None,
+        fault_recovery: Any = None,
+    ):
         """Initialize health manager.
 
         Args:
             check_interval: Interval for periodic health checks.
         """
         self._fault_events = fault_events
-        generation = fault_events.bind_source()[0] if fault_events is not None else None
+        generation, seed = fault_events.bind_source(fault_recovery) if fault_events is not None else (None, None)
         status_class = HealthStatus.options(**with_control_plane_affinity(config))
-        self.status = status_class.remote(fault_generation=generation)
+        self.status = status_class.remote(fault_generation=generation, fault_seed=seed)
         self._checker: Optional[HealthChecker] = None
         self._check_interval = check_interval
         logger.info("HealthManager initialized")
