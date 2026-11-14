@@ -77,6 +77,11 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
             use_dynamic_global_batch_size=partial_rollout and dynamic_global_batch_size,
             debug_rollout_only=False,
             reward_key=reward_key,
+            sglang_enable_deterministic_inference=False,
+            use_rollout_indexer_replay=False,
+            lora_rank=0,
+            lora_adapter_mode=False,
+            slime_router_sticky=False,
         )
         state = SimpleNamespace(
             last_step_current_deficit=0,

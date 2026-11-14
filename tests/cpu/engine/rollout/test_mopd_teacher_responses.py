@@ -26,6 +26,7 @@ def rollout(monkeypatch):
         opd_teacher_timeout_s=10,
         opd_teacher_key="data_source",
         opd_teacher_routes_map={"A": ["http://a/generate"], "B": ["http://b/generate"]},
+        sglang_enable_deterministic_inference=False,
     )
     manager = opd.OpdManager(args)
     state = SimpleNamespace(
