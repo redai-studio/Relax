@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import threading
 import time
 from argparse import Namespace
@@ -109,14 +110,16 @@ class Actor(Base):
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
         self._peer_barrier: Optional[PeerStepBarrier] = None
 
-    def set_rollout_manager(self, rollout_manager: Any) -> None:
+    async def set_rollout_manager(self, rollout_manager: Any) -> None:
         """Set the rollout manager and initialize weights."""
         self.rollout_manager = rollout_manager
-        self.actor_model.set_rollout_manager(self.rollout_manager)
+        await asyncio.to_thread(self.actor_model.set_rollout_manager, self.rollout_manager)
 
         # The backend owns sync and offload lifecycles. SFT syncs before predict.
         if (not self.config.fully_async or self.config.hybrid) and not is_offline_mode(self.config):
-            self.actor_model.update_weights()
+            # Export/publication may take minutes; keep Serve's event loop
+            # responsive to health probes while waiting for the train actors.
+            await asyncio.to_thread(self.actor_model.update_weights)
 
     def set_barriers(
         self,
@@ -145,7 +148,7 @@ class Actor(Base):
         set_managed_opd_teacher_on_train_group(self.actor_model, teacher_manager)
         self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
-    def update_weights_fully_async(
+    async def update_weights_fully_async(
         self,
         rollout_only: bool = False,
         actor_fwd_only: bool = False,
@@ -154,7 +157,12 @@ class Actor(Base):
         from relax.utils.fault_events.receipts import emit_receipt
 
         try:
-            self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+            await asyncio.to_thread(
+                self.actor_model.update_weights_fully_async,
+                0,
+                rollout_only=rollout_only,
+                actor_fwd_only=actor_fwd_only,
+            )
         except Exception:
             emit_receipt(self, recovery_token, "actor_send", "failed")
             raise

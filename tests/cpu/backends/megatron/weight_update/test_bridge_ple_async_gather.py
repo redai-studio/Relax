@@ -6,7 +6,7 @@ import ast
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -49,16 +49,20 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
     gdn_split_sizes = {dense_names[0]: (1,)} if dense_names else {}
     async_calls, sync_calls, produced_shards = [], [], []
 
-    def gather_async(pairs: list, *, gdn_split_sizes: dict) -> list[torch.Tensor]:
+    def gather_async(pairs: list, *, gdn_split_sizes: dict, agreement=None) -> list[torch.Tensor]:
         assert gdn_split_sizes is actor._gdn_split_sizes
         assert [info.name for info, _ in pairs] == dense_names
         async_calls.append(dense_names)
         return [param + 100 for _, param in pairs]
 
-    def gather_sync(args: SimpleNamespace, name: str, param: torch.Tensor) -> torch.Tensor:
+    def gather_sync(args: SimpleNamespace, name: str, param: torch.Tensor, *, agreement=None) -> torch.Tensor:
         assert not async_mode and name in dense_names
         sync_calls.append(name)
         return param + 100
+
+    convert_checked = next(
+        node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "_convert_checked"
+    )
 
     def convert(name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         assert name in dense_names
@@ -72,7 +76,7 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
 
     converter = SimpleNamespace(
         init_tasks=lambda: None,
-        broadcast_and_apply_configs=lambda: None,
+        broadcast_and_apply_configs=lambda agreement=None: None,
         convert=convert,
         iter_ple_shards=ple_shards,
     )
@@ -93,7 +97,8 @@ def test_bridge_iterator_preserves_ple_shards_with_async_gather(async_mode: bool
         "all_gather_param": gather_sync,
         "all_gather_params_async": gather_async,
     }
-    exec(compile(ast.Module(body=[suffix, method], type_ignores=[]), str(source), "exec"), namespace)
+    exec(compile(ast.Module(body=[suffix, method, convert_checked], type_ignores=[]), str(source), "exec"), namespace)
+    actor._convert_checked = MethodType(namespace["_convert_checked"], actor)
     stream = namespace["_iter_hf_params"](actor, {}, include_experts=False)
     assert produced_shards == []
     expected_shards = []

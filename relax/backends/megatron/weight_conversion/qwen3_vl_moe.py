@@ -4,6 +4,8 @@ import re
 
 import torch
 
+from .qwen3_vl_vision import convert_qwen3vl_vision_to_hf
+
 
 def convert_qwen3vlmoe_to_hf(args, name, param):
     if name.startswith("module.module.language_model."):
@@ -14,8 +16,7 @@ def convert_qwen3vlmoe_to_hf(args, name, param):
         name = name.replace("module.module.module.", "module.module.", 1)
 
     if name.startswith("module.module.vision_model."):
-        hf_name = "model.visual." + name[len("module.module.vision_model.") :]
-        return [(hf_name, param)]
+        return convert_qwen3vl_vision_to_hf(args, name, param)
 
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.language_model.embed_tokens.weight", param)]
@@ -122,13 +123,10 @@ def convert_qwen3vlmoe_to_hf(args, name, param):
             return [(f"{base}.mlp.down_proj.weight", param)]
 
         # ── Layer norms ──────────────────────────────────────────────────
-        elif rest == "self_attention.linear_qkv.layer_norm_weight":
+        elif rest in ("self_attention.linear_qkv.layer_norm_weight", "input_layernorm.weight"):
             return [(f"{base}.input_layernorm.weight", param)]
 
-        elif rest == "mlp.linear_fc1.layer_norm_weight":
-            return [(f"{base}.post_attention_layernorm.weight", param)]
-
-        elif rest == "pre_mlp_layernorm.weight":
+        elif rest in ("mlp.linear_fc1.layer_norm_weight", "pre_mlp_layernorm.weight"):
             return [(f"{base}.post_attention_layernorm.weight", param)]
 
         # ── QK norm ──────────────────────────────────────────────────────

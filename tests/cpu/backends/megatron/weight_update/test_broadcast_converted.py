@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from relax.distributed.weight_sync import traffic
 from relax.utils.types import ParamInfo
 
 
@@ -27,6 +28,7 @@ _SOURCE = Path(__file__).resolve().parents[5] / "relax/backends/megatron/weight_
 _FUNCTIONS = {
     "_broadcast_converted_bucket",
     "_broadcast_converted_phase",
+    "_converted_phase_steps",
     "_compute_slot_size",
     "_decode_metadata",
     "_encode_metadata",
@@ -38,7 +40,7 @@ _nodes = [
     if (isinstance(node, ast.FunctionDef) and node.name in _FUNCTIONS)
     or (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in _CONSTANTS for t in node.targets))
 ]
-_scope = {"torch": torch, "dist": torch.distributed, "mpu": SimpleNamespace()}
+_scope = {"torch": torch, "dist": torch.distributed, "mpu": SimpleNamespace(), "traffic": traffic}
 exec(compile(ast.Module(body=_nodes, type_ignores=[]), str(_SOURCE), "exec"), _scope)
 _broadcast_converted_bucket = _scope["_broadcast_converted_bucket"]
 _broadcast_converted_phase = _scope["_broadcast_converted_phase"]

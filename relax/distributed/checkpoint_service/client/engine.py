@@ -95,6 +95,9 @@ class CheckpointEngineClient:
             device_id=device_id,
             metadata=metadata or {},
         )
+        import uuid
+
+        self.role_info.metadata["worker_incarnation"] = uuid.uuid4().hex
         self.args = args
         self.backend_type = backend_type
         self._backend: Optional[CommBackend] = None
@@ -272,9 +275,18 @@ class CheckpointEngineClient:
         )
         if not self.need_update_ref and self.role == "reference":
             return
+        previous_rollout, occurrence = getattr(self, "_forward_update_occurrence", (None, -1))
+        occurrence = occurrence + 1 if previous_rollout == rollout_id else 0
+        self._forward_update_occurrence = (rollout_id, occurrence)
         response = await self._http_client.get(
             f"{self.coordinator_url}/get_model_update_group_ranks",
-            params={"role": self.role, "rank": self.rank, "need_update_ref": self.need_update_ref},
+            params={
+                "role": self.role,
+                "rank": self.rank,
+                "need_update_ref": self.need_update_ref,
+                "rollout_id": rollout_id,
+                "occurrence": occurrence,
+            },
         )
         response.raise_for_status()
         data = response.json()

@@ -18,6 +18,7 @@ from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, encode_
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
+from relax.utils.http_utils import get_serve_http_port
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
@@ -474,6 +475,10 @@ def post_process_env(args, env):
 
     if "env_vars" not in env or not isinstance(env["env_vars"], dict):
         env["env_vars"] = {}
+    # Resolve once for the driver and every explicitly configured Ray worker.
+    port = str(get_serve_http_port(env["env_vars"].get("RELAX_SERVE_HTTP_PORT")))
+    env["env_vars"]["RELAX_SERVE_HTTP_PORT"] = port
+    os.environ["RELAX_SERVE_HTTP_PORT"] = port
 
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
@@ -738,7 +743,7 @@ def get_serve_url(route_prefix: str = "") -> str:
     if route_prefix and not route_prefix.startswith("/"):
         route_prefix = "/" + route_prefix
 
-    serve_url = f"http://{head_ip}:{8000}{route_prefix}"
+    serve_url = f"http://{head_ip}:{get_serve_http_port()}{route_prefix}"
     logger.info("Serve URL: %s", serve_url)
     return serve_url
 
