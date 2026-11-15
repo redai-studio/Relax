@@ -17,6 +17,7 @@ import pytest
 
 from relax.utils.data.flops_scheduling import build_estimator
 
+
 _QWEN3_CONFIG = {
     "model_type": "qwen3",
     "hidden_size": 2560,
