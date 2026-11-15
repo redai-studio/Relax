@@ -26,6 +26,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
+from relax.utils.straggler import straggler_rollout_end
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
@@ -460,6 +461,9 @@ def get_batch(
     else:
         batch, _ = next(data_iterator)
 
+    from relax.utils.agentic_obs.train_hooks import capture_training_input
+
+    capture_training_input(batch)
     if isinstance(batch, PrepackedBatch):
         return batch
 
@@ -685,6 +689,11 @@ def get_batch(
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.
         packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
+        # Zigzag CP pads each sample separately; valid tokens need not form a prefix.
+        valid_lengths = [sample.numel() for sample in batch["unconcat_tokens"]]
+        packed_seq_params.valid_seqlens_q_cpu = valid_lengths + [0] * (len(cu_seqlens_cpu) - 1 - len(valid_lengths))
+        # Auxiliary attention losses must exclude the optional padding-only tail.
+        packed_seq_params.num_valid_tokens = sum(valid_lengths)
         select_offsets = list(cu_seqlens_cpu)
         if allgather_cp:
             select_offsets[-1] += pad
@@ -883,7 +892,7 @@ def get_batch(
         Envs.RELAX_SFT_SELECTIVE_LOGITS
         and cp_size == 1
         and qkv_format == "thd"
-        and not has_mm_inputs
+        and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
         and "unsplit_tokens" not in batch
         and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"
@@ -908,6 +917,15 @@ def get_batch(
             [rows.numel() for rows in getattr(packed_seq_params, "relax_sft_selective_mtp_rows", ())],
         )
     batch.pop("selective_loss_masks_cpu", None)
+    for packed_key in ("packed_seq_params", "vlm_packed_seq_params"):
+        if batch.get(packed_key) is not None:
+            batch[packed_key].is_dummy = batch.get("__is_dummy__", False)
+            if not is_sft_mode(get_args()) and not is_preference_mode(get_args()) and "response_lengths" in batch:
+                # Visual placeholders belong to the prompt, not generated token IDs.
+                batch[packed_key].prompt_lengths = [
+                    total - response
+                    for total, response in zip(batch["total_lengths"], batch["response_lengths"], strict=True)
+                ]
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     if pack_device is not None:
         batch = PrepackedBatch(batch)
@@ -1500,7 +1518,12 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "dataset_ids",
                 "sample_index_mask_sums",
+                # An opaque join key, not a measurement: averaging it would put a
+                # meaningless ~1e18 scalar on the metrics dashboard.
+                "sample_export_ids",
+                "agentic_group_ids",
                 "rollout_routed_experts",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
@@ -1695,6 +1718,8 @@ def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter 
         ),
         flops_counter=flops_counter,
         world_size=dist.get_world_size(),
+        # A Gloo collective once per window: every rank of the actor group must reach it.
+        extra_metrics=straggler_rollout_end(rollout_id),
     )
 
 

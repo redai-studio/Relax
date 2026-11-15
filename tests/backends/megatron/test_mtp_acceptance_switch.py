@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.backends.megatron.test_selective_mtp_loss import Head, ce, patch
+from tests.cpu.backends.megatron.test_selective_mtp_loss import Head, ce, patch
 
 
 @pytest.mark.parametrize("fused_ce", [False, True])

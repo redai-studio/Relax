@@ -49,8 +49,8 @@ def _reference(inputs: list[torch.Tensor], indices: torch.Tensor, upstream: torc
     """Query chunks bound memory; no production attention/mask implementation
     used."""
     q, k, v = inputs
-    k = k[:, 0].float().detach().requires_grad_()
-    v = v[:, 0].float().detach().requires_grad_()
+    k = k.float().detach().requires_grad_()
+    v = v.float().detach().requires_grad_()
     output = torch.empty_like(q, dtype=torch.float32)
     dq = torch.empty_like(q, dtype=torch.float32)
     dk, dv = torch.zeros_like(k), torch.zeros_like(v)
@@ -60,15 +60,16 @@ def _reference(inputs: list[torch.Tensor], indices: torch.Tensor, upstream: torc
         selected = indices[start:end].long()
         valid = selected >= 0
         selected = selected.clamp_min(0)
-        keys, values = k[selected], v[selected]
-        scores = torch.einsum("chd,csd->chs", query, keys) * (256**-0.5)
+        keys = k[selected].repeat_interleave(q.shape[1] // k.shape[1], dim=2)
+        values = v[selected].repeat_interleave(q.shape[1] // v.shape[1], dim=2)
+        scores = torch.einsum("chd,cshd->chs", query, keys) * (256**-0.5)
         weights = torch.softmax(scores.masked_fill(~valid[:, None], -torch.inf), dim=-1)
-        result = torch.einsum("chs,csd->chd", weights, values)
+        result = torch.einsum("chs,cshd->chd", weights, values)
         gradients = torch.autograd.grad(result, (query, k, v), upstream[start:end].float())
         output[start:end], dq[start:end] = result.detach(), gradients[0]
         dk.add_(gradients[1])
         dv.add_(gradients[2])
-    return output, dq, dk.unsqueeze(1), dv.unsqueeze(1)
+    return output, dq, dk, dv
 
 
 def _metrics(got: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
@@ -81,14 +82,17 @@ def _metrics(got: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     }
 
 
-def _run_case(lengths: tuple[int, ...], budget: int) -> None:
+def _run_case(lengths: tuple[int, ...], budget: int, geometry=(12, 1)) -> None:
     from relax.models.qwen3_8 import qsa_community as patch
     from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
 
     torch.manual_seed(20261013)
     selection = _routes(lengths, budget)
     length = sum(lengths)
-    values = [torch.randn(length, heads, 256, dtype=torch.bfloat16, device="cuda") for heads in (12, 1, 1)]
+    values = [
+        torch.randn(length, heads, 256, dtype=torch.bfloat16, device="cuda")
+        for heads in (geometry[0], geometry[1], geometry[1])
+    ]
     actual_inputs = [value.detach().requires_grad_() for value in values]
     upstream = torch.randn_like(values[0])
     actual = patch._community_id_sparse_forward(
@@ -113,7 +117,7 @@ def _run_case(lengths: tuple[int, ...], budget: int) -> None:
     indices = independent_indices
     indices._qsa_bounds = selection._relax_qsa_mixed_bounds
     expected = _reference(values, indices, upstream)
-    report = {"lengths": lengths, "block_budget": budget, "fp32": {}, "reference": {}}
+    report = {"geometry": geometry, "lengths": lengths, "block_budget": budget, "fp32": {}, "reference": {}}
     for name, got, want in zip(("output", "dq", "dk", "dv"), (actual, *gradients), expected):
         assert torch.isfinite(got).all(), name
         metrics = _metrics(got, want)
@@ -123,7 +127,8 @@ def _run_case(lengths: tuple[int, ...], budget: int) -> None:
     source = os.environ.get("QSA_MIXED_REFERENCE_RUNTIME")
     # Empty-document handling is an intentional fix to the source mixed dispatcher.
     if source and all(lengths):
-        sys.path.insert(0, source)
+        if source not in sys.path:
+            sys.path.insert(0, source)
         from qsa_mixed_tp2 import attention as source_attention
 
         source_inputs = [value.detach().clone().requires_grad_() for value in values]
@@ -157,17 +162,8 @@ def _run_case(lengths: tuple[int, ...], budget: int) -> None:
         ((7, 2052, 16385), 512),
     ],
 )
-def test_qsa_mixed_output_and_gradients(lengths: tuple[int, ...], budget: int) -> None:
-    environment = os.environ.copy()
-    environment.update(
-        RELAX_QWEN38_QSA_COMMUNITY_BACKEND="mixed",
-        MCORE_QSA_SPARSE_BACKEND="id_sparse",
-        RELAX_QWEN38_QSA_FUSED_ATTENTION="0",
-        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
-    )
-    subprocess.run(
-        [sys.executable, __file__, json.dumps(lengths), str(budget)], env=environment, check=True, timeout=600
-    )
+def check_qsa_mixed_output_and_gradients(lengths: tuple[int, ...], budget: int) -> None:
+    _run_case(lengths, budget)
 
 
 def _check_layout_binding() -> None:
@@ -195,7 +191,14 @@ def _check_layout_binding() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA adapter validation requires CUDA")
-def test_qsa_mixed_packed_binding_preserves_dispatch() -> None:
+def check_qsa_mixed_packed_binding_preserves_dispatch() -> None:
+    _check_layout_binding()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA precision requires CUDA BF16")
+def test_qsa_mixed_in_isolated_process() -> None:
+    # Keep backend configuration isolated, but reuse imports and compiled kernels
+    # across all shapes. The child pytest retains individual case diagnostics.
     environment = os.environ.copy()
     environment.update(
         RELAX_QWEN38_QSA_COMMUNITY_BACKEND="mixed",
@@ -203,7 +206,27 @@ def test_qsa_mixed_packed_binding_preserves_dispatch() -> None:
         RELAX_QWEN38_QSA_FUSED_ATTENTION="0",
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
     )
-    subprocess.run([sys.executable, __file__, "--layout-binding"], env=environment, check=True, timeout=120)
+    environment.pop("PYTEST_ADDOPTS", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(Path(__file__).resolve()),
+            "-o",
+            "python_functions=check_qsa_mixed_*",
+            "-v",
+            "--tb=short",
+            "--durations=10",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert " skipped" not in result.stdout, output
 
 
 if __name__ == "__main__":
@@ -211,3 +234,17 @@ if __name__ == "__main__":
         _check_layout_binding()
     else:
         _run_case(tuple(json.loads(sys.argv[1])), int(sys.argv[2]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA GQA precision requires CUDA")
+@pytest.mark.parametrize("geometry", [(12, 1), (6, 1), (24, 2), (3, 1)])
+@pytest.mark.parametrize("lengths", [(7,), (65,), (7, 65)])
+def check_qsa_mixed_parallel_geometry(geometry, lengths):
+    _run_case(lengths, 8, geometry)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mixed QSA production-budget precision requires CUDA")
+@pytest.mark.parametrize("geometry", [(6, 1), (3, 1)])
+@pytest.mark.parametrize("lengths", [(2052,), (16385,)])
+def check_qsa_mixed_production_sparse_budget(geometry, lengths):
+    _run_case(lengths, 512, geometry)

@@ -701,6 +701,233 @@ radix-cache entries when a session ends. See [Agentic KV Scheduling](./agentic-k
 Set `--save-debug-rollout-data <path-with-{rollout_id}>` to save complete metadata, SessionForest state hashes, terminal
 status, turn count, request timing, abort count, and weight-version information.
 
+### Agentic Observability JSONL
+
+Set `--dump-agentic-obs <directory>` to write `manifest.json` and sharded JSONL
+under a generated `run_*` directory. Collect files from every producing node,
+or use a shared output directory. Each JSONL row carries `schema_version` and
+`run_id`; `sample_export_id` is a decimal string, including inside `samples[]`.
+
+| Stream | Records and join keys |
+| --- | --- |
+| `prompts/*.jsonl` | Original source row, `prompt_id`, dataset provenance, raw `input_payload`, optional reference, and text preview. |
+| `groups/*.jsonl` | Runtime Group creation, `group_id`, `group_index`, `prompt_id`, expected Session count, mode, and creation time. |
+| `sessions/*.jsonl` | `session_id`, `group_id`, `prompt_id`, sample/replicate indices, expected Group size, and merged sampling defaults. |
+| `trajectories/*.jsonl` | Exported lineage, `sample_export_id`, `session_id`, runtime `group_id`, `sample_index`, and `exported_at`. Multiple exports share a sample index but have distinct export IDs. |
+| `stages/*.jsonl` | Paired stage boundaries with `stage_id`, `record_id`, `scope`, `event_seq`, `occurred_at`, and `is_terminal`. Trajectory stages describe reward, filter and transfer; rollout/update events carry `group_ids` and `groups_finalized`. |
+| `train/*.jsonl` | One DP fragment per actual policy update: `update_id`, `train_generation_id`, `stage_id`, `capture_phase=training_input`, `samples[]`, `dp_rank`, `dp_world_size`, and `input_complete`. |
+
+The current train producer covers the Megatron policy actor. An update ID is
+`actor:<rollout_id>:<step_id>`, scoped by `(run_id, train_generation_id)`; one rollout
+may contain several updates. Inputs are captured as micro-batches are consumed, before packing or
+dynamic CP splitting. Dummy batches are omitted, but real samples with zero
+loss masks remain. Each sample includes lengths, effective tokens, and masked
+advantage/return statistics. Train records with schema `4.0.0` encode
+`loss_mask.ranges` as zero-based, half-open `[start, end, value]` intervals over
+the response. Fill uncovered positions with zero up to `response_length`.
+For example, `[1, 1, 0, 1]` becomes `{"ranges": [[0, 2, 1], [3, 4, 1]]}`.
+Train records with schema `3.0.0` store `loss_mask` as a per-token array.
+Static CP statistics are `null`; dynamic CP captures full sequences before
+splitting. The mask describes training input before loss-local TIS/OPSM filtering.
+
+Identify each DP fragment by `(run_id, train_generation_id, update_id, dp_rank)`
+and join by `(run_id, train_generation_id, update_id)`. The actor-group initializer
+assigns one shared generation ID to a copy of its worker arguments; reinitialization
+gets a new ID without changing training settings or adding a collective. Input
+fragments must also match their DP boundary's `stage_id`, so replayed updates cannot
+reuse an earlier attempt's input. Missing generation IDs mean unknown.
+Each DP owner emits paired `scope=update_fragment` boundaries into
+`stages/actor_<rollout_id>_dp_<rank>.jsonl`, including `dp_world_size`, `step_id`,
+`train_generation_id`, `update_sequence`, and its local `optimizer_successful` result. No observability
+collective runs in training. A training exception records failed/cancelled with
+unknown optimizer outcome and incomplete membership.
+
+Use `relax.utils.agentic_obs.merge_train_updates(stage_records, train_records)`
+on the reader side. It reports `committed` only when every expected DP owner has
+one consistent start/end pair and all optimizer results succeeded. Missing or
+conflicting evidence means `unknown`; missing train input fragments independently
+make `input_complete=false`. It preserves legacy `scope=update` records unchanged.
+`optimizer_step` counts successful updates within each actor-group generation, starting at 1;
+skipped updates do not increment it. A gap or conflict in the per-DP sequence makes
+this count null from that point. `groups_finalized=true` closes membership, not
+sample success. Runtime `group_id` and reward-normalization `group_index` differ.
+
+Custom converters should return aligned CPU int64 `sample_export_ids`. Missing or
+invalid identities produce aligned `-1` IDs and empty group IDs, without changing
+training rows or omitting the TQ observation columns; downstream membership and
+input completeness remain false. IDs are never inferred from input order.
+
+Reward completion and transfer acknowledgement are nonterminal. A TQ RPC failure
+after submission has `reason_code=transfer_outcome_unknown` and
+`is_terminal=false`, since the remote write may have succeeded. Selection
+failures and completed Eval exports are terminal. Deduplicate stage events by
+`record_id` and order within their scope identity by `event_seq`, rather than
+using file order across shards.
+
+The training driver writes its lifecycle to `stages/run.jsonl`, using
+`scope=run, stage=execution`. A `start` is followed by a terminal `completed`,
+`failed`, or `cancelled` with the same `stage_id` and `event_seq=2`.
+The terminal `occurred_at` is the training end time; `operation` identifies
+`startup`, `training`, or a known `checkpoint` failure. `reason_code` is
+`run_failed` or `run_cancelled`, and `reason` retains the exception type and
+message or the received signal. Megatron annotates checkpoint errors, including
+asynchronous save finalization, before they cross Ray. Unmarked failures retain
+the driver's broader phase; the observer does not guess a phase or quota error
+from traceback text. The first outcome wins, so a cleanup signal cannot overwrite
+a completed or failed Run. Existing `scope=run, stage=startup` records describe
+the resolved schedule and are not Run outcomes.
+
+Platform consumers should keep three independent states:
+
+| Display | Evidence |
+| --- | --- |
+| Training Run | The terminal Run execution event; fall back to the authoritative Trial terminal status when it is absent. |
+| Collection freshness | The collector's last successful collection time and its configured freshness threshold. |
+| Session | That Session's own execution events, independently of the Run and collector. |
+
+Registration-time `Running` is not a permanent status. Without a Run outcome or
+an authoritative Trial result, stale collection means **status awaiting
+confirmation**; it cannot establish success, failure, or cancellation. A Run
+outcome does not prove that all producer files have been collected. `SIGTERM`
+and `SIGINT` record cancellation before remote cleanup; `SIGKILL`, node loss,
+and an unwritable observation directory can leave only a start. An ordinary
+process exit without a recorded result also leaves the outcome unknown.
+Argument parsing precedes the Run start. Place observation files on storage
+with independent available quota when checkpoint storage may fill up.
+
+Keep training progress when a Run fails: count distinct committed `(train_generation_id, update_id)` pairs
+within the Run, and find participating Sessions by joining their DP input
+`sample_export_id`s to trajectory `session_id`s, deduplicated across updates.
+Group membership alone does not prove Session consumption. If DP fragments or
+trajectories are missing, report an observed lower bound or unknown membership,
+not an exact Session total. This lets a platform display a checkpoint failure
+alongside its already committed updates and participating Sessions.
+
+Dumps are best-effort. Producers snapshot and enqueue without waiting for disk.
+Daemon queues bound both items and bytes, including in-flight work. Closure has a
+one-second total drain budget per recorder/process close, including flush/status;
+expired or cancelled closes discard pending items. Only the in-flight write retains
+its resources. At most 16 observation workers can run per process, so repeated
+recorder creation against a stalled disk cannot accumulate unlimited threads.
+Observation persistence never shields cancellation or adds a training collective.
+
+Producer `*.status.json` files expose write/drop counts when writable. Input
+saturation retains small local optimizer facts through a separate bounded queue;
+whole-writer failure or abrupt process death can still lose records. Require all DP
+input fragments with `input_complete=true` before declaring a complete input set.
+Missing records, missing log files, unacknowledged export delivery, and partial JSONL
+tails mean **unknown**, never proof of a pending or rejected training update.
+Managed logs snapshot the final 1 MiB locally before temporary-directory cleanup;
+`log_ref` names an accepted background write, so readers must check file availability.
+The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`.
+Its `train_schema_version` identifies the train stream's schema. Readers merge
+DP facts to determine the update outcome.
+
+Eager and streaming readers preserve source identity before custom prompt processing,
+templating, filtering, shuffling, or replication. `source_row_id` is the zero-based
+physical JSONL line or Parquet row, including sliced/multi-file datasets.
+`dataset_id` defaults to the resolved source path; metadata can supply `dataset_id`,
+`dataset_version`, and `split`. Unknown versions remain `null`. Prompt IDs hash source
+provenance and original content: resampling a row preserves identity, while equal
+content in distinct rows or modified unversioned content produces different IDs.
+Train and Eval splits have separate identities.
+
+Custom sources can populate `Sample.agentic_prompt_source` with these provenance and
+payload fields. Otherwise `identity_kind=content_fallback` uses a content digest with
+null dataset/row fields; identical custom inputs cannot be distinguished as separate
+source rows. Deduplicate prompt and Group inventories by ID within a run. Each driver
+instance writes separate producer files.
+
+Groups are recorded when fetched, including those waiting for preparation. Session
+inventory is emitted after launch is accepted, before Shard registration; actual
+preparation failures also retain their inventory. Deferring a Group to the next step
+creates neither failed Sessions nor extra replicas. In Eval without group reward,
+each single-Session runtime Group has `expected_group_size=1`, although the algorithm's
+`group_index` can be shared. `sampling_config` holds merged Session defaults and
+overrides; the terminal `llm_calls` list carries actual request overrides and context caps.
+
+Scoped intervals use one `start` and one
+outcome with the same `stage_id`; their `occurred_at` values are its boundaries.
+`record_id` deduplicates events. `event_seq` increases across stages for the same
+scope owner. `is_terminal` closes the owner lifecycle, independently of closing a stage.
+
+| Scope / stage | Start boundary | End results |
+| --- | --- | --- |
+| run / execution | Training driver begins startup | completed / failed / cancelled for the whole training Run |
+| rollout / execution | A train or Eval scheduling batch begins | completed / failed / cancelled after batch cleanup |
+| session / rollout | Driver begins preparation of an accepted Session | completed / failed / cancelled after Shard cleanup |
+| trajectory / reward | RM or acceptance of an agent-provided reward begins | completed / failed / cancelled |
+| trajectory / filter | A selection or custom advantage decision begins | passed / filtered / failed / cancelled |
+| trajectory / transfer | Conversion and queue submission begin | queued_for_train / failed / cancelled |
+| update_fragment / train | This DP owner begins the update | completed / failed / cancelled; reader derives global committed/failed/unknown |
+
+Successful transfer uses `status=queued_for_train`. Earlier dumps used `completed`
+for the same acknowledgement; readers can accept that legacy value when
+`stage=transfer`. Neither value proves that an optimizer update committed.
+
+`filter.operation` distinguishes `dynamic_filter`, `custom_advantage`, `oversampling`,
+`shutdown`, `execution` (group disposal), `export_delivery`, and `eval` (accepting the
+Eval result). These are real selection decisions; an instantaneous decision can have
+zero duration. A provided reward uses `reward.operation=provided_reward`; a custom
+advantage path without a reward does not manufacture an RM interval or a zero reward.
+A shared `transfer_batch_id` groups the exports submitted in one batch. Unknown queue
+acknowledgements remain nonterminal and are never automatically retried by the observer.
+`retry_of_stage_id` is reserved for explicit business retries; the observer does not add retries.
+
+**Session writes only start and its final rollout result: no progress field, phase
+field, request event, or pause/resume event.** Driver owns start; Shard owns the end
+once registration is attempted. A proven local preparation failure has a paired end
+and an empty call list. An unknown registration outcome is logged and leaves start
+open until the Shard supplies an end; the driver does not manufacture a failed end.
+
+| Terminal field | Meaning |
+| --- | --- |
+| `wall_ms` / `active_ms` | Wall time from Driver preparation / managed process active-budget time excluding pauses. Clock synchronization is required across producers. |
+| `llm_calls` / `llm_calls_complete` | Every admitted logical request, including rejected, failed, cancelled and unexported calls; completeness describes captured call/attempt boundaries. |
+| `request_count` / `attempt_count` | Distinct logical requests / entries into backend.generate. Internal HTTP retries are not separate runtime attempts. |
+| `generated_tokens` / `token_count_complete` | Sum of returned deltas, including aborted prefixes and cleanup results. Tokens are null when generation results or internal retries are unobservable. |
+| `export_ids` | Published export IDs as decimal strings; empty when no export exists. |
+| `diagnostics` / `log_ref` | Soft cleanup diagnostics / relative queued agent log path, nullable; existence must be checked. |
+
+A call carries `request_id`, zero-based `call_index`, `started_at`, `finished_at`,
+`status`, `parent_state_hash`, `resp_state_hash`, and `attempts`. Runtime attempts carry
+zero-based `attempt_index`, `rollout_id`, both timestamps and status. An aborted partial
+attempt and a resumed attempt share the logical request ID, even across rollouts.
+A separately submitted agent request receives a new ID; similarity is not evidence
+of a retry. Requests rejected before generation have `attempts=[]`. A length-limited
+response is a completed call with `finish_reason=length`, not a failed call.
+
+Request failure does not force Session failure if the agent recovers. Terminal causes
+include `agent_timeout`, `agent_exit_nonzero`, `agent_output_invalid`,
+`export_validation_failed`, `session_prepare_failed`, `session_infra_failed`, and
+`session_cleanup_failed`. Unfinished siblings and explicit disposal are cancelled with
+category `selection`; an already completed Session is never rewritten by later filtering.
+
+To build a Session timeline on the platform:
+
+1. Load Session, Group and Prompt by their IDs within `run_id`; collect all Session exports.
+2. Expand every DP fragment of `train.samples` and join by export ID to find actual update
+   membership. Group membership alone never proves training consumption.
+3. Collect Session, export and consumed-update stage events; deduplicate by `record_id`,
+   then pair by `stage_id`, verifying scope/owner/stage. Conflicting duplicates or multiple
+   ends are data errors. File order is not event order.
+4. Read calls only from the unique Session end; without it, calls are unknown. Draw each
+   logical call once, nesting attempts and linking `(session_id, request_id)` to export
+   `agentic_trace.turns`, then `resp_state_hash` to lineage. Unexported calls remain visible.
+5. Draw reward/filter/transfer per export; draw each consumed update once. Use
+   `transfer_batch_id` for batch grouping and attempt rollout IDs for batch background,
+   scoped by the Session's `rollout_mode` to separate train and Eval.
+6. Derive durations only from complete, ordered boundaries. Missing ends remain open;
+   a snapshot time is a display limit, never an observed end. Flag clock inversions.
+   Gaps between LLM calls do not establish tool execution times. Only a committed update
+   proves successful training; require all DP fragments to claim complete inputs.
+
+`--dump-agentic-obs-media` additionally saves content-addressed media bytes. Without
+it, data URIs and raw binary payloads in prompts/trajectories become digest/size
+references. Logs are copied before temporary agent directories are removed; abrupt
+Shard death can still prevent the final copy. `tokens.jsonl` remains deferred by
+the current design.
+
 ### Common Problems
 
 - **The agent does not start or exits with an error:** check `--agent-cwd` and `--agent-command`, then inspect `run.log`.

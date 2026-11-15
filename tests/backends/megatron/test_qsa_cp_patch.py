@@ -88,7 +88,7 @@ def test_replay_resets_context_after_exception(monkeypatch):
     import sys
     from types import ModuleType
 
-    from tests.backends.megatron.test_qsa_flex_mask_replay import _load_functions
+    from tests.cpu.backends.megatron.test_qsa_flex_mask_replay import _load_functions
 
     patch = ModuleType("qsa_replay_exception_test")
     monkeypatch.setitem(sys.modules, patch.__name__, patch)

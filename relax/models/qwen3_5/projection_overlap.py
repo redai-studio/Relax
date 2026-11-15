@@ -62,7 +62,7 @@ def install(args, model):
     rank = dist.get_rank(dist.group.WORLD)
     ranks = dist.get_process_group_ranks(tp)
     # TE splits WORLD into contiguous TP domains; never infer this without checking.
-    assert dist.get_world_size(dist.group.WORLD) == 64
+    assert dist.get_world_size(dist.group.WORLD) % 8 == 0
     assert ranks == list(range(rank // 4 * 4, rank // 4 * 4 + 4))
     assert not base.is_ub_initialized()
     init_receipt = initialize()

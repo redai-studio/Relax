@@ -29,6 +29,7 @@ import asyncio
 import os
 import random
 import time
+from functools import partial
 from typing import Any
 
 import ray
@@ -39,6 +40,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.components.base import Base
 from relax.engine.sft.data_state import restore_data_state, save_data_state
 from relax.engine.sft.dataset import streaming as streaming_dataset
+from relax.engine.sft.dataset.oversize import keep_within_sequence_limit
 from relax.engine.sft.dataset.preference import (
     PreferenceStreamingDataset,
     ProcessedPreferencePair,
@@ -120,6 +122,8 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
         if not oversize_custom_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         oversize_custom_fn = load_function(oversize_custom_path)
+        if oversize_custom_fn is keep_within_sequence_limit:
+            oversize_custom_fn = partial(oversize_custom_fn, seq_length=config.seq_length)
         if logger is not None:
             logger.info(f"SFT oversize strategy: custom (loaded {oversize_custom_path})")
     elif logger is not None:

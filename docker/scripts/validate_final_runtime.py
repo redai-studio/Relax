@@ -27,6 +27,10 @@ def main() -> None:
         if md.version(package) != version:
             raise ValueError(f"{package}: expected {version}, got {md.version(package)}")
     import torch
+    from flash_mla import flash_mla_sparse_fwd
+
+    if not callable(flash_mla_sparse_fwd):
+        raise ValueError("FlashMLA is missing the sparse forward API required by cuDNN DSA")
 
     if not torch.version.cuda or not torch.version.cuda.startswith("12." if args.profile == "cu12" else "13."):
         raise ValueError(f"CUDA runtime does not match {args.profile}: {torch.version.cuda}")

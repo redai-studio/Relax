@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from argparse import Namespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import ray
 import requests
@@ -16,6 +16,8 @@ from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
 )
+from relax.utils.fault_events.models import RecoveryEvidence
+from relax.utils.fault_events.recovery import observe_recovery
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url, recovery_load_path
 
@@ -250,18 +252,23 @@ class Service:
         """
         await self.handle.train.remote(step, clear_data=clear_data)
 
-    async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False):
+    async def update_weights_fully_async(
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        recovery_token: dict | None = None,
+    ):
         """Trigger a fully asynchronous weight update for Actor service."""
         return await self.handle.update_weights_fully_async.remote(
-            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, recovery_token=recovery_token
         )
 
-    async def recv_weight_fully_async(self):
+    async def recv_weight_fully_async(self, recovery_token: dict | None = None):
         """Trigger a fully asynchronous weight receive for Actor FWD
         service."""
-        return await self.handle.recv_weight_fully_async.remote()
+        return await self.handle.recv_weight_fully_async.remote(recovery_token=recovery_token)
 
-    def restart(self) -> None:
+    def restart(self, fault_observer: Callable[..., None] | None = None) -> None:
         """Restart this service in-place: reuse placement groups and dynamic
         state.
 
@@ -299,6 +306,7 @@ class Service:
 
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
         self._deploy(pgs)
+        observe_recovery(fault_observer, observed=RecoveryEvidence.DEPLOYED)
         logger.info(f"[{self.role}] Service redeployed successfully")
 
         current_step = 0
@@ -312,11 +320,15 @@ class Service:
         try:
             self._http_call(self.role, "/set_step", method="POST", params={"step": current_step})
             logger.info(f"[{self.role}] Restored step to {current_step}")
+            observe_recovery(fault_observer, observed=RecoveryEvidence.STEP_RESTORED)
         except Exception as e:
+            observe_recovery(fault_observer, failed=RecoveryEvidence.STEP_RESTORED)
             logger.warning(f"[{self.role}] Failed to restore step: {e}")
 
         self._task_ref = None
         task_ref = self.run()
+        if task_ref is not None:
+            observe_recovery(fault_observer, observed=RecoveryEvidence.TASK_SUBMITTED)
         logger.info(f"[{self.role}] Service task re-launched after restart, task_ref={task_ref}")
 
     def _ensure_placement_group(self) -> Optional[Any]:
