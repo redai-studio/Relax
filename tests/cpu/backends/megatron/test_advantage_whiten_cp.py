@@ -10,7 +10,7 @@ length on every static CP rank, so the collective must span only the
 CP-excluding DP group to avoid counting each token `cp_size` times in Bessel's
 correction.
 
-Real Gloo worker processes (`<= 4` ranks per case, 30s timeout, ~17s total) are
+Real Gloo worker processes (`<= 4` ranks per case, 30s timeout, ~25s total) are
 required because an in-process mock cannot detect an `all_reduce` hang when one
 rank owns zero response tokens (`all_masks.numel() == 0` on `(dp=1, cp=1)` at
 `(dp_size=2, cp_size=2)`) or exercise split `dp_only` vs `dp_cp` collectives.
@@ -318,3 +318,122 @@ def test_whitened_advantages_are_cp_invariant(
             f"dp={dp_size} cp={cp_size} dynamic_cp={dynamic_cp}: "
             f"sample {sample_idx} whitened tokens mismatch single-rank baseline"
         )
+
+
+def _all_empty_worker(rank: int, world_size: int, cp_size: int, init_file: str, result_dir: str) -> None:
+    import torch.distributed as dist
+
+    torch.set_num_threads(1)
+    _ensure_megatron_importable()
+    cp_rank = rank % cp_size
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        dp_cp_group = dist.new_group(ranks=list(range(world_size)))
+        dp_only_groups = [
+            dist.new_group(ranks=[r for r in range(world_size) if r % cp_size == c]) for c in range(cp_size)
+        ]
+        fake_mpu = SimpleNamespace(
+            is_pipeline_last_stage=lambda: True,
+            get_context_parallel_world_size=lambda: cp_size,
+            get_context_parallel_rank=lambda: cp_rank,
+            get_tensor_model_parallel_world_size=lambda: 1,
+            get_data_parallel_group=lambda with_context_parallel=False: (
+                dp_cp_group if with_context_parallel else dp_only_groups[cp_rank]
+            ),
+        )
+
+        from relax.backends.megatron import cp_utils
+
+        loss_module = importlib.import_module("relax.backends.megatron.loss")
+        loss_module.mpu = fake_mpu
+        cp_utils.mpu = fake_mpu
+
+        out: dict[str, dict[str, list[int]]] = {}
+        for dynamic_cp in (False, True):
+            rollout_data = {
+                "log_probs": [torch.empty(0, dtype=torch.float32), torch.empty(0, dtype=torch.float32)],
+                "loss_masks": [torch.empty(0, dtype=torch.float32), torch.empty(0, dtype=torch.float32)],
+                "rewards": [1.5, -0.5],
+                "response_lengths": [0, 0],
+                "total_lengths": [16, 20],
+            }
+            loss_module.compute_advantages_and_returns(_make_args(dynamic_cp=dynamic_cp), rollout_data)
+            out[str(dynamic_cp)] = {
+                "adv_lens": [int(t.numel()) for t in rollout_data["advantages"]],
+                "ret_lens": [int(t.numel()) for t in rollout_data["returns"]],
+            }
+        with open(os.path.join(result_dir, f"empty_rank{rank}.json"), "w") as f:
+            json.dump(out, f)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="torch.distributed with Gloo is required",
+)
+def test_whiten_group_all_empty_responses_is_noop(tmp_path) -> None:
+    import torch.multiprocessing as mp
+
+    world_size = 4
+    init_file = tmp_path / "empty_gloo_init"
+    mp.spawn(
+        _all_empty_worker,
+        args=(world_size, 2, str(init_file), str(tmp_path)),
+        nprocs=world_size,
+        join=True,
+    )
+    expected = {
+        "False": {"adv_lens": [0, 0], "ret_lens": [0, 0]},
+        "True": {"adv_lens": [0, 0], "ret_lens": [0, 0]},
+    }
+    for rank in range(world_size):
+        with open(tmp_path / f"empty_rank{rank}.json") as f:
+            payload = json.load(f)
+        assert payload == expected
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="torch.distributed with Gloo is required",
+)
+def test_whiten_nonempty_zero_mask_still_raises(monkeypatch, tmp_path) -> None:
+    import torch.distributed as dist
+
+    _ensure_megatron_importable()
+    from relax.backends.megatron import cp_utils
+
+    loss_module = importlib.import_module("relax.backends.megatron.loss")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmp_path / 'zero-mask-gloo-init'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        fake_mpu = SimpleNamespace(
+            is_pipeline_last_stage=lambda: True,
+            get_context_parallel_world_size=lambda: 1,
+            get_data_parallel_group=lambda with_context_parallel=False: dist.group.WORLD,
+        )
+        monkeypatch.setattr(loss_module, "mpu", fake_mpu)
+        monkeypatch.setattr(cp_utils, "mpu", fake_mpu)
+
+        rollout_data = {
+            "log_probs": [torch.zeros(2, dtype=torch.float32)],
+            "loss_masks": [torch.zeros(2, dtype=torch.float32)],
+            "rewards": [1.0],
+            "response_lengths": [2],
+            "total_lengths": [6],
+        }
+        with pytest.raises(ValueError, match="global mask sum"):
+            loss_module.compute_advantages_and_returns(_make_args(dynamic_cp=False), rollout_data)
+    finally:
+        dist.destroy_process_group()

@@ -49,6 +49,7 @@ def test_compute_advantages_and_returns_wires_baseline_contract(monkeypatch, tmp
             gamma=1.0,
             use_opd=False,
             normalize_advantages=True,
+            dynamic_context_parallel=False,
         )
         rollout_data = {
             "log_probs": [torch.zeros(2), torch.zeros(2)],

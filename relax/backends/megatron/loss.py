@@ -840,9 +840,10 @@ def compute_advantages_and_returns(
         # mask-safe reducer.
         #
         # Static CP ranks hold only their zig-zag slice in `all_advs` / `all_masks`,
-        # so whitening must span DP with CP. Keep the collective unconditional
-        # because a rank can own zero response tokens for prompt-heavy sequences,
-        # and skipping the all_reduce on that rank alone hangs its peers.
+        # so whitening must span DP with CP. Check response-token presence across
+        # `whiten_group` rather than locally: a rank with an empty CP shard must
+        # still join the collective when peers hold tokens, while a group-wide
+        # empty-response batch stays a no-op for the zero-token step path.
         is_token_global = get_algorithm(args.advantage_estimator).advantage_normalization == "token_global"
         whiten_group = mpu.get_data_parallel_group(with_context_parallel=not use_dynamic_cp)
 
@@ -867,15 +868,20 @@ def compute_advantages_and_returns(
             rollout_data["reinforce_pp_advantage_normalized_std"] = [normalized_std] * num_samples
             rollout_data["reinforce_pp_valid_token_count"] = [valid_count] * num_samples
             rollout_data["reinforce_pp_zero_variance"] = [zero_variance] * num_samples
+            chunk_lengths = [chunk.size(0) for chunk in advantages]
+            advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
         else:
-            whitened_advs_flat = distributed_masked_whiten(
-                all_advs,
-                all_masks,
-                process_group=whiten_group,
-                shift_mean=True,
-            )
-        chunk_lengths = [chunk.size(0) for chunk in advantages]
-        advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
+            global_numel = torch.tensor(all_masks.numel(), device=all_advs.device, dtype=torch.int64)
+            dist.all_reduce(global_numel, group=whiten_group)
+            if global_numel.item() > 0:
+                whitened_advs_flat = distributed_masked_whiten(
+                    all_advs,
+                    all_masks,
+                    process_group=whiten_group,
+                    shift_mean=True,
+                )
+                chunk_lengths = [chunk.size(0) for chunk in advantages]
+                advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
