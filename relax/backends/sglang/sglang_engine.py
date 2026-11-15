@@ -2296,8 +2296,11 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
-        if getattr(args, "colocate", False) and (
-            Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP or getattr(args, "use_shard_p2p_weight_sync", False)
+        if (
+            getattr(args, "colocate", False)
+            and Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
+            or getattr(args, "use_shard_p2p_weight_sync", False)
+            and (getattr(args, "colocate", False) or getattr(args, "fully_async", False))
         ):
             # Empty updates through this loader wait for CUDA reads before ACK.
             from relax.backends.sglang.weight_loader import NATIVE_SYNC_FENCE_LOADER

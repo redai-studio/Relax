@@ -32,7 +32,7 @@ def _guarded_manager_type():
             self.action = None
 
         def _select_runners(self, selector="all"):
-            return list(zip(("target", "draft"), self.runners, strict=True))
+            return list(zip(("target", "draft")[: len(self.runners)], self.runners, strict=True))
 
     def operation(name):
         def body(self, recv_req):
@@ -202,3 +202,70 @@ def test_prepare_reply_uses_real_sglang_response_and_never_replays(native_guard,
     with pytest.raises(RuntimeError, match="native failure"):
         manager.update_weights_from_tensor(None)
     assert not hasattr(model, "_relax_weight_sync_reply") and guard.lease.failed
+
+
+@pytest.mark.parametrize("operation", ["replica_ready", "replica_gather"])
+def test_replica_continuation_retains_only_its_matching_native_lease(native_guard, monkeypatch, operation):
+    from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqOutput
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    from relax.backends.sglang.weight_loader import COLOCATE_NIXL_LOADER
+
+    manager, guard = native_guard
+    manager.runners = manager.runners[:1]
+    guard.refresh()
+    model = guard.models[0]
+    identity = guard.lease.begin("session", 2, "delivery")
+    token = (0, 0, "epoch")
+    guard.lease.add(token, 2)
+    epoch = dict(
+        model=model,
+        identity=identity,
+        token=token,
+        version=2,
+        generation="epoch",
+        registration=None,
+        parameters={"weight": model.weight},
+    )
+    guard.colocate_owner = epoch
+    model._relax_expert_ipc = dict(
+        session="session",
+        engine=0,
+        version=1,
+        epoch=epoch,
+        delivery_hash="delivery",
+        geometry=dict(expert_enabled=False, ordinary_targets={"weight": list(model.weight.shape)}),
+    )
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+
+    def worker(request):
+        guard.control_entry_seen = True
+        if operation == "replica_ready":
+            model._relax_weight_sync_reply = '{"shard_p2p_replica_ready": []}'
+        return True, "ok"
+
+    manager.tp_worker.update_weights_from_tensor = worker
+
+    def native(manager):
+        success, message = manager.tp_worker.update_weights_from_tensor(None)
+        return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+
+    manager.action = native
+    command = dict(
+        op=operation, session="session", engine=0, version=2, delivery_hash="delivery", epoch_generation="epoch"
+    )
+
+    def request():
+        return SimpleNamespace(
+            load_format=COLOCATE_NIXL_LOADER,
+            serialized_named_tensors=[
+                MultiprocessingSerializer.serialize([(json.dumps(command), torch.empty(0))], output_str=True)
+            ],
+        )
+
+    assert manager.update_weights_from_tensor(request()).success
+    assert guard.lease.active == identity and guard.lease.pending == {token} and not guard.lease.failed
+    command["epoch_generation"] = "stale"
+    with pytest.raises(RuntimeError, match="unrelated native request"):
+        manager.update_weights_from_tensor(request())
+    assert manager.effects == ["update_weights_from_tensor"] and guard.lease.failed

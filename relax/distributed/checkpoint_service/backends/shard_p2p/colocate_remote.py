@@ -17,6 +17,7 @@ def send_remote_shards(
     version: int,
     writer: BufferedWriter | None,
     agent_future: Future | None = None,
+    buffer_bytes: int = 64 << 20,
 ) -> tuple[dict[str, dict], BufferedWriter | None]:
     """Return receipts only after every original owner's native write is
     DONE."""
@@ -26,7 +27,10 @@ def send_remote_shards(
         return {}, writer
     if writer is None:
         agent = agent_future.result() if agent_future is not None else None
-        writer = BufferedWriter(64 << 20, device=torch.device("cuda", torch.cuda.current_device()), agent=agent)
+        pending_bytes = sum(write["rows"] * write["row_bytes"] for plan in plans.values() for write in plan["writes"])
+        writer = BufferedWriter(
+            min(buffer_bytes, pending_bytes), device=torch.device("cuda", torch.cuda.current_device()), agent=agent
+        )
     try:
         persistent = all(manifests[target].get("persistent_registration_key") for target in plans)
         connected = getattr(writer, "targets", {})
@@ -68,15 +72,32 @@ def send_remote_shards(
                         raise RuntimeError("Remote shard source storage changed")
                     flats[name] = source.view(torch.uint8).view(-1)
                 flat = flats[name]
+                column_stride = write.get("src_column_stride", 1)
                 if (
                     any(type(write[key]) is not int for key in ("src_offset", "src_stride", "rows", "row_bytes"))
                     or write["src_offset"] < 0
                     or write["rows"] <= 0
                     or write["row_bytes"] <= 0
-                    or write["src_stride"] < write["row_bytes"]
+                    or type(column_stride) is not int
+                    or (column_stride == 1 and write["src_stride"] < write["row_bytes"])
+                    or (
+                        column_stride != 1
+                        and (
+                            column_stride <= 0
+                            or column_stride % 2
+                            or write["src_stride"] != 2
+                            or write["src_offset"] % 2
+                            or write["row_bytes"] % 2
+                            or buffer.numel() % 2
+                            or write["row_bytes"] > buffer.numel()
+                        )
+                    )
                 ):
                     raise RuntimeError("Remote shard source rectangle is invalid")
-                end = write["src_offset"] + (write["rows"] - 1) * write["src_stride"] + write["row_bytes"]
+                extent = (
+                    write["row_bytes"] if column_stride == 1 else (write["row_bytes"] // 2 - 1) * column_stride + 2
+                )
+                end = write["src_offset"] + (write["rows"] - 1) * write["src_stride"] + extent
                 if end > flat.numel():
                     raise RuntimeError("Remote shard source rectangle exceeds live storage")
                 row = 0
@@ -89,13 +110,17 @@ def send_remote_shards(
                             continue
                         size = count_rows * width
                         payload = buffer[cursor : cursor + size]
-                        payload.view(count_rows, width).copy_(
-                            flat.as_strided(
-                                (count_rows, width),
-                                (write["src_stride"], 1),
-                                storage_offset=flat.storage_offset() + write["src_offset"] + row * write["src_stride"],
+                        offset = flat.storage_offset() + write["src_offset"] + row * write["src_stride"]
+                        if column_stride == 1:
+                            payload.view(count_rows, width).copy_(
+                                flat.as_strided((count_rows, width), (write["src_stride"], 1), storage_offset=offset)
                             )
-                        )
+                        else:
+                            payload.view(torch.bfloat16).view(count_rows, width // 2).copy_(
+                                flat.view(torch.bfloat16).as_strided(
+                                    (count_rows, width // 2), (1, column_stride // 2), storage_offset=offset // 2
+                                )
+                            )
                         batch.append(
                             (
                                 dict(
