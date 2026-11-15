@@ -176,3 +176,69 @@ def test_end_update_weight_does_not_block_after_failed_can_do():
         assert shell.status == "running"
 
     asyncio.run(_scenario())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler,path", [("chat_completions", "v1/chat/completions"), ("generate_request", "generate")]
+)
+async def test_managed_rollout_http_routes_use_admission(handler, path):
+    """Both production handlers must reach the shared executor and return
+    permits."""
+    import json
+    from types import SimpleNamespace
+
+    import httpx
+    from starlette.requests import Request
+
+    from relax.components.inference_gateway import InferenceGateway
+    from relax.engine.inference.types import LifecycleState, ModelSnapshot, Role, RoleSnapshot, RoutingSpec
+
+    inflight = set()
+
+    async def snapshot(role):
+        return RoleSnapshot(
+            Role.ROLLOUT,
+            "epoch",
+            models=(ModelSnapshot("default", router_url="http://router", state=LifecycleState.READY, admission=True),),
+            routing=RoutingSpec(default_model="default"),
+        )
+
+    async def admit(*args):
+        inflight.add("permit")
+        return "permit"
+
+    async def complete(permit):
+        inflight.remove(permit)
+
+    owner = SimpleNamespace(
+        snapshot=SimpleNamespace(remote=snapshot),
+        admit_request=SimpleNamespace(remote=admit),
+        complete_request=SimpleNamespace(remote=complete),
+    )
+    gateway = InferenceGateway(Role.ROLLOUT, manager_handle=owner)
+    await gateway._client.aclose()
+
+    def upstream(request):
+        assert inflight == {"permit"}
+        assert str(request.url) == f"http://router/{path}"
+        assert json.loads(request.content)["rid"].startswith("relax-inf-")
+        return httpx.Response(200, json={"result": "ok"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    gateway._executor.client = client
+    shell = object.__new__(Rollout)
+    shell._inference_gateway = gateway
+    payload = {"model": "default", "messages": []} if path.startswith("v1/") else {"text": "hello"}
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}
+
+    request = Request({"type": "http", "method": "POST", "path": f"/{path}", "headers": []}, receive)
+    try:
+        response = await getattr(shell, handler)(request)
+        assert response.status_code == 200
+        assert json.loads(response.body) == {"result": "ok"}
+        assert not inflight
+    finally:
+        await gateway.close()

@@ -52,7 +52,7 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         # Second call passes a list of get_ip_and_gpu_id futures -> return one
         # (ip, gpu_id) tuple per bundle. First call is pg.ready() (unused).
         if isinstance(arg, list):
-            return [("10.0.0.1", i) for i in range(len(arg))]
+            return [("10.0.0.1", i, i) for i in range(len(arg))]
         return None
 
     cr_mock = MagicMock(return_value=cluster_resources or {"GPU": 8.0, "CPU": 64.0})
@@ -287,7 +287,11 @@ def test_placement_sorts_nodes_numerically_then_gpu_and_releases_only_info_actor
         patch.object(placement, "placement_group", return_value=pg) as factory,
         patch.object(placement, "InfoActor") as info,
         patch.object(placement, "PlacementGroupSchedulingStrategy") as strategy,
-        patch.object(placement.ray, "get", side_effect=[None, coordinates]),
+        patch.object(
+            placement.ray,
+            "get",
+            side_effect=[None, coordinates, [("node-a", 0, 0), ("node-b", 3, 3), ("node-b", 1, 1), ("node-a", 2, 2)]],
+        ),
         patch.object(placement.ray, "kill") as kill,
     ):
         info.options.return_value.remote.side_effect = info_actors

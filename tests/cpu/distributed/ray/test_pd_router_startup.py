@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from conftest import HAS_DEPS, make_engine_group, make_mock_args, make_mock_engine, mock_ray_get
+from conftest import HAS_DEPS, AwaitableValue, make_engine_group, make_mock_args, make_mock_engine, mock_ray_get
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -391,10 +391,12 @@ def test_engine_shutdown_uses_one_deadline_for_all_pd_workers(monkeypatch, rollo
     killed = Mock()
     monkeypatch.setattr(rollout_module.ray, "get", get)
     monkeypatch.setattr(rollout_module.ray, "kill", killed)
-    manager._shutdown_all_engines(timeout=15.0)
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        manager._shutdown_all_engines(timeout=15.0)
+    assert manager.servers["default"].engine_groups[0].all_engines == engines
     assert timeouts == [15.0, 0.0, 0.0, 0.0]
     assert rollout_module.time.now == 15.0
-    assert killed.call_count == 4
+    killed.assert_not_called()
 
 
 @pytest.mark.parametrize("removed", [False, True])
@@ -468,7 +470,7 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     monkeypatch.setattr(rollout_module, "remove_dead_router_worker", cleanup)
     pending, failed = object(), object()
     replacements = [make_mock_engine() for _ in slots]
-    # A shutdown queued behind pending init can time out; every actor must still be killed.
+    # A shutdown queued behind pending init must retain ownership until confirmed.
     shutdown_ref = object()
     replacements[0].shutdown.remote.return_value = shutdown_ref
     attempts = []
@@ -504,18 +506,23 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     monkeypatch.setattr(rollout_module.ray, "kill", kill)
     server = make_rollout_server(engine_groups=[group])
 
-    with pytest.raises(RuntimeError, match="Required PD router registration failed") as caught:
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
         server.recover()
 
-    assert caught.value is failure
-    assert group.all_engines == surviving + [None] * len(slots)
+    assert group.all_engines == surviving + replacements[:1] + [None] * (len(slots) - 1)
+    assert group.pending_shutdown_indices == {slots[0]}
     assert server.num_new_engines == 0
     assert group.engine_init_records == records
-    assert [call.args[0] for call in kill.call_args_list] == replacements
+    assert [call.args[0] for call in kill.call_args_list] == replacements[1:]
     for engine in surviving:
         engine.shutdown.remote.assert_not_called()
 
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        server.recover()
+    assert len(attempts) == 1
+    replacements[0].shutdown.remote.return_value = AwaitableValue(None)
     server.recover()
+    assert not group.pending_shutdown_indices
     assert group.all_engines == surviving + replacements
     assert server.num_new_engines == len(slots)
     assert [call.args[2].actor_id for call in cleanup.call_args_list] == [
@@ -542,3 +549,39 @@ def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_mod
     assert events[:5] == [("eviction", 0.0)] + [(f"health-{i}", 0.0) for i in range(4)]
     assert rollout_module.time.now == 5.0
     assert events[-2:] == [("engines", None), ("routers", None)]
+
+
+def test_pd_failed_init_cleanup_attempts_every_group(monkeypatch, rollout_module):
+    from conftest import make_rollout_server
+
+    groups = [make_engine_group(engines=[None], worker_type="decode") for _ in range(2)]
+    engines = [make_mock_engine() for _ in groups]
+    failed = object()
+    shutdown_failed = object()
+    engines[0].shutdown.remote.return_value = shutdown_failed
+    for group, engine in zip(groups, engines, strict=True):
+        group.pg = (object(), [0], [0])
+
+        def start(cursors, group=group, engine=engine):
+            group.all_engines[0] = engine
+            return [failed], cursors
+
+        monkeypatch.setattr(group, "start_engines", start)
+
+    def get(ref, timeout=None):
+        if isinstance(ref, list) and failed in ref:
+            raise RuntimeError("init failed")
+        if ref is shutdown_failed:
+            assert groups[1].pending_shutdown_indices == {0}
+            raise TimeoutError("cleanup unknown")
+        return mock_ray_get(ref, timeout)
+
+    monkeypatch.setattr(rollout_module.ray, "get", get)
+    monkeypatch.setattr(rollout_module.ray, "kill", Mock())
+    server = make_rollout_server(engine_groups=groups)
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        server.recover()
+    assert groups[0].all_engines == [engines[0]]
+    assert groups[1].all_engines == [None]
+    for engine in engines:
+        engine.shutdown.remote.assert_called_once()

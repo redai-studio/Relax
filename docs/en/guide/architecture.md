@@ -84,6 +84,23 @@ The deployed service graph depends on the algorithm and execution mode. Colocate
 
 ### 4. Engine Layer
 
+Standard SGLang rollout tasks use an `InferenceManager` to own engines and
+Router processes, and a separate CPU `RolloutWorker` to run generation,
+evaluation and data transfer. The Worker sends requests through the shared
+request executor; public HTTP requests use the Rollout service's Gateway.
+The Manager closes request admission before memory release
+or weight updates; a weights-only load keeps admission closed until KV cache is
+restored. Actor and Controller calls retain the rollout manager interface
+through a delegating handle.
+
+This path is selected automatically for standard rollout and evaluation
+functions with framework-created placement groups. Tasks using GenRM, OPD,
+Agentic, native/custom engines, external engines, custom generation/dataset or
+post-processing hooks, and offline training retain their complete existing
+orchestration. No new launch flag is required. The existing `/rollout/engines`
+response remains the default; managed tasks additionally expose the Manager's
+discovery snapshot with `?schema_version=2`.
+
 The engine layer provides rollout data generation and reward computation:
 
 - [**Rollout Engine**](../../../relax/engine/rollout/): SGLang rollout implementation, on-policy distillation, etc.

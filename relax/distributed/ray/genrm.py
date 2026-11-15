@@ -39,7 +39,7 @@ class GenRMManager(MultiEngineManager):
     - Onload/offload operations
     """
 
-    def __init__(self, args, pg, bundle_offset: int = 0, port_window_index: int = 0):
+    def __init__(self, args, pg, bundle_offset: int = 0, port_window_index: int = 0, *, dedicated_pg: bool = False):
         init_http_client(args)
 
         num_gpu_per_engine = min(args.genrm_num_gpus_per_engine, args.num_gpus_per_node)
@@ -47,6 +47,7 @@ class GenRMManager(MultiEngineManager):
         nodes_per_engine = max(1, args.genrm_num_gpus_per_engine // args.num_gpus_per_node)
 
         self.pg = pg
+        self.dedicated_pg = dedicated_pg
         self.num_gpu_per_engine = num_gpu_per_engine
         self.bundle_offset = bundle_offset
         self.port_window_index = port_window_index
@@ -89,7 +90,7 @@ class GenRMManager(MultiEngineManager):
         results = []
         for rank in range(0, len(self.all_engines), self.nodes_per_engine):
             engine = self.all_engines[rank]
-            if engine is not None and rank in self._engine_addr_and_ports:
+            if engine is not None and rank not in self._unready_ranks and rank in self._engine_addr_and_ports:
                 info = self._engine_addr_and_ports[rank]
                 results.append((info["host"], info["port"]))
         return results
@@ -101,7 +102,7 @@ class GenRMManager(MultiEngineManager):
     def _resolve_placement(self, rank):
         gpu_idx = rank * self.num_gpu_per_engine + self.bundle_offset
         shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        if not self.args.fully_async and not shared_with_rollout:
+        if not self.args.fully_async and not shared_with_rollout and not self.dedicated_pg:
             gpu_idx += self.args.rollout_num_gpus
 
         return self.pg, False, gpu_idx

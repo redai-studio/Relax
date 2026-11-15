@@ -25,6 +25,12 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 3. 发送到 SGLang 引擎，使用可配置的采样参数
 4. 返回原始模型响应文本
 
+### 独立 GPU 资源
+
+未启用 `--colocate` 的标准 SGLang 任务通过公共推理管理器和请求执行链调用 GenRM。每个 judge 使用自己的 checkpoint 与 GPU 切片，Actor 权重更新不改变 judge 权重。请求会读取当前副本地址，因此引擎替换后可以使用新端口，避免服务持续访问旧地址。原有 `route_key` 与采样配置继续适用。
+
+使用自定义生命周期或生成 hook、Agentic rollout、外部 rollout 引擎的任务保留现有编排。Colocate 任务也继续使用现有 offload/onload 协调，包括训练阶段由 Actor 复用的不同推理切片。
+
 ### 共置模式
 
 当与 Actor 共置（共享 GPU 资源）时，GenRM 支持卸载/加载操作：

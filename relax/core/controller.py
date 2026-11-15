@@ -961,6 +961,14 @@ class Controller:
                     ray.get(rollout_manager.dispose.remote(), timeout=30)
                 except Exception as e:
                     logger.warning(f"[{role}] Failed to dispose rollout manager during phase abort: {e}")
+            if str(role) == GENRM_ROLE and getattr(service, "_deployed", False):
+                from relax.distributed.ray.inference_handle import use_managed_auxiliary
+
+                if use_managed_auxiliary(self.config):
+                    try:
+                        service.handle.close.remote().result(timeout_s=120)
+                    except Exception:
+                        logger.exception("Could not confirm aborted GenRM startup cleanup")
             try:
                 serve.delete(role)
             except Exception as e:
@@ -1478,6 +1486,19 @@ class Controller:
             logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
             return False
 
+    def _dispose_managed_genrm(self) -> None:
+        from relax.distributed.ray.inference_handle import use_managed_auxiliary
+
+        config = getattr(self, "config", None)
+        if config is None or not use_managed_auxiliary(config):
+            return
+        service = self.serve_dict.get(GENRM_ROLE)
+        if service is not None and getattr(service, "handle", None) is not None:
+            try:
+                service.handle.close.remote().result(timeout_s=120)
+            except Exception:
+                logger.exception("Could not confirm managed GenRM cleanup")
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1503,8 +1524,9 @@ class Controller:
                 logger.warning(f"Image SFT producer shutdown failed: {exc}")
 
         self._dispose_rollout_manager()
+        self._dispose_managed_genrm()
 
-        shutdown_managed_opd_teacher(self._teacher_manager)
+        shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
 
         self._shutdown_agentic_rollout_services()
 
@@ -1761,6 +1783,11 @@ class Controller:
 
         # The rollout actor owns router subprocesses; dispose before deleting its handle.
         self._dispose_rollout_manager()
+        self._dispose_managed_genrm()
+        shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
+        self._teacher_manager = None
+        if hasattr(self.config, "_teacher_inference_manager_handle"):
+            delattr(self.config, "_teacher_inference_manager_handle")
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import concurrent.futures
 import sys
 import threading
 from types import SimpleNamespace
@@ -157,3 +158,39 @@ def test_global_restart_cleans_both_router_owners(
     assert events.index("stop driver router") < events.index("ray shutdown") < events.index("reinit")
     assert controller._restart_error is None
     assert controller._restart_done_event.is_set()
+
+
+@pytest.mark.parametrize("aborted", [False, True])
+def test_managed_genrm_cleanup_waits_for_serve_response(monkeypatch, aborted):
+    """Serve responses require result(), unlike backend Actor ObjectRefs."""
+    from ray.serve._private.common import RequestMetadata
+    from ray.serve.handle import DeploymentResponse
+
+    from relax.distributed.ray import inference_handle
+
+    events = []
+
+    def finish_close(timeout_s):
+        assert 119 < timeout_s <= 120
+        events.append("closed")
+
+    future = concurrent.futures.Future()
+    future.set_result(SimpleNamespace(get=finish_close))
+    response = DeploymentResponse(future, RequestMetadata("close-genrm", "close-genrm"))
+    service = SimpleNamespace(
+        _deployed=True,
+        _stop_heartbeat_thread=Mock(),
+        handle=SimpleNamespace(close=SimpleNamespace(remote=lambda: response)),
+        pgs=None,
+    )
+    controller = object.__new__(Controller)
+    controller.config = SimpleNamespace()
+    controller.serve_dict = {controller_module.GENRM_ROLE: service}
+    monkeypatch.setattr(inference_handle, "use_managed_auxiliary", lambda config: True)
+    monkeypatch.setattr(controller_module.serve, "delete", lambda role: events.append("deleted"))
+    if aborted:
+        controller._cleanup_aborted_service(controller_module.GENRM_ROLE, service, deploy=True)
+        assert events == ["closed", "deleted"]
+    else:
+        controller._dispose_managed_genrm()
+        assert events == ["closed"]

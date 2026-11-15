@@ -12,6 +12,7 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
+from relax.engine.inference.placement import ProbedPlacementGroup
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
 from relax.utils.agentic_obs.startup import record_run_startup
@@ -58,6 +59,18 @@ def _get_head_node_id():
 class InfoActor:
     def get_ip_and_gpu_id(self):
         return ray.util.get_node_ip_address(), ray_get_device_ids()[0]
+
+    def get_binding(self):
+        # Ray records the node worker's visibility before narrowing it to this
+        # actor's allocation. Engine actors disable that narrowing and inherit
+        # this original list, so their local index must use the same mapping.
+        from ray._private.worker import global_worker
+
+        physical = int(ray_get_device_ids()[0])
+        resource = device_utils.get_ray_accelerator_name()
+        visible = global_worker.original_visible_accelerator_ids.get(resource)
+        local = [int(device) for device in visible].index(physical) if visible is not None else physical
+        return ray.get_runtime_context().get_node_id(), physical, local
 
 
 def sort_key(x):
@@ -137,9 +150,12 @@ def create_placement_group(
                 **accelerator_kwargs,
             ).remote()
         )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
+    try:
+        gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+        bindings = ray.get([actor.get_binding.remote() for actor in info_actors])
+    finally:
+        for actor in info_actors:
+            ray.kill(actor)
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
     sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
@@ -154,7 +170,13 @@ def create_placement_group(
             f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
         )
 
-    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
+    return ProbedPlacementGroup(
+        pg,
+        pg_reordered_bundle_indices,
+        pg_reordered_gpu_ids,
+        tuple(bindings[index][0] for index in pg_reordered_bundle_indices),
+        tuple(bindings[index][2] for index in pg_reordered_bundle_indices),
+    )
 
 
 def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
@@ -169,7 +191,13 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
 
 
 def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
+    from .inference_handle import use_managed_rollout
     from .rollout import RolloutManager
+
+    if use_managed_rollout(args) and isinstance(pg, ProbedPlacementGroup):
+        from .inference_manager import create_managed_rollout
+
+        return create_managed_rollout(args, pg, data_source, runtime_env)
 
     # Get the head node ID to ensure RolloutManager runs on the head node
     # This is critical because the Router binds to the SLIME_HOST_IP address,
@@ -255,6 +283,11 @@ def create_genrm_manager(args, pg, runtime_env=None):
     Returns:
         Initialized GenRM manager
     """
+    from .inference_handle import use_managed_auxiliary
+
+    if use_managed_auxiliary(args):
+        return create_genrm_managers(args, pg, runtime_env)["__default__"]
+
     from .genrm import GenRMManager
 
     # `name` (with no explicit namespace) lets user code inside other actors of
@@ -302,7 +335,39 @@ def create_genrm_managers(args, pg, runtime_env=None):
     import copy
 
     from .genrm import GenRMManager
+    from .inference_handle import use_managed_auxiliary
     from .multi_instance_orchestrator import start_multi_instance_managers
+
+    if use_managed_auxiliary(args):
+        from .inference_manager import create_static_inference_manager, rollback_static_inference_manager
+
+        managers = {}
+        offset = 0
+        try:
+            for index, (key, spec) in enumerate(args._genrm_instances_resolved.items()):
+                instance_args = copy.copy(args)
+                for field in ("model_path", "num_gpus", "num_gpus_per_engine", "engine_config", "sampling_config"):
+                    setattr(instance_args, f"genrm_{field}", spec[field])
+                name = "relax_genrm_manager" if key == "__default__" else f"relax_genrm_manager_{key}"
+                managers[key] = create_static_inference_manager(
+                    instance_args,
+                    "genrm",
+                    pg,
+                    runtime_env=runtime_env,
+                    name=name,
+                    model_id=key,
+                    bundle_offset=offset,
+                    port_window_index=index,
+                )
+                offset += spec["num_gpus"]
+            return managers
+        except BaseException:
+            for manager in managers.values():
+                try:
+                    rollback_static_inference_manager(manager)
+                except Exception:
+                    logger.exception("GenRM startup rollback could not confirm cleanup; owner retained")
+            raise
 
     instance_specs = args._genrm_instances_resolved
     if list(instance_specs.keys()) == ["__default__"]:

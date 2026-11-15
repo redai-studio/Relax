@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import copy
 import logging
 import os
 import random
@@ -30,6 +31,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.inference.lifecycle import managed_weight_update
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -403,6 +405,10 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
+        # Only rollout requests consume this live handle. Megatron saves its
+        # args in common.pt; serializing a job-scoped Ray owner breaks resume.
+        args = copy.copy(args)
+        vars(args).pop("_teacher_inference_manager_handle", None)
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
@@ -3051,6 +3057,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("old_actor")
 
     @timer
+    @managed_weight_update
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
