@@ -168,7 +168,10 @@ def create_managed_opd_teacher_manager(
     from relax.distributed.ray.inference_handle import use_managed_auxiliary
 
     if not shared_pg and use_managed_auxiliary(args):
-        from relax.distributed.ray.inference_manager import create_static_inference_manager
+        from relax.distributed.ray.inference_manager import (
+            create_static_inference_manager,
+            rollback_static_inference_manager,
+        )
 
         manager = create_static_inference_manager(
             args,
@@ -180,10 +183,7 @@ def create_managed_opd_teacher_manager(
         try:
             urls = ray.get(manager.get_urls.remote())
         except BaseException:
-            try:
-                ray.get(manager.dispose.remote(), timeout=60)
-            finally:
-                ray.kill(manager)
+            rollback_static_inference_manager(manager)
             raise
         args._teacher_inference_manager_handle = manager
         return manager, urls

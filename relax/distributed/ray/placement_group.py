@@ -339,7 +339,7 @@ def create_genrm_managers(args, pg, runtime_env=None):
     from .multi_instance_orchestrator import start_multi_instance_managers
 
     if use_managed_auxiliary(args):
-        from .inference_manager import create_static_inference_manager
+        from .inference_manager import create_static_inference_manager, rollback_static_inference_manager
 
         managers = {}
         offset = 0
@@ -364,11 +364,9 @@ def create_genrm_managers(args, pg, runtime_env=None):
         except BaseException:
             for manager in managers.values():
                 try:
-                    ray.get(manager.dispose.remote(), timeout=60)
+                    rollback_static_inference_manager(manager)
                 except Exception:
-                    logger.exception("GenRM startup rollback could not confirm cleanup")
-                finally:
-                    ray.kill(manager)
+                    logger.exception("GenRM startup rollback could not confirm cleanup; owner retained")
             raise
 
     instance_specs = args._genrm_instances_resolved

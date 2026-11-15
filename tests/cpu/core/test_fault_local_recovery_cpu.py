@@ -23,6 +23,7 @@ from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import FaultContext, RecoveryEvidence, new_id
 from relax.utils.fault_events.recovery import GlobalStartup, expected_evidence, observe_recovery
 from relax.utils.fault_events.runtime import FaultEventRuntime
+from relax.utils.opd.opd_utils import shutdown_managed_opd_teacher
 
 
 try:
@@ -57,6 +58,7 @@ def load_classes(path, names, namespace):
         "RecoveryEvidence": RecoveryEvidence,
         "expected_evidence": expected_evidence,
         "GlobalStartup": GlobalStartup,
+        "shutdown_managed_opd_teacher": shutdown_managed_opd_teacher,
         **namespace,
     }
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), namespace)

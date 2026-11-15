@@ -28,6 +28,7 @@ from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.health_system import HealthChecker, HealthManager
 from relax.utils.logging_utils import get_logger
+from relax.utils.opd.opd_utils import shutdown_managed_opd_teacher
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -191,6 +192,7 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
         register_extra_roles=lambda *args: None,
         run=training_run if native else asyncio.run,
         set_managed_opd_teacher_on_actor_service=noop,
+        shutdown_managed_opd_teacher=shutdown_managed_opd_teacher,
     )
     cls = load_definitions("relax/core/controller.py", namespace)["Controller"]
     cls._initialize_data_system = lambda self: None

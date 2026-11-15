@@ -237,3 +237,43 @@ def test_check_services_health_resets_fence_deadline_after_non_503(monkeypatch):
 
     assert shell._check_services_health() == (True, False)
     assert sum(url.endswith("/can_do_update_weight_for_async") for url in calls) == 4
+
+
+@pytest.mark.parametrize("has_teacher_owner", [False, True])
+def test_train_initialization_excludes_live_teacher_owner_from_checkpoint_args(monkeypatch, has_teacher_owner):
+    import io
+    from argparse import Namespace
+
+    import torch
+
+    class LiveTeacherOwner:
+        def __reduce__(self):
+            raise AssertionError("Live Ray owner must not be persisted")
+
+    owner = LiveTeacherOwner()
+    original = Namespace(hf_checkpoint="student", lr=1e-6, use_opd=True, teacher_hf_checkpoint="teacher")
+    if has_teacher_owner:
+        original._teacher_inference_manager_handle = owner
+    captured = []
+
+    class DistributedBoundaryReached(Exception):
+        pass
+
+    def stop_before_distributed_init(args):
+        captured.append(args)
+        raise DistributedBoundaryReached
+
+    monkeypatch.setattr(actor_mod, "monkey_patch_torch_dist", stop_before_distributed_init)
+    actor = object.__new__(MegatronTrainRayActor)
+    # Execute the actual initialization body, omitting only its timing decorator.
+    with pytest.raises(DistributedBoundaryReached):
+        MegatronTrainRayActor._init.__wrapped__(actor, original, "actor")
+    training_args = captured[0]
+    assert training_args is not original
+    assert not hasattr(training_args, "_teacher_inference_manager_handle")
+    assert getattr(original, "_teacher_inference_manager_handle", None) is (owner if has_teacher_owner else None)
+    storage = io.BytesIO()
+    torch.save({"args": training_args}, storage)
+    storage.seek(0)
+    restored = torch.load(storage, weights_only=False)["args"]
+    assert vars(restored) == dict(hf_checkpoint="student", lr=1e-6, use_opd=True, teacher_hf_checkpoint="teacher")

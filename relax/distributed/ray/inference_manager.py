@@ -19,8 +19,23 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-# Failed rollback owners must outlive the failing factory stack.
+# Failed rollback owners must outlive the failing factory stack. In particular,
+# unnamed Teacher actors would otherwise lose their last driver reference.
 _FAILED_ROLLBACK_OWNERS: dict[int, Any] = {}
+
+
+def rollback_static_inference_manager(manager: Any) -> None:
+    """Release an owner only after its engines have confirmed disposal."""
+    key = id(manager)
+    _FAILED_ROLLBACK_OWNERS[key] = manager
+    try:
+        ray.get(manager.dispose.remote(), timeout=60)
+    except BaseException:
+        logger.exception("Static inference cleanup unconfirmed; retaining owner %s", key)
+        raise
+    ray.kill(manager)
+    _FAILED_ROLLBACK_OWNERS.pop(key, None)
+
 
 # Explicit surface: private/workload methods cannot bypass the engine owner.
 POOL_METHODS = frozenset(
@@ -30,7 +45,6 @@ POOL_METHODS = frozenset(
         "get_router_address",
         "get_engines_info",
         "get_status",
-        "get_lora_training_config",
         "check_weights",
         "health_monitoring_pause",
         "health_monitoring_resume",
@@ -132,7 +146,8 @@ class InferenceManager:
                 raise ValueError("Static pools only support auxiliary roles")
 
             def create_pool() -> None:
-                self.pool = StaticInferencePool(self.role, args, binding, options)
+                self.pool = StaticInferencePool.__new__(StaticInferencePool)
+                StaticInferencePool.__init__(self.pool, self.role, args, binding, options)
                 self.pool.record_placement(self.placement)
 
             await _blocking(create_pool)
@@ -439,12 +454,7 @@ class InferenceManager:
                 except Exception:
                     logger.exception("Could not abort residual requests during shutdown")
                 if worker is not None:
-                    try:
-                        await asyncio.wait_for(worker.close.remote(), timeout=30)
-                    except ray.exceptions.ActorDiedError:
-                        # A previous cleanup attempt may already have stopped
-                        # the CPU worker. GPU release is still checked below.
-                        pass
+                    await asyncio.wait_for(worker.close.remote(), timeout=30)
                 await self.ledger.drain("shutdown", timeout=10)
             finally:
                 try:
@@ -463,11 +473,8 @@ def dispose_managed_rollout(manager: Any, worker: Any) -> None:
     """Release the CPU owner after cleanup, including on global restarts."""
     try:
         ray.get(manager.dispose.remote(worker))
-    except BaseException:
-        _FAILED_ROLLBACK_OWNERS[id(manager)] = manager
-        raise
-    ray.kill(manager)
-    _FAILED_ROLLBACK_OWNERS.pop(id(manager), None)
+    finally:
+        ray.kill(manager)
 
 
 def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: Any) -> tuple[Any, Any]:
@@ -554,9 +561,6 @@ def create_static_inference_manager(
     try:
         ray.get(manager.start_static.remote(role, deepcopy(args), binding, pool_options))
     except BaseException:
-        try:
-            ray.get(manager.dispose.remote(), timeout=60)
-        finally:
-            ray.kill(manager)
+        rollback_static_inference_manager(manager)
         raise
     return manager

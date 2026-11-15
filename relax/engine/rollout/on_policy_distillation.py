@@ -362,7 +362,7 @@ class OpdManager:
 
         self._assemble_transfer(sample_list)
 
-    async def _post_managed_teacher(self, manager: Any, payload: dict) -> dict:
+    async def _post_managed_teacher(self, manager: Any, payload: dict, sample: Sample) -> dict:
         from relax.engine.inference.executor import InferenceRequestExecutor
         from relax.utils import http_utils
 
@@ -373,9 +373,9 @@ class OpdManager:
 
         async def generate() -> dict:
             if self._teacher_slots is None:
-                return await self._teacher_executor.generate_json(payload)
+                return await self._teacher_executor.generate_json(payload, replica_cursor=sample.group_index)
             async with self._teacher_slots:
-                return await self._teacher_executor.generate_json(payload)
+                return await self._teacher_executor.generate_json(payload, replica_cursor=sample.group_index)
 
         return await asyncio.wait_for(generate(), timeout=float(self.args.opd_teacher_timeout_s))
 
@@ -391,7 +391,7 @@ class OpdManager:
         try:
             manager = getattr(self.args, "_teacher_inference_manager_handle", None)
             if manager is not None and err_tag == "teacher prefill":
-                data = await self._post_managed_teacher(manager, payload)
+                data = await self._post_managed_teacher(manager, payload, sample)
             else:
                 async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
                     if resp.status >= 400:
