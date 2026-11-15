@@ -6,6 +6,7 @@ from argparse import Namespace
 
 from relax.engine.sft.image_preprocessing_config import configure_image_preprocessing
 from relax.engine.sft.runtime import is_offline_mode, is_sft_mode
+from relax.models.qwen3_5.recipe import enabled as qwen35_recipe_enabled
 from relax.utils.data.wholepack_policy import enabled as wholepack_enabled
 
 
@@ -20,6 +21,8 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
             is_sft
             # Wholepack owns the packing plan and requires raw prefetched batches.
             and not wholepack_enabled(args)
+            # The optimized recipe consumes raw batches even without wholepack.
+            and not qwen35_recipe_enabled(args)
             and lookahead
             and "image" not in (getattr(args, "multimodal_keys", None) or {})
             and args.distributed_backend == "nccl"

@@ -146,8 +146,10 @@ def qsa_bridge_checkpointed_forward(
         while layer_idx < self.num_layers_per_pipeline_rank:
             chunk_end = min(layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank)
             forward_func = custom(layer_idx, chunk_end)
-            if chunk_end == layer_idx + 1 and getattr(
-                self._get_layer(layer_idx), "_relax_qsa_attention_retained", False
+            layer = self._get_layer(layer_idx)
+            if chunk_end == layer_idx + 1 and (
+                getattr(layer, "_relax_qsa_attention_retained", False)
+                or getattr(layer, "_relax_qsa_full_layer_retained", False)
             ):
                 hidden_states, context = forward_func(
                     hidden_states,

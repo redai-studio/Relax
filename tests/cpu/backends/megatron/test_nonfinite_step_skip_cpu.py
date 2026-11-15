@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from relax.utils.agentic_obs.train_hooks import record_optimizer_result
 from relax.utils.training.nonfinite_grad import configure_nonfinite_guard, install_nonfinite_guard
 
 
@@ -55,6 +56,7 @@ def update_block(guard):
             args=SimpleNamespace(check_for_nan_in_loss_and_grad=False),
             losses_reduced=[],
             _is_global_zero_token_step=lambda _: False,
+            record_optimizer_result=record_optimizer_result,
             step_id=128,
             rollout_id=128,
             step_global_batch_size=1600,

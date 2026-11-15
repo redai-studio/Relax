@@ -1,5 +1,14 @@
 # Kimi-K3 优化
 
+## 脚本默认配置
+
+本目录的 K3 脚本和 K3.1 的 SFT / LoRA 两个通用入口默认开启 SiTU / AttnRes 融合；LoRA 脚本还默认开启 Expert Split 和满足条件时的 Grouped GEMM 去复制路径。框架级开关仍默认关闭，已有运行不会热切换。
+
+- 设置 `RELAX_KIMI_K3_FUSED_SITU=0`、`RELAX_KIMI_K3_FUSED_ATTN_RES=0` 或 `RELAX_KIMI_K3_EXPERT_SPLIT=0` 可分别关闭。
+- K3 MLA 默认使用 `ATTENTION_BACKEND=fused`，可设置 `ATTENTION_BACKEND=flash` 对照；K3.1 保留各脚本的 DSA 路径，不能直接套用 MLA cuDNN 的收益。
+- 设置了共享 `SAVE_DIR` 时，编译缓存默认放在 `${SAVE_DIR}/.kernel-cache`。`RELAX_KERNEL_CACHE_DIR` 可指定其他共享绝对路径，显式设为空字符串可关闭；未设置 `SAVE_DIR` 的运行需显式提供缓存目录。
+- [configure_kernel_cache.sh](./tools/configure_kernel_cache.sh) 在提交前调用已有缓存准备函数，兼容外层 `ray-job.sh` 已先执行的情况，并复用已准备好的缓存 session。缓存覆盖 TorchInductor / Triton，不保证消除 DSA TileLang 的首次编译。
+
 ## Kimi K3 LoRA：Expert Split 优化
 
 ### 优化思路
@@ -50,7 +59,7 @@ AttnRes 原先先拼接 residual bank 和当前 prefix，再依次执行 RMS 打
 
 若已有 `--train-env-vars`，将两个字段合入原 JSON。worker 日志出现 `Enabled Kimi K3 fused SiTU (precise tanh).` 和 `Enabled Kimi K3 fused AttnRes aggregation.` 表示对应实现已安装。将任一字段设为 `0`，可单独关闭该优化做对照。
 
-框架中两个开关均默认关闭；[64 卡 Blackwell 启动脚本](./scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh) 默认将它们设为 `1`，启动前显式设置同名环境变量为 `0` 可覆盖脚本默认值。
+框架中两个开关均默认关闭；上述训练脚本默认将它们设为 `1`，启动前显式设置同名环境变量为 `0` 可覆盖脚本默认值。
 
 ### 代码位置
 
@@ -88,7 +97,7 @@ Blackwell 单卡上，使用真实训练的 4 个 PP 阶段、共 8 份样本验
 
 ### 如何开启
 
-启动前设置共享缓存目录，再使用原有训练入口启动：
+脚本已有共享 `SAVE_DIR` 时自动使用 `${SAVE_DIR}/.kernel-cache`；也可以在启动前显式指定共享缓存目录，再使用原有训练入口启动：
 
 ```bash
 export RELAX_KERNEL_CACHE_DIR=/shared/compiler-cache

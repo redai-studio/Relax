@@ -37,7 +37,9 @@ from relax.utils.data.kimi_k3 import (
     make_kimi_k3_sft_request,
 )
 from relax.utils.data.streaming_dataset import CompositeStreamingReader, IndexManager, PrefetchBuffer, StreamingReader
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.types import MultimodalTypes
 
 
 logger = get_logger(__name__)
@@ -98,6 +100,7 @@ class ProcessedSample:
     # the dropped pixel_values; None keeps the pixel-shipping default mode.
     image_refs_descriptor: dict[str, Any] | None = None
     pre_shifted_labels: torch.Tensor | None = None
+    dataset_id: int | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -108,6 +111,27 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def _assistant_quotes_media_tags(row: dict[str, Any], prompt_key: str, multimodal_keys: dict[str, str] | None) -> bool:
+    """Recognize assistant-only literal tags in conversations without media."""
+    if not multimodal_keys or any(row.get(key) for key in multimodal_keys.values()):
+        return False
+    messages = row.get(prompt_key)
+    if not isinstance(messages, list):
+        return False
+    markers = tuple(media.placeholder for media in MultimodalTypes.all() if media.name in multimodal_keys)
+    if len(markers) != len(multimodal_keys):
+        return False
+    found = False
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            return False
+        if any(marker in message["content"] for marker in markers):
+            if message.get("role") != "assistant":
+                return False
+            found = True
+    return found
 
 
 def _validate_multimodal_contract(
@@ -185,6 +209,8 @@ def _normalize_tools(value: Any) -> list[dict] | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if not value or value.isspace():
+            return None
         value = json.loads(value)
     elif hasattr(value, "tolist"):
         value = value.tolist()
@@ -342,6 +368,7 @@ def _build_canonical_sample_from_row(
     source_name: str,
     task_type: str = "causal_lm",
     conversation_key_map: dict[str, str] | None = None,
+    assistant_media_tags_as_text: bool = False,
 ) -> CanonicalSample:
     prompt = row.get(prompt_key)
     if prompt is None:
@@ -378,6 +405,8 @@ def _build_canonical_sample_from_row(
             for message in prompt
         ]
         row = {**row, prompt_key: prompt}
+        if assistant_media_tags_as_text and _assistant_quotes_media_tags(row, prompt_key, multimodal_keys):
+            multimodal_keys = None
         _validate_multimodal_contract(
             row,
             prompt,
@@ -795,6 +824,11 @@ class SFTStreamingDataset:
             require_response=self.require_response,
             source_name=self.source_name,
             task_type=self.task_type,
+            assistant_media_tags_as_text=(
+                self.training_mode == "sft"
+                and self.task_type == "causal_lm"
+                and Envs.RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT
+            ),
         )
 
     def get_classification_label(self, idx: int, *, row: dict[str, Any] | None = None) -> torch.Tensor | None:
@@ -1239,6 +1273,7 @@ class SFTStreamingDataset:
             classification_label=rendered.classification_label,
             multimodal_train_inputs=mm_inputs,
             source_idx=rendered.idx,
+            dataset_id=self.reader.dataset_id(rendered.idx) if hasattr(self.reader, "dataset_id") else None,
             image_refs_descriptor=image_refs_descriptor,
         )
 
@@ -1426,6 +1461,10 @@ def pack_samples_for_tq(
         # assistant/function_call token positions.
         "response_lengths": [1] * len(samples) if is_classification else total_lengths,
     }
+    if any(s.dataset_id is not None for s in samples):
+        if not all(s.dataset_id is not None for s in samples):
+            raise ValueError("dataset ids must be present for every sample in a mixture batch")
+        batch["dataset_ids"] = [s.dataset_id for s in samples]
     if is_classification:
         batch["classification_labels"] = [s.classification_label.tolist() for s in samples]
     if has_pre_shifted_labels:

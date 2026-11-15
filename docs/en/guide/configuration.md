@@ -69,6 +69,8 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--critic-load` | str | None | Critic model checkpoint path. When None, equals `--load` |
 | `--critic-save` | str | None | Critic model save path |
 
+When a native Megatron checkpoint is selected, a missing iteration directory is an error rather than a fallback to HF initialization. DCP shard files are checked for missing or truncated storage before loading. A training resume requires optimizer, scheduler, and RNG state unless the corresponding reset is explicit: use `--no-load-optim` to reset the optimizer and scheduler, `--no-load-rng` to reset RNG, or `--finetune` to start a new run from native model weights. These options do not repair damaged shards. Megatron release checkpoints remain weights-only sources. HF weight initialization remains available through an explicit HF source.
+
 ---
 
 ## Data Configuration

@@ -25,7 +25,9 @@ from relax.distributed.checkpoint_service.client.engine import CheckpointEngineC
 @pytest.fixture(autouse=True)
 def single_rank_collective(monkeypatch):
     monkeypatch.setattr(client_module, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(client_module.dist, "get_rank", lambda **kwargs: 0)
     monkeypatch.setattr(client_module.dist, "get_world_size", lambda **kwargs: 1)
+    monkeypatch.setattr(client_module.dist, "broadcast_object_list", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         client_module.dist, "all_gather_object", lambda output, value, **kwargs: output.__setitem__(0, value)
     )
