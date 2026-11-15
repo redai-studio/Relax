@@ -1389,8 +1389,8 @@ class SGLangEngine(RayActor):
         returned*; a request admitted between the flush and the release would
         touch a KV/token pool that is already gone (Relax #282). Closing
         admission with ``/pause_generation`` (abort mode) before the flush
-        keeps the offload window shut; ``resume_memory_occupation`` re-opens
-        it once the engine is back.
+        keeps the offload window shut; ``resume_memory_occupation`` re-opens it
+        once the engine is back.
         """
         if self.node_rank == 0:
             deadline = time.monotonic() + _OFFLOAD_DRAIN_TIMEOUT_S
@@ -1446,9 +1446,8 @@ class SGLangEngine(RayActor):
     def _pause_generation_for_offload(self, deadline: float) -> None:
         """Pause admission (abort mode) before draining.
 
-        Raises if the pause does not take: releasing memory while admission
-        is still open leaves the flush->release race this barrier exists to
-        close.
+        Raises if the pause does not take: releasing memory while admission is
+        still open leaves the flush->release race this barrier exists to close.
         """
         self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
 
