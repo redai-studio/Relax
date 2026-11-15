@@ -159,6 +159,8 @@ def resolve_shard_ordinal(default: int = 0) -> int:
     try:
         import ray
 
+        if not ray.is_initialized():
+            return default
         actor_name = ray.get_runtime_context().get_actor_name()
     except Exception:  # noqa: BLE001 — driver-side tests run outside an actor
         return default
