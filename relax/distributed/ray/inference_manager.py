@@ -473,8 +473,11 @@ def dispose_managed_rollout(manager: Any, worker: Any) -> None:
     """Release the CPU owner after cleanup, including on global restarts."""
     try:
         ray.get(manager.dispose.remote(worker))
-    finally:
-        ray.kill(manager)
+    except BaseException:
+        _FAILED_ROLLBACK_OWNERS[id(manager)] = manager
+        raise
+    ray.kill(manager)
+    _FAILED_ROLLBACK_OWNERS.pop(id(manager), None)
 
 
 def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: Any) -> tuple[Any, Any]:
