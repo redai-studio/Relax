@@ -2,9 +2,10 @@
 
 """Opt-in bounded-memory PLE forward for packed Qwen4Exp context parallelism.
 
-The four residual streams are independent inside PLE. Checkpointing each stream
-keeps its FP32 gate, RMSNorm, and convolution temporaries out of the other
-streams' forward activations. The original implementation remains the default.
+The four residual streams are independent inside PLE. Checkpoint sequence
+chunks with a left convolution halo inside each stream, so backward replay does
+not rebuild full-sequence FP32 gate, RMSNorm, and convolution tensors. The
+original implementation remains the default.
 """
 
 import math
@@ -15,6 +16,9 @@ from megatron.core import parallel_state
 from megatron.core.transformer.hyper_connection import gated_residual_group_rmsnorm
 from megatron.core.transformer.per_layer_embedding import PerLayerEmbedding
 from torch.utils.checkpoint import checkpoint
+
+
+_STREAM_CHUNK_ROWS = 8192
 
 
 def _stream_conv(ple: PerLayerEmbedding, x: torch.Tensor, positions: torch.Tensor, stream: int) -> torch.Tensor:
@@ -91,16 +95,26 @@ def _streamed_forward(self: PerLayerEmbedding, hidden_states: torch.Tensor) -> t
         stop = start + channels
         hidden_stream = hidden_states[..., start:stop]
         key_stream = key_raw[..., start:stop]
-        piece = checkpoint(
-            lambda h, k, v, p, stream=stream: _stream_forward(self, h, k, v, p, stream),
-            hidden_stream,
-            key_stream,
-            value,
-            positions,
-            use_reentrant=False,
-            preserve_rng_state=False,
-        )
-        pieces.append(piece)
+        chunks = []
+        for begin in range(0, max(sequence_length, 1), _STREAM_CHUNK_ROWS):
+            end = min(begin + _STREAM_CHUNK_ROWS, sequence_length)
+            left = max(0, begin - self.halo)
+            trim = begin - left
+            # Keep document-relative positions unchanged: the original mask
+            # still prevents halo reads across packed document boundaries.
+            # Bind trim/stream because checkpoint replay occurs after this loop.
+            piece = checkpoint(
+                lambda h, k, v, p, stream=stream, trim=trim: _stream_forward(self, h, k, v, p, stream)[trim:],
+                hidden_stream[left:end],
+                key_stream[left:end],
+                value[left:end],
+                positions[left:end],
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+            chunks.append(piece)
+        pieces.append(torch.cat(chunks, dim=0))
+        del chunks, piece
     result = torch.cat(pieces, dim=-1)
     result = split_tensor_cp(result, self._cp_packed_seq_params, dim=0)
     if sp_replicated:

@@ -62,6 +62,7 @@ def _manager(**overrides) -> OpdManager:
         opd_kl_coef=1.0,
         opd_loss_coef=0.0,
         opd_teacher_url="http://teacher/generate",
+        opd_teacher_routes_map=None,
         sglang_router_ip="student",
         sglang_router_port=80,
     )
@@ -350,6 +351,8 @@ def native_generate(monkeypatch):
     sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
     args = SimpleNamespace(
         ci_test=False,
+        use_opd=True,
+        opd_type="sglang",
         sglang_router_ip="unused",
         sglang_router_port=1,
         use_slime_router=False,
@@ -392,11 +395,13 @@ def native_generate(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_native_generate_sends_collapsed_ids_and_preserves_expanded_sample(native_generate):
+@pytest.mark.parametrize("evaluation", [False, True])
+async def test_native_generate_sends_collapsed_ids_and_preserves_expanded_sample(native_generate, evaluation):
     rollout, args, sample, _, _, requests = native_generate
-    assert await rollout.generate(args, sample, {"max_new_tokens": 2}) is sample
+    assert await rollout.generate(args, sample, {"max_new_tokens": 2}, evaluation=evaluation) is sample
     assert requests[0]["input_ids"] == [1, 99, 2]
-    assert requests[0]["return_prompt_token_ids"] is True
+    assert requests[0].get("return_prompt_token_ids", False) is not evaluation
+    assert requests[0]["return_logprob"] is not evaluation
     assert requests[0]["image_data"] == ["student-image"]
     assert sample.tokens == [1, 99, 99, 99, 2, 10, 11]
     assert sample.rollout_tokens == [1, 99, 2, 10, 11]
@@ -450,6 +455,8 @@ async def test_image_opd_rejects_text_radix_routing_before_generation(monkeypatc
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: SimpleNamespace(opd_manager=object()))
     args = SimpleNamespace(
         ci_test=False,
+        use_opd=True,
+        opd_type="sglang",
         sglang_router_ip="unused",
         sglang_router_port=1,
         use_slime_router=True,

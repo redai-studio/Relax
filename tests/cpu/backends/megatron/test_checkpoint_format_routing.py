@@ -49,6 +49,10 @@ def checkpoint(request, monkeypatch):
             ],
         )
     monkeypatch.setattr(module, "_collective_checkpoint_probe", lambda probe: probe(), raising=False)
+    # These format-routing fixtures have placeholder metadata, not loadable
+    # shards; actual storage validation is covered in test_checkpoint_preflight.
+    monkeypatch.setattr(module, "_checkpoint_has_optimizer_state", lambda *args: True, raising=False)
+    monkeypatch.setattr(module, "validate_native_checkpoint", lambda *args, **kwargs: {}, raising=False)
     monkeypatch.setattr(module, "is_rm_mode", lambda args: False, raising=False)
     monkeypatch.setattr(module, "_LORA_CHECKPOINT_METADATA_ATTR", "relax_lora_checkpoint_metadata", raising=False)
     monkeypatch.setattr(module, "logger", Mock(), raising=False)

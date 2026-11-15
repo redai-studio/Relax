@@ -82,7 +82,7 @@ FROM base as train
 RUN python -c "import torch; assert torch.backends.cudnn.version() is not None"
 
 # FA2 is retained as a comparison backend. Build against this image's Torch/CUDA ABI.
-# Hopper-only FA3 is built in relax_hopper below, outside the Blackwell stage chain.
+# Hopper-only FA3 is built in fa3_builder below, outside the Blackwell stage chain.
 RUN . /etc/relax_build.env && FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 \
     pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
     pip install --no-cache-dir flash-linear-attention==0.4.1
@@ -123,6 +123,21 @@ RUN . /etc/relax_build.env && \
     rm -rf /tmp/int4_qat
 
 ARG TRAIN_IMAGE=train
+# FA3 needs Torch/CUDA and build tooling, not application requirements or Python
+# patches. Use the final image's TRAIN_IMAGE so its Python/libc/Torch ABI matches.
+# Only relax_hopper consumes this stage; Blackwell must not build Hopper kernels.
+FROM ${TRAIN_IMAGE} as fa3_builder
+ARG FA3_COMMIT=0f82fead0b2d59f6390c62a1d74e927159bc5a7b
+# Clear training-library preloads only for this build, not the final runtime.
+RUN git clone https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention-fa3 && \
+    cd /tmp/flash-attention-fa3 && git checkout "$FA3_COMMIT" && \
+    test "$(git rev-parse HEAD)" = "$FA3_COMMIT" && \
+    git submodule update --init --depth=1 && \
+    env -u LD_PRELOAD CUDA_VISIBLE_DEVICES="" FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTENTION_DISABLE_SM80=TRUE \
+        MAX_JOBS=32 pip wheel --no-cache-dir --no-build-isolation --no-deps \
+        --wheel-dir /opt/fa3-wheels ./hopper && \
+    cd /root && rm -rf /tmp/flash-attention-fa3
+
 # Compile communication extensions independently of application dependencies and
 # patches. Keep the same Python/library paths as the final TRAIN_IMAGE: DeepEP
 # records NCCL/NVSHMEM paths in its wheel and extension rpath.
@@ -149,12 +164,14 @@ RUN . /etc/relax_build.env && \
 FROM ep_builder_base as deepep_v2_builder
 ARG DEEP_EP_V2_COMMIT
 COPY docker/patch/deepep/2.1.0-relax-namespace.patch /tmp/deepep-v2.patch
-RUN . /etc/relax_build.env && \
+RUN --mount=type=bind,source=docker/patch/deepep/2.1.0-nccl-runtime-filter.patch,target=/tmp/deepep-nccl-filter.patch \
+    . /etc/relax_build.env && \
     git clone https://github.com/deepseek-ai/DeepEP.git /tmp/DeepEP-v2 && \
     cd /tmp/DeepEP-v2 && git checkout --detach "$DEEP_EP_V2_COMMIT" && \
     test "$(git rev-parse HEAD)" = "$DEEP_EP_V2_COMMIT" && \
     git submodule update --init --recursive && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/deepep-v2.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/deepep-nccl-filter.patch && \
     mv deep_ep _relax_deep_ep_v2 && \
     NCCL_ROOT="$(python -c 'import importlib.metadata as m; print(m.distribution("nvidia-nccl-cu13").locate_file("nvidia/nccl"))')" && \
     CUDA_VISIBLE_DEVICES="" MAX_JOBS=16 EP_NCCL_ROOT_DIR="$NCCL_ROOT" \
@@ -296,6 +313,7 @@ RUN --mount=type=bind,source=docker/patch/sglang/v0.5.21.patch,target=/tmp/sglan
 RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-transform.patch,target=/tmp/tq-assignment.patch \
     --mount=type=bind,source=requirements.txt,target=/tmp/requirements.in \
     --mount=type=bind,from=router_builder,source=/opt/router-wheels,target=/tmp/router-wheels \
+    --mount=type=bind,source=docker/scripts/nvcc-without-preload.sh,target=/tmp/nvcc-without-preload.sh \
     cp /tmp/requirements.in /tmp/requirements.txt && \
     sed -i \
     -e 's/^clearml==2\.1\.3$/clearml==2.1.4/' \
@@ -309,6 +327,16 @@ RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-trans
     pip install --no-cache-dir "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps && \
     TQ_SITE="$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transfer_queue").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -d "$TQ_SITE" -p1 < /tmp/tq-assignment.patch && \
+    NVCC_BIN=/usr/local/cuda/bin && \
+    if [ -e "$NVCC_BIN/nvcc.real" ]; then \
+        cmp /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
+    else \
+        test -f "$NVCC_BIN/nvcc" && test -x "$NVCC_BIN/nvcc" && \
+        ! cmp -s /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc" && \
+        mv "$NVCC_BIN/nvcc" "$NVCC_BIN/nvcc.real" && \
+        install -m 755 /tmp/nvcc-without-preload.sh "$NVCC_BIN/nvcc"; \
+    fi && \
+    "$NVCC_BIN/nvcc" --version && \
     rm /tmp/requirements.txt && \
     python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
     python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
@@ -326,6 +354,7 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     --mount=type=bind,source=docker/patch/megatron/20261020-model-operators.patch,target=/tmp/relax-patches/20261020-model-operators.patch \
     --mount=type=bind,source=docker/patch/megatron/mtp-cp-normalization.patch,target=/tmp/relax-patches/mtp-cp-normalization.patch \
     --mount=type=bind,source=docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch,target=/tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
+    --mount=type=bind,source=docker/patch/megatron/fully-reshardable-checkpoint-padding.patch,target=/tmp/relax-patches/fully-reshardable-checkpoint-padding.patch \
     --mount=type=bind,source=docker/scripts/setup_memory_saver.py,target=/tmp/setup_memory_saver.py \
     cp /tmp/relax-patches/megatron.patch \
     /tmp/relax-patches/sync-save-bounded-staging.patch \
@@ -334,7 +363,8 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     /tmp/relax-patches/20261020-qwen35-optimized.patch \
     /tmp/relax-patches/20261020-model-operators.patch \
     /tmp/relax-patches/mtp-cp-normalization.patch \
-    /tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch /root/Megatron-LM/ && \
+    /tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
+    /tmp/relax-patches/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/ && \
     cd /root/Megatron-LM && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < /root/Megatron-LM/megatron.patch && \
@@ -352,10 +382,11 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
     echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
+    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
     sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch fully-reshardable-checkpoint-padding.patch && \
     cd /root && python /tmp/setup_memory_saver.py
 
 # Hold the architecture-specific cache lock only while building sampling.so.
@@ -416,13 +447,10 @@ RUN --mount=type=bind,from=hybridep_builder,source=/opt/ep-wheels,target=/tmp/ep
 # Enable the EFA NCCL plugin only for 280G Blackwell; Hopper clusters may not have EFA.
 FROM relax_ep as relax_hopper
 # Match the CUDA 12 FA3 source/API, rebuilt for this image's Torch/CUDA ABI.
-ARG FA3_COMMIT=0f82fead0b2d59f6390c62a1d74e927159bc5a7b
-RUN git clone https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention-fa3 && \
-    cd /tmp/flash-attention-fa3 && git checkout "$FA3_COMMIT" && \
-    git submodule update --init --depth=1 && \
-    CUDA_VISIBLE_DEVICES="" FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTENTION_DISABLE_SM80=TRUE \
-        MAX_JOBS=32 pip install --no-cache-dir --no-build-isolation --no-deps ./hopper && \
-    cd /root && rm -rf /tmp/flash-attention-fa3
+# Bind the wheel instead of retaining an archive or adding a COPY layer.
+RUN --mount=type=bind,from=fa3_builder,source=/opt/fa3-wheels,target=/tmp/fa3-wheels \
+    pip install --no-cache-dir --force-reinstall --no-deps /tmp/fa3-wheels/*.whl && \
+    python -c "import torch; import flash_attn_3._C"
 ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}
 
 FROM relax_ep as relax_blackwell

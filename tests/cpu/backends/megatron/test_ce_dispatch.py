@@ -8,7 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 
-def _check_ce_dispatch_entrypoint(enabled: bool, backport_first: bool) -> None:
+def _check_ce_dispatch_entrypoint(enabled: bool, backport_first: bool, architecture: int | None = None) -> None:
     script = f"""
 import importlib
 if {backport_first!r}:
@@ -23,7 +23,11 @@ fused_linear_ce._LinearCE.apply = lambda *args: fallback_result
 fused_linear_ce._log_enabled = lambda *args: None
 import torch
 hidden = torch.ones(1)
-expected = backport_result if {enabled!r} else fallback_result
+if {architecture!r} is not None:
+    from types import SimpleNamespace
+    hidden = SimpleNamespace(is_cuda=True, device=torch.device('cuda:0'), numel=lambda: 1)
+    torch.cuda.get_device_capability = lambda *_: ({architecture!r}, 0)
+expected = backport_result if {enabled!r} and {architecture!r} != 9 else fallback_result
 assert fused_linear_ce.linear_cross_entropy(hidden, hidden, hidden, None) is expected
 assert fused_linear_ce.linear_cross_entropy is original
 """
@@ -43,5 +47,7 @@ def test_ce_dispatch_preserves_entrypoint_identity() -> None:
             for backport_first in (False, True)
             for enabled in (False, True)
         ]
+        # A previously imported SM100 backport must not capture Hopper calls.
+        cases.append(executor.submit(_check_ce_dispatch_entrypoint, True, True, 9))
         for case in cases:
             case.result()

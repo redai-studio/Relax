@@ -16,15 +16,15 @@
     },
     "integration/gpu-async": {
       "workflow": "integration-test.yml",
-      "job": "Qwen3-4B-4xgpu-async"
+      "job": "Qwen3.5-4B-4xgpu-async"
     },
     "integration/gpu-vl": {
       "workflow": "integration-test.yml",
-      "job": "Qwen3-VL-4B-2xgpu"
+      "job": "Qwen3.5-4B-2xgpu-vl"
     },
     "integration/npu-async": {
       "workflow": "integration-test.yml",
-      "job": "Qwen3-4B-4xnpu-async"
+      "job": "Qwen3.5-4B-4xnpu-async"
     }
   }
 }

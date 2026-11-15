@@ -21,7 +21,7 @@ import pytest
 
 from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import FaultContext, RecoveryEvidence, new_id
-from relax.utils.fault_events.recovery import expected_evidence, observe_recovery
+from relax.utils.fault_events.recovery import GlobalStartup, expected_evidence, observe_recovery
 from relax.utils.fault_events.runtime import FaultEventRuntime
 
 
@@ -56,6 +56,7 @@ def load_classes(path, names, namespace):
         "IntEnum": IntEnum,
         "RecoveryEvidence": RecoveryEvidence,
         "expected_evidence": expected_evidence,
+        "GlobalStartup": GlobalStartup,
         **namespace,
     }
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), namespace)
@@ -259,12 +260,14 @@ def test_observer_and_its_log_failure_do_not_change_actual_service_restart(monke
     logger.warning.assert_called_with("Fault observation unavailable")
 
 
-def test_default_off_never_evaluates_recovery_plan():
+def test_default_off_never_evaluates_recovery_plan(monkeypatch):
+    from relax.utils.fault_events import runtime as runtime_module
+
     trace = []
     service = make_service(trace)
     controller, _ = make_controller(None, {Roles.advantages: service}, trace)
     plan = Mock(side_effect=AssertionError("disabled observation must not evaluate a plan"))
-    type(controller)._restart_serve.__globals__["expected_evidence"] = plan
+    monkeypatch.setattr(runtime_module, "expected_evidence", plan)
     controller.restart_serve(Roles.advantages)
     assert "submit_task" in trace and controller._restart_error is None
     plan.assert_not_called()
@@ -289,7 +292,7 @@ def test_default_off_never_evaluates_recovery_plan():
 def test_recovery_plan_preserves_role_and_configuration_rules(mode, roles, options, expected):
     config = SimpleNamespace(**options)
     plan = expected_evidence(mode, config, dict.fromkeys(roles))
-    assert type(plan) is int and plan == expected
+    assert type(plan) is RecoveryEvidence and plan == expected
 
 
 def test_local_recovery_context_stays_owned_until_restart_is_complete_and_consumed(runtime):

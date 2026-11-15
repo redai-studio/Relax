@@ -262,6 +262,46 @@ def test_expert_sync_rejects_inconsistent_scheduler_layouts(monkeypatch, expert_
 
 
 @pytest.mark.parametrize(
+    ("supported", "offload", "global_backend", "overrides", "expected"),
+    [
+        (True, True, None, {}, "disabled"),
+        (True, False, None, {}, None),
+        (True, True, "breakable", {}, "breakable"),
+        (True, True, "disabled", {"cuda_graph_backend_prefill": "breakable"}, "breakable"),
+        (True, True, None, {"enable_memory_saver": False}, None),
+        (True, False, None, {"enable_memory_saver": True}, "disabled"),
+        (False, True, None, {}, None),
+    ],
+)
+def test_genrm_prefill_cuda_graph_respects_memory_saver_and_overrides(
+    monkeypatch, sglang_engine_module, supported, offload, global_backend, overrides, expected
+):
+    module = sglang_engine_module
+    fields = [("enable_memory_saver", bool, False)]
+    if supported:
+        fields.append(("cuda_graph_backend_prefill", str, None))
+    monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", fields))
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
+    args = SimpleNamespace(
+        genrm_num_gpus_per_engine=1,
+        num_gpus_per_node=8,
+        genrm_model_path="/test/genrm",
+        genrm_engine_config=overrides,
+        seed=42,
+        offload_rollout=offload,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_cuda_graph_backend_prefill=global_backend,
+    )
+
+    result, _ = module._compute_genrm_server_args(args, 0, "localhost:8000", 8001, "localhost", 8002, base_gpu_id=0)
+
+    assert result.get("cuda_graph_backend_prefill") == expected
+    if not supported:
+        assert "cuda_graph_backend_prefill" not in result
+
+
+@pytest.mark.parametrize(
     ("enforce", "overrides", "expected_disabled"),
     [
         (False, None, True),
