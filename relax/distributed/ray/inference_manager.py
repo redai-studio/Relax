@@ -19,6 +19,24 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Failed rollback owners must outlive the failing factory stack. In particular,
+# unnamed Teacher actors would otherwise lose their last driver reference.
+_FAILED_ROLLBACK_OWNERS: dict[int, Any] = {}
+
+
+def rollback_static_inference_manager(manager: Any) -> None:
+    """Release an owner only after its engines have confirmed disposal."""
+    key = id(manager)
+    _FAILED_ROLLBACK_OWNERS[key] = manager
+    try:
+        ray.get(manager.dispose.remote(), timeout=60)
+    except BaseException:
+        logger.exception("Static inference cleanup unconfirmed; retaining owner %s", key)
+        raise
+    ray.kill(manager)
+    _FAILED_ROLLBACK_OWNERS.pop(key, None)
+
+
 # Explicit surface: private/workload methods cannot bypass the engine owner.
 POOL_METHODS = frozenset(
     {
@@ -107,7 +125,8 @@ class InferenceManager:
                 def create_pool() -> None:
                     # Publish ownership inside the operation, even if the RPC
                     # caller is cancelled before receiving the startup reply.
-                    self.pool = RolloutPool(args, binding)
+                    self.pool = RolloutPool.__new__(RolloutPool)
+                    RolloutPool.__init__(self.pool, args, binding)
 
                 await _blocking(create_pool)
                 self._recipients = set(self.pool.synced_actor_ids)
@@ -127,7 +146,8 @@ class InferenceManager:
                 raise ValueError("Static pools only support auxiliary roles")
 
             def create_pool() -> None:
-                self.pool = StaticInferencePool(self.role, args, binding, options)
+                self.pool = StaticInferencePool.__new__(StaticInferencePool)
+                StaticInferencePool.__init__(self.pool, self.role, args, binding, options)
                 self.pool.record_placement(self.placement)
 
             await _blocking(create_pool)
@@ -382,7 +402,10 @@ class InferenceManager:
     async def dispose(self, worker: Any = None) -> None:
         self._closing = True
         self.ledger.fences.add("shutdown")
-        if self._cleanup_task is None:
+        if self._cleanup_task is None or (
+            self._cleanup_task.done()
+            and (self._cleanup_task.cancelled() or self._cleanup_task.exception() is not None)
+        ):
             self._cleanup_task = asyncio.create_task(self._dispose(worker))
         cleanup = self._cleanup_task
         cancelled = False
@@ -509,9 +532,10 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
     except BaseException:
         try:
             ray.get(manager.dispose.remote(worker), timeout=60)
-        except Exception:
-            logger.exception("Managed rollout startup rollback could not be confirmed")
-        finally:
+        except BaseException:
+            _FAILED_ROLLBACK_OWNERS[id(manager)] = manager
+            logger.exception("Managed rollout startup rollback could not be confirmed; retaining owner")
+        else:
             if worker is not None:
                 ray.kill(worker)
             ray.kill(manager)
@@ -537,9 +561,6 @@ def create_static_inference_manager(
     try:
         ray.get(manager.start_static.remote(role, deepcopy(args), binding, pool_options))
     except BaseException:
-        try:
-            ray.get(manager.dispose.remote(), timeout=60)
-        finally:
-            ray.kill(manager)
+        rollback_static_inference_manager(manager)
         raise
     return manager

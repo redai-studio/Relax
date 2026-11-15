@@ -19,10 +19,10 @@ class StaticInferencePool:
     def __init__(self, role: Role, args: Any, binding: Any, options: dict[str, Any]) -> None:
         from relax.engine.inference.config_adapters import static_role_spec
 
+        self.backend: Any = None
         self.spec = static_role_spec(role, args, options)
         self.role = role
         self.model_id = self.spec.models[0].model_id
-        self.backend: Any = None
         if role is Role.GENRM:
             from relax.distributed.ray.genrm import GenRMManager
 
@@ -64,6 +64,7 @@ class StaticInferencePool:
                 PlacementOwner.MANAGER if owned else PlacementOwner.CONTROLLER,
                 identity=pg,
                 node_ids=getattr(binding, "node_ids", None),
+                local_gpu_ids=getattr(binding, "local_gpu_ids", None),
                 bundle_count=getattr(pg, "bundle_count", None),
             )
             planner.plan(
@@ -126,9 +127,9 @@ class StaticInferencePool:
         MultiEngineManager.recover(self.backend)
 
     def dispose(self) -> None:
-        try:
-            self.backend.shutdown()
-        finally:
-            lock = getattr(self.backend, "genrm_engine_lock", None)
-            if lock is not None:
-                ray.kill(lock)
+        if self.backend is None:
+            return
+        self.backend.shutdown()
+        lock = getattr(self.backend, "genrm_engine_lock", None)
+        if lock is not None:
+            ray.kill(lock)

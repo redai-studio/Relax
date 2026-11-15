@@ -966,7 +966,7 @@ class Controller:
 
                 if use_managed_auxiliary(self.config):
                     try:
-                        ray.get(service.handle.close.remote(), timeout=120)
+                        service.handle.close.remote().result(timeout_s=120)
                     except Exception:
                         logger.exception("Could not confirm aborted GenRM startup cleanup")
             try:
@@ -1495,7 +1495,7 @@ class Controller:
         service = self.serve_dict.get(GENRM_ROLE)
         if service is not None and getattr(service, "handle", None) is not None:
             try:
-                ray.get(service.handle.close.remote(), timeout=120)
+                service.handle.close.remote().result(timeout_s=120)
             except Exception:
                 logger.exception("Could not confirm managed GenRM cleanup")
 

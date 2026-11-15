@@ -63,6 +63,7 @@ class AdmittedRequest:
     dispatched: bool = False
     finished: bool = False
     released: bool = False
+    replica_cursor: int | None = None
 
 
 # SGLang's scheduler aborts every request whose rid starts with the aborted
@@ -135,23 +136,37 @@ class InferenceRequestExecutor:
         return await self.manager_call("snapshot", self.role)
 
     async def resolve(
-        self, *, model: str | None = None, route_key: str | None = None, advance: bool = True
+        self,
+        *,
+        model: str | None = None,
+        route_key: str | None = None,
+        advance: bool = True,
+        replica_cursor: int | None = None,
     ) -> tuple[str, str, bool]:
         """Return ``(target, model_id, via_router)``, or raise
         :class:`RoutingError`."""
         snapshot = await self.snapshot()
         selected = resolve_model(snapshot, model=model, route_key=route_key)
-        target = select_target(selected, cursor=next(self._cursor) if advance else 0).base_url.rstrip("/")
+        target = select_target(
+            selected, cursor=replica_cursor if replica_cursor is not None else (next(self._cursor) if advance else 0)
+        ).base_url.rstrip("/")
         return target, selected.model_id, target == (selected.router_url or "").rstrip("/")
 
-    async def admit(self, trace_id: str, *, model: str | None = None, route_key: str | None = None) -> AdmittedRequest:
+    async def admit(
+        self,
+        trace_id: str,
+        *,
+        model: str | None = None,
+        route_key: str | None = None,
+        replica_cursor: int | None = None,
+    ) -> AdmittedRequest:
         """Resolve a target and take a permit for it.
 
         Raises :class:`RoutingError` when no target resolves or the Manager
         refuses the admission (503, e.g. the model is draining).
         """
         target, model_id, via_router = await self.resolve(
-            model=model, route_key=route_key, advance=self.role is Role.ROLLOUT
+            model=model, route_key=route_key, advance=self.role is Role.ROLLOUT, replica_cursor=replica_cursor
         )
         call = asyncio.ensure_future(self.manager_call("admit_request", self.role, model_id, trace_id))
         try:
@@ -170,7 +185,7 @@ class InferenceRequestExecutor:
             try:
                 # Recovery may move a replica before admission. Its permit now
                 # prevents replacement: select once from the current snapshot.
-                target, _, via_router = await self.resolve(model=model_id)
+                target, _, via_router = await self.resolve(model=model_id, replica_cursor=replica_cursor)
             except BaseException:
                 await self._return_unclaimed_permit(call, trace_id)
                 raise
@@ -181,6 +196,7 @@ class InferenceRequestExecutor:
             permit=permit,
             rid=new_backend_rid(),
             trace_id=trace_id,
+            replica_cursor=replica_cursor,
         )
 
     async def _return_unclaimed_permit(self, call: asyncio.Future, trace_id: str) -> None:
@@ -237,7 +253,9 @@ class InferenceRequestExecutor:
                 await asyncio.sleep(_RETRY_BACKOFF_S * attempt)
                 # The endpoint may be gone and recovered elsewhere; a model that
                 # stopped admitting meanwhile raises RoutingError here.
-                request.target, _, request.via_router = await self.resolve(model=request.model_id)
+                request.target, _, request.via_router = await self.resolve(
+                    model=request.model_id, replica_cursor=request.replica_cursor
+                )
         raise AssertionError("unreachable")
 
     async def read(self, request: AdmittedRequest, response: httpx.Response) -> bytes:
@@ -261,13 +279,15 @@ class InferenceRequestExecutor:
         await self.read(request, response)
         return response
 
-    async def generate_json(self, payload: dict[str, Any], headers: dict[str, str] | None = None) -> Any:
+    async def generate_json(
+        self, payload: dict[str, Any], headers: dict[str, str] | None = None, *, replica_cursor: int | None = None
+    ) -> Any:
         """Execute internal rollout directly, without re-entering its Serve
         deployment."""
         trace_id = str(payload.get("rid") or uuid.uuid4().hex)
         while True:
             try:
-                request = await self.admit(trace_id)
+                request = await self.admit(trace_id, replica_cursor=replica_cursor)
                 break
             except RoutingError as exc:
                 if exc.code != "unavailable":

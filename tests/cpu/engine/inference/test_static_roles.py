@@ -192,3 +192,113 @@ def test_teacher_factory_injects_public_owner_for_independent_requests(monkeypat
     assert captured == [("teacher", 2, 4)]
     assert args._teacher_inference_manager_handle is handle is teacher
     assert urls == ["http://engine/generate"]
+
+
+@pytest.mark.parametrize("fully_async,sizes", [(False, (2,)), (True, (2,)), (False, (1, 2))])
+def test_dedicated_genrm_engine_placement_matches_recorded_slices(fully_async, sizes):
+    from relax.distributed.ray.genrm import GenRMManager
+    from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner
+
+    implementation = GenRMManager.__ray_metadata__.modified_class
+    total = sum(sizes)
+    binding = ("dedicated-genrm", list(range(total)), list(range(total)))
+    planner = PlacementPlanner()
+    offset = 0
+    selected = []
+    for index, size in enumerate(sizes):
+        args = SimpleNamespace(
+            fully_async=fully_async,
+            rollout_num_gpus=4,
+            num_gpus_per_node=4,
+            genrm_model_path=f"judge-{index}",
+            genrm_num_gpus=size,
+            genrm_num_gpus_per_engine=1,
+            genrm_engine_config={},
+            genrm_sampling_config={},
+        )
+        backend = implementation.__new__(implementation)
+        backend.args = args
+        backend.pg = binding
+        backend.bundle_offset = offset
+        backend.num_gpu_per_engine = 1
+        backend.dedicated_pg = True
+        pool = StaticInferencePool.__new__(StaticInferencePool)
+        pool.backend = backend
+        pool.role = Role.GENRM
+        pool.model_id = f"judge-{index}"
+        pool.spec = static_role_spec(Role.GENRM, args, {"model_id": pool.model_id})
+        pool.record_placement(planner)
+        engine_slots = []
+        for rank in range(size):
+            actual_binding, owned, slot = backend._resolve_placement(rank)
+            assert actual_binding is binding
+            assert not owned
+            engine_slots.append(slot)
+        view = PlacementGroupView(
+            tuple(range(total)), tuple(range(total)), PlacementOwner.CONTROLLER, identity=binding[0]
+        )
+        allocation = next(item for item in planner.allocations(view) if item.group_id == f"genrm/{pool.model_id}/0")
+        assert tuple(engine_slots) == allocation.bundle_indices
+        assert engine_slots == list(range(offset, offset + size))
+        selected.extend(engine_slots)
+        offset += size
+    assert selected == list(range(total))
+
+
+@pytest.mark.asyncio
+async def test_managed_teacher_group_affinity_uses_current_replica(monkeypatch):
+    from relax.engine.rollout.on_policy_distillation import OpdManager
+    from relax.utils import http_utils
+    from relax.utils.types import Sample
+
+    owner, remote = _owner(Role.TEACHER)
+    owner.pool.backend.nodes_per_engine = 1
+    owner.pool.backend._engine_addr_and_ports[1] = {"host": "other", "port": 16001}
+    worker = OpdManager.__new__(OpdManager)
+    worker.args = SimpleNamespace(opd_teacher_timeout_s=2)
+    sent = []
+
+    def respond(request):
+        sent.append(request.url.host)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        await worker._post_managed_teacher(remote, {}, Sample(index=1, group_index=1))
+        await worker._post_managed_teacher(remote, {}, Sample(index=2, group_index=1))
+        await worker._post_managed_teacher(remote, {}, Sample(index=3, group_index=0))
+    assert sent == ["other", "other", "engine"]
+    assert not owner.ledger.permits
+
+
+@pytest.mark.asyncio
+async def test_policy_abort_cancels_managed_admission_wait(monkeypatch):
+    from relax.engine.rollout.sglang_rollout import GenerationAborted, _post_generation
+    from relax.utils import http_utils
+
+    owner, remote = _owner(Role.ROLLOUT)
+    owner.memory_ready = False
+    waiting = asyncio.Event()
+
+    async def wait_ready(*args):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    remote.wait_ready = SimpleNamespace(remote=wait_ready)
+    args = SimpleNamespace(fully_async=True, use_slime_router=False, _inference_manager_handle=remote)
+    state = SimpleNamespace(abort_event=asyncio.Event())
+    sent = []
+
+    def respond(request):
+        sent.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        task = asyncio.create_task(_post_generation(args, state, "http://stale", {}, None, False))
+        await asyncio.wait_for(waiting.wait(), 2)
+        state.abort_event.set()
+        with pytest.raises(GenerationAborted):
+            await asyncio.wait_for(task, 2)
+    assert not sent
+    assert not owner.ledger.permits

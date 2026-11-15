@@ -362,7 +362,22 @@ async def _post_generation(
                 from relax.utils import http_utils
 
                 executor = InferenceRequestExecutor("rollout", manager, http_utils._http_client)
-                return await executor.generate_json(payload, headers)
+                if evaluation:
+                    return await executor.generate_json(payload, headers)
+                if state.abort_event.is_set():
+                    raise GenerationAborted
+                generation = asyncio.create_task(executor.generate_json(payload, headers))
+                aborted = asyncio.create_task(state.abort_event.wait())
+                try:
+                    await asyncio.wait((generation, aborted), return_when=asyncio.FIRST_COMPLETED)
+                    if state.abort_event.is_set():
+                        raise GenerationAborted
+                    return await generation
+                finally:
+                    aborted.cancel()
+                    if not generation.done():
+                        generation.cancel()
+                    await asyncio.gather(generation, aborted, return_exceptions=True)
             return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):

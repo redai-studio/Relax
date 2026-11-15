@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import copy
 import logging
 import os
 import random
@@ -404,6 +405,10 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
+        # Only rollout requests consume this live handle. Megatron saves its
+        # args in common.pt; serializing a job-scoped Ray owner breaks resume.
+        args = copy.copy(args)
+        vars(args).pop("_teacher_inference_manager_handle", None)
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
