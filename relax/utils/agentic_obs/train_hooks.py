@@ -55,6 +55,10 @@ class _Snapshot:
     source: Any
     advantage_available: bool
     returns_available: bool
+    effective_values: Any = None
+    effective_event: Any = None
+    effective_source: Any = None
+    effective_status: str = "loss_not_observed"
 
 
 @dataclass
@@ -78,6 +82,7 @@ class _Update:
     stage: ExportStageRecord | None = None
     reserved: bool = False
     metadata_reserved: bool = False
+    consumption_version: dict[str, Any] | None = None
 
 
 _CURRENT: ContextVar[_Update | None] = ContextVar("agentic_obs_update", default=None)
@@ -107,6 +112,8 @@ def _begin_update(args: Namespace, rollout_id: int, step_id: int, role: str) -> 
         return None
     from megatron.core import mpu
 
+    from relax.utils.agentic_obs.weight_publication import consumption_snapshot
+
     if not (
         mpu.get_tensor_model_parallel_rank() == 0
         and mpu.is_pipeline_last_stage(ignore_virtual=True)
@@ -127,6 +134,7 @@ def _begin_update(args: Namespace, rollout_id: int, step_id: int, role: str) -> 
         dp_rank=rank,
         dp_size=mpu.get_data_parallel_world_size(with_context_parallel=False),
         cp_size=1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size(),
+        consumption_version=consumption_snapshot(args),
         train_generation_id=generation,
         update_sequence=sequence,
     )
@@ -269,7 +277,46 @@ def _capture(state: _Update, batch: Any) -> None:
     else:
         values = source.clone()
     state.snapshots.append(_Snapshot(identities, values, event, source, adv_ok, ret_ok))
+    batch["_weight_audit_capture"] = (state.stage_id, len(state.snapshots) - 1)
     state.size_bytes += size_bytes
+
+
+@best_effort
+def capture_effective_loss_mask(batch: Any, masks: Any, *, status: str = "complete") -> None:
+    """Fill one input snapshot once, including under loss recomputation.
+
+    Masks describe objective membership, not whether a token's derivative
+    happens to be zero. Unknown objective/CP support is explicit.
+    """
+    state = _CURRENT.get()
+    capture = batch.get("_weight_audit_capture")
+    if state is None or capture is None or capture[0] != state.stage_id:
+        return
+    snapshot = state.snapshots[capture[1]]
+    if snapshot.effective_status != "loss_not_observed":
+        return
+    snapshot.effective_status = status
+    if masks is None:
+        return
+    import torch
+
+    lengths = [identity[2] for identity in snapshot.identities]
+    if len(masks) != len(lengths) or any(mask.numel() != size for mask, size in zip(masks, lengths)):
+        snapshot.effective_status = "mask_shape_mismatch"
+        return
+    source = torch.cat([mask.detach().bool().reshape(-1) for mask in masks])
+    if state.size_bytes + source.numel() > _MAX_UPDATE_BYTES:
+        snapshot.effective_status = "capture_capacity"
+        return
+    state.size_bytes += source.numel()
+    snapshot.effective_source = source
+    if source.is_cuda:
+        snapshot.effective_values = torch.empty_like(source, device="cpu", pin_memory=True)
+        snapshot.effective_values.copy_(source, non_blocking=True)
+        snapshot.effective_event = torch.cuda.Event()
+        snapshot.effective_event.record(torch.cuda.current_stream(source.device))
+    else:
+        snapshot.effective_values = source.clone()
 
 
 @best_effort
@@ -309,9 +356,18 @@ def _write_update(state: _Update) -> None:
             snapshot.source = None
             values = snapshot.values.tolist()
             cursor = 3 * len(snapshot.identities)
+            if snapshot.effective_event is not None:
+                snapshot.effective_event.synchronize()
+            effective = snapshot.effective_values.tolist() if snapshot.effective_values is not None else None
+            snapshot.effective_source = None
+            effective_cursor = 0
             for index, (export_id, group, response, total) in enumerate(snapshot.identities):
                 mask_start = cursor
                 cursor += response
+                effective_mask = (
+                    effective[effective_cursor : effective_cursor + response] if effective is not None else None
+                )
+                effective_cursor += response
                 if export_id < 0:
                     continue
                 mask_ranges = _loss_mask_ranges(values[mask_start:cursor])
@@ -324,6 +380,10 @@ def _write_update(state: _Update) -> None:
                         "response_length": response,
                         "total_length": total,
                         "loss_mask": {"ranges": mask_ranges},
+                        "effective_loss_mask": (
+                            {"ranges": _loss_mask_ranges(effective_mask)} if effective_mask is not None else None
+                        ),
+                        "effective_loss_mask_status": snapshot.effective_status,
                         "advantage_mean": values[3 * index] if snapshot.advantage_available else None,
                         "advantage_absmax": values[3 * index + 1] if snapshot.advantage_available else None,
                         "returns_mean": values[3 * index + 2] if snapshot.returns_available else None,
@@ -339,6 +399,7 @@ def _write_update(state: _Update) -> None:
                 update_id=state.update_id,
                 stage_id=state.stage_id,
                 train_generation_id=state.train_generation_id,
+                consumption_version=state.consumption_version,
                 samples=samples,
                 dp_rank=state.dp_rank,
                 dp_world_size=state.dp_size,

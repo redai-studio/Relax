@@ -101,6 +101,45 @@ def test_dcs_quantized_rollout_restores_and_repacks_before_resume(rollout_backen
         assert awaited[-1] == ["/continue_generation"]
 
 
+@pytest.mark.parametrize("postprocess_fails", [False, True])
+def test_dcs_publication_requires_completed_quantization(rollout_backend, monkeypatch, postprocess_fails):
+    from relax.utils.agentic_obs import weight_publication
+    from relax.utils.agentic_obs.weight_audit import PublicationLedger
+
+    backend, _, _ = rollout_backend
+    backend.quantization_config = {"quant_method": "compressed-tensors"}
+    ledger = PublicationLedger()
+    monkeypatch.setattr(
+        weight_publication,
+        "begin_publication",
+        lambda owner: ledger.begin("policy", "epoch", str(owner.weight_version)),
+    )
+    monkeypatch.setattr(
+        weight_publication,
+        "commit_publication",
+        lambda owner: ledger.commit("policy", "epoch", str(owner.weight_version)),
+    )
+    resumed = []
+
+    def receiver(endpoint, payload=None):
+        if endpoint == "/post_process_weights" and payload["post_process_quantization"]:
+            assert ledger.snapshot()["ordinal"] is None
+            if postprocess_fails:
+                raise RuntimeError("quantization failed")
+        if endpoint == "/continue_generation":
+            resumed.append(ledger.snapshot())
+        return []
+
+    backend._batch_request = receiver
+    if postprocess_fails:
+        with pytest.raises(RuntimeError, match="quantization failed"):
+            backend.update_weights_for_rollout(rollout_only=True)
+        assert ledger.snapshot()["ordinal"] is None and not resumed
+    else:
+        backend.update_weights_for_rollout(rollout_only=True)
+        assert resumed == [{"policy": "policy", "epoch": "epoch", "ordinal": 1, "raw_version": "1"}]
+
+
 def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_backend):
     backend, events, _ = rollout_backend
     backend.quantization_config = {"quant_method": "compressed-tensors"}

@@ -174,6 +174,13 @@ def build_manifest(args: Namespace, config: AgenticObsConfig, *, cp_size: int | 
         "optimizer_step": "successful updates within the actor-group generation; null on missing or conflicting sequence history",
         "missing_records": "unknown until all producers have been collected; dumps are best-effort",
         "loss_mask_space": "response; training input before loss-local filtering",
+        "weight_audit": {
+            "version_age": "successful rollout publications within one policy/publisher epoch",
+            "generation_end": "final backend result observed by Session before permit release",
+            "consumption": "local published frontier at optimizer-step entry; joined with successful outcome",
+            "effective_mask": "response-space objective membership; null when unsupported or unobserved",
+            "report": "python -m relax.utils.agentic_obs.weight_report RUN_DIRECTORY --output report.json",
+        },
         "static_cp_scalars": "null",
         "cp_size": cp_size if cp_size is not None else getattr(args, "context_parallel_size", None),
         "dynamic_context_parallel": bool(getattr(args, "dynamic_context_parallel", False)),

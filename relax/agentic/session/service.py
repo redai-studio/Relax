@@ -2567,6 +2567,13 @@ class AgenticSessionShard:
         def is_current() -> bool:
             return session.phase is SessionPhase.ACTIVE and ir in session.live_irs and ir.runner_task is runner_task
 
+        from relax.utils.agentic_obs.weight_audit import attempt_source
+        from relax.utils.agentic_obs.weight_publication import generation_snapshot, weight_audit_enabled
+
+        audit_enabled = weight_audit_enabled(self.args)
+        audit_coordinator = getattr(self, "_sglang_request_limiter", None)
+        source_version = end_version = None
+
         async with session.lock:
             if not is_current():
                 return
@@ -2581,6 +2588,7 @@ class AgenticSessionShard:
                 router_unavailable = False
                 async with self._admission_lease(session, ir):
                     async with self._sglang_request_permit():
+                        before_version = await generation_snapshot(audit_coordinator) if audit_enabled else None
                         async with session.lock:
                             if not is_current():
                                 return
@@ -2618,6 +2626,11 @@ class AgenticSessionShard:
                                 collect_score_centering=group.rollout_mode == "train",
                                 fail_fast_no_workers=router_recovery_enabled,
                             )
+                            if audit_enabled:
+                                end_version = await generation_snapshot(audit_coordinator)
+                                source_version = attempt_source(
+                                    result.meta_info.get("weight_version"), before_version, end_version
+                                )
                             if observation is not None:
                                 # Count each returned delta before cleanup or a
                                 # superseding generation gate can discard it.
@@ -2695,10 +2708,14 @@ class AgenticSessionShard:
                 )
             return
         except BackendContextLengthExceededError:
+            # No final backend result was observed for this completion.
+            # A retained partial prefix still has sources, but no end frontier.
             async with session.lock:
                 if is_current():
                     ir.runner_task = None
                     ir.backend_started = False
+                    if audit_enabled:
+                        ir.pending_generation_end_version = None
                     try:
                         payload = self._context_exhausted_response_locked(session, ir, remaining_tokens)
                     except Exception as error:
@@ -2748,6 +2765,21 @@ class AgenticSessionShard:
             ir.backend_started = False
             try:
                 self._apply_generate_result(ir, result)
+                if audit_enabled:
+                    end = len(ir.pending_token_delta)
+                    if result.new_tokens:
+                        ir.pending_generation_segments.append(
+                            {
+                                "request_id": ir.request_id,
+                                "attempt_id": backend_request_id,
+                                "start": end - len(result.new_tokens),
+                                "end": end,
+                                "raw_version": result.meta_info.get("weight_version"),
+                                "version": source_version,
+                            }
+                        )
+                    # A terminal zero-token attempt still establishes completion.
+                    ir.pending_generation_end_version = end_version
                 finish_type = result.finish_type
                 if _last_token_is_stop_token(
                     token_ids=result.new_tokens,
@@ -2915,6 +2947,8 @@ class AgenticSessionShard:
             if ir.pending_topk_logprob_delta
             else None,
             weight_version_delta=ir.pending_weight_version_delta,
+            generation_segments=ir.pending_generation_segments,
+            generation_end_version=ir.pending_generation_end_version,
             spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,

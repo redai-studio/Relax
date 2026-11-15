@@ -17,6 +17,7 @@ from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
 from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
+from relax.utils.agentic_obs.weight_publication import observe_install_result, publication_label
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -465,6 +466,10 @@ class UpdateWeightFromTensor:
 
         self.weight_version += 1
 
+        from relax.utils.agentic_obs.weight_publication import begin_publication, commit_publication
+
+        begin_publication(self)
+
         # Pause/flush must cover both IPC and distributed-broadcast engines,
         # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
@@ -486,12 +491,15 @@ class UpdateWeightFromTensor:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
             ray.get([engine.flush_cache.remote() for engine in all_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=True,
-                    post_process_quantization=False,
-                    rollout_engines=all_engines,
+                observe_install_result(
+                    self,
+                    post_process_weights(
+                        restore_weights_before_load=True,
+                        post_process_quantization=False,
+                        rollout_engines=all_engines,
+                    ),
                 )
-            ray.get([engine.begin_weight_update.remote() for engine in all_engines])
+            observe_install_result(self, ray.get([engine.begin_weight_update.remote() for engine in all_engines]))
         dist.barrier(group=get_gloo_group())
 
         megatron_local_weights = self.weights_getter()
@@ -576,16 +584,23 @@ class UpdateWeightFromTensor:
                     restore_weights_before_load=False,
                     post_process_quantization=True,
                 )
-            self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
+            self._routed_engine_call(all_engines, "update_weight_version", weight_version=publication_label(self))
+            commit_publication(self)
             self._routed_engine_call(all_engines, "continue_generation")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                    rollout_engines=all_engines,
+                observe_install_result(
+                    self,
+                    post_process_weights(
+                        restore_weights_before_load=False,
+                        post_process_quantization=True,
+                        rollout_engines=all_engines,
+                    ),
                 )
-            ray.get([engine.end_weight_update.remote() for engine in all_engines])
+            observe_install_result(self, ray.get([engine.end_weight_update.remote() for engine in all_engines]))
+        if not self._route_experts:
+            commit_publication(self)
+        if not self._route_experts and rank == 0:
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
@@ -894,7 +909,7 @@ class UpdateWeightFromTensor:
                 bucket_allocator=self._ipc_bucket_allocator,
                 ipc_gather_src=self._ipc_gather_src,
                 ipc_gather_group=self._ipc_gather_group,
-                weight_version=None if self._route_experts else self.weight_version,
+                weight_version=None if self._route_experts else publication_label(self),
                 dispatch_errors=dispatch_errors,
                 direct_layout=getattr(self, "_direct_expert_layout", None),
             )
@@ -904,7 +919,7 @@ class UpdateWeightFromTensor:
             refs_distributed = update_weights_from_distributed(
                 self._group_name,
                 self._model_update_groups,
-                self.weight_version,
+                publication_label(self),
                 self.distributed_rollout_engines,
                 hf_named_tensors,
             )
