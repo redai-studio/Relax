@@ -27,14 +27,10 @@ def _patch_provider_deps(monkeypatch, *, replay: bool):
     megatron = ModuleType("megatron")
     training = ModuleType("megatron.training")
     global_vars = ModuleType("megatron.training.global_vars")
-    global_vars.get_args = lambda: SimpleNamespace(
-        use_rollout_indexer_replay=replay, hf_checkpoint="ckpt"
-    )
+    global_vars.get_args = lambda: SimpleNamespace(use_rollout_indexer_replay=replay, hf_checkpoint="ckpt")
 
     fp8_weights = ModuleType("relax.models.deepseek_v4.fp8_weights")
-    fp8_weights.install_native_fp8_weights = lambda *_args, **_kwargs: calls.append(
-        "fp8"
-    ) or ()
+    fp8_weights.install_native_fp8_weights = lambda *_args, **_kwargs: calls.append("fp8") or ()
     indexer = ModuleType("relax.models.deepseek_v4.indexer")
     indexer.select_process_mode = lambda **_kwargs: calls.append("select_process_mode")
     indexer.install_indexer_qat = lambda *_args, **_kwargs: calls.append("qat") or ()
@@ -43,13 +39,9 @@ def _patch_provider_deps(monkeypatch, *, replay: bool):
     qat.model_provider = lambda **_kwargs: calls.append("build") or model
 
     env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace(
-        RELAX_DSV4_FP4_INDEXER=True, RELAX_DSV4_FP4_BF16_SCORES=False
-    )
+    env.Envs = SimpleNamespace(RELAX_DSV4_FP4_INDEXER=True, RELAX_DSV4_FP4_BF16_SCORES=False)
     logging_utils = ModuleType("relax.utils.logging_utils")
-    logging_utils.get_logger = lambda _name: SimpleNamespace(
-        info=lambda *_args, **_kwargs: None
-    )
+    logging_utils.get_logger = lambda _name: SimpleNamespace(info=lambda *_args, **_kwargs: None)
 
     for name, module in {
         "megatron": megatron,

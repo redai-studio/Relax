@@ -10,8 +10,8 @@ def _validate_indexer_qat_replay(enabled: bool, use_rollout_indexer_replay: bool
     """Reject native indexer QAT combined with rollout indexer replay.
 
     ``install_indexer_qat`` also guards on the model config, but that flag is
-    only set later by ``fill_indexer_replay``. Checking the launch argument here
-    makes the rejection independent of initialization order.
+    only set later by ``fill_indexer_replay``. Checking the launch argument
+    here makes the rejection independent of initialization order.
     """
     if enabled and use_rollout_indexer_replay:
         raise ValueError(
