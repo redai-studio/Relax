@@ -93,13 +93,25 @@ class RayTrainGroup:
             env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")
             env_vars["TRITON_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "triton")
 
+        if (
+            self.role == "actor"
+            and getattr(self.args, "use_shard_p2p_weight_sync", False)
+            and (not getattr(self.args, "colocate", False) or self.args.train_backend != "megatron")
+        ):
+            logger.info(
+                "ShardP2P weight sync requested=True effective=False: currently requires colocated Megatron; using native sync"
+            )
+
         # Select before workers start: TMS preload cannot be switched safely later.
         self._selective_offload_for_weight_sync = False
         effective_env = {**os.environ, **env_vars}
         if (
             self.role == "actor"
             and self.args.train_backend == "megatron"
-            and resolve_in("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", effective_env)
+            and (
+                resolve_in("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", effective_env)
+                or getattr(self.args, "use_shard_p2p_weight_sync", False)
+            )
         ):
             from relax.backends.megatron.weight_update.utils import validate_actor_weight_retention
 
@@ -112,9 +124,10 @@ class RayTrainGroup:
             )
             if reason is None:
                 self._selective_offload_for_weight_sync = True
-                env_vars["RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"] = effective_env[
-                    "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"
-                ]
+                if "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP" in effective_env:
+                    env_vars["RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"] = effective_env[
+                        "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"
+                    ]
                 # Remove only TMS from the effective worker preload, including
                 # inherited job settings; retain unrelated user libraries.
                 env_vars["LD_PRELOAD"] = " ".join(
@@ -124,7 +137,7 @@ class RayTrainGroup:
                 )
                 env_vars["TMS_INIT_ENABLE"] = env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
                 logger.info(
-                    "Colocate weight-sync overlap: %sselective offload before Actor startup; "
+                    "Colocate source-weight sync: %sselective offload before Actor startup; "
                     "TMS preload disabled. Unsupported receivers will use ordinary selective offload and weight sync.",
                     "automatically selecting " if not getattr(self.args, "selective_offload", False) else "using ",
                 )

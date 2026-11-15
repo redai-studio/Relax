@@ -1116,6 +1116,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # update weight
             parser.add_argument(
+                "--use-shard-p2p-weight-sync",
+                action="store_true",
+                default=False,
+                help="Use direct expert shards for supported single-node colocated Megatron/SGLang weight sync. "
+                "Unsupported weights and modes keep native synchronization.",
+            )
+            parser.add_argument(
                 "--update-weight-buffer-size",
                 type=int,
                 default=512 * 1024**2,
