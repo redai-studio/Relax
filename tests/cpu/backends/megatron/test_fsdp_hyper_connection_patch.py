@@ -56,6 +56,40 @@ def make_native(module, kind, dtype=torch.float32):
     return getattr(module, kind)(config, **kwargs)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mtp_hidden_norm_matches_flattened_reference(native_mcore, dtype):
+    backbone = make_native(native_mcore, "GatedResidualHyperConnection", dtype)
+    model = native_mcore.GatedResidualMTPHiddenNorm(backbone.config, hidden_size=8, eps=1e-6)
+    gain = torch.linspace(-0.2, 0.3, 32, dtype=dtype)
+    with torch.no_grad():
+        model.weight.copy_(gain)
+        backbone.hc_norm.weight.copy_(gain)
+    reference_gain = gain.clone().requires_grad_()
+    base = torch.arange(1, 9, dtype=dtype).reshape(1, 1, 1, 8)
+    scales = torch.tensor([0.1, 1.0, 4.0, 10.0], dtype=dtype).reshape(1, 1, 4, 1)
+    inputs = (base * scales).requires_grad_()
+    reference_inputs = inputs.detach().clone().requires_grad_()
+
+    actual = model(inputs)
+    expected = (
+        (F.rms_norm(reference_inputs.flatten(-2).float(), (32,), eps=1e-6) * (1.0 + reference_gain.float()))
+        .to(dtype)
+        .reshape_as(inputs)
+    )
+    independent = (F.rms_norm(inputs.float(), (8,), eps=1e-6) * (1.0 + gain.float()).reshape(4, 8)).to(dtype)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(backbone.hc_norm(inputs), independent)
+    assert not torch.allclose(actual, independent, rtol=0.1, atol=0.1)
+    assert actual.shape == inputs.shape and actual.dtype == dtype
+    assert model.weight.sequence_parallel
+
+    probe = torch.linspace(-1, 1, inputs.numel()).reshape_as(inputs)
+    (actual.float() * probe).sum().backward()
+    (expected.float() * probe).sum().backward()
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+    torch.testing.assert_close(model.weight.grad, reference_gain.grad)
+
+
 @pytest.fixture
 def legacy_mcore(monkeypatch):
     """Small CPU reproducer of the legacy MCore gated-residual

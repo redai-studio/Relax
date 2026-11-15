@@ -5,7 +5,8 @@ on:
     types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft]
   workflow_run:
     workflows: [Review Signal, CI, Unit Tests, Integration Tests]
-    types: [in_progress, completed]
+    # PR events refresh new commits; manual CI reruns refresh only on completion.
+    types: [completed]
 
 permissions:
   contents: read
@@ -13,6 +14,11 @@ permissions:
 
 jobs:
   resolve:
+    # Reject non-PR upstream runs before allocating a runner or checking out code.
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'workflow_run' &&
+       contains(fromJSON('["pull_request", "pull_request_review"]'), github.event.workflow_run.event))
     runs-on: ubuntu-slim
     timeout-minutes: 3
     outputs:

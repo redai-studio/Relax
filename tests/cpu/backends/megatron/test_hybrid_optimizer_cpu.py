@@ -11,6 +11,7 @@ complete distributed checkpoint loader.
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +83,14 @@ def _cpu_hybrid(*, fused: bool) -> HybridDeviceOptimizer:
     optimizer = object.__new__(HybridDeviceOptimizer)
     torch.optim.Optimizer.__init__(optimizer, groups, {"cpu_optimizer_cls": torch.optim.AdamW})
     optimizer.param_update_in_fp32 = True
+    _init_cpu_sub_optimizers(optimizer)
+    return optimizer
+
+
+def _init_cpu_sub_optimizers(optimizer: HybridDeviceOptimizer) -> None:
+    """Replace device setup while retaining the real builder and state
+    mapping."""
+    originals = [parameter for group in optimizer.param_groups for parameter in group["params"]]
     optimizer.param_to_inner_param = {parameter: parameter.float().clone() for parameter in originals}
     optimizer.inner_param_to_orig_param = {
         inner: parameter for parameter, inner in optimizer.param_to_inner_param.items()
@@ -91,6 +100,9 @@ def _cpu_hybrid(*, fused: bool) -> HybridDeviceOptimizer:
         for parameter, inner in optimizer.param_to_inner_param.items()
         if parameter.dtype != torch.float32
     }
+    optimizer.fp32_param_to_orig_param = {
+        inner: parameter for parameter, inner in optimizer.param_to_fp32_param.items()
+    }
     optimizer.gpu_params_map_cpu_copy = dict(optimizer.param_to_inner_param)
     optimizer.cpu_copys_map_gpu_param = dict(optimizer.inner_param_to_orig_param)
     cpu_groups = [
@@ -99,15 +111,92 @@ def _cpu_hybrid(*, fused: bool) -> HybridDeviceOptimizer:
     ]
     optimizer.cpu_optimizers = HybridDeviceOptimizer.build_cpu_optimizer_list(torch.optim.AdamW, cpu_groups)
     optimizer.gpu_optimizer = None
-    return optimizer
 
 
 def _cpu_step(optimizer: HybridDeviceOptimizer, step: int) -> None:
+    optimizer._sync_hdo_param_groups_to_sub_optimizers()
     for index, inner in enumerate(optimizer.param_to_inner_param.values()):
         inner.grad = torch.tensor([0.125 * (step + 1), -0.25 * (index + 1)], dtype=torch.float32)
     for cpu_optimizer in optimizer.cpu_optimizers:
         cpu_optimizer.step()
     optimizer._sync_sub_optimizers_state_to_hdo()
+
+
+@pytest.fixture
+def expert_cpu_hybrid(monkeypatch: pytest.MonkeyPatch, fused: bool) -> Callable[..., HybridDeviceOptimizer]:
+    monkeypatch.setattr(HybridDeviceOptimizer, "_init_sub_optimizers", _init_cpu_sub_optimizers)
+    patch_hybrid_optimizer_native_fp32_checkpoint_load()
+
+    def build(*, individual: bool = False) -> HybridDeviceOptimizer:
+        groups = []
+        for index, (count, expert, dtype) in enumerate(
+            [(17, True, torch.bfloat16), (2, True, torch.bfloat16), (2, False, torch.float32)]
+        ):
+            groups.append(
+                {
+                    "params": [torch.tensor([0.5 + n / 64, -0.75], dtype=dtype) for n in range(count)],
+                    "is_expert_parallel": expert,
+                    "lr": 0.025 / (index + 1),
+                    "weight_decay": 0.1 * index,
+                    "fused": fused,
+                }
+            )
+        if individual:
+            monkeypatch.setenv("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE", "1")
+        else:
+            monkeypatch.delenv("RELAX_EXPERT_CPU_ADAM_BATCH_SIZE", raising=False)
+        return HybridDeviceOptimizer(
+            groups, cpu_optimizer_cls=torch.optim.AdamW, offload_fraction=1.0, param_update_in_fp32=True
+        )
+
+    return build
+
+
+def _assert_cpu_hybrid_equal(expected: HybridDeviceOptimizer, actual: HybridDeviceOptimizer) -> None:
+    for expected_param, actual_param in zip(expected.param_to_inner_param, actual.param_to_inner_param, strict=True):
+        torch.testing.assert_close(
+            actual.param_to_inner_param[actual_param], expected.param_to_inner_param[expected_param], rtol=0, atol=0
+        )
+        for name in ("exp_avg", "exp_avg_sq", "step", "master_param"):
+            torch.testing.assert_close(
+                actual.state[actual_param][name], expected.state[expected_param][name], rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_hybrid_cpu_expert_batches_match_individual_updates(expert_cpu_hybrid) -> None:
+    reference = expert_cpu_hybrid(individual=True)
+    assert all(len(child.param_groups[0]["params"]) == 1 for child in reference.cpu_optimizers)
+    batched = expert_cpu_hybrid()
+    child_groups = [group for child in batched.cpu_optimizers for group in child.param_groups]
+    assert [len(group["params"]) for group in child_groups] == [16, 1, 2, 1, 1]
+    assert [id(parameter) for group in child_groups for parameter in group["params"]] == [
+        id(parameter) for parameter in batched.param_to_inner_param.values()
+    ]
+    for step in range(6):
+        for optimizer in (reference, batched):
+            optimizer.param_groups[0]["lr"] = 0.025 / (step + 1)
+            _cpu_step(optimizer, step)
+        _assert_cpu_hybrid_equal(reference, batched)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("individual", [True, False], ids=["individual-to-batched", "batched-to-batched"])
+def test_hybrid_cpu_expert_batches_resume_updates(expert_cpu_hybrid, individual: bool) -> None:
+    reference = expert_cpu_hybrid(individual=individual)
+    for step in range(3):
+        _cpu_step(reference, step)
+    saved = copy.deepcopy(reference.state_dict())
+    assert [len(group["params"]) for group in saved["param_groups"]] == [17, 2, 2]
+
+    restored = expert_cpu_hybrid()
+    restored.load_state_dict(saved)
+    assert [len(child.param_groups[0]["params"]) for child in restored.cpu_optimizers] == [16, 1, 2, 1, 1]
+    _assert_cpu_hybrid_equal(reference, restored)
+    for step in range(3, 6):
+        _cpu_step(reference, step)
+        _cpu_step(restored, step)
+        _assert_cpu_hybrid_equal(reference, restored)
 
 
 def _distributed_state_loader(optimizer: HybridDeviceOptimizer) -> DistributedOptimizer:

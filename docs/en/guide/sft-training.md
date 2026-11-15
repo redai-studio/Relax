@@ -41,7 +41,7 @@ datasets:
 YAML mixtures automatically enable per-source training metrics, without an extra flag. Each optimizer step reports:
 
 - `train/dataset/general/loss`: summed supervised-token NLL divided by the source's effective supervised-token count.
-- `train/dataset/general/tokens`: effective tokens contributing to the main language-model objective.
+- `train/dataset/general/tokens`: effective tokens contributing to the main language-model objective in the current step, summed across ranks rather than cumulative.
 - `train/dataset/general/samples`: accepted samples, including fully masked rows and excluding dummy microbatches used for alignment.
 - `train/dataset/general/token_fraction` and `sample_fraction`: this source's share of the step's actual tokens and samples after filtering.
 
@@ -49,7 +49,7 @@ Other sources use the same suffixes. Source names are URL percent-encoded: `code
 
 Mixture weights allocate sample quotas over a complete logical epoch, rather than fixed proportions within every step. Filtering can change the accepted proportions; inspect source sample and token counts. These metrics cover the main language-model training loss, exclude MTP auxiliary loss, and leave evaluation metrics unchanged. FSDP, sequence classification, DPO/RM and custom datasets are outside this source-metric scope. Keep the YAML and data snapshot unchanged when resuming.
 
-With `--use-clearml --use-metrics-service`, ClearML uses the single SDK title `train`: the aggregate loss has series `loss`, and each dataset has series `loss/<name>`. In the task-list Scalars comparison view, expand `train` to see a separate plot named after each series, alongside the existing training plots. Per-source counts and fractions remain in the canonical training metrics but are not separately reported to ClearML, so they do not create extra plots or categories. CPT uses the same mapping. Historical tasks retain previously reported titles; start a new task to use this layout.
+With `--use-clearml --use-metrics-service`, ClearML uses the single SDK title `train`: the aggregate loss has series `loss`, and each dataset has series `loss/<name>` and `tokens/<name>`. The token series shows the current step's effective supervised-token count, including zero for a source with no supervised tokens. In the task-list Scalars comparison view, expand `train` to see a separate plot named after each series, alongside the existing training plots. Per-source sample counts and fractions remain in the canonical training metrics without additional ClearML plots. CPT uses the same mapping. Historical tasks retain previously reported titles; start a new task to use this layout.
 
 ## Data Preparation
 

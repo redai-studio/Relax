@@ -145,8 +145,20 @@ class Actor(Base):
         set_managed_opd_teacher_on_train_group(self.actor_model, teacher_manager)
         self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
-    def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
-        self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+    def update_weights_fully_async(
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        recovery_token: dict | None = None,
+    ) -> None:
+        from relax.utils.fault_events.receipts import emit_receipt
+
+        try:
+            self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        except Exception:
+            emit_receipt(self, recovery_token, "actor_send", "failed")
+            raise
+        emit_receipt(self, recovery_token, "actor_send", "succeeded")
 
     async def run(self) -> None:
         await self._loop_runner.run(self._background_run, before_start=self._reset_consumption)

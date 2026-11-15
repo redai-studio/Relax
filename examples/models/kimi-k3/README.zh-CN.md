@@ -2,6 +2,33 @@
 
 [English](./README.md)
 
+## Kimi K3.1 训练入口
+
+K3.1 只保留 `scripts/run-kimi-k3.1-pro-sft.sh`（全参）和 `scripts/run-kimi-k3.1-pro-lora.sh`（LoRA）两个入口，支持文本和多模态数据。两者通过 `scripts/entrypoint/ray-job.sh` 提交，默认阻塞等待；`DRY_RUN=1` 仅输出参数。
+
+必填 `MODEL_DIR`（原始 HF 基座）、`DATA_DIR`、`SAVE_DIR`（持久化 checkpoint 根）。`EXP_NAME` 是稳定实验名，保存/恢复共用 `${SAVE_DIR}/${EXP_NAME}`；`LOAD_DIR` 可显式指定其他恢复目录。新实验更换保存目录或实验名。
+
+| Variable                                                   | Full SFT             | LoRA                |
+| ---------------------------------------------------------- | -------------------- | ------------------- |
+| `NUM_GPUS` / `TP_SIZE` / `PP_SIZE` / `CP_SIZE` / `EP_SIZE` | 128 / 4 / 4 / 8 / 32 | 64 / 4 / 4 / 4 / 16 |
+| `NUM_ROLLOUT`                                              | 1000                 | 200                 |
+| `GLOBAL_BATCH_SIZE`                                        | 512                  | 128                 |
+| `TRAIN_FILE` / `RAW_TEXT`                                  | train.parquet / 0    | train.parquet / 0   |
+| `SAVE_INTERVAL` / `SAVE_OPTIMIZER`                         | 100 / 1              | 10 / 1              |
+| `EVAL_INTERVAL`                                            | 0                    | 0                   |
+
+`PROMPT_DATA` 可覆盖训练文件路径；启用评测时指定 `EVAL_INTERVAL` 和 `EVAL_FILE`（相对 `DATA_DIR`）。`NUM_ROLLOUT` 对应训练参数 `--num-rollout`；学习率、调度长度、序列长度、LoRA rank/alpha 及 PP 首末层数分别由 `LR`、`LR_DECAY_STEPS`、`MAX_TOKENS_PER_GPU`、`LORA_RANK`/`LORA_ALPHA`、`PP_FIRST_LAYERS`/`PP_LAST_LAYERS` 覆盖。后续 CLI 参数也会原样传入训练入口。
+
+```bash
+# Set MODEL_DIR, DATA_DIR, SAVE_DIR and Ray addresses before submitting.
+TRAIN_FILE=train.jsonl RAW_TEXT=1 GLOBAL_BATCH_SIZE=256 NUM_ROLLOUT=100 EXP_NAME=k31-text bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=336 EXP_NAME=k31-multimodal bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=1000 LR_DECAY_STEPS=1000 EXP_NAME=k31-lora bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-lora.sh
+TRAIN_FILE=train.absolute-images.jsonl GLOBAL_BATCH_SIZE=128 MAX_TOKENS_PER_GPU=16384 NUM_ROLLOUT=241 LR_DECAY_STEPS=241 EXP_NAME=k31-aim bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+```
+
+DSA 复用及融合为显式实验开关：`RELAX_KIMI_K31_DSA_SELECTION_REUSE=1`、`RELAX_KIMI_K31_DSA_FUSED_INDEXER=1`，默认关闭。完整训练严格数值一致性尚未验收。模型权重单独保存（`SAVE_OPTIMIZER=0`）不能精确恢复 Adam 状态。
+
 ## 概述
 
 Relax 支持 Kimi K3 的全参和 LoRA SFT，包括图片输入、packing、固定 CP、PP 和 EP。模型配置位于 `scripts/models/kimi-k3.sh`，公开示例位于 `examples/models/kimi-k3/scripts/`。
@@ -93,6 +120,18 @@ Relax 支持 Kimi K3 的全参和 LoRA SFT，包括图片输入、packing、固�
 | ![OpenR1-MM GRPO 优化前迭代耗时](./assets/openr1mm-grpo-step-time-before.png) | ![OpenR1-MM GRPO 后续迭代耗时对比](./assets/openr1mm-grpo-step-time.png) |
 
 脚本：[`run-kimi-k3-openr1mm-128xblackwell-grpo.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh)。
+
+## Kimi K3.1 Pro
+
+使用官方 `moonshotai/Kimi-K3.1-Pro` checkpoint，并配置 `--trust-remote-code` 和 `--megatron-to-hf-mode bridge`。Relax 根据 `KimiK31ForConditionalGeneration` / `kimi_k31` 自动选择本地 K3.1 bridge。模型配置位于 `scripts/models/kimi-k3.1-pro.sh`，复用 K3 的主干尺寸。现有 K3 SFT 脚本也可以将 `MODEL_DIR` 指向 K3.1 目录，同时设置新的 `EXP_NAME` 和 checkpoint 目录。
+
+K3.1 保留 93 层主干、KDA、latent MoE、AttnRes 和图像处理流程，在 24 个 MLA 层中增加 NoPE DSA 索引器：32 个头、每头 128 维，每个 query 选择 top-2048 keys。Bridge 为每个 MLA 层映射五个新增索引器张量。SFT/RL 中索引器保持冻结，因为硬 top-k 选择没有语言模型损失梯度；本次接入没有新增索引器蒸馏目标。K3.1 的 HF 仓库省略了 K3 动态加载所需的 modeling 文件，因此使用本地可训练的 MoonViT 和 projector。现有 FLOPs 估算尚未计入稀疏注意力及冻结索引器，K3.1 暂不报告 FLOPs/MFU，仍报告吞吐和耗时。
+
+训练路径使用 Core 的 TileLang 稀疏注意力，必要时对 K3 的 96 个注意力头进行计算块补齐。如果 LoRA 包装了 `kv_b_proj`，则使用展开注意力路径以保留 adapter 梯度和 dropout，但长上下文的内存开销更大。KDA 的固定 CP 依赖两个训练 Dockerfile 都会应用的 Relax Megatron patch：它移除了上游 Bridge 的 CP 拒绝检查，并加入 headwise/chunkwise CP 实现。请使用包含该 patch 的训练镜像；未打 patch 的固定版本 Bridge 不支持 KDA CP。K3.1 DSA 的 CP key gather 和 packed zigzag 重排由 Core 负责。完整脚本保留 CP8，但 K3.1 端到端 CP 数值和多节点训练仍需验证。下文 K3 的其他并行限制仍然适用。
+
+当前固定的 Megatron-Bridge 已提供可复用的 K3 主干。Bridge `v0.7.0` 和 main 的 `20874c8db` 均未实现 K3.1，单独升级 Bridge 无法获得支持，因此本次保留依赖版本。可参考[官方模型配置](https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/config.json)和 [Bridge 版本差异](https://github.com/NVIDIA-NeMo/Megatron-Bridge/compare/6862ee170a2569607e8ebc5dde91f119779093ca...20874c8dbf87af6eafa8c93c0f44586ddc47fe5a)。
+
+RL rollout 或 serving 需要包含 [SGLang #48415](https://github.com/sgl-project/sglang/pull/48415)（`61a3c7f2`，K3.1 支持）的运行环境，并移植、验证 Relax 的权重重载 patch；仓库当前的 SGLang `v0.5.21` 基础版本尚不支持。本次没有升级或验证该推理环境。下文 K3 专用的离线导出与 streaming LoRA 工具也尚未扩展到 K3.1。GPU 数值、分布式 checkpoint 和在线 rollout 权重重载仍需在目标训练镜像及集群验证。
 
 ## 训练
 
