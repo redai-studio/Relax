@@ -1,12 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""Review F1/F2/F3: batch-coupled objectives are rejected at the scheduling
+gate.
 
-"""Review F1/F2/F3: batch-coupled objectives are rejected at the scheduling gate.
-
-M2PO clipping, direct OPD loss normalization and batch-coupled MoE routing
-(aux_loss statistics / Sinkhorn / token dropping) all average or normalize over
-the current microbatch; FLOPs repacking changes their statistics domain. The
-gate must reject these combinations while flops_scheduling is enabled and keep
-them untouched in off mode.
+M2PO clipping, direct OPD loss normalization and batch-coupled MoE
+routing (aux_loss statistics / Sinkhorn / token dropping) all average or
+normalize over the current microbatch; FLOPs repacking changes their
+statistics domain. The gate must reject these combinations while
+flops_scheduling is enabled and keep them untouched in off mode.
 """
 
 from __future__ import annotations
