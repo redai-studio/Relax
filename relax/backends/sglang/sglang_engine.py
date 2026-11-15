@@ -1446,8 +1446,9 @@ class SGLangEngine(RayActor):
     def _pause_generation_for_offload(self, deadline: float) -> None:
         """Pause admission (abort mode) before draining.
 
-        Raises if the pause does not take: releasing memory while admission is
-        still open leaves the flush->release race this barrier exists to close.
+        Raises if the pause does not take: releasing memory while admission
+        is still open leaves the flush->release race this barrier exists to
+        close.
         """
         self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
 
