@@ -33,7 +33,7 @@ def test_compute_advantages_and_returns_wires_baseline_contract(monkeypatch, tmp
         fake_mpu = SimpleNamespace(
             is_pipeline_last_stage=lambda: True,
             get_context_parallel_world_size=lambda: 1,
-            get_data_parallel_group=lambda: dist.group.WORLD,
+            get_data_parallel_group=lambda with_context_parallel=False: dist.group.WORLD,
         )
         monkeypatch.setattr(loss_module, "mpu", fake_mpu)
         monkeypatch.setattr(cp_utils, "mpu", fake_mpu)
@@ -49,7 +49,6 @@ def test_compute_advantages_and_returns_wires_baseline_contract(monkeypatch, tmp
             gamma=1.0,
             use_opd=False,
             normalize_advantages=True,
-            dynamic_context_parallel=False,
         )
         rollout_data = {
             "log_probs": [torch.zeros(2), torch.zeros(2)],

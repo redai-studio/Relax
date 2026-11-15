@@ -699,8 +699,10 @@ def compute_advantages_and_returns(
     supported methods are whatever that registry holds -- deliberately not
     listed here, because keeping algorithm names in prose is the duplication
     the registry exists to remove. When `args.normalize_advantages` is True,
-    advantages are whitened across the data-parallel group using masked
-    statistics.
+    advantages are whitened across the data-parallel-with-context-parallel
+    group using masked statistics (or the CP-excluding data-parallel group
+    under dynamic context parallelism, where responses are already merged to
+    full length).
 
     Early returns if both `log_probs` and `values` are None (intermediate
     pipeline stages).
@@ -784,10 +786,11 @@ def compute_advantages_and_returns(
     if args.normalize_advantages:
         all_advs = torch.cat(advantages)
         # Under dynamic CP, rollout_data was merged back to full-length responses
-        # (dynamic_cp_merge_output), so advantages/masks are already full — use cp=1
-        # (no zig-zag chunking). The whitening stats are unchanged by the CP-group
-        # replication (uniform duplication doesn't move mean/std).
-        cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
+        # (dynamic_cp_merge_output), so advantages/masks are already full on every
+        # static CP rank. Use cp=1 (no zig-zag chunking) and exclude CP from the
+        # whitening group so each token is counted once in Bessel's correction.
+        use_dynamic_cp = getattr(args, "dynamic_context_parallel", False)
+        cp_size = 1 if use_dynamic_cp else mpu.get_context_parallel_world_size()
         if cp_size == 1:
             all_masks = torch.cat(loss_masks)
         else:
@@ -835,40 +838,44 @@ def compute_advantages_and_returns(
         # kind of pair that drifts: the two have to stay in step because
         # token-global normalisation is only correct together with the
         # mask-safe reducer.
+        #
+        # Static CP ranks hold only their zig-zag slice in `all_advs` / `all_masks`,
+        # so whitening must span DP with CP. Keep the collective unconditional
+        # because a rank can own zero response tokens for prompt-heavy sequences,
+        # and skipping the all_reduce on that rank alone hangs its peers.
         is_token_global = get_algorithm(args.advantage_estimator).advantage_normalization == "token_global"
-        if is_token_global or all_masks.numel() > 0:
-            dp_group = mpu.get_data_parallel_group()
+        whiten_group = mpu.get_data_parallel_group(with_context_parallel=not use_dynamic_cp)
 
-            if is_token_global:
-                whitened_advs_flat, raw_mean, raw_variance, valid_count = distributed_masked_normalize(
-                    all_advs,
-                    all_masks,
-                    process_group=dp_group,
-                )
-                variance_floor = torch.tensor(1e-8, device=raw_variance.device, dtype=raw_variance.dtype)
-                normalized_variance = raw_variance / torch.maximum(raw_variance, variance_floor)
-                num_samples = len(advantages)
-                raw_mean = raw_mean.detach()
-                raw_std = raw_variance.sqrt().detach()
-                normalized_mean = torch.zeros_like(raw_mean)
-                normalized_std = normalized_variance.sqrt().detach()
-                valid_count = valid_count.detach()
-                zero_variance = (raw_variance == 0).to(dtype=raw_variance.dtype).detach()
-                rollout_data["reinforce_pp_advantage_raw_mean"] = [raw_mean] * num_samples
-                rollout_data["reinforce_pp_advantage_raw_std"] = [raw_std] * num_samples
-                rollout_data["reinforce_pp_advantage_normalized_mean"] = [normalized_mean] * num_samples
-                rollout_data["reinforce_pp_advantage_normalized_std"] = [normalized_std] * num_samples
-                rollout_data["reinforce_pp_valid_token_count"] = [valid_count] * num_samples
-                rollout_data["reinforce_pp_zero_variance"] = [zero_variance] * num_samples
-            else:
-                whitened_advs_flat = distributed_masked_whiten(
-                    all_advs,
-                    all_masks,
-                    process_group=dp_group,
-                    shift_mean=True,
-                )
-            chunk_lengths = [chunk.size(0) for chunk in advantages]
-            advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
+        if is_token_global:
+            whitened_advs_flat, raw_mean, raw_variance, valid_count = distributed_masked_normalize(
+                all_advs,
+                all_masks,
+                process_group=whiten_group,
+            )
+            variance_floor = torch.tensor(1e-8, device=raw_variance.device, dtype=raw_variance.dtype)
+            normalized_variance = raw_variance / torch.maximum(raw_variance, variance_floor)
+            num_samples = len(advantages)
+            raw_mean = raw_mean.detach()
+            raw_std = raw_variance.sqrt().detach()
+            normalized_mean = torch.zeros_like(raw_mean)
+            normalized_std = normalized_variance.sqrt().detach()
+            valid_count = valid_count.detach()
+            zero_variance = (raw_variance == 0).to(dtype=raw_variance.dtype).detach()
+            rollout_data["reinforce_pp_advantage_raw_mean"] = [raw_mean] * num_samples
+            rollout_data["reinforce_pp_advantage_raw_std"] = [raw_std] * num_samples
+            rollout_data["reinforce_pp_advantage_normalized_mean"] = [normalized_mean] * num_samples
+            rollout_data["reinforce_pp_advantage_normalized_std"] = [normalized_std] * num_samples
+            rollout_data["reinforce_pp_valid_token_count"] = [valid_count] * num_samples
+            rollout_data["reinforce_pp_zero_variance"] = [zero_variance] * num_samples
+        else:
+            whitened_advs_flat = distributed_masked_whiten(
+                all_advs,
+                all_masks,
+                process_group=whiten_group,
+                shift_mean=True,
+            )
+        chunk_lengths = [chunk.size(0) for chunk in advantages]
+        advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
