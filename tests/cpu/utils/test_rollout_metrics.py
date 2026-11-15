@@ -82,7 +82,9 @@ def test_rollout_metrics_preserve_reward_categories_cache_and_effective_lengths(
             status=Sample.Status.COMPLETED,
             multimodal_train_inputs={"image_grid_thw": [[1, 4, 4]]},
             prefix_cache_info=Sample.PrefixCacheInfo(cached_tokens=4, total_prompt_tokens=8),
-            spec_info=Sample.SpecInfo(spec_accept_token_num=2, spec_draft_token_num=4),
+            spec_info=Sample.SpecInfo(
+                spec_accept_token_num=2, spec_draft_token_num=4, counts_reported=True, available_counters=None
+            ),
         ),
         Sample(
             index=2,
@@ -92,7 +94,9 @@ def test_rollout_metrics_preserve_reward_categories_cache_and_effective_lengths(
             reward={"score": 0.0, "quality": 1.0},
             status=Sample.Status.TRUNCATED,
             prefix_cache_info=Sample.PrefixCacheInfo(cached_tokens=2, total_prompt_tokens=4),
-            spec_info=Sample.SpecInfo(spec_accept_token_num=3, spec_draft_token_num=4),
+            spec_info=Sample.SpecInfo(
+                spec_accept_token_num=3, spec_draft_token_num=4, counts_reported=True, available_counters=None
+            ),
         ),
         Sample(index=3, response="unscored", response_length=3, reward=None),
     ]
@@ -110,7 +114,7 @@ def test_rollout_metrics_preserve_reward_categories_cache_and_effective_lengths(
     assert metrics["repetition_frac"] == 0.0
     assert metrics["prefix_cache_hit_rate"] == 0.5
     assert metrics["avg_cached_tokens_per_sample"] == 2.0
-    assert metrics["spec_accept_rate"] == pytest.approx((0.5 + 0.75) / 3)
+    assert metrics["spec_accept_rate"] == pytest.approx((2 + 3) / (4 + 4))
     assert metrics["image_count/mean"] == pytest.approx(1 / 3)
     assert metrics["multimodal_token_count/max"] == 4
     assert samples == before
