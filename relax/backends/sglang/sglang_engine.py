@@ -20,15 +20,9 @@ import requests
 import sglang_router
 from packaging.version import parse
 from requests.exceptions import ConnectTimeout
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-
-
-try:
-    from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-except ImportError:
-    # Older SGLang releases rely on the wire value instead of the constant.
-    GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 
 
 try:
@@ -1450,16 +1444,12 @@ class SGLangEngine(RayActor):
         return result
 
     def _pause_generation_for_offload(self, deadline: float) -> None:
-        """Best-effort /pause_generation (abort mode) before draining.
+        """Pause admission (abort mode) before draining.
 
-        Never raises: if the pause does not take, the per-retry abort in
-        release_memory_occupation still drains the engine — the pause only
-        additionally closes the flush->release admission window.
+        Raises if the pause does not take: releasing memory while admission is
+        still open leaves the flush->release race this barrier exists to close.
         """
-        try:
-            self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"pause_generation before offload failed (continuing to drain): {e}")
+        self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})

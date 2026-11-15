@@ -168,16 +168,19 @@ def test_release_tolerates_abort_failure(patched, engine_cls, m):
     assert fake_requests.calls.count("release_memory_occupation") == 1
 
 
-def test_release_tolerates_pause_failure_and_still_drains(patched, engine_cls, m):
-    # If pause does not take, per-retry abort still drains and release proceeds.
+def test_release_propagates_pause_failure_without_releasing(patched, engine_cls, m):
+    # If pause does not take, releasing memory would leave the admission race
+    # open: the error must propagate and the engine must stay untouched.
     fake_requests, _ = patched(
-        flush_statuses=[200],
         post_raises={"pause_generation": real_requests.exceptions.ConnectionError("boom")},
     )
-    _make_engine(m, engine_cls).release_memory_occupation()
 
-    assert "abort_request" in fake_requests.calls
-    assert fake_requests.calls.count("release_memory_occupation") == 1
+    with pytest.raises(real_requests.exceptions.ConnectionError, match="boom"):
+        _make_engine(m, engine_cls).release_memory_occupation()
+
+    assert "pause_generation" in fake_requests.calls
+    assert "flush_cache" not in fake_requests.calls
+    assert "release_memory_occupation" not in fake_requests.calls
 
 
 def test_full_resume_reopens_admission(patched, engine_cls, m):
