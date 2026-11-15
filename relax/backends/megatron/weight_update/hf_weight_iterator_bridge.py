@@ -825,7 +825,10 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
         if merge_fn is not None and rank == info.src_rank:
             param = merge_fn(info, param, megatron_local_weights, device)
         params.append(param)
-    device_module.synchronize()
+    # The D2H backup may be running on another stream while retained Actor
+    # weights are exported. Only the copies queued above need to finish here.
+    if device.type != "cpu":
+        device_module.current_stream().synchronize()
     return params
 
 

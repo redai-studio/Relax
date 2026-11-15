@@ -158,6 +158,7 @@ def test_controller_limits_offsets_references_to_sft_config(role):
         "threading": threading,
         "copy": copy,
         "Service": service,
+        "ROLES": SimpleNamespace(rollout="rollout"),
         "ACTOR_ROLLOUT_PG_ROLES": ["actor"],
         "logger": Mock(),
     }

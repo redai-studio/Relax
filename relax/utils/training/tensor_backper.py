@@ -69,7 +69,33 @@ class _TensorBackuperNormal(TensorBackuper):
         return list(self._backups)
 
     def get(self, tag: str):
+        if tag == "actor" and getattr(self, "_actor_backup_pending", False):
+            raise RuntimeError("Actor CPU backup is awaiting completion of weight sync")
         return self._backups[tag]
+
+    def mark_actor_backup_pending(self) -> None:
+        """Block reads of the old CPU backup until the new backup is ready."""
+        if set(self._backups) != {"actor"}:
+            raise RuntimeError("Reusing the CPU backup requires a single actor snapshot")
+        self._actor_backup_pending = True
+
+    def reuse_actor_cpu_backup(self, tensors: dict[str, torch.Tensor]) -> None:
+        """Use completed offloader CPU tensors as the Actor backup without
+        copying.
+
+        The caller must wait for the CPU copy to finish before passing tensors.
+        """
+        if set(self._backups) != {"actor"} or set(tensors) != set(self._backups["actor"]):
+            raise RuntimeError("CPU backup must contain every weight from the current Actor snapshot")
+        if any(t.device.type != "cpu" for t in tensors.values()):
+            raise ValueError("Actor weight backup must be on CPU")
+        if any(
+            tensor.shape != self._backups["actor"][name].shape or tensor.dtype != self._backups["actor"][name].dtype
+            for name, tensor in tensors.items()
+        ):
+            raise ValueError("Actor CPU backup shape/dtype changed")
+        self._backups["actor"] = tensors
+        self._actor_backup_pending = False
 
     @torch.no_grad()
     def backup(self, tag: str, *, on_device: bool = False) -> None:
@@ -102,6 +128,8 @@ class _TensorBackuperNormal(TensorBackuper):
         for name, param in self._source_getter():
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_module.synchronize()
+        if tag == "actor":
+            self._actor_backup_pending = False
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -110,7 +138,7 @@ class _TensorBackuperNormal(TensorBackuper):
 
     @torch.no_grad()
     def restore(self, tag: str) -> None:
-        backup_dict = self._backups[tag]
+        backup_dict = self.get(tag)
         for name, param in self._source_getter():
             assert name in backup_dict
             param.copy_(backup_dict[name], non_blocking=_NON_BLOCKING)

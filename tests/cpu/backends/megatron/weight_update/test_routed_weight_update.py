@@ -164,6 +164,54 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
             engine.update_weight_version.remote.assert_called_once_with(weight_version="1")
 
 
+def test_retained_sync_fences_before_closing_receiver_session(module):
+    from types import SimpleNamespace
+
+    events = []
+    engine = Mock()
+    for method in (
+        "pause_generation",
+        "flush_cache",
+        "begin_weight_update",
+        "update_weights_from_tensor",
+        "end_weight_update",
+    ):
+        getattr(engine, method).remote.side_effect = lambda _method=method, **kw: (
+            events.append((_method, kw)) or {"success": True}
+        )
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater._route_experts = False
+    updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = True
+    updater.lora_enabled = updater.lora_adapter_mode = False
+    updater.quantization_config = None
+    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
+    updater.rollout_engines, updater.distributed_rollout_engines = [engine], []
+    updater.weight_version = 0
+    updater.weights_getter = lambda: {}
+    updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=lambda weights: iter([[("weight", object())]]))
+    updater._send_hf_params = lambda tensors, **kw: ([{"success": True}], None)
+    with (
+        patch.object(module.ray, "get", side_effect=lambda refs: refs),
+        patch.object(module.MultiprocessingSerializer, "serialize", return_value="empty"),
+        patch.object(module.dist, "get_rank", return_value=0),
+        patch.object(module.dist, "all_reduce"),
+        patch.object(module.dist, "barrier"),
+        patch.object(module.dist, "get_world_size", return_value=1),
+        patch.object(module.dist, "all_gather_object", side_effect=lambda out, local, **kw: out.__setitem__(0, local)),
+        patch.object(module, "get_gloo_group"),
+        patch.object(module.device_utils, "maybe_backend_barrier_on_weight_chunk"),
+    ):
+        updater.update_weights()
+    assert [method for method, _ in events] == [
+        "pause_generation",
+        "flush_cache",
+        "begin_weight_update",
+        "update_weights_from_tensor",
+        "end_weight_update",
+    ]
+    assert events[3][1]["load_format"] == module.NATIVE_SYNC_FENCE_LOADER
+
+
 @pytest.mark.parametrize("version", [None, 3])
 def test_routed_ipc_payload_omits_uncommitted_version(module, version):
     import torch

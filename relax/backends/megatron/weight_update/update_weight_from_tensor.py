@@ -2,7 +2,7 @@
 
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from time import monotonic
 from typing import Any
 
@@ -14,11 +14,12 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
-from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
+from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER, NATIVE_SYNC_FENCE_LOADER
 from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     LORA_ADAPTER_NAME,
@@ -75,6 +76,14 @@ class UpdateWeightFromTensor:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
+        # requested: a consumer needs GPU weights kept until sync completes.
+        # enabled: all Actor ranks and SGLang receivers passed the checks.
+        # active: this update reads retained GPU weights instead of a CPU backup.
+        # OVERLAP_WEIGHT_BACKUP separately controls CPU-backup/send overlap.
+        self.actor_weight_retention_requested = False
+        self.actor_weight_retention_enabled = False
+        self.actor_weight_retention_active = False
+        self.actor_weight_retention_fallback_reason = "Actor GPU weight retention has not been validated"
         self._ipc_allocator_version: int | None = None
         self._ipc_bucket_allocator: IpcBucketAllocator | None = None
 
@@ -157,14 +166,50 @@ class UpdateWeightFromTensor:
 
         # Route via CUDA IPC only for engines on the same Ray node as the actor;
         # cross-node IPC fails with cudaErrorMapBufferObjectFailed.
+        local_actor_node_id = ray.get_runtime_context().get_node_id()
+        requested = getattr(self, "actor_weight_retention_requested", False)
+        active = getattr(self, "actor_weight_retention_enabled", False) or getattr(
+            self, "actor_weight_retention_active", False
+        )
+        reason = None
+        # Reuse the node all-gather to agree on weight-retention settings.
+        # Disabled ranks send the original node string without extra collectives.
+        local_info = local_actor_node_id
+        if requested or active or Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP:
+            mode = (
+                requested,
+                Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP,
+            )
+            reason = (
+                getattr(self, "actor_weight_retention_fallback_reason", None)
+                if requested
+                else "Actor GPU weight retention was not requested"
+            )
+            local_info = (local_actor_node_id, mode, reason, active)
+        infos = [None] * dist.get_world_size(get_gloo_group())
+        dist.all_gather_object(infos, local_info, group=get_gloo_group())
+        if any(isinstance(info, tuple) for info in infos):
+            from .utils import agree_actor_weight_retention
+
+            records = [
+                info[1:] if isinstance(info, tuple) else ((False, False), "disabled by configuration", False)
+                for info in infos
+            ]
+            qualified = agree_actor_weight_retention(reason, get_gloo_group(), requested=requested, records=records)
+        else:
+            qualified = False
+        gathered_actor_node_ids = [info[0] if isinstance(info, tuple) else info for info in infos]
+        actor_node_id_set = {nid for nid in gathered_actor_node_ids if nid}
         engine_node_ids = [
             info.get("node_id", "")
             for info in ray.get([engine.get_pid_and_node_id.remote() for engine in rollout_engines])
         ]
-        local_actor_node_id = ray.get_runtime_context().get_node_id()
-        gathered_actor_node_ids: list[str | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered_actor_node_ids, local_actor_node_id, group=get_gloo_group())
-        actor_node_id_set = {nid for nid in gathered_actor_node_ids if nid}
+        if qualified:
+            self._check_receivers_for_actor_weight_retention(
+                gathered_actor_node_ids, engine_node_ids, engine_gpu_counts, engine_gpu_offsets
+            )
+        else:
+            self.actor_weight_retention_enabled = False
 
         colocate_engine_nums = 0
         for engine_node_id in engine_node_ids:
@@ -325,6 +370,7 @@ class UpdateWeightFromTensor:
             [
                 int(
                     configure is not None
+                    and not getattr(self, "actor_weight_retention_enabled", False)
                     and torch.cuda.is_available()
                     and torch.version.hip is None
                     and mpu.get_expert_tensor_parallel_world_size() == 1
@@ -482,6 +528,9 @@ class UpdateWeightFromTensor:
                     restore_weights_before_load=True,
                     post_process_quantization=False,
                 )
+        elif self._has_retained_actor_weights():
+            for method in ("pause_generation", "flush_cache", "begin_weight_update"):
+                self._routed_engine_call(all_engines, method)
         elif rank == 0:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
             ray.get([engine.flush_cache.remote() for engine in all_engines])
@@ -541,9 +590,12 @@ class UpdateWeightFromTensor:
                         self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
                         current_refs = []
                     else:
-                        self._wait_for_ipc(prev_refs)
+                        self._wait_for_ipc(
+                            prev_refs,
+                            error=("; ".join(dispatch_errors) or None) if self._has_retained_actor_weights() else None,
+                        )
                         prev_refs = []
-                        if dispatch_errors:
+                        if dispatch_errors and not self._has_retained_actor_weights():
                             self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
                     prev_long_lived_tensors = long_lived_tensors
                     prev_refs, current_refs = current_refs, []
@@ -578,6 +630,18 @@ class UpdateWeightFromTensor:
                 )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
             self._routed_engine_call(all_engines, "continue_generation")
+        elif self._has_retained_actor_weights():
+            serialized_empty = [
+                MultiprocessingSerializer.serialize([], output_str=True)
+            ] * self.args.rollout_num_gpus_per_engine
+            self._routed_engine_call(
+                all_engines,
+                "update_weights_from_tensor",
+                serialized_named_tensors=serialized_empty,
+                load_format=NATIVE_SYNC_FENCE_LOADER,
+                flush_cache=False,
+            )
+            self._routed_engine_call(all_engines, "end_weight_update")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -588,6 +652,66 @@ class UpdateWeightFromTensor:
             ray.get([engine.end_weight_update.remote() for engine in all_engines])
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _has_retained_actor_weights(self) -> bool:
+        """Whether this update reads GPU weights kept by the Actor after
+        training."""
+        return getattr(self, "actor_weight_retention_enabled", False) and getattr(
+            self, "actor_weight_retention_active", False
+        )
+
+    def resume_generation_after_sync(self) -> None:
+        """Resume SGLang after Actor weight release and rollout KV-cache
+        reload.
+
+        All Actor ranks call this; group rank 0 submits the resume RPCs.
+        """
+        from .utils import run_rank0_rpc_calls
+
+        run_rank0_rpc_calls(
+            [lambda engine=engine: engine.continue_generation.remote() for engine in self.rollout_engines],
+            get_gloo_group(),
+        )
+
+    def _check_receivers_for_actor_weight_retention(self, actor_nodes, engine_nodes, counts, offsets) -> None:
+        """Query receivers on rank 0 and agree on retention support across
+        ranks.
+
+        All Actor ranks must call this. Update the shared enabled decision;
+        loss of support after enablement raises instead of changing paths.
+        """
+        if not getattr(self, "actor_weight_retention_requested", False):
+            return
+        from .utils import agree_actor_weight_retention, validate_sglang_weight_sync_support
+
+        group = get_gloo_group()
+        status = [None]
+        if dist.get_rank(group) == 0:
+            try:
+                status[0] = (ray.get([e.get_expert_weight_sync_layout.remote() for e in self.rollout_engines]), None)
+            except Exception as error:
+                status[0] = ([], f"receiver capability query failed: {error}")
+        dist.broadcast_object_list(status, src=0, group=group)
+        receivers, reason = status[0]
+        reason = reason or validate_sglang_weight_sync_support(
+            actor_nodes, engine_nodes, counts, offsets, receivers, self.args.rollout_num_gpus_per_engine
+        )
+        if self.quantization_config or (self.lora_enabled and self.lora_adapter_mode) or self._route_experts:
+            reason = "quantization, LoRA adapters or explicit expert routing requires the original lifecycle"
+        enabled = agree_actor_weight_retention(
+            reason,
+            group,
+            requested=self.actor_weight_retention_requested,
+            active=self.actor_weight_retention_enabled or self.actor_weight_retention_active,
+        )
+        self.actor_weight_retention_enabled = enabled
+        if dist.get_rank(group) == 0:
+            logger.info(
+                "Actor weight retention requested=%s enabled=%s overlap=%s",
+                self.actor_weight_retention_requested,
+                enabled,
+                Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP,
+            )
 
     def _routed_engine_call(self, engines: Sequence[ActorHandle], method: str, **kwargs) -> None:
         refs = []
@@ -601,6 +725,12 @@ class UpdateWeightFromTensor:
         self._wait_for_ipc(refs, error=error)
 
     def _wait_for_ipc(self, refs: list[ObjectRef], *, error: str | None = None) -> None:
+        """Wait for receiver ACKs before callers can reuse the transmitted
+        storage.
+
+        For expert routing or retained Actor weights, every rank calls this,
+        including ranks with no refs, so receiver failures reach all senders.
+        """
         try:
             results = ray.get(refs) if refs else []
             for result in results:
@@ -611,7 +741,7 @@ class UpdateWeightFromTensor:
             # ray.get(list) may raise before other requests finish. Keep source
             # buffers alive until every submitted reader has completed/failed.
             _drain_ipc_refs(refs)
-        if not self._route_experts:
+        if not self._route_experts and not self._has_retained_actor_weights():
             if error is not None:
                 raise RuntimeError(f"Weight load failed: {error}")
             return
@@ -897,6 +1027,7 @@ class UpdateWeightFromTensor:
                 weight_version=None if self._route_experts else self.weight_version,
                 dispatch_errors=dispatch_errors,
                 direct_layout=getattr(self, "_direct_expert_layout", None),
+                pack_error_group=get_gloo_group() if self._has_retained_actor_weights() else None,
             )
             all_refs.extend(refs_colocated)
 
@@ -914,6 +1045,26 @@ class UpdateWeightFromTensor:
         return all_refs, long_lived_tensors
 
 
+@contextmanager
+def _check_packing_errors_across_ranks(group):
+    """Report local packing errors to all ranks before their next IPC
+    gather."""
+    error = None
+    try:
+        yield
+    except Exception as exc:
+        if group is None:
+            raise
+        error = str(exc)
+    if group is not None:
+        failed = torch.tensor([int(error is not None)], dtype=torch.int32, device="cpu")
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+        if failed.item():
+            errors = [None] * dist.get_world_size(group)
+            dist.all_gather_object(errors, error, group=group)
+            raise RuntimeError(f"Native IPC packing failed: {errors}")
+
+
 def _send_to_colocated_engine(
     hf_named_tensors: list[tuple[str, torch.Tensor]],
     *,
@@ -924,6 +1075,7 @@ def _send_to_colocated_engine(
     bucket_allocator: IpcBucketAllocator | None = None,
     dispatch_errors: list[str] | None = None,
     direct_layout: DirectExpertLayout | None = None,
+    pack_error_group=None,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -939,51 +1091,55 @@ def _send_to_colocated_engine(
     # devices. Synchronous copy: this runs on the weight-update path (not the
     # rollout/train hot path) and FlattenedTensorBucket may flatten on a
     # different stream — correctness over a few µs.
-    cur_device = make_current_torch_device()
-    hf_named_tensors = [
-        (name, tensor.to(cur_device) if tensor.device != cur_device else tensor) for name, tensor in hf_named_tensors
-    ]
+    with _check_packing_errors_across_ranks(pack_error_group):
+        cur_device = make_current_torch_device()
+        hf_named_tensors = [
+            (name, tensor.to(cur_device) if tensor.device != cur_device else tensor)
+            for name, tensor in hf_named_tensors
+        ]
 
-    direct_chunk = None
-    direct_format = "direct"
-    if direct_layout is not None:
-        if dist.get_world_size(ipc_gather_group) != direct_layout.tp_size:
-            raise ValueError("Expert layout does not match the receiver TP group")
-        direct_chunk = direct_expert_chunk(hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group))
-        if direct_chunk is None and direct_layout.supports_expert_slices:
-            direct_chunk = expert_slice_chunk(hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group))
-            direct_format = EXPERT_SLICE_LOADER
-    if direct_chunk is not None:
-        converted_named_tensors_by_dtypes = {"direct": direct_chunk}
-    elif getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-        # An empty local chunk contributes no bucket; FlattenedTensorBucket
-        # rejects an empty named_tensors list, so skip building one.
-        converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors} if hf_named_tensors else {}
-    else:
-        converted_named_tensors_by_dtypes = {}
-        for name, tensor in hf_named_tensors:
-            dtype = tensor.dtype
-            if dtype not in converted_named_tensors_by_dtypes:
-                converted_named_tensors_by_dtypes[dtype] = []
-            converted_named_tensors_by_dtypes[dtype].append((name, tensor))
-
-    bucket_allocator = bucket_allocator or IpcBucketAllocator(cur_device)
-    serialized_tensors = []
-    for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+        direct_chunk = None
+        direct_format = "direct"
+        if direct_layout is not None:
+            if dist.get_world_size(ipc_gather_group) != direct_layout.tp_size:
+                raise ValueError("Expert layout does not match the receiver TP group")
+            direct_chunk = direct_expert_chunk(hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group))
+            if direct_chunk is None and direct_layout.supports_expert_slices:
+                direct_chunk = expert_slice_chunk(
+                    hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group)
+                )
+                direct_format = EXPERT_SLICE_LOADER
         if direct_chunk is not None:
-            payload, load_format = named_tensors, direct_format
+            converted_named_tensors_by_dtypes = {"direct": direct_chunk}
+        elif getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+            # An empty local chunk contributes no bucket; FlattenedTensorBucket
+            # rejects an empty named_tensors list, so skip building one.
+            converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors} if hf_named_tensors else {}
         else:
-            # Bucket-owned allocations use ordinary CUDA storage for inexpensive IPC.
-            with bucket_allocator.allocation():
-                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            payload = {
-                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-                "metadata": flattened_tensor_bucket.get_metadata(),
-            }
-            load_format = "flattened_bucket"
-        long_live_tensors.append(payload)
-        serialized = MultiprocessingSerializer.serialize(payload, output_str=True)
-        serialized_tensors.append((load_format, serialized))
+            converted_named_tensors_by_dtypes = {}
+            for name, tensor in hf_named_tensors:
+                dtype = tensor.dtype
+                if dtype not in converted_named_tensors_by_dtypes:
+                    converted_named_tensors_by_dtypes[dtype] = []
+                converted_named_tensors_by_dtypes[dtype].append((name, tensor))
+
+        bucket_allocator = bucket_allocator or IpcBucketAllocator(cur_device)
+        serialized_tensors = []
+        for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+            if direct_chunk is not None:
+                payload, load_format = named_tensors, direct_format
+            else:
+                # Bucket-owned allocations use ordinary CUDA storage for inexpensive IPC.
+                with bucket_allocator.allocation():
+                    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+                payload = {
+                    "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                    "metadata": flattened_tensor_bucket.get_metadata(),
+                }
+                load_format = "flattened_bucket"
+            long_live_tensors.append(payload)
+            serialized = MultiprocessingSerializer.serialize(payload, output_str=True)
+            serialized_tensors.append((load_format, serialized))
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None

@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import os
+import re
+from copy import copy
 from typing import Any
 
 import ray
@@ -10,8 +12,12 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.agentic_obs.config import train_generation_args
-from relax.utils.env import Envs
+from relax.utils.env import Envs, resolve_in
+from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_ray_accelerator_kwargs
+
+
+logger = get_logger(__name__)
 
 
 def _resolve_train_actor_class(args):
@@ -87,6 +93,42 @@ class RayTrainGroup:
             env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")
             env_vars["TRITON_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "triton")
 
+        # Select before workers start: TMS preload cannot be switched safely later.
+        self._selective_offload_for_weight_sync = False
+        effective_env = {**os.environ, **env_vars}
+        if (
+            self.role == "actor"
+            and self.args.train_backend == "megatron"
+            and resolve_in("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", effective_env)
+        ):
+            from relax.backends.megatron.weight_update.utils import validate_actor_weight_retention
+
+            reason = validate_actor_weight_retention(
+                self.args,
+                role=self.role,
+                with_ref=bool(getattr(self.args, "kl_coef", 0) or getattr(self.args, "use_kl_loss", False)),
+                with_teacher=bool(getattr(self.args, "opd_teacher_load", None)),
+                requested=True,
+            )
+            if reason is None:
+                self._selective_offload_for_weight_sync = True
+                env_vars["RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"] = effective_env[
+                    "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"
+                ]
+                # Remove only TMS from the effective worker preload, including
+                # inherited job settings; retain unrelated user libraries.
+                env_vars["LD_PRELOAD"] = " ".join(
+                    path
+                    for path in re.split(r"[\s:]+", effective_env.get("LD_PRELOAD", ""))
+                    if path and "torch_memory_saver" not in os.path.basename(path)
+                )
+                env_vars["TMS_INIT_ENABLE"] = env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
+                logger.info(
+                    "Colocate weight-sync overlap: %sselective offload before Actor startup; "
+                    "TMS preload disabled. Unsupported receivers will use ordinary selective offload and weight sync.",
+                    "automatically selecting " if not getattr(self.args, "selective_offload", False) else "using ",
+                )
+
         # Only preload the torch_memory_saver hook when it is actually the offload
         # mechanism. --selective-offload uses application-level selective CPU offload
         # and must NOT LD_PRELOAD the TMS hook (its global allocator hook + whole-pool
@@ -95,6 +137,7 @@ class RayTrainGroup:
             self.args.offload_train
             and self.args.train_backend == "megatron"
             and not getattr(self.args, "selective_offload", False)
+            and not self._selective_offload_for_weight_sync
         ):
             import torch_memory_saver
 
@@ -109,7 +152,7 @@ class RayTrainGroup:
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
         # We cannot do routing replay for critic.
-        if self.args.use_routing_replay and self.role == "actor":
+        if self.args.use_routing_replay and self.role != "critic":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
         actor_impl = _resolve_train_actor_class(self.args)
@@ -137,6 +180,11 @@ class RayTrainGroup:
     def async_init(self, args, role, with_ref=False, with_opd_teacher=False):
         """Allocate GPU resourced and initialize model, optimzier, local ckpt,
         etc."""
+        if getattr(self, "_selective_offload_for_weight_sync", False):
+            if role != "actor" or with_ref or with_opd_teacher:
+                raise ValueError("Actor role/snapshots changed after selecting selective offload for weight sync")
+            args = copy(args)
+            args.selective_offload = True
         self.args = args
         init_args = train_generation_args(args)
         return [
