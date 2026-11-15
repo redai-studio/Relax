@@ -66,6 +66,29 @@ def build_estimator(args: Any, model_config: Any) -> RelaxFlopsEstimator | None:
         raise ValueError("FLOPs scheduling currently supports ordinary text SFT/RL objectives only")
     if getattr(args, "task_type", "causal_lm") != "causal_lm":
         raise ValueError("FLOPs scheduling requires the causal_lm head; classification heads are not supported")
+    # F1: M2PO's clipping budget averages harmful tokens over the current
+    # microbatch, so repacking changes the clipping domain and the objective.
+    if getattr(args, "advantage_estimator", None) == "m2po":
+        raise ValueError("FLOPs scheduling does not support microbatch-dependent M2PO clipping")
+    # F2: direct OPD loss normalizes over valid tokens inside each microbatch;
+    # repacking changes that local denominator and can flip gradient signs.
+    if getattr(args, "use_opd", False) and float(getattr(args, "opd_loss_coef", 0.0) or 0.0) != 0.0:
+        raise ValueError("FLOPs scheduling does not support microbatch-dependent direct OPD loss")
+    # F3: batch-coupled MoE routing objectives (per-microbatch aux-loss statistics,
+    # Sinkhorn joint normalization, per-microbatch token dropping) change their
+    # statistics domain under repacking; token-independent modes stay supported.
+    auxiliary = getattr(args, "moe_aux_loss_coeff", 0.0)
+    auxiliary = auxiliary if isinstance(auxiliary, (list, tuple)) else [auxiliary]
+    if any(value is not None and value != 0 for value in auxiliary):
+        raise ValueError("FLOPs scheduling requires zero MoE auxiliary-loss coefficients to preserve the objective")
+    if getattr(args, "moe_expert_capacity_factor", None) is not None:
+        raise ValueError("FLOPs scheduling does not support microbatch-dependent MoE token dropping")
+    routing = getattr(args, "moe_router_load_balancing_type", "none")
+    routing = routing if isinstance(routing, (list, tuple)) else [routing]
+    if any(mode not in ("none", "aux_loss", "seq_aux_loss", "global_aux_loss") for mode in routing):
+        raise ValueError(
+            "FLOPs scheduling requires token-independent MoE routing; batch-coupled modes are unsupported"
+        )
     if not hasattr(args, "enable_mtp_training"):
         raise ValueError("FLOPs scheduling requires the normalized args.enable_mtp_training runtime switch")
     model_type = (
