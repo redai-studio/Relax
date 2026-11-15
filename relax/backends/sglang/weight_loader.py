@@ -12,6 +12,7 @@ import torch
 EXPERT_SLICE_LOADER = "relax.backends.sglang.weight_loader.load_expert_slices"
 EXPERT_IPC_LOADER = "relax.backends.sglang.shard_p2p_weight_loader.control"
 TP_IPC_LOADER = "relax.backends.sglang.shard_p2p_weight_loader.control_tp"
+COLOCATE_NIXL_LOADER = "relax.backends.sglang.shard_p2p_weight_loader.control_remote"
 NATIVE_SYNC_FENCE_LOADER = "relax.backends.sglang.weight_loader.fence_native_weights"
 _SLICE_PREFIX = "relax.expert_slice.v1:"
 _PARAMETER = re.compile(r"model\.layers\.\d+\.mlp\.experts\.(w13_weight|w2_weight)")

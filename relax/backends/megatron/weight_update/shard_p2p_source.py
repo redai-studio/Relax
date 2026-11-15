@@ -22,6 +22,7 @@ from relax.distributed.checkpoint_service.backends.shard_p2p.plan import (
     region_write,
 )
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 from ..sglang import MultiprocessingSerializer
@@ -343,11 +344,11 @@ class MegatronShardP2PSource:
                         name, parameter, **({"allow_etp": True} if role[2][1][0] > 1 else {})
                     )
                 )
-                digests = snapshot_digests(views)
+                digests = snapshot_digests(views) if Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK else {}
                 for canonical, tensor in views.items():
                     if canonical in parameters:
                         raise ValueError("Duplicate canonical expert replica parameter")
-                    parameters[canonical] = (tuple(tensor.shape), str(tensor.dtype), digests[canonical])
+                    parameters[canonical] = (tuple(tensor.shape), str(tensor.dtype), digests.get(canonical))
         return dict(
             rank=dist.get_global_rank(self.group, self.rank),
             role=role,
@@ -359,10 +360,11 @@ class MegatronShardP2PSource:
     def validate_replicas(records: list[dict]) -> None:
         _validate_replicas(records)
         logger.info(
-            "COLOCATE_EXPERT_REPLICA_AUDIT ranks=%d groups=%d parameter_views=%d exact=True",
+            "COLOCATE_EXPERT_REPLICA_AUDIT ranks=%d groups=%d parameter_views=%d content_check=%s",
             len(records),
             len({record["role"][0] for record in records}),
             sum(len(record["parameters"]) for record in records),
+            bool(Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK),
         )
 
     @staticmethod
@@ -464,6 +466,7 @@ def create_shard_p2p_synchronizer(owner):
         control_loader=TP_IPC_LOADER,
         update_loader=EXPERT_IPC_LOADER,
         validate_devices=validate_native_colocate_devices,
+        agent_future=getattr(owner, "_remote_writer_agent_future", None),
     )
 
 

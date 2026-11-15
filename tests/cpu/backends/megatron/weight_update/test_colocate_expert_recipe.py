@@ -258,6 +258,7 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
     monkeypatch.setattr(ipc.dist, "broadcast_object_list", lambda values, **kwargs: None)
     monkeypatch.setattr(ipc.dist, "gather_object", lambda value, out, **kwargs: out.__setitem__(0, value))
     monkeypatch.setattr(ipc.dist, "all_gather_object", lambda out, value, **kwargs: out.__setitem__(0, value))
+    monkeypatch.setattr(ipc.dist, "scatter_object_list", lambda out, values, **kwargs: out.__setitem__(0, values[0]))
     monkeypatch.setattr(ray, "get", lambda refs: [ref() for ref in refs])
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     endpoint = dict(

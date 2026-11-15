@@ -15,6 +15,7 @@ from relax.distributed.checkpoint_service.backends.shard_p2p.plan import fingerp
 def transfer(monkeypatch):
     from relax.distributed.checkpoint_service.backends.shard_p2p import ipc
 
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(ipc, "import_tensor", lambda payload, device: payload)
@@ -56,6 +57,7 @@ def transfer(monkeypatch):
         writes=writes,
         plan_hash=fingerprint(dict(geometry=geometry, writes=writes)),
         audit_native=True,
+        consistency_check=True,
     )
     update = dict(
         op="apply",
@@ -147,13 +149,12 @@ def test_physical_expert_prepare_seed_and_warm_audit(transfer, delivery):
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
 
 
-@pytest.mark.parametrize("fault", ["remote", "missing_owner", "duplicate_owner", "logical_hash"])
+@pytest.mark.parametrize("fault", ["invalid_endpoint", "missing_owner", "duplicate_owner", "logical_hash"])
 def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, fault):
     model, parameters, expected, seed, _ = transfer
     probe, control = delivery
-    cuda_initialized = torch.cuda.is_initialized()
-    if fault == "remote":
-        probe["sources"][0]["endpoint"] = _endpoint(0, remote=True)
+    if fault == "invalid_endpoint":
+        probe["sources"][0]["endpoint"].pop("boot_id")
     elif fault == "missing_owner":
         probe["sources"].pop()
     elif fault == "duplicate_owner":
@@ -165,7 +166,7 @@ def test_bind_delivery_failure_does_not_poison_native_seed(transfer, delivery, f
     assert not hasattr(model, "_relax_weight_sync_reply")
     assert not hasattr(model, "_relax_expert_ipc")
     assert all(torch.equal(parameters[name], value) for name, value in expected.items())
-    assert torch.cuda.is_initialized() == cuda_initialized
+    assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.parametrize("field", ["nonce", "engine", "receiver", "routes", "missing"])
@@ -221,7 +222,7 @@ def test_failed_transfer_cannot_publish_or_accept_later_updates(transfer, invali
 
 @pytest.mark.parametrize("new_receiver", [False, True])
 @pytest.mark.parametrize("mode", ["expert", "ordinary", "mixed"])
-def test_completed_session_can_reseed_after_full_native_recovery(transfer, new_receiver, mode):
+def test_completed_session_can_reseed_after_full_native_recovery(transfer, monkeypatch, new_receiver, mode):
     model, parameters, expected, seed, update = transfer
     if mode != "expert":
         if mode == "ordinary":
@@ -262,8 +263,15 @@ def test_completed_session_can_reseed_after_full_native_recovery(transfer, new_r
         parameter.copy_(expected[name] + 1)
     for binding in update["bindings"]:
         binding["payload"] = binding["payload"].clone() + 1
+    retired = []
+    if not new_receiver:
+        model._relax_expert_ipc["pinned_targets"] = SimpleNamespace(
+            registration=SimpleNamespace(release=lambda: retired.append("release"))
+        )
+        monkeypatch.setenv("RELAX_COLOCATE_PINNED_NIXL_TARGET", "0")
     seed.update(previous_version=7, version=8, nonce="reseed8")
     apply_command(model, seed, 0)
+    assert retired == ([] if new_receiver else ["release"])
     assert all(torch.isnan(parameter).all() for parameter in parameters.values())
     update.update(version=8, nonce="recovery8")
     apply_command(model, update, 0)
@@ -294,7 +302,6 @@ def _tp_control_error_worker(rank, rendezvous, output):
         enable_lora=False,
         speculative_algorithm=None,
     )
-    cuda_initialized = torch.cuda.is_initialized()
     try:
         for fault in ("decode", "reply", "mode", "copy", "header"):
             model = torch.nn.Linear(2, 2, bias=False)
@@ -334,7 +341,7 @@ def _tp_control_error_worker(rank, rendezvous, output):
                 assert not applied
             marker = torch.tensor(1)
             dist.all_reduce(marker, group=dist.group.WORLD)
-            assert marker.item() == 2 and torch.cuda.is_initialized() == cuda_initialized
+            assert marker.item() == 2 and not torch.cuda.is_initialized()
         Path(output, f"{rank}.json").write_text("passed")
     finally:
         dist.destroy_process_group()
@@ -405,6 +412,7 @@ def test_compiled_target_alias_failure_locks_session_before_import(transfer, mon
 
 @pytest.mark.parametrize("fault", [None, "stale", "hash", "missing", "duplicate", "failure"])
 def test_prepare_rpc_response_binds_actual_receiver_without_files(transfer, delivery, monkeypatch, fault):
+    from relax.backends.megatron.weight_update.shard_p2p_source import MegatronShardP2PSource
     from relax.distributed.checkpoint_service.backends.shard_p2p.plan import TransferPlan
     from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import ShardP2PSynchronizer
 
@@ -412,11 +420,15 @@ def test_prepare_rpc_response_binds_actual_receiver_without_files(transfer, deli
     probe, control = delivery
     helper = object.__new__(ShardP2PSynchronizer)
     helper.rank, helper.geometry = 0, seed["geometry"]
+    helper.source = MegatronShardP2PSource
     helper._phase = lambda operation: operation()
     helper.group, helper._actor_endpoints = "actor-group", []
     helper._plan_hashes = [seed["plan_hash"]]
     helper.validate_devices = lambda actors, receivers: None
     monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda values, **kwargs: None)
+    monkeypatch.setattr(
+        torch.distributed, "scatter_object_list", lambda output, values, **kwargs: output.__setitem__(0, values[0])
+    )
     endpoints = [_endpoint(rank) for rank in range(8)]
     builder = TransferPlan("tp-0", 8, tuple(seed["writes"])).bind_sources(dict(enumerate(endpoints)))
 

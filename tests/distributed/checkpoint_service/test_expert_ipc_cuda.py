@@ -400,6 +400,30 @@ def test_batched_copy_preserves_all_bits_and_strided_tail(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires actual CUDA native storage")
+def test_pinned_native_and_normal_copy_preserve_bits_and_span_boundaries():
+    from relax.distributed.checkpoint_service.backends.shard_p2p.remote.transport import PersistentPinnedTargets
+
+    # Cross three 64 MiB chunks with an unaligned chunk tail and nonzero
+    # destination origin. uint16 patterns include all NaNs and signed zeros.
+    elements = 64 * 1024**2 + 8195
+    target = torch.arange(elements + 7, device="cuda", dtype=torch.int32).to(torch.uint16).view(torch.bfloat16)
+    spans = {"weight": (6, (elements + 3) * 2)}
+    agent = SimpleNamespace(get_reg_descs=lambda values: values, register_memory=lambda descriptors: None)
+    pinned = PersistentPinnedTargets(agent, {"weight": target}, spans=spans)
+    begin, end = spans["weight"]
+    pinned.buffer.copy_(target.view(torch.uint8)[begin:end])
+    pinned.copy_to({"weight": target}, verify_native=True)
+    expected = torch.arange(elements + 7, device="cuda", dtype=torch.int32).to(torch.uint16)
+    assert torch.equal(target.view(torch.uint8), expected.view(torch.uint8))
+    # Normal copies use a separate path and must preserve both span boundaries.
+    pinned.buffer.fill_(0x5A)
+    pinned.copy_to({"weight": target})
+    assert bool((target.view(torch.uint8)[begin:end] == 0x5A).all())
+    assert torch.equal(target.view(torch.uint8)[:begin], expected.view(torch.uint8)[:begin])
+    assert torch.equal(target.view(torch.uint8)[end:], expected.view(torch.uint8)[end:])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires actual CUDA native storage")
 @pytest.mark.parametrize("storage_wrapper", ["view", "dlpack"])
 @pytest.mark.parametrize("overlap", [False, True])
 def test_native_target_physical_aliases_on_cuda(storage_wrapper, overlap):
