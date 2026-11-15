@@ -395,7 +395,8 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
             raise RuntimeError("next conversion failed")
         yield []
 
-    def send(tensors, *, dispatch_errors):
+    def send(tensors, *, dispatch_errors, defer_version=False):
+        assert not defer_version
         key = "chunk" + str(len(alive))
         storage = Storage()
         alive[key] = weakref.ref(storage)

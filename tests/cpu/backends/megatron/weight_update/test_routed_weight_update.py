@@ -122,7 +122,8 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
 
     updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=chunks)
 
-    def send(tensors, *, dispatch_errors=None):
+    def send(tensors, *, dispatch_errors=None, defer_version=False):
+        assert not defer_version
         events.append(("send", {}))
         if fail_load == "dispatch":
             dispatch_errors.append("dispatch failed")

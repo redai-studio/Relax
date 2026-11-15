@@ -878,6 +878,7 @@ class SGLangEngine(RayActor):
         )
         for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
             layout[key] = getattr(text_config, key, None)
+        layout["ordinary_tp_protocol"] = 1
         return layout
 
     def load_lora_adapter_from_tensors(
