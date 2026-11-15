@@ -10,8 +10,10 @@ import torch
 
 from relax.backends.megatron.weight_update.utils import (
     validate_actor_weight_retention,
+    validate_native_colocate_devices,
+    validate_sglang_weight_sync_support,
 )
-from relax.backends.sglang.weight_loader import fence_native_weights
+from relax.backends.sglang.weight_loader import NATIVE_SYNC_FENCE_LOADER, fence_native_weights
 
 
 def test_retention_checks_contracts_and_integration_gaps_not_training_recipe():
@@ -38,18 +40,47 @@ def test_retention_checks_contracts_and_integration_gaps_not_training_recipe():
     # Representative unvalidated settings are not a recipe whitelist.
     assert check(bf16=False, pipeline_model_parallel_size=2, update_weights_interval=2, use_critic=True) is None
     assert check(lora_rank=8, lora_merge_mode=True, use_opd=True, opd_type="sglang") is None
-    assert "equal Actor and rollout" in check(resource={"actor": (1, 4), "rollout": (1, 2)})
+    assert check(resource={"actor": (1, 8), "rollout": (1, 4), "teacher": (1, 4)}) is None
+    assert "within the Actor world" in check(resource={"actor": (1, 4), "rollout": (1, 8)})
     assert "whole rollout engines" in check(rollout_num_gpus_per_engine=3)
     assert "offload_train" in check(offload_train=False)
     assert "single actor snapshot" in check(keep_old_actor=True)
     assert "snapshot keys" in check(megatron_to_hf_mode="raw")
     assert "resume generation" in check(lora_rank=8, lora_adapter_mode=True)
-    assert "teacher onload" in check(
-        use_opd=True,
-        opd_type="sglang",
-        teacher_hf_checkpoint="teacher",
-        resource=args["resource"] | {"teacher": (1, 1)},
+    assert (
+        check(
+            use_opd=True,
+            opd_type="sglang",
+            teacher_hf_checkpoint="teacher",
+            resource=args["resource"] | {"teacher": (1, 1)},
+        )
+        is None
     )
+
+
+def test_student_receivers_cover_only_their_actor_gpus():
+    actors = [
+        dict(
+            boot_id="00000000-0000-0000-0000-000000000001",
+            hostname="node",
+            pid=rank + 1,
+            gpu_uuid=f"gpu-{rank}",
+            device_index=rank,
+            generation="source",
+        )
+        for rank in range(8)
+    ]
+    engines = [[dict(actor, pid=actor["pid"] + 8, generation="receiver")] for actor in actors[:4]]
+    receivers = [dict(device="cuda", tp_size=1, custom_weight_loader=[NATIVE_SYNC_FENCE_LOADER])] * 4
+    assert validate_sglang_weight_sync_support(["node"] * 8, ["node"] * 4, [1] * 4, [0, 1, 2, 3], receivers, 1) is None
+    validate_native_colocate_devices(actors, engines)
+    # Teacher devices are outside the student prefix; neither offsets nor
+    # physical worker identities may silently redirect student weight writes.
+    assert validate_sglang_weight_sync_support(["node"] * 8, ["node"] * 4, [1] * 4, [0, 1, 2, 4], receivers, 1)
+    with pytest.raises(ValueError, match="Actor block"):
+        validate_native_colocate_devices(actors, engines[:3] + [[actors[4]]])
+    with pytest.raises(ValueError, match="reuses"):
+        validate_native_colocate_devices(actors, engines[:3] + [engines[0]])
 
 
 def test_native_receiver_fence_rejects_payload_and_waits_all_streams(monkeypatch):

@@ -553,7 +553,7 @@ class UpdateWeightFromTensor:
             and not self.use_distribute
             and hasattr(self._hf_weight_iterator, "_bridge_converter")
             and self.args.rollout_num_gpus_per_engine * len(self.rollout_engines)
-            == dist.get_world_size(get_gloo_group())
+            <= dist.get_world_size(get_gloo_group())
         )
         decision = torch.tensor([int(ordinary)], dtype=torch.int32, device="cpu")
         dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
@@ -1180,6 +1180,11 @@ class UpdateWeightFromTensor:
                 pack_error_group=get_gloo_group() if self._has_retained_actor_weights() else None,
             )
             all_refs.extend(refs_colocated)
+        elif self._has_retained_actor_weights():
+            # Actor ranks assigned to teachers have no student IPC engine, but
+            # must join the packing-error phase used by the student ranks.
+            with _check_packing_errors_across_ranks(get_gloo_group()):
+                pass
 
         if self.use_distribute and self._is_distributed_src_rank:
             refs_distributed = update_weights_from_distributed(
