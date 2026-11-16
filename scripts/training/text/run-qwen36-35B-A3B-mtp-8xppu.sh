@@ -39,9 +39,9 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export RELAX_DEVICE_TYPE=ppu
 export RL_MODEL_TYPE="Qwen36_35B_text"
 
-export NCCL_SOCKET_IFNAME=eth0
-export GLOO_SOCKET_IFNAME=eth0
-export TP_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-eth0}"
+export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-eth0}"
 
 # Inherited by rollout/sglang; the train actor flips it back via --train-env-vars.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
@@ -70,8 +70,16 @@ unset https_proxy
 # PPU_CLEAR_CACHE=1 forces cold caches on a rerun; must run before local-ppu.sh,
 # which starts the ray head into /tmp/ray.
 if [ "${PPU_CLEAR_CACHE:-0}" = "1" ]; then
-    rm -rf /tmp/ray /tmp/torchinductor_root /root/.cache/triton /root/.triton /root/.cache/nvte_gg_rtc
-    echo "[cache] cleared triton/inductor/nvte-rtc caches + /tmp/ray (cold-cache run)"
+    rm -rf /tmp/torchinductor_root /root/.cache/triton /root/.triton /root/.cache/nvte_gg_rtc
+    echo "[cache] cleared triton/inductor/nvte-rtc caches (cold-cache run)"
+    # A running cluster owns /tmp/ray; wipe it only when we start the head below.
+    if [ -n "${RELAX_ENTRYPOINT_MODE:-}" ] ||
+       { [ -n "${RAY_ADDRESS:-}" ] && timeout 5 ray status >/dev/null 2>&1; }; then
+        echo "[cache] kept /tmp/ray: reusing the running Ray cluster"
+    else
+        rm -rf /tmp/ray
+        echo "[cache] cleared /tmp/ray (cold-cache run)"
+    fi
 fi
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
@@ -255,7 +263,7 @@ MISC_ARGS=(
 source "${SCRIPT_DIR}/../../entrypoint/runtime-env-ppu.sh"
 
 mkdir -p log
-ray job submit --address="http://${HOST_IP}:8265" \
+ray job submit --address="${RAY_DASHBOARD_ADDRESS:-http://${HOST_IP}:8265}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
    --resource '{"actor": [1, 8], "rollout": [1, 8]}' \
@@ -272,4 +280,5 @@ ray job submit --address="http://${HOST_IP}:8265" \
    "${PERF_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen36-35B-A3B-mtp-ppu8-vmm-${now}.log
+   "${MISC_ARGS[@]}" \
+   "$@" 2>&1 | tee log/qwen36-35B-A3B-mtp-ppu8-vmm-${now}.log
