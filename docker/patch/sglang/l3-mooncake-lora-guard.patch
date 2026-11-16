@@ -1,0 +1,15 @@
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -7218,6 +7218,12 @@
+             )
+ 
+     def _resolve_storage_layout_compatibility(self):
++        if self.hicache_storage_backend == "mooncake" and self.enable_lora:
++            raise ValueError(
++                "Mooncake HiCache L3 does not support LoRA: adapter updates bypass "
++                "the L3 weight-epoch invalidation and could restore KV/Mamba state "
++                "computed with an older adapter. Disable LoRA or use a non-L3 backend."
++            )
+         if (
+             self.hicache_storage_backend != "mooncake"
+             or self.hicache_mem_layout != "layer_first"

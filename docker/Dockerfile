@@ -215,6 +215,13 @@ RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path
     python -m compileall -q fla/modules/conv/triton && \
     rm /tmp/fla-output-config.patch /tmp/fla-conv-entries.patch
 
+# Pin the Store SDK used by the Mooncake HiCache L3 backend (SGLang 0.5.17).
+ARG MOONCAKE_VERSION=0.3.12.post1
+RUN python -m pip install --no-cache-dir --no-deps "mooncake-transfer-engine==${MOONCAKE_VERSION}" && \
+    python -c "from mooncake.store import MooncakeDistributedStore; import shutil; \
+        assert hasattr(MooncakeDistributedStore, 'batch_get_into'); \
+        assert shutil.which('mooncake_master') and shutil.which('mooncake_client')"
+
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
 RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
@@ -253,17 +260,19 @@ RUN cd Megatron-LM && \
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
 COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
+COPY docker/patch/sglang/l3-mooncake-lora-guard.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     cd /sgl-workspace/sglang && git add . && \
     git update-index --refresh && \
     git apply sglang.patch --3way && \
+    if [ "$PATCH_VERSION" = "v0.5.17" ]; then git apply l3-mooncake-lora-guard.patch; fi && \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
     git apply --check sglang_per_pos_topk.patch && \
     git apply sglang_per_pos_topk.patch && \
-    rm sglang.patch sglang_per_pos_topk.patch; \
+    rm sglang.patch sglang_per_pos_topk.patch l3-mooncake-lora-guard.patch; \
 fi
 
 # Shared MCore model sources are installed above, but this CUDA 12 image retains

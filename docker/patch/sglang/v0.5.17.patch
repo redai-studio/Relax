@@ -1687,10 +1687,18 @@ index 39eeec2e..12ba5133 100644
                      if self.profile_in_progress:
                          # force trace flush
 diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-index 653b28c4..d30ce9f9 100644
+index 653b28c4186823a01801e14a624b1828eac51538..0918ba19ca951f11df855340e0213f5875db95f0 100644
 --- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
 +++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-@@ -28,6 +28,8 @@ from sglang.srt.managers.io_struct import (
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import logging
+ import time
+ import traceback
+@@ -28,6 +29,8 @@
      GetWeightsByNameReqOutput,
      InitWeightsUpdateGroupReqInput,
      InitWeightsUpdateGroupReqOutput,
@@ -1699,26 +1707,235 @@ index 653b28c4..d30ce9f9 100644
      ReleaseMemoryOccupationReqInput,
      ReleaseMemoryOccupationReqOutput,
      ResumeMemoryOccupationReqInput,
-@@ -183,6 +185,19 @@ class SchedulerWeightUpdaterManager:
+@@ -85,6 +88,97 @@
+     offload_tags: set = field(default_factory=set)
+     stashed_model_static_state: Any = None
+ 
++    def _storage_weight_backend(self):
++        cache = getattr(self.scheduler, "tree_cache", None)
++        controller = getattr(cache, "cache_controller", None)
++        backend = getattr(controller, "storage_backend", None)
++        if backend is None or not hasattr(backend, "weight_namespace"):
++            return None
++        if not backend.weight_namespace:
++            raise RuntimeError("Mooncake L3 weight updates require an initialized cache namespace")
++        return backend
++
++    def _log_storage_lifecycle(self, event: str) -> None:
++        cache = getattr(self.scheduler, "tree_cache", None)
++        controller = getattr(cache, "cache_controller", None)
++        backend = getattr(controller, "storage_backend", None)
++        if not getattr(backend, "weight_namespace", None):
++            return
++        logger.info("MOONCAKE_L3_LIFECYCLE %s", json.dumps({
++            "event": event, "tp_rank": self.scheduler.ps.tp_rank,
++            "namespace": backend.weight_namespace, "epoch": backend.weight_epoch,
++            "backend": type(backend).__name__,
++            "offload_tags": sorted(self.offload_tags),
++        }, sort_keys=True))
++
++    @contextmanager
++    def _storage_weight_update(self):
++        backend = self._storage_weight_backend()
++        outcome = {"success": False}
++        if backend is None:
++            yield outcome
++            return
++        cache = self.scheduler.tree_cache
++        controller = cache.cache_controller
++        try:
++            deadline = time.monotonic() + 10.0
++            while True:
++                cache.check_hicache_events()
++                states = torch.tensor([int(not self.is_fully_idle())], dtype=torch.int)
++                torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++                if not states[0].item():
++                    break
++                expired = torch.tensor([int(time.monotonic() >= deadline)], dtype=torch.int)
++                torch.distributed.all_reduce(expired, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++                if expired[0].item():
++                    raise RuntimeError("Mooncake L3 weight update requires a fully idle engine")
++                time.sleep(0.001)
++            error = None
++            try:
++                controller._stop_storage_threads()
++            except Exception as exc:
++                error = exc
++            states = torch.tensor([int(error is not None)], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Mooncake L3 storage workers did not stop on every rank") from error
++            backend.advance_weight_namespace()
++            error = None
++            try:
++                flushed = self.flush_cache(empty_cache=False)
++            except Exception as exc:
++                flushed, error = False, exc
++            states = torch.tensor([int(not flushed)], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Mooncake L3 cache flush failed before weight mutation") from error
++            digest = torch.tensor(list(hashlib.sha256(backend.weight_namespace.encode()).digest()), dtype=torch.int)
++            low, high = digest.clone(), digest.clone()
++            cache._all_reduce_attn_groups(low, torch.distributed.ReduceOp.MIN)
++            cache._all_reduce_attn_groups(high, torch.distributed.ReduceOp.MAX)
++            states = torch.tensor([int(not torch.equal(low, high))], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Mooncake L3 weight namespaces differ within an attention owner")
++            self._log_storage_lifecycle("before_weight_mutation")
++            mutation_error = None
++            try:
++                yield outcome
++            except BaseException as exc:
++                mutation_error = exc
++            states = torch.tensor([int(mutation_error is not None or not outcome["success"])], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Weight mutation failed; Mooncake L3 engine must be rebuilt") from mutation_error
++            self._log_storage_lifecycle("after_weight_mutation")
++        except BaseException:
++            # Partial mutation cannot safely resume generation or reuse the old
++            # namespace. The supervisor observes an engine failure, never a gain.
++            # Do not request graceful host-pool destruction: a failed stop may
++            # still own an IO pointer. Propagate to the scheduler's fatal path.
++            controller.storage_stop_event.set()
++            raise
++
+     @contextmanager
+     def _observe_weight_load(self, source: str) -> Iterator[None]:
+         # Edge-trigger weight_load_duration_seconds at the end of each
+@@ -93,7 +187,8 @@
+         # `source` distinguishes disk vs distributed vs tensor vs ipc.
+         t0 = time.perf_counter()
+         try:
+-            yield
++            with self._storage_weight_update() as outcome:
++                yield outcome
+         finally:
+             if self.metrics_collector is not None:
+                 self.metrics_collector.observe_weight_load(
+@@ -101,6 +196,10 @@
+                 )
+ 
+     def flush_cache_after_weight_update(self, recv_req) -> None:
++        if self._storage_weight_backend() is not None:
++            # Already collectively flushed before mutation. A rank-local worker
++            # success must not select a second collective flush before agreement.
++            return
+         if recv_req.flush_cache:
+             flush_cache_success = self.flush_cache(
+                 empty_cache=recv_req.torch_empty_cache
+@@ -109,7 +208,7 @@
+ 
+     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+         """In-place update of the weights from disk."""
+-        with self._observe_weight_load("disk"):
++        with self._observe_weight_load("disk") as outcome:
+             success, message = self.tp_worker.update_weights_from_disk(recv_req)
+             tp_success = success
+             if success and self.draft_worker is not None:
+@@ -118,6 +217,7 @@
+                 self.flush_cache_after_weight_update(recv_req)
+             if not success:
+                 logger.error(message)
++            outcome["success"] = bool(success)
+             return UpdateWeightFromDiskReqOutput(
+                 success=success, message=message, num_paused_requests=0
+             )
+@@ -140,19 +240,20 @@
+         recv_req: UpdateWeightsFromDistributedReqInput,
+     ) -> Tuple[bool, str]:
+         """Update the online model parameter."""
+-        with self._observe_weight_load("distributed"):
++        with self._observe_weight_load("distributed") as outcome:
+             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+             if success:
+                 self.flush_cache_after_weight_update(recv_req)
+             else:
+                 logger.error(message)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromDistributedReqOutput(
+                 success=success, message=message
+             )
+ 
+     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+         """Update the online model parameter from tensors."""
+-        with self._observe_weight_load("tensor"):
++        with self._observe_weight_load("tensor") as outcome:
+             if recv_req.disable_draft_model:
+                 worker = self.tp_worker
+             else:
+@@ -162,12 +263,14 @@
+                 self.flush_cache_after_weight_update(recv_req)
+             else:
+                 logger.error(message)
+-            torch.distributed.barrier(group=self.tp_cpu_group)
++            if self._storage_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+ 
+     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+         """Update the online model parameter from IPC for checkpoint-engine integration."""
+-        with self._observe_weight_load("ipc"):
++        with self._observe_weight_load("ipc") as outcome:
+             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+             tp_success = success
+             if success and self.draft_worker is not None:
+@@ -176,12 +279,30 @@
+                 self.flush_cache_after_weight_update(recv_req)
+             if not success:
+                 logger.error(message)
+-            torch.distributed.barrier(group=self.tp_cpu_group)
++            if self._storage_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
+ 
+     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
          parameter = self.tp_worker.get_weights_by_name(recv_req)
          return GetWeightsByNameReqOutput(parameter=parameter)
- 
-+    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
-+        success, message = self.tp_worker.post_process_weights(recv_req)
-+        if (
-+            success
-+            and self.draft_worker is not None
-+            and hasattr(self.draft_worker, "post_process_weights")
-+        ):
-+            success, message = self.draft_worker.post_process_weights(recv_req)
-+        if not success:
-+            logger.error(message)
-+        torch.distributed.barrier(group=self.tp_cpu_group)
-+        return PostProcessWeightsReqOutput(success=success, message=message)
 +
++    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
++        with self._storage_weight_update() as outcome:
++            success, message = self.tp_worker.post_process_weights(recv_req)
++            if (
++                success
++                and self.draft_worker is not None
++                and hasattr(self.draft_worker, "post_process_weights")
++            ):
++                success, message = self.draft_worker.post_process_weights(recv_req)
++            if not success:
++                logger.error(message)
++            if self._storage_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
++            return PostProcessWeightsReqOutput(success=success, message=message)
+ 
      def _assert_weight_cache_inactive(self, op: str) -> None:
          """Reject freeing/restoring model weights while the CUDA IPC weight
-         cache is active: the weights are shared with the daemon via CUDA IPC, so
+@@ -243,6 +364,7 @@
+ 
+         torch.get_device_module().synchronize()
+ 
++        self._log_storage_lifecycle("after_release")
+         return ReleaseMemoryOccupationReqOutput()
+ 
+     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+@@ -284,9 +406,12 @@
+                     if queue is not None:
+                         queue.resume_memory_occupation()
+ 
++        self._log_storage_lifecycle("after_resume")
+         return ResumeMemoryOccupationReqOutput()
+ 
+     def check_weights(self, recv_req: CheckWeightsReqInput):
++        if recv_req.action == "reset_tensors" and self._storage_weight_backend() is not None:
++            return CheckWeightsReqOutput(success=False, message="reset_tensors is disabled with Mooncake L3; use a full weight update")
+         try:
+             payload = self.tp_worker.model_runner.check_weights(
+                 action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
 index 7cfd98b8..03ac104c 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
@@ -3438,9 +3655,78 @@ diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interfa
      def begin_insert(self, params: InsertParams) -> InsertStepResult:
          """Start the (single-flight) insert, running to its first barrier or completion."""
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index c11a02e30f68e7b81834a41e9af5838da461e684..9e3f5dffb4b7e82c420f2a29f18e4716d1a1f1ea 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
-@@ -602,6 +602,9 @@
+@@ -7,6 +7,8 @@
+ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+ 
+ import torch
++import uuid
++import hashlib
+ 
+ from sglang.srt.distributed.communication_tags import P2PTag
+ from sglang.srt.environ import envs
+@@ -216,21 +218,17 @@
+         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+ 
+     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+-        reduced = False
+         for group in (self.attn_cp_group, self.attn_tp_group):
+             if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                 torch.distributed.all_reduce(tensor, op=op, group=group)
+-                reduced = True
+-        if not reduced and self.tp_world_size > 1:
++        if self.attn_cp_group is None and self.attn_tp_group is None and self.tp_world_size > 1:
+             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+ 
+     def _barrier_attn_groups(self):
+-        waited = False
+         for group in (self.attn_cp_group, self.attn_tp_group):
+             if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                 torch.distributed.barrier(group=group)
+-                waited = True
+-        if not waited and self.tp_world_size > 1:
++        if self.attn_cp_group is None and self.attn_tp_group is None and self.tp_world_size > 1:
+             torch.distributed.barrier(group=self.tp_group)
+ 
+     def _drain_async_work(self):
+@@ -296,6 +294,8 @@
+         self.enable_storage = False
+         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
++        self.aborted_prefetch: set[str] = set()
++        self._native_prefetch_sequence = 0
+         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+ 
+         if self.cache_controller is not None:
+@@ -342,6 +342,14 @@
+             storage_extra_config=storage_extra_config,
+             storage_prefetch_threshold=storage_prefetch_threshold,
+         )
++        if storage_backend == "mooncake":
++            # Isolate each attention-DP owner and engine incarnation.
++            # Only the attention TP/CP participants share a storage namespace.
++            incarnation = torch.tensor(list(uuid.uuid4().bytes), dtype=torch.int)
++            self._all_reduce_attn_groups(incarnation, torch.distributed.ReduceOp.MIN)
++            self.cache_controller.storage_backend.initialize_weight_namespace(
++                bytes(incarnation.tolist()).hex()
++            )
+         # Tag HiCache enablement on the TreeCore.
+         if self.cache_controller is not None:
+             self.tree_core.set_hicache_enabled()
+@@ -376,6 +384,10 @@
+         self.sidecar_pool_specs.append(spec)
+ 
+     def release_host_resources(self) -> None:
++        if self.cache_controller is not None and self.cache_controller.enable_storage:
++            # Graceful shutdown can arrive with an active zero-copy read. Never
++            # unregister/free its host buffers until every storage worker exits.
++            self.cache_controller._stop_storage_threads()
+         if self.host_pool_group is not None:
+             self.host_pool_group.destroy()
+ 
+@@ -602,6 +614,9 @@
          if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
              return
  
@@ -3450,7 +3736,7 @@ diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/
          if self.disable:
              kv_indices = self.req_to_token_pool.req_to_token[
                  req.req_pool_idx, :kv_len_to_handle
-@@ -666,6 +669,30 @@
+@@ -666,6 +681,30 @@
                  kv_indices[req.cache_protected_len :],
                  start_pos=req.cache_protected_len,
              )
@@ -3481,7 +3767,7 @@ diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/
  
          self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
  
-@@ -789,6 +816,15 @@
+@@ -789,6 +828,15 @@
              req.prefix_indices = new_indices
          req.cache_protected_len = len(new_indices)
          req.last_node = new_last_node
@@ -3497,6 +3783,339 @@ diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/
          req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
          # carry the skip set so this node's dec releases only what we locked
          req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+@@ -1168,6 +1216,14 @@
+         if not self.enable_storage or self.cache_controller is None:
+             return
+ 
++        states = torch.tensor(
++            [int(req_id in self.ongoing_prefetch or req_id in self.aborted_prefetch)],
++            dtype=torch.int,
++        )
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        if states[0].item():
++            return
++
+         extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+         prefetch_key = RadixKey(
+             new_input_tokens,
+@@ -1175,10 +1231,12 @@
+             is_bigram=self.tree_core.is_eagle,
+         ).page_aligned(self.page_size)
+         prefetch_length = len(prefetch_key)
+-        if (
+-            prefetch_length < self.prefetch_threshold
+-            or self.cache_controller.prefetch_rate_limited()
+-        ):
++        states = torch.tensor(
++            [int(prefetch_length < self.prefetch_threshold or self.cache_controller.prefetch_rate_limited())],
++            dtype=torch.int,
++        )
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        if states[0].item():
+             return
+ 
+         anchor_lock_params = self.inc_host_lock_ref(last_host_node_id).to_dec_params()
+@@ -1211,9 +1269,12 @@
+         sidecar_xfers = self._build_sidecar_transfers(
+             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+         )
+-        if alloc_failed:
+-            self.cache_controller.append_host_mem_release(
+-                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
++        states = torch.tensor([int(alloc_failed)], dtype=torch.int)
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        if states[0].item():
++            # No reader owns these allocations; release locally on every rank.
++            self.cache_controller.release_unsubmitted_prefetch(
++                [x for xfers in comp_xfers.values() for x in xfers]
+             )
+             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+             return
+@@ -1226,7 +1287,10 @@
+             last_hash,
+             prefix_keys,
+             extra_pools=aux_xfers or None,
+-        )
++            revoke_with_operation=True,
++        )
++        self._native_prefetch_sequence += 1
++        operation.native_sequence = self._native_prefetch_sequence
+         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
+             last_host_node_id,
+             prefetch_key,
+@@ -1245,43 +1309,76 @@
+         )
+ 
+     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+-        if self.prefetch_stop_policy == "best_effort":
++        return self._prefetch_completion_status(operation)[0]
++
++    def _prefetch_completion_status(
++        self, operation: Optional[PrefetchOperation]
++    ) -> tuple[bool, bool]:
++        if operation is None:
++            can_terminate = True
++        else:
++            if len(operation.hash_value) == 0:
++                completed = False
++            else:
++                completed = (
++                    operation.completed_tokens == len(operation.hash_value) * self.page_size
++                )
++
++            if (
++                completed
++                and getattr(operation, "pool_transfers", None)
++                and not getattr(operation, "pool_transfers_done", True)
++            ):
++                completed = False
++
++            if self.prefetch_stop_policy == "wait_complete":
++                can_terminate = completed
++            elif self.prefetch_stop_policy == "timeout":
++                can_terminate = completed or self._prefetch_timeout_check_linear_func(
++                    operation
++                )
++            else:
++                can_terminate = True
++
++        has_host = operation is not None and operation.host_indices is not None
++        operation_terminated = operation is None or operation.is_terminated()
++        io_pending = has_host and not operation.io_done.is_set()
++        states = torch.tensor(
++            [1 - int(can_terminate), int(operation_terminated), int(io_pending),
++             int(not has_host)],
++            dtype=torch.int,
++        )
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        stop_requested = states[0].item() == 0 or states[1].item() == 1
++        if stop_requested and operation is not None:
++            # Propagate stop to every reader. Buffers remain owned until all
++            # ranks exit I/O, including when a peer failed host allocation.
++            operation.mark_terminate()
++        return stop_requested and states[2].item() == 0, states[3].item() == 0
++
++    def check_prefetch_progress(self, req_id: str) -> bool:
++        if req_id in self.aborted_prefetch:
++            return False
++        info = self.ongoing_prefetch.get(req_id)
++        operation = info.operation if info is not None else None
++        ready, all_have_host = self._prefetch_completion_status(operation)
++        if not ready:
++            return False
++        if info is None:
+             return True
+-
+-        if len(operation.hash_value) == 0:
+-            completed = False
+-        else:
+-            completed = (
+-                operation.completed_tokens == len(operation.hash_value) * self.page_size
+-            )
+-
+-        if self.prefetch_stop_policy == "wait_complete":
+-            can_terminate = completed
+-        elif self.prefetch_stop_policy == "timeout":
+-            can_terminate = completed or self._prefetch_timeout_check_linear_func(
+-                operation
+-            )
+-        else:
+-            return True
+-        if (
+-            completed
+-            and getattr(operation, "pool_transfers", None)
+-            and not getattr(operation, "pool_transfers_done", True)
+-        ):
+-            can_terminate = False
+-
+-        operation_terminated = operation.is_terminated()
+-        states = torch.tensor(
+-            [1 - int(can_terminate), int(operation_terminated)],
+-            dtype=torch.int,
+-        )
+-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+-        can_terminate = states[0].item() == 0
+-        operation_terminated = states[1].item() == 1
+-        return can_terminate or operation_terminated
+-
+-    def check_prefetch_progress(self, req_id: str) -> bool:
+-        if req_id not in self.ongoing_prefetch:
++        if not all_have_host:
++            if operation.host_indices is None:
++                self._revoke_pending_prefetch(req_id)
++            else:
++                completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
++                self.cache_controller.append_host_mem_release(
++                    host_indices=info.host_indices[:completed_tokens],
++                    extra_pools=[x for xfers in info.comp_xfers.values() for x in xfers],
++                )
++                self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
++                del self.ongoing_prefetch[req_id]
++                self.cache_controller.prefetch_tokens_occupied -= len(info.prefetch_key)
++            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+             return True
+ 
+         (
+@@ -1292,13 +1389,6 @@
+             anchor_lock_params,
+             comp_xfers,
+         ) = self.ongoing_prefetch[req_id]
+-        if not self.can_terminate_prefetch(operation):
+-            return False
+-        if operation.host_indices is None:
+-            self.cache_controller.terminate_prefetch(operation)
+-            self._revoke_pending_prefetch(req_id)
+-            return True
+-
+         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+             operation
+         )
+@@ -1470,6 +1560,9 @@
+ 
+     def release_aborted_request(self, rid: str) -> None:
+         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
++        # Abort intent must survive local revocation so every rank participates
++        # in the same readiness collective, even when it owns no local reader.
++        self.aborted_prefetch.add(rid)
+         if rid not in self.ongoing_prefetch:
+             return
+ 
+@@ -1486,15 +1579,34 @@
+             self._revoke_pending_prefetch(rid)
+             return
+ 
+-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
+-        self._barrier_attn_groups()
+-        self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+-        del self.ongoing_prefetch[rid]
+-        self.cache_controller.append_host_mem_release(
+-            host_indices=host_indices[:completed_tokens],
+-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+-        )
+-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
++        self.cache_controller.terminate_prefetch(operation)
++
++    def _drain_aborted_prefetch(self) -> None:
++        for rid in sorted(self.aborted_prefetch):
++            info = self.ongoing_prefetch.get(rid)
++            operation = info.operation if info is not None else None
++            if operation is not None:
++                operation.mark_terminate()
++            io_pending = (
++                operation is not None
++                and operation.host_indices is not None
++                and not operation.io_done.is_set()
++            )
++            states = torch.tensor([int(io_pending)], dtype=torch.int)
++            self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++            if states[0].item() != 0:
++                continue
++            self.aborted_prefetch.discard(rid)
++            if info is None:
++                continue
++            completed_tokens, _ = self.cache_controller.terminate_prefetch(info.operation)
++            self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
++            del self.ongoing_prefetch[rid]
++            self.cache_controller.append_host_mem_release(
++                host_indices=info.host_indices[:completed_tokens],
++                extra_pools=[x for xfers in info.comp_xfers.values() for x in xfers],
++            )
++            self.cache_controller.prefetch_tokens_occupied -= len(info.prefetch_key)
+ 
+     def _revoke_pending_prefetch(self, req_id: str) -> None:
+         info = self.ongoing_prefetch.pop(req_id, None)
+@@ -1509,8 +1621,8 @@
+             comp_xfers,
+         ) = info
+         cc = self.cache_controller
+-        cc.append_host_mem_release(
+-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
++        cc.release_unsubmitted_prefetch(
++            [x for xfers in comp_xfers.values() for x in xfers]
+         )
+         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+         cc.prefetch_tokens_occupied = max(
+@@ -1539,43 +1651,48 @@
+                 yield item
+ 
+         def _drain_revoke():
+-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+-                self._revoke_pending_prefetch(req_id)
++            for operation in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
++                info = self.ongoing_prefetch.get(operation.request_id)
++                if info is not None and info.operation is operation:
++                    self._revoke_pending_prefetch(operation.request_id)
+ 
+         def _drain_and_alloc_storage_hit():
+             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                 req_id = operation.request_id
+                 info = self.ongoing_prefetch.get(req_id)
+-                if info is None:
+-                    # request already aborted/cleaned up, skip
++                owns_operation = info is not None and info.operation is operation
++                # The global StorageOperation counter is shared with backups;
++                # use our collectively enqueued sequence and checkpoint instead.
++                identity = repr((req_id, operation.native_sequence,
++                                 operation.storage_hit_count, operation.hash_value[-1:]))
++                signature = list(hashlib.sha256(identity.encode()).digest())
++                states = torch.tensor(
++                    [int(not owns_operation or operation.is_terminated()), *signature],
++                    dtype=torch.int,
++                )
++                low, high = states.clone(), states.clone()
++                self._all_reduce_attn_groups(low, torch.distributed.ReduceOp.MIN)
++                self._all_reduce_attn_groups(high, torch.distributed.ReduceOp.MAX)
++                if high[0].item() or not torch.equal(low[1:], high[1:]):
++                    if owns_operation:
++                        self._revoke_pending_prefetch(req_id)
+                     continue
+-                if operation.is_terminated():
+-                    # request was aborted while the storage query was in flight
+-                    self._revoke_pending_prefetch(req_id)
+-                    continue
+-
++
++                # All ranks must read the same Full/Mamba checkpoint. Do not
++                # shorten a hit independently to fit local host pressure.
+                 alloc_len = operation.storage_hit_count
+                 host_indices = cc.mem_pool_host.alloc(alloc_len)
+                 if host_indices is None:
+                     self.evict_host(alloc_len)
+                     host_indices = cc.mem_pool_host.alloc(alloc_len)
+-                if host_indices is None:
+-                    # Memory-pressure fallback: a shorter page-aligned prefix.
+-                    available_size = cc.mem_pool_host.available_size()
+-                    alloc_len = min(
+-                        operation.storage_hit_count,
+-                        available_size - (available_size % self.page_size),
+-                    )
+-                    if alloc_len >= self.prefetch_threshold:
+-                        host_indices = cc.mem_pool_host.alloc(alloc_len)
+-                if host_indices is None:
++                states = torch.tensor([int(host_indices is None)], dtype=torch.int)
++                self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++                if states[0].item():
++                    if host_indices is not None:
++                        cc.mem_pool_host.free(host_indices)
+                     self._revoke_pending_prefetch(req_id)
+                     continue
+ 
+-                operation.storage_hit_count = alloc_len
+-                operation.hash_value = operation.hash_value[
+-                    : alloc_len // self.page_size
+-                ]
+                 operation.host_indices = host_indices
+                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
+                 cc.prefetch_buffer.put(operation)
+@@ -1968,6 +2085,8 @@
+                     extra_release_counts=extra_release_counts,
+                     log_metrics=True,
+                 )
++        if self.enable_storage:
++            self._drain_aborted_prefetch()
+         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+             self.storage_metrics_collector.log_storage_metrics(
+                 self.cache_controller.storage_backend.get_stats()
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
@@ -3590,6 +4209,291 @@ diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt
              return output
  
      def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+diff --git a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+index 0f3234b3b3580e9f070316cefc01ef4029da089a..ccdd73283e2ee6e81dc48693ed3bd28d0cd4d84e 100644
+--- a/python/sglang/srt/managers/cache_controller.py
++++ b/python/sglang/srt/managers/cache_controller.py
+@@ -202,6 +202,8 @@
+ 
+         self._lock = threading.Lock()
+         self._terminated_flag = False
++        # An allocated host buffer cannot be reused until its reader exits.
++        self.io_done = threading.Event()
+         self.storage_hit_count = 0
+         self.start_time = time.monotonic()
+ 
+@@ -375,7 +377,7 @@
+         self.backup_queue = Queue()
+ 
+         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
+-        self.prefetch_revoke_queue: Queue[str] = Queue()
++        self.prefetch_revoke_queue: Queue[str | StorageOperation] = Queue()
+         self.ack_backup_queue: Queue[StorageOperation] = Queue()
+         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
+ 
+@@ -405,20 +407,20 @@
+         except Exception:
+             pass
+ 
+-        # Best-effort joins (threads are daemon, but join keeps state clean).
++        # The prefetch thread creates its IO child. Join the parent first,
++        # then discover the child; snapshotting all threads before joining can
++        # miss a child created during a startup/reset race.
++        deadline = time.monotonic() + 10.0
+         threads = []
+-        if hasattr(self, "prefetch_thread"):
+-            threads.append(self.prefetch_thread)
+-        if hasattr(self, "backup_thread"):
+-            threads.append(self.backup_thread)
+-        if hasattr(self, "prefetch_io_aux_thread"):
+-            threads.append(self.prefetch_io_aux_thread)
+-
+-        for t in threads:
++        for name in ("prefetch_thread", "backup_thread", "prefetch_io_aux_thread"):
++            thread = getattr(self, name, None)
++            if thread is None:
++                continue
++            threads.append(thread)
+             try:
+-                t.join(timeout=10)
+-            except Exception:
+-                pass
++                thread.join(timeout=max(0.0, deadline - time.monotonic()))
++            except RuntimeError:
++                pass  # Partially initialized controller; checked below.
+ 
+         alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+         if alive:
+@@ -641,6 +643,8 @@
+         )
+ 
+     def reset(self):
++        if self.enable_storage:
++            self._stop_storage_threads()
+         self.storage_stop_event.set()
+ 
+         self.write_queue.clear()
+@@ -1002,11 +1006,24 @@
+                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                 if operation is None:
+                     continue
+-                self._page_transfer(operation)
+-                # operation terminated by controller, release pre-allocated memory
+-                self.append_host_mem_release(
+-                    operation.host_indices[operation.completed_tokens :]
+-                )
++                try:
++                    self._page_transfer(operation)
++                except Exception:
++                    # A failed storage read must not kill the shared I/O worker or
++                    # leave wait_complete requests waiting forever. The transfer
++                    # has unwound: only its already-published prefix is usable;
++                    # hybrid callers still validate every component across TP.
++                    operation.mark_terminate()
++                    logger.warning(
++                        "HiCache prefetch I/O failed; terminating the operation.",
++                        exc_info=True,
++                    )
++                finally:
++                    # IO has unwound, including a failed Full or Mamba read.
++                    self.append_host_mem_release(
++                        operation.host_indices[operation.completed_tokens :]
++                    )
++                    operation.io_done.set()
+             except Empty:
+                 continue
+ 
+@@ -1061,7 +1078,12 @@
+                 if operation.is_terminated():
+                     hash_value, storage_hit_count = [], 0
+                 else:
+-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
++                    try:
++                        hash_value, storage_hit_count = self._storage_hit_query(operation)
++                    except Exception:
++                        # Every rank must still enter the hit-count collective.
++                        hash_value, storage_hit_count = [], 0
++                        logger.warning("HiCache storage lookup failed; recomputing.", exc_info=True)
+                 storage_hit_count_tensor = torch.tensor(
+                     storage_hit_count, dtype=torch.int
+                 )
+@@ -1072,7 +1094,11 @@
+ 
+                 if storage_hit_count < self.prefetch_threshold:
+                     # not to prefetch if not enough benefits
+-                    self.prefetch_revoke_queue.put(operation.request_id)
++                    self.prefetch_revoke_queue.put(
++                        operation
++                        if getattr(operation, "revoke_with_operation", False)
++                        else operation.request_id
++                    )
+                     logger.debug(
+                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                     )
+@@ -1219,9 +1245,14 @@
+                 if operation is None:
+                     continue
+ 
+-                if not self.backup_skip:
+-                    self._page_backup(operation)
+-                self.ack_backup_queue.put(operation)
++                try:
++                    if not self.backup_skip:
++                        self._page_backup(operation)
++                except Exception:
++                    logger.warning("HiCache storage backup failed; retaining host cache.", exc_info=True)
++                finally:
++                    # The writer has exited; release its host lock even on failure.
++                    self.ack_backup_queue.put(operation)
+ 
+             except Empty:
+                 continue
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+index 5764a9f600e0830d3a2947f9ae4b7f2d76d07954..e7a9648fe198bf4b996006a276ca3d9e0a4cf8b9 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+@@ -130,6 +130,7 @@
+         self.request_id = request_id
+         self._lock = threading.Lock()
+         self._terminated_flag = False
++        self.io_done = threading.Event()
+         self.storage_hit_count = 0
+         self.start_time = time.monotonic()
+         super().__init__(
+@@ -353,6 +354,22 @@
+                 release_queue, transfer.host_indices, entry.host_pool.page_size
+             )
+ 
++    def release_unsubmitted_prefetch(self, extra_pools: list[PoolTransfer]) -> None:
++        """Roll back scheduler-owned buffers before any reader is submitted.
++
++        Local allocation can fail asymmetrically across TP. These buffers must
++        not enter release queues whose lengths are reduced with MIN.
++        """
++        for transfer in extra_pools:
++            entry = self.mem_pool_host.entry_map.get(transfer.name)
++            if (
++                entry is not None
++                and not entry.is_primary_index_anchor
++                and transfer.indices_from_pool is None
++                and transfer.host_indices is not None
++            ):
++                entry.host_pool.free(transfer.host_indices)
++
+     def reset(self):
+         super().reset()
+         if self.enable_storage:
+@@ -570,6 +587,8 @@
+         last_hash: Optional[str] = None,
+         prefix_keys: Optional[List[str]] = None,
+         extra_pools: Optional[list[PoolTransfer]] = None,
++        *,
++        revoke_with_operation: bool = False,
+     ) -> PrefetchOperation:
+         operation = PrefetchOperation(
+             request_id,
+@@ -578,6 +597,7 @@
+             prefix_keys=prefix_keys,
+             pool_transfers=extra_pools,
+         )
++        operation.revoke_with_operation = revoke_with_operation
+         self.prefetch_queue.put(operation)
+         return operation
+ 
+@@ -727,8 +747,12 @@
+                 operation = self.backup_queue.get(block=True, timeout=1)
+                 if operation is None:
+                     continue
+-                self._page_backup(operation)
+-                self.ack_backup_queue.put(operation)
++                try:
++                    self._page_backup(operation)
++                except Exception:
++                    logger.warning("HiCache hybrid backup failed; retaining host cache.", exc_info=True)
++                finally:
++                    self.ack_backup_queue.put(operation)
+             except Empty:
+                 continue
+ 
+diff --git a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+index 0051f12411c1fbcbf45f4ac4c909c835ad916071..62e7438e229dd9e6f99200f83162d91c4320d8be 100644
+--- a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
++++ b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+@@ -419,6 +419,8 @@
+             # Use the backend tag and model name as a prefix to isolate tenants
+             # and models sharing one store.
+             self.config_prefix = None
++            self.weight_namespace = None
++            self.weight_epoch = 0
+             config_prefix_parts = []
+             if extra_config and extra_config.get("extra_backend_tag") is not None:
+                 config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
+@@ -712,10 +714,32 @@
+         for buf in self._iter_host_pool_buffers(host_pool):
+             super().register_buffer(buf)
+ 
++    def initialize_weight_namespace(self, incarnation: str) -> None:
++        """Start a fresh Unified cache owner; never reuse previous model state."""
++        if not incarnation or self.weight_namespace is not None:
++            raise RuntimeError("Mooncake cache namespace must be initialized once")
++        self._weight_incarnation = incarnation
++        self.weight_epoch = 0
++        self.weight_namespace = f"relax-v1-{incarnation}-w0"
++        logger.info(
++            "Mooncake L3 owner initialized namespace=%s config_prefix=%s tp_rank=%s",
++            self.weight_namespace, self.config_prefix, self.local_rank,
++        )
++
++    def advance_weight_namespace(self) -> None:
++        """Called only after all storage workers have stopped before mutation."""
++        if self.weight_namespace is None:
++            raise RuntimeError("Mooncake cache namespace is not initialized")
++        self.weight_epoch += 1
++        self.weight_namespace = f"relax-v1-{self._weight_incarnation}-w{self.weight_epoch}"
++
+     def _tag_keys(self, keys: List[str]) -> List[str]:
+-        if self.config_prefix is None:
++        prefix = self.config_prefix
++        if self.weight_namespace is not None:
++            prefix = f"{prefix}_{self.weight_namespace}" if prefix else self.weight_namespace
++        if prefix is None:
+             return keys
+-        return [f"{self.config_prefix}_{key}" for key in keys]
++        return [f"{prefix}_{key}" for key in keys]
+ 
+     def _can_use_group_semantics(self) -> bool:
+         return self._use_group_semantics
+@@ -1272,7 +1296,10 @@
+         pass
+ 
+     def clear(self) -> None:
+-        self.store.remove_all()
++        raise RuntimeError(
++            "Mooncake Store is shared; global clear is disabled. "
++            "Flush resets GPU/CPU state only; restart the engine to invalidate its L3 namespace."
++        )
+ 
+     def _put_batch_zero_copy_impl(
+         self,
+@@ -1307,10 +1334,16 @@
+         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+     ) -> List[int]:
+         if self._uses_multi_buffer(buffer_ptrs):
+-            return self.store.batch_get_into_multi_buffers(
++            results = self.store.batch_get_into_multi_buffers(
+                 key_strs, buffer_ptrs, buffer_sizes
+             )
+-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
++            expected_sizes = [sum(sizes) for sizes in buffer_sizes]
++        else:
++            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
++            expected_sizes = buffer_sizes
++        if len(results) != len(key_strs):
++            raise RuntimeError("Mooncake returned an incomplete zero-copy read result")
++        return [result if result == size else -1 for result, size in zip(results, expected_sizes)]
+ 
+     def _batch_exist(self, key_strs: List[str]) -> List[int]:
+         return self.store.batch_is_exist(key_strs)
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
 index ea54bac..f959bea 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
