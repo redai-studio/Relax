@@ -117,6 +117,11 @@ class InstallSession:
                 and old.get("installation_id") == installation_id
                 and old.get("engines") == identity
             ):
+                if checkpoint_record is not None:
+                    old["committed_checkpoint"] = checkpoint_record
+                    old["active_checkpoint"] = checkpoint_record
+                    old["artifact_id"] = manifest["artifact_id"]
+                    atomic_write(self.directory / "state.json", canonical(old))
                 return old
             if old.get("committed") and old.get("phase") != "ACTIVE" and old.get("target") != target:
                 raise ValueError("Committed installation must recover before changing target")

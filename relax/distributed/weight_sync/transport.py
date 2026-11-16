@@ -117,7 +117,7 @@ class SharedFSTransport:
     def object(self, key: str) -> bytes:
         path = self.source.object_path(key)
         if path.stat().st_size > MAX_CHUNK_BYTES:
-            raise ValueError("Object exceeds frame limit")
+            raise ContentError("Object exceeds frame limit")
         value = path.read_bytes()
         self._received(len(value))
         return value

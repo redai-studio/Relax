@@ -92,6 +92,7 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import SCORE_CENTERING_TRAIN_FIELDS
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
@@ -364,6 +365,21 @@ class _SFTPrepackedDeviceIterator:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def set_rollout_manager(self, rollout_manager: Any) -> None:
+        super().set_rollout_manager(rollout_manager)
+        config = ray.get(rollout_manager.get_lora_training_config.remote())
+        self._managed_lora_publication = config is not None
+        if config is not None:
+            if (
+                not self.args.fully_async
+                or self.args.hybrid
+                or self.args.colocate
+                or self.args.offload_rollout
+                or not is_lora_adapter_mode(self.args)
+            ):
+                raise ValueError("managed training publication requires fully-async adapter mode")
+            self.checkpoint_engine_client.backend.configure_lora_publication(config, rollout_manager)
+
     @property
     def _per_step_rollout(self) -> bool:
         """RL consumes weights every train step.
@@ -790,6 +806,7 @@ class MegatronTrainRayActor(TrainRayActor):
             and getattr(self, "_active_model_tag", None) == "actor"
             and set(self.weights_backuper.backup_tags) == {"actor"}
             and getattr(self.args, "sft_predict_interval", None) is None
+            and not getattr(self.args, "weight_version_config", None)
             and not any(
                 getattr(self.args, flag, False)
                 for flag in (
@@ -1408,7 +1425,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def _end_rollout_weight_update(self, rollout_id: int) -> None:
         """Release the rollout handshake even when no new policy was
         published."""
-        if getattr(self, "rollout_manager", None) is None or dist.get_rank(group=dist.group.WORLD) != 0:
+        if (
+            getattr(self, "_managed_lora_publication", False)
+            or getattr(self, "rollout_manager", None) is None
+            or dist.get_rank(group=dist.group.WORLD) != 0
+        ):
             return
         try:
             response = requests.get(
@@ -2325,6 +2346,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.sleep()
             if has_rollout:
                 self.update_weights()
+        elif getattr(self.args, "weight_version_config", None):
+            self.publish_weight_version()
         with timer("train_metrics_flush"):
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done)
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
@@ -2652,7 +2675,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.advantage_estimator == "score_centering":
-                    data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+                    data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
@@ -2856,7 +2879,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
         if self.args.advantage_estimator == "score_centering":
-            data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+            data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
         if not getattr(self.args, "true_on_policy_mode", False):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
@@ -3235,9 +3258,12 @@ class MegatronTrainRayActor(TrainRayActor):
             # Check rollout service
             try:
                 independent_publication = bool(getattr(self.args, "weight_version_config", None))
-                rollout_serve_url = None if independent_publication else get_serve_url("rollout")
+                managed_publication = getattr(self, "_managed_lora_publication", False)
+                rollout_serve_url = (
+                    None if independent_publication or managed_publication else get_serve_url("rollout")
+                )
                 retry_deadline = None
-                while not independent_publication:
+                while rollout_serve_url is not None:
                     request_timeout = self.args.rollout_http_timeout
                     if retry_deadline is not None:
                         request_timeout = retry_deadline - time.monotonic()
@@ -3375,15 +3401,30 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         print_memory("before update_weights")
 
+        managed = getattr(self, "_managed_lora_publication", False)
+        if managed:
+            from relax.engine.lora_versions.training import run_on_training_rank_zero
+
+            def acquire_topology_lease() -> None:
+                if not ray.get(self.rollout_manager.set_weight_updating.remote(True)):
+                    raise RuntimeError("the managed engine pool is being changed")
+
+            run_on_training_rank_zero(acquire_topology_lease, phase="LoRA topology lease")
+
         weight_sync_lock = getattr(self, "_weight_sync_lock", None)
-        if weight_sync_lock is not None and dist.get_rank() == 0:
-            acquired = False
-            while not acquired:
-                acquired = ray.get(weight_sync_lock.acquire.remote())
-                if not acquired:
+
+        def acquire_sync_lock() -> None:
+            if weight_sync_lock is not None:
+                while not ray.get(weight_sync_lock.acquire.remote()):
                     time.sleep(1)
 
+        lock_acquired = False
         try:
+            if managed:
+                run_on_training_rank_zero(acquire_sync_lock, phase="LoRA weight-sync lock")
+            elif dist.get_rank() == 0:
+                acquire_sync_lock()
+            lock_acquired = True
             # Every PP source must select recipients after rank 0 owns the sync lock.
             dist.barrier(group=get_gloo_group())
             if not rollout_only:
@@ -3402,7 +3443,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     # sync without stranding other ranks at their barrier.
                     logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
-            if weight_sync_lock is not None and dist.get_rank() == 0:
+            if managed:
+
+                def release_managed_locks() -> None:
+                    try:
+                        if lock_acquired and weight_sync_lock is not None:
+                            ray.get(weight_sync_lock.release.remote())
+                    finally:
+                        ray.get(self.rollout_manager.set_weight_updating.remote(False))
+
+                run_on_training_rank_zero(release_managed_locks, phase="LoRA weight-sync cleanup")
+            elif lock_acquired and weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())
 
     def _backup_published_actor(self) -> None:
@@ -3420,7 +3471,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         from .weight_update.version_integration import create_version_publisher
 
-        if self.args.offload_train:
+        self._flush_resident_sft_parameters()
+        reload_groups = self.args.offload_train and self._per_step_rollout
+        if reload_groups:
             reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
         try:
             with self._train_state_offloader.disable_during_update():
@@ -3434,7 +3487,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self._backup_published_actor()
             return asdict(published)
         finally:
-            if self.args.offload_train:
+            if reload_groups:
                 destroy_process_groups()
 
     def finalize_weight_publication(self) -> dict | None:

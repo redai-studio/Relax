@@ -81,7 +81,7 @@ def test_resolve_agentic_obs_config_paths(tmp_path):
 
 
 def test_resolve_agentic_obs_config_falls_back_when_run_id_is_missing(tmp_path):
-    # run_id is derived in slime_validate_args, never parsed, so it is only
+    # run_id is derived in relax_validate_args, never parsed, so it is only
     # absent when a caller builds a Namespace by hand. Must not crash a run.
     config = resolve_agentic_obs_config(Namespace(dump_agentic_obs=str(tmp_path)))
     assert config is not None

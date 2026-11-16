@@ -65,12 +65,16 @@ def test_busy_worker_receipt_preserves_identity_failures(monkeypatch, tmp_path, 
 @pytest.mark.parametrize("cache_enabled,flush_ok", [(True, True), (False, True), (True, False)])
 def test_version_flush_invalidates_visual_features(monkeypatch, tmp_path, cache_enabled, flush_ok):
     import torch
-    from sglang.srt.managers import mm_utils
+
+    try:
+        from sglang.srt.managers import mm_schedule as mm_cache
+    except ImportError:
+        from sglang.srt.managers import mm_utils as mm_cache
     from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 
     cache = MultiModalStaticCache(1024)
     assert cache.set(17, EmbeddingResult(embedding=torch.ones(8)))
-    monkeypatch.setattr(mm_utils, "embedding_cache", cache if cache_enabled else None)
+    monkeypatch.setattr(mm_cache, "embedding_cache", cache if cache_enabled else None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(distributed, "get_world_size", lambda group: 1)
     monkeypatch.setattr(distributed, "all_gather_object", lambda output, value, group: output.__setitem__(0, value))

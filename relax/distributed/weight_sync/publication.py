@@ -123,6 +123,7 @@ class VersionPublisher:
             manifest = self.store.manifest(self.stream, handle.version)
             if manifest["update_id"] != handle.update_id:
                 raise ValueError("Pending candidate conflicts with the committed update")
+            self.store.commit(manifest)
             record = {
                 "phase": "STORE_COMMITTED",
                 "attempt": self._attempt,

@@ -156,7 +156,9 @@ class VersionConsumer:
                         # write_checkpoint validates every byte in staging
                         # before its atomic rename. Do not immediately hash
                         # the same model a second time under this same lock.
-                        write_checkpoint(self.cache, stream, version, destination, config_source=self.config)
+                        write_checkpoint(
+                            self.cache, stream, version, destination, config_source=self.config, retention_owner=owner
+                        )
                     elif not verified:
                         # An existing but invalid destination must still fail;
                         # a path's existence is never proof of its contents.

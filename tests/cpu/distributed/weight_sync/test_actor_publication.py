@@ -5,7 +5,7 @@ import inspect
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -33,6 +33,62 @@ def actor_method(name, **globals_):
 
 
 class PublicationRoutingTests(unittest.TestCase):
+    def test_offline_training_publishes_after_each_optimizer_step(self):
+        events = []
+        args = SimpleNamespace(
+            loss_type="sft",
+            use_routing_replay=False,
+            use_rollout_routing_replay=False,
+            compute_advantages_and_returns=False,
+            ref_update_interval=None,
+            num_rollout=2,
+            save=None,
+            weight_version_config="publisher.json",
+            offload_train=False,
+        )
+        actor = SimpleNamespace(
+            args=args,
+            model=[],
+            optimizer=object(),
+            opt_param_scheduler=object(),
+            rollout_data_postprocess=None,
+            tokenizer=None,
+            prof=Mock(),
+            flops_counter=None,
+            _per_step_rollout=False,
+            _resident_sft_overlap_enabled=lambda: False,
+            _is_standard_dpo=lambda: False,
+            _backup_actor_weights_after_train=lambda: events.append("backup"),
+            publish_weight_version=lambda: events.append("publish"),
+            _run_step_evaluation=Mock(),
+            _wait_for_previous_eval=Mock(),
+        )
+
+        def gather(output, value, **kwargs):
+            output[0] = value
+
+        train_actor = actor_method(
+            "train_actor",
+            timer=lambda *a, **kw: nullcontext(),
+            inverse_timer=lambda *a: nullcontext(),
+            get_data_iterator=lambda *a: ([], [1]),
+            train=lambda *a: events.append("train"),
+            log_rollout_data=Mock(),
+            log_perf_data=Mock(),
+            train_dump_utils=Mock(),
+            tracking_utils=Mock(),
+            compute_rollout_step=lambda *a: 0,
+            evaluation_step_for_rollout=lambda *a: 0,
+            mpu=SimpleNamespace(
+                get_data_parallel_world_size=lambda **kw: 1, get_data_parallel_group=lambda **kw: None
+            ),
+            dist=SimpleNamespace(all_gather_object=gather, barrier=lambda **kw: None),
+            get_gloo_group=lambda: None,
+        )
+        for step in range(2):
+            train_actor(actor, step, {"total_lengths": [2], "loss_masks": [[1, 1]]})
+        self.assertEqual(events, ["train", "backup", "publish"] * 2)
+
     def test_initial_publication_protects_setup_and_releases_offload_context(self):
         @dataclass
         class Published:
@@ -72,6 +128,8 @@ class PublicationRoutingTests(unittest.TestCase):
                 module.create_version_publisher = create
                 actor = SimpleNamespace(
                     args=SimpleNamespace(offload_train=True, distributed_timeout_minutes=3),
+                    _per_step_rollout=True,
+                    _flush_resident_sft_parameters=Mock(),
                     _train_state_offloader=SimpleNamespace(disable_during_update=protected),
                     _backup_published_actor=lambda: events.append("backup"),
                 )

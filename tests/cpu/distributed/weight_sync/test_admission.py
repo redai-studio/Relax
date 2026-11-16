@@ -1,10 +1,32 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware
 
 
 class AdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_platform_inference_routes_obey_installation_drain(self):
+        for configured in ("/vertex_generate", "/predict/model"):
+            with patch.dict("os.environ", {"AIP_PREDICT_ROUTE": configured}):
+                gate = AdmissionGate()
+                called, output = [], []
+
+                async def application(scope, receive, send):
+                    called.append(scope["path"])
+
+                async def send(message):
+                    output.append(message)
+
+                middleware = AdmissionMiddleware(application, gate)
+                for route in ("/invocations", configured):
+                    await middleware({"type": "http", "path": route}, None, send)
+                    self.assertEqual(output[-2]["status"], 503)
+                self.assertEqual(called, [])
+                await gate.open()
+                await middleware({"type": "http", "path": configured}, None, send)
+                self.assertEqual(called, [configured])
+
     async def test_close_waits_for_stream_and_rejects_new_requests(self):
         gate = AdmissionGate()
         started, release = asyncio.Event(), asyncio.Event()

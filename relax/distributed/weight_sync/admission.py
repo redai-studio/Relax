@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 
 
@@ -91,6 +92,7 @@ class AdmissionMiddleware:
     def __init__(self, app, gate: AdmissionGate, fence=None, control=None) -> None:
         self.app, self.gate = app, gate
         self.fence, self.control = fence, control
+        self.vertex_route = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
@@ -139,9 +141,15 @@ class AdmissionMiddleware:
                 return await self.app(scope, receive, send)
             finally:
                 self.control.release()
-        inference = path in ("/generate", "/encode", "/classify", "/score", "/health_generate") or path.startswith(
-            ("/v1/", "/v2/", "/api/generate", "/api/chat", "/api/embed")
-        )
+        inference = path in (
+            "/generate",
+            "/encode",
+            "/classify",
+            "/score",
+            "/health_generate",
+            "/invocations",
+            self.vertex_route,
+        ) or path.startswith(("/v1/", "/v2/", "/api/generate", "/api/chat", "/api/embed"))
         if scope["type"] != "http" or not inference:
             return await self.app(scope, receive, send)
         if not await self.gate.enter():
