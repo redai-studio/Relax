@@ -41,7 +41,7 @@ datasets:
 YAML 混合数据自动启用按源训练指标，不需要额外参数。每个 optimizer step 上报：
 
 - `train/dataset/general/loss`：该源的监督 token NLL 总和除以有效监督 token 数。
-- `train/dataset/general/tokens`：实际参与主语言模型监督的 token 数。
+- `train/dataset/general/tokens`：当前 step 实际参与主语言模型监督的有效 token 数，全卡汇总，非累计值。
 - `train/dataset/general/samples`：进入该 step 的实际样本数，包含零监督 token 的样本，排除对齐用 dummy microbatch。
 - `train/dataset/general/token_fraction`、`sample_fraction`：过滤后，该源占当前 step 实际 token 数和样本数的比例。
 
@@ -49,7 +49,7 @@ YAML 混合数据自动启用按源训练指标，不需要额外参数。每个
 
 配比按完整逻辑 epoch 的样本配额生效，不保证逐 step 的固定比例；过滤和跳过样本也会影响实际训练配比，可结合各源 `samples`、`tokens` 观察。这些指标针对主语言模型训练 loss，不包含 MTP 辅助 loss，不改变已有 eval 指标；FSDP、序列分类、DPO/RM 和自定义 dataset 不在此分源统计范围内。续训时应保持 YAML 和数据快照不变。
 
-开启 `--use-clearml --use-metrics-service` 后，ClearML SDK 的 title 统一为 `train`：整体 loss 的 series 为 `loss`，分数据集 loss 的 series 为 `loss/<name>`。在任务列表的 Scalars 对比视图中展开 `train`，每个 series 对应一张独立图，图名包含数据集名称，与原有训练图并列。分源计数及占比保留在原始训练指标中，但不单独上报到 ClearML，避免额外图表或分类；CPT 复用同一映射。历史任务已写入的旧标题不会自动改名，新任务使用此布局。
+开启 `--use-clearml --use-metrics-service` 后，ClearML SDK 的 title 统一为 `train`：整体 loss 的 series 为 `loss`，分数据集 loss 的 series 为 `loss/<name>`，有效监督 token 数的 series 为 `tokens/<name>`，显示当前 step 的数量；该源没有有效监督 token 时也会上报 `0`。在任务列表的 Scalars 对比视图中展开 `train`，每个 series 对应一张独立图，图名包含数据集名称，与原有训练图并列。分源样本数及占比仍保留在原始训练指标中，不额外生成 ClearML 图表；CPT 复用同一映射。历史任务已写入的旧标题不会自动改名，新任务使用此布局。
 
 ## 数据准备
 
@@ -384,7 +384,11 @@ patch 按样本、按调用生效，绝不会修改 `tokenizer.chat_template`。
 
 除了 JSON 布尔值和 `null` 之外的值（例如 `"false"`）会触发 `ValueError`。如果疑似 Qwen 的模板包含重复、冲突或无法识别的 history gate，Relax 会触发 `RuntimeError`，而不是猜测如何 patch。可以通过 SFT 日志中的 `source=qwen_history_thinking (patched|native)` 和最终 `preserve_thinking` 值确认实际分支。
 
+较新的 Qwen3.8 模板用原生 `{% generation %}` 标签标记 assistant 轮次。SFT 渲染时 Relax 会去掉这些标签，token 和 loss mask 与早期 Qwen3.8 模板一致。
+
 ### 评估与 predict
+
+**SFT 的生成式评分（包括异步 judge）必须设置 `--sft-predict-interval N`，并配置 `--custom-rm-path` 或 `--rm-type`。** 异步设置只控制评分的执行方式，不会单独触发评测；`--eval-interval` 只控制参考答案的 loss/PPL 评估，不调用 reward 函数。
 
 PPL 评估由以下参数控制：
 
@@ -406,10 +410,35 @@ PPL 评估由以下参数控制：
 设置 `--sft-predict-interval` 后，Relax 会自动拉起 Rollout 角色，并把预测结果写到：
 
 ```text
-<save>/predict/predictions_step_<rollout_id>.jsonl
+<save>/predict/predictions_step_<train_step>.jsonl
 ```
 
 math 推理任务通常需要更长的 `--eval-max-response-len`；caption 或图像描述任务可以设短一些。
+
+没有配置 reward 时，predict 仍只保存原有的 `prompt`、`reference`、`completion` 三个字段。要为生成答案评分，在现有 SFT 启动参数中配置以下选项，并确保已设置 `--save`，以及 `--eval-size` 或 `--eval-prompt-data` 二选一的评测数据来源：
+
+```bash
+--sft-predict-interval 10
+--custom-rm-path your_module.reward_func
+--eval-reward-key score
+```
+
+也可以用 `--rm-type` 指定内置评分函数。Reward 会收到包含生成回答、token ID、参考答案 `label` 和来源 metadata 的 `Sample`，以及 `evaluation=True`。SFT 训练仍优化监督学习 loss；这些 reward 只用于评测指标。无需 eval YAML 或额外的 metadata 标记。目前 SFT 评分支持每题一个答案（`--n-samples-per-eval-prompt 1`）；自定义 group reward 收到的是每个 prompt 对应的单样本组。
+
+异步 judge 默认对符合条件的 scorer 开启。自定义函数通过以下声明接入；同步 `def` 仍可使用独立的 reward worker 池：
+
+```python
+def reward_func(args, sample, **kwargs):
+    assert kwargs["evaluation"]
+    return {"score": score_answer(sample.response, sample.label)}
+
+
+reward_func.supports_async_eval = True
+```
+
+该声明要求 scorer 只依赖传入的 `Sample` 和独立 CPU / judge 资源，返回真实分数，不依赖实时 policy 引擎或训练时会被 offload 的 GenRM 服务。内置 `remote_rm` 自动符合异步条件；未声明的其他 scorer 仍同步执行。传入 `--disable-eval-async-judge` 可强制同步评分。
+
+权重同步和答案生成仍会阻塞 SFT predict 周期，只有符合条件的评分在后台执行并与后续训练重叠；正常退出前会等待所有评分完成，并传播失败。评分指标记录为 `eval/sft_predict`，step 使用本次评测对应的已完成训练步数，同时保存到 `<save>/rollout_result/eval/<train_step>.jsonl`。设置 `--save-debug-rollout-data` 时也会保存已有的 eval debug dump。`--eval-interval` 继续控制独立的 loss/PPL 评估。
 
 ### 并行与资源
 

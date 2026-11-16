@@ -163,6 +163,71 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
     response.raise_for_status.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "draft_model_path", "draft_revision", "external_draft", "selector"),
+    [
+        ("NEXTN", None, None, None, "all"),
+        ("NEXTN", "/policy", None, None, "all"),
+        ("NEXTN", "/policy", "other-revision", None, None),
+        ("NEXTN", "/separate-draft", None, None, None),
+        ("NEXTN", None, None, "/policy", "all"),
+        ("NEXTN", None, None, "/separate-draft", None),
+        ("EAGLE", None, None, None, None),
+        (None, None, None, None, None),
+    ],
+)
+def test_distributed_update_selects_same_checkpoint_nextn_runners(
+    monkeypatch, sglang_engine_module, algorithm, draft_model_path, draft_revision, external_draft, selector
+):
+    module = sglang_engine_module
+    args = SimpleNamespace(
+        rollout_external=external_draft is not None,
+        sglang_router_ip=None,
+        sglang_router_port=None,
+        fully_async=True,
+        rollout_num_gpus_per_engine=1,
+        coordinator_url="http://dcs",
+    )
+    create_client = Mock()
+    monkeypatch.setattr(module, "create_client", create_client)
+    engine = module.SGLangEngine(args, rank=0)
+    server_args = {
+        "node_rank": 0,
+        "host": "127.0.0.1",
+        "port": 5000,
+        "model_path": "/policy",
+        "speculative_algorithm": algorithm,
+        "speculative_draft_model_path": draft_model_path,
+        "speculative_draft_model_revision": draft_revision,
+    }
+    monkeypatch.setattr(module, "_compute_server_args", Mock(return_value=(server_args, [])))
+    monkeypatch.setattr(engine, "_init_normal", Mock())
+    monkeypatch.setattr(engine, "get_pid_and_node_id", Mock(return_value={}), raising=False)
+    if external_draft is not None:
+        actual = {**server_args, "speculative_algorithm": "EAGLE", "speculative_draft_model_path": external_draft}
+        monkeypatch.setattr(module, "_wait_server_healthy", Mock())
+        monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=actual))))
+    engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1", skip_router_registration=True)
+    assert create_client.call_args.kwargs["metadata"]["sync_nextn_draft"] is (selector == "all")
+
+    request = Mock(return_value={"success": True})
+    monkeypatch.setattr(engine, "_make_request", request)
+    engine.update_weights_from_distributed(
+        ["mtp.layers.0.o_proj.weight_scale_inv"], ["torch.float32"], [[1, 1]], "rollout", weight_version="7"
+    )
+    payload = {
+        "names": ["mtp.layers.0.o_proj.weight_scale_inv"],
+        "dtypes": ["float32"],
+        "shapes": [[1, 1]],
+        "group_name": "rollout",
+        "flush_cache": False,
+        "weight_version": "7",
+    }
+    if selector is not None:
+        payload["selector"] = selector
+    request.assert_called_once_with("update_weights_from_distributed", payload)
+
+
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
     engine = object.__new__(sglang_engine_module.SGLangEngine)
     request = Mock(return_value={"success": True})
@@ -259,6 +324,46 @@ def test_expert_sync_rejects_inconsistent_scheduler_layouts(monkeypatch, expert_
 
     with pytest.raises(ValueError, match="schedulers disagree"):
         engine.get_expert_weight_sync_layout()
+
+
+@pytest.mark.parametrize(
+    ("supported", "offload", "global_backend", "overrides", "expected"),
+    [
+        (True, True, None, {}, "disabled"),
+        (True, False, None, {}, None),
+        (True, True, "breakable", {}, "breakable"),
+        (True, True, "disabled", {"cuda_graph_backend_prefill": "breakable"}, "breakable"),
+        (True, True, None, {"enable_memory_saver": False}, None),
+        (True, False, None, {"enable_memory_saver": True}, "disabled"),
+        (False, True, None, {}, None),
+    ],
+)
+def test_genrm_prefill_cuda_graph_respects_memory_saver_and_overrides(
+    monkeypatch, sglang_engine_module, supported, offload, global_backend, overrides, expected
+):
+    module = sglang_engine_module
+    fields = [("enable_memory_saver", bool, False)]
+    if supported:
+        fields.append(("cuda_graph_backend_prefill", str, None))
+    monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", fields))
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
+    args = SimpleNamespace(
+        genrm_num_gpus_per_engine=1,
+        num_gpus_per_node=8,
+        genrm_model_path="/test/genrm",
+        genrm_engine_config=overrides,
+        seed=42,
+        offload_rollout=offload,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_cuda_graph_backend_prefill=global_backend,
+    )
+
+    result, _ = module._compute_genrm_server_args(args, 0, "localhost:8000", 8001, "localhost", 8002, base_gpu_id=0)
+
+    assert result.get("cuda_graph_backend_prefill") == expected
+    if not supported:
+        assert "cuda_graph_backend_prefill" not in result
 
 
 @pytest.mark.parametrize(

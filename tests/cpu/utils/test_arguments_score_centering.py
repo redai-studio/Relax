@@ -17,6 +17,7 @@ def _sc_args(**overrides) -> SimpleNamespace:
         advantage_estimator="score_centering",
         loss_type="policy_loss",
         use_opd=False,
+        enable_weights_backuper=True,
         # The existing OPD coefficient defaults to 1 even when OPD is disabled.
         opd_kl_coef=1.0,
         rollout_temperature=1.0,
@@ -53,7 +54,7 @@ def test_sc_preserves_execution_modes_and_diagnostic_only_mismatch(arguments_mod
         custom_tis_function_path=None,
         resource={"actor": [0], "rollout": [0], "actor_fwd": [0]},
     )
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
     assert args.use_critic is False
 
 
@@ -81,12 +82,12 @@ def test_sc_preserves_execution_modes_and_diagnostic_only_mismatch(arguments_mod
 )
 def test_sc_rejects_incompatible_effective_config(arguments_module, overrides, match):
     with pytest.raises(ValueError, match=match):
-        arguments_module.slime_validate_args(_sc_args(**overrides))
+        arguments_module.relax_validate_args(_sc_args(**overrides))
 
 
 def test_sc_yaml_cannot_enable_opd_after_validation(arguments_module, tmp_path):
     args = _sc_args()
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
     config = tmp_path / "override.yaml"
     config.write_text("use_opd: true\nopd_loss_coef: 1.0\nopd_kl_coef: 0.0\n")
     args.custom_config_path = str(config)

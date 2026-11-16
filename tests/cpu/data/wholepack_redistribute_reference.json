@@ -1,0 +1,1219 @@
+{
+  "reference_sha256": "d47a8a5ef266565c451ecf8e60a94929f5849b52d68ae5df7aeec864d32f201b",
+  "cases": [
+    {
+      "name": "tp2_long_wave_count_change",
+      "source_seed": 0,
+      "kwargs": {
+        "capacity": 131072,
+        "tp_size": 2,
+        "global_batch_size": 8
+      },
+      "expected_assignment": [
+        [
+          [0, false],
+          [1, false]
+        ],
+        [
+          [2, false],
+          [3, false]
+        ],
+        [
+          [4, false],
+          [5, false]
+        ],
+        [
+          [6, false],
+          [7, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 1183109499198,
+          "Bmax": 464896,
+          "A": [1183109499198],
+          "B": [464896],
+          "long_waves": 2,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 874496,
+          "samples_min": 2,
+          "samples_max": 2
+        },
+        "candidate": {
+          "Amax": 1183109499198,
+          "Bmax": 464896,
+          "A": [1183109499198],
+          "B": [464896],
+          "long_waves": 2,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 874496,
+          "samples_min": 2,
+          "samples_max": 2
+        },
+        "fallback_reason": "long_wave_count_change"
+      },
+      "reference_accepts": [],
+      "lengths": [
+        [131071, 16384],
+        [131071, 256010],
+        [204955, 32768],
+        [65536, 32768]
+      ]
+    },
+    {
+      "name": "tp4_single_domain",
+      "source_seed": 1,
+      "kwargs": {
+        "capacity": 262144,
+        "tp_size": 4,
+        "global_batch_size": 8
+      },
+      "expected_assignment": [
+        [
+          [0, false],
+          [3, false],
+          [4, false],
+          [5, false]
+        ],
+        [
+          [1, false],
+          [6, false],
+          [2, false],
+          [7, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 3096772098168,
+          "Bmax": 1097728,
+          "A": [3096772098168],
+          "B": [1097728],
+          "long_waves": 1,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 1515520,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "candidate": {
+          "Amax": 2388720946868,
+          "Bmax": 876544,
+          "A": [2388720946868],
+          "B": [876544],
+          "long_waves": 1,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 1515520,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "fallback_reason": null
+      },
+      "reference_accepts": [],
+      "lengths": [
+        [323968, 259751, 235663, 247593],
+        [110077, 49210, 255778, 14863]
+      ]
+    },
+    {
+      "name": "tp4_long_wave_count_change",
+      "source_seed": 5,
+      "kwargs": {
+        "capacity": 262144,
+        "tp_size": 4,
+        "global_batch_size": 128
+      },
+      "expected_assignment": [
+        [
+          [0, false],
+          [1, false],
+          [2, false],
+          [3, false],
+          [4, false],
+          [5, false],
+          [6, false],
+          [7, false]
+        ],
+        [
+          [8, false],
+          [9, false],
+          [10, false],
+          [11, false],
+          [12, false],
+          [13, false],
+          [14, false],
+          [15, false]
+        ],
+        [
+          [16, false],
+          [17, false],
+          [18, false],
+          [19, false],
+          [20, false],
+          [21, false],
+          [22, false],
+          [23, false]
+        ],
+        [
+          [24, false],
+          [25, false],
+          [26, false],
+          [27, false],
+          [28, false],
+          [29, false],
+          [30, false],
+          [31, false]
+        ],
+        [
+          [32, false],
+          [33, false],
+          [34, false],
+          [35, false],
+          [36, false],
+          [37, false],
+          [38, false],
+          [39, false]
+        ],
+        [
+          [40, false],
+          [41, false],
+          [42, false],
+          [43, false],
+          [44, false],
+          [45, false],
+          [46, false],
+          [47, false]
+        ],
+        [
+          [48, false],
+          [49, false],
+          [50, false],
+          [51, false],
+          [52, false],
+          [53, false],
+          [54, false],
+          [55, false]
+        ],
+        [
+          [56, false],
+          [57, false],
+          [58, false],
+          [59, false],
+          [60, false],
+          [61, false],
+          [62, false],
+          [63, false]
+        ],
+        [
+          [64, false],
+          [65, false],
+          [66, false],
+          [67, false],
+          [68, false],
+          [69, false],
+          [70, false],
+          [71, false]
+        ],
+        [
+          [72, false],
+          [73, false],
+          [74, false],
+          [75, false],
+          [76, false],
+          [77, false],
+          [78, false],
+          [79, false]
+        ],
+        [
+          [80, false],
+          [81, false],
+          [82, false],
+          [83, false],
+          [84, false],
+          [85, false],
+          [86, false],
+          [87, false]
+        ],
+        [
+          [88, false],
+          [89, false],
+          [90, false],
+          [91, false],
+          [92, false],
+          [93, false],
+          [94, false],
+          [95, false]
+        ],
+        [
+          [96, false],
+          [97, false],
+          [98, false],
+          [99, false],
+          [100, false],
+          [101, false],
+          [102, false],
+          [103, false]
+        ],
+        [
+          [104, false],
+          [105, false],
+          [106, false],
+          [107, false],
+          [108, false],
+          [109, false],
+          [110, false],
+          [111, false]
+        ],
+        [
+          [112, false],
+          [113, false],
+          [114, false],
+          [115, false],
+          [116, false],
+          [117, false],
+          [118, false],
+          [119, false]
+        ],
+        [
+          [120, false],
+          [121, false],
+          [122, false],
+          [123, false],
+          [124, false],
+          [125, false],
+          [126, false],
+          [127, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 4576860312158,
+          "Bmax": 1748992,
+          "A": [
+            2643154283368, 2139425553572, 4340382316272, 3139293370560, 4249009938046,
+            3412026243684, 4576860312158, 3762301276396
+          ],
+          "B": [1323008, 1163264, 1601536, 1425408, 1593344, 1474560, 1748992, 1597440],
+          "long_waves": 6,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 18206720,
+          "samples_min": 8,
+          "samples_max": 8
+        },
+        "candidate": {
+          "Amax": 4576860312158,
+          "Bmax": 1748992,
+          "A": [
+            2643154283368, 2139425553572, 4340382316272, 3139293370560, 4249009938046,
+            3412026243684, 4576860312158, 3762301276396
+          ],
+          "B": [1323008, 1163264, 1601536, 1425408, 1593344, 1474560, 1748992, 1597440],
+          "long_waves": 6,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 18206720,
+          "samples_min": 8,
+          "samples_max": 8
+        },
+        "fallback_reason": "long_wave_count_change"
+      },
+      "reference_accepts": [],
+      "lengths": [
+        [187976, 15208, 244121, 130576, 27187, 82236, 59353, 194927],
+        [129276, 199627, 53464, 130722, 6876, 113629, 213989, 146530],
+        [83679, 37713, 72755, 233223, 66427, 69333, 264930, 109816],
+        [86957, 87286, 151680, 164444, 104276, 107364, 95247, 103222],
+        [200920, 156652, 11310, 189368, 217531, 87009, 76390, 138314],
+        [1774, 177156, 34615, 162508, 422610, 252049, 165567, 96875],
+        [92338, 29885, 134314, 11989, 187509, 211967, 9473, 219587],
+        [286643, 94854, 103034, 62402, 129021, 242329, 180556, 186014],
+        [131541, 242667, 56651, 192570, 155118, 19206, 227005, 47805],
+        [77698, 178237, 144534, 48273, 163814, 422666, 93050, 40998],
+        [162165, 253648, 84688, 25456, 42446, 212803, 16687, 124433],
+        [180268, 131182, 238900, 221123, 76352, 29207, 17156, 258770],
+        [68458, 69614, 216963, 350655, 227833, 195559, 78248, 30813],
+        [154567, 74031, 237584, 88757, 237786, 255936, 166568, 251157],
+        [211702, 76812, 59015, 197657, 94056, 261789, 177461, 308878],
+        [189440, 33088, 186489, 17993, 160275, 190543, 147248, 254639]
+      ]
+    },
+    {
+      "name": "tp4_square_only",
+      "source_seed": 7,
+      "kwargs": {
+        "capacity": 262144,
+        "tp_size": 4,
+        "global_batch_size": 32
+      },
+      "expected_assignment": [
+        [
+          [0, false],
+          [1, false],
+          [2, false],
+          [3, false]
+        ],
+        [
+          [4, false],
+          [5, false],
+          [6, false],
+          [7, false]
+        ],
+        [
+          [8, false],
+          [9, false],
+          [10, false],
+          [11, false]
+        ],
+        [
+          [12, false],
+          [13, false],
+          [14, false],
+          [15, false]
+        ],
+        [
+          [16, false],
+          [17, false],
+          [18, false],
+          [19, false]
+        ],
+        [
+          [20, false],
+          [21, false],
+          [22, false],
+          [23, false]
+        ],
+        [
+          [24, false],
+          [25, false],
+          [26, false],
+          [27, false]
+        ],
+        [
+          [28, false],
+          [29, false],
+          [30, false],
+          [31, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 3026122438942,
+          "Bmax": 1028096,
+          "A": [2003747045488, 1253850894518, 2753240198962, 3026122438942],
+          "B": [794624, 679936, 905216, 1028096],
+          "long_waves": 2,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 4947968,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "candidate": {
+          "Amax": 3026122438942,
+          "Bmax": 1028096,
+          "A": [2003747045488, 1253850894518, 2753240198962, 3026122438942],
+          "B": [794624, 679936, 905216, 1028096],
+          "long_waves": 2,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 4947968,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "fallback_reason": "long_wave_count_change"
+      },
+      "reference_accepts": [
+        {
+          "a": 4,
+          "b": 7,
+          "square_only": true
+        }
+      ],
+      "lengths": [
+        [207002, 300122, 49352, 191727],
+        [112564, 19659, 45062, 227356],
+        [126177, 47560, 222571, 30991],
+        [64908, 117042, 32434, 207975],
+        [24423, 413983, 219750, 75632],
+        [161734, 94753, 54031, 98499],
+        [370126, 260265, 224182, 164704],
+        [237600, 189574, 157165, 130248]
+      ]
+    },
+    {
+      "name": "tp2_multiple_accepts",
+      "source_seed": 10,
+      "kwargs": {
+        "capacity": 131072,
+        "tp_size": 2,
+        "global_batch_size": 32
+      },
+      "expected_assignment": [
+        [
+          [31, false],
+          [17, false],
+          [14, false],
+          [18, false]
+        ],
+        [
+          [0, false],
+          [22, false],
+          [10, false],
+          [26, false]
+        ],
+        [
+          [1, false],
+          [29, false],
+          [28, false],
+          [24, false]
+        ],
+        [
+          [30, false],
+          [12, false],
+          [20, false],
+          [3, false]
+        ],
+        [
+          [13, false],
+          [23, false],
+          [7, false],
+          [2, false]
+        ],
+        [
+          [21, false],
+          [11, false],
+          [15, false],
+          [6, false]
+        ],
+        [
+          [19, false],
+          [8, false],
+          [27, false],
+          [9, false]
+        ],
+        [
+          [4, false],
+          [16, false],
+          [5, false],
+          [25, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 952396558536,
+          "Bmax": 542720,
+          "A": [952396558536, 492312131860],
+          "B": [542720, 436224],
+          "long_waves": 1,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 2543616,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "candidate": {
+          "Amax": 811916495056,
+          "Bmax": 460800,
+          "A": [366322164186, 811916495056],
+          "B": [366592, 460800],
+          "long_waves": 1,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 2543616,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "fallback_reason": null
+      },
+      "reference_accepts": [
+        {
+          "a": 0,
+          "b": 4,
+          "square_only": false
+        },
+        {
+          "a": 0,
+          "b": 6,
+          "square_only": false
+        },
+        {
+          "a": 1,
+          "b": 7,
+          "square_only": false
+        },
+        {
+          "a": 3,
+          "b": 6,
+          "square_only": false
+        }
+      ],
+      "lengths": [
+        [112431, 126501, 3889, 54028],
+        [128791, 72751, 42004, 9019],
+        [85924, 19947, 65536, 94676],
+        [93083, 241504, 74349, 68766],
+        [79458, 95051, 34860, 119782],
+        [62753, 115252, 98368, 11603],
+        [61776, 35121, 51106, 79394],
+        [62963, 82409, 118129, 114303]
+      ]
+    },
+    {
+      "name": "tp4_multiple_accepts",
+      "source_seed": 11,
+      "kwargs": {
+        "capacity": 262144,
+        "tp_size": 4,
+        "global_batch_size": 128
+      },
+      "expected_assignment": [
+        [
+          [0, false],
+          [1, false],
+          [2, false],
+          [3, false],
+          [4, false],
+          [5, false],
+          [6, false],
+          [7, false]
+        ],
+        [
+          [8, false],
+          [9, false],
+          [10, false],
+          [11, false],
+          [12, false],
+          [13, false],
+          [14, false],
+          [15, false]
+        ],
+        [
+          [16, false],
+          [17, false],
+          [18, false],
+          [19, false],
+          [20, false],
+          [21, false],
+          [22, false],
+          [23, false]
+        ],
+        [
+          [24, false],
+          [25, false],
+          [26, false],
+          [27, false],
+          [28, false],
+          [29, false],
+          [30, false],
+          [31, false]
+        ],
+        [
+          [32, false],
+          [33, false],
+          [34, false],
+          [35, false],
+          [36, false],
+          [37, false],
+          [38, false],
+          [39, false]
+        ],
+        [
+          [40, false],
+          [41, false],
+          [42, false],
+          [43, false],
+          [44, false],
+          [45, false],
+          [46, false],
+          [47, false]
+        ],
+        [
+          [48, false],
+          [49, false],
+          [50, false],
+          [51, false],
+          [52, false],
+          [53, false],
+          [54, false],
+          [55, false]
+        ],
+        [
+          [56, false],
+          [57, false],
+          [58, false],
+          [59, false],
+          [60, false],
+          [61, false],
+          [62, false],
+          [63, false]
+        ],
+        [
+          [64, false],
+          [65, false],
+          [66, false],
+          [67, false],
+          [68, false],
+          [69, false],
+          [70, false],
+          [71, false]
+        ],
+        [
+          [72, false],
+          [73, false],
+          [74, false],
+          [75, false],
+          [76, false],
+          [77, false],
+          [78, false],
+          [79, false]
+        ],
+        [
+          [80, false],
+          [81, false],
+          [82, false],
+          [83, false],
+          [84, false],
+          [85, false],
+          [86, false],
+          [87, false]
+        ],
+        [
+          [88, false],
+          [89, false],
+          [90, false],
+          [91, false],
+          [92, false],
+          [93, false],
+          [94, false],
+          [95, false]
+        ],
+        [
+          [96, false],
+          [97, false],
+          [98, false],
+          [99, false],
+          [100, false],
+          [101, false],
+          [102, false],
+          [103, false]
+        ],
+        [
+          [104, false],
+          [105, false],
+          [106, false],
+          [107, false],
+          [108, false],
+          [109, false],
+          [110, false],
+          [111, false]
+        ],
+        [
+          [112, false],
+          [113, false],
+          [114, false],
+          [115, false],
+          [116, false],
+          [117, false],
+          [118, false],
+          [119, false]
+        ],
+        [
+          [120, false],
+          [121, false],
+          [122, false],
+          [123, false],
+          [124, false],
+          [125, false],
+          [126, false],
+          [127, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 5437681028136,
+          "Bmax": 1835008,
+          "A": [
+            4964223473038, 5437681028136, 4167220556898, 4569395715828, 4951301313926,
+            4257617388864, 3158461776942, 4324346584902
+          ],
+          "B": [1585152, 1835008, 1564672, 1695744, 1679360, 1708032, 1323008, 1409024],
+          "long_waves": 6,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 18415616,
+          "samples_min": 8,
+          "samples_max": 8
+        },
+        "candidate": {
+          "Amax": 5437681028136,
+          "Bmax": 1835008,
+          "A": [
+            4964223473038, 5437681028136, 4167220556898, 4569395715828, 4951301313926,
+            4257617388864, 3158461776942, 4324346584902
+          ],
+          "B": [1585152, 1835008, 1564672, 1695744, 1679360, 1708032, 1323008, 1409024],
+          "long_waves": 6,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 18415616,
+          "samples_min": 8,
+          "samples_max": 8
+        },
+        "fallback_reason": "long_wave_count_change"
+      },
+      "reference_accepts": [
+        {
+          "a": 10,
+          "b": 12,
+          "square_only": true
+        },
+        {
+          "a": 12,
+          "b": 14,
+          "square_only": true
+        },
+        {
+          "a": 12,
+          "b": 15,
+          "square_only": true
+        }
+      ],
+      "lengths": [
+        [244135, 236891, 99564, 96816, 249437, 97609, 49348, 234144],
+        [21958, 499644, 82573, 7865, 33117, 31222, 18693, 99724],
+        [15772, 243236, 171072, 230966, 102405, 122498, 154221, 262026],
+        [239773, 475414, 43623, 133167, 165297, 120412, 151541, 15599],
+        [209925, 414661, 202645, 35037, 8856, 286, 111937, 109953],
+        [27433, 246409, 196851, 208365, 220092, 38294, 104066, 141441],
+        [174371, 7943, 214985, 61862, 391323, 52978, 5744, 31402],
+        [255236, 93155, 98769, 234580, 99974, 68665, 219798, 201197],
+        [111603, 247, 141451, 159460, 10293, 110473, 468858, 52604],
+        [111801, 231496, 267165, 172468, 155360, 202465, 38482, 38945],
+        [8132, 193292, 194880, 328845, 253611, 71166, 202427, 95855],
+        [162955, 119739, 130810, 99511, 83087, 103070, 203534, 252978],
+        [220965, 24853, 54442, 57173, 20289, 133788, 124995, 205317],
+        [153845, 91978, 36059, 66271, 119746, 251292, 38871, 373503],
+        [106944, 8690, 36257, 141136, 215707, 233679, 130582, 31697],
+        [193350, 68986, 48336, 189869, 498255, 173521, 73583, 18393]
+      ]
+    },
+    {
+      "name": "tp2_square_only",
+      "source_seed": 14,
+      "kwargs": {
+        "capacity": 131072,
+        "tp_size": 2,
+        "global_batch_size": 128
+      },
+      "expected_assignment": [
+        [
+          [0, false],
+          [1, false],
+          [2, false],
+          [3, false],
+          [4, false],
+          [5, false],
+          [6, false],
+          [7, false]
+        ],
+        [
+          [8, false],
+          [9, false],
+          [10, false],
+          [11, false],
+          [12, false],
+          [13, false],
+          [14, false],
+          [15, false]
+        ],
+        [
+          [16, false],
+          [17, false],
+          [18, false],
+          [19, false],
+          [20, false],
+          [21, false],
+          [22, false],
+          [23, false]
+        ],
+        [
+          [24, false],
+          [25, false],
+          [26, false],
+          [27, false],
+          [28, false],
+          [29, false],
+          [30, false],
+          [31, false]
+        ],
+        [
+          [32, false],
+          [33, false],
+          [34, false],
+          [35, false],
+          [36, false],
+          [37, false],
+          [38, false],
+          [39, false]
+        ],
+        [
+          [40, false],
+          [41, false],
+          [42, false],
+          [43, false],
+          [44, false],
+          [45, false],
+          [46, false],
+          [47, false]
+        ],
+        [
+          [48, false],
+          [49, false],
+          [50, false],
+          [51, false],
+          [52, false],
+          [53, false],
+          [54, false],
+          [55, false]
+        ],
+        [
+          [56, false],
+          [57, false],
+          [58, false],
+          [59, false],
+          [60, false],
+          [61, false],
+          [62, false],
+          [63, false]
+        ],
+        [
+          [64, false],
+          [65, false],
+          [66, false],
+          [67, false],
+          [68, false],
+          [69, false],
+          [70, false],
+          [71, false]
+        ],
+        [
+          [72, false],
+          [73, false],
+          [74, false],
+          [75, false],
+          [76, false],
+          [77, false],
+          [78, false],
+          [79, false]
+        ],
+        [
+          [80, false],
+          [81, false],
+          [82, false],
+          [83, false],
+          [84, false],
+          [85, false],
+          [86, false],
+          [87, false]
+        ],
+        [
+          [88, false],
+          [89, false],
+          [90, false],
+          [91, false],
+          [92, false],
+          [93, false],
+          [94, false],
+          [95, false]
+        ],
+        [
+          [96, false],
+          [97, false],
+          [98, false],
+          [99, false],
+          [100, false],
+          [101, false],
+          [102, false],
+          [103, false]
+        ],
+        [
+          [104, false],
+          [105, false],
+          [106, false],
+          [107, false],
+          [108, false],
+          [109, false],
+          [110, false],
+          [111, false]
+        ],
+        [
+          [112, false],
+          [113, false],
+          [114, false],
+          [115, false],
+          [116, false],
+          [117, false],
+          [118, false],
+          [119, false]
+        ],
+        [
+          [120, false],
+          [121, false],
+          [122, false],
+          [123, false],
+          [124, false],
+          [125, false],
+          [126, false],
+          [127, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 2102386983380,
+          "Bmax": 1163264,
+          "A": [1623257305254, 1405667136654, 990402480062, 2102386983380],
+          "B": [1044480, 1036288, 862208, 1163264],
+          "long_waves": 4,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 9684992,
+          "samples_min": 8,
+          "samples_max": 8
+        },
+        "candidate": {
+          "Amax": 2102386983380,
+          "Bmax": 1163264,
+          "A": [1623257305254, 1405667136654, 990402480062, 2102386983380],
+          "B": [1044480, 1036288, 862208, 1163264],
+          "long_waves": 4,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 9684992,
+          "samples_min": 8,
+          "samples_max": 8
+        },
+        "fallback_reason": "long_wave_count_change"
+      },
+      "reference_accepts": [
+        {
+          "a": 6,
+          "b": 8,
+          "square_only": true
+        },
+        {
+          "a": 10,
+          "b": 12,
+          "square_only": true
+        }
+      ],
+      "lengths": [
+        [71072, 67051, 76289, 248970, 79427, 122322, 103986, 103235],
+        [31038, 69080, 58528, 82748, 93857, 68263, 94548, 39244],
+        [43241, 2781, 18334, 32251, 138357, 21813, 71842, 53588],
+        [100108, 105822, 114989, 24745, 29238, 95488, 47500, 24818],
+        [127567, 50814, 70997, 118647, 57197, 127072, 73748, 66748],
+        [73042, 162079, 7340, 42393, 107969, 29852, 24376, 111461],
+        [44138, 101369, 119320, 81141, 127107, 120541, 114569, 109496],
+        [24866, 67209, 124393, 103306, 61936, 117765, 128204, 17420],
+        [128203, 69937, 115712, 5009, 106349, 110916, 5452, 91093],
+        [96457, 123482, 69086, 93219, 79243, 49470, 11219, 123014],
+        [24999, 101685, 25646, 9118, 50434, 81907, 6603, 96],
+        [74078, 93920, 65939, 29832, 9212, 38326, 52177, 467],
+        [47816, 65170, 54488, 87038, 227734, 8266, 41484, 51729],
+        [64192, 101725, 82431, 127917, 8272, 64831, 253998, 88981],
+        [34053, 145375, 36869, 55460, 67821, 127672, 117278, 32946],
+        [99748, 13315, 27884, 67314, 96627, 111413, 109761, 33783]
+      ]
+    },
+    {
+      "name": "tp4_square_only_without_fallback",
+      "source_seed": 0,
+      "reference_commit": "a3a0983",
+      "reference_source_sha256": "b5676767d66d2a0db3030361da60f92a75706c0255d9cc7d691062d2cd2dfeef",
+      "kwargs": {
+        "capacity": 262144,
+        "tp_size": 4,
+        "global_batch_size": 64
+      },
+      "lengths": [
+        [102400, 110592, 12288, 69632],
+        [131072, 106496, 81920, 126976],
+        [94208, 57344, 36864, 77824],
+        [36864, 28672, 69632, 40960],
+        [81920, 28672, 20480, 90112],
+        [126976, 28672, 94208, 114688],
+        [86016, 57344, 126976, 118784],
+        [69632, 16384, 4096, 24576],
+        [106496, 4096, 131072, 90112],
+        [65536, 86016, 20480, 53248],
+        [61440, 65536, 40960, 118784],
+        [24576, 24576, 86016, 131072],
+        [28672, 81920, 77824, 32768],
+        [90112, 57344, 77824, 118784],
+        [24576, 102400, 86016, 65536],
+        [77824, 49152, 53248, 49152]
+      ],
+      "expected_assignment": [
+        [
+          [7, false],
+          [49, false],
+          [15, false],
+          [48, false]
+        ],
+        [
+          [34, false],
+          [60, false],
+          [10, false],
+          [17, false]
+        ],
+        [
+          [4, false],
+          [54, false],
+          [42, false],
+          [45, false]
+        ],
+        [
+          [47, false],
+          [3, false],
+          [62, false],
+          [33, false]
+        ],
+        [
+          [20, false],
+          [11, false],
+          [61, false],
+          [38, false]
+        ],
+        [
+          [26, false],
+          [50, false],
+          [63, false],
+          [29, false]
+        ],
+        [
+          [55, false],
+          [16, false],
+          [53, false],
+          [18, false]
+        ],
+        [
+          [43, false],
+          [6, false],
+          [25, false],
+          [56, false]
+        ],
+        [
+          [27, false],
+          [58, false],
+          [39, false],
+          [30, false]
+        ],
+        [
+          [23, false],
+          [46, false],
+          [9, false],
+          [31, false]
+        ],
+        [
+          [57, false],
+          [35, false],
+          [36, false],
+          [51, false]
+        ],
+        [
+          [5, false],
+          [52, false],
+          [59, false],
+          [2, false]
+        ],
+        [
+          [32, false],
+          [24, false],
+          [41, false],
+          [13, false]
+        ],
+        [
+          [1, false],
+          [37, false],
+          [40, false],
+          [21, false]
+        ],
+        [
+          [0, false],
+          [19, false],
+          [28, false],
+          [44, false]
+        ],
+        [
+          [8, false],
+          [22, false],
+          [14, false],
+          [12, false]
+        ]
+      ],
+      "expected_evidence": {
+        "original": {
+          "Amax": 522442506240,
+          "Bmax": 450560,
+          "A": [
+            522442506240, 230686720000, 389734727680, 409196298240, 440401920000, 326484623360,
+            349972725760, 282360545280
+          ],
+          "B": [450560, 299008, 364544, 389120, 413696, 344064, 368640, 331776],
+          "long_waves": 0,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 4456448,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "candidate": {
+          "Amax": 266757734400,
+          "Bmax": 303104,
+          "A": [
+            263905607680, 266757734400, 250148290560, 247128391680, 254007050240, 248302796800,
+            247463936000, 255684771840
+          ],
+          "B": [282624, 286720, 274432, 282624, 286720, 294912, 290816, 303104],
+          "long_waves": 0,
+          "dummy_tokens": 0,
+          "dummy_count": 0,
+          "total_padded_tokens": 4456448,
+          "samples_min": 4,
+          "samples_max": 4
+        },
+        "fallback_reason": null
+      },
+      "reference_accepts": [
+        {
+          "a": 0,
+          "b": 2,
+          "square_only": false
+        },
+        {
+          "a": 0,
+          "b": 3,
+          "square_only": true
+        },
+        {
+          "a": 6,
+          "b": 8,
+          "square_only": true
+        },
+        {
+          "a": 10,
+          "b": 13,
+          "square_only": true
+        },
+        {
+          "a": 10,
+          "b": 14,
+          "square_only": true
+        }
+      ]
+    }
+  ]
+}

@@ -39,7 +39,7 @@ from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enab
 from relax.utils import tracking_utils
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
-from relax.utils.data.stream_dataloader import StreamingTQIterator
+from relax.utils.data.stream_dataloader import MicroBatchListIterator, StreamingTQIterator
 from relax.utils.device import device_module
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -48,6 +48,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
+from relax.utils.straggler import note_microbatch_tokens, straggler_timers
 from relax.utils.timer import timer
 from relax.utils.training.nonfinite_grad import (
     NonFiniteGradientNormError,
@@ -605,13 +606,17 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    config.timers = None
+    config.timers = straggler_timers("train")
     _validate_vit_lr_trainable_params(args, model)
 
     if args.optimizer_cpu_offload:
-        from .compat import patch_hdo_group_steps
+        from .compat import patch_hdo_gpu_gradient_stream, patch_hdo_group_steps, patch_hdo_native_fp32_gradients
 
         patch_hdo_group_steps()
+        if patch_hdo_gpu_gradient_stream():
+            logger.info("Enabled HDO GPU gradient stream dependency.")
+        if patch_hdo_native_fp32_gradients():
+            logger.info("Enabled HDO native FP32 GPU gradients.")
 
     optimizer = get_megatron_optimizer(
         config=config,
@@ -1116,8 +1121,7 @@ def forward_only(
         custom_before_log_prob_hook(args, model, store_prefix)
 
     forward_backward_func = get_forward_backward_func()
-    # Don't care about timing during evaluation
-    config.timers = None
+    config.timers = straggler_timers("forward_only", model, num_microbatches)
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
@@ -1224,6 +1228,42 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
     return bool(signal.item())
 
 
+def _prepare_mtp_training_window(
+    args: Namespace,
+    data_iterator: Sequence[DataIterator | Iterator],
+    num_microbatches: int,
+    model: Sequence[DDP],
+) -> tuple[Sequence[DataIterator | Iterator], int]:
+    """Collect one streaming window so native MTP scaling sees its true
+    size."""
+    if not (
+        getattr(args, "enable_mtp_training", False)
+        and not getattr(args, "calculate_per_token_loss", False)
+        and isinstance(data_iterator[0], StreamingTQIterator)
+    ):
+        return data_iterator, num_microbatches
+
+    config = get_model_config(model[0])
+    if getattr(config, "fine_grained_activation_offloading", False):
+        # Preserve the streaming restriction before switching to a fixed list.
+        raise ValueError(
+            "Streaming schedules do not support fine-grained activation offloading with variable microbatch counts. "
+            "Disable --fine-grained-activation-offloading or --use-dynamic-batch-size."
+        )
+
+    # Keep the original stream for rollout logging and wait metrics. Its
+    # aligned dummy batches must retain their original positions and masks.
+    stream = data_iterator[0]
+    microbatches = list(stream)
+    num_microbatches = len(microbatches)
+    if num_microbatches == 0:
+        raise RuntimeError("Cannot train MTP on an empty streaming window.")
+    # The native schedule divides both losses by this count. Compensate only
+    # the explicit main-loss scale so PG keeps its sample weighting while
+    # MTP gets its microbatch mean.
+    return [MicroBatchListIterator(microbatches, loss_scale=stream.loss_scale * num_microbatches)], num_microbatches
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -1289,6 +1329,10 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    # Fetch only after optimizer-state offload and gradient cleanup, before
+    # the native schedule needs the fixed accumulation count.
+    data_iterator, num_microbatches = _prepare_mtp_training_window(args, data_iterator, num_microbatches, model)
+
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()
 
@@ -1339,6 +1383,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "rollout_topk_token_ids",
                     "rollout_topk_log_probs",
+                    "rollout_topk_support_complete",
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
@@ -1350,6 +1395,7 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        note_microbatch_tokens(batch.get("total_lengths"))
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1364,7 +1410,7 @@ def train_one_step(
             # build_schedule_plan path doesn't go through model() so the
             # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
             # chunked-logits incompatibility is enforced as a hard assert in
-            # arguments.py.slime_validate_args, so bypass mode is guaranteed
+            # arguments.py.relax_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
             if use_indexer_replay:
                 with IndexerReplay.forward_stage():
@@ -1417,6 +1463,14 @@ def train_one_step(
             mm_inputs = batch.get("multimodal_train_inputs")
             if is_vl_model and mm_inputs:
                 forward_kwargs.update(mm_inputs)
+
+            # Score Centering upcasts response blocks internally.
+            if (
+                getattr(args, "loss_type", None) == "policy_loss"
+                and getattr(args, "advantage_estimator", None) == "score_centering"
+                and (args.bf16 or args.fp16)
+            ):
+                forward_kwargs["fp32_output"] = False
 
             _attach_mtp_forward_kwargs(args, batch, forward_kwargs)
 
@@ -1525,6 +1579,9 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
+    timers = straggler_timers("train", model, num_microbatches)
+    if timers is not None:
+        get_model_config(model[0]).timers = timers
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
@@ -1854,6 +1911,7 @@ def train(
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
+        step_num_microbatches = num_microbatches[step_id]
         from relax.utils.agentic_obs.train_hooks import observe_train_step
 
         # Cover all micro-batches, the optimizer, and post-step parameter gather.
@@ -1870,9 +1928,15 @@ def train(
                     model,
                     optimizer,
                     opt_param_scheduler,
-                    num_microbatches[step_id],
+                    step_num_microbatches,
                     global_batch_sizes[step_id],
                 )
+                if (
+                    args.enable_mtp_training
+                    and not args.calculate_per_token_loss
+                    and isinstance(step_data_iterator[0], StreamingTQIterator)
+                ):
+                    step_num_microbatches = step_data_iterator[0].mb_count
             if keep_forward_pre_hook_disabled:
                 force_param_sync(model)
 
@@ -1903,7 +1967,7 @@ def train(
                     group=mpu.get_data_parallel_group(with_context_parallel=True),
                     op=torch.distributed.ReduceOp.AVG,
                 )
-                mtp_legacy_per_depth = (legacy_raw_ce / num_microbatches[step_id]).tolist()
+                mtp_legacy_per_depth = (legacy_raw_ce / step_num_microbatches).tolist()
             # mcore >= 0.19 renamed the tracker payload: the per-microbatch
             # accumulator is now "loss_sums" (plus "num_tokens" in per-token mode)
             # instead of "values", and the cross-rank reduction moved into
@@ -1914,7 +1978,7 @@ def train(
             mtp_losses = None
             reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
             mtp_loss_scale, raw_ce_scale = _mtp_metric_scales(
-                args, num_microbatches[step_id], token_tracker=reduce_in_tracker is not None
+                args, step_num_microbatches, token_tracker=reduce_in_tracker is not None
             )
             if reduce_in_tracker is not None:
                 reduce_in_tracker()
@@ -2079,6 +2143,11 @@ def save(
         args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    # Checkpoint planning can initialize NCCL communicators outside PyTorch's
+    # allocator. Return unused training cache before those CUDA allocations.
+    memory_before = available_memory()
+    clear_memory()
+    logger.info("Checkpoint cache release: before=%s after=%s", memory_before, available_memory())
     save_checkpoint(
         iteration,
         model,

@@ -8,6 +8,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, contextmanager
+from itertools import groupby
 from time import monotonic
 from typing import Any
 
@@ -23,6 +24,7 @@ from tqdm import tqdm
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
+from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
@@ -513,6 +515,7 @@ async def generate(
             sampling_mode=sc_sampling_mode,
             expected_tokens=output.get("output_ids"),
             vocab_size=resolve_score_centering_vocab_size(args),
+            return_support_complete=True,
         )
     if native_image_opd:
         validate_prompt_token_ids(output, sample.tokens)
@@ -523,7 +526,7 @@ async def generate(
 
         sample = await postprocess_sample_with_radix_tree(args, sample, output)
         if sc_result is not None:
-            sc_tokens, sc_sampled, sc_ids, sc_logprobs = sc_result
+            sc_tokens, sc_sampled, sc_ids, sc_logprobs, sc_complete = sc_result
             response_tokens = sample.tokens[-sample.response_length :] if sample.response_length else []
             if response_tokens != sc_tokens:
                 raise ValueError(
@@ -532,6 +535,7 @@ async def generate(
             sample.rollout_log_probs = sc_sampled
             sample.rollout_topk_token_ids = sc_ids
             sample.rollout_topk_log_probs = sc_logprobs
+            sample.rollout_topk_support_complete = sc_complete
     else:
         if "output_token_logprobs" in output["meta_info"]:
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -546,7 +550,7 @@ async def generate(
             )
 
         if sc_result is not None:
-            new_response_tokens, new_response_log_probs, _, _ = sc_result
+            new_response_tokens, new_response_log_probs, *_ = sc_result
             # Keep an independent copy to detect in-place token sanitization.
             sc_tokens_before_sanitization = list(new_response_tokens)
 
@@ -615,7 +619,7 @@ async def generate(
             sample.rollout_log_probs = []
         sample.rollout_log_probs += new_response_log_probs
         if sc_result is not None:
-            append_score_centering_candidates(sample, sc_result[2], sc_result[3])
+            append_score_centering_candidates(sample, *sc_result[2:])
 
         if opd_enabled:
             state.opd_manager.after_rollout(sample, output)
@@ -731,11 +735,11 @@ async def generate_and_rm(
     # Custom generation may already have assigned rewards to some outputs.
     if isinstance(generated, list):
         samples_need_reward = [sample for sample in generated if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
     elif generated.reward is None:
-        generated.reward = await async_rm(args, generated)
+        generated.reward = await async_rm(args, generated, evaluation=evaluation)
 
     if opd.is_opd_enabled(args, evaluation=evaluation):
         await state.opd_manager.prefill(generated, _encode_multimodal_inputs)
@@ -820,17 +824,17 @@ async def generate_and_rm_group(
 
     group = await asyncio.gather(*tasks)
 
-    # Skip group scoring if any training response was aborted.
-    group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
+    # Group rewards require complete trajectories, including during evaluation.
+    group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
     if not args.group_rm:
         return group
-    if (state.aborted and not evaluation) or group_has_training_abort:
+    if (state.aborted and not evaluation) or group_aborted:
         if teacher_routing_enabled:
             for sample in group:
                 state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
-    rewards = await batched_async_rm(args, group)
+    rewards = await batched_async_rm(args, group, evaluation=evaluation)
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 
@@ -1362,7 +1366,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalO
 
 async def eval_rollout_single_dataset(
     args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+) -> dict[str, dict[str, Any]]:
     """An example to implement the eval_rollout function for an rule based rm
     rollout generation.
 
@@ -1437,7 +1441,8 @@ async def eval_rollout_single_dataset(
         pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
         for coro in asyncio.as_completed(tasks):
             group = await coro
-            if do_print:
+            pbar.update(1)
+            if do_print and group:
                 sample = group[0]
                 logger.info(
                     "eval_rollout_single_dataset example data: "
@@ -1446,7 +1451,6 @@ async def eval_rollout_single_dataset(
                 )
                 do_print = False
             data.extend(group)
-            pbar.update(1)
         pbar.close()
     else:
         tasks = []
@@ -1489,11 +1493,41 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+    # Preserve original prompt boundaries for pass@k, including missing samples.
+    group_size = dataset_cfg.n_samples_per_eval_prompt
+    valid_data = []
+    for prompt_index, samples in groupby(data, key=lambda sample: sample.index // group_size):
+        group = list(samples)
+        expected_indices = range(prompt_index * group_size, (prompt_index + 1) * group_size)
+        if (
+            0 <= prompt_index < len(dataset.samples)
+            and [sample.index for sample in group] == list(expected_indices)
+            and all(
+                (sample.reward is not None or is_eval_reward_pending(sample))
+                and sample.status != Sample.Status.ABORTED
+                for sample in group
+            )
+        ):
+            valid_data.extend(group)
+    num_valid_prompts = len(valid_data) // group_size
+    if num_valid_prompts != len(dataset.samples):
+        logger.warning(
+            "eval_rollout_single_dataset: partial evaluation, retaining %d/%d complete prompts",
+            num_valid_prompts,
+            len(dataset.samples),
+        )
+    data = valid_data
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [
+                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
+                for sample in data
+            ],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "group_size": group_size,
+            "num_prompts": len(dataset.samples),
+            "num_valid_prompts": num_valid_prompts,
         }
     }
 
