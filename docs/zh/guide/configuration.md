@@ -700,7 +700,7 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--debug-rollout-only` | flag | False | 仅运行 Rollout，不训练 |
+| `--debug-rollout-only` | flag | False | 仅运行 Rollout。使用全局数据集时，`--start-rollout-id 131 --load DIR` 从第 130 批保存的游标续跑；缺少游标会在采样前报错。 |
 | `--debug-train-only` | flag | False | 仅运行训练，不 Rollout |
 | `--load-debug-rollout-data` | str | None | 加载调试用 Rollout 数据。设置后自动启用 `--debug-train-only` |
 | `--load-debug-rollout-data-subsample` | float | None | 子采样部分调试 Rollout 数据以加速调试 |

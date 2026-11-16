@@ -14,7 +14,7 @@ import sys
 import tempfile
 from argparse import Namespace
 from types import ModuleType
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -78,6 +78,50 @@ class TestEagerDataset:
 
 class TestDataSourceIntegration:
     """Integration tests for data_source.py with StreamingDataset."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cursor_dir", ["dataset", "rollout", None])
+    async def test_rollout_only_restores_cursor_before_first_batch(
+        self, tmp_path, data_source_module, monkeypatch, cursor_dir
+    ):
+        from relax.components import rollout
+
+        args = Namespace(
+            debug_rollout_only=True,
+            start_rollout_id=131,
+            load=str(tmp_path),
+            rollout_global_dataset=True,
+            rollout_shuffle=False,
+            tq_config=None,
+        )
+        source = object.__new__(data_source_module.RolloutDataSource)
+        source.args = args
+        source._use_streaming = False
+        source.sample_offset = 0
+        handle = MagicMock()
+        handle.load.remote = AsyncMock(side_effect=source.load)
+        # Serve copies the component globals when constructing its ingress wrapper.
+        component = rollout.Rollout.func_or_class.__bases__[0]
+        monkeypatch.setitem(component.__init__.__globals__, "attach_tq_client", lambda *a, **kw: None)
+        monkeypatch.setitem(component.__init__.__globals__, "create_rollout_manager", lambda *a, **kw: (handle, None))
+        service = component(None, None, args, data_source=handle)
+
+        batches = []
+
+        async def first_batch():
+            batches.append((service.step, source.sample_offset))
+
+        service._async_run = first_batch
+        if cursor_dir is None:
+            with pytest.raises(FileNotFoundError, match="global_dataset_state_dict_130"):
+                await service.run()
+            assert not batches
+        else:
+            directory = tmp_path / cursor_dir
+            directory.mkdir()
+            torch.save({"sample_offset": 37}, directory / "global_dataset_state_dict_130.pt")
+            await service.run()
+            assert batches == [(131, 37)]
 
     @pytest.mark.parametrize("failure", ["write", "publish"])
     def test_failed_snapshot_preserves_previous_sampling_cursor(

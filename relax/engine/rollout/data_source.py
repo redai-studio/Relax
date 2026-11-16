@@ -293,6 +293,8 @@ class RolloutDataSource(DataSource):
                 logger.warning(f"Loading dataset state from legacy path {legacy_path} (new path: dataset/)")
                 path = legacy_path
             else:
+                if getattr(self.args, "debug_rollout_only", False) and (self.args.start_rollout_id or 0) > 0:
+                    raise FileNotFoundError(f"Missing rollout dataset cursor: {path} (also checked {legacy_path})")
                 logger.error(f"Checkpoint {path} does not exist.")
                 return
 

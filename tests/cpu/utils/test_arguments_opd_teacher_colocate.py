@@ -233,6 +233,21 @@ def test_rollout_only_with_external_teacher_uses_student_gpus(arguments_module) 
     assert args.actor_num_gpus_per_node * args.actor_num_nodes == args.rollout_num_gpus == 4
 
 
+@pytest.mark.parametrize("mode", ["bridge", "raw"])
+def test_rollout_only_resume_preserves_cursor_directory_without_actor_tracker(arguments_module, tmp_path, mode):
+    args = _opd_args()
+    args.debug_rollout_only = True
+    args.start_rollout_id = 131
+    args.load = str(tmp_path)
+    args.ref_ckpt_step = None
+    args.megatron_to_hf_mode = mode
+
+    arguments_module.relax_validate_args(args)
+
+    assert args.start_rollout_id == 131
+    assert args.load == str(tmp_path)
+
+
 def test_sequence_classification_accepts_multimodal_keys(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"

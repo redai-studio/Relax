@@ -4267,6 +4267,10 @@ def relax_validate_args(args):
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
+    elif args.debug_rollout_only and (getattr(args, "start_rollout_id", None) or 0) > 0:
+        # Rollout-only runs save a data cursor without a training checkpoint.
+        if args.rollout_global_dataset and not args.load:
+            raise ValueError("Rollout-only resume requires --load for the dataset cursor")
     else:
         if args.megatron_to_hf_mode == "bridge":
             if (
