@@ -1324,6 +1324,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "Higher values increase parallelism but may trigger EAGAIN errors "
                 "on some platforms. Only effective when prefetching is enabled.",
             )
+            parser.add_argument(
+                "--sample-prepare-workers",
+                type=_positive_int,
+                default=1,
+                help="Threads for preparing the current streaming batch when background dataset prefetch is inactive.",
+            )
             # TODO: maybe add an num_epoch and calculate the num_rollout from buffer
             parser.add_argument(
                 "--num-rollout",

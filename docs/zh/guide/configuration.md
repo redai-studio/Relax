@@ -95,6 +95,7 @@
 | `--prefetch-chunk-size` | int | 32 | 每轮预取时分派到线程池的样本数。较大的值可以提高吞吐量但也会增加内存压力。仅在设置了 `--use-streaming-dataset` 且数据集包含多模态数据时生效 |
 | `--prefetch-max-cached` | int | 256 | 预取缓存中保留的最大预加载样本数。缓存满时后台预取线程会暂停，直到消费者释放空间。设为 0 可禁用预取。仅在设置了 `--use-streaming-dataset` 且数据集包含多模态数据时生效 |
 | `--prefetch-num-workers` | int | 1 | 预取缓冲区中用于 I/O 密集型媒体解码（视频/图像）的并行工作线程数。设为 1 可序列化所有解码操作（对 FFmpeg 非线程安全问题最安全）。较高值可提高并行度，但在某些平台上可能触发 EAGAIN 错误。仅在启用预取时生效 |
+| `--sample-prepare-workers` | int | 1 | 后台预取未启用时，并行准备当前批样本的线程数。样本按数据集顺序交付。使用多线程时，处理器和自定义 prompt 回调需支持并发调用。 |
 | `--custom-prompt-path` | str | None | 自定义 Prompt 转换函数的 Python 点分导入路径。该函数在对话/多模态处理之前调用。函数签名：`def custom_fn(prompt, data: dict) -> prompt`。示例：`my_package.prompt_utils.add_prefix` |
 | `--data-source-path` | str | `relax.engine.rollout.data_source.RolloutDataSourceWithBuffer` | Rollout 数据源类路径 |
 | `--start-rollout-id` | int | None | 起始 Rollout 步数。未设置时会尝试从 `--load` 的检查点中读取 |

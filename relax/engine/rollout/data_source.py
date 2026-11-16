@@ -76,11 +76,12 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
         prefetch_chunk_size = getattr(args, "prefetch_chunk_size", 32)
         prefetch_max_cached = getattr(args, "prefetch_max_cached", 256)
         prefetch_num_workers = getattr(args, "prefetch_num_workers", 1)
+        sample_prepare_workers = getattr(args, "sample_prepare_workers", 1)
 
         logger.info(
             f"Using StreamingDataset with buffer_size={buffer_size}, "
             f"prefetch_chunk_size={prefetch_chunk_size}, prefetch_max_cached={prefetch_max_cached}, "
-            f"prefetch_num_workers={prefetch_num_workers}"
+            f"prefetch_num_workers={prefetch_num_workers}, sample_prepare_workers={sample_prepare_workers}"
         )
         return StreamingDataset(
             path=args.prompt_data,
@@ -101,6 +102,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             prefetch_chunk_size=prefetch_chunk_size,
             prefetch_max_cached=prefetch_max_cached,
             prefetch_num_workers=prefetch_num_workers,
+            sample_prepare_workers=sample_prepare_workers,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
