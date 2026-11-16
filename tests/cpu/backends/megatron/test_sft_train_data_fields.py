@@ -128,15 +128,17 @@ def test_rl_data_fields_include_replay_metadata():
 
 @pytest.mark.parametrize("algorithm", ["grpo", "score_centering"])
 def test_score_centering_requests_rollout_head_fields(algorithm):
-    from relax.utils.training.data_fields import build_data_fields
+    from relax.utils.training.data_fields import build_async_train_data_fields, build_data_fields
 
     args = _mk_actor_args(loss_type="policy_loss")
     args.advantage_estimator = algorithm
+    args.kl_coef = 0.0
+    args.use_kl_loss = False
 
-    fields = build_data_fields(args)
-
-    for field in ("rollout_topk_token_ids", "rollout_topk_log_probs"):
-        assert (field in fields) == (algorithm == "score_centering")
+    for build_fields in (build_data_fields, build_async_train_data_fields):
+        fields = build_fields(args)
+        for field in ("rollout_topk_token_ids", "rollout_topk_log_probs", "rollout_topk_support_complete"):
+            assert (field in fields) == (algorithm == "score_centering")
 
 
 def test_sft_partition_naming_uses_sft_prefix():

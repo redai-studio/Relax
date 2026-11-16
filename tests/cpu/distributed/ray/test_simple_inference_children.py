@@ -132,6 +132,8 @@ def test_recovery_disposal_rejects_surviving_router(monkeypatch):
 def test_cancelled_generate_await_does_not_claim_thread_idle():
     manager, _ = _manager()
     manager.args = SimpleNamespace(ci_test=False, partial_rollout=False)
+    manager._engine_lifecycle_lock = threading.RLock()
+    manager._begin_generation = _method("rollout.py", "RolloutManager", "_begin_generation").__get__(manager)
     manager.health_monitoring_resume = Mock()
     manager.generate_rollout = object()
     manager.data_source = object()
