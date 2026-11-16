@@ -4749,20 +4749,3 @@ diff --git a/python/sglang/srt/configs/qwen3_asr.py b/python/sglang/srt/configs/
 +AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
 +AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)
 # END transformers5
-diff --git a/python/sglang/srt/layers/attention/dsa_backend.py b/python/sglang/srt/layers/attention/dsa_backend.py
---- a/python/sglang/srt/layers/attention/dsa_backend.py
-+++ b/python/sglang/srt/layers/attention/dsa_backend.py
-@@ -2902,6 +2902,13 @@
-                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-             )
- 
-+        # FA3 can read physical V padding even when cu_seqlens_k excludes it.
-+        # In BF16 dense MHA, 0 * NaN from those rows contaminates valid output.
-+        # Use KV lengths (including cached prefixes), and keep the mask on GPU.
-+        if self.device_sm_major == 9 and v.dtype == torch.bfloat16:
-+            invalid_v = torch.arange(v.shape[0], device=v.device) >= cu_seqlens_k[-1]
-+            v.masked_fill_(invalid_v[:, None, None], 0)
-+
-         # Use FA3 for SM90 (Hopper/H200)
-         return flash_attn_varlen_func(
-             q=q,
