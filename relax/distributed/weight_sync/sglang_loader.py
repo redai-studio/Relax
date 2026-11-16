@@ -312,7 +312,8 @@ def _verify_qwen3_dense(
                 raise ValueError(f"Parameter is outside its pipeline range: {label}")
             if name == "model.embed_tokens.weight" and pp != 0:
                 raise ValueError(f"Input parameter belongs on the first pipeline stage: {label}")
-            if name in ("lm_head.weight", "model.norm.weight") and pp != pp_size - 1:
+            replicated_head = name == "lm_head.weight" and config["model_type"] == "qwen3_moe"
+            if name in ("lm_head.weight", "model.norm.weight") and pp != pp_size - 1 and not replicated_head:
                 raise ValueError(f"Output parameter belongs on the last pipeline stage: {label}")
         if is_vl:
             if name.startswith("visual."):
@@ -769,12 +770,14 @@ class SGLangHTTPGroup(EmbeddedSGLangGroup):
         tp_size: int,
         audit_directory: str | Path,
         api_key: str | None = None,
+        admin_api_key: str | None = None,
         pp_size: int = 1,
     ):
         self.url = url.rstrip("/")
         self.owner = uuid.uuid4().hex
         self.installation_identity = None
         self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self.control_headers = {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else self.headers
         super().__init__(
             None, model_path=model_path, tp_size=tp_size, pp_size=pp_size, audit_directory=audit_directory
         )
@@ -800,7 +803,7 @@ class SGLangHTTPGroup(EmbeddedSGLangGroup):
                     **payload,
                     "timeout": min(float(payload.get("timeout", budget)), budget),
                 },
-                headers=self.headers,
+                headers=self.control_headers,
                 timeout=Timeout(total=budget, connect=min(5, budget)),
             )
             request_body = getattr(getattr(response, "request", None), "body", None)

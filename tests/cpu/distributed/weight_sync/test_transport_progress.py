@@ -19,6 +19,38 @@ from relax.distributed.weight_sync.transport import (
 
 
 class ProgressTests(unittest.TestCase):
+    def test_partial_sends_share_one_absolute_response_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = VersionStore(Path(directory), disk_budget=1024**2, max_weight_bytes=1024)
+            with ObjectServer(("127.0.0.1", 0), store, timeout=0.15) as server:
+                sender, receiver = socket.socketpair()
+                sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                sender.settimeout(0.15)
+                receiver.settimeout(1)
+                stop = threading.Event()
+
+                def drain():
+                    while not stop.wait(0.01):
+                        try:
+                            if not receiver.recv(4096):
+                                return
+                        except OSError:
+                            return
+
+                reader = threading.Thread(target=drain)
+                reader.start()
+                started = time.monotonic()
+                try:
+                    with self.assertRaises(TimeoutError):
+                        server.send_counted(sender, bytes(4 * 1024**2), "X")
+                    self.assertLess(time.monotonic() - started, 1)
+                    self.assertGreater(server.ledger.report()["bytes"]["sent"]["X"], 4096)
+                finally:
+                    stop.set()
+                    sender.close()
+                    receiver.close()
+                    reader.join(2)
+
     def test_error_response_parts_share_the_object_deadline(self):
         detail = canonical({"type": "ValueError", "message": "remote failure"})
 

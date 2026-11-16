@@ -23,7 +23,6 @@ from relax.utils.logging_utils import get_logger
 from .codec import MAX_CHUNK_BYTES
 from .deadline import checkpoint, time_budget
 from .deadline import remaining as operation_remaining
-from .diagnostics import save_diagnostic
 from .ledger import SocketLedger
 from .parallel_io import ordered_map
 from .store import (
@@ -155,7 +154,7 @@ class SharedFSTransport:
     def object(self, key: str) -> bytes:
         path = self.source.object_path(key)
         if path.stat().st_size > MAX_CHUNK_BYTES:
-            raise ValueError("Object exceeds frame limit")
+            raise ContentError("Object exceeds frame limit")
         value = path.read_bytes()
         self._received(len(value))
         return value
@@ -412,9 +411,15 @@ class ObjectServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         with metrics.stage("source_full_repair_wait", path=self.store.root) if metrics else nullcontext():
             return future.result(timeout=operation_remaining(self.full_timeout, "FULL repair"))
 
-    def send_counted(self, request: socket.socket, data: bytes, stage: str) -> None:
+    def send_counted(self, request: socket.socket, data: bytes, stage: str, *, deadline: float | None = None) -> None:
+        if deadline is None:
+            deadline = time.monotonic() + (request.gettimeout() or self.socket_timeout)
         pending = memoryview(data)
         while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Response deadline exceeded")
+            request.settimeout(remaining)
             count = request.send(pending)
             if not count:
                 raise ConnectionError("Peer disconnected during response")
@@ -429,13 +434,16 @@ class ObjectServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             from .metrics import SyncMetrics
             from .traffic import capture
 
-            metrics = SyncMetrics("unattributed-request")
+            metrics = SyncMetrics("unattributed-request") if self.metrics is not None else None
             ledger = SocketLedger()
             self._request_local.ledger = ledger
             drained = bytearray()
             decoded = None
             try:
-                with capture(metrics), metrics.stage("source_tcp_rejection", path=self.store.root):
+                with (
+                    capture(metrics),
+                    metrics.stage("source_tcp_rejection", path=self.store.root) if metrics else nullcontext(),
+                ):
                     request.settimeout(min(self.socket_timeout, 0.05))
                     self.send_counted(request, struct.pack("!Q", BUSY_RESPONSE), "C")
                     request.shutdown(socket.SHUT_WR)
@@ -466,7 +474,10 @@ class ObjectServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                                 decoded = value
                                 context = value.get("target_context", value)
                                 if isinstance(context, dict) and "stream" in context and "version" in context:
-                                    metrics.update_id = self.target_update_id(context["stream"], context["version"])
+                                    if metrics is not None:
+                                        metrics.update_id = self.target_update_id(
+                                            context["stream"], context["version"]
+                                        )
                         except (KeyError, ValueError, TypeError, OSError):
                             pass
                 self._persist_observation(
@@ -485,15 +496,15 @@ class ObjectServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def _persist_observation(
         self,
-        metrics: "SyncMetrics",
+        metrics: "SyncMetrics | None",
         ledger: SocketLedger,
         request: dict | None,
         error: dict | None,
         *,
         admission: str = "handled",
     ) -> None:
-        from .traffic import capture
-
+        if metrics is None:
+            return
         report = {
             **metrics.report(),
             "storage_role": "source",
@@ -505,15 +516,9 @@ class ObjectServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             "socket_count_scope": "per_request_detail_of_server_cumulative_ledger",
         }
         if self.metrics is not None:
-            self.metrics.related(report)
-        try:
-            # Observation failure cannot change an already delivered outcome.
-            with capture(None):
-                save_diagnostic(
-                    self.store.root / "transport-observations" / (metrics.operation_id + ".json"), canonical(report)
-                )
-        except OSError as caught:
-            logger.warning("Could not retain TCP request observation: %s", caught)
+            # Keep cumulative counters and a bounded recent diagnostic window.
+            # The service owner saves this report at its configured metrics path.
+            self.metrics.related(report, limit=128)
 
     def process_request_thread(self, request: socket.socket, client_address: tuple[str, int]) -> None:
         from .traffic import capture
@@ -530,7 +535,7 @@ class ObjectHandler(socketserver.BaseRequestHandler):
         from .metrics import SyncMetrics
         from .traffic import capture
 
-        self.attempt_metrics = SyncMetrics("unattributed-request")
+        self.attempt_metrics = SyncMetrics("unattributed-request") if self.server.metrics is not None else None
         self.attempt_request = None
         self.attempt_error = None
         ledger = SocketLedger()
@@ -538,7 +543,9 @@ class ObjectHandler(socketserver.BaseRequestHandler):
         try:
             with (
                 capture(self.attempt_metrics),
-                self.attempt_metrics.stage("source_tcp_request", path=self.server.store.root),
+                self.attempt_metrics.stage("source_tcp_request", path=self.server.store.root)
+                if self.attempt_metrics
+                else nullcontext(),
             ):
                 self._handle()
         finally:
@@ -563,7 +570,7 @@ class ObjectHandler(socketserver.BaseRequestHandler):
             context = request.get("target_context", request)
             if request.get("op") == "acknowledge":
                 context = request["receipt"]["target"]
-            if "stream" in context and "version" in context:
+            if self.attempt_metrics is not None and "stream" in context and "version" in context:
                 try:
                     self.attempt_metrics.update_id = self.server.target_update_id(
                         context["stream"], context["version"]
@@ -586,8 +593,10 @@ class ObjectHandler(socketserver.BaseRequestHandler):
             if remaining <= 0:
                 raise TimeoutError("Object request deadline exceeded")
             self.request.settimeout(remaining)
-            self.server.send_counted(self.request, struct.pack("!Q", len(payload)), "C")
-            self.server.send_counted(self.request, payload, "X" if request["op"] in ("object", "manifest") else "C")
+            self.server.send_counted(self.request, struct.pack("!Q", len(payload)), "C", deadline=deadline)
+            self.server.send_counted(
+                self.request, payload, "X" if request["op"] in ("object", "manifest") else "C", deadline=deadline
+            )
         except (TimeoutError, ConnectionError) as error:
             self.attempt_error = {"type": type(error).__name__, "message": str(error)}
             return

@@ -138,14 +138,17 @@ def worker_rpc(scheduler, payload: str) -> None:
                         timings=verification_timings,
                     )
             elif phase == "flush":
-                from sglang.srt.managers import mm_utils
+                try:
+                    from sglang.srt.managers import mm_schedule as mm_cache
+                except ImportError:
+                    from sglang.srt.managers import mm_utils as mm_cache
 
                 if not scheduler.flush_cache():
                     raise RuntimeError("Scheduler cache is still in use")
                 # SGLang's scheduler flush resets KV/grammar caches, while
                 # vision embeddings are retained separately by image hash.
                 # Every installation invalidates features from old weights.
-                cache = mm_utils.embedding_cache
+                cache = mm_cache.embedding_cache
                 if cache is not None:
                     multimodal_cache = {"entries_cleared": len(cache), "bytes_cleared": cache.current_size}
                     cache.clear()

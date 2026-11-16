@@ -5,7 +5,7 @@
 ``_resolve_genrm_instances`` is the single source of truth downstream code
 (``register_genrm``, ``create_genrm_managers``, the GPU split/shared check)
 relies on to treat single- and multi-instance genRM configs uniformly. It is
-tested standalone here (not through the full ``slime_validate_args`` pipeline)
+tested standalone here (not through the full ``relax_validate_args`` pipeline)
 because it has no dependency on the rest of the argument surface.
 """
 

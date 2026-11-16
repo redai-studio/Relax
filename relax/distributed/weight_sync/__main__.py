@@ -32,7 +32,10 @@ def main() -> None:
     serve.add_argument("--control-timeout", type=float, default=120, help="Store control operation budget in seconds")
     serve.add_argument("--bind", default="127.0.0.1")
     serve.add_argument("--port", type=int, required=True)
-    serve.add_argument("--metrics-output", help="Save server socket and repair-write counters on orderly shutdown")
+    serve.add_argument(
+        "--metrics-output",
+        help="Save cumulative socket/repair-write counters and the latest 128 request details on orderly shutdown",
+    )
     get = sub.add_parser("fetch")
     location = get.add_mutually_exclusive_group(required=True)
     location.add_argument("--source-store")

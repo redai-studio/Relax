@@ -164,6 +164,50 @@ class ReviewRecoveryTests(unittest.TestCase):
         consumer.release(second, remove_checkpoint=True)
         self.assertFalse(second.checkpoint.exists())
 
+    def test_checkpoint_materialization_uses_recoverable_owner_pin(self):
+        from relax.distributed.weight_sync import checkpoint
+
+        self.publish(0, model_config={})
+        consumer = self.runner()[0].consumer
+        owners = []
+        write = checkpoint.validate_checkpoint
+
+        def inspect_pins(*args, **kwargs):
+            owners.extend(path.stem for path in (consumer.cache.root / "pins").glob("*.json"))
+            return write(*args, **kwargs)
+
+        with patch.object(checkpoint, "validate_checkpoint", side_effect=inspect_pins):
+            prepared = consumer.prepare("s", 0, "recoverable-owner")
+        self.assertEqual(owners, ["recoverable-owner"])
+        consumer.release(prepared, remove_checkpoint=True)
+        self.assertEqual(list((consumer.cache.root / "pins").glob("*.json")), [])
+
+    def test_active_full_retry_retains_checkpoint_across_retry_and_restart(self):
+        self.publish(0, model_config={})
+        self.publish(1, model_config={})
+        runner, engines = self.runner()
+        runner.apply(0)
+        runner.apply(1)
+        runner.apply(1, full=True)
+        active = runner._active()
+        runner.apply(1)
+        self.assertTrue(active.checkpoint.is_dir())
+        self.assertTrue((runner.consumer.cache.root / "pins" / f"{active.owner}.json").is_file())
+        restarted, replacement = self.runner()
+        self.assertEqual(restarted.recover_active()["cursor"], 1)
+        self.assertEqual(replacement.content, engines.content)
+
+    def test_oversized_delivery_is_repaired_from_canonical_content(self):
+        from relax.distributed.weight_sync.codec import MAX_CHUNK_BYTES
+
+        manifest = self.publish(0, model_config={})
+        key = manifest["tensors"][0]["chunks"][0]["object"]
+        with self.store.object_path(key).open("wb") as handle:
+            handle.truncate(MAX_CHUNK_BYTES + 1)
+        prepared = self.runner()[0].consumer.prepare("s", 0, "reader")
+        self.assertEqual(prepared.manifest["root"], manifest["root"])
+        self.assertLess(self.store.object_path(key).stat().st_size, MAX_CHUNK_BYTES)
+
     def test_corrupt_delivery_automatically_requests_same_target_full_once(self):
         self.publish(0, model_config={})
         target = self.publish(1, model_config={})

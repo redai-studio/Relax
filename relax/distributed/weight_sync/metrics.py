@@ -34,6 +34,8 @@ class SyncMetrics:
         self.details: list[dict] = []
         self.observations: list[dict] = []
         self.related_reports: list[dict] = []
+        self.related_report_count = 0
+        self.related_bytes_by_scope: dict[str, dict[str, int]] = {}
         self.gaps: list[dict] = []
         self._lock = threading.Lock()
         self.operation_id = uuid.uuid4().hex
@@ -66,11 +68,18 @@ class SyncMetrics:
                     }
                 )
 
-    def related(self, report: dict) -> None:
+    def related(self, report: dict, *, limit: int | None = None) -> None:
         """Keep separately attributed work without adding it to parent
         bytes."""
         with self._lock:
+            self.related_report_count += 1
+            for scope, counts in report.get("bytes_by_scope", {}).items():
+                totals = self.related_bytes_by_scope.setdefault(scope, {})
+                for stage, count in counts.items():
+                    totals[stage] = totals.get(stage, 0) + count
             self.related_reports.append(report)
+            if limit is not None:
+                del self.related_reports[:-limit]
 
     def unmeasured(self, stage: str, reason: str) -> None:
         with self._lock:
@@ -123,6 +132,10 @@ class SyncMetrics:
                 "links": list(self.details),
                 "observations": list(self.observations),
                 "related_reports": list(self.related_reports),
+                "related_report_count": self.related_report_count,
+                "related_bytes_by_scope": {
+                    scope: dict(values) for scope, values in self.related_bytes_by_scope.items()
+                },
                 "unmeasured": list(self.gaps),
             }
 
