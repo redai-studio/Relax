@@ -260,8 +260,8 @@ _THINK_CLOSE_TAG = "</think>"
 _NON_THINKING_PREFIX = "<think>\n\n</think>\n\n"
 _IM_END = "<|im_end|>"
 # Qwen3.5 wraps tool messages inside a user block as
-# `<tool_response>\n{content}\n</tool_response>`, so role=="tool" has no
-# `<|im_start|>tool\n` header — scan the wrapper instead.
+# `<tool_response>\n{content}\n</tool_response>`; other ChatML templates use
+# an independent `<|im_start|>tool\n` turn. Accept both boundaries.
 _TOOL_RESPONSE_OPEN = "<tool_response>\n"
 _TOOL_RESPONSE_CLOSE = "\n</tool_response>"
 
@@ -304,8 +304,8 @@ class _ChatTemplateDialect(Protocol):
 
 
 class _ChatMLDialect:
-    """Qwen-style ChatML: ``<|im_start|>{role}\\n…<|im_end|>`` with tool
-    messages wrapped in ``<tool_response>…</tool_response>``.
+    """ChatML turns, with standalone tool turns or Qwen-style tool messages
+    wrapped in ``<tool_response>…</tool_response>``.
 
     The implicit default.
     """
@@ -316,8 +316,10 @@ class _ChatMLDialect:
         return bool(template) and "<|im_start|>" in template
 
     def locate(self, text: str, cursor: int, msg: CanonicalMessage) -> _MsgSpan:
-        if msg.role == "tool":
-            open_pos = text.find(_TOOL_RESPONSE_OPEN, cursor)
+        header = f"<|im_start|>{msg.role}\n"
+        header_pos = text.find(header, cursor)
+        open_pos = text.find(_TOOL_RESPONSE_OPEN, cursor) if msg.role == "tool" else -1
+        if msg.role == "tool" and (header_pos < 0 or 0 <= open_pos < header_pos):
             if open_pos < 0:
                 raise RuntimeError(
                     f"could not locate <tool_response> for tool message after cursor {cursor} "
@@ -330,8 +332,6 @@ class _ChatMLDialect:
             span_end = close_pos
             next_cursor = close_pos + len(_TOOL_RESPONSE_CLOSE)
         else:
-            header = f"<|im_start|>{msg.role}\n"
-            header_pos = text.find(header, cursor)
             if header_pos < 0:
                 raise RuntimeError(
                     f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat template output"
@@ -701,18 +701,10 @@ def _render_per_message_fallback(
                     f"tool messages are not supported by the {dialect.name!r} loss-mask dialect; "
                     f"add its tool-call delimiters to _Dialect first"
                 )
-            open_pos = rendered_text.find(_TOOL_RESPONSE_OPEN, cursor)
-            if open_pos < 0:
-                raise RuntimeError(
-                    f"could not locate <tool_response> for tool message after cursor {cursor} "
-                    f"in rendered chat template output"
-                )
-            content_start = open_pos + len(_TOOL_RESPONSE_OPEN)
-            close_pos = rendered_text.find(_TOOL_RESPONSE_CLOSE, content_start)
-            if close_pos < 0:
-                raise RuntimeError("could not locate </tool_response> for tool message")
-            span_end = close_pos
-            cursor = close_pos + len(_TOOL_RESPONSE_CLOSE)
+            span = _DEFAULT_DIALECT.locate(rendered_text, cursor, msg)
+            content_start = span.learn_start
+            span_end = span.span_end
+            cursor = span.next_cursor
         else:
             header = dialect.header(msg.role)
             header_pos = rendered_text.find(header, cursor)

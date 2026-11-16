@@ -67,10 +67,14 @@ def _sample(messages):
 
 
 @pytest.mark.parametrize(
-    "native,reasoning",
-    [(False, "SECRET"), (True, "SECRET"), (False, "literal </think> inside reasoning")],
+    "native,reasoning,tool_result",
+    [
+        (False, "SECRET", "RESULT"),
+        (True, "SECRET", "RESULT"),
+        (False, "literal </think> inside reasoning", "RESULT <tool_response>\nnot a boundary\n</tool_response>"),
+    ],
 )
-def test_mask_keeps_input_and_learns_answer_tools_and_eos(native, reasoning):
+def test_mask_keeps_input_and_learns_answer_tools_and_eos(native, reasoning, tool_result):
     tokenizer = _tokenizer(native)
     messages = [
         {"role": "user", "content": "Question"},
@@ -80,6 +84,8 @@ def test_mask_keeps_input_and_learns_answer_tools_and_eos(native, reasoning):
             "reasoning_content": reasoning,
             "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": {}}}],
         },
+        {"role": "tool", "content": tool_result},
+        {"role": "assistant", "content": "FINAL", "reasoning_content": "FINAL_REASON"},
     ]
     original = deepcopy(messages)
     sample = _sample(messages)
@@ -88,7 +94,7 @@ def test_mask_keeps_input_and_learns_answer_tools_and_eos(native, reasoning):
     assert torch.equal(ids, before_ids)
     assert torch.all(mask <= before_mask)
     learned = tokenizer.decode(ids[mask.bool()])
-    assert learned == "ANSWER with literal </think><tool_call>lookup</tool_call><|im_end|>\n"
+    assert learned == "ANSWER with literal </think><tool_call>lookup</tool_call><|im_end|>\nFINAL<|im_end|>\n"
     assert messages == original
 
 
