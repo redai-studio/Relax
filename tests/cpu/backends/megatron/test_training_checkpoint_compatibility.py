@@ -96,6 +96,7 @@ def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
             "DDP": type("DDP", (), {}),
             "get_model_config": lambda model: SimpleNamespace(),
             "finalize_model_grads": Mock(),
+            "is_lora_enabled": lambda args: False,
             "resident_sft_param_overlap_enabled": lambda args: False,
             "should_disable_forward_pre_hook": stop,
             "mpu": Mock(),

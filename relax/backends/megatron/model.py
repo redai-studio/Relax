@@ -1828,7 +1828,10 @@ def train(
         )
 
         # Fused accumulation writes main_grad; remove the eager grad hooks before backward.
+        from relax.utils.training.lora_grad_sync import mark_expert_adapter_optimizer_replicas
+
         enable_expert_parallel_grad_sync_in_finalize(model)
+        mark_expert_adapter_optimizer_replicas(optimizer, expert_group=mpu.get_expert_model_parallel_group())
         finalize_grads_func = finalize_model_grads_with_expert_adapter_sync
     config.finalize_model_grads_func = (
         partial(_finalize_model_grads_with_memory_release, finalize_grads_func=finalize_grads_func)

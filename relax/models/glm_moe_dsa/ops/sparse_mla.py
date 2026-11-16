@@ -1,9 +1,8 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 """Autograd wrapper for the fused tilelang sparse MLA fwd/bwd kernels."""
 
 import torch
-
-from .tilelang_sparse_mla_bwd import sparse_mla_bwd
-from .tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
 
 
 class SparseMLA(torch.autograd.Function):
@@ -21,6 +20,8 @@ class SparseMLA(torch.autograd.Function):
         Returns:
             out: Output tensor (seq_len, heads, dim)
         """
+        from .tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
+
         indices = indices.contiguous()
         q, kv = q.contiguous(), kv.contiguous()
         ctx.scaling = scaling
@@ -41,6 +42,8 @@ class SparseMLA(torch.autograd.Function):
         Returns:
             Gradients for q, kv, and indices (None for indices)
         """
+        from .tilelang_sparse_mla_bwd import sparse_mla_bwd
+
         q, kv, indices, tl_out, tl_lse = ctx.saved_tensors
         scaling = ctx.scaling
 

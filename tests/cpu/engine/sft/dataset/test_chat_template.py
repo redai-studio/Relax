@@ -1300,3 +1300,38 @@ def test_gemma4_tool_schema_delimiters_never_become_targets(schema_location, sel
     assert "FINAL<turn|>" in learned
     assert ("call:lookup" in learned) is (selection != "final")
     assert sample.tools == original_tools
+
+
+class _FakeGLMTokenizer(_FakeDeepSeekTokenizer):
+    chat_template = """
+        {{- '[gMASK]<sop><|system|>Reasoning Effort: Max' -}}
+        {%- for message in messages -%}
+            {%- if message.role == 'assistant' -%}
+                {{- '<|assistant|><think>' + message.content -}}
+            {%- elif message.role == 'tool' -%}
+                {{- '<|observation|><tool_response>' + message.content + '</tool_response>' -}}
+            {%- elif message.role == 'user' -%}
+                {{- '<|user|>' + message.content -}}
+            {%- endif -%}
+        {%- endfor -%}
+    """
+
+
+@pytest.mark.parametrize("last_turn_only", [False, True])
+def test_glm_fallback_masks_roles_tools_and_preserves_reasoning(last_turn_only):
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "question1", False),
+            CanonicalMessage("assistant", "reason</think><tool_call>f</tool_call>", True),
+            CanonicalMessage("tool", "observation", False),
+            CanonicalMessage("assistant", "</think>answer1", True),
+            CanonicalMessage("user", "question2", False),
+            CanonicalMessage("assistant", "final reasoning</think>answer2", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    ids, mask = render_with_loss_mask(sample, tokenizer=_FakeGLMTokenizer(), last_turn_only=last_turn_only)
+    expected = "final reasoning</think>answer2"
+    if not last_turn_only:
+        expected = "reason</think><tool_call>f</tool_call></think>answer1" + expected
+    assert _learned_text(ids, mask) == expected
