@@ -1097,6 +1097,7 @@ class StreamingDataset(BaseDataset):
             indices, epoch_crossed = self.index_manager.get_next_indices(1)
             if epoch_crossed and not crossed_epoch:
                 crossed_epoch = True
+                # IndexManager has shuffled the new epoch, but prefetch still follows the old order.
                 self._reset_prefetch_window()
             idx = indices[0]
 
