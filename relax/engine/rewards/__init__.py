@@ -218,8 +218,11 @@ class RewardWorker:
 
 
 class RewardExecutor:
-    """Singleton that manages a pool of RewardWorker actors and an
-    asyncio.Semaphore for per-process concurrency control."""
+    """Manage a reward worker pool and its concurrency limit.
+
+    Default helpers share a per-process singleton; background judges own
+    independent instances.
+    """
 
     _instance: "RewardExecutor | None" = None
 
@@ -245,11 +248,11 @@ class RewardExecutor:
 
     @classmethod
     def reload_custom_reward(cls, path: str) -> None:
-        """Refresh a custom reward in the executor and all worker processes."""
+        """Refresh a custom reward in the default executor and its workers."""
         executor = cls._instance
         if executor is None:
             return
-        executor._reload_custom_reward(path)
+        executor.refresh_custom_reward(path)
 
     # -- lazy init (must happen inside an event loop) -------------------------
 
@@ -300,13 +303,20 @@ class RewardExecutor:
             self._custom_reward_is_async[path] = _is_async_callable(function)
         return function
 
-    def _reload_custom_reward(self, path: str) -> None:
+    def refresh_custom_reward(self, path: str) -> None:
+        """Refresh a custom reward in this instance and its workers."""
         self._custom_reward_functions.pop(path, None)
         self._custom_reward_is_async.pop(path, None)
 
         if not self._workers:
             return
         ray.get([worker.reload_custom_reward.remote(path) for worker in self._workers])
+
+    def close_workers(self) -> None:
+        """Release this instance's workers after scoring has stopped."""
+        for worker in self._workers:
+            ray.kill(worker)
+        self._workers.clear()
 
     @staticmethod
     def _cancel_worker_call(ref, *, custom_rm_path: str) -> None:
@@ -374,6 +384,14 @@ class RewardExecutor:
             ) from exc
 
     # -- public API -----------------------------------------------------------
+
+    async def execute_batch(
+        self, args: Any, samples: list[Sample], **kwargs: Any
+    ) -> list[int | float | dict[str, Any]]:
+        """Score a complete custom batch or fan out built-in rewards."""
+        if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False):
+            return await self._execute_custom_with_concurrency(args, samples, **kwargs)
+        return await asyncio.gather(*(self.execute(args, sample, **kwargs) for sample in samples))
 
     async def _execute_custom_with_concurrency(self, args, sample: Sample | list[Sample], **kwargs):
         """Execute one custom reward call with concurrency control."""
@@ -525,8 +543,6 @@ async def batched_async_rm(
     """Score multiple samples.
 
     Custom rewards receive the complete sample payload in one invocation.
-    Built-in rewards fan out through per-sample ``async_rm`` calls.
+    Built-in rewards are evaluated independently for each sample.
     """
-    if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False):
-        return await _get_reward_executor(args)._execute_custom_with_concurrency(args, samples, **kwargs)
-    return await asyncio.gather(*(async_rm(args, sample, **kwargs) for sample in samples))
+    return await _get_reward_executor(args).execute_batch(args, samples, **kwargs)

@@ -117,7 +117,7 @@ class EvalJudgeWorker:
             function = reload_function(path)
             if function is None or not callable(function):
                 raise RuntimeError(f"Failed to reload custom reward {path!r} in EvalJudgeWorker.")
-            self._executor._reload_custom_reward(path)
+            self._executor.refresh_custom_reward(path)
 
         async with self._lock:
             task = asyncio.create_task(asyncio.to_thread(refresh))
@@ -158,7 +158,7 @@ class EvalJudgeWorker:
 
     async def _score_call(self, args: Any, call: DeferredReward) -> None:
         if isinstance(call.samples, list):
-            rewards = await self._executor._execute_custom_with_concurrency(args, call.samples, **call.kwargs)
+            rewards = await self._executor.execute_batch(args, call.samples, **call.kwargs)
             for sample, reward in zip(call.samples, rewards, strict=True):
                 sample.reward = reward
         else:
@@ -169,8 +169,6 @@ class EvalJudgeWorker:
     async def close(self) -> None:
         from relax.engine.rewards import _shared_session
 
-        for worker in self._executor._workers:
-            ray.kill(worker)
-        self._executor._workers.clear()
+        self._executor.close_workers()
         if _shared_session is not None and not _shared_session.closed:
             await _shared_session.close()

@@ -1028,6 +1028,11 @@ class RolloutManager(ReloadableMixin):
     def reload_all_functions(self) -> dict[str, Any]:
         return super().reload_all_functions()
 
+    def _on_custom_reward_reloaded(self, module_path: str) -> None:
+        """Wait for this manager's background judge to refresh as well."""
+        if self._eval_judge is not None:
+            ray.get(self._eval_judge.reload_custom_reward.remote(module_path))
+
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
         reused."""
