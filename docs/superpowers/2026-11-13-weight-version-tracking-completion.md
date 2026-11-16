@@ -1,8 +1,9 @@
 # 权重版本追踪与滞后审计 — 工作收尾记录
 
-日期：2026-11-13
+日期：2026-11-13（2026-11-16 更新 PR 状态）
 仓库：Relax（`/home/nianliu/code/xhs/Relax`）
-分支：`feat/weight-version-tracking`（基于 `main` @ 78d704e，15 个 commit，未推送）
+分支：`agentic/weight-version-tracking`（已 rebase 到 `main` @ 2ecdc45，20 个 commit）
+PR：[redai-studio/Relax#669](https://github.com/redai-studio/Relax/pull/669)（open，head `d186867`）
 任务来源：`/home/nianliu/code/xhs/task.txt`【No.15】
 关联文档：
 - 设计：`docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md`
@@ -10,31 +11,51 @@
 - 报告样例：`docs/superpowers/examples/weight-version-audit-report.md`
 - 验证指南：`docs/superpowers/2026-11-13-weight-version-verification-guide.md`
 
-## 状态：实现完成，待合并
+## 状态：PR 已创建，待 CI 检查与评审
 
-所有 8 个计划任务（任务 0-8）已完成并逐任务通过 spec 合规 + 代码质量两阶段评审；整体实现通过最终代码评审（verdict: APPROVED, ready to merge）。分支未推送、未合并——按约定由用户自行合入远程。
+所有 8 个计划任务（任务 0-8）已完成并逐任务通过 spec 合规 + 代码质量两阶段评审；整体实现通过最终代码评审（verdict: APPROVED, ready to merge）。
+
+## 合并指引
+
+分支 `agentic/weight-version-tracking` 已就绪（工作树 clean，HEAD = `d186867`）。
+
+### 发布过程记录（2026-11-13 → 11-16）
+
+1. **Fork 流程**：账号 `nianliunian` 无 `redai-studio/Relax` 写权限（直推 403），按 `relax-github-workflow` skill 走个人 fork `nianliunian/Relax` + PR。
+2. **PAT workflow-scope 拒绝**：初次推 fork 被拒（branch 基于旧 main @ 78d704e，树里携带过期的 `.github/workflows/integration-test.yml`，而 PAT 无 `workflow` scope）。解法：rebase 到最新 `origin/main` @ 2ecdc45——分支 20 个 commit 从不触碰 `.github/`，rebase 后树内 workflow 文件与 main 一致，绕开该限制，无需改 token。
+3. **Rebase 冲突 3 处**（上游 38 commit 演进）：`TRAIN_SCHEMA_VERSION = "4.0.0"` 引入（records.py 注释与常量）、上游 loss-mask-4.0.0 文档段落与本文档合入（zh/en agentic-rollout.md）、`take_ready()` 改 yield 三元组（MOPD，#569）导致 `test_weight_version_observability.py` fixture 修复：`[(stream, None, ())]`，fixup 进其归属 commit。
+4. **Rebase 后全量验证**：177 passed（9 个测试文件），ruff check/format 通过；PR 发布前再跑受影响两文件 123 passed。
+5. **PR #669**：标题 `feat(obs): weight version tracking and staleness audit for agentic async training`（提交时暂为 `Agentic/weight version tracking`，已提醒用户改为 Conventional Commits 格式——squash merge 以 PR 标题为最终 commit 主题）。正文中文，按 `.github/PULL_REQUEST_TEMPLATE.md`，审计示例数值与验证指南 §3.2 真实 CLI 输出逐字节一致。中文正文草稿存于 `.git/pr-body-draft.md`（不入库）。
+6. **待办**：CI 检查结果（用户将同步）→ 评审反馈处理 → squash merge 后清理本地 `feat/weight-version-tracking`（旧基线分支，347de06）与 `main`（落后 38，rebase 时未动）。
 
 ## 提交清单
 
+Rebase 后 20 个 commit（`origin/main` @ 2ecdc45 → `d186867`；哈希为 rebase 后最终值）：
+
 | Commit | 说明 |
 | --- | --- |
-| d53d27e | feat(agentic): WeightVersionSpan 类型 + `Sample.weight_version_spans` |
-| 33583fc | feat(agentic): spans 贯穿 IR / MsgNode / append_resp / build_sample |
-| aa998c1 | test(agentic): 修正 state 测试的过时坐标注释并关闭事件循环 |
-| 3d4c8d2 | feat(agentic): 在生成 attempt 边界采集 spans（service.py） |
-| 553dc8e | feat(obs): spans 快照进 trajectory 流（schema 3.1.0） |
-| 2750909 | test(obs): ruff format + None 版本 round-trip 覆盖 |
-| e6bb24e | feat(train): 训练消费版本 `consumed_weight_version` 写入 train 流 |
-| 8a9b978 | test(obs): isolation fake lineage node 补 spans 默认值 |
-| ec85898 | fix(train): 按模式取消费版本，schema 升 3.2.0 |
-| db92bc6 | feat(obs): version_audit 核心统计 |
-| 2bfa8b5 | feat(obs): version_audit CLI（trajectories × train 流 join） |
-| b2bd6fc | fix(obs): 加固流 join 与明细输出（overflow 分片、零除、CLI 校验） |
-| 75841de | fix(obs): 容忍 JSONL 撕裂的多字节尾行 |
-| 9a6f761 | feat(obs): 验收场景测试 + 报告样例 + zh/en 文档 |
-| 069d5a6 | docs(obs): 报告样例改用节点内相对坐标 |
+| ab709d5 | docs: 权重版本追踪与滞后审计设计 spec |
+| 935eac5 | docs: 设计补充 TQ 序列化探针准则 |
+| 67c420c | docs: 实施计划 |
+| ec632db | feat(agentic): WeightVersionSpan 类型 + `Sample.weight_version_spans` |
+| ef8239f | feat(agentic): spans 贯穿 IR / MsgNode / append_resp / build_sample |
+| 9dde26a | test(agentic): 修正 state 测试的过时坐标注释并关闭事件循环 |
+| 67b4821 | feat(agentic): 在生成 attempt 边界采集 spans（service.py） |
+| 267c9fe | feat(obs): spans 快照进 trajectory 流（schema 3.1.0） |
+| 08f24e9 | test(obs): ruff format + None 版本 round-trip 覆盖 |
+| e5292ec | feat(train): 训练消费版本 `consumed_weight_version` 写入 train 流 |
+| dc51dde | test(obs): isolation fake lineage node 补 spans 默认值 |
+| 8ebb029 | fix(train): 按模式取消费版本，schema 升 3.2.0 |
+| 6042822 | feat(obs): version_audit 核心统计 |
+| b779b6d | feat(obs): version_audit CLI（trajectories × train 流 join） |
+| 01364fd | fix(obs): 加固流 join 与明细输出（overflow 分片、零除、CLI 校验） |
+| 29fef44 | fix(obs): 容忍 JSONL 撕裂的多字节尾行 |
+| 57c2813 | feat(obs): 验收场景测试 + 报告样例 + zh/en 文档 |
+| 0ef564f | docs(obs): 报告样例改用节点内相对坐标 |
+| 2c60e96 | docs(obs): 特性文档页 + 本收尾记录 |
+| d186867 | docs(obs): 验证指南 |
 
-变更范围：23 个文件（+2124/−17）。核心实现 9 个（`relax/utils/types.py`、`relax/agentic/session/state.py`、`relax/agentic/session/service.py`、`relax/agentic/observability.py`、`relax/utils/agentic_obs/records.py`、`train_hooks.py`、`version_audit.py`（新）、`relax/backends/megatron/actor.py`、`model.py`），测试 11 个，文档 3 个。
+变更范围（rebase 后 vs `origin/main`）：30 个文件（+4387/−17）。核心实现 9 个（`relax/utils/types.py`、`relax/agentic/session/state.py`、`relax/agentic/session/service.py`、`relax/agentic/observability.py`、`relax/utils/agentic_obs/records.py`、`train_hooks.py`、`version_audit.py`（新）、`relax/backends/megatron/actor.py`、`model.py`），测试 11 个，文档 10 个（含 zh/en 特性页与用户指南）。
 
 ## 验收标准证据表
 
@@ -68,8 +89,4 @@
 
 - 评审 Minor 未处理项：scenario 测试 fixture 与 `test_weight_version_service.py` 约 110 行同构复制（本仓库 tests/cpu 无共享 conftest 惯例，第三个消费者出现时再抽取）；`test_metric_distinction` 的链式 `!=` 仅断言相邻不等（数值已被逐项 pin 死，无实际风险）；取消测试走数据不变量而非生产取消路径（CPU 验收测试的合理取舍）。
 - 用户指南的审计小节链接了 `docs/superpowers/specs/...` §6（仓库内路径，VitePress 站点不可导航）——特性文档 `docs/{zh,en}/guide/weight-version-audit.md` 已补独立口径页并互链（见下），后续可考虑把指南内链改为指向特性页。
-- GPU/完整依赖环境需复核：`tests/cpu/backends/megatron/test_weight_version_helper.py`（本机 skip）与 DCS 版本链路的端到端行为。
-
-## 合并指引
-
-分支 `feat/weight-version-tracking` 已就绪（工作树 clean，HEAD = 069d5a6）。合并方式由用户决定（本地 merge / push + PR）；按约定不代为推送。
+- GPU/完整依赖环境需复核：`tests/cpu/backends/megatron/test_weight_version_helper.py`（本机 skip）与 DCS 版本链路的端到端行为——依赖 PR CI（单卡/多卡）覆盖。
