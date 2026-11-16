@@ -41,6 +41,7 @@ __all__ = ["SGLangNativeGenerationEngine"]
 _HEALTH_TIMEOUT_S = 1800.0
 _REQUEST_TIMEOUT_S = 3600.0
 _SGLANG_DIFFUSION_PATCH_PATH = "docker/patch/sglang/v0.5.21.patch"
+_SGLANG_ART_PATCH_PATH = "docker/patch/sglang/v0.5.21-sensenova-art.patch"
 _REQUIRED_DIFFUSION_SAMPLING_FIELDS = frozenset(
     {
         "initial_noise_group_ids",
@@ -58,23 +59,31 @@ def _verify_diffusion_patch_contract(pipeline_config=None) -> None:
     import inspect
 
     if pipeline_config is not None and type(pipeline_config).__name__ == "SenseNovaU1PipelineConfig":
-        from sglang.multimodal_gen.configs.sample.sensenova_u1 import SenseNovaU1SamplingParams
-        from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
-        from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import SenseNovaU1Pipeline
-
-        if "rollout_options" not in {field.name for field in fields(SenseNovaU1SamplingParams)}:
-            raise RuntimeError("SenseNova sampling parameters lack the rollout protocol")
-        if not callable(getattr(SenseNovaU1Pipeline, "set_lora_from_tensors", None)) or (
-            "replay_conditions" not in inspect.getsource(NEOChatModel.prepare_it2i_conditioning)
-        ):
+        try:
+            from sglang.multimodal_gen.configs.sample.sensenova_u1 import SenseNovaU1SamplingParams
+            from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
+            from sglang.multimodal_gen.runtime.models.sensenova_u1.rollout import ART_ROLLOUT_PROTOCOL_VERSION
+            from sglang.multimodal_gen.runtime.models.sensenova_u1.weights import validate_dense_bucket
+            from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import RolloutDitTrajectory
+        except ImportError as exc:
             raise RuntimeError(
-                "SenseNova lacks online LoRA or canonical replay conditions. Apply the integrated "
-                f"{_SGLANG_DIFFUSION_PATCH_PATH} to the pinned SGLang source before launching RL."
-            )
-        from sglang.multimodal_gen.runtime.models.sensenova_u1.weights import validate_dense_bucket
+                f"SenseNova ART requires {_SGLANG_ART_PATCH_PATH} after the base SGLang patch."
+            ) from exc
 
-        if not callable(validate_dense_bucket):
-            raise RuntimeError("SenseNova lacks strict dense weight-bucket validation")
+        required_methods = (
+            "prepare_it2i_conditioning",
+            "initialize_it2i_latents",
+            "it2i_timesteps",
+            "predict_it2i_velocity",
+        )
+        if (
+            ART_ROLLOUT_PROTOCOL_VERSION != 5
+            or "rollout_options" not in {field.name for field in fields(SenseNovaU1SamplingParams)}
+            or "old_velocities" not in {field.name for field in fields(RolloutDitTrajectory)}
+            or not all(callable(getattr(NEOChatModel, method, None)) for method in required_methods)
+            or not callable(validate_dense_bucket)
+        ):
+            raise RuntimeError(f"Incomplete SenseNova ART protocol; apply {_SGLANG_ART_PATCH_PATH}.")
         return
 
     try:
@@ -325,17 +334,6 @@ class SGLangNativeGenerationEngine(RayActor):
         ``nccl_port`` is consumed, by ``_compute_server_args``.
         """
         self._url = self._launch_server(host, port, engine_args)
-        self._wait_healthy(timeout=_HEALTH_TIMEOUT_S)
-        return {"rank": self.rank, "url": self._url, "active_version": self._active_version}
-
-    def attach_server(self, url: str) -> Dict[str, Any]:
-        """Connect a standalone validation client without creating a Ray
-        cluster."""
-        if self.process is not None:
-            raise RuntimeError("Cannot attach an external server while owning a managed server process")
-        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-            raise ValueError("url must be an HTTP(S) server URL")
-        self._url = url.rstrip("/")
         self._wait_healthy(timeout=_HEALTH_TIMEOUT_S)
         return {"rank": self.rank, "url": self._url, "active_version": self._active_version}
 

@@ -8,11 +8,19 @@ understanding branch. GRPO and image SFT retain their existing entry points.
 
 ## Environment and inputs
 
-Use the SGLang **v0.5.21** environment and apply
-`docker/patch/sglang/v0.5.21.patch` to its source before installation. Restart
-existing engines after updating the patch. The default older SGLang image is
-not sufficient. CUDA, FlashAttention, Ray, PyTorch and Transformers must match
-the supported training image; do not upgrade only one package in place.
+Use a CUDA 13 image built from this branch's `docker/Dockerfile.cu13`.
+SGLang **v0.5.21** and the general Relax patch are already provided by #495;
+this contribution does not upgrade that version. The image additionally applies
+`docker/patch/sglang/v0.5.21-sensenova-art.patch` after the unchanged general
+`v0.5.21.patch`. If maintaining a separate image, apply these two patches in
+that order to the pinned v0.5.21 source before installation. Rebuild and restart
+existing engines to load the ART overlay; no separate package upgrade is needed.
+
+The ART overlay adds SenseNova ODE capture, exact replay conditions, FP32 cached
+velocities, transport and dense weight validation. It retains the default RoPE
+reuse optimization and native attention dispatch. SenseNova-specific LoRA,
+TP/SP/distributed CFG and optional FA3 adapters are outside this profile;
+generic capabilities supplied by the base Relax patch are unchanged.
 
 The optional TextPecker example additionally needs `openai`, `lpips` and offline
 AlexNet weights at `$TORCH_HOME/hub/checkpoints/alexnet-owt-7be5be79.pth`

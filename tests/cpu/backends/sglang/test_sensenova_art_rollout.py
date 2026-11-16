@@ -262,3 +262,52 @@ def test_art_adapter_also_rejects_invalid_cached_payloads_without_wire_revalidat
         mapped["timesteps"] = mapped["timesteps"].half()
     with pytest.raises(ValueError, match="ART"):
         SenseNovaU1ImageEditAdapter().pack_trajectory(mapped)
+
+
+@pytest.mark.parametrize("legacy_runtime", [False, True])
+def test_art_preflight_requires_velocity_protocol_without_lora(monkeypatch, legacy_runtime):
+    import sys
+    import types
+    from dataclasses import make_dataclass
+
+    from relax.backends.sglang.diffusion_engine import _verify_diffusion_patch_contract
+
+    def model_method(*args, **kwargs):
+        return None
+
+    model = type(
+        "NEOChatModel",
+        (),
+        {
+            name: model_method
+            for name in (
+                "prepare_it2i_conditioning",
+                "initialize_it2i_latents",
+                "it2i_timesteps",
+                "predict_it2i_velocity",
+            )
+        },
+    )
+    modules = {
+        "sglang.multimodal_gen.configs.sample.sensenova_u1": {
+            "SenseNovaU1SamplingParams": make_dataclass("Sampling", [("rollout_options", dict)])
+        },
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat": {"NEOChatModel": model},
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.rollout": {"ART_ROLLOUT_PROTOCOL_VERSION": 5},
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.weights": {"validate_dense_bucket": model_method},
+        "sglang.multimodal_gen.runtime.post_training.rl_dataclasses": {
+            "RolloutDitTrajectory": make_dataclass(
+                "Trajectory", [] if legacy_runtime else [("old_velocities", object)]
+            )
+        },
+    }
+    for name, attributes in modules.items():
+        module = types.ModuleType(name)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, name, module)
+    config = type("SenseNovaU1PipelineConfig", (), {})()
+    if legacy_runtime:
+        with pytest.raises(RuntimeError, match="v0.5.21-sensenova-art.patch"):
+            _verify_diffusion_patch_contract(config)
+    else:
+        _verify_diffusion_patch_contract(config)

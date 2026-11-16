@@ -10,19 +10,24 @@ import torch
 from relax.backends.sglang.diffusion_engine import _deserialize
 
 
-@pytest.fixture(autouse=True)
-def install_codec(monkeypatch):
-    # Exercise the shipped patch, including its actual import path at the receiver.
-    global codec
-    name = "sglang.multimodal_gen.runtime.entrypoints.post_training.mask_codec"
+def _overlay_module(name):
     path = "python/" + name.replace(".", "/") + ".py"
-    patch = (Path(__file__).resolve().parents[4] / "docker/patch/sglang/v0.5.21.patch").read_text()
+    patch = (Path(__file__).resolve().parents[4] / "docker/patch/sglang/v0.5.21-sensenova-art.patch").read_text()
     section = patch.split(f"diff --git a/{path} b/{path}\n", 1)[1].split("diff --git ", 1)[0]
     source = "\n".join(
         line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++")
     )
-    codec = types.ModuleType(name)
-    exec(compile(source, path, "exec"), codec.__dict__)
+    module = types.ModuleType(name)
+    exec(compile(source, path, "exec"), module.__dict__)
+    return module
+
+
+@pytest.fixture(autouse=True)
+def install_codec(monkeypatch):
+    # Execute the actual new-file implementation shipped in the image overlay.
+    global codec
+    name = "sglang.multimodal_gen.runtime.entrypoints.post_training.mask_codec"
+    codec = _overlay_module(name)
     monkeypatch.setitem(sys.modules, name, codec)
 
 
@@ -105,3 +110,43 @@ def test_only_art_leaf_encoded_without_mutating_environment():
     assert torch.equal(_deserialize(encoded)["prefix_attention_mask"], value)
     env.image_kwargs["sensenova_rollout"]["capture"] = "terminal"
     assert "__tensor__" in codec.serialize_art_conditions(env, _maybe_serialize)["prefix_attention_mask"]
+
+
+def test_rope_reuse_preserves_results_and_clears_between_forwards():
+    from copy import deepcopy
+
+    cache = _overlay_module("sglang.multimodal_gen.runtime.models.sensenova_u1.rope_cache")
+
+    class Rotary(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("inv_freq", torch.tensor([0.5, 1.0]))
+            self.attention_scaling, self.rope_type, self.calls = 1.0, "default", 0
+
+        def forward(self, x, position_ids):
+            self.calls += 1
+            return (position_ids[..., None] * self.inv_freq).cos().to(x.dtype)
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList(
+                [torch.nn.ModuleDict({"rotary_emb": Rotary(), "rotary_emb_hw": Rotary()}) for _ in range(2)]
+            )
+            for layer in self.layers:
+                layer.self_attn = SimpleNamespace(rotary_emb=layer["rotary_emb"], rotary_emb_hw=layer["rotary_emb_hw"])
+
+        def forward(self, x, positions):
+            return sum(
+                layer["rotary_emb"](x, positions) + layer["rotary_emb_hw"](x, positions) for layer in self.layers
+            )
+
+    decoder = Decoder()
+    reference = deepcopy(decoder)
+    cache.install_rope_cache(SimpleNamespace(language_model=SimpleNamespace(model=decoder)))
+    x, positions = torch.ones(1, dtype=torch.bfloat16), torch.tensor([[0.0, 1.0]])
+    torch.testing.assert_close(decoder(x, positions), reference(x, positions), rtol=0, atol=0)
+    assert [layer["rotary_emb"].calls for layer in decoder.layers] == [1, 0]
+    positions.add_(1)  # Same storage address, different forward: the cache must expire.
+    torch.testing.assert_close(decoder(x, positions), reference(x, positions), rtol=0, atol=0)
+    assert [layer["rotary_emb"].calls for layer in decoder.layers] == [2, 0]
