@@ -1409,7 +1409,7 @@ def train_one_step(
             # build_schedule_plan path doesn't go through model() so the
             # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
             # chunked-logits incompatibility is enforced as a hard assert in
-            # arguments.py.slime_validate_args, so bypass mode is guaranteed
+            # arguments.py.relax_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
             if use_indexer_replay:
                 with IndexerReplay.forward_stage():
