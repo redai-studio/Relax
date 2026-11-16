@@ -18,7 +18,6 @@ MODEL_ARGS=(
     --norm-epsilon 1e-6
     --rotary-percent 0.25
     --swiglu
-    --untie-embeddings-and-output-weights
     --vocab-size 248320
 
     --rotary-base 10000000

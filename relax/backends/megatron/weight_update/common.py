@@ -38,6 +38,9 @@ def gdn_component_sizes(config, tp_size: int, name: str) -> tuple[int, ...] | No
 
 def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
     if split_sizes is not None:
+        # At TP=1 the gathered tensor already has every GDN component in order.
+        if len(partitions) == 1:
+            return partitions[0].contiguous()
         assert partition_dim == 0, "GDN components must be sharded along rows"
         components = [part.split(split_sizes, dim=0) for part in partitions]
         return torch.cat([parts[index] for index in range(len(split_sizes)) for parts in components], dim=0)
@@ -228,7 +231,11 @@ def _named_params_and_buffers_global(
 
                 # MTP layer indices start from 0
                 middle_path, layer_idx, rest = match.groups()
-                expert_pattern = r"transformer_layer.mlp.experts\.(.+)\.weight(\d+)"
+                # GPT MTP uses transformer_layer; hybrid MTP (e.g. Qwen3.8)
+                # nests its transformer layer inside mtp_model_layer.layers.
+                expert_pattern = (
+                    r"((?:transformer_layer|mtp_model_layer\.layers\.\d+)\.mlp\.experts\..+)\.weight(\d+)$"
+                )
                 match = re.match(expert_pattern, rest)
                 if not match:
                     yield name, param
@@ -241,7 +248,7 @@ def _named_params_and_buffers_global(
                 else:
                     middle_path += "."
                 yield (
-                    f"module.module.{middle_path}mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.weight{expert_idx}",
+                    f"module.module.{middle_path}mtp.layers.{layer_idx}.{rest}.weight{expert_idx}",
                     param,
                 )
                 continue

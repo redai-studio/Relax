@@ -5,6 +5,8 @@ import json
 import math
 import os
 import sys
+import time
+import uuid
 import warnings
 from typing import Any
 
@@ -199,6 +201,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(TensorBackuper + _switch_model), so the actor handles ref / actor_fwd / advantages "
                     "internally on its own GPUs while rollout runs on a separate GPU placement group. "
                     "Mutually exclusive with passing --fully-async and --colocate together."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-weights-backuper-on-gpu",
+                action="store_true",
+                default=False,
+                help=(
+                    "Only takes effect with --hybrid. Keeps the 'actor' "
+                    "TensorBackuper snapshot used for the DCS actor->rollout weight push "
+                    "on-device instead of host-pinned memory, trading a permanent extra "
+                    "device-resident copy of the model (full size at TP=1, sharded by TP degree "
+                    "otherwise) for skipping the D2H backup copy + H2D push-time copy "
+                    "(relax/distributed/checkpoint_service/backends/device_direct.py's "
+                    "_named_params_and_buffers). Off by default: raises peak GPU memory, so only "
+                    "enable if headroom is confirmed for the model being trained."
                 ),
             )
             parser.add_argument(
@@ -574,11 +591,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "logits. Default off — legacy external-loss SFT path materializes full logits "
                 "and runs CE externally. Set --sft-chunked-logits to opt in. MTP head calls "
                 "continue to use the real output_layer before the main head is deferred. "
-                "Incompatible when embeddings are tied "
-                "(--untie-embeddings-and-output-weights not set: output_layer is built with "
-                "skip_weight_param_allocation=True so output_layer.weight is None and the "
-                "chunked path's lm_head matmul has nothing to multiply against; tied models "
-                "are small enough that the chunked path's memory win is marginal anyway).",
+                "Tied embeddings reuse the explicit shared weight passed to the main output layer. "
+                "Chunked recomputation with tied embeddings does not support overlapping "
+                "gradient reduction.",
             )
             parser.add_argument(
                 "--only-train-params-name-list",
@@ -2306,7 +2321,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # wandb
         def add_wandb_arguments(parser):
             # wandb parameters
-            parser.add_argument("--use-wandb", action="store_true", default=False)
+            parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=False)
             parser.add_argument(
                 "--wandb-mode",
                 type=str,
@@ -2387,7 +2402,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_clearml_arguments(parser):
             # TODO(yuetian): Reuse tb-experiment-name --tb-project-name as the ClearML experiment name currently.
             # Need to refactor the experiment management part later.
-            parser.add_argument("--use-clearml", action="store_true", default=False)
+            parser.add_argument("--use-clearml", action=argparse.BooleanOptionalAction, default=False)
 
             return parser
 
@@ -2475,6 +2490,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=("Dump all details of training for post-hoc analysis and visualization."),
+            )
+            parser.add_argument(
+                "--dump-agentic-obs",
+                type=str,
+                default=None,
+                help=(
+                    "Dump agentic rollout observability to this directory, one wall-clock subdirectory "
+                    "`<dir>/run_YYYYmmdd_HHMMSS/` per run. Holds three JSONL streams joined by "
+                    "sample_export_id: trajectories/ (the exported lineage, written by each SessionShard), "
+                    "stages/ (reward, selection, transfer and optimizer events) "
+                    "and train/ (actual update inputs, response masks and scalars, written by the policy actor). Unset disables "
+                    "every producer. Independent of --dump-details, which dumps whole .pt tensors."
+                ),
+            )
+            parser.add_argument(
+                "--dump-agentic-obs-media",
+                action="store_true",
+                default=False,
+                help=(
+                    "Also write the media bytes referenced by --dump-agentic-obs trajectories to `media/`, "
+                    "content-addressed by sha256. Without it, inline data: URIs are replaced by their digest "
+                    "and the bytes are dropped. Ignored without --dump-agentic-obs."
+                ),
             )
             parser.add_argument(
                 "--rollout-result-dir",
@@ -3140,7 +3178,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
-    slime_validate_args(args)
+    relax_validate_args(args)
 
     if args.train_backend == "fsdp":
         from relax.backends.fsdp.arguments import validate_generative_config
@@ -4029,7 +4067,16 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
         )
 
 
-def slime_validate_args(args):
+def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
+    if args.colocate and not args.rollout_num_gpus:
+        args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
+    else:
+        args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
+        args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
+    args.colocate = False
+
+
+def relax_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
@@ -4429,6 +4476,19 @@ def slime_validate_args(args):
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
 
+    if getattr(args, "dump_agentic_obs", None):
+        # Derived rather than parsed, and stamped exactly once here on the
+        # driver, then carried inside the pickled args Namespace to every Ray
+        # actor. Deriving it lazily per actor would give the SessionShards, the
+        # rollout driver and the actors different directories, splitting one
+        # run's streams across many roots. The suffix separates launches
+        # started in the same second, even when they share an output root.
+        args.agentic_obs_run_id = f"{time.strftime('run_%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:12]}"
+    elif getattr(args, "dump_agentic_obs_media", False):
+        # The media flag only modifies a dump that is not happening. Say so,
+        # rather than letting the operator wait for images that never appear.
+        logger.warning("--dump-agentic-obs-media is set but --dump-agentic-obs is not; nothing will be written.")
+
     if args.load_debug_rollout_data is not None:
         logger.info(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
@@ -4524,20 +4584,15 @@ def slime_validate_args(args):
     del args.offload
 
     if args.debug_rollout_only:
-        if args.colocate and (not args.rollout_num_gpus):
-            args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-        else:
-            args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
-            args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
-        args.colocate = False
+        _configure_rollout_only_gpus(args)
         args.offload_train = args.offload_rollout = False
         if args.train_memory_margin_bytes > 0:
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
             args.train_memory_margin_bytes = 0
 
     # Resolve --hybrid into the underlying execution flags so downstream
-    # machinery (StreamDataLoader broadcast_pp, UpdateWeightFromTensor
-    # selection, sglang_engine DCS gating) keeps a single semantic axis.
+    # machinery (StreamDataLoader broadcast_pp and SGLang DCS registration)
+    # keeps a single semantic axis.
     # `args.hybrid` remains the canonical switch for hybrid-specific
     # branches (registry, controller dispatch, train_hybrid call site).
     if args.hybrid:
@@ -4547,6 +4602,13 @@ def slime_validate_args(args):
             "hybrid mode: actor/reference/actor_fwd/advantages will share GPUs "
             "via offload/onload role switching, while rollout uses separate GPUs."
         )
+        if not args.enable_weights_backuper:
+            raise ValueError(
+                "Hybrid training requires the weights backuper for DCS synchronization: with "
+                "--disable-weights-backuper the DCS push would read detached live tensors that "
+                "carry no Megatron TP attributes, so all_gather_param would silently treat TP "
+                "shards as replicated weights. Remove --disable-weights-backuper."
+            )
     elif args.fully_async and args.colocate:
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "
@@ -4713,27 +4775,13 @@ def slime_validate_args(args):
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
-    # --sft-chunked-logits incompatibilities. Both are flagged here so
+    # --sft-chunked-logits incompatibilities are flagged here so
     # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # Both are hard asserts — the user must remove --sft-chunked-logits
+    # This is a hard assert — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
-        # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
-        #    Output_layer is built with skip_weight_param_allocation=True →
-        #    output_layer.weight is None → chunked path's lm_head matmul
-        #    crashes on NoneType. The chunked memory win is marginal on the
-        #    small models that ship with tied embeddings anyway, so the user
-        #    should just drop the flag.
-        assert getattr(args, "untie_embeddings_and_output_weights", False), (
-            "--sft-chunked-logits is incompatible with tied embeddings "
-            "(HF config.tie_word_embeddings=true → "
-            "--untie-embeddings-and-output-weights not set; output_layer.weight "
-            "is None and the chunked path's lm_head matmul has nothing to "
-            "multiply against). Remove --sft-chunked-logits; the chunked "
-            "memory win is marginal on tied-weight models."
-        )
-        # 2) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        # Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.

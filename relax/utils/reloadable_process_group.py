@@ -2,6 +2,7 @@
 
 import os
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import timedelta
 
@@ -158,10 +159,14 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         return getattr(self.group, name)
 
     @staticmethod
-    def destroy_process_groups(post_destroy_delay: float = 2.0):
+    def destroy_process_groups(post_destroy_delay: float = 2.0, *, force: bool = False):
         pid = os.getpid()
         destroyed_count = 0
         for reloadable_group in ReloadableProcessGroup.GROUPS.get(pid, []):
+            if not force and getattr(reloadable_group, "_keep_alive_for_weight_sync", False):
+                continue
+            if force:
+                reloadable_group._keep_alive_for_weight_sync = False
             if reloadable_group.group is None:
                 continue
             try:
@@ -186,9 +191,14 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
             time.sleep(post_destroy_delay)
 
     @staticmethod
-    def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
+    def reload_process_groups(
+        timeout_minutes: int = 30,
+        max_retries: int = 3,
+        retry_delay: float = 5.0,
+        process_groups: Sequence["ReloadableProcessGroup"] | None = None,
+    ):
         pid = os.getpid()
-        reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
+        reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, []) if process_groups is None else process_groups
         logger.info(f"Reloading {len(reloadable_groups)} process groups in pid {pid}")
         old_new_group = old_new_group_dict.get(pid)
         for idx, reloadable_group in enumerate(reloadable_groups):
@@ -361,22 +371,54 @@ def _should_skip_reload_and_destroy() -> bool:
     return device_utils.is_klx()
 
 
-def destroy_process_groups(post_destroy_delay: float = 2.0):
-    """Destroy all reloadable process groups."""
+def destroy_process_groups(post_destroy_delay: float = 2.0, *, force: bool = False):
+    """Release offloaded groups; force also releases retained sync groups."""
     if _should_skip_reload_and_destroy():
         return
     if device_utils.is_npu_available:
         post_destroy_delay = 0.0
-    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
+    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay, force=force)
 
 
-def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
-    """Reload all reloadable process groups."""
+def reload_process_groups(
+    timeout_minutes: int = 30,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
+    process_groups: Sequence[ReloadableProcessGroup] | None = None,
+):
+    """Reload all groups, or just the audited groups needed by this phase."""
     if _should_skip_reload_and_destroy():
         return
     ReloadableProcessGroup.reload_process_groups(
-        timeout_minutes=timeout_minutes, max_retries=max_retries, retry_delay=retry_delay
+        timeout_minutes=timeout_minutes,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        process_groups=process_groups,
     )
+
+
+def retain_process_groups(
+    process_groups: Sequence[dist.ProcessGroup], *, metadata_group: dist.ProcessGroup
+) -> tuple[ReloadableProcessGroup, ...] | None:
+    """Agree on a globally ordered subset before retaining any communicator.
+
+    Singleton/native groups are already resident. Unknown proxy registries fall
+    back to full reload; no rank may independently skip group creation. The
+    caller must first use these groups outside its offload allocation pool.
+    """
+    registry = ReloadableProcessGroup.GROUPS.get(os.getpid(), [])
+    indices = [index for index, group in enumerate(registry) if any(group is item for item in process_groups)]
+    supported = all(isinstance(group, ReloadableProcessGroup) for group in process_groups)
+    supported = supported and len(indices) == len({id(group) for group in process_groups})
+    signature = [list(group.group_info["ranks"]) for group in registry]
+    plans = [None] * dist.get_world_size(group=metadata_group)
+    dist.all_gather_object(plans, (signature, indices, supported), group=metadata_group)
+    if any(not ready or other != signature for other, _, ready in plans):
+        return None
+    selected = tuple(registry[index] for index in sorted({index for _, entries, _ in plans for index in entries}))
+    for group in selected:
+        group._keep_alive_for_weight_sync = True
+    return selected
 
 
 @contextmanager

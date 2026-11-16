@@ -1288,9 +1288,11 @@ def calculate_log_probs_and_entropy(
                 log_prob_keep_mask=log_prob_keep_mask,
             )
     else:
-        log_prob = logits.new_zeros((0,))
+        # Empty CP response shards still participate in differentiable
+        # redistribution; keep the zero-size result connected to logits.
+        log_prob = logits.sum(dim=-1)
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = log_prob if with_entropy_grad else log_prob.detach()
 
     return log_prob, entropy
 

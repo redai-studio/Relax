@@ -163,6 +163,7 @@ def main() -> None:
                 "flashqla": "/tmp/qwen35-build/0.1.3-kkt-no-tma.patch",
                 "megatron": "/root/Megatron-LM/20261020-qwen35-optimized.patch",
                 "model_operators": "/root/Megatron-LM/20261020-model-operators.patch",
+                "checkpoint": "/root/Megatron-LM/20261028-dp-reshardable-checkpoint.patch",
             }.items()
         },
         "gpu_validated": False,

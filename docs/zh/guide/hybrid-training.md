@@ -15,7 +15,7 @@
 | ------------------- | ----------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
 | **GPU 布局**        | Actor 与 Rollout 分时复用同一组 GPU       | Actor / Rollout / ActorFwd / Reference 各自独立 GPU          | Actor 与 Rollout 独立 GPU；ref / actor_fwd / adv 复用 actor 的 GPU                    |
 | **数据流水线**      | TransferQueue，批同步                     | TransferQueue + StreamingDataLoader，完全流式                | TransferQueue + 子批次流式（`num-iters-per-train-update`）                            |
-| **权重同步**        | 进程内 tensor 拷贝                        | 通过 DCS（Checkpoint Engine）做 NCCL broadcast               | 同步的 `UpdateWeightFromTensor` 推给 rollout；ref/actor_fwd 走 TensorBackuper          |
+| **权重同步**        | 进程内 tensor 拷贝                        | 通过 DCS（Checkpoint Engine）做 NCCL broadcast               | 通过 DCS 做 NCCL broadcast 推给 rollout；ref/actor_fwd 走 TensorBackuper |
 | **Staleness**       | `max_staleness = 0`（严格 on-policy）     | 可配置 `max_staleness`                                       | 可配置 `max_staleness`                                                                 |
 | **部署的角色**      | `actor`, `critic`, `rollout`              | `actor`, `critic`, `rollout`, `advantages`, `reference`, `actor_fwd` | `actor`, `critic`, `rollout`（与 Colocate 相同；ref/actor_fwd 在 actor 内部）         |
 | **DP token 均衡**   | 静态/序列长度路径通过 `--balance-data` 支持 | 动态 batch 自动做 DP token 均衡；`--balance-data` 可传入但无额外效果 | 动态 batch 自动做 DP token 均衡；静态/序列长度路径可使用 `--balance-data`              |
@@ -150,12 +150,19 @@ ______________________________________________________________________
 
 ### 常用可选参数
 
-| 参数                          | 说明                                                                                                    |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `--balance-data`              | Hybrid 模式下可传入。启用 `--use-dynamic-batch-size` 时，DP token 均衡由流式 sampler 自动完成；在静态/序列长度路径上，该参数会启用 DP token 均衡。 |
-| `--num-data-storage-units`    | TransferQueue 存储 actor 的数量。                                                                       |
-| `--use-streaming-dataset`     | 从磁盘流式读取 prompts，而不是全量载入内存。                                                            |
-| `--ref-update-interval`       | 周期性地用最新 actor 权重刷新缓存的 ref 权重。                                                          |
+| 参数                                 | 说明                                                                                                                                          |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--hybrid-weights-backuper-on-gpu`   | 把 DCS 推送读取的 `actor` 快照常驻 GPU（省每步 D2H+H2D 往返），代价是常驻一份模型显存；默认关闭（快照在锁页内存）              |
+| `--balance-data`                     | Hybrid 模式下可传入。启用 `--use-dynamic-batch-size` 时，DP token 均衡由流式 sampler 自动完成；在静态/序列长度路径上，该参数会启用 DP token 均衡。 |
+| `--num-data-storage-units`           | TransferQueue 存储 actor 的数量。                                                                                                             |
+| `--use-streaming-dataset`            | 从磁盘流式读取 prompts，而不是全量载入内存。                                                                                                  |
+| `--ref-update-interval`              | 周期性地用最新 actor 权重刷新缓存的 ref 权重。                                                                                                |
+
+::: warning
+Hybrid 模式与 `--disable-weights-backuper` 互斥（启动即报错）：DCS 推送读取 TensorBackuper 的解耦快照，Noop backuper 会让它读到不带 TP 属性的活模型 tensor，导致静默推错权重。多模态组合仍需按具体模型验证权重转换与 offload 生命周期；LoRA adapter 模式下弹性扩缩与崩溃恢复的组合不保证重建引擎重新挂载 Router。
+:::
+
+Hybrid 默认通过 DCS 同步权重，与 Fully Async 使用同一套同步机制。`--autoscaler-config` 只用于配置弹性扩缩容；YAML 中 `enabled: false` 关闭自动决策，仍可手动扩缩容。
 
 ### 默认值覆盖
 
@@ -237,7 +244,7 @@ ______________________________________________________________________
 
 Hybrid 模式计划推进的工作：
 
-- **接入 DCS 做权重同步** —— 用 Distributed Checkpoint Service 替换当前同步的 `UpdateWeightFromTensor` 路径，使权重向 rollout 广播能够与下一轮训练迭代重叠，消除每次 `train_hybrid` 结束时残留的同步阻塞。
+- ~~**接入 DCS 做权重同步**~~ —— 已作为 Hybrid 默认同步机制落地（见上方配置节）。DCS 后端让 Hybrid 直接复用 fully async 的弹性扩缩容链路（扩出的引擎注册 DCS 后随每步广播获得权重），见 [弹性 Rollout](./elastic-rollout.md)。后续将多模态模型纳入该后端，并评估推送与下一轮训练重叠的优化。
 - **将 `train_actor` 拆分为 `num_iters_per_train_update` 次训练迭代** —— 目前 `num_iters_per_train_update` 只对 forward 阶段做了切分，合并后的训练步仍然在整个全局 batch 上跑一次。下一步将训练步同样切成 `num_iters_per_train_update` 次，让优化器更新与 TransferQueue 数据消费形成流水线，并进一步压低训练侧峰值显存。
 
 相关文档：

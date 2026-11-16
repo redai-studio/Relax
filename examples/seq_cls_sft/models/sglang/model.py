@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Iterable, Optional, Tuple, Type
 
 import torch
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType, score_and_pool
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch

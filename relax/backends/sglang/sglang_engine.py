@@ -289,12 +289,10 @@ _MAX_CONSECUTIVE_CONNECT_ERRORS = 3
 
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
-    if args.colocate:
-        start_index = (rank * num_gpus) % args.num_gpus_per_node
-    else:
-        num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
-        start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
-    return start_index
+    start_index = rank * num_gpus
+    if not args.colocate and not args.debug_rollout_only:
+        start_index += args.actor_num_gpus_per_node * args.actor_num_nodes
+    return start_index % args.num_gpus_per_node
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
@@ -495,6 +493,7 @@ class SGLangEngine(RayActor):
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._sync_nextn_draft = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -587,6 +586,9 @@ class SGLangEngine(RayActor):
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
+            self._sync_nextn_draft = server_args_dict.get(
+                "speculative_algorithm"
+            ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
             self._init_normal(server_args_dict)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
@@ -611,6 +613,7 @@ class SGLangEngine(RayActor):
                     metadata={
                         "num_gpus_per_engine": effective_num_gpus,
                         "actor_id": ray.get_runtime_context().get_actor_id(),
+                        "sync_nextn_draft": self._sync_nextn_draft,
                     },
                 )
             )
@@ -639,6 +642,14 @@ class SGLangEngine(RayActor):
         )
         actual_server_args = _get_actual_server_args()
         _sanity_check_server_args(actual_server_args, expect_server_args)
+        # SGLang may report NEXTN as EAGLE after resolving the server args.
+        self._sync_nextn_draft = (
+            expect_server_args.get("speculative_algorithm") == "NEXTN"
+            and actual_server_args.get("speculative_algorithm") in ("NEXTN", "EAGLE")
+            and "model_path" in actual_server_args
+            and "speculative_draft_model_path" in actual_server_args
+            and _uses_target_checkpoint_for_draft(actual_server_args)
+        )
 
         if not self._skip_router_registration:
             self.register_to_router()
@@ -807,6 +818,7 @@ class SGLangEngine(RayActor):
             "ep_join_mode",
             "elastic_ep_backend",
             "speculative_algorithm",
+            "speculative_draft_model_path",
             "moe_runner_backend",
             "moe_a2a_backend",
             "json_model_override_args",
@@ -835,7 +847,11 @@ class SGLangEngine(RayActor):
             and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
         )
         config = get_hf_config(layout["model_path"])
-        text_config = getattr(config, "text_config", None) or config
+        text_config = (
+            getattr(config, "text_config", None)
+            or getattr(getattr(config, "thinker_config", None), "text_config", None)
+            or config
+        )
         if "dtype" in layout:
             from sglang.srt.configs.model_config import _get_and_verify_dtype
 
@@ -852,6 +868,11 @@ class SGLangEngine(RayActor):
             layout["moe_runner_backend"] = "triton"
         layout["num_experts"] = getattr(text_config, "num_experts", None) or getattr(
             text_config, "n_routed_experts", None
+        )
+        layout["num_shared_experts"] = (
+            getattr(text_config, "n_shared_experts", None)
+            or getattr(text_config, "num_shared_experts", None)
+            or int(bool(getattr(text_config, "shared_expert_intermediate_size", 0)))
         )
         for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
             layout[key] = getattr(text_config, key, None)
@@ -1421,6 +1442,8 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if self._sync_nextn_draft:
+            payload["selector"] = "all"
         return self._make_request(
             "update_weights_from_distributed",
             payload,
@@ -1909,6 +1932,13 @@ class GenRMEngine(SGLangEngine):
             logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
 
+def _uses_target_checkpoint_for_draft(server_args: dict) -> bool:
+    draft_path = server_args.get("speculative_draft_model_path")
+    draft_revision = server_args.get("speculative_draft_model_revision") or "main"
+    target_revision = server_args.get("revision") or "main"
+    return draft_path is None or (draft_path == server_args["model_path"] and draft_revision == target_revision)
+
+
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
     if getattr(args, "enable_mtp_training", False):
         return False
@@ -2056,6 +2086,26 @@ def _compute_genrm_server_args(
         kwargs[key] = value
         unused_keys.discard(key)
 
+    # CUDA IPC cannot cross nodes, and SGLang rejects it on ROCm. Resolve the default
+    # after GenRM's own topology and overrides; an explicit None retains SGLang's
+    # automatic selection.
+    if (
+        "mm_feature_transport" in server_arg_fields
+        and "mm_feature_transport" not in (args.genrm_engine_config or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
+
+    if (
+        "cuda_graph_backend_prefill" in server_arg_fields
+        and kwargs.get("enable_memory_saver")
+        and kwargs.get("cuda_graph_backend_prefill") is None
+    ):
+        # Match policy engines: the default breakable prefill backend is incompatible with memory saver mode.
+        kwargs["cuda_graph_backend_prefill"] = "disabled"
+
     # for compatibility with old args
     if len(unused_keys) > 0:
         logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
@@ -2168,6 +2218,18 @@ def _compute_server_args(
                 logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
             kwargs[key] = value
             unused_keys.discard(key)
+
+    # Use CUDA IPC only for engines confined to one node; multi-node engines
+    # retain SGLang's auto policy, including CUDA VMM where supported. SGLang
+    # rejects CUDA IPC on ROCm, so ROCm engines always keep the auto policy.
+    if (
+        "mm_feature_transport" in server_arg_field_names
+        and "mm_feature_transport" not in (sglang_overrides or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
 
     # Repeated policy updates benefit from keeping shared and routed experts
     # separate. Explicit per-engine settings or enforced fusion take precedence.

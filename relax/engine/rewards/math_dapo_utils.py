@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import re
 import signal
 
@@ -167,7 +169,7 @@ def normalize_final_answer(final_answer: str) -> str:
 
 
 def is_correct_minerva(
-    solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
+    solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)(?=Answer\s*:\s*([^\n]+))"
 ) -> tuple[bool, str]:
     """Check if the solution is correct according to Minerva criteria.
 
@@ -180,10 +182,15 @@ def is_correct_minerva(
     Returns:
         Tuple of (is_correct, normalized_prediction)
     """
-    # Extract answer from solution
+    # Overlapping matches prevent a heading from consuming the next Answer marker.
     match = re.findall(answer_pattern, solution_str)
     extracted_answer = match[-1] if match else "[INVALID]"
+    boxed_answer = last_boxed_only_string(extracted_answer)
+    if boxed_answer is not None:
+        extracted_answer = remove_boxed(boxed_answer)
     pred = normalize_final_answer(extracted_answer)
+    if re.fullmatch(r"[+-]?\d+(?:\.0+)?", pred):
+        pred = str(int(pred.split(".", 1)[0]))
 
     # Process ground truth
     if gt_need_extract:

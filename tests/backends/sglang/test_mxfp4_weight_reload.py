@@ -34,6 +34,7 @@ def _method(backend: str):
     }
     exec(compile(ast.Module(body=[cls], type_ignores=[]), "<sglang-mxfp4-hooks>", "exec"), namespace)
     method = namespace["Mxfp4MoEMethod"]()
+    method.use_mega_moe = backend == "megamoe"
     method.use_deep_gemm = backend in ("deep_gemm", "megamoe")
     method.use_triton_kernels = backend == "triton"
     method.use_flashinfer = backend == "sm90"
