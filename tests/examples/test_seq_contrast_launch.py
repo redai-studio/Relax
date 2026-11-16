@@ -16,20 +16,40 @@ SCRIPT = ROOT / "examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-nli-pt-8xgpu.
 
 
 @pytest.mark.parametrize(
-    ("model_type", "initializer"), [("qwen2_vl", None), ("qwen2_vl", "xavier"), ("qwen3_5", None)]
+    ("model_type", "initializer", "shape"),
+    [
+        ("qwen2_vl", None, None),
+        ("qwen2_vl", "xavier", None),
+        ("qwen3_5", None, ("0.8b", 1024, 3584, 24, 8, 2, True)),
+        ("qwen3_5", None, ("2b", 2048, 6144, 24, 8, 2, True)),
+        ("qwen3_5", None, ("4b", 2560, 9216, 32, 16, 4, True)),
+        ("qwen3_5", None, ("9b", 4096, 12288, 32, 16, 4, False)),
+    ],
 )
-def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, model_type, initializer):
-    qwen35 = model_type == "qwen3_5"
-    model = tmp_path / "models" / ("Qwen3.5-0.8B-emb" if qwen35 else "Qwen2-VL-2B-Instruct-emb")
+def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, model_type, initializer, shape):
+    qwen35 = shape is not None
+    model = tmp_path / "models" / ("Qwen3.5-emb" if qwen35 else "Qwen2-VL-2B-Instruct-emb")
     model.mkdir(parents=True)
-    (model / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": model_type,
-                "text_config": {"vocab_size": 248320 if qwen35 else 151665, "hidden_size": 1024 if qwen35 else 1536},
-            }
-        )
-    )
+    config = {"model_type": model_type, "text_config": {"vocab_size": 151665}}
+    if qwen35:
+        size, hidden, ffn, layers, heads, groups, tied = shape
+        config["tie_word_embeddings"] = tied
+        config["text_config"] = {
+            "hidden_size": hidden,
+            "intermediate_size": ffn,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "num_key_value_heads": groups,
+            "head_dim": 256,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 248320,
+            "rope_parameters": {
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+            },
+        }
+    (model / "config.json").write_text(json.dumps(config))
     binaries = tmp_path / "bin"
     binaries.mkdir()
     capture = tmp_path / "submission.json"
@@ -77,10 +97,15 @@ def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, model_ty
     assert "--custom-megatron-before-train-step-hook-path" not in args
     assert "--use-tensorboard" not in args
     assert "--no-wait" not in args
-    profile = "qwen35-0.8b" if qwen35 else "qwen2-vl-2b"
+    profile = f"qwen35-{size}" if qwen35 else "qwen2-vl-2b"
     experiment = "explicit-xavier-run" if initializer else f"{profile}-nli-bridge-lora-kaiming-dp8"
     if qwen35:
-        assert args[args.index("--hidden-size") + 1] == "1024"
+        assert args[args.index("--hidden-size") + 1] == str(hidden)
+        assert args[args.index("--ffn-hidden-size") + 1] == str(ffn)
+        assert args[args.index("--num-layers") + 1] == str(layers)
+        assert args[args.index("--num-attention-heads") + 1] == str(heads)
+        assert args[args.index("--num-query-groups") + 1] == str(groups)
+        assert ("--untie-embeddings-and-output-weights" in args) == (not tied)
         assert args[args.index("--lora-target-modules") + 1 : args.index("--lora-scope")] == [
             "linear_proj",
             "linear_fc2",
