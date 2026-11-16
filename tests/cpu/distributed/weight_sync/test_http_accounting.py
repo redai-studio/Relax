@@ -10,11 +10,13 @@ from relax.distributed.weight_sync.sglang_loader import SGLangHTTPGroup
 
 def test_actual_control_bodies_are_counted_on_success_and_error(tmp_path):
     received = []
+    authorization = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             received.append(body)
+            authorization.append(self.headers.get("Authorization"))
             value = json.loads(body)
             reply = b'{"ok":true}'
             self.send_response(409 if value["action"] == "fail" else 200)
@@ -32,6 +34,7 @@ def test_actual_control_bodies_are_counted_on_success_and_error(tmp_path):
         group.url = f"http://127.0.0.1:{server.server_port}"
         group.owner, group.installation_identity = "test", None
         group.headers = {"Authorization": "Bearer synthetic-test-value"}
+        group.control_headers = {"Authorization": "Bearer synthetic-admin-value"}
         group.audit_directory = tmp_path
         try:
             with time_budget(1800):
@@ -44,6 +47,8 @@ def test_actual_control_bodies_are_counted_on_success_and_error(tmp_path):
             report = json.loads(raw)
             assert report["bytes_by_scope"]["http_body"]["C"] == sum(map(len, received)) + 2 * len(b'{"ok":true}')
             assert "synthetic-test-value" not in raw and "Authorization" not in raw
+            assert "synthetic-admin-value" not in raw
+            assert authorization == ["Bearer synthetic-admin-value"] * 2
             assert not report["physical_link_coverage_complete"]
             # A fresh controller reuses the audit directory after a server
             # restart. Its counters must not erase the previous controller.
