@@ -2,7 +2,9 @@
 
 import argparse
 import importlib
+import json
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -201,6 +203,42 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+@pytest.mark.parametrize("late_override", [False, True])
+def test_source_mixture_parser_and_final_validation(arguments_module, tmp_path: Path, late_override: bool) -> None:
+    """The CLI and late YAML overrides must both reach the mixture contract."""
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    data = tmp_path / "data.jsonl"
+    data.write_text('{"prompt": "test"}\n')
+    mixture = tmp_path / "mixture.yaml"
+    mixture.write_text("sources:\n  A: {path: data.jsonl, weight: 3}\n  B: {path: data.jsonl, weight: 1}\n")
+
+    parsed = parser.parse_args(["--rollout-source-mixture", str(mixture)])
+    args = _opd_args()
+    args.rollout_source_mixture = parsed.rollout_source_mixture
+    args.rollout_function_path = "relax.engine.rollout.sglang_rollout.generate_rollout"
+    args.opd_teacher_routes = json.dumps({"A": "/teacher-a", "B": "/teacher-b"})
+    args.teacher_hf_checkpoint = None
+    args.opd_teacher_key = "data_source"
+    args.colocate = True
+    args.use_streaming_dataset = True
+    args.n_samples_per_prompt = 1
+    args.global_batch_size = 4
+    if late_override:
+        override = tmp_path / "override.yaml"
+        override.write_text("n_samples_per_prompt: 2\n")
+        args.custom_config_path = str(override)
+        with pytest.raises(ValueError, match="n_samples_per_prompt"):
+            arguments_module.slime_validate_args(args)
+    else:
+        arguments_module.slime_validate_args(args)
+        assert args.source_mixture_quotas == {"A": 3, "B": 1}
+        assert args.over_sampling_batch_size == 4
+        assert args.data_source_path == "relax.engine.rollout.source_mixture.SourceMixtureDataSource"
 
 
 def test_sequence_classification_accepts_multimodal_keys(arguments_module):

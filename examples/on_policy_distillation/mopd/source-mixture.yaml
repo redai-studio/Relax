@@ -1,0 +1,11 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Select this file with `--rollout-source-mixture /path/to/source-mixture.yaml`.
+# Dataset paths expand environment variables before source validation.
+# With global batch size 32, these weights select 24 GSM8K + 8 Geometry3K samples.
+sources:
+  openai/gsm8k:
+    path: ${DATA_DIR}/MOPD/gsm8k/train.parquet
+    weight: 3
+  hiyouga/geometry3k:
+    path: ${DATA_DIR}/MOPD/geometry3k/train.parquet
+    weight: 1
