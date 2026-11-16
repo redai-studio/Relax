@@ -236,6 +236,7 @@ def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
             _check_bridge_chunk_rounds(rank, layout, interleaved=False)
             _check_bridge_chunk_rounds(rank, layout, interleaved=True)
             _check_bf16_replicas(rank, layout)
+        dist.barrier()
         _worker_stage(rank, "all assertions passed")
     finally:
         _worker_stage(rank, "destroying Gloo")
