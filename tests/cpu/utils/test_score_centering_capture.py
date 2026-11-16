@@ -109,22 +109,31 @@ def test_score_centering_capture_uses_head_q_without_renormalizing_and_keeps_tai
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_score_centering_capture_filtered_support_uses_actual_sampled_probability(packed):
+@pytest.mark.parametrize("support_logprobs", [False, True])
+def test_score_centering_capture_filtered_support_uses_actual_sampled_probability(packed, support_logprobs):
     meta = {
         "output_token_logprobs": [[math.log(0.14), 4, None]],
         "output_token_sampling_mask": [[4, 1, 2]],
         "output_token_sampling_logprobs": [math.log(0.2)],
         "output_top_logprobs": [[[math.log(0.35), 1], [math.log(0.21), 2]]],
     }
+    if support_logprobs:
+        meta["output_token_sampling_logprobs"] = [[math.log(0.2), math.log(0.5), math.log(0.3)]]
     response = _packed_metadata(meta) if packed else meta
-    tokens, sampled, ids, logprobs = parse_score_centering_response(response, 2, sampling_mode="support", vocab_size=8)
+    tokens, sampled, ids, logprobs, coverage = parse_score_centering_response(
+        response, 2, sampling_mode="support", vocab_size=8, return_support_complete=True
+    )
+    np.testing.assert_array_equal(coverage, [False])
     assert tokens == [4]
     assert sampled == pytest.approx([math.log(0.2)])
     np.testing.assert_array_equal(ids, [[1, 2]])
     np.testing.assert_allclose(np.exp(logprobs), [[0.5, 0.3]])
     meta["output_top_logprobs"][0].extend([[math.log(0.14), 4], [math.log(0.1), 5]])
     response = _packed_metadata(meta) if packed else meta
-    _, _, ids, logprobs = parse_score_centering_response(response, 4, sampling_mode="support", vocab_size=8)
+    _, _, ids, logprobs, coverage = parse_score_centering_response(
+        response, 4, sampling_mode="support", vocab_size=8, return_support_complete=True
+    )
+    np.testing.assert_array_equal(coverage, [support_logprobs])
     np.testing.assert_array_equal(ids, [[1, 2, 4, -1]])
     assert np.isneginf(logprobs[0, 3])
 
@@ -150,6 +159,45 @@ def test_score_centering_capture_rejects_corrupt_probability_metadata(change):
         parse_score_centering_response(meta, 2, vocab_size=8)
 
 
+def test_score_centering_capture_uses_real_support_at_tied_top_k_boundary():
+    meta = {
+        "output_token_logprobs": [[math.log(0.4), 0]],
+        "output_top_logprobs": [[[math.log(0.4), 0], [math.log(0.2), 2]]],
+        "output_token_sampling_mask": [[0, 2]],
+        "output_token_sampling_logprobs": [math.log(2 / 3)],
+    }
+    _, _, ids, logprobs, coverage = parse_score_centering_response(
+        meta, 2, sampling_mode="support", return_support_complete=True
+    )
+    np.testing.assert_array_equal(ids, [[0, 2]])
+    np.testing.assert_allclose(np.exp(logprobs), [[2 / 3, 1 / 3]])
+    np.testing.assert_array_equal(coverage, [False])
+
+    meta["output_token_sampling_mask"] = [[0, 1]]
+    meta["output_token_sampling_logprobs"] = [[math.log(2 / 3), math.log(1 / 3)]]
+    _, sampled, ids, logprobs, coverage = parse_score_centering_response(
+        meta, 2, sampling_mode="support", return_support_complete=True
+    )
+    assert sampled == pytest.approx([math.log(2 / 3)])
+    np.testing.assert_array_equal(ids, [[0, -1]])
+    np.testing.assert_allclose(np.exp(logprobs), [[2 / 3, 0]])
+    np.testing.assert_array_equal(coverage, [False])
+
+
+def test_score_centering_capture_near_unit_mass_does_not_prove_complete_support():
+    meta = {
+        "output_token_logprobs": [[math.log(0.7999992), 1]],
+        "output_top_logprobs": [[[math.log(0.7999992), 1]]],
+        "output_token_sampling_mask": [[1, 2]],
+        "output_token_sampling_logprobs": [[math.log(0.999999), math.log(0.000001)]],
+    }
+    _, _, _, head, coverage = parse_score_centering_response(
+        meta, 1, sampling_mode="support", return_support_complete=True
+    )
+    assert np.isclose(np.exp(head).sum(), 1.0)
+    np.testing.assert_array_equal(coverage, [False])
+
+
 def test_score_centering_capture_requires_complete_actual_support_metadata():
     with pytest.raises(ValueError, match="actual behavior q"):
         parse_score_centering_response(_metadata(), 2, sampling_mode="support")
@@ -168,9 +216,12 @@ def test_score_centering_capture_singleton_support_handles_argmax_topk_ties():
         "output_token_logprobs": [[math.log(0.5), 1]],
         "output_top_logprobs": [[[math.log(0.5), 2]]],
         "output_token_sampling_mask": [[1]],
-        "output_token_sampling_logprobs": [0.0],
+        "output_token_sampling_logprobs": [[0.0]],
     }
-    _, sampled, ids, logprobs = parse_score_centering_response(meta, 1, sampling_mode="support")
+    _, sampled, ids, logprobs, coverage = parse_score_centering_response(
+        meta, 1, sampling_mode="support", return_support_complete=True
+    )
+    np.testing.assert_array_equal(coverage, [True])
     assert sampled == [0.0]
     np.testing.assert_array_equal(ids, [[1]])
     np.testing.assert_array_equal(logprobs, [[0.0]])
@@ -209,7 +260,7 @@ def test_score_centering_capture_observation_rows_and_partial_append():
 def test_score_centering_capture_request_selects_behavior_support_for_filters(overrides):
     payload = {"sampling_params": overrides.copy()}
     assert configure_score_centering_request(_args(sglang_sampling_backend="pytorch"), payload) == "support"
-    assert payload["return_sampling_mask"] and "sampling_logprobs_mode" not in payload
+    assert payload["return_sampling_mask"] and payload["sampling_logprobs_mode"] == "support"
     assert payload["top_logprobs_num"] == 2
     assert all(payload["sampling_params"][key] == value for key, value in overrides.items())
 
@@ -231,6 +282,19 @@ def test_score_centering_capture_rejects_top_p_with_batch_dependent_support(back
 def test_score_centering_capture_top_k_min_p_without_top_p_is_batch_independent(backend, min_p):
     payload = {"sampling_params": {"top_k": 2, "top_p": 1.0, "min_p": min_p}}
     assert configure_score_centering_request(_args(sglang_sampling_backend=backend), payload) == "support"
+    assert payload.get("sampling_logprobs_mode") == ("support" if backend == "pytorch" else None)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"rollout_external": True}, {"sglang_config": "engine.yaml"}, {"rollout_engine_class_path": "custom.Engine"}],
+)
+def test_score_centering_capture_keeps_legacy_request_for_unverified_backend(override):
+    payload = {"sampling_params": {"top_k": 2}}
+    assert (
+        configure_score_centering_request(_args(sglang_sampling_backend="pytorch", **override), payload) == "support"
+    )
+    assert "sampling_logprobs_mode" not in payload
 
 
 def test_score_centering_capture_request_preserves_penalties_and_checks_temperature(monkeypatch):
@@ -309,8 +373,14 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
 
     async def post_generation(args, state, url, payload, headers, evaluation):
         calls.append(copy.deepcopy(payload))
-        meta = _packed_metadata(_metadata()) if packed else _metadata()
-        return {"text": "answer", "output_ids": [4, 2], "meta_info": meta}
+        meta = _metadata()
+        meta["output_token_sampling_mask"] = [[4, 1, 2], [2, 3]]
+        assert payload["sampling_logprobs_mode"] == "support"
+        meta["output_token_sampling_logprobs"] = [
+            [math.log(0.2), math.log(0.5), math.log(0.3)],
+            [math.log(0.6 / 0.9), math.log(0.3 / 0.9)],
+        ]
+        return {"text": "answer", "output_ids": [4, 2], "meta_info": _packed_metadata(meta) if packed else meta}
 
     namespace = {
         "Sample": Sample,
@@ -331,18 +401,23 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         use_rollout_routing_replay=False,
         use_slime_router=False,
         sglang_router_policy="round_robin",
+        sglang_sampling_backend="pytorch",
         partial_rollout=True,
         mask_offpolicy_in_partial_rollout=True,
     )
     sample = Sample(prompt="prompt")
-    asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
+    sampling = {"max_new_tokens": 8, "temperature": 0.7, "top_k": 3}
+    asyncio.run(namespace["generate"](args, sample, sampling))
     sample.loss_mask = [0, 0]
     first_head = sample.rollout_topk_log_probs.copy()
-    asyncio.run(namespace["generate"](args, sample, {"max_new_tokens": 8, "temperature": 0.7}))
+    asyncio.run(namespace["generate"](args, sample, sampling))
     assert calls[0]["top_logprobs_num"] == 2
     assert calls[1]["input_ids"] == [0, 4, 2]
     assert sample.tokens == [0, 4, 2, 4, 2] and sample.loss_mask == [0, 0, 1, 1]
     np.testing.assert_array_equal(sample.rollout_topk_log_probs[:2], first_head)
+    np.testing.assert_array_equal(sample.rollout_topk_support_complete, [False, True, False, True])
+    restored = Sample.from_dict(pickle.loads(pickle.dumps(sample.to_dict())))
+    np.testing.assert_array_equal(restored.rollout_topk_support_complete, sample.rollout_topk_support_complete)
     validate_score_centering_sample(sample, 2, vocab_size=8)
 
 
@@ -359,6 +434,7 @@ def test_score_centering_converter_flattens_candidates_and_rejects_missing_field
         sample = _sample()
         data = module.convert_samples_to_train_data(args, [sample])
         assert data["rollout_topk_token_ids"] == [[1, 2, 2, 3]]
+        assert data["rollout_topk_support_complete"][0].tolist() == [False, False]
         np.testing.assert_allclose(np.reshape(data["rollout_topk_log_probs"], (2, 2)), sample.rollout_topk_log_probs)
         monkeypatch.setattr(module, "post_process_rewards", lambda args, samples: [[0.3, -0.2]] * len(samples))
         assert module.convert_samples_to_train_data(args, [sample])["rewards"] == [[0.3, -0.2]]
@@ -366,9 +442,11 @@ def test_score_centering_converter_flattens_candidates_and_rejects_missing_field
         monkeypatch.setattr(module, "load_function", lambda path: lambda args, samples: {"tokens": [[0, 4, 2]]})
         with pytest.raises(ValueError, match="custom converter omitted"):
             module.convert_samples_to_train_data(args, [sample])
+        del data["rollout_topk_support_complete"]
         monkeypatch.setattr(module, "load_function", lambda path: lambda args, samples: data)
         # Custom converters own their input layout, including grouped samples.
         assert module.convert_samples_to_train_data(args, [[sample]]) is data
+        assert data["rollout_topk_support_complete"][0].tolist() == [False, False]
         args.custom_convert_samples_to_train_data_path = None
         sample.rollout_topk_log_probs = None
         with pytest.raises(ValueError, match="rollout_topk_log_probs"):

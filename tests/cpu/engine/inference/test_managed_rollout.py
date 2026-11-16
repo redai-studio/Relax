@@ -44,6 +44,9 @@ class FakeBackend:
     def get_status(self):
         return self.status
 
+    def get_lora_training_config(self):
+        return None
+
 
 class FakePool:
     def __init__(self):
@@ -207,11 +210,17 @@ def test_handle_survives_serialization_and_routes_by_owner():
             return args, kwargs
 
     manager_handle = SimpleNamespace(pool_call=Remote(), dispose=Remote())
-    worker = SimpleNamespace(generate=Remote(), set_train_parallel_config=Remote())
+    worker = SimpleNamespace(generate=Remote(), drain_eval_judges=Remote(), set_train_parallel_config=Remote())
     handle = ray.cloudpickle.loads(ray.cloudpickle.dumps(ManagedRolloutHandle(manager_handle, worker)))
     assert handle.generate.remote(3) == ((3,), {})
+    assert handle.drain_eval_judges.remote() == ((), {})
     assert handle.offload.remote() == (("offload",), {})
     assert handle.set_train_parallel_config.remote({"tp": 2}) == (({"tp": 2},), {})
+
+
+@pytest.mark.asyncio
+async def test_managed_rollout_answers_the_training_lora_configuration_query():
+    assert await manager().pool_call("get_lora_training_config") is None
 
 
 @pytest.mark.asyncio

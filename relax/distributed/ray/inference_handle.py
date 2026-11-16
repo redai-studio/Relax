@@ -10,6 +10,7 @@ WORKLOAD_METHODS = frozenset(
     {
         "generate",
         "eval",
+        "drain_eval_judges",
         "save",
         "load",
         "get_num_rollout_per_epoch",

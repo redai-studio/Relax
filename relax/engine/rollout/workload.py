@@ -12,8 +12,13 @@ handle.  Everything it needs from the inference side goes through
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Protocol
 
+import ray
+
+from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
@@ -74,6 +79,10 @@ class RolloutWorkload(ReloadableMixin):
         self._dynamic_global_batch_size = None
         self._metric_checker = MetricChecker.maybe_create(args)
         self._tokenizer = None  # Lazy-initialized tokenizer for debug data saving
+        self._eval_judge = None
+        self._eval_judge_init_lock = asyncio.Lock()
+        self._eval_judge_tasks: set[asyncio.Task] = set()
+        self._eval_judge_errors: list[str] = []
 
     # ----------------------------- data source -----------------------------
 
@@ -125,23 +134,77 @@ class RolloutWorkload(ReloadableMixin):
             )
 
     async def eval(self, rollout_id) -> None:
-        from relax.distributed.ray.rollout import _log_eval_rollout_data
-
         await self.inference.resume_health_monitoring()
 
         # TODO: add fault tolerance to eval
-        result = await asyncio.to_thread(
-            call_rollout_fn,
+        result, pending = await asyncio.to_thread(
+            call_eval_with_deferred_rewards,
             self.eval_generate_rollout,
             self.args,
             rollout_id,
             self.data_source,
             self.data_system_client,
-            evaluation=True,
         )
+        await self.submit_eval_result(rollout_id, result, pending)
+
+    def _record_eval_result(self, rollout_id: int, result: Any) -> None:
+        from relax.distributed.ray.rollout import _log_eval_rollout_data
+
         data = result.data
         self.save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+
+    def _on_custom_reward_reloaded(self, module_path: str) -> None:
+        """Wait for this manager's background judge to refresh as well."""
+        if self._eval_judge is not None:
+            ray.get(self._eval_judge.reload_custom_reward.remote(module_path))
+
+    async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
+        """Record inline scores or enqueue captured judges from RL or SFT."""
+        if pending:
+            async with self._eval_judge_init_lock:
+                if self._eval_judge is None:
+                    self._eval_judge = await asyncio.to_thread(
+                        lambda: EvalJudgeWorker.options(**with_control_plane_affinity(self.args)).remote(self.args)
+                    )
+            # Ray serializes the snapshot before returning the ObjectRef. Keep
+            # result + pending together to preserve their shared Sample refs.
+            ref = await asyncio.to_thread(self._eval_judge.score.remote, self.args, (result, pending))
+            task = asyncio.create_task(self._finish_eval_judge(rollout_id, ref))
+            self._eval_judge_tasks.add(task)
+            task.add_done_callback(self._eval_judge_tasks.discard)
+            logger.info(
+                "Queued eval judge for rollout %s (%d pending evaluations)", rollout_id, len(self._eval_judge_tasks)
+            )
+            return
+        self._record_eval_result(rollout_id, result)
+
+    async def _finish_eval_judge(self, rollout_id: int, ref: Any) -> None:
+        start = time.monotonic()
+        try:
+            result = await ref
+            result.metrics = dict(result.metrics or {})
+            result.metrics.update({"eval/async_judge": 1, "eval/async_judge_seconds": time.monotonic() - start})
+            await asyncio.to_thread(self._record_eval_result, rollout_id, result)
+        except Exception as exc:
+            self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
+            logger.exception("Background eval judge failed for rollout %s", rollout_id)
+
+    async def drain_eval_judges(self) -> None:
+        """Finish scoring and reporting before the normal job shutdown."""
+        while self._eval_judge_tasks:
+            logger.info("Waiting for %d pending eval judges at training completion", len(self._eval_judge_tasks))
+            await asyncio.gather(*tuple(self._eval_judge_tasks))
+        if self._eval_judge_errors:
+            raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
+
+    async def close(self) -> None:
+        if self._eval_judge is not None:
+            try:
+                await asyncio.wait_for(self._eval_judge.close.remote(), timeout=10)
+            finally:
+                ray.kill(self._eval_judge)
+                self._eval_judge = None
 
     # ------------------------------ debug dump -----------------------------
 

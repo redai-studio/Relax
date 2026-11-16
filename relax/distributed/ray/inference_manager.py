@@ -30,6 +30,7 @@ POOL_METHODS = frozenset(
         "get_router_address",
         "get_engines_info",
         "get_status",
+        "get_lora_training_config",
         "check_weights",
         "health_monitoring_pause",
         "health_monitoring_resume",

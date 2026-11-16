@@ -34,7 +34,7 @@ class _InferencePort:
         return f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
 
 
-@ray.remote(num_cpus=1, num_gpus=0)
+@ray.remote(num_cpus=1, num_gpus=0, concurrency_groups={"reload": 1})
 class RolloutWorker:
     def __init__(self, args: Any, data_source: Any, manager: Any) -> None:
         self.args = args
@@ -77,6 +77,9 @@ class RolloutWorker:
         await self.manager.begin_rollout.remote(rollout_id)
         await self._run("eval", rollout_id)
 
+    async def drain_eval_judges(self) -> None:
+        await self._run("drain_eval_judges")
+
     async def save(self, rollout_id: int) -> None:
         await self._run("save", rollout_id)
 
@@ -92,12 +95,15 @@ class RolloutWorker:
     def set_train_parallel_config(self, config: dict) -> None:
         self.workload.set_train_parallel_config(config)
 
+    @ray.method(concurrency_group="reload")
     def reload_function_by_name(self, module_name: str) -> dict:
         return self.workload.reload_function_by_name(module_name)
 
+    @ray.method(concurrency_group="reload")
     def reload_all_functions(self) -> dict:
         return self.workload.reload_all_functions()
 
+    @ray.method(concurrency_group="reload")
     def reload_module(self, module_name: str, module_path: str | None = None) -> dict:
         return self.workload.reload_module(module_name, module_path)
 
@@ -109,6 +115,9 @@ class RolloutWorker:
 
     async def close(self) -> None:
         self._closed = True
-        if self._active:
-            await asyncio.gather(*tuple(self._active), return_exceptions=True)
-        detach_tq_client()
+        try:
+            if self._active:
+                await asyncio.gather(*tuple(self._active), return_exceptions=True)
+            await self.workload.close()
+        finally:
+            detach_tq_client()
