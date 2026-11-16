@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -358,8 +359,13 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
 
     rollout.get_step = observe_rollout_step
     rollout.data_source = SimpleNamespace(discard_pending=SimpleNamespace(remote=discard))
+    drained = Future()
+    drained.set_result(None)
     rollout.get_rollout_manager = AsyncMock(
-        return_value=SimpleNamespace(reset_data_window=SimpleNamespace(remote=reset))
+        return_value=SimpleNamespace(
+            reset_data_window=SimpleNamespace(remote=reset),
+            drain_eval_judges=SimpleNamespace(remote=lambda: SimpleNamespace(future=lambda: drained)),
+        )
     )
     forward.run = lambda: asyncio.create_task(failed())
     forward.rebuild_for_recovery = Mock()
