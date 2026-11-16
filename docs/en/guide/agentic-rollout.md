@@ -521,6 +521,61 @@ selects that value. Leave reward unset on sibling contexts. Put any outcome need
 metadata. In multi-context training, reward reports the task outcome and custom advantage determines each export's
 advantage.
 
+### Background Eval Judging
+
+The built-in Agentic and standard SGLang eval paths can run expensive judges in the background after generating
+trajectories. Background judging is enabled by default without any flag; pass `--disable-eval-async-judge` to disable it
+and wait for scoring. This works with both colocated and separate training/rollout GPUs. Generating eval trajectories still uses
+the existing policy inference resources, and background scoring must not continue to depend on those resources.
+
+The independent HTTP reward `remote_rm` uses this mechanism automatically. A custom `--custom-rm-path` must declare
+support explicitly. For example, with existing `train_reward` and `eval_reward` implementations, the entry point can
+remain a synchronous function:
+
+```python
+def reward_func(args, sample, *, evaluation=False, **kwargs):
+    if evaluation:
+        return eval_reward(args, sample)
+    return train_reward(args, sample)
+
+
+reward_func.supports_async_eval = True
+```
+
+Synchronous `def` functions still run in the Ray reward process pool; `async def` functions can also declare support.
+The built-in Agentic and standard SGLang rollout paths pass `evaluation=False` during training and `evaluation=True`
+during evaluation, for both inline and background scoring. Functions accepting an `evaluation` keyword or `**kwargs`
+receive the argument; existing strict two-argument functions receive no extra argument. If you implement a complete
+rollout or eval function, explicitly pass `evaluation` when calling `async_rm` / `batched_async_rm`; Relax does not infer
+the phase from shared `args` or metadata. You do not need metadata phase markers or an extra YAML file to distinguish
+the phases. Configure the evaluation data directly through the CLI:
+
+```bash
+--eval-prompt-data agent_eval "<eval-data-path>"
+```
+
+You can still use `--eval-config` for dataset-specific sampling parameters or metadata.
+
+Declaring `supports_async_eval` means eval scoring only needs the exported Sample snapshot, persistent artifacts, and
+independent CPU or remote judge resources. Export the actions, tool results, and intermediate traces needed for scoring
+before the Session ends. The scorer must not depend on a live Session, temporary files, or a colocated model that may
+be offloaded. Return the final real reward; do not submit a background job yourself and return its ID or a placeholder
+score. The complete-list input and corresponding-list output contract for `group_rm` is unchanged.
+
+Relax uses a CPU reward pool separate from training scoring, then records metrics and dumps under the original eval
+iteration once the real scores arrive. Ordinary rule rewards, custom rewards without the declaration, managed
+`dapo-genrm`, and native image scoring keep their existing paths. Training rewards are also unaffected by this option.
+In ordinary RM mode, a reward already supplied by the Agent is reused without another scoring call.
+
+The eval pool for synchronous judges uses `--reward-num-workers` and `--reward-max-concurrency` independently of the
+training pool. Reserve CPU resources for the additional scoring processes.
+
+Normal training completion waits for pending judges and records their results. Background scoring failures are logged
+and raised during this final drain. This is not a durable job queue that survives the training job: failures or forced
+shutdown can interrupt scoring. Judges that consistently run slower than eval submission will accumulate a backlog,
+so set timeouts on remote calls and provision enough scoring capacity. Separate worker pools do not remove contention
+at a shared remote judge service.
+
 ## Configure Runtime Behavior
 
 ::: danger Required external-agent capacity
