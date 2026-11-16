@@ -786,11 +786,14 @@ class TestStreamingDataset:
         assert samples[0].prompt == data[expected_manager.indices[0]]["text"]
         assert dataset.index_manager.position == 1
 
-    def test_streaming_dataset_no_prefetch_refills_filtered_samples(self, jsonl_file, mock_tokenizer):
+    @pytest.mark.parametrize("workers", [1, 4])
+    def test_streaming_dataset_no_prefetch_refills_filtered_samples(self, jsonl_file, mock_tokenizer, workers):
         from relax.utils.data.streaming_dataset import StreamingDataset
 
         filepath, data = jsonl_file
-        dataset = StreamingDataset(filepath, mock_tokenizer, processor=None, max_length=5)
+        dataset = StreamingDataset(
+            filepath, mock_tokenizer, processor=None, max_length=5, sample_prepare_workers=workers
+        )
         dataset.shuffle(0)
         order = list(dataset.index_manager.indices)
         filtered = {order[pos] for pos in (1, 4, 9, 13, 18)}
@@ -810,6 +813,31 @@ class TestStreamingDataset:
         assert dataset.index_manager.position == len(data)
         assert dataset._filter_count == len(filtered)
         assert dataset._total_processed == len(data)
+
+    def test_no_prefetch_delivers_slow_first_sample_in_order(self, jsonl_file, mock_tokenizer):
+        from relax.utils.data.streaming_dataset import StreamingDataset
+
+        path, rows = jsonl_file
+        dataset = StreamingDataset(path, mock_tokenizer, processor=None, max_length=5, sample_prepare_workers=4)
+        dataset.shuffle(0)
+        expected = [rows[idx]["text"] for idx in dataset.index_manager.indices[:2]]
+        second_checked = threading.Event()
+        second_finished_first = False
+
+        def tokenize(text: str, **kwargs) -> dict:
+            nonlocal second_finished_first
+            if text == expected[0]:
+                second_finished_first = second_checked.wait(timeout=3)
+            elif text == expected[1]:
+                second_checked.set()
+            return {"input_ids": [1]}
+
+        mock_tokenizer.side_effect = tokenize
+        samples, crossed = dataset.get_batch(2)
+        assert second_finished_first
+        assert [sample.prompt for sample in samples] == expected
+        assert not crossed
+        assert dataset.index_manager.position == 2
 
     def test_shuffle_epoch(self, jsonl_file, mock_tokenizer):
         """Test that shuffle produces different order."""
@@ -970,7 +998,8 @@ class TestStreamingDataset:
                 if os.path.exists(path):
                     os.unlink(path)
 
-    def test_dataset_multi_file_global_slice_get_batch_across_epoch(self, mock_tokenizer):
+    @pytest.mark.parametrize("workers", [1, 4])
+    def test_dataset_multi_file_global_slice_get_batch_across_epoch(self, mock_tokenizer, workers):
         """Test get_batch preserves the sliced multi-file domain across epoch
         wraparound."""
         from relax.utils.data.streaming_dataset import StreamingDataset
@@ -992,6 +1021,7 @@ class TestStreamingDataset:
                 processor=None,
                 max_length=None,
                 prompt_key="text",
+                sample_prepare_workers=workers,
             )
 
             dataset.shuffle(0)

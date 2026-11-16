@@ -896,6 +896,7 @@ class StreamingDataset(BaseDataset):
         prefetch_chunk_size: int = 32,
         prefetch_max_cached: int = 256,
         prefetch_num_workers: int = 1,
+        sample_prepare_workers: int = 1,
         multimodal_config: MultimodalConfig = None,
         custom_prompt_func=None,
         teacher_prompt_key: Optional[str] = None,
@@ -928,6 +929,7 @@ class StreamingDataset(BaseDataset):
             prefetch_num_workers: Number of parallel worker threads inside the
                 prefetch buffer for I/O-bound media decoding.  Set to 1 to
                 serialise decoding (avoids FFmpeg thread-safety issues).
+            sample_prepare_workers: Threads for processing the requested batch when prefetch is inactive.
             multimodal_config: MultimodalConfig for multimodal processing
         """
         # Initialize base class
@@ -963,6 +965,7 @@ class StreamingDataset(BaseDataset):
 
         self._filter_count = 0
         self._total_processed = 0
+        self._sample_prepare_workers = sample_prepare_workers
 
         # Prefetch buffer for overlapping multimodal I/O with compute.
         # Only enabled when multimodal_keys are set and prefetch_max_cached > 0.
@@ -992,9 +995,7 @@ class StreamingDataset(BaseDataset):
         in parallel worker threads.
         """
         try:
-            raw_data = self.reader[idx]
-            sample = self._process_raw_data(raw_data)
-            return sample
+            return self._record_processed(self._prepare_sample(idx))
         except Exception as e:
             logger.warning(f"Prefetch: error processing index {idx}: {e}")
             return None
@@ -1027,19 +1028,19 @@ class StreamingDataset(BaseDataset):
                 f"position={self.index_manager.position}, remaining={len(remaining)}"
             )
 
-    def _process_raw_data(self, data: dict) -> Optional[Sample]:
-        """Process raw data into a Sample.
-
-        Uses the shared _process_data from BaseDataset.
-
-        Args:
-            data: Raw data dict from file
-
-        Returns:
-            Sample or None if filtered out
-        """
+    def _record_processed(self, result: tuple[Optional[Sample], bool]) -> Optional[Sample]:
+        sample, filtered = result
         self._total_processed += 1
+        if filtered:
+            self._filter_count += 1
+        return sample
 
+    def _prepare_sample(self, idx: int) -> tuple[Optional[Sample], bool]:
+        """Read and check one row.
+
+        Only length rejections count as filtered.
+        """
+        data = self.reader[idx]
         try:
             sample = self._process_data(data)
 
@@ -1052,14 +1053,13 @@ class StreamingDataset(BaseDataset):
                     self.max_length,
                     apply_chat_template_kwargs=self.apply_chat_template_kwargs,
                 ):
-                    self._filter_count += 1
-                    return None
+                    return None, True
 
-            return sample
+            return sample, False
 
         except Exception as e:
             logger.warning(f"Error processing data: {e}")
-            return None
+            return None, False
 
     def get_batch(self, n: int) -> tuple[list[Sample], bool]:
         """Get a batch of n valid samples.
@@ -1082,6 +1082,9 @@ class StreamingDataset(BaseDataset):
         """
         if self._prefetch_buffer is not None:
             return self._get_batch_prefetch(n)
+        if self._sample_prepare_workers > 1 and n > 1:
+            with ThreadPoolExecutor(self._sample_prepare_workers) as pool:
+                return self._get_batch_no_prefetch(n, pool)
         return self._get_batch_no_prefetch(n)
 
     def _get_batch_prefetch(self, n: int) -> tuple[list[Sample], bool]:
@@ -1125,7 +1128,7 @@ class StreamingDataset(BaseDataset):
 
         return samples, crossed_epoch
 
-    def _get_batch_no_prefetch(self, n: int) -> tuple[list[Sample], bool]:
+    def _get_batch_no_prefetch(self, n: int, pool: Optional[ThreadPoolExecutor] = None) -> tuple[list[Sample], bool]:
         """Non-prefetch path: fetch indices in small batches for efficiency."""
         samples: list[Sample] = []
         crossed_epoch = False
@@ -1140,9 +1143,19 @@ class StreamingDataset(BaseDataset):
             indices, epoch_crossed = self.index_manager.get_next_indices(fetch_size)
             crossed_epoch = crossed_epoch or epoch_crossed
 
+            pending = {}
+            if pool is not None:
+                # An epoch boundary can repeat an index in the same batch.
+                pending = {
+                    idx: pool.submit(self._prepare_sample, idx)
+                    for idx in dict.fromkeys(indices)
+                    if idx not in self.buffer.cache
+                }
+
             attempts += len(indices)
             for idx in indices:
-                sample = self[idx]
+                future = pending.pop(idx, None)
+                sample = self[idx] if future is None else self._get_sample(idx, future)
                 if sample is not None:
                     samples.append(sample)
 
@@ -1154,26 +1167,17 @@ class StreamingDataset(BaseDataset):
 
         return samples, crossed_epoch
 
-    def __getitem__(self, idx: int) -> Optional[Sample]:
-        """Get a single sample by index.
-
-        Args:
-            idx: Sample index
-
-        Returns:
-            Sample or None if filtered
-        """
+    def _get_sample(self, idx: int, future: Future[tuple[Optional[Sample], bool]] | None = None) -> Optional[Sample]:
         sample = self.buffer.get(idx)
-        if sample is not None:
-            return sample
-
-        raw_data = self.reader[idx]
-        sample = self._process_raw_data(raw_data)
-
-        if sample is not None:
-            self.buffer.put(idx, sample)
-
+        if sample is None:
+            result = future.result() if future is not None else self._prepare_sample(idx)
+            sample = self._record_processed(result)
+            if sample is not None:
+                self.buffer.put(idx, sample)
         return sample
+
+    def __getitem__(self, idx: int) -> Optional[Sample]:
+        return self._get_sample(idx)
 
     @property
     def samples(self) -> "StreamingDatasetSamplesProxy":
