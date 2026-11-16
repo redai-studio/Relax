@@ -9,7 +9,7 @@ inside `backends/megatron/data.py:get_batch` — the producer only filters
 oversized samples and emits per-sample lists.
 
 When ``--eval-interval`` is set, the producer also pushes an eval batch on
-every step where ``(step + 1) % eval_interval == 0``. The eval set is split
+each configured step or epoch boundary, optionally before the first update. The eval set is split
 into ``ceil(n_eval / global_batch_size)`` chunks and pushed serially under
 ``partition_id=f"sft_eval_{step}_n{N}_{i}"`` (with backpressure between
 chunks) so each partition fits within TQ's per-step storage cap. The
@@ -27,8 +27,8 @@ Mirrors `relax/components/advantages.py` in shape: no FastAPI ingress, plain
 
 import asyncio
 import os
-import random
 import time
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -1120,8 +1120,8 @@ class SFT(Base):
                 "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
                 "skip warnings."
             )
-        # Causal eval pads sub-GBS pools because its legacy consumer requests a
-        # fixed batch size. Preference eval uses actual partial-chunk sizes and
+        # Causal eval zero-masks padding because its consumer requests a fixed
+        # batch size. Preference eval uses actual partial-chunk sizes and
         # must preserve every evaluation pair without padding.
         gbs = self.config.global_batch_size
         n_original = len(samples)
@@ -1138,15 +1138,23 @@ class SFT(Base):
                 f"Classification eval @ step {self.step}: {n_original} real samples, "
                 f"{pad_count} zero-weight padding samples, {n_chunks} chunk(s)."
             )
-        elif n_original < gbs and not preference_mode:
-            rng = random.Random(completed_steps)
-            pad_count = gbs - n_original
-            samples = list(samples) + rng.choices(samples, k=pad_count)
-            self._logger.warning(
-                f"Eval @ completed_steps={completed_steps}: eval pool of {n_original} samples is smaller than "
-                f"global_batch_size ({gbs}); random-padded with {pad_count} resampled (with "
-                f"replacement) samples to fill one batch. PPL counts duplicated samples — "
-                f"interpret with caution."
+        elif not preference_mode:
+            pad_count = (-n_original) % gbs
+            if pad_count:
+                shortest = min(samples, key=lambda sample: sample.total_length)
+                padding = replace(
+                    shortest,
+                    loss_mask=shortest.loss_mask.new_zeros(shortest.loss_mask.shape),
+                    pre_shifted_labels=(
+                        shortest.pre_shifted_labels.new_full(shortest.pre_shifted_labels.shape, -100)
+                        if shortest.pre_shifted_labels is not None
+                        else None
+                    ),
+                )
+                samples = list(samples) + [padding] * pad_count
+            self._logger.info(
+                f"Causal eval @ completed_steps={completed_steps}: {n_original} real samples, "
+                f"{pad_count} zero-mask padding samples."
             )
 
         if preference_mode:
@@ -1253,6 +1261,8 @@ class SFT(Base):
 
     async def _async_run(self) -> None:
         try:
+            if self.step == 0 and self.config.num_rollout > 0 and not self._stop_event.is_set():
+                await self._maybe_produce_eval(0)
             while self.step < self.config.num_rollout and not self._stop_event.is_set():
                 await self._produce_one_step()
         except Exception as exc:

@@ -97,3 +97,51 @@ def test_sft_epoch_progress_custom_dataset_clears_unknown_denominator():
 def test_epoch_progress_preserves_rl_multiple_updates_per_rollout():
     args = Namespace(num_rollout_per_epoch=10)
     assert _reported_metrics(args, 7, steps_per_rollout=4)["train/cur_epoch"] == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("interval,steps,boundaries", [("epoch", 32, [11, 21, 32]), (10, 31, [10, 20, 30])])
+def test_epoch_intervals_cover_nondivisible_training_without_changing_step_intervals(
+    sized_dataset, interval, steps, boundaries
+):
+    from relax.engine.sft.runtime import should_run_sft_eval
+    from relax.utils.training.intervals import should_save_checkpoint
+
+    args = Namespace(
+        loss_type="sft",
+        prompt_data=2732,
+        eval_size=70,
+        rollout_batch_size=256,
+        global_batch_size=256,
+        num_epoch=3,
+        num_rollout=None,
+        save="ckpt",
+        save_interval=interval,
+        eval_interval=interval,
+        sft_eval_before_train=True,
+    )
+    resolve_sft_num_rollout(args)
+    assert args.num_rollout == steps
+    assert args._sft_train_dataset_size == 2662
+    assert [s for s in range(steps + 1) if should_run_sft_eval(args, s)] == [0, *boundaries]
+    expected_saves = sorted({*boundaries, steps})
+    assert [s for s in range(steps + 1) if should_save_checkpoint(args, s)] == expected_saves
+    # A checkpoint at completed step 11 resumes with step 12, without replaying the boundary.
+    assert [s for s in range(12, steps + 1) if should_save_checkpoint(args, s)] == expected_saves[1:]
+
+
+def test_epoch_interval_respects_explicit_step_cap(sized_dataset):
+    from relax.utils.training.intervals import should_save_checkpoint
+
+    args = Namespace(
+        loss_type="sft",
+        prompt_data=2662,
+        rollout_batch_size=256,
+        global_batch_size=256,
+        num_epoch=3,
+        num_rollout=15,
+        save="ckpt",
+        save_interval="epoch",
+    )
+    resolve_sft_num_rollout(args)
+    assert args.num_rollout == 15
+    assert [s for s in range(16) if should_save_checkpoint(args, s)] == [11, 15]

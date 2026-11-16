@@ -101,8 +101,12 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
     # Fractional epochs remain meaningful for progress reporting even when
     # there is no integer step interval suitable for epoch-boundary triggers.
     config.num_rollout_per_epoch_for_metrics = dataset_size / config.rollout_batch_size
+    config._sft_train_dataset_size = dataset_size
+    epoch_interval = "epoch" in (getattr(config, "save_interval", None), getattr(config, "eval_interval", None))
     if config.num_epoch is not None:
-        epoch_rollout = dataset_size * config.num_epoch // config.rollout_batch_size
+        sample_count = dataset_size * config.num_epoch
+        rounding = config.rollout_batch_size - 1 if epoch_interval else 0
+        epoch_rollout = (sample_count + rounding) // config.rollout_batch_size
         if config.num_rollout is not None:
             limiting_option = (
                 "both limits (equal)"
@@ -114,7 +118,8 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
             logger.warning(
                 f"Both --num-epoch={config.num_epoch} and --num-rollout={config.num_rollout} are set for SFT. "
                 f"The smaller limit wins: epoch-based limit = {dataset_size} training samples * "
-                f"{config.num_epoch} epochs // {config.rollout_batch_size} rollout batch size = {epoch_rollout} steps; "
+                f"{config.num_epoch} epochs / {config.rollout_batch_size} rollout batch size "
+                f"(rounded {'up' if epoch_interval else 'down'}) = {epoch_rollout} steps; "
                 f"effective training length = {min(config.num_rollout, epoch_rollout)} steps, "
                 f"limited by {limiting_option}. Set only one option if this double limit is unintended."
             )

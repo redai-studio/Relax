@@ -86,6 +86,18 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _step_or_epoch_interval(value: str) -> int | str:
+    return "epoch" if value == "epoch" else int(value)
+
+
+def _add_step_or_epoch_interval(parser, name: str) -> None:
+    reset_arg(parser, name, type=_step_or_epoch_interval, default=None)
+    # reset_arg preserves the native Megatron action's type; update it here too.
+    action = parser._option_string_actions[name]
+    action.type = _step_or_epoch_interval
+    action.help = "Positive step interval, or 'epoch' for native Megatron SFT epoch boundaries."
+
+
 def _fault_events_port(value: str) -> int:
     parsed = int(value)
     if not 0 <= parsed <= 65535:
@@ -1352,6 +1364,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Number of epochs over the dataset. When set, "
                     "`actual_num_rollout = num_epoch * dataset_size // rollout_batch_size`. "
+                    "Native SFT with an epoch save/eval interval rounds the total up to a full batch. "
                     "If both --num-rollout and --num-epoch are set, the smaller of the two wins "
                     "(epoch acts as a cap). At least one of --num-rollout / --num-epoch must be set. "
                     "Applies to both RL and SFT."
@@ -1816,7 +1829,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             # change the default value of eval_interval from Megatron to None
-            reset_arg(parser, "--eval-interval", type=int, default=None)
+            _add_step_or_epoch_interval(parser, "--eval-interval")
+            parser.add_argument(
+                "--sft-eval-before-train",
+                action="store_true",
+                help="Evaluate native Megatron SFT before the first update; checkpoint resumes skip this pass.",
+            )
 
             parser.add_argument(
                 "--eval-prompt-data",
@@ -1948,7 +1966,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
-            reset_arg(parser, "--save-interval", type=int, default=None)
+            _add_step_or_epoch_interval(parser, "--save-interval")
             reset_arg(parser, "--async-save", action="store_true")
             parser.add_argument(
                 "--save-lora-only",
@@ -3400,6 +3418,39 @@ def _normalize_mtp_only_training_args(args) -> None:
     args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
+def _validate_sft_epoch_eval_args(args) -> None:
+    epoch_interval = "epoch" in (getattr(args, "save_interval", None), getattr(args, "eval_interval", None))
+    initial_eval = getattr(args, "sft_eval_before_train", False)
+    if not (epoch_interval or initial_eval):
+        return
+    from relax.engine.sft.runtime import is_i2i_sft
+
+    if not is_sft_mode(args) or is_i2i_sft(args) or getattr(args, "train_backend", "megatron") != "megatron":
+        raise ValueError("Epoch intervals and --sft-eval-before-train require native Megatron SFT.")
+    if getattr(args, "custom_dataset_class_path", None):
+        raise ValueError("Epoch intervals and initial SFT eval require the native dataset.")
+    if epoch_interval and getattr(args, "rotate_ckpt", False):
+        raise ValueError("Epoch intervals cannot be combined with --rotate-ckpt.")
+    if epoch_interval and getattr(args, "save_retain_interval", None):
+        raise ValueError("Epoch intervals cannot be combined with --save-retain-interval.")
+    if epoch_interval and getattr(args, "global_batch_size", None) != getattr(args, "rollout_batch_size", None):
+        raise ValueError("Epoch intervals require rollout_batch_size == global_batch_size for SFT.")
+    if (
+        getattr(args, "sft_predict_interval", None)
+        or getattr(args, "debug_train_only", False)
+        or getattr(args, "debug_rollout_only", False)
+        or getattr(args, "load_debug_rollout_data", None) is not None
+    ):
+        raise ValueError(
+            "Epoch intervals and initial SFT eval require offline training without prediction/debug data."
+        )
+    if initial_eval:
+        if getattr(args, "eval_interval", None) is None:
+            raise ValueError("--sft-eval-before-train requires --eval-interval and an evaluation source.")
+        if getattr(args, "skip_eval_before_train", False):
+            raise ValueError("--sft-eval-before-train conflicts with --skip-eval-before-train.")
+
+
 def _validate_sft_mask_reasoning_args(args) -> None:
     if not getattr(args, "sft_mask_reasoning", False):
         return
@@ -4830,6 +4881,7 @@ def relax_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    _validate_sft_epoch_eval_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

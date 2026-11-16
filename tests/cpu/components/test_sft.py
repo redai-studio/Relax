@@ -971,3 +971,113 @@ async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
     await sft._async_run()
 
     sft._produce_one_step.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n_real,pre_shifted", [(3, False), (4, False), (5, True)])
+async def test_causal_eval_keeps_every_real_sample_and_zero_masks_padding(n_real, pre_shifted):
+    from relax.components.sft import SFT
+
+    samples = [_make_processed(i) for i in range(n_real)]
+    for sample in samples:
+        sample.tokens = sample.tokens + sample.source_idx * 10
+        if pre_shifted:
+            sample.pre_shifted_labels = torch.where(sample.loss_mask.bool(), sample.tokens, -100)
+    original_masks = [sample.loss_mask.clone() for sample in samples]
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = SimpleNamespace(
+        loss_type="sft",
+        eval_size=n_real,
+        eval_interval=1,
+        global_batch_size=4,
+        task_type="causal_lm",
+        multimodal_keys=None,
+    )
+    sft.step = 0
+    sft._logger_instance = MagicMock()
+    sft.data_system_client = MagicMock(async_put=AsyncMock())
+    sft._build_eval_batches = MagicMock(return_value=samples)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+    await sft._maybe_produce_eval(1)
+    chunks = [call.kwargs["data"] for call in sft.data_system_client.async_put.call_args_list]
+    masks = [mask for chunk in chunks for mask in chunk["loss_masks"]]
+    tokens = [row for chunk in chunks for row in chunk["tokens"]]
+    assert all(len(chunk["tokens"]) == 4 for chunk in chunks)
+    assert len(chunks) == (n_real + 3) // 4
+    assert all(torch.equal(tokens[i], samples[i].tokens) for i in range(n_real))
+    assert sum(int(mask.sum()) for mask in masks) == sum(int(mask.sum()) for mask in original_masks)
+    assert all(not mask.any() for mask in masks[n_real:])
+    assert all(torch.equal(sample.loss_mask, mask) for sample, mask in zip(samples, original_masks, strict=True))
+    if pre_shifted:
+        labels = [row for chunk in chunks for row in chunk["pre_shifted_labels"]]
+        assert all(torch.all(row == -100) for row in labels[n_real:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_step", [0, 1])
+async def test_initial_eval_drains_before_training_and_is_not_replayed_on_resume(start_step):
+    import asyncio
+    import threading
+
+    from relax.components.actor import Actor
+    from relax.components.sft import SFT
+
+    events = []
+    eval_ready = threading.Event()
+    eval_done = threading.Event()
+    args = _make_args(num_rollout=2)
+    args.colocate = True
+    args.fully_async = False
+    args.debug_train_only = False
+    args.eval_interval = 1
+    args.eval_size = 1
+    args.sft_eval_before_train = True
+
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = args
+    sft.step = start_step
+    sft._stop_event = threading.Event()
+    sft._logger_instance = MagicMock()
+
+    async def produce_eval(step):
+        assert step == 0
+        events.append("produce_eval_0")
+        eval_ready.set()
+        assert await asyncio.to_thread(eval_done.wait, 5)
+
+    async def produce_train():
+        events.append(f"produce_train_{sft.step}")
+        sft.step += 1
+
+    sft._maybe_produce_eval = produce_eval
+    sft._produce_one_step = produce_train
+    cls = Actor.func_or_class.__mro__[1]
+    actor = cls.__new__(cls)
+    actor.config = args
+    actor.step = start_step
+    actor._lock = threading.RLock()
+    actor._stop_event = threading.Event()
+    actor._logger_instance = MagicMock()
+    actor.healthy = MagicMock()
+    actor.data_system_client = MagicMock(async_clear_partition=AsyncMock())
+
+    def consume_eval(step):
+        assert step == 0
+        assert eval_ready.wait(5)
+        events.append("consume_eval_0")
+        eval_done.set()
+
+    def wait_train():
+        if start_step == 0:
+            assert eval_done.is_set(), "Actor waited for train_0 before consuming eval_0"
+        return True
+
+    actor.actor_model = MagicMock(evaluate_sft=consume_eval)
+    actor._wait_for_rollout_data = wait_train
+    actor._execute_training = lambda: True
+    await asyncio.wait_for(asyncio.gather(sft._async_run(), asyncio.to_thread(actor._background_run)), 10)
+    assert actor.step == sft.step == 2
+    if start_step == 0:
+        assert events[:2] == ["produce_eval_0", "consume_eval_0"]
+    else:
+        assert events == ["produce_train_1"]

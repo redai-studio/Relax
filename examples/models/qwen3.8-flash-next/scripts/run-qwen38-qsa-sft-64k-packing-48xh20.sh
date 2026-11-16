@@ -5,7 +5,8 @@
 # Validated sample lengths reached 113,569 tokens; 256K samples are not yet validated.
 # Existing 48-GPU Ray head; MODEL_DIR, DATA_DIR and SAVE_DIR are required.
 # Default: one epoch, with resumable checkpoints under SAVE_DIR/EXP_NAME.
-# NUM_STEPS overrides NUM_EPOCH; native epochs count complete global batches.
+# NUM_STEPS overrides NUM_EPOCH; SAVE_INTERVAL=epoch rounds up to cover every epoch.
+# Integer intervals retain native full-batch counting. Eval flags can be passed as script arguments.
 # Short benchmark: NUM_STEPS=10 SAVE_CHECKPOINT=0 LR_DECAY_ITERS=32.
 # DRY_RUN=1 prints the effective argv/runtime environment without cluster access.
 set -eo pipefail
@@ -43,8 +44,11 @@ case "${SAVE_CHECKPOINT:-1}" in
             --load "${SAVE_DIR}/${EXP_NAME}"
             --save "${SAVE_DIR}/${EXP_NAME}"
             --save-interval "${SAVE_INTERVAL:-100}"
-            --max-actor-ckpt-to-keep "${MAX_CKPT_TO_KEEP:-2}"
         )
+        # An explicitly empty limit keeps all checkpoints; unset retains the recipe default.
+        if [[ -n "${MAX_CKPT_TO_KEEP-2}" ]]; then
+            CKPT_ARGS+=(--max-actor-ckpt-to-keep "${MAX_CKPT_TO_KEEP-2}")
+        fi
         ;;
     0) ;;
     *) echo 'SAVE_CHECKPOINT must be 0 or 1' >&2; exit 2 ;;

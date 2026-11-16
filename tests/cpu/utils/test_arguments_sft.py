@@ -196,3 +196,83 @@ def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
     assert parser.parse_args(cli).sft_packing_strategy == expected
+
+
+@pytest.mark.parametrize("interval", ["epoch", "10"])
+def test_sft_epoch_interval_overrides_native_megatron_parser_type(arguments_module, interval):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--global-batch-size", type=int)
+    parser.add_argument("--save-interval", type=int)
+    parser.add_argument("--eval-interval", type=int)
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    arguments_module.get_slime_extra_args_provider()(parser)
+    args = parser.parse_args(
+        [
+            "--loss-type",
+            "sft",
+            "--save-interval",
+            interval,
+            "--eval-interval",
+            interval,
+            "--sft-eval-before-train",
+            "--global-batch-size",
+            "256",
+            "--rollout-batch-size",
+            "256",
+        ]
+    )
+    assert args.save_interval == args.eval_interval == ("epoch" if interval == "epoch" else 10)
+    arguments_module._validate_sft_epoch_eval_args(args)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"loss_type": "policy_loss"},
+        {"train_backend": "fsdp"},
+        {"custom_dataset_class_path": "custom.Dataset"},
+        {"rotate_ckpt": True},
+        {"generation_task": "i2i"},
+        {"skip_eval_before_train": True},
+        {"load_debug_rollout_data": "debug.pt"},
+        {"global_batch_size": 256, "rollout_batch_size": 128},
+    ],
+)
+def test_sft_epoch_interval_rejects_unsupported_runtime(arguments_module, overrides):
+    args = SimpleNamespace(
+        **{
+            "loss_type": "sft",
+            "train_backend": "megatron",
+            "save_interval": "epoch",
+            "eval_interval": "epoch",
+            "sft_eval_before_train": True,
+            **overrides,
+        }
+    )
+    with pytest.raises(ValueError):
+        arguments_module._validate_sft_epoch_eval_args(args)
+
+
+def test_yaml_cannot_enable_epoch_checkpoint_rotation_after_validation(arguments_module, tmp_path):
+    args = _opd_args()
+    vars(args).update(
+        loss_type="sft",
+        prompt_data=["/train.jsonl"],
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=4096,
+        n_samples_per_prompt=1,
+        qkv_format="thd",
+        use_gloo_process_groups=True,
+        sft_oversize_strategy="keep",
+        sft_oversize_custom_function_path=None,
+        save="ckpt",
+        save_interval=10,
+        global_batch_size=256,
+        rollout_batch_size=256,
+        num_steps_per_rollout=None,
+    )
+    config = tmp_path / "override.yaml"
+    config.write_text("save_interval: epoch\nrotate_ckpt: true\n")
+    args.custom_config_path = str(config)
+    with pytest.raises(ValueError, match="Epoch intervals cannot be combined with --rotate-ckpt"):
+        arguments_module.relax_validate_args(args)
