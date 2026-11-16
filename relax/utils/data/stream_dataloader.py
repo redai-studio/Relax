@@ -577,10 +577,11 @@ def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
             return tensor.to(dtype=dtype).contiguous()
         return torch.empty(shape, dtype=dtype)
 
-    # --- Step 1: CP broadcast (CP=0 -> other CP ranks of TP=0/PP=0) ---
-    # Only the global source's CP group has real data on its rank-0; the rest
-    # broadcast a placeholder that the TP / PP stages below overwrite.
-    if not cp_trivial:
+    # --- Step 1: CP broadcast among TP=0 peers ---
+    # TP is constant within a CP group. Other TP ranks receive real data in
+    # step 2, so their CP placeholders are unnecessary. Keep every PP stage:
+    # with broadcast_pp=False, each stage has its own (TP=0, CP=0) source.
+    if not cp_trivial and mpu.get_tensor_model_parallel_rank() == 0:
         tensor = _bcast(tensor, is_src, mpu.get_context_parallel_group())
 
     # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
@@ -1255,6 +1256,7 @@ def post_process_rollout_data(args, rollout_data):
         *iter_opd_cp_float_fields(),
     ]
     response_field_dtypes = dict.fromkeys(response_float_fields, torch.float32)
+    response_field_dtypes["rollout_topk_support_complete"] = torch.bool
     for key, dtype in (("rollout_topk_token_ids", torch.long), ("rollout_topk_log_probs", torch.float32)):
         if key in rollout_data:
             rollout_data[key] = [

@@ -33,7 +33,11 @@ from .checkpoint_metadata import (
     _collective_checkpoint_probe,
     validate_native_checkpoint,
 )
-from .compat import patch_hybrid_optimizer_native_fp32_checkpoint_load, preserve_hdo_dp_reshardable_steps_on_load
+from .compat import (
+    patch_hybrid_optimizer_native_fp32_checkpoint_load,
+    patch_te_optimizer_remainder_initialization,
+    preserve_hdo_dp_reshardable_steps_on_load,
+)
 
 
 try:
@@ -687,6 +691,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             )
 
         _alias_renamed_transfer_queue_enum()
+        if (
+            load_optimizer
+            and getattr(args, "use_precision_aware_optimizer", False)
+            and patch_te_optimizer_remainder_initialization()
+        ):
+            logger.info("Applied dtype-aware TE optimizer remainder initialization for checkpoint load")
         if (
             optimizer is not None
             and getattr(args, "optimizer_cpu_offload", False)

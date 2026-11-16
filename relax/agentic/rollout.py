@@ -656,7 +656,9 @@ class AgenticResidentPipeline:
         # same number of resident Groups is confirmed interrupted. Debt from
         # the older partition must finish first: only two physical partitions
         # can be active, so carrying it again would make the next open fail.
-        if self.args.fully_async and not context.final_backfill:
+        # Zero staleness blocks the next rollout until training consumes this
+        # partition, so it cannot leave debt for that next rollout to fill.
+        if self.args.fully_async and self.args.max_staleness > 0 and not context.final_backfill:
             return (
                 get_local_rollout_manager().training_weight_updating
                 and self.transfer_domain.previous_debt == 0
@@ -1102,6 +1104,10 @@ def shutdown_agentic_resident_pipeline() -> None:
 def bind_agentic_router(router_ip: str, router_port: int) -> None:
     """Publish the ready router on the resident Pipeline's event loop."""
     _run_on_resident_async_loop(get_agentic_resident_pipeline().runtime_domain.bind_router(router_ip, router_port))
+
+
+def bind_agentic_lora_runtime(handle: Any) -> None:
+    _run_on_resident_async_loop(get_agentic_resident_pipeline().runtime_domain.bind_lora_runtime(handle))
 
 
 def _aggregate_agentic_timing(samples: list[Sample]) -> dict[str, float]:

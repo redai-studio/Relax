@@ -393,6 +393,8 @@ class Controller:
                     dp_size=dp_size,
                     capacity=capacity,
                     pad_size=pad_size,
+                    tp_size=self.config.tensor_model_parallel_size,
+                    global_batch_size=self.config.global_batch_size,
                 )
             else:
                 sampler = SeqlenBalancedSampler(
@@ -1178,7 +1180,7 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
-        actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
+        teacher_pg, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
             runtime_env=self.runtime_env,
         )
@@ -1201,7 +1203,7 @@ class Controller:
         role_names = {str(r) for r in roles_iter}
         # SFT path returns ROLES_SFT_ONLY (no `rollout` attr); rollout may be
         # injected via extra_roles — gate on the unified name set, not the enum.
-        colocate = self.config.colocate and "rollout" in role_names and "actor" in role_names
+        actor_rollout_colocate = self.config.colocate and "rollout" in role_names and "actor" in role_names
 
         roles_to_create = []
         for role in roles_iter:
@@ -1231,19 +1233,16 @@ class Controller:
         relax_utils.report_train_start(_build_train_start_config(self.config))
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
-        self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
+        self._validate_gpu_resources(roles_to_create, actor_rollout_colocate, actor_rollout_pg_roles)
 
-        if colocate and not self.config.hybrid:
-            # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
-            if actor_rollout_pgs is None:
-                num_gpus = self.config.resource.get(ROLES.actor)[1]
-                actor_rollout_pgs = create_placement_group(
-                    num_gpus=num_gpus,
+        shared_pg = None
+        if actor_rollout_colocate and not self.config.hybrid:
+            shared_pg = teacher_pg
+            if shared_pg is None:
+                shared_pg = create_placement_group(
+                    num_gpus=self.config.resource.get(ROLES.actor)[1],
                     node_group_affinity=self.config.enable_affinity,
                 )
-        else:
-            # fully_async (pure or hybrid): actor and rollout use separate GPUs
-            actor_rollout_pgs = None
 
         service_args = [
             (
@@ -1251,7 +1250,7 @@ class Controller:
                 cls,
                 num_gpus,
                 data_source,
-                actor_rollout_pgs,
+                shared_pg,
                 actor_rollout_pg_roles,
             )
             for role, cls, num_gpus, data_source in roles_to_create

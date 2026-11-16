@@ -48,6 +48,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import available_memory, clear_memory, collect_manual_gc, log_step_peak_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
+from relax.utils.straggler import note_microbatch_tokens, straggler_timers
 from relax.utils.timer import timer
 from relax.utils.training.nonfinite_grad import (
     NonFiniteGradientNormError,
@@ -605,13 +606,17 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    config.timers = None
+    config.timers = straggler_timers("train")
     _validate_vit_lr_trainable_params(args, model)
 
     if args.optimizer_cpu_offload:
-        from .compat import patch_hdo_group_steps
+        from .compat import patch_hdo_gpu_gradient_stream, patch_hdo_group_steps, patch_hdo_native_fp32_gradients
 
         patch_hdo_group_steps()
+        if patch_hdo_gpu_gradient_stream():
+            logger.info("Enabled HDO GPU gradient stream dependency.")
+        if patch_hdo_native_fp32_gradients():
+            logger.info("Enabled HDO native FP32 GPU gradients.")
 
     optimizer = get_megatron_optimizer(
         config=config,
@@ -1116,8 +1121,7 @@ def forward_only(
         custom_before_log_prob_hook(args, model, store_prefix)
 
     forward_backward_func = get_forward_backward_func()
-    # Don't care about timing during evaluation
-    config.timers = None
+    config.timers = straggler_timers("forward_only", model, num_microbatches)
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
@@ -1379,6 +1383,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "rollout_topk_token_ids",
                     "rollout_topk_log_probs",
+                    "rollout_topk_support_complete",
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
@@ -1390,6 +1395,7 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        note_microbatch_tokens(batch.get("total_lengths"))
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1404,7 +1410,7 @@ def train_one_step(
             # build_schedule_plan path doesn't go through model() so the
             # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
             # chunked-logits incompatibility is enforced as a hard assert in
-            # arguments.py.slime_validate_args, so bypass mode is guaranteed
+            # arguments.py.relax_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
             if use_indexer_replay:
                 with IndexerReplay.forward_stage():
@@ -1457,6 +1463,14 @@ def train_one_step(
             mm_inputs = batch.get("multimodal_train_inputs")
             if is_vl_model and mm_inputs:
                 forward_kwargs.update(mm_inputs)
+
+            # Score Centering upcasts response blocks internally.
+            if (
+                getattr(args, "loss_type", None) == "policy_loss"
+                and getattr(args, "advantage_estimator", None) == "score_centering"
+                and (args.bf16 or args.fp16)
+            ):
+                forward_kwargs["fp32_output"] = False
 
             _attach_mtp_forward_kwargs(args, batch, forward_kwargs)
 
@@ -1565,6 +1579,9 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
+    timers = straggler_timers("train", model, num_microbatches)
+    if timers is not None:
+        get_model_config(model[0]).timers = timers
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
