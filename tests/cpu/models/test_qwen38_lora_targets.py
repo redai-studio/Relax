@@ -10,7 +10,8 @@ from types import ModuleType
 import pytest
 import torch
 
-from relax.models.qwen3_8.lora import HC_TARGETS, PLE_TARGETS, qwen38_lora_targets, validate_qwen38_lora
+from relax.models.common.lora import finalize_lora_models, resolve_lora_targets
+from relax.models.qwen3_8.lora import HC_TARGETS, PLE_TARGETS
 
 
 class _HC(torch.nn.Module):
@@ -77,7 +78,7 @@ def test_qwen38_lora_targets_isolate_owners_and_keep_export_names(case):
     model, args = case
     args.lora_dropout = 0.25
     original = list(args.lora_target_modules)
-    result = qwen38_lora_targets(model, ["linear_qkv", *original], args)
+    result = resolve_lora_targets(model, ["linear_qkv", *original], args)
 
     assert result[0] == "linear_qkv"
     assert len(result) == 11  # Three HC + two mixer + three MTP HC + two PLE.
@@ -91,15 +92,23 @@ def test_qwen38_lora_empty_pipeline_chunk_does_not_select_all_linears(case):
     model, args = case
     empty = torch.nn.Module()
     empty.config = model.config
-    assert qwen38_lora_targets(empty, args.lora_target_modules, args) == ["__relax_lora_no_match__"]
+    assert resolve_lora_targets(empty, args.lora_target_modules, args) == ["__relax_lora_no_match__"]
     assert empty._relax_qwen38_lora_targets == ()
+    with pytest.raises(ValueError, match="no Qwen3.8 HC/PLE projection matched"):
+        finalize_lora_models([empty], args)
 
 
-def test_qwen38_lora_does_not_change_other_models(case):
+def test_qwen38_lora_does_not_change_other_models(case, monkeypatch):
     model, args = case
     model.config.mhc_variant = "other"
-    assert qwen38_lora_targets(model, args.lora_target_modules, args) == args.lora_target_modules
+    monkeypatch.setitem(sys.modules, "relax.models.qwen3_8.lora", None)
+    assert resolve_lora_targets(model, args.lora_target_modules, args) == args.lora_target_modules
+    finalize_lora_models([model], args)
     assert not hasattr(model, "_relax_qwen38_lora_targets")
+
+    del model.config
+    assert resolve_lora_targets(model, args.lora_target_modules, args) == args.lora_target_modules
+    finalize_lora_models([model], args)
 
 
 @pytest.mark.parametrize(
@@ -113,48 +122,67 @@ def test_qwen38_lora_rejects_unsupported_modes(case, setting, value, message):
     model, args = case
     setattr(args, setting, value)
     with pytest.raises(ValueError, match=message):
-        qwen38_lora_targets(model, args.lora_target_modules, args)
+        resolve_lora_targets(model, args.lora_target_modules, args)
 
 
 def test_qwen38_lora_rejects_streamed_ple_only_when_requested(case, monkeypatch):
     model, args = case
     monkeypatch.setenv("RELAX_QWEN38_PLE_STREAMED", "1")
-    qwen38_lora_targets(model, list(HC_TARGETS), args)
+    resolve_lora_targets(model, list(HC_TARGETS), args)
     with pytest.raises(ValueError, match="PLE_STREAMED=0"):
-        qwen38_lora_targets(model, args.lora_target_modules, args)
+        resolve_lora_targets(model, args.lora_target_modules, args)
 
 
 def test_qwen38_lora_validates_after_freeze_and_sync_inheritance(case):
     model, args = case
-    qwen38_lora_targets(model, args.lora_target_modules, args)
+    resolve_lora_targets(model, args.lora_target_modules, args)
     _inject(model)
-    validate_qwen38_lora([model], args)
+    finalize_lora_models([model], args)
     projection = model.ple.key_proj
     projection.adapter.linear_in.weight.requires_grad_(False)
     with pytest.raises(ValueError, match="requested adapter was frozen"):
-        validate_qwen38_lora([model], args)
+        finalize_lora_models([model], args)
     projection.adapter.linear_in.weight.requires_grad_(True)
     projection.to_wrap.weight.sequence_parallel = True
     with pytest.raises(ValueError, match="TP SUM"):
-        validate_qwen38_lora([model], args)
+        finalize_lora_models([model], args)
     for parameter in projection.adapter.parameters():
         parameter.sequence_parallel = True
-    validate_qwen38_lora([model], args)
+    finalize_lora_models([model], args)
     model.ple.norm.requires_grad_(True)
     with pytest.raises(ValueError, match="base parameters must stay frozen"):
-        validate_qwen38_lora([model], args)
+        finalize_lora_models([model], args)
+
+
+def test_qwen38_lora_validates_targets_across_all_virtual_pipeline_chunks(case):
+    model, args = case
+    ple_chunk = torch.nn.Module()
+    ple_chunk.config = model.config
+    ple_chunk.ple = model.ple
+    del model.ple
+    empty_chunk = torch.nn.Module()
+    empty_chunk.config = model.config
+    chunks = [empty_chunk, model, ple_chunk]
+    for chunk in chunks:
+        resolve_lora_targets(chunk, args.lora_target_modules, args)
+        _inject(chunk)
+
+    finalize_lora_models(chunks, args)
+    ple_chunk.ple.key_proj.adapter.linear_in.weight.requires_grad_(False)
+    with pytest.raises(ValueError, match="requested adapter was frozen"):
+        finalize_lora_models(chunks, args)
 
 
 def test_qwen38_lora_rejects_filtered_and_globally_missing_targets(case):
     model, args = case
-    qwen38_lora_targets(model, args.lora_target_modules, args)
+    resolve_lora_targets(model, args.lora_target_modules, args)
     with pytest.raises(ValueError, match="expected a plain LinearAdapter"):
-        validate_qwen38_lora([model], args)
+        finalize_lora_models([model], args)
     del model.ple
-    qwen38_lora_targets(model, args.lora_target_modules, args)
+    resolve_lora_targets(model, args.lora_target_modules, args)
     _inject(model)
     with pytest.raises(ValueError, match="no Qwen3.8 HC/PLE projection matched"):
-        validate_qwen38_lora([model], args)
+        finalize_lora_models([model], args)
 
 
 @pytest.mark.parametrize("target", ["ple.key_proj", "*.input_mix_weight_*", "*.key_proj", "*ple*key_proj"])
@@ -162,6 +190,6 @@ def test_qwen38_lora_paths_cannot_bypass_validation(case, target):
     model, args = case
     args.lora_target_modules = [target]
     args.lora_dropout = 0.05
-    qwen38_lora_targets(model, args.lora_target_modules, args)
+    resolve_lora_targets(model, args.lora_target_modules, args)
     with pytest.raises(ValueError, match="use canonical HC/PLE target names"):
-        validate_qwen38_lora([model], args)
+        finalize_lora_models([model], args)

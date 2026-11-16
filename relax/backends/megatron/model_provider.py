@@ -26,7 +26,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from relax.models.qwen3_8.lora import qwen38_lora_targets
+from relax.models.common.lora import resolve_lora_targets
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -797,7 +797,7 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
-            peft.target_modules = qwen38_lora_targets(model, list(peft.target_modules), args)
+            peft.target_modules = resolve_lora_targets(model, list(peft.target_modules), args)
             # Restrict adapter injection to the requested model region (e.g. language-only
             # for VL models). Overriding target_modules post-construction is supported:
             # PEFT.__call__ rebuilds its matcher state from the current target_modules.

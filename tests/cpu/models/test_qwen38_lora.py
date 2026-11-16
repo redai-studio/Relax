@@ -68,14 +68,15 @@ def _model(tp_size: int, with_ple: bool, cp_size: int = 1) -> torch.nn.Module:
 
 
 def _inject(model: torch.nn.Module, dropout: float = 0.0, targets: list[str] | None = None) -> Namespace:
-    from relax.models.qwen3_8.lora import HC_TARGETS, PLE_TARGETS, qwen38_lora_targets
+    from relax.models.common.lora import resolve_lora_targets
+    from relax.models.qwen3_8.lora import HC_TARGETS, PLE_TARGETS
     from relax.utils.training.lora_grad_sync import inherit_lora_tp_grad_sync
 
     lora, _, _ = _runtime()
     if targets is None:
         targets = list(HC_TARGETS) + (list(PLE_TARGETS) if hasattr(model, "ple") else [])
     args = Namespace(lora_rank=2, lora_dropout=dropout, lora_scope="all", lora_target_modules=targets)
-    resolved = qwen38_lora_targets(model, targets, args)
+    resolved = resolve_lora_targets(model, targets, args)
     lora(target_modules=resolved, dim=2, alpha=4, dropout=dropout)(model)
     inherit_lora_tp_grad_sync(model)
     return args
@@ -180,7 +181,7 @@ def _tp_contract(rank: int) -> None:
     from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
     from relax.models.common.chunked_grad_coalesce import _allreduce_non_tensor_model_parallel_grads
-    from relax.models.qwen3_8.lora import validate_qwen38_lora
+    from relax.models.common.lora import finalize_lora_models
     from relax.utils.distributed_utils import init_gloo_group
 
     model = _model(2, with_ple=False)
@@ -192,7 +193,7 @@ def _tp_contract(rank: int) -> None:
             if "linear_in" in name:
                 parameter.add_(rank)
     init_gloo_group(distributed_timeout_minutes=2)
-    validate_qwen38_lora([model], args)
+    finalize_lora_models([model], args)
     for parameter in _adapters(model).values():
         copies = [torch.empty_like(parameter) for _ in range(2)]
         dist.all_gather(copies, parameter, group=dist.group.WORLD)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.8: 4 nodes x 8 Blackwell GPUs, TP2/PP4/DP4/CP1/EP8, one MTP layer.
+# Qwen3.8: 1 nodes x 8 Blackwell GPUs, TP2/PP1/DP4/CP1/EP8, one MTP layer.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
 # DRY_RUN=1 prints JSON without Ray setup, cleanup, network calls or GPU imports.
 # MODEL_DIR and DATA_DIR are the exact HF checkpoint and prompt-data paths.
@@ -72,7 +72,6 @@ ENV_ARGS=(
     RELAX_QWEN38_PLE_STREAMED=0
     RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG=1
     RELAX_QWEN38_FLA_CONV_CACHE_REUSE=1
-    # This CP2 recipe uses native QSA; the mixed backend/selector require CP1.
     RELAX_QWEN38_QSA_COMMUNITY_BACKEND=mixed
     "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=${RELAX_QWEN38_QSA_MIXED_LONG_BACKEND:-grouped}"
     "RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN=${RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN:--1}"
@@ -94,7 +93,7 @@ ENV_ARGS=(
     "RELAX_AUTOTUNE_LOG_DIR=${RELAX_AUTOTUNE_LOG_DIR-${SAVE_DIR}/autotune}"
     RELAX_QWEN38_HC_FUSED_MIX=1
     RELAX_SFT_SELECTIVE_LOGITS=1
-    RELAX_QWEN38_QSA_TP_SELECTOR=0
+    RELAX_QWEN38_QSA_TP_SELECTOR=1
     RELAX_QWEN38_QSA_FUSED_SELECTOR=0
     RELAX_QWEN38_QSA_GROUPED_BACKWARD_WARPS=4
     RELAX_QWEN38_QSA_FLEX_SPARSE_MASK=1

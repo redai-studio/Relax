@@ -36,6 +36,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
+from relax.models.common.lora import finalize_lora_models
 from relax.utils import tracking_utils
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
@@ -566,9 +567,7 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
-    from relax.models.qwen3_8.lora import validate_qwen38_lora
-
-    validate_qwen38_lora([_unwrap_module(chunk) for chunk in model], args)
+    finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
