@@ -3,6 +3,7 @@
 models."""
 
 import asyncio
+import importlib
 import os
 import signal
 import socket
@@ -78,6 +79,9 @@ def _listening(port: int) -> bool:
 
 @pytest.fixture
 def cluster():
+    # Normal service construction loads routing before a restart. CPU replicas
+    # replace that construction, so load its cleanup module before timing recovery.
+    importlib.import_module("relax.distributed.ray.rollout")
     port = _free_port()
     head = subprocess.Popen(
         [

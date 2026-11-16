@@ -27,6 +27,7 @@ from relax.utils.async_utils import shutdown_async_loop
 from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.health_system import HealthChecker, HealthManager
+from relax.utils.http_utils import get_serve_http_port
 from relax.utils.logging_utils import get_logger
 
 
@@ -175,6 +176,7 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
         ray=ray_adapter,
         serve=serve_adapter,
         HealthManager=HealthManager if native else ControlledHealthManager,
+        get_serve_http_port=get_serve_http_port,
         logger=get_logger("fault-cpu-controller"),
         GENRM_ROLE="genrm",
         ACTOR_ROLLOUT_PG_ROLES=[],
