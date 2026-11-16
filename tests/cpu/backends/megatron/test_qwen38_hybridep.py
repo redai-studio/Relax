@@ -124,6 +124,27 @@ def test_bad_group_fails_collectively(preflight, monkeypatch, failure):
         detect.assert_not_called()
 
 
+@pytest.mark.parametrize("cp", [2, 4])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkeypatch, cp, enabled):
+    module, mpu, _, detect, expert, _ = preflight
+    mpu.get_tensor_model_parallel_world_size = lambda: 2
+    mpu.get_context_parallel_world_size = lambda: cp
+    monkeypatch.setenv("RELAX_QWEN38_QSA_CP", str(int(enabled)))
+    monkeypatch.setenv("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", "mixed")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "cute")
+    if enabled:
+        module.validate_hybridep_worker_group()
+        detect.assert_called_once_with(expert)
+        detect.return_value = 7
+        with pytest.raises(RuntimeError, match="accessible peers"):
+            module.validate_hybridep_worker_group()
+    else:
+        with pytest.raises(RuntimeError, match="preflight rejected"):
+            module.validate_hybridep_worker_group()
+        detect.assert_not_called()
+
+
 @pytest.mark.parametrize("failure", [None, "cross_node", "detected_peers", "world_size"])
 def test_35b_ep4_requires_exact_layout_and_four_accessible_peers(preflight, failure):
     module, mpu, dist, detect, expert, logger = preflight

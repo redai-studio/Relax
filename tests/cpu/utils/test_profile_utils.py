@@ -77,6 +77,11 @@ def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_pat
         profile_with_flops=False,
     )
     tensor = torch.randn(16)
+    # Initialize Torch's annotation machinery before collecting Python stacks.
+    # A cold ProfilerStep annotation can import _cupti_monitor inside the trace
+    # and produce invalid UTF-8 stack labels. Keep strict trace decoding below.
+    with torch.profiler.record_function("initialize-profiler-annotations"):
+        pass
     with profile_utils._create_torch_profiler(args, "stack-test") as profiler:
         _python_stack_probe_leaf(tensor)
         profiler.step()
