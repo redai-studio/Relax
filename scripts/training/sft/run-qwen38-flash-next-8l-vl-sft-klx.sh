@@ -13,10 +13,18 @@
 #   added    : --loss-type sft, epoch/eval control, chunked SFT logits
 #   resource : {"sft":[1,0],"actor":[1,8]} -- no rollout engine at all
 #
-# Data: train-00000-of-00001-converted.parquet (7689 rows), columns
-#   prompt : list<struct<content,role>>  chat turns, rendered by the template
-#   image  : list<binary>                embedded JPEG bytes (no path deps)
-#   label  : string                      target response = the SFT label
+# Data: train-00000-of-00001_sft_localpath.parquet (7689 rows), columns
+#   messages : list<struct<content,role>>  full OpenAI turns; the assistant
+#              turn IS the supervision target, so --label-key stays unset
+#   images   : list<string>                paths into the sibling images/ dir,
+#              one per row; the <image> placeholder sits in the user turn
+#
+# This is NOT the RL parquet. scripts/tools/process_openr1.py emits the GRPO
+# layout (prompt / image<binary> / label), which the SFT loader rejects both
+# ways: with --label-key the prompt column must be a plain string
+# (relax/engine/sft/dataset/streaming.py:279-283), and without it the messages
+# list carries no assistant turn, so loss_mask comes out all zeros. Build this
+# parquet with scripts/tools/process_openr1_sft.py instead.
 #
 # Usage:
 #   bash scripts/training/sft/run-qwen38-flash-next-8l-vl-sft-klx.sh
@@ -165,9 +173,8 @@ OPTIMIZER_ARGS=(
 TRACKING_ARGS=(
     --tb-experiment-name qwen3.8-flash-next-sft
     --use-wandb
-    --wandb-project qwen38-flash-next-sft-vl
+    --wandb-project "${PROJECT_NAME//\//-}"
     --wandb-group qwen38-flash-next-sft-klx-${now}
-    --wandb-key "${WANDB_API_KEY}"
     --disable-wandb-random-suffix
     --no-use-metrics-service
 )
