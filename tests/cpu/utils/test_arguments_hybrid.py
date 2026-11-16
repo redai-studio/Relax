@@ -106,6 +106,6 @@ def test_full_async_does_not_add_hybrid_init_sync(config_path):
     actor = Actor.func_or_class.__new__(Actor.func_or_class)
     actor.config = Namespace(hybrid=False, fully_async=True, autoscaler_config=config_path, loss_type="policy_loss")
     actor.actor_model = Mock()
-    actor.set_rollout_manager(Mock())
+    asyncio.run(actor.set_rollout_manager(Mock()))
     actor.actor_model.update_weights.assert_not_called()
     actor.actor_model.update_weights_fully_async.assert_not_called()

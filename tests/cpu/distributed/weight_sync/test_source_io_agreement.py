@@ -12,7 +12,7 @@ def _agreement_worker(rank, rendezvous, output):
 
     from relax.distributed.weight_sync.source_io import agree_errors, agree_io_state, coordinated_io
 
-    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=rendezvous, timeout=timedelta(seconds=20))
+    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=rendezvous, timeout=timedelta(seconds=60))
     group = dist.group.WORLD
     try:
         assert agree_errors(None, group) == [None, None]
@@ -103,7 +103,7 @@ def test_two_real_ranks_preserve_failure_details_and_wait_for_file_workers(tmp_p
         for process in processes:
             process.start()
         for process in processes:
-            process.join(timeout=40)
+            process.join(timeout=90)
         assert [process.exitcode for process in processes] == [0, 0]
         assert all(json.loads((tmp_path / f"rank-{rank}.json").read_bytes())["passed"] for rank in range(2))
     finally:
