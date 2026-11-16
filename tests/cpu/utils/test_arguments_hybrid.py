@@ -60,7 +60,7 @@ def test_colocate_still_accepts_rollout_offload(offload_flag):
 
 @pytest.mark.parametrize("enabled", [None, False, True])
 @pytest.mark.parametrize("loss_type", ["policy_loss", "sft", "dpo"])
-def test_hybrid_init_weight_sync_routes_elastic_and_skips_offline(enabled, loss_type, tmp_path):
+def test_hybrid_init_weight_sync_routes_elastic_and_skips_offline(enabled, loss_type, tmp_path, monkeypatch):
     from relax.components.actor import Actor
 
     cls = Actor.func_or_class
@@ -69,9 +69,13 @@ def test_hybrid_init_weight_sync_routes_elastic_and_skips_offline(enabled, loss_
     if enabled is not None:
         config_path = tmp_path / "elastic.yaml"
         config_path.write_text(f"enabled: {str(enabled).lower()}\n")
-    actor.config = Namespace(hybrid=True, fully_async=True, autoscaler_config=config_path, loss_type=loss_type)
+    actor.config = Namespace(
+        hybrid=True, fully_async=True, autoscaler_config=config_path, loss_type=loss_type, train_backend="megatron"
+    )
     actor.actor_model = Mock()
     manager = Mock()
+    manager.get_lora_training_config.remote.return_value = None
+    monkeypatch.setattr("ray.get", lambda value: value)
     actor.set_rollout_manager(manager)
     actor.actor_model.set_rollout_manager.assert_called_once_with(manager)
     if loss_type != "policy_loss":
@@ -99,12 +103,21 @@ def test_hybrid_requires_real_weights_backuper(elastic):
 
 
 @pytest.mark.parametrize("config_path", [None, "elastic.yaml"])
-def test_full_async_does_not_add_hybrid_init_sync(config_path):
+def test_full_async_does_not_add_hybrid_init_sync(config_path, monkeypatch):
     from relax.components.actor import Actor
 
     actor = Actor.func_or_class.__new__(Actor.func_or_class)
-    actor.config = Namespace(hybrid=False, fully_async=True, autoscaler_config=config_path, loss_type="policy_loss")
+    actor.config = Namespace(
+        hybrid=False,
+        fully_async=True,
+        autoscaler_config=config_path,
+        loss_type="policy_loss",
+        train_backend="megatron",
+    )
     actor.actor_model = Mock()
-    actor.set_rollout_manager(Mock())
+    manager = Mock()
+    manager.get_lora_training_config.remote.return_value = None
+    monkeypatch.setattr("ray.get", lambda value: value)
+    actor.set_rollout_manager(manager)
     actor.actor_model.update_weights.assert_not_called()
     actor.actor_model.update_weights_fully_async.assert_not_called()
