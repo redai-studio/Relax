@@ -344,7 +344,7 @@ async def test_external_outer_catch_does_not_leak_exception_args():
     server.router_ip = "10.0.0.1"
     server.router_port = 8000
     # Force the outer try/except to trip with a secret-bearing exception.
-    type(server).engine_groups = PropertyMock(side_effect=RuntimeError(secret))
+    type(server).router_ip = PropertyMock(side_effect=RuntimeError(secret))
     manager._get_server = MagicMock(return_value=server)
     manager._rollback_engines = AsyncMock()
 

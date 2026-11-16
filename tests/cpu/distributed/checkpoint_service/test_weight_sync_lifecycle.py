@@ -172,3 +172,56 @@ def test_rollout_health_can_probe_without_generating(monkeypatch, generate):
     monkeypatch.setattr(device_direct.requests, "get", request)
     assert engine.health(timeout=7, generate=generate)
     request.assert_called_once_with(f"http://engine/{'health_generate' if generate else 'get_server_info'}", timeout=7)
+
+
+@pytest.mark.parametrize(
+    "sources,expected,rank,incomplete",
+    [
+        ([{"A", "B"}, {"A", "B"}], ["A", "B"], 0, False),
+        ([{"A", "B"}, {"A"}], ["A", "B"], 0, True),
+        ([{"A", "B", "C"}], ["A", "B"], 0, True),
+        ([set()], [], 0, True),
+        ([{"A"}], ["A", "B"], 1, True),
+    ],
+)
+def test_replacement_sync_requires_every_pp_source_and_expected_engine(
+    monkeypatch, sources, expected, rank, incomplete
+):
+    client = engine_module.CheckpointEngineClient(
+        args=SimpleNamespace(), coordinator_url="http://dcs", role="actor", rank=rank
+    )
+    topology = {"nodes": {"rollout": {"0": {"metadata": {"actor_id": "A"}}}}}
+    response = Mock()
+    response.json.return_value = topology
+    client._http_client = SimpleNamespace(get=AsyncMock(return_value=response))
+    client._backend = Mock(
+        _lora_adapter_mode=False, _is_pp_src_rank=True, rollout_topology=topology["nodes"]["rollout"]
+    )
+    group = object()
+    monkeypatch.setattr(engine_module, "get_gloo_group", lambda: group)
+    monkeypatch.setattr(engine_module.dist, "get_rank", lambda **kw: rank)
+    monkeypatch.setattr(engine_module.dist, "get_world_size", lambda **kw: len(sources))
+    monkeypatch.setattr(
+        engine_module.dist, "all_gather_object", lambda out, ids, **kw: out.__setitem__(slice(None), sources)
+    )
+    broadcasts = []
+
+    def broadcast(payload, src, group):
+        broadcasts.append(payload)
+        if rank == 1:
+            payload[0] = (
+                (topology, None)
+                if len(broadcasts) == 1
+                else "Replacement Rollout weight synchronization is incomplete"
+            )
+
+    monkeypatch.setattr(engine_module.dist, "broadcast_object_list", broadcast)
+    if incomplete:
+        with pytest.raises(RuntimeError, match="Replacement Rollout weight synchronization is incomplete"):
+            asyncio.run(client.update_weights_for_rollout(rollout_only=True, expected_rollout_actor_ids=expected))
+    else:
+        assert asyncio.run(
+            client.update_weights_for_rollout(rollout_only=True, expected_rollout_actor_ids=expected)
+        ) == ["A", "B"]
+    assert len(broadcasts) == 2
+    client._backend.update_weights_for_rollout.assert_called_once_with(True, False)

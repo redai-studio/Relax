@@ -634,6 +634,8 @@ def test_start_engines_preserves_submitted_record_on_later_synchronous_failure(m
 
 def prepare_external_manager(monkeypatch, *, policy="keep_partial", finalize_success=True, creation_error=False):
     manager, initial_group = make_manager([make_engine()], [engine_metadata(pid=100)])
+    manager._engine_lifecycle_lock = threading.RLock()
+    manager._next_engine_rank = initial_group.rank_offset + len(initial_group.all_engines)
     manager.args.scale_out_partial_success_policy = policy
     manager._health_check_engines = AsyncMock(return_value=True)
     manager._sync_weights_from_seed_engine = AsyncMock(return_value=finalize_success)

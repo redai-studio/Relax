@@ -30,6 +30,7 @@ def hybrid_actor(monkeypatch, request):
         keep_old_actor=False,
     )
     actor.role = "actor"
+    actor._inference_recovery = None
     actor._use_dcs_hybrid_weight_sync = True
     state = SimpleNamespace(awake=True, tp_group=object(), updating=False, events=[])
 

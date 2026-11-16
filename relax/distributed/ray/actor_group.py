@@ -116,6 +116,7 @@ class RayTrainGroup:
 
         TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
         lock = Lock.options(**with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})).remote()
+        self._actor_lock = lock
 
         # Create worker actors
         self._actor_handlers = []
@@ -239,25 +240,41 @@ class RayTrainGroup:
 
         self._actor_handlers = []
 
-    def async_train(self, rollout_id):
+    def async_train(self, rollout_id, *, defer_inference: bool = False):
         """Do one rollout training."""
-        return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
+        options = {"defer_inference": True} if defer_inference else {}
+        return [actor.train.remote(rollout_id, **options) for actor in self._actor_handlers]
+
+    def get_recovery_children(self) -> list[Any]:
+        """Owned workers and lock; placement groups belong to the Service."""
+        children = list(self._actor_handlers)
+        if self._actor_lock is not None:
+            children.append(self._actor_lock)
+        return children
+
+    def async_inference_call(self, method: str, *args: Any, **kwargs: Any) -> list[Any]:
+        """Submit a call to every inference rank; the caller observes all
+        results."""
+        return [getattr(actor, method).remote(*args, **kwargs) for actor in self._actor_handlers]
 
     def async_compute_ref_log_prob(self, rollout_id):
         """Compute reference log prob for routing replay."""
         return [actor.compute_ref_log_prob.remote(rollout_id) for actor in self._actor_handlers]
 
-    def async_compute_actor_log_prob(self, rollout_id):
+    def async_compute_actor_log_prob(self, rollout_id, *, defer_weight_receive: bool = False):
         """Compute actor log prob for routing replay."""
-        return [actor.compute_actor_log_prob.remote(rollout_id) for actor in self._actor_handlers]
+        options = {"defer_weight_receive": True} if defer_weight_receive else {}
+        return [actor.compute_actor_log_prob.remote(rollout_id, **options) for actor in self._actor_handlers]
 
-    def train_fully_async(self, rollout_id):
+    def train_fully_async(self, rollout_id, *, defer_inference: bool = False):
         """Do one rollout training without ref log prob computation."""
-        return [actor.train_async.remote(rollout_id) for actor in self._actor_handlers]
+        options = {"defer_inference": True} if defer_inference else {}
+        return [actor.train_async.remote(rollout_id, **options) for actor in self._actor_handlers]
 
-    def train_hybrid(self, rollout_id):
+    def train_hybrid(self, rollout_id, *, defer_inference: bool = False):
         """Hybrid mode: actor handles ref/actor_fwd/adv internally."""
-        return [actor.train_hybrid.remote(rollout_id) for actor in self._actor_handlers]
+        options = {"defer_inference": True} if defer_inference else {}
+        return [actor.train_hybrid.remote(rollout_id, **options) for actor in self._actor_handlers]
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model."""

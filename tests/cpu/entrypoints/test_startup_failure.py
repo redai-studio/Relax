@@ -319,7 +319,7 @@ class _RecordingRemovePG:
 def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, remove_pg=None):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    wanted = {"_run_service_phase", "_abort_service_phase"}
+    wanted = {"_run_service_phase", "_abort_service_phase", "_cleanup_aborted_service"}
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "concurrent": SimpleNamespace(futures=concurrent.futures),
@@ -336,12 +336,18 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
     exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), namespace)
     controller = SimpleNamespace(
         config=SimpleNamespace(fully_async=fully_async),
+        _startup_abort_event=threading.Event(),
+        _startup_services=[],
         serve_dict={} if serve_dict is None else serve_dict,
         _serve=namespace["serve"],
     )
     controller._abort_service_phase = lambda phase_, services, failed_services=None: namespace["_abort_service_phase"](
         controller, phase_, services, failed_services
     )
+    controller._cleanup_aborted_service = lambda role, service, **kwargs: namespace["_cleanup_aborted_service"](
+        controller, role, service, **kwargs
+    )
+    controller._validate_service_close_receipt = lambda receipt: None
     return controller, lambda task, args: namespace["_run_service_phase"](controller, phase, task, args)
 
 
@@ -424,9 +430,9 @@ def test_controller_allocate_phase_failure_releases_pgs_without_touching_serve_d
     # PGs here so ray.shutdown() is not the only backstop.
     actor_pg = object()
     rollout_pg = object()
+    remove_pg = _RecordingRemovePG()
     prepared_actor = SimpleNamespace(pgs=(actor_pg, [0], ["gpu-0"]))
     failed_rollout = SimpleNamespace(pgs=(rollout_pg, [0], ["gpu-0"]))
-    remove_pg = _RecordingRemovePG()
     controller, run = _service_phase(False, phase=_FakePhase.ALLOCATE_RESOURCES, remove_pg=remove_pg)
 
     def task(role):
@@ -465,6 +471,7 @@ def test_service_constructor_failure_is_bounded_and_propagated(has_data_source):
         "Any": object,
         "os": os,
         "Optional": Optional,
+        "Callable": Callable,
         "Namespace": SimpleNamespace,
         "logger": Mock(),
         "with_control_plane_affinity": lambda config, options: options,
@@ -480,7 +487,11 @@ def test_service_constructor_failure_is_bounded_and_propagated(has_data_source):
     service.num_gpus = 0
     service.data_source = object() if has_data_source else None
     service.pgs = None
+    service._is_shared_pgs = False
     service._deployed = False
+    # Lifecycle attributes introduced with the recovery-hardened Service.
+    service._heartbeat_thread = None
+    service._stop_heartbeat = threading.Event()
     ns["serve"].run.side_effect = RuntimeError("constructor failed")
     with pytest.raises(RuntimeError, match="constructor failed"):
         service.deploy()
@@ -494,6 +505,7 @@ def test_service_deploy_failure_releases_owned_pg():
         "Any": object,
         "os": os,
         "Optional": Optional,
+        "Callable": Callable,
         "Namespace": SimpleNamespace,
         "logger": Mock(),
         "with_control_plane_affinity": lambda config, options: options,
@@ -513,6 +525,9 @@ def test_service_deploy_failure_releases_owned_pg():
     service.pgs = (pg, [0], ["gpu-0"])
     service._is_shared_pgs = False
     service._deployed = False
+    # Lifecycle attributes introduced with the recovery-hardened Service.
+    service._heartbeat_thread = None
+    service._stop_heartbeat = threading.Event()
     ns["serve"].run.side_effect = RuntimeError("deploy failed")
 
     with pytest.raises(RuntimeError, match="deploy failed"):
@@ -558,11 +573,6 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
 def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    methods = [
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
-    ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
@@ -571,20 +581,22 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     ns = {
         "logger": Mock(),
         "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
-        "shutdown_managed_opd_teacher": stop_teacher,
         "asyncio": asyncio,
         "run": asyncio.run,
+        "threading": threading,
+        "require_control_plane_resource": Mock(side_effect=ValueError("startup failed")),
+        "shutdown_managed_opd_teacher": stop_teacher,
     }
-    exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
+    module = ast.Module(body=[ast.parse("from __future__ import annotations").body[0], cls], type_ignores=[])
+    exec(compile(module, "controller.py", "exec"), ns)
+    partial_controller = ns["Controller"].__new__(ns["Controller"])
+    with pytest.raises(ValueError, match="startup failed"):
+        partial_controller.__init__(SimpleNamespace())
     teacher = object()
-    partial_controller = SimpleNamespace(
-        serve_dict={},
-        _teacher_manager=teacher,
-        _shutdown_agentic_rollout_services=Mock(),
-        _close_data_system=Mock(),
-        _cleanup_s3_model_weights_after_init=Mock(),
-    )
-    partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
+    partial_controller._teacher_manager = teacher
+    partial_controller._shutdown_agentic_rollout_services = Mock()
+    partial_controller._close_data_system = Mock()
+    partial_controller._cleanup_s3_model_weights_after_init = Mock()
     stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
     if mode != "missing_config":
         partial_controller.config = SimpleNamespace(
@@ -593,7 +605,9 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         partial_controller.serve_dict["sft"] = SimpleNamespace(
             handle=SimpleNamespace(stop=SimpleNamespace(remote=stop_image))
         )
-    ns["shutdown"](partial_controller)
+    else:
+        del partial_controller.config
+    partial_controller.shutdown()
     if mode.startswith("i2i"):
         stop_image.assert_awaited_once()
     else:

@@ -922,7 +922,57 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     return aborted_samples, completed_protected_samples
 
 
+def reset_data_window(timeout: float = 30.0) -> None:
+    """Discard settled native carryover without rewinding the input cursor."""
+    from relax.distributed.settlement import wait_all
+    from relax.utils.utils import CURRENT_ROLLOUT_BATCH
+
+    state = GenerateState._instances.get(GenerateState)
+    if state is None:
+        return
+    transfers = getattr(state, "recovery_transfers", [])
+    tasks = state.pendings | state.protected_pendings | set(transfers)
+    if state.evaluating or any(not task.done() for task in tasks):
+        raise RuntimeError("Old generation operations are not terminal")
+    if any(task.cancelled() or task.exception() is not None for task in transfers):
+        raise RuntimeError("Old storage writes failed or have an unknown result")
+    if state.prefetched_samples_ref is not None:
+        wait_all([state.prefetched_samples_ref], timeout=timeout)
+    state.reset()
+    state.prefetched_samples_ref = None
+    state.last_step_current_deficit = 0
+    CURRENT_ROLLOUT_BATCH.clear()
+
+
 async def generate_rollout_async(
+    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
+) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    if not getattr(args, "inference_recovery", False):
+        return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
+    from relax.distributed.settlement import UnsafeInferenceError
+
+    state = GenerateState(args)
+    state.recovery_transfers = []
+    try:
+        return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
+    except Exception:
+        # Local HTTP awaits may be cancelled, but dispatched storage writes must settle.
+        tasks = state.pendings | state.protected_pendings
+        for task in tasks:
+            task.cancel()
+        pending = list(tasks) + state.recovery_transfers
+        if pending:
+            done, unfinished = await asyncio.wait(pending, timeout=60)
+            if unfinished:
+                raise UnsafeInferenceError("Old generation work is still running; require global restart")
+            await asyncio.gather(*done, return_exceptions=True)
+            writes_failed = any(task.cancelled() or task.exception() is not None for task in state.recovery_transfers)
+            if writes_failed:
+                raise UnsafeInferenceError("Old storage writes failed; their effects are uncertain")
+        raise
+
+
+async def _generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based
@@ -988,6 +1038,8 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
     transfer_tasks = []
+    if getattr(args, "inference_recovery", False):
+        state.recovery_transfers = transfer_tasks
     batch_to_transfer = []
     aborted_samples = []
     # Completed groups beyond target_data_size (over-sampling surplus). Carried back to
@@ -1158,7 +1210,9 @@ async def generate_rollout_async(
                     n = len(batch_to_transfer)
                     # is_last for the current partition ONLY if this step fully meets its
                     # target (no deficit carried) — otherwise the tail is backfilled next step.
-                    curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
+                    curr_is_last = (args.fully_async or getattr(args, "inference_recovery", False)) and (
+                        committed_curr + n >= curr_target
+                    )
                     transfer_task = asyncio.create_task(
                         transfer_batch_to_data_system(
                             args,
@@ -1221,7 +1275,8 @@ async def generate_rollout_async(
                             n,
                             rollout_id,
                             data_system_client,
-                            is_last=args.fully_async and committed_curr + n >= curr_target,
+                            is_last=(args.fully_async or getattr(args, "inference_recovery", False))
+                            and committed_curr + n >= curr_target,
                         )
                     )
                 )

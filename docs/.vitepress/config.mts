@@ -276,6 +276,7 @@ export default defineConfig({
                 { text: 'Distributed Checkpoint', link: '/en/guide/distributed-checkpoint' },
                 { text: 'Health Check Manager', link: '/en/guide/health-check-manager' },
                 { text: 'Fault Event History', link: '/en/guide/fault-events' },
+                { text: 'Local Inference Recovery', link: '/en/guide/inference-recovery' },
               ],
             },
             {
@@ -417,6 +418,7 @@ export default defineConfig({
                 { text: 'Distributed Checkpoint', link: '/zh/guide/distributed-checkpoint' },
                 { text: '健康检查管理器', link: '/zh/guide/health-check-manager' },
                 { text: '故障事件历史', link: '/zh/guide/fault-events' },
+                { text: '推理服务局部自愈', link: '/zh/guide/inference-recovery' },
               ],
             },
             {
