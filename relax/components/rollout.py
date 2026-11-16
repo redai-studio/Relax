@@ -343,7 +343,8 @@ class Rollout(Base):
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env
         )
-        self.step = max(0, config.start_rollout_id or 0) if config.debug_rollout_only else 0
+        if config.debug_rollout_only and config.start_rollout_id is not None and config.start_rollout_id > 0:
+            self.step = config.start_rollout_id
         self.data_source = data_source
 
         self._stop_event = asyncio.Event()

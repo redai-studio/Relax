@@ -75,6 +75,7 @@ def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected
 
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
+        start_rollout_id=None,
         loss_type="grpo",
         eval_config=None,
         eval_prompt_data=None,
