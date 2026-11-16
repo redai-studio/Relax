@@ -35,7 +35,7 @@ now=$(date "+%Y%m%d-%H%M%S")
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
-source "${SCRIPT_DIR}/../../models/glm5.2-744B-A40B.sh"
+source "${SCRIPT_DIR}/../../models/glm5.3-744B-A40B.sh"
 
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/${MODEL_NAME}"
