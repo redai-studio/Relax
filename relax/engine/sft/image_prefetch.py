@@ -80,6 +80,20 @@ class ImagePrefetch:
         self._fill()
         return sample
 
+    def ready_samples(self, limit: int | None = None) -> list[tuple[int, int, int, Any]]:
+        """Borrow already decoded future samples without advancing the cursor.
+
+        Failed reads remain queued so ``get`` reports the error at its original
+        position. Callers must not mutate samples or consume any training RNG.
+        """
+        ready = []
+        for step, micro, sample_id, future in self.pending:
+            if limit is not None and len(ready) >= limit:
+                break
+            if future.done() and not future.cancelled() and future.exception() is None:
+                ready.append((step, micro, sample_id, future.result()))
+        return ready
+
     def close(self) -> None:
         # Cancel queued reads. Python cannot interrupt an already running NFS
         # read; process termination remains the fallback for a hung filesystem.

@@ -3,11 +3,31 @@
 import gzip
 import json
 from argparse import Namespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from relax.utils import profile_utils
+
+
+def test_train_rank_tag_supports_fsdp_without_megatron_groups(monkeypatch):
+    import sys
+
+    mpu = SimpleNamespace(
+        model_parallel_is_initialized=lambda: False,
+        get_data_parallel_rank=Mock(return_value=2),
+        get_tensor_model_parallel_rank=Mock(return_value=1),
+        get_pipeline_model_parallel_rank=Mock(return_value=0),
+    )
+    core = ModuleType("megatron.core")
+    core.mpu = mpu
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    monkeypatch.setattr(profile_utils.torch.distributed, "get_rank", lambda group: 3)
+    assert profile_utils._get_rank_tag() == "rank3"
+    mpu.get_data_parallel_rank.assert_not_called()
+    mpu.get_tensor_model_parallel_rank.assert_not_called()
+    mpu.get_pipeline_model_parallel_rank.assert_not_called()
 
 
 @pytest.mark.parametrize("rank,selected", [(0, True), (48, True), (1, False)])

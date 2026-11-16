@@ -9,6 +9,7 @@ here keeps the dispatchers in those files to one-line calls.
 
 import math
 from argparse import Namespace
+from typing import Any
 
 import numpy as np
 
@@ -67,6 +68,38 @@ def is_sft_mode(args: Namespace) -> bool:
 def is_i2i_sft(args: Namespace) -> bool:
     """Image-edit supervision uses its own data contract within SFT."""
     return is_sft_mode(args) and getattr(args, "generation_task", None) == "i2i"
+
+
+def is_image_sft(args: Namespace) -> bool:
+    """Image generation and editing share the supervised image runtime."""
+    return is_sft_mode(args) and getattr(args, "generation_task", None) in ("i2i", "t2i")
+
+
+def get_image_sft_config(args: Namespace) -> dict[str, Any]:
+    """Resolve the task's data contract without reinterpreting edit inputs."""
+    task = getattr(args, "generation_task", None)
+    if task not in ("i2i", "t2i"):
+        raise ValueError("Image SFT requires generation_task=i2i or t2i")
+    config = getattr(args, f"{task}_sft_config", None)
+    if not isinstance(config, dict):
+        raise ValueError(f"Image SFT requires --{task}-sft-config")
+    return config
+
+
+def image_sft_task(args: Namespace) -> str:
+    """Keep task checkpoint directories distinct and legacy i2i names
+    stable."""
+    if not is_image_sft(args):
+        raise ValueError("Image SFT checkpoint task requires image supervision")
+    return f"{args.generation_task}_sft"
+
+
+def image_sft_attempt_id(args: Namespace) -> str:
+    """Return the Controller-owned attempt shared by every image worker."""
+    attempt_id = getattr(args, f"_{image_sft_task(args)}_attempt_id", None)
+    if not attempt_id:
+        raise ValueError("Image SFT queue attempt must be initialized before starting workers")
+    return attempt_id
 
 
 def is_dpo_mode(args: Namespace) -> bool:
@@ -203,11 +236,8 @@ def should_use_sft_chunked(args: Namespace) -> bool:
 
 def sft_partition_prefix(args: Namespace) -> str:
     """Keep image SFT queue state isolated across Controller attempts."""
-    if is_i2i_sft(args):
-        attempt_id = getattr(args, "_i2i_sft_attempt_id", None)
-        if not attempt_id:
-            raise ValueError("Image SFT queue attempt must be initialized before starting workers")
-        return f"sft_{attempt_id}_"
+    if is_image_sft(args):
+        return f"sft_{image_sft_attempt_id(args)}_"
     return "sft_" if is_offline_mode(args) else "train_"
 
 

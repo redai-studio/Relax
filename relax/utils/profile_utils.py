@@ -40,8 +40,12 @@ def _profile_this_rank() -> bool:
 
 def _get_rank_tag() -> str:
     """Build a rank tag string like ``rank0_dp0_tp0_pp0`` from Megatron mpu."""
-    global_rank = torch.distributed.get_rank()
+    global_rank = torch.distributed.get_rank(group=torch.distributed.group.WORLD)
     from megatron.core import mpu
+
+    if not mpu.model_parallel_is_initialized():
+        # FSDP initializes distributed groups without Megatron model parallelism.
+        return f"rank{global_rank}"
 
     dp = mpu.get_data_parallel_rank(with_context_parallel=True)
     tp = mpu.get_tensor_model_parallel_rank()

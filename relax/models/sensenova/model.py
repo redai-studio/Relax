@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import os
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -99,6 +99,12 @@ class SenseNovaU1RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+def _rope_tensor_metadata(tensor: torch.Tensor) -> tuple[Any, ...]:
+    """Metadata only: never read back a derived positional tensor's
+    contents."""
+    return id(tensor), tensor._version, tensor.dtype, tensor.device, tuple(tensor.shape), tuple(tensor.stride())
+
+
 class SenseNovaU1RotaryEmbedding(nn.Module):
     def __init__(self, head_dim: Any, rope_theta: Any, max_position_embeddings: Any, device: Any = None) -> None:
         super().__init__()
@@ -108,6 +114,11 @@ class SenseNovaU1RotaryEmbedding(nn.Module):
         self.original_max_seq_len = max_position_embeddings
         self.attention_scaling = 1.0
         self.inv_freq = None
+        self._conditioning_rope_snapshot = None
+
+    def conditioning_rope_cache_is_pristine(self) -> bool:
+        """Distinguish our deterministic lazy materialization from mutation."""
+        return self.inv_freq is None or _rope_tensor_metadata(self.inv_freq) == self._conditioning_rope_snapshot
 
     @staticmethod
     def _compute_inv_freq(base: Any, dim: Any, device: Any = None) -> Any:
@@ -118,6 +129,7 @@ class SenseNovaU1RotaryEmbedding(nn.Module):
             return
         inv_freq_full = self._compute_inv_freq(self.rope_theta, self.rope_head_dim * 2, device)
         self.inv_freq = inv_freq_full[::2]
+        self._conditioning_rope_snapshot = _rope_tensor_metadata(self.inv_freq)
 
     @torch.no_grad()
     def forward(self, x: Any, position_ids: Any) -> Any:
@@ -534,8 +546,18 @@ class SenseNovaU1Model(nn.Module):
         update_cache: Any = True,
         use_gradient_checkpointing: Any = False,
         use_gradient_checkpointing_offload: Any = False,
+        token_type: Literal["understanding", "generation"] | None = None,
     ) -> Any:
-        if image_gen_indicators is None:
+        if token_type is not None:
+            if image_gen_indicators is not None:
+                raise ValueError("Specify either token_type or image_gen_indicators, not both")
+            if token_type not in ("understanding", "generation"):
+                raise ValueError("token_type must be 'understanding' or 'generation'")
+            # Homogeneous callers already know the token type; inspecting GPU
+            # indicators here would synchronize the host before every forward.
+            exist_non_image_gen_tokens = token_type == "understanding"
+            exist_image_gen_tokens = token_type == "generation"
+        elif image_gen_indicators is None:
             exist_non_image_gen_tokens = True
             exist_image_gen_tokens = False
         else:
@@ -671,6 +693,41 @@ class SenseNovaU1VisionEmbeddings(nn.Module):
         self.register_buffer("sin_cached_x", None, persistent=False)
         self.register_buffer("cos_cached_y", None, persistent=False)
         self.register_buffer("sin_cached_y", None, persistent=False)
+        self._conditioning_rope_snapshot: dict[str, tuple[Any, ...]] = {}
+
+    def conditioning_rope_cache_is_pristine(self) -> bool:
+        tensors = {
+            name: getattr(self, name) for name in ("cos_cached_x", "sin_cached_x", "cos_cached_y", "sin_cached_y")
+        }
+        if all(tensor is None for tensor in tensors.values()):
+            return True
+        return all(
+            tensor is not None and _rope_tensor_metadata(tensor) == self._conditioning_rope_snapshot.get(name)
+            for name, tensor in tensors.items()
+        )
+
+    def _apply(self, fn: Any, recurse: bool = True) -> Any:
+        # Module.to(device) legitimately replaces registered buffers. Accept
+        # only a pristine cache and unchanged dtype/layout, not a cast or an
+        # already-mutated table. No tensor values are inspected.
+        pristine = self.conditioning_rope_cache_is_pristine()
+        previous = self._conditioning_rope_snapshot
+        result = super()._apply(fn, recurse=recurse)
+        current = {
+            name: _rope_tensor_metadata(getattr(self, name)) for name in previous if getattr(self, name) is not None
+        }
+        if (
+            pristine
+            and current.keys() == previous.keys()
+            and all(
+                current[name][2] == previous[name][2]
+                and current[name][4:] == previous[name][4:]
+                and (current[name][3] != previous[name][3] or current[name][:2] == previous[name][:2])
+                for name in current
+            )
+        ):
+            self._conditioning_rope_snapshot = current
+        return result
 
     def _ensure_rope_cache(self, device: torch.device) -> None:
         if self.cos_cached_x is not None and self.cos_cached_x.device == device:
@@ -685,6 +742,10 @@ class SenseNovaU1VisionEmbeddings(nn.Module):
         self.sin_cached_x = sin
         self.cos_cached_y = cos.clone()
         self.sin_cached_y = sin.clone()
+        self._conditioning_rope_snapshot = {
+            name: _rope_tensor_metadata(getattr(self, name))
+            for name in ("cos_cached_x", "sin_cached_x", "cos_cached_y", "sin_cached_y")
+        }
 
     def _apply_2d_rotary_pos_emb(self, patch_embeds: Any, grid_hw: Any) -> Any:
         abs_pos_x, abs_pos_y = build_abs_positions_from_grid_hw(grid_hw, device=patch_embeds.device)
@@ -1034,11 +1095,10 @@ class SenseNovaU1DiT(nn.Module):
         use_gradient_checkpointing_offload: Any = False,
     ) -> Any:
         batch_size, num_tokens = image_embeds.shape[0], image_embeds.shape[1]
-        image_gen_indicators = torch.ones((batch_size, num_tokens), dtype=torch.bool, device=image_embeds.device)
 
         hidden_states, _ = self.language_model.model(
             inputs_embeds=image_embeds,
-            image_gen_indicators=image_gen_indicators,
+            token_type="generation",
             indexes=indexes_image,
             attention_mask=None,
             past_key_values=past_key_values,

@@ -57,6 +57,25 @@ def test_head_validation_and_sizing_need_no_worker_mount():
     assert args.i2i_sft_config["max_pixels"] == 1024**2
 
 
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_branch_group_config_requires_boolean(value):
+    args = _args(i2i_sft_config={"data_root": "/worker", "dataset_size": 19, "fsdp_branch_groups": value})
+    with pytest.raises(ValueError, match="fsdp_branch_groups must be boolean"):
+        validate_i2i_sft_config(args)
+
+
+def test_branch_group_default_preserves_checkpoint_config():
+    args = _args()
+    validate_i2i_sft_config(args)
+    assert "fsdp_branch_groups" not in args.i2i_sft_config
+    args.i2i_sft_config["fsdp_branch_groups"] = False
+    validate_i2i_sft_config(args)
+    assert "fsdp_branch_groups" not in args.i2i_sft_config
+    args.i2i_sft_config["fsdp_branch_groups"] = True
+    validate_i2i_sft_config(args)
+    assert args.i2i_sft_config["fsdp_branch_groups"] is True
+
+
 @pytest.mark.parametrize("tiers", [[True], [False], [1024, True], [1.5], ["1024"], [0], [-1], [], True])
 def test_fixed_pixels_tiers_reject_invalid_values(tiers):
     args = _args(i2i_sft_config={"data_root": "/worker", "dataset_size": 19, "fixed_pixels_tiers": tiers})

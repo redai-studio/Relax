@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,12 @@ import torch
 import torch.distributed as dist
 
 from relax.backends.fsdp import checkpoint
-from relax.engine.sft.image import ImageBatchSampler, ImageEditDataset, assign_image_batch
+from relax.engine.sft.image import ImageBatchSampler, ImageSFTDataset, assign_image_batch
+from relax.engine.sft.runtime import get_image_sft_config, image_sft_attempt_id, image_sft_task
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
-TASK = "i2i_sft"
 
 
 def _report_sft_metrics(args: Any, values: dict[str, Any]) -> None:
@@ -81,11 +82,12 @@ class FSDPSFTTrainer:
         from relax.backends.fsdp.actor import _collect_rank_objects, _collect_weight_sync_errors
 
         self.actor, self.args = actor, actor.args
+        self.task = image_sft_task(self.args)
         self.group = actor._device_group()
         self.world, self.rank = dist.get_world_size(self.group), dist.get_rank(self.group)
         if self.args.global_batch_size % self.world:
             raise ValueError("Image SFT global batch size must be divisible by the FSDP world size")
-        config = self.args.i2i_sft_config
+        config = get_image_sft_config(self.args)
         if config.get("dp_tier_micro_balance", False) and actor.adapter.family != "sensenova":
             raise ValueError("DP tier micro balancing currently requires the SenseNova per-row tier policy")
         from relax.utils.profile_utils import TrainProfiler
@@ -94,7 +96,7 @@ class FSDPSFTTrainer:
         self.step = 0
         dataset_error = None
         try:
-            self.dataset = ImageEditDataset(self.args, actor.adapter)
+            self.dataset = ImageSFTDataset(self.args, actor.adapter)
         except Exception as exc:
             dataset_error = f"{type(exc).__name__}: {exc}"
         errors = _collect_weight_sync_errors(dataset_error)
@@ -137,6 +139,8 @@ class FSDPSFTTrainer:
             "master_dtype": self.args.fsdp_master_dtype,
             "torch_version": torch.__version__,
         }
+        if self.args.generation_task == "t2i":
+            self.contract["generation_task"] = "t2i"
         # JSON roundtrip canonicalizes optimizer tuples before disk comparison.
         import json
 
@@ -147,10 +151,11 @@ class FSDPSFTTrainer:
         if self.args.load:
             self._resume()
         else:
-            if self.args.save and checkpoint.find_latest_committed(self.args.save, TASK) is not None:
+            if self.args.save and checkpoint.find_latest_committed(self.args.save, self.task) is not None:
                 raise FileExistsError("Output already contains SFT checkpoints; use --load or a fresh --save")
             seed_training(self.args.seed + self.rank)
         self.prefetch = None
+        self._conditioning_hints: dict[tuple[int, int, int], Any] = {}
         depth = config.get("image_prefetch_depth", 0)
         workers = config.get("image_prefetch_workers", 2)
         if type(depth) is not int or depth < 0 or type(workers) is not int or workers <= 0:
@@ -171,16 +176,39 @@ class FSDPSFTTrainer:
                 workers,
             )
         self.profiler.on_init_end()
+        self.conditioning = None
+        from relax.engine.sft.conditioning import ConditioningRuntime, conditioning_cache_enabled
+
+        if conditioning_cache_enabled():
+            from relax.utils.distributed_utils import get_gloo_group
+
+            try:
+                self.conditioning = ConditioningRuntime(
+                    model=actor.model,
+                    model_path=self.args.model_path,
+                    device=actor.device,
+                    group=get_gloo_group(),
+                    rank=self.rank,
+                    namespace=image_sft_attempt_id(self.args),
+                    local_batch_size=self.args.global_batch_size // self.world,
+                )
+            except BaseException:
+                try:
+                    self.close()
+                except BaseException as cleanup_error:
+                    logger.warning("SFT initialization cleanup interrupted: %s", cleanup_error)
+                raise
 
     def _resume(self) -> None:
-        latest = checkpoint.find_latest_committed(self.args.load, TASK)
+        latest = checkpoint.find_latest_committed(self.args.load, self.task)
         if latest is None:
             raise FileNotFoundError(f"No committed image SFT checkpoint under {self.args.load}")
-        if checkpoint.read_adapter_contract(self.args.load, TASK, latest) != self.contract:
+        saved_contract = checkpoint.read_adapter_contract(self.args.load, self.task, latest)
+        if saved_contract != self.contract:
             raise ValueError("Checkpoint model/data/optimizer contract differs; refusing SFT resume")
         state = checkpoint.load_checkpoint(
             self.args.load,
-            TASK,
+            self.task,
             latest,
             self.actor.model,
             self.actor.optimizer,
@@ -193,22 +221,64 @@ class FSDPSFTTrainer:
         explicit = getattr(self.args, "_start_rollout_id_explicit", False)
         if explicit and self.args.start_rollout_id != self.step:
             raise ValueError("--start-rollout-id disagrees with the restored SFT cursor")
-        restore_rng(Path(self.args.load) / TASK / checkpoint.iter_dir_name(latest), self.rank)
+        restore_rng(Path(self.args.load) / self.task / checkpoint.iter_dir_name(latest), self.rank)
 
     def train(self, step: int) -> None:
         try:
             self._train_step(step)
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                logger.warning("SFT error cleanup interrupted: %s", cleanup_error)
             raise
 
     def close(self) -> None:
+        self._conditioning_hints = {}
         if self.prefetch:
             self.prefetch.close()
+        runtime = getattr(self, "conditioning", None)
+        if runtime is not None:
+            runtime.close()
+
+    def _prefetch_conditioning(self) -> None:
+        runtime = getattr(self, "conditioning", None)
+        describe = getattr(self.actor.model, "conditioning_prefetch_spec", None)
+        if self.prefetch is None or runtime is None or not runtime.prefetch_enabled or describe is None:
+            self._conditioning_hints = {}
+            return
+        try:
+            # CPU decoding has already happened in the original image queue.
+            # Only the training thread reads model/tokenizer state. The cache
+            # executor receives content keys and never runs model collectives.
+            previous = getattr(self, "_conditioning_hints", {})
+            hints = {}
+            for step, micro, sample_id, data in self.prefetch.ready_samples(runtime.prefetch_depth):
+                ticket = (step, micro, sample_id)
+                # A hint only schedules speculative I/O. Forward independently
+                # keys the actual input and checks frozen dependencies again.
+                # Tickets are unique cursor positions, not feature cache keys.
+                hints[ticket] = previous[ticket] if ticket in previous else describe(data)
+            self._conditioning_hints = hints
+            runtime.prefetch_many(list(hints.values()))
+        except Exception as error:
+            self._conditioning_hints = {}
+            runtime.prefetch_many([])
+            logger.warning("Conditioning lookahead skipped; retaining synchronous lookup: %s", error)
+
+    def _profile_range(self, name: str) -> Any:
+        return (
+            torch.profiler.record_function(name)
+            if getattr(self.args, "use_pytorch_profiler", False)
+            else nullcontext()
+        )
 
     def _train_step(self, step: int) -> None:
         from relax.backends.fsdp.actor import _collect_weight_sync_errors
 
+        runtime = getattr(self, "conditioning", None)
+        if runtime is not None:
+            runtime.begin_step()
         if step != self.step:
             raise ValueError(f"Expected SFT step {self.step}, received {step}")
         holder: list[Any] = [None]
@@ -225,7 +295,7 @@ class FSDPSFTTrainer:
         from relax.utils.distributed_utils import get_gloo_group
 
         dist.broadcast_object_list(holder, src=0, group=get_gloo_group())
-        ids = assign_image_batch(holder[0], self.args.i2i_sft_config, step=step, world=self.world)[
+        ids = assign_image_batch(holder[0], get_image_sft_config(self.args), step=step, world=self.world)[
             self.rank :: self.world
         ]
         started = time.monotonic()
@@ -234,10 +304,13 @@ class FSDPSFTTrainer:
         loss_sum = torch.zeros((), device=self.actor.device, dtype=torch.float32)
         data_wait = 0.0
         for micro, sample_id in enumerate(ids):
+            if runtime is not None:
+                runtime.before_forward()
             data, error = None, None
             read_started = time.monotonic()
             try:
-                data = self.prefetch.get(step, micro, sample_id) if self.prefetch else self.dataset[sample_id]
+                with self._profile_range("sft.data_wait"):
+                    data = self.prefetch.get(step, micro, sample_id) if self.prefetch else self.dataset[sample_id]
             except Exception as exc:
                 error = f"sample {sample_id}: {type(exc).__name__}: {exc}"
             data_wait += time.monotonic() - read_started
@@ -246,13 +319,21 @@ class FSDPSFTTrainer:
                 if self.prefetch:
                     self.prefetch.close()
                 raise ValueError(f"Image decoding failed: {errors}")
-            loss = self.actor.model(data)
+            with self._profile_range("sft.forward"):
+                loss = self.actor.model(data)
+            # The current resolver has consumed its entry. Replace the future
+            # window now, allowing lookup/checksum to overlap backward/update.
+            with self._profile_range("sft.conditioning_lookahead"):
+                self._prefetch_conditioning()
             torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
-            (loss / len(ids)).backward()
+            with self._profile_range("sft.backward"):
+                (loss / len(ids)).backward()
             loss_sum.add_(loss.detach().float() / len(ids))
-        norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
         lr = optimizer.param_groups[0]["lr"]
-        optimizer.step()
+        with self._profile_range("sft.clip_gradients"):
+            norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
+        with self._profile_range("sft.optimizer"):
+            optimizer.step()
         self.scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         self.step += 1
@@ -285,7 +366,8 @@ class FSDPSFTTrainer:
             values["train/step"] = self.step
             _report_sft_metrics(self.args, values)
             logger.info(
-                "i2i SFT step=%s loss=%.8f grad_norm=%.8f lr=%g peak_allocated=%d peak_reserved=%d",
+                "%s SFT step=%s loss=%.8f grad_norm=%.8f lr=%g peak_allocated=%d peak_reserved=%d",
+                self.args.generation_task,
                 self.step,
                 *metrics,
                 lr,
@@ -295,18 +377,25 @@ class FSDPSFTTrainer:
         interval = self.args.save_interval
         if self.args.save and (self.step == self.args.num_rollout or (interval and self.step % interval == 0)):
             self.save()
+        if runtime is not None:
+            runtime.end_step()
+            if self.step == self.args.num_rollout:
+                runtime.close()
 
     def save(self) -> None:
         try:
             self._save_checkpoint()
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                logger.warning("SFT checkpoint cleanup interrupted: %s", cleanup_error)
             raise
 
     def _save_checkpoint(self) -> None:
         checkpoint.save_checkpoint(
             self.args.save,
-            TASK,
+            self.task,
             self.step,
             self.actor.model,
             self.actor.optimizer,
@@ -321,7 +410,7 @@ class FSDPSFTTrainer:
 
         self.actor._rank0_then_agree(
             lambda: rotate_ckpt(
-                self.args, global_step=self.step, save_dir=os.path.join(self.args.save, TASK), committed_only=True
+                self.args, global_step=self.step, save_dir=os.path.join(self.args.save, self.task), committed_only=True
             ),
             what=f"SFT checkpoint rotation at step {self.step}",
         )

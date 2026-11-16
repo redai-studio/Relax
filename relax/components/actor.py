@@ -15,6 +15,7 @@ from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrie
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import (
     is_dpo_mode,
+    is_image_sft,
     is_offline_mode,
     sft_partition_ids,
     sft_task_name,
@@ -32,9 +33,12 @@ def _resolve_start_rollout_id(
     backend_step: int,
     *,
     explicitly_set: bool,
+    image_sft: bool = False,
 ) -> int:
     """Resolve the service step after the backend has loaded its checkpoint."""
-    if configured_step is None:
+    # Image SFT returns the exact next update, including a checkpoint at step 1.
+    # Other backends may report 1 on a fresh start; preserve that convention.
+    if configured_step is None or (image_sft and not explicitly_set):
         return backend_step
     if not explicitly_set and configured_step == 0 and backend_step > 1:
         return backend_step
@@ -94,6 +98,7 @@ class Actor(Base):
             configured_step,
             self.steps[0],
             explicitly_set=getattr(self.config, "_start_rollout_id_explicit", configured_step is not None),
+            image_sft=is_image_sft(self.config),
         )
         if configured_step is not None and configured_step != self.config.start_rollout_id:
             self._logger.warning(
