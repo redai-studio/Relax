@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from itertools import islice
 from typing import Any, Callable, Deque, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupInput
@@ -29,13 +30,25 @@ class PrepareDomain:
         self.data_source = data_source
         self.runtime_domain = runtime_domain
         self._prelaunch_next_step = False
+        args = runtime_domain.args
+        self.fixed_batch = (
+            getattr(args, "agentic_prelaunch", False)
+            and not args.fully_async
+            and not args.partial_rollout
+            and not getattr(args, "use_dynamic_global_batch_size", False)
+            and args.over_sampling_batch_size == args.rollout_batch_size
+            and not getattr(args, "dynamic_sampling_filter_path", None)
+            and not getattr(args, "agentic_custom_advantage_path", None)
+        )
+        self._batch_end = 0
+        self._checkpoint_step: int | None = None
         self._next_group_sequence = 0
         self._prepare_fetch_task: Optional[asyncio.Task[None]] = None
         self._pending_group_inputs: Deque[GroupInput] = deque()
         self._warming_prepare_tasks: dict[
             asyncio.Task[Optional[_PreparedGroup]], Tuple[GroupInput, asyncio.Future[bool]]
         ] = {}
-        self._ready_prepare_tasks: Deque[asyncio.Task[_PreparedGroup]] = deque()
+        self._ready_prepare_tasks: dict[asyncio.Task[_PreparedGroup], int] = {}
         self._progress_callback: Callable[[], None] = lambda: None
 
     @property
@@ -53,8 +66,24 @@ class PrepareDomain:
     def set_progress_callback(self, callback: Callable[[], None]) -> None:
         self._progress_callback = callback
 
-    def open_step(self, *, prelaunch_next_step: bool) -> None:
+    def open_step(self, *, prelaunch_next_step: bool, rollout_id: int = 0) -> None:
         self._prelaunch_next_step = prelaunch_next_step
+        self._checkpoint_step = None
+        if self.fixed_batch:
+            args = self.runtime_domain.args
+            self._batch_end += args.rollout_batch_size
+            interval = getattr(args, "save_interval", None)
+            if (
+                prelaunch_next_step
+                and interval
+                and args.save
+                and (args.rotate_ckpt or (rollout_id + 1) % interval == 0)
+            ):
+                # Custom sources without cursor snapshots must stay at the save boundary.
+                if hasattr(self.data_source, "remember_prelaunch_cursor"):
+                    self._checkpoint_step = rollout_id
+                else:
+                    self._prelaunch_next_step = False
 
     def fill(self, demand: int = 0) -> None:
         target = self.runtime_domain.concurrency if self._prelaunch_next_step else demand
@@ -63,8 +92,19 @@ class PrepareDomain:
             self._start_prepare(self._pending_group_inputs.popleft())
             gap -= 1
 
+        checkpoint_step = None
+        if self.fixed_batch:
+            # Split reads at source batch boundaries so a checkpoint can exclude lookahead.
+            remaining = self._batch_end - self._next_group_sequence
+            if remaining <= 0 and self._prelaunch_next_step:
+                if remaining == 0:
+                    checkpoint_step = self._checkpoint_step
+                remaining += self.runtime_domain.args.rollout_batch_size
+            gap = min(gap, remaining)
         if self._prepare_fetch_task is None and gap > 0:
-            self._prepare_fetch_task = asyncio.create_task(self._fetch_group_inputs(gap), name="agentic-prepare-fetch")
+            self._prepare_fetch_task = asyncio.create_task(
+                self._fetch_group_inputs(gap, checkpoint_step), name="agentic-prepare-fetch"
+            )
             self._prepare_fetch_task.add_done_callback(lambda _task: self._progress_callback())
 
     def collect(self) -> None:
@@ -72,15 +112,22 @@ class PrepareDomain:
             prepare_fetch_task = self._prepare_fetch_task
             self._prepare_fetch_task = None
             prepare_fetch_task.result()
-        for task in tuple(self._ready_prepare_tasks):
+        for task, sequence in tuple(self._ready_prepare_tasks.items()):
+            if self.fixed_batch and sequence >= self._batch_end:
+                continue
             error = task.exception()
             if error is not None:
-                self._ready_prepare_tasks.remove(task)
+                del self._ready_prepare_tasks[task]
                 raise error
 
     def take_ready(self, limit: int) -> Tuple[_PreparedGroup, ...]:
-        count = min(max(limit, 0), len(self._ready_prepare_tasks))
-        return tuple(self._ready_prepare_tasks.popleft().result() for _ in range(count))
+        eligible = (
+            task for task, seq in self._ready_prepare_tasks.items() if not self.fixed_batch or seq < self._batch_end
+        )
+        ready = tuple(islice(eligible, max(0, limit)))
+        for task in ready:
+            del self._ready_prepare_tasks[task]
+        return tuple(task.result() for task in ready)
 
     def close_step(self) -> None:
         if self._prelaunch_next_step:
@@ -109,7 +156,9 @@ class PrepareDomain:
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 raise outcome
 
-    async def _fetch_group_inputs(self, requested_group_count: int) -> None:
+    async def _fetch_group_inputs(self, requested_group_count: int, checkpoint_step: int | None = None) -> None:
+        if checkpoint_step is not None:
+            await self.data_source.remember_prelaunch_cursor.remote(checkpoint_step)
         sample_groups = await self.data_source.get_samples.remote(requested_group_count)
         if not sample_groups:
             raise RuntimeError("data source returned no sample groups")
@@ -124,7 +173,9 @@ class PrepareDomain:
                     )
             sequence = self._next_group_sequence
             self._next_group_sequence += 1
-            group_input = GroupInput(group_id=f"{self.scope_id}:prepare_group_{sequence}", samples=sample_group)
+            group_input = GroupInput(
+                group_id=f"{self.scope_id}:prepare_group_{sequence}", samples=sample_group, source_sequence=sequence
+            )
             self.runtime_domain.observe_group_input(group_input)
             self._pending_group_inputs.append(group_input)
         if self._prelaunch_next_step:
@@ -144,6 +195,8 @@ class PrepareDomain:
     ) -> _PreparedGroup | None:
         stream = await self.runtime_domain.prepare_group(group_input, launch_decision)
         if stream is None:
+            if self.fixed_batch and launch_decision.result():
+                raise RuntimeError(f"Fixed prelaunch group {group_input.group_id} ended before its first request")
             return None
         if not self.runtime_domain.teacher_routing_enabled:
             return stream, None, ()
@@ -152,7 +205,7 @@ class PrepareDomain:
         return stream, teacher_id, cast(tuple[int | str, ...], response_keys)
 
     def _on_prepare_finished(self, task: asyncio.Task[Optional[_PreparedGroup]]) -> None:
-        self._warming_prepare_tasks.pop(task)
+        group_input, _ = self._warming_prepare_tasks.pop(task)
         if not task.cancelled() and (task.exception() is not None or task.result() is not None):
-            self._ready_prepare_tasks.append(cast(asyncio.Task[_PreparedGroup], task))
+            self._ready_prepare_tasks[cast(asyncio.Task[_PreparedGroup], task)] = group_input.source_sequence
         self._progress_callback()

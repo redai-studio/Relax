@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import abc
+import copy
 import os
 import tempfile
 from pathlib import Path
@@ -159,6 +160,8 @@ class DataSource(abc.ABC):
 
 # TODO may further refactor data-loading part later
 class RolloutDataSource(DataSource):
+    _prelaunch_cursor: tuple[int, dict] | None = None
+
     def __init__(self, args):
         self.args = args
 
@@ -244,10 +247,7 @@ class RolloutDataSource(DataSource):
     def add_samples(self, samples: list[list[Sample]]):
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
 
-    def save(self, rollout_id):
-        if not self.args.rollout_global_dataset:
-            return
-
+    def _cursor_state(self):
         state_dict = {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
@@ -260,6 +260,21 @@ class RolloutDataSource(DataSource):
         # Add streaming dataset state if applicable
         if self._use_streaming and self.dataset is not None:
             state_dict["streaming_state"] = self.dataset.get_state()
+
+        return state_dict
+
+    def remember_prelaunch_cursor(self, rollout_id: int) -> None:
+        """Keep the consumed position before reading groups for the next
+        rollout."""
+        self._prelaunch_cursor = (rollout_id, copy.deepcopy(self._cursor_state()))
+
+    def save(self, rollout_id):
+        if not self.args.rollout_global_dataset:
+            return
+        if self._prelaunch_cursor is not None and self._prelaunch_cursor[0] == rollout_id:
+            state_dict = self._prelaunch_cursor[1]
+        else:
+            state_dict = self._cursor_state()
 
         path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -298,6 +313,7 @@ class RolloutDataSource(DataSource):
 
         logger.info(f"load metadata from {path}")
         state_dict = torch.load(path)
+        self._prelaunch_cursor = None
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)

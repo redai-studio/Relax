@@ -325,7 +325,8 @@ class AgenticResidentPipeline:
                     item.observed_rollout_id = rollout_id
                 await self._record_rollout(context)
             self.prepare_domain.open_step(
-                prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout
+                rollout_id=rollout_id,
+                prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout,
             )
             output = await self._run_rollout_step(context)
             self._finish_step_progress(context)
@@ -643,6 +644,8 @@ class AgenticResidentPipeline:
             self._group_observations.pop(task, None)
             if outcome is not None:
                 self._finalized_groups.append(outcome)
+            elif self.prepare_domain.fixed_batch:
+                raise RuntimeError(f"Fixed prelaunch group {task.get_name()} finished without a usable export")
 
     def _step_can_close(self, context: _StepContext) -> bool:
         """Read close eligibility from physical debt and resident Group

@@ -158,6 +158,54 @@ class TestDataSourceIntegration:
         assert isinstance(dataset, StreamingDataset)
         assert len(dataset) == len(data)
 
+    @pytest.mark.parametrize("streaming", [False, True], ids=["eager", "streaming"])
+    def test_prelaunch_checkpoint_resumes_at_consumed_group_boundary(
+        self, tmp_path, jsonl_file, data_source_module, monkeypatch, streaming
+    ):
+        from relax.utils.data.data import Dataset
+        from relax.utils.data.streaming_dataset import StreamingDataset
+
+        path, _ = jsonl_file
+        tokenizer = MagicMock(side_effect=lambda text, **kwargs: {"input_ids": [0, 0] if text == "Sample 2" else [0]})
+        dataset_cls = StreamingDataset if streaming else Dataset
+        max_length = 1 if streaming else None
+        monkeypatch.setattr(
+            data_source_module, "_create_dataset", lambda *args: dataset_cls(path, tokenizer, None, max_length)
+        )
+        args = Namespace(
+            use_streaming_dataset=streaming,
+            rollout_global_dataset=True,
+            hf_checkpoint=None,
+            dump_details=None,
+            rollout_shuffle=True,
+            n_samples_per_prompt=2,
+            buffer_filter_path=None,
+            save=str(tmp_path),
+            load=str(tmp_path),
+        )
+
+        def read_batch(source):
+            return [
+                [(sample.prompt, sample.group_index, sample.index) for sample in group]
+                for group in source.get_samples(4)
+            ]
+
+        source = data_source_module.RolloutDataSourceWithBuffer(args)
+        read_batch(source)
+        for step in (130, 131):
+            source.remember_prelaunch_cursor(step)
+            if streaming:
+                consumed_state = source.dataset.get_state()
+            warmed = read_batch(source)
+            source.save(step)
+
+            restored = data_source_module.RolloutDataSourceWithBuffer(args)
+            restored.load(step)
+            if streaming:
+                assert restored.dataset.get_state() == consumed_state
+            assert read_batch(restored) == warmed
+        assert source.epoch_id == 1
+
     def test_factory_function_traditional(self, jsonl_file, data_source_module):
         """Test _create_dataset factory with streaming disabled."""
         from relax.utils.data.data import Dataset

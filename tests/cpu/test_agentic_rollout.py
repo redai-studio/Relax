@@ -564,6 +564,73 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
         np.testing.assert_array_equal(sample.rollout_topk_support_complete, [True, False, False, False])
 
 
+@pytest.mark.parametrize("batch_size", [2, 512])
+async def test_prelaunch_keeps_next_batch_ready_behind_slow_current_group(batch_size: int) -> None:
+    source_groups = deque([[Sample(group_index=i, index=i)] for i in range(2 * batch_size)])
+    checkpoint_cursors = []
+    slow_audit = asyncio.Event()
+    warmed = set()
+
+    async def fetch(count: int) -> list[list[Sample]]:
+        return [source_groups.popleft() for _ in range(count)]
+
+    async def remember_cursor(rollout_id: int) -> None:
+        checkpoint_cursors.append((rollout_id, source_groups[0][0].group_index))
+
+    async def warm(group: GroupInput, launch_decision: asyncio.Future[bool]) -> GroupInput:
+        launch_decision.set_result(True)
+        index = group.samples[0].group_index
+        if index == 0:
+            await slow_audit.wait()
+        warmed.add(index)
+        return group
+
+    source = SimpleNamespace(
+        get_samples=SimpleNamespace(remote=fetch),
+        remember_prelaunch_cursor=SimpleNamespace(remote=remember_cursor),
+    )
+    runtime = SimpleNamespace(
+        args=_runtime_args(
+            rollout_batch_size=batch_size,
+            agentic_prelaunch=True,
+            save="/checkpoints",
+            save_interval=1,
+            rotate_ckpt=False,
+        ),
+        concurrency=2 * batch_size,
+        teacher_routing_enabled=False,
+        observe_group_input=lambda group: None,
+        prepare_group=warm,
+    )
+    prepare = PrepareDomain("train", source, runtime)
+
+    async def warm_until(indices: set[int]) -> None:
+        while not indices.issubset(warmed):
+            prepare.collect()
+            prepare.fill(batch_size)
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)  # Let the completed prepare tasks publish their groups.
+        prepare.collect()
+
+    def take_indices() -> list[int]:
+        return [group.samples[0].group_index for group, _, _ in prepare.take_ready(batch_size)]
+
+    try:
+        prepare.open_step(prelaunch_next_step=True)
+        await asyncio.wait_for(warm_until(set(range(1, 2 * batch_size))), timeout=5)
+        assert sorted(take_indices()) == list(range(1, batch_size))
+        assert checkpoint_cursors == [(0, batch_size)]
+        slow_audit.set()
+        await asyncio.wait_for(warm_until({0}), timeout=3)
+        assert take_indices() == [0]
+
+        prepare.close_step()
+        prepare.open_step(prelaunch_next_step=False)
+        assert sorted(take_indices()) == list(range(batch_size, 2 * batch_size))
+    finally:
+        await prepare.shutdown()
+
+
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:
     handle = SimpleNamespace(
         start_group=SimpleNamespace(remote=AsyncMock()),
