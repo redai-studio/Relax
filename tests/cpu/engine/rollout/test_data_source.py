@@ -85,6 +85,7 @@ class TestDataSourceIntegration:
         self, tmp_path, data_source_module, monkeypatch, cursor_dir
     ):
         from relax.components import rollout
+        from relax.distributed.ray.rollout import RolloutManager
 
         args = Namespace(
             debug_rollout_only=True,
@@ -98,13 +99,19 @@ class TestDataSourceIntegration:
         source.args = args
         source._use_streaming = False
         source.sample_offset = 0
-        handle = MagicMock()
-        handle.load.remote = AsyncMock(side_effect=source.load)
+        data_source_handle = MagicMock()
+        data_source_handle.load.remote = AsyncMock(side_effect=source.load)
+        manager = object.__new__(RolloutManager.__ray_metadata__.modified_class)
+        manager.data_source = data_source_handle
+        manager_handle = MagicMock()
+        manager_handle.load.remote = manager.load
         # Serve copies the component globals when constructing its ingress wrapper.
         component = rollout.Rollout.func_or_class.__bases__[0]
         monkeypatch.setitem(component.__init__.__globals__, "attach_tq_client", lambda *a, **kw: None)
-        monkeypatch.setitem(component.__init__.__globals__, "create_rollout_manager", lambda *a, **kw: (handle, None))
-        service = component(None, None, args, data_source=handle)
+        monkeypatch.setitem(
+            component.__init__.__globals__, "create_rollout_manager", lambda *a, **kw: (manager_handle, None)
+        )
+        service = component(None, None, args, data_source=data_source_handle)
 
         batches = []
 
