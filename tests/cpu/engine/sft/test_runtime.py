@@ -7,6 +7,10 @@ import pytest
 
 from relax.engine.sft.bootstrap import resolve_sft_num_rollout
 from relax.engine.sft.runtime import (
+    get_image_sft_config,
+    image_sft_task,
+    is_i2i_sft,
+    is_image_sft,
     resolve_sft_split_indices,
     sft_partition_id,
     sft_partition_ids,
@@ -81,15 +85,16 @@ def test_sft_keeps_weight_management_for_consumers_and_other_losses(overrides, c
     assert not should_skip_sft_weight_management(args, **consumers)
 
 
-def test_image_sft_attempt_is_shared_with_workers_and_changes_on_restore():
+@pytest.mark.parametrize("task", ["i2i", "t2i"])
+def test_image_sft_attempt_is_shared_with_workers_and_changes_on_restore(task):
     args = Namespace(
         loss_type="sft",
-        generation_task="i2i",
-        i2i_sft_config={"dataset_size": 19},
+        generation_task=task,
         global_batch_size=8,
         num_epoch=2,
         num_rollout=None,
     )
+    setattr(args, f"{task}_sft_config", {"dataset_size": 19})
     resolve_sft_num_rollout(args)
     worker_args = pickle.loads(pickle.dumps(args))
     previous = sft_partition_id(args, 10)
@@ -103,9 +108,30 @@ def test_image_sft_attempt_is_shared_with_workers_and_changes_on_restore():
     assert args.num_rollout == 6
 
 
-def test_image_sft_partition_requires_shared_attempt():
+@pytest.mark.parametrize("task", ["i2i", "t2i"])
+def test_image_sft_partition_requires_shared_attempt(task):
     with pytest.raises(ValueError, match="initialized before starting workers"):
-        sft_partition_id(Namespace(loss_type="sft", generation_task="i2i"), 10)
+        sft_partition_id(Namespace(loss_type="sft", generation_task=task), 10)
+
+
+@pytest.mark.parametrize("task", ["i2i", "t2i"])
+def test_image_sft_helpers_keep_data_and_checkpoint_tasks_distinct(task):
+    selected, other = {"dataset_size": 19}, {"dataset_size": 2}
+    args = Namespace(loss_type="sft", generation_task=task)
+    setattr(args, f"{task}_sft_config", selected)
+    setattr(args, f"{'i2i' if task == 't2i' else 't2i'}_sft_config", other)
+    assert is_image_sft(args)
+    assert is_i2i_sft(args) is (task == "i2i")
+    assert get_image_sft_config(args) is selected
+    assert image_sft_task(args) == f"{task}_sft"
+
+
+@pytest.mark.parametrize("loss_type", ["policy_loss", "dpo", "rm", None])
+def test_t2i_generation_does_not_route_other_objectives_to_image_sft(loss_type):
+    args = Namespace(loss_type=loss_type, generation_task="t2i")
+    assert not is_image_sft(args)
+    with pytest.raises(ValueError, match="requires image supervision"):
+        image_sft_task(args)
 
 
 @pytest.mark.parametrize("loss_type,prefix", [("sft", "sft_"), ("dpo", "sft_"), ("rm", "sft_"), ("policy", "train_")])

@@ -71,11 +71,13 @@ def test_sft_metrics_flush_even_when_logging_fails(monkeypatch):
     tracking.flush_metrics.assert_called_once()
 
 
-def test_sft_save_requires_complete_rng_state(monkeypatch):
+@pytest.mark.parametrize("task", ["i2i_sft", "t2i_sft"])
+def test_sft_save_requires_complete_rng_state(monkeypatch, task):
     from relax.backends.fsdp import sft
 
     trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
     trainer.step, trainer.rank = 10, 0
+    trainer.task = task
     trainer.args = SimpleNamespace(save="/checkpoint")
     trainer.actor = Mock()
     trainer.actor._trainable_mode = "full"
@@ -84,4 +86,5 @@ def test_sft_save_requires_complete_rng_state(monkeypatch):
     save = Mock()
     monkeypatch.setattr(sft.checkpoint, "save_checkpoint", save)
     trainer._save_checkpoint()
+    assert save.call_args.args[1] == task
     assert save.call_args.kwargs["require_rng_state"] is True

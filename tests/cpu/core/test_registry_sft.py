@@ -77,12 +77,13 @@ def test_algos_sft_actor_class_unchanged():
     assert registry.ALGOS["sft"][registry.ROLES.actor] is Actor
 
 
-def test_image_sft_selects_producer_without_mutating_text_registry():
+@pytest.mark.parametrize("task", ["i2i", "t2i"])
+def test_image_sft_selects_producer_without_mutating_text_registry(task):
     from relax.components.image_sft import ImageSFT
     from relax.components.sft import SFT
 
     registry = _registry_module()
-    image = registry.resolve_algorithm(_cfg(loss_type="sft", generation_task="i2i"))
+    image = registry.resolve_algorithm(_cfg(loss_type="sft", generation_task=task))
     text = registry.resolve_algorithm(_cfg(loss_type="sft"))
     assert image[registry.ROLES.sft] is ImageSFT
     assert text[registry.ROLES.sft] is SFT

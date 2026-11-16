@@ -154,10 +154,10 @@ def resolve_algorithm(config: Namespace) -> dict[str, Any]:
     """Resolve model-independent SFT orchestration for registration and
     restart."""
     from relax.engine.sft.bootstrap import resolve_sft_algo_key
-    from relax.engine.sft.runtime import is_i2i_sft
+    from relax.engine.sft.runtime import is_image_sft
 
     algo = ALGOS[resolve_sft_algo_key(config)].copy()
-    if is_i2i_sft(config):
+    if is_image_sft(config):
         from relax.components.image_sft import ImageSFT
 
         algo[ROLES.sft] = ImageSFT
