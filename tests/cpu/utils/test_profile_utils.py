@@ -1,8 +1,15 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import gzip
+import hashlib
 import json
+import locale
+import os
+import platform
+import shutil
+import sys
 from argparse import Namespace
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -51,8 +58,78 @@ def _python_stack_probe_leaf(tensor):
     return tensor.sin().square()
 
 
+def _load_trace_events(path: Path, request: pytest.FixtureRequest, compression: str | None) -> list[dict]:
+    """Keep original bytes and runtime provenance for the CI investigation."""
+    evidence_root = os.environ.get("RELAX_PROFILER_EVIDENCE_DIR")
+    evidence = None
+    if evidence_root:
+        worker = os.environ.get("PYTEST_XDIST_WORKER", "serial")
+        evidence = Path(evidence_root) / f"{worker}-{os.getpid()}-gzip-{compression}"
+        evidence.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, evidence / path.name)
+    with gzip.open(path, "rb") as stream:
+        raw = stream.read()
+    metadata = {}
+    if evidence is not None:
+        (evidence / "trace.json").write_bytes(raw)
+        torch = profile_utils.torch
+        source_paths = [Path(__file__), Path(profile_utils.__file__), Path(torch.profiler.profiler.__file__)]
+        metadata = {
+            "nodeid": request.node.nodeid,
+            "compression": compression,
+            "pid": os.getpid(),
+            "worker": os.environ.get("PYTEST_XDIST_WORKER", "serial"),
+            "worker_count": os.environ.get("PYTEST_XDIST_WORKER_COUNT"),
+            "pytest_args": list(request.config.invocation_params.args),
+            "python": sys.version,
+            "executable": sys.executable,
+            "platform": platform.platform(),
+            "locale_encoding": locale.getpreferredencoding(False),
+            "torch_version": torch.__version__,
+            "torch_git_version": torch.version.git_version,
+            "torch_cuda": torch.version.cuda,
+            "torch_config": torch.__config__.show(),
+            "torch_path": torch.__file__,
+            "source_sha256": {str(source): hashlib.sha256(source.read_bytes()).hexdigest() for source in source_paths},
+            "requested_checkout": os.environ.get("RELAX_CI_CHECKOUT"),
+            "image": os.environ.get("RELAX_CI_IMAGE"),
+            "environment": {
+                key: os.environ.get(key)
+                for key in (
+                    "CUDA_VISIBLE_DEVICES",
+                    "NVIDIA_VISIBLE_DEVICES",
+                    "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "RELAX_PROFILE_GZIP_LEVEL",
+                    "LANG",
+                    "LC_ALL",
+                )
+            },
+            "gzip_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_size": len(raw),
+        }
+    try:
+        # Decode the complete buffer strictly so error offsets are absolute byte offsets.
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        metadata["decode_error"] = {
+            "start": exc.start,
+            "end": exc.end,
+            "reason": exc.reason,
+            "context_start": max(0, exc.start - 96),
+            "context_hex": raw[max(0, exc.start - 96) : exc.end + 96].hex(),
+        }
+        raise
+    finally:
+        if evidence is not None:
+            (evidence / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return json.loads(text)["traceEvents"]
+
+
 @pytest.mark.parametrize("compression", [None, "1"])
-def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_path, compression):
+def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_path, compression, request):
     """with_stack alone can omit operator Call stack fields from Chrome
     traces."""
     torch = profile_utils.torch
@@ -82,8 +159,7 @@ def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_pat
         profiler.step()
     files = list(tmp_path.glob("*.pt.trace.json.gz"))
     assert len(files) == 1
-    with gzip.open(files[0], "rt") as stream:
-        events = json.load(stream)["traceEvents"]
+    events = _load_trace_events(files[0], request, compression)
     assert any(
         event.get("cat") == "python_function" and "_python_stack_probe_leaf" in event["name"] for event in events
     )
@@ -93,6 +169,23 @@ def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_pat
     )
     assert not list(tmp_path.glob("relax-*.json"))
     assert not list(tmp_path.glob("*.partial"))
+
+
+def test_trace_diagnostics_preserve_invalid_utf8(monkeypatch, tmp_path, request):
+    evidence = tmp_path / "evidence"
+    monkeypatch.setenv("RELAX_PROFILER_EVIDENCE_DIR", str(evidence))
+    path = tmp_path / "invalid.pt.trace.json.gz"
+    raw = b'{"traceEvents": [{"name": "' + b"\x98" + b'"}]}'
+    path.write_bytes(gzip.compress(raw))
+    with pytest.raises(UnicodeDecodeError) as error:
+        _load_trace_events(path, request, None)
+    retained = next(evidence.iterdir())
+    assert (retained / path.name).read_bytes() == path.read_bytes()
+    assert (retained / "trace.json").read_bytes() == raw
+    metadata = json.loads((retained / "metadata.json").read_text())
+    assert metadata["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert metadata["decode_error"]["start"] == error.value.start == raw.index(b"\x98")
+    assert metadata["decode_error"]["context_hex"] == raw.hex()
 
 
 def test_failed_trace_export_preserves_local_evidence(monkeypatch, tmp_path):

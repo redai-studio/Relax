@@ -123,16 +123,55 @@ jobs:
         if: matrix.gpus > 0
         run: docker exec "$CI_CONTAINER_NAME" nvidia-smi
 
+      - name: Record profiler CI provenance
+        if: matrix.suite == 'cpu'
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+        run: |
+          {
+            if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+              git log -1 --format='checkout=%H%ntree=%T%nparents=%P'
+            else
+              # checkout can use REST archives when the runner has no usable Git.
+              printf 'checkout_mode=archive\nrequested_commit=%s\n' "$GITHUB_SHA"
+            fi
+            docker inspect --format 'image={{.Image}}' "$CI_CONTAINER_NAME"
+            printf 'runner=%s\nrun=%s\nattempt=%s\nref=%s\n' \
+              "$RUNNER_NAME" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_REF"
+          } > "$ARTIFACT_DIR/profiler-provenance.txt"
+
       - name: Run unit tests
+        id: unit-tests
         timeout-minutes: 20
         env:
           PYTEST_ARGS: ${{ matrix.pytest-args }}
+          PROFILER_EVIDENCE_DIR: ${{ matrix.suite == 'cpu' && '/artifacts/profiler/cpu6' || '' }}
         run: |
           read -r -a pytest_args <<< "$PYTEST_ARGS"
-          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+          docker exec \
+            --env RELAX_PROFILER_EVIDENCE_DIR="$PROFILER_EVIDENCE_DIR" \
+            --env RELAX_CI_CHECKOUT="$GITHUB_SHA" \
+            --env RELAX_CI_IMAGE="$(docker inspect --format '{{.Image}}' "$CI_CONTAINER_NAME")" \
+            "$CI_CONTAINER_NAME" bash -euo pipefail -c '
             python -m pytest "$@" -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           ' bash "${pytest_args[@]}"
+
+      # One independent sample, not a retry: retain the CPU6 failure status and artifacts.
+      # Same container/image/source, but fresh process without the full-suite worker history.
+      - name: Compare profiler in a fresh serial process
+        if: ${{ !cancelled() && matrix.suite == 'cpu' && (steps.unit-tests.outcome == 'success' || steps.unit-tests.outcome == 'failure') }}
+        timeout-minutes: 2
+        run: |
+          docker exec \
+            --env RELAX_PROFILER_EVIDENCE_DIR=/artifacts/profiler/serial \
+            --env RELAX_CI_CHECKOUT="$GITHUB_SHA" \
+            --env RELAX_CI_IMAGE="$(docker inspect --format '{{.Image}}' "$CI_CONTAINER_NAME")" \
+            "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            python -m pytest tests/cpu/utils/test_profile_utils.py -n 0 -v -ra --tb=short \
+              --junitxml=/artifacts/profiler-serial-junit.xml \
+              2>&1 | tee /artifacts/profiler-serial-pytest.log
+          '
 
       - name: Stop test container
         if: always()
