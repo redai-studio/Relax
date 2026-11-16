@@ -4,8 +4,8 @@
 
 Self-contained copy of the six-stream join scenario from
 ``tests/cpu/test_agentic_observability.py`` (helpers, fixtures, and the
-scenario itself), extended to assert that the ``weight_version_spans``
-captured on SessionForest resp nodes survive the trajectory JSONL boundary.
+scenario itself), extended to assert that the ``weight_version_spans`` captured
+on SessionForest resp nodes survive the trajectory JSONL boundary.
 """
 
 from __future__ import annotations

@@ -309,6 +309,15 @@ def test_resident_sft_live_initialization_reaches_train_without_snapshots(monkey
     )
     actor._resident_sft_overlap_enabled = MethodType(namespace["_resident_sft_overlap_enabled"], actor)
     actor._is_standard_dpo = MethodType(namespace["_is_standard_dpo"], actor)
+    # Offline SFT has neither weight_updater nor checkpoint_engine_client, so
+    # bind the real helper's semantics without importing the megatron module:
+    # the instance method just delegates to the module-level function.
+    _functions(
+        Path("relax/backends/megatron/actor.py"),
+        {"_consumed_weight_version"},
+        namespace,
+    )
+    actor._consumed_weight_version = MethodType(lambda self: namespace["_consumed_weight_version"](None, None), actor)
     rollout_id = args.num_rollout - 1 if final_rollout else 0
     rollout_data = {}
     kwargs = (
@@ -317,7 +326,13 @@ def test_resident_sft_live_initialization_reaches_train_without_snapshots(monkey
     with pytest.raises(ReachedAfterTrain):
         namespace["train_actor"](actor, rollout_id, rollout_data, **kwargs)
     train.assert_called_once_with(
-        rollout_id, actor.model, actor.optimizer, actor.opt_param_scheduler, data_iterator, num_microbatches
+        rollout_id,
+        actor.model,
+        actor.optimizer,
+        actor.opt_param_scheduler,
+        data_iterator,
+        num_microbatches,
+        consumed_weight_version=None,
     )
     assert args._relax_resident_sft_actor_verified
     assert actor._resident_sft_params_pending is (not final_rollout)

@@ -150,16 +150,16 @@ sample=1002 session=sess-2 turn=1 attempt=0 tokens=[0,2) version=None age=None
 
 **手工核对口径**（验证标准 4 的口径区分，数值是算出来的不是背的）：
 
-| 指标 | 手算 | 命中行 |
-| --- | --- | --- |
-| generation_span | 3 − 1 = 2 | `generation_span_mean: 2.0` |
-| oldest_lag（样本 1001） | 5 − 1 = 4 | `oldest_lag_max: 4`、明细 `age=4` |
-| newest_lag / post_generation_lag | 5 − 3 = 2 | `newest_lag_max: 2`、明细 `age=2` |
-| token_weighted_lag | (4×2 + 2×3) / 5 = 2.8 | `token_weighted_lag_mean: 2.8` |
-| span_missing_rate | 1 未知 / 3 总 span | `0.3333...` |
-| token_missing_rate | 2 未知 / 7 总 token | `0.2857...` |
-| sample_missing_rate | 1 全未知 / 2 样本 | `0.5` |
-| `lag_sample_count` | 仅样本 1001 有已知版本参与 lag | `1`（不是 2） |
+| 指标                             | 手算                           | 命中行                            |
+| -------------------------------- | ------------------------------ | --------------------------------- |
+| generation_span                  | 3 − 1 = 2                      | `generation_span_mean: 2.0`       |
+| oldest_lag（样本 1001）          | 5 − 1 = 4                      | `oldest_lag_max: 4`、明细 `age=4` |
+| newest_lag / post_generation_lag | 5 − 3 = 2                      | `newest_lag_max: 2`、明细 `age=2` |
+| token_weighted_lag               | (4×2 + 2×3) / 5 = 2.8          | `token_weighted_lag_mean: 2.8`    |
+| span_missing_rate                | 1 未知 / 3 总 span             | `0.3333...`                       |
+| token_missing_rate               | 2 未知 / 7 总 token            | `0.2857...`                       |
+| sample_missing_rate              | 1 全未知 / 2 样本              | `0.5`                             |
+| `lag_sample_count`               | 仅样本 1001 有已知版本参与 lag | `1`（不是 2）                     |
 
 **未知版本检查点（验收标准 3）**：样本 1002 的版本是 `null`，明细行显示 `version=None age=None`；它**不进**任何 lag 均值（`lag_sample_count=1` 证明），也不被当成 0 或 5 猜测——只通过三个缺失率出现。
 
@@ -206,13 +206,13 @@ printf '{"schema_version": "3.2.0", "run_i' >> /tmp/wv_verify_demo/run-1/traject
 
 ## 五、验证结论判读
 
-| 项 | 通过标准 |
-| --- | --- |
-| §1.1 特性测试 | `34 passed`，零失败 |
-| §2.1 回归对比 | 与 main 基线逐位一致，delta 恰为 +3 passed，零新增失败/错误 |
-| §2.3 ruff | check 无告警，format 全部 unchanged |
-| §3.2 CLI 演练 | 汇总与明细输出与本文逐字节一致，8 项口径手算全命中 |
-| §3.2 未知版本 | None 不进均值、不被猜测、只进缺失率 |
-| §4 GPU 环境 | test_weight_version_helper 通过 + 真实 run 的 missing_rate 合理 |
+| 项            | 通过标准                                                        |
+| ------------- | --------------------------------------------------------------- |
+| §1.1 特性测试 | `34 passed`，零失败                                             |
+| §2.1 回归对比 | 与 main 基线逐位一致，delta 恰为 +3 passed，零新增失败/错误     |
+| §2.3 ruff     | check 无告警，format 全部 unchanged                             |
+| §3.2 CLI 演练 | 汇总与明细输出与本文逐字节一致，8 项口径手算全命中              |
+| §3.2 未知版本 | None 不进均值、不被猜测、只进缺失率                             |
+| §4 GPU 环境   | test_weight_version_helper 通过 + 真实 run 的 missing_rate 合理 |
 
 全绿即满足 task.txt【No.15】验收标准 1-6 的可验证闭环。

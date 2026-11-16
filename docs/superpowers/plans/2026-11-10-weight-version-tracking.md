@@ -12,11 +12,12 @@
 
 **规范文档：** `docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md`（用户已批准）。
 
----
+______________________________________________________________________
 
 ## 任务 0：环境准备与基线
 
 **Files:**
+
 - 无代码修改。
 
 - [ ] **Step 1: 确认仓库与基线测试可用**
@@ -30,12 +31,14 @@ Expected: git 根为 Relax 目录；abort 相关测试 PASS（基线绿）。若
 
 说明：本仓库测试从仓库根直接运行 `pytest tests/cpu/...`（`pyproject.toml` 的 `[tool.pytest.ini_options]` 只配了 `asyncio_mode = "auto"`，无 pythonpath 配置；`tests/__init__.py`、`tests/cpu/__init__.py`、`tests/cpu/utils/__init__.py` 存在，`relax` 按已安装依赖解析）。新测试文件 import `relax.*` 即可；不要 import `tests.*` 下其他测试文件——复用 fixture 时复制定义（符合既有测试自包含风格）。
 
----
+______________________________________________________________________
 
 ## 任务 1：`WeightVersionSpan` 类型 + `Sample.weight_version_spans` 字段
 
 **Files:**
+
 - Modify: `relax/utils/types.py`（Sample 定义在 28-120 行；在文件顶部 dataclass 定义区、Sample 之前插入新类型；Sample 的 `weight_versions` 在 47 行）
+
 - Test: `tests/cpu/utils/test_weight_version_types.py`（新建）
 
 - [ ] **Step 1: 写失败的单测**
@@ -146,12 +149,14 @@ git add relax/utils/types.py tests/cpu/utils/test_weight_version_types.py
 git commit -m "feat(agentic): add WeightVersionSpan type and Sample.weight_version_spans"
 ```
 
----
+______________________________________________________________________
 
 ## 任务 2：session state 扩展（IR / MsgNode / append_resp / build_sample）
 
 **Files:**
+
 - Modify: `relax/agentic/session/state.py`（InflightRequest 438-467；MsgNode 409-435；append_resp 691-751；build_sample 775-897）
+
 - Test: `tests/cpu/test_weight_version_state.py`（新建）
 
 - [ ] **Step 1: 写失败的单测（状态层）**
@@ -354,6 +359,7 @@ from relax.utils.types import Sample, WeightVersionSpan
 （abort 重排队时这两个字段与 `pending_token_delta`/`pending_weight_version_delta` 一样随 IR 对象保留——dataclass 字段天然满足，无需额外代码。）
 
 **(d) append_resp**（691-751 行，keyword-only 签名）：
+
 - 签名新增 keyword-only 参数（702 行 `weight_version_delta` 之后）：
 
 ```python
@@ -367,6 +373,7 @@ from relax.utils.types import Sample, WeightVersionSpan
 ```
 
 **(e) build_sample**（775-897 行）：
+
 - locals 区（798 行 `weight_versions` 之后）新增：
 
 ```python
@@ -416,12 +423,14 @@ git add relax/agentic/session/state.py tests/cpu/test_weight_version_state.py
 git commit -m "feat(agentic): thread weight version spans through IR, MsgNode, append_resp, build_sample"
 ```
 
----
+______________________________________________________________________
 
 ## 任务 3：service.py 采集（attempt 边界、abort 保留、提交、清理丢弃）
 
 **Files:**
+
 - Modify: `relax/agentic/session/service.py`（`_apply_generate_result` 2819-2845；`_terminal_response_locked` 2904-2925 附近；abort 分支 2763-2786 无需改——dataclass 字段自动保留）
+
 - Test: `tests/cpu/test_weight_version_service.py`（新建）
 
 - [ ] **Step 1: 写失败的采集测试**
@@ -607,15 +616,20 @@ git add relax/agentic/session/service.py tests/cpu/test_weight_version_service.p
 git commit -m "feat(agentic): capture weight version spans at generate attempt boundaries"
 ```
 
----
+______________________________________________________________________
 
 ## 任务 4：观测序列化（LineageNode spans + schema 3.1.0）
 
 **Files:**
+
 - Modify: `relax/utils/agentic_obs/records.py`（LineageNode 126-144；SCHEMA_VERSION 30）
+
 - Modify: `relax/agentic/observability.py`（build_trajectory_record 391-444）
+
 - Modify: `tests/cpu/utils/test_agentic_obs.py:227`（schema 断言更新）
+
 - Modify: `tests/cpu/test_agentic_observability.py:981、2138`（schema 断言更新）
+
 - Test: `tests/cpu/test_weight_version_observability.py`（新建，span 快照断言）
 
 - [ ] **Step 1: 写失败的观测测试**
@@ -714,9 +728,13 @@ SCHEMA_VERSION = "3.1.0"
 ```
 
 **(d) 更新 4 处既有 schema 断言**（`"3.0.0"` → `"3.1.0"`）：
+
 - `tests/cpu/utils/test_agentic_obs.py:227`
+
 - `tests/cpu/test_agentic_observability.py:981`
+
 - `tests/cpu/test_agentic_observability.py:2138`
+
 - （docs 两处在任务 7 一并更新。）
 
 - [ ] **Step 4: 跑新测试 + 全部观测回归**
@@ -736,14 +754,18 @@ git add relax/utils/agentic_obs/records.py relax/agentic/observability.py \
 git commit -m "feat(obs): snapshot weight version spans into trajectory stream (schema 3.1.0)"
 ```
 
----
+______________________________________________________________________
 
 ## 任务 5：训练消费点（train_hooks + model.train 签名 + actor 传参）
 
 **Files:**
+
 - Modify: `relax/utils/agentic_obs/train_hooks.py`（`_Update` 59-79；`observe_train_step` 180-195；`_write_update` 290-348）
+
 - Modify: `relax/backends/megatron/model.py`（`train` 1704-1711 签名；调用点 1862）
+
 - Modify: `relax/backends/megatron/actor.py`（2200、2691、2843 三处 actor train 调用；**跳过 2013 行 critic 调用**）
+
 - Test: `tests/cpu/test_weight_version_train_hooks.py`（新建）
 
 - [ ] **Step 1: 写失败的 train_hooks 测试**
@@ -907,12 +929,14 @@ git commit -m "feat(train): stamp consumed weight version into train observation
 
 Expected: ast 检查无输出（成功）；测试 PASS。
 
----
+______________________________________________________________________
 
 ## 任务 6：version_audit.py 离线诊断工具
 
 **Files:**
+
 - Create: `relax/utils/agentic_obs/version_audit.py`
+
 - Test: `tests/cpu/utils/test_version_audit.py`（新建）
 
 - [ ] **Step 1: 写失败的纯函数单测**
@@ -1195,7 +1219,7 @@ def compute_run_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 ```
 
-校验测试期望值：`test_run_level_aggregates_exclude_unknown_from_means` 中 span_missing_rate = 1/(2+2+1)=0.2 ✓；token_missing_rate = 3/(4+4+3)=3/11 ✓；sample_missing_rate：第三个样本全未知 → 1/3 ✓。`oldest_lag` 是 int，`_mean` 返回 float 6.0 ✓；median [6] → 6（statistics.median 单元素返回原值 6，测试断言 `== 6.0`，`6 == 6.0` 为 True）✓。
+校验测试期望值：`test_run_level_aggregates_exclude_unknown_from_means` 中 span_missing_rate = 1/(2+2+1)=0.2 ✓；token_missing_rate = 3/(4+4+3)=3/11 ✓；sample_missing_rate：第三个样本全未知 → 1/3 ✓。`oldest_lag` 是 int，`_mean` 返回 float 6.0 ✓；median \[6\] → 6（statistics.median 单元素返回原值 6，测试断言 `== 6.0`，`6 == 6.0` 为 True）✓。
 
 - [ ] **Step 4: 跑纯函数测试确认通过**
 
@@ -1437,14 +1461,18 @@ git add relax/utils/agentic_obs/version_audit.py tests/cpu/utils/test_version_au
 git commit -m "feat(obs): add version_audit CLI joining trajectory and train streams"
 ```
 
----
+______________________________________________________________________
 
 ## 任务 7：验收场景测试 + 可复现示例报告
 
 **Files:**
+
 - Test: `tests/cpu/test_weight_version_scenarios.py`（新建，spec §8 场景矩阵的端到端覆盖）
+
 - Create: `docs/superpowers/examples/weight-version-audit-report.md`（诊断报告样例，验收标准 6）
+
 - Modify: `docs/zh/guide/agentic-rollout.md`（779 行 schema 引用 + version_audit 用法小节）
+
 - Modify: `docs/en/guide/agentic-rollout.md`（818 行 schema 引用 + 对应英文小节）
 
 - [ ] **Step 1: 写验收场景测试**
@@ -1586,21 +1614,23 @@ sample=1001 session=sess-1 turn=2 attempt=0 tokens=[2,5) version=3 age=2
 - [ ] **Step 4: 更新 zh/en 文档**
 
 `docs/zh/guide/agentic-rollout.md`：
+
 - 779 行附近 `schema 3.0.0` → `schema 3.1.0`；
 - 「Agentic 可观测性 JSONL」小节（684 行起）的 train 流说明（700-724 行附近）补一句：train 流每样本含 `consumed_weight_version`（消费时刻 actor 权重版本，未采集为 null）；trajectory 流 lineage 节点含 `weight_version_spans`（token 区间 + 生成时版本，未知为 null）；
 - 小节末尾补 version_audit 用法段（SSOT：详细口径链接 spec §6，不复制定义表）：
 
-```markdown
+````markdown
 #### 权重版本滞后审计
 
 对已产出的观测目录离线运行：
 
 ```bash
 python -m relax.utils.agentic_obs.version_audit <run_dir> [--session S] [--group G] [--missing-only] [--jsonl]
-```
+````
 
 输出 run 级汇总（各滞后均值/中位数/最大值、三口径缺失率）与样本级明细（session → turn → attempt → token 区间 → 来源版本 → 消费时年龄）。指标口径定义见 `docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md` §6。
-```
+
+````
 
 `docs/en/guide/agentic-rollout.md`：818 行 schema 引用同步 3.1.0，并加对应英文小节（与 zh 对应，同样链接 spec 不复制口径表）。
 
@@ -1608,7 +1638,7 @@ python -m relax.utils.agentic_obs.version_audit <run_dir> [--session S] [--group
 
 ```bash
 python3 -m pytest tests/cpu -q 2>&1 | tail -5
-```
+````
 
 Expected: 全绿。若有失败：先判断是否本 PR 引入（跑 git stash 前后对比或看失败测试是否涉及本改动），按 ci-failure-triage 原则处理。
 
@@ -1623,25 +1653,26 @@ git commit -m "feat(obs): acceptance scenarios, audit report sample, and docs fo
 
 Expected: pre-commit 全过（不过则修完再提交）。
 
----
+______________________________________________________________________
 
 ## 任务 8：最终验证
 
 **Files:**
+
 - 无新修改。
 
 - [ ] **Step 1: 验收标准逐条自查**
 
 对照 `docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md` 与 task.txt 验收标准 1-6，逐条确认：
 
-| 验收标准 | 证据 |
-|---|---|
-| 1 跨版本多轮/恢复/缺失/取消 | 任务 3（abort 保留）+ 任务 7（取消丢弃）+ 任务 6（缺失） |
-| 2 token 区间只对成功提交内容 | 任务 3 采集点在 attempt 边界 + IR 丢弃即消失 + 任务 7 显式断言 |
-| 3 未知显式 None + 缺失率 | 任务 6 `compute_sample_stats`/`compute_run_summary` 三口径 |
-| 4 版本年龄按发布序号、口径区分 | 任务 7 口径区分测试 |
-| 5 旁路不侵入 | 任务 2/3 Step 5 回归全绿 |
-| 6 实现+测试+可复现示例 | 任务 7 示例测试 + 报告样例文件 |
+| 验收标准                       | 证据                                                           |
+| ------------------------------ | -------------------------------------------------------------- |
+| 1 跨版本多轮/恢复/缺失/取消    | 任务 3（abort 保留）+ 任务 7（取消丢弃）+ 任务 6（缺失）       |
+| 2 token 区间只对成功提交内容   | 任务 3 采集点在 attempt 边界 + IR 丢弃即消失 + 任务 7 显式断言 |
+| 3 未知显式 None + 缺失率       | 任务 6 `compute_sample_stats`/`compute_run_summary` 三口径     |
+| 4 版本年龄按发布序号、口径区分 | 任务 7 口径区分测试                                            |
+| 5 旁路不侵入                   | 任务 2/3 Step 5 回归全绿                                       |
+| 6 实现+测试+可复现示例         | 任务 7 示例测试 + 报告样例文件                                 |
 
 - [ ] **Step 2: 全量测试 + pre-commit 终检**
 
@@ -1653,13 +1684,13 @@ git log --oneline | head -8
 
 Expected: 测试全绿、pre-commit 通过、提交历史为任务 1-7 的 7 个 feat 提交。
 
----
+______________________________________________________________________
 
 ## Self-Review 记录
 
 - **Spec 覆盖**：spec §3.1（任务 1）、§3.2（任务 1/2/4）、§4 采集链路（任务 3，含 abort/清理两条特殊路径）、§5 训练消费侧（任务 5，TQ 探针已在前置验证中解决——fallback 即主路径）、§6 统计口径（任务 6 + 任务 7 口径区分测试）、§7 离线报告（任务 6 CLI + 任务 7 样例）、§8 测试矩阵（任务 2/3/6/7 分布覆盖，逐行对应见任务 8 表格）、§9 规则（版权头/get_logger/类型注解/最小变更/pre-commit 均写入各任务）。无缺口。
 - **签名核对（本轮修正）**：计划中所有测试代码引用的构造函数/方法/fixture 均已对照源码逐个核实：`SessionForest.create_empty(session_id, group_index, index, label, train_metadata, metadata)`；`append_obs`/`append_resp` keyword-only 参数（`parent_state_hash`/`rollout_id`/`abort_count`/`messages_delta`/`train_token_delta`/`rollout_token_delta`/`token_delta`/`logprob_delta`/`weight_version_delta`/`weight_version_spans`）；node 查找走 `forest.nodes_by_hash`；`InflightRequest` 必填 `waiter`；`Sample()` 全字段默认值；`_router_recovery_shard()` 返回 `(shard, group, session, ir)` 四元组；`_read_train_samples(path)` 接收 train JSONL 路径（`resolve_agentic_obs_config(args).train_scalar_path(rollout_id, dp_rank)`）；`_train_args`/`_rollout_data`/`_emit_update` 是普通函数直接调用（唯一 fixture 是 `fake_mpu` 与 `tmp_path`）；六流 join 测试实名 `test_all_six_streams_join_from_prompt_to_committed_update`（2053 行）。
-- **lineage 索引语义（本轮修正）**：`forest.lineage(leaf_hash)` 含 index 0 的合成 root，两轮 forest 侧索引为 `[root, obs, resp, obs, resp]`（resp 在 2/4），trajectory JSON 侧因 root 被 `if not node.messages_delta and not node.train_token_delta: continue`（observability.py:413）过滤为 `[obs, resp, obs, resp]`（resp 在 1/3）。任务 4 挂 spans 用 forest 侧 [2]/[4]，JSON 断言用 [1]/[3]，与既有测试 2067/2145/2147 行的手法一致。
+- **lineage 索引语义（本轮修正）**：`forest.lineage(leaf_hash)` 含 index 0 的合成 root，两轮 forest 侧索引为 `[root, obs, resp, obs, resp]`（resp 在 2/4），trajectory JSON 侧因 root 被 `if not node.messages_delta and not node.train_token_delta: continue`（observability.py:413）过滤为 `[obs, resp, obs, resp]`（resp 在 1/3）。任务 4 挂 spans 用 forest 侧 \[2\]/\[4\]，JSON 断言用 \[1\]/\[3\]，与既有测试 2067/2145/2147 行的手法一致。
 - **frozen dataclass 转换（本轮修正）**：`WeightVersionSpan` 是 frozen dataclass，无 `__dict__`，`vars()` 不可用——任务 7 统一 `dataclasses.asdict(span)`。
 - **占位符扫描**：任务 4 Step 1 与任务 6 Step 1/6 的测试代码含「先读既有测试/文件，按实际签名微调构造」的指令——这是**引导性指令而非占位符**（断言目标与核心代码完整给出；构造样板已给出且指明核对来源），符合本仓库「测试 fixture 须与被测代码实际签名一致」的现实约束。其余步骤均为完整代码。
-- **类型一致性**：`WeightVersionSpan(version, token_start, token_end, attempt_seq)` 在任务 1 定义、任务 2/3 按位置构造一致；`weight_version_spans` 字段名贯穿 IR/MsgNode/append_resp/build_sample/Sample/LineageNode/trajectory JSON/CLI 一致；`consumed_weight_version` 命名贯穿 observe_train_step/_Update/train 签名/actor 传参/train JSON 一致；`compute_sample_stats`/`compute_run_summary` 签名在任务 6 定义与任务 7 消费一致。
+- **类型一致性**：`WeightVersionSpan(version, token_start, token_end, attempt_seq)` 在任务 1 定义、任务 2/3 按位置构造一致；`weight_version_spans` 字段名贯穿 IR/MsgNode/append_resp/build_sample/Sample/LineageNode/trajectory JSON/CLI 一致；`consumed_weight_version` 命名贯穿 observe_train_step/\_Update/train 签名/actor 传参/train JSON 一致；`compute_sample_stats`/`compute_run_summary` 签名在任务 6 定义与任务 7 消费一致。

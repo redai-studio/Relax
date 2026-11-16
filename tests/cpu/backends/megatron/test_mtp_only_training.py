@@ -214,7 +214,13 @@ def test_mtp_only_sft_reaches_train_without_weight_backuper(monkeypatch, prepack
         actor.train_actor(0, rollout_data, **kwargs)
 
     train.assert_called_once_with(
-        0, actor.model, actor.optimizer, actor.opt_param_scheduler, data_iterator, num_microbatches
+        0,
+        actor.model,
+        actor.optimizer,
+        actor.opt_param_scheduler,
+        data_iterator,
+        num_microbatches,
+        consumed_weight_version=None,
     )
     iterator.close.assert_called_once()
     if prepacked:

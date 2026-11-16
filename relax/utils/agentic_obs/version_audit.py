@@ -50,12 +50,12 @@ def compute_sample_stats(spans: list[dict[str, Any]], consumed_weight_version: s
     """Per-sample staleness stats over that sample's weight version spans.
 
     ``spans`` are the ``weight_version_spans`` dicts of one trajectory
-    (``version``/``token_start``/``token_end``). ``consumed_weight_version``
-    is the train-side stamp; when it is missing every lag is ``None`` rather
-    than 0. Known spans are those whose version parses as an int; unknown
-    spans (null or non-numeric version) are excluded from lags and counted in
-    the missing rates. The output carries ``spans_count`` / ``unknown_spans``
-    so callers can aggregate span coverage without re-parsing the spans.
+    (``version``/``token_start``/``token_end``). ``consumed_weight_version`` is
+    the train-side stamp; when it is missing every lag is ``None`` rather than
+    0. Known spans are those whose version parses as an int; unknown spans
+    (null or non-numeric version) are excluded from lags and counted in the
+    missing rates. The output carries ``spans_count`` / ``unknown_spans`` so
+    callers can aggregate span coverage without re-parsing the spans.
     """
 
     known: list[tuple[int, str, int]] = []  # (version int, original string, token count)
@@ -231,10 +231,10 @@ def load_consumed_versions(run_dir: Path) -> dict[int, str | None]:
     """Latest consumed weight version per sample across train DP shards.
 
     Covers both regular ``step_*_dp_*.jsonl`` shards and the
-    ``overflow_step_*_dp_*.jsonl`` shards train_hooks writes under
-    backpressure — the regime where staleness is most interesting. Shards are
-    ordered by ``(rollout_id, dp_rank, is_overflow)``, so a sample consumed by
-    a later step always overwrites the earlier stamp.
+    ``overflow_step_*_dp_*.jsonl`` shards train_hooks writes under backpressure
+    — the regime where staleness is most interesting. Shards are ordered by
+    ``(rollout_id, dp_rank, is_overflow)``, so a sample consumed by a later
+    step always overwrites the earlier stamp.
     """
 
     consumed: dict[int, str | None] = {}

@@ -19,17 +19,17 @@
 
 ## 2. 核心决策（已与用户确认）
 
-| 决策点 | 结论 |
-| --- | --- |
-| 目标仓库 | Relax |
-| 版本记录粒度 | token 区间级（span），非 attempt 级 |
-| 指标出口 | 六流 JSONL + 离线诊断报告（CLI） |
-| 版本号体系 | actor 发布序号（`weight_updater.weight_version`，每 policy 单调递增） |
-| 未知版本处理 | 显式 None，不计入 lag 均值分子分母，缺失率单列；绝不按 0 或最新版本处理 |
-| 消费滞后采集点 | actor 侧 train_hooks（写 TrainRecord 时计算） |
-| 实现方案 | 方案 A：演进现有链路为 token-span，单一数据源 |
+| 决策点                          | 结论                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------- |
+| 目标仓库                        | Relax                                                                     |
+| 版本记录粒度                    | token 区间级（span），非 attempt 级                                       |
+| 指标出口                        | 六流 JSONL + 离线诊断报告（CLI）                                          |
+| 版本号体系                      | actor 发布序号（`weight_updater.weight_version`，每 policy 单调递增）     |
+| 未知版本处理                    | 显式 None，不计入 lag 均值分子分母，缺失率单列；绝不按 0 或最新版本处理   |
+| 消费滞后采集点                  | actor 侧 train_hooks（写 TrainRecord 时计算）                             |
+| 实现方案                        | 方案 A：演进现有链路为 token-span，单一数据源                             |
 | 旧字段 `Sample.weight_versions` | 保留（并存），新增 `weight_version_spans`；旧字段无消费者但按用户要求保留 |
-| 示例交付 | 单元测试（可复现场景）+ 诊断报告样例文件 |
+| 示例交付                        | 单元测试（可复现场景）+ 诊断报告样例文件                                  |
 
 ## 3. 数据结构
 
@@ -64,7 +64,7 @@ class WeightVersionSpan:
 
 1. **每次 backend.generate attempt 返回时**：
    - attempt 开始前记录 `token_start = len(ir.pending_token_delta)`（该次调用前已积累的 token 数）；
-   - attempt 返回后 `token_end = len(ir.pending_token_delta)`（本次新增 token 落在 [token_start, token_end)）；
+   - attempt 返回后 `token_end = len(ir.pending_token_delta)`（本次新增 token 落在 \[token_start, token_end)）；
    - `version = meta_info.get("weight_version")`（None 未知也照样记 span，version=None）；
    - 追加 `WeightVersionSpan(version, token_start, token_end, attempt_seq)` 到 `ir.pending_weight_version_spans`；`attempt_seq` 由 IR 上的 attempt 计数器维护。
 2. **abort 恢复**：IR 重排队时 `pending_weight_version_spans` 与 token delta 一样跨 attempt 保留（与现有 `pending_weight_version_delta` 行为一致，测试 `tests/cpu/test_agentic_rollout.py:1445-1469` 已锁定该语义）；恢复后的新 attempt 追加新 span。
@@ -95,15 +95,15 @@ class WeightVersionSpan:
 
 设某样本 spans 的已知版本集合 V，token 数按 span 长度计：
 
-| 指标 | 定义 |
-| --- | --- |
-| 生成期跨度 generation_span | `max(V) − min(V)`，仅已知版本；无已知版本记 None |
-| 消费滞后（oldest）oldest_lag | `current − min(V)`（current = consumed_weight_version） |
-| 消费滞后（newest）newest_lag | `current − max(V)` |
-| token 加权滞后 token_weighted_lag | `Σ((current − v_i) × len_i) / Σ len_i`，仅已知版本的 span |
-| 等待滞后 post_generation_lag | `newest_lag`（生成完成后老化的部分）；与生成期跨度（生成过程中跨越）分列呈现 |
-| 版本缺失率（span 级） | unknown spans / total spans |
-| 版本缺失率（token 加权） | unknown tokens / total tokens |
+| 指标                              | 定义                                                                         |
+| --------------------------------- | ---------------------------------------------------------------------------- |
+| 生成期跨度 generation_span        | `max(V) − min(V)`，仅已知版本；无已知版本记 None                             |
+| 消费滞后（oldest）oldest_lag      | `current − min(V)`（current = consumed_weight_version）                      |
+| 消费滞后（newest）newest_lag      | `current − max(V)`                                                           |
+| token 加权滞后 token_weighted_lag | `Σ((current − v_i) × len_i) / Σ len_i`，仅已知版本的 span                    |
+| 等待滞后 post_generation_lag      | `newest_lag`（生成完成后老化的部分）；与生成期跨度（生成过程中跨越）分列呈现 |
+| 版本缺失率（span 级）             | unknown spans / total spans                                                  |
+| 版本缺失率（token 加权）          | unknown tokens / total tokens                                                |
 
 - 所有 lag 均值**只计入有已知版本的样本/span**；缺失不进分子分母，单独报缺失率（三种口径）。
 - 未知版本在报告里显式 `version: null` 行呈现，不存在按 0 或最新版本处理的路径。
@@ -134,15 +134,15 @@ class WeightVersionSpan:
 
 测试放 `tests/cpu/`（纯 CPU、无 GPU 依赖，符合 Relax 测试放置规则）：
 
-| 场景 | 断言要点 | 对应验收标准 |
-| --- | --- | --- |
-| 多轮生成 + 工具等待期间两次权重更新 | 各轮 token 的 span 版本来源正确（v1/v2/v3 分属各轮）；消费时版本年龄数值正确 | 6 |
-| abort 恢复 | pending spans 跨 attempt 保留；恢复后新 attempt 新 span、attempt_seq 递增 | 1 |
-| 取消清理 | 被丢弃 IR 的 spans 不出现在 node / trajectory / train 任何流 | 2 |
-| 缺失版本 | version=None 显式呈现；缺失率三口径正确；不进 lag 均值 | 3 |
-| 口径区分 | generation_span vs consumption_lag vs post_generation_lag 三者数值互不混淆 | 4 |
-| 端到端 join | trajectory ↔ train 合并产出样本级报告行（含追溯链 session → turn → attempt） | 7/9 |
-| 旁路不侵入 | 现有 GRPO 组处理、采样语义测试全绿（回归） | 5 |
+| 场景                                | 断言要点                                                                     | 对应验收标准 |
+| ----------------------------------- | ---------------------------------------------------------------------------- | ------------ |
+| 多轮生成 + 工具等待期间两次权重更新 | 各轮 token 的 span 版本来源正确（v1/v2/v3 分属各轮）；消费时版本年龄数值正确 | 6            |
+| abort 恢复                          | pending spans 跨 attempt 保留；恢复后新 attempt 新 span、attempt_seq 递增    | 1            |
+| 取消清理                            | 被丢弃 IR 的 spans 不出现在 node / trajectory / train 任何流                 | 2            |
+| 缺失版本                            | version=None 显式呈现；缺失率三口径正确；不进 lag 均值                       | 3            |
+| 口径区分                            | generation_span vs consumption_lag vs post_generation_lag 三者数值互不混淆   | 4            |
+| 端到端 join                         | trajectory ↔ train 合并产出样本级报告行（含追溯链 session → turn → attempt） | 7/9          |
+| 旁路不侵入                          | 现有 GRPO 组处理、采样语义测试全绿（回归）                                   | 5            |
 
 报告样例：单测产物或独立小脚本生成一份诊断报告示例文件，直观展示「Agent 在工具等待期间经历两次权重更新后，各轮 token 的来源及训练消费时的版本年龄」（验收标准 6 的可复现示例）。
 

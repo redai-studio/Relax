@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Acceptance-scenario tests for weight version tracking metrics and span isolation."""
+"""Acceptance-scenario tests for weight version tracking metrics and span
+isolation."""
 
 from __future__ import annotations
 
@@ -140,11 +141,10 @@ def _result(tokens, finish_type, weight_version):
 
 
 def test_acceptance_6_tool_wait_two_weight_updates_reproducible_example():
-    """可复现示例：Agent 在工具等待期间经历两次权重更新后，各轮 token
-    的来源及训练消费时的版本年龄。
+    """可复现示例：Agent 在工具等待期间经历两次权重更新后，各轮 token 的来源及训练消费时的版本年龄。
 
-    时间线：v1 生成第 1 轮 resp（2 token）→ 工具等待 → v2 发布 → v3 生成
-    第 2 轮 resp（3 token）→ 等待 → v4、v5 发布 → 训练消费（current=5）。
+    时间线：v1 生成第 1 轮 resp（2 token）→ 工具等待 → v2 发布 → v3 生成 第 2 轮 resp（3 token）→ 等待
+    → v4、v5 发布 → 训练消费（current=5）。
     """
     spans = [
         WeightVersionSpan(version="1", token_start=0, token_end=2, attempt_seq=0),
@@ -184,8 +184,8 @@ def test_metric_distinction_generation_span_vs_consumption_vs_waiting():
 async def test_cancelled_ir_spans_never_reach_any_stream():
     """验收标准 2：取消或被替换的片段不混入统计。
 
-    IR 被 session 清理后，其 pending spans 随 IR 一起消失，不存在写入任何
-    forest node 的代码路径；对照 IR 的 spans 正常提交。
+    IR 被 session 清理后，其 pending spans 随 IR 一起消失，不存在写入任何 forest node 的代码路径；对照 IR
+    的 spans 正常提交。
     """
     shard, _group, session, ir = _router_recovery_shard()
     # 对照 IR：正常提交，spans 进入 resp node。

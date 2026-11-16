@@ -6,6 +6,7 @@
 PR：[redai-studio/Relax#669](https://github.com/redai-studio/Relax/pull/669)（open，head `d186867`）
 任务来源：`/home/nianliu/code/xhs/task.txt`【No.15】
 关联文档：
+
 - 设计：`docs/superpowers/specs/2026-11-10-weight-version-tracking-design.md`
 - 实施计划：`docs/superpowers/plans/2026-11-10-weight-version-tracking.md`
 - 报告样例：`docs/superpowers/examples/weight-version-audit-report.md`
@@ -32,41 +33,41 @@ PR：[redai-studio/Relax#669](https://github.com/redai-studio/Relax/pull/669)（
 
 Rebase 后 20 个 commit（`origin/main` @ 2ecdc45 → `d186867`；哈希为 rebase 后最终值）：
 
-| Commit | 说明 |
-| --- | --- |
-| ab709d5 | docs: 权重版本追踪与滞后审计设计 spec |
-| 935eac5 | docs: 设计补充 TQ 序列化探针准则 |
-| 67c420c | docs: 实施计划 |
+| Commit  | 说明                                                                  |
+| ------- | --------------------------------------------------------------------- |
+| ab709d5 | docs: 权重版本追踪与滞后审计设计 spec                                 |
+| 935eac5 | docs: 设计补充 TQ 序列化探针准则                                      |
+| 67c420c | docs: 实施计划                                                        |
 | ec632db | feat(agentic): WeightVersionSpan 类型 + `Sample.weight_version_spans` |
-| ef8239f | feat(agentic): spans 贯穿 IR / MsgNode / append_resp / build_sample |
-| 9dde26a | test(agentic): 修正 state 测试的过时坐标注释并关闭事件循环 |
-| 67b4821 | feat(agentic): 在生成 attempt 边界采集 spans（service.py） |
-| 267c9fe | feat(obs): spans 快照进 trajectory 流（schema 3.1.0） |
-| 08f24e9 | test(obs): ruff format + None 版本 round-trip 覆盖 |
-| e5292ec | feat(train): 训练消费版本 `consumed_weight_version` 写入 train 流 |
-| dc51dde | test(obs): isolation fake lineage node 补 spans 默认值 |
-| 8ebb029 | fix(train): 按模式取消费版本，schema 升 3.2.0 |
-| 6042822 | feat(obs): version_audit 核心统计 |
-| b779b6d | feat(obs): version_audit CLI（trajectories × train 流 join） |
-| 01364fd | fix(obs): 加固流 join 与明细输出（overflow 分片、零除、CLI 校验） |
-| 29fef44 | fix(obs): 容忍 JSONL 撕裂的多字节尾行 |
-| 57c2813 | feat(obs): 验收场景测试 + 报告样例 + zh/en 文档 |
-| 0ef564f | docs(obs): 报告样例改用节点内相对坐标 |
-| 2c60e96 | docs(obs): 特性文档页 + 本收尾记录 |
-| d186867 | docs(obs): 验证指南 |
+| ef8239f | feat(agentic): spans 贯穿 IR / MsgNode / append_resp / build_sample   |
+| 9dde26a | test(agentic): 修正 state 测试的过时坐标注释并关闭事件循环            |
+| 67b4821 | feat(agentic): 在生成 attempt 边界采集 spans（service.py）            |
+| 267c9fe | feat(obs): spans 快照进 trajectory 流（schema 3.1.0）                 |
+| 08f24e9 | test(obs): ruff format + None 版本 round-trip 覆盖                    |
+| e5292ec | feat(train): 训练消费版本 `consumed_weight_version` 写入 train 流     |
+| dc51dde | test(obs): isolation fake lineage node 补 spans 默认值                |
+| 8ebb029 | fix(train): 按模式取消费版本，schema 升 3.2.0                         |
+| 6042822 | feat(obs): version_audit 核心统计                                     |
+| b779b6d | feat(obs): version_audit CLI（trajectories × train 流 join）          |
+| 01364fd | fix(obs): 加固流 join 与明细输出（overflow 分片、零除、CLI 校验）     |
+| 29fef44 | fix(obs): 容忍 JSONL 撕裂的多字节尾行                                 |
+| 57c2813 | feat(obs): 验收场景测试 + 报告样例 + zh/en 文档                       |
+| 0ef564f | docs(obs): 报告样例改用节点内相对坐标                                 |
+| 2c60e96 | docs(obs): 特性文档页 + 本收尾记录                                    |
+| d186867 | docs(obs): 验证指南                                                   |
 
 变更范围（rebase 后 vs `origin/main`）：30 个文件（+4387/−17）。核心实现 9 个（`relax/utils/types.py`、`relax/agentic/session/state.py`、`relax/agentic/session/service.py`、`relax/agentic/observability.py`、`relax/utils/agentic_obs/records.py`、`train_hooks.py`、`version_audit.py`（新）、`relax/backends/megatron/actor.py`、`model.py`），测试 11 个，文档 10 个（含 zh/en 特性页与用户指南）。
 
 ## 验收标准证据表
 
-| 验收标准 | 证据 |
-| --- | --- |
+| 验收标准                                      | 证据                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1 跨版本多轮 / 暂停恢复 / 缺失版本 / 取消重试 | `test_weight_version_service.py::test_apply_generate_result_records_span_per_attempt`（多 attempt）、`::test_spans_survive_abort_requeue_and_commit`（abort 恢复）、`::test_apply_generate_result_records_unknown_version_as_none`（缺失）；`test_weight_version_scenarios.py::test_cancelled_ir_spans_never_reach_any_stream`（取消） |
-| 2 token 区间只对应成功提交内容 | 采集点在 attempt 边界（service.py `_apply_generate_result`），spans 仅经 `_terminal_response_locked → append_resp` 入 node；IR 丢弃即消失，scenario 测试显式断言所有非提交 node spans 为空 |
-| 3 未知版本显式呈现 + 缺失率 | `version=None` 全链路保留（JSON null）；`version_audit.py` 三口径缺失率（span/token/sample）；`test_version_audit.py::test_all_unknown_reports_null_not_zero` 等 |
-| 4 版本年龄按发布序号、口径区分 | 单一序号源：`weight_updater.weight_version`（colocate/hybrid）与 DCS `DeviceDirectBackend.weight_version`；`test_metric_distinction_generation_span_vs_consumption_vs_waiting` |
-| 5 旁路审计不侵入 | service.py 仅在既有异常护栏内累加数据；actor/model/train_hooks 为加法式 kwarg 透传；回归 delta = +3 passed，零新增失败 |
-| 6 实现 + 测试 + 可复现示例 | `test_acceptance_6_tool_wait_two_weight_updates_reproducible_example` + `docs/superpowers/examples/weight-version-audit-report.md`（数值经真实 CLI 逐字节核对） |
+| 2 token 区间只对应成功提交内容                | 采集点在 attempt 边界（service.py `_apply_generate_result`），spans 仅经 `_terminal_response_locked → append_resp` 入 node；IR 丢弃即消失，scenario 测试显式断言所有非提交 node spans 为空                                                                                                                                             |
+| 3 未知版本显式呈现 + 缺失率                   | `version=None` 全链路保留（JSON null）；`version_audit.py` 三口径缺失率（span/token/sample）；`test_version_audit.py::test_all_unknown_reports_null_not_zero` 等                                                                                                                                                                       |
+| 4 版本年龄按发布序号、口径区分                | 单一序号源：`weight_updater.weight_version`（colocate/hybrid）与 DCS `DeviceDirectBackend.weight_version`；`test_metric_distinction_generation_span_vs_consumption_vs_waiting`                                                                                                                                                         |
+| 5 旁路审计不侵入                              | service.py 仅在既有异常护栏内累加数据；actor/model/train_hooks 为加法式 kwarg 透传；回归 delta = +3 passed，零新增失败                                                                                                                                                                                                                 |
+| 6 实现 + 测试 + 可复现示例                    | `test_acceptance_6_tool_wait_two_weight_updates_reproducible_example` + `docs/superpowers/examples/weight-version-audit-report.md`（数值经真实 CLI 逐字节核对）                                                                                                                                                                        |
 
 ## 最终验证结果（2026-11-13）
 
