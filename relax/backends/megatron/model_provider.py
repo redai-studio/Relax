@@ -407,6 +407,8 @@ def get_model_provider_func(
             "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
+            "moe_megakernel_backend",
+            "moe_megakernel_backend_config",
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",

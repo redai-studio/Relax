@@ -5,13 +5,17 @@
 # oversize hook retains 128k-256k samples unchanged for singleton microbatches
 # and skips samples above 256k. Such long singletons can still exhaust memory.
 # Override SEQ_LENGTH and MAX_TOKENS_PER_GPU together for other length budgets.
-# Retain Relax's TP2/CP1 mixed QSA and HybridEP implementations.
+# Retain Relax's TP2/CP1 mixed QSA; MOE_BACKEND selects hybridep (default) or mok.
+# MOK_BACKEND_CONFIG optionally supplies the MCore/MoK backend JSON options.
+# MoK requires the MCore adapter with fixed_num_local_tokens support and a
+# compatible mixture-of-kittens installation/import path on every worker.
 # Run this script directly; it delegates setup to scripts/entrypoint/ray-job.sh.
 # DRY_RUN=1 prints JSON without Ray setup, cleanup, network calls or GPU imports.
 # MODEL_DIR and DATA_DIR are the exact HF checkpoint and prompt-data paths.
 # Initialize from an HF checkpoint containing the MTP weights.
 # Default: one epoch, GBS4096, hold out 512 rows without periodic evaluation.
 # Keep SAVE_DIR/EXP_NAME stable to resume; save at completion and retain 2.
+# SAVE_CHECKPOINTS=0 disables checkpoint writes, including the final step.
 # Usage inside the unified image on an existing Ray cluster:
 # MODEL_DIR=... DATA_DIR=... SAVE_DIR=... MEGATRON=... RELAX_SKIP_CLUSTER_CLEANUP=1 \
 #   bash scripts/entrypoint/ray-job.sh \
@@ -33,7 +37,12 @@ source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 export MEGATRON
 # Use the unified image's installed Bridge, Python dependencies and HybridEP.
 # The image supplies this revision for worker package validation, not feature selection.
-: "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}"
+export MOE_BACKEND="${MOE_BACKEND:-hybridep}"
+case "${MOE_BACKEND}" in
+    hybridep) : "${RELAX_HYBRID_EP_COMMIT:?Use the unified Blackwell image with HybridEP installed}" ;;
+    mok) ;;
+    *) echo "MOE_BACKEND must be hybridep or mok" >&2; exit 2 ;;
+esac
 # Resolve shared libraries from the active Python environment without importing CUDA.
 # Explicit library directories and inherited loader paths remain available.
 LD_LIBRARY_PATH=$(python3 - <<'PYLIB'
@@ -54,8 +63,14 @@ print(":".join(dict.fromkeys(paths)))
 PYLIB
 )
 export LD_LIBRARY_PATH
+SFT_TRAINING_MODE="${SFT_TRAINING_MODE:-sft}"
+case "${SFT_TRAINING_MODE}" in
+    sft) DEFAULT_MAX_TOKENS_PER_GPU=131072 ;;
+    cpt) DEFAULT_MAX_TOKENS_PER_GPU=262144 ;;
+    *) echo "SFT_TRAINING_MODE must be sft or cpt" >&2; exit 2 ;;
+esac
 SEQ_LENGTH="${SEQ_LENGTH:-262144}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-131072}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_MAX_TOKENS_PER_GPU}}"
 if [[ ! "${SEQ_LENGTH}" =~ ^[1-9][0-9]*$ || ! "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]] ||
     (( MAX_TOKENS_PER_GPU > SEQ_LENGTH )); then
     echo "Require positive MAX_TOKENS_PER_GPU <= SEQ_LENGTH for the custom SFT sample limit" >&2
@@ -63,7 +78,9 @@ if [[ ! "${SEQ_LENGTH}" =~ ^[1-9][0-9]*$ || ! "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][
 fi
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
-export EXP_NAME="${EXP_NAME:-qwen38-qsa-sft-256k-32xb300}" # gitleaks:allow -- stable experiment/checkpoint identity
+DEFAULT_EXP_NAME=qwen38-qsa-sft-256k-32xb300 # gitleaks:allow -- stable experiment/checkpoint identity
+if [[ "${MOE_BACKEND}" == mok ]]; then DEFAULT_EXP_NAME+=-mok; fi
+export EXP_NAME="${EXP_NAME:-${DEFAULT_EXP_NAME}}" # gitleaks:allow -- stable experiment/checkpoint identity
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa-256k}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
@@ -79,21 +96,22 @@ if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
 
-# Explicit driver/actor settings override entrypoint defaults (notably connections=1).
+# Explicit driver/actor settings override entrypoint defaults.
 ENV_ARGS=(
     "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-0}"
     MCORE_QSA_SPARSE_BACKEND=id_sparse
     TORCHINDUCTOR_COMPILE_THREADS=1
     QWEN38_PLE_CPU_OFFLOAD=1
-    "RELAX_HYBRID_EP_COMMIT=${RELAX_HYBRID_EP_COMMIT}"
+    "RELAX_HYBRID_EP_COMMIT=${RELAX_HYBRID_EP_COMMIT:-}"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
-    RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
+    "CUDA_HOME=${CUDA_HOME:-}"
+    RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,CUDA_HOME,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
     NCCL_NVLS_ENABLE=0
-    "PYTHONPATH=${RELAX}:${MEGATRON}"
+    "PYTHONPATH=${RELAX}:${MEGATRON}${PYTHONPATH:+:${PYTHONPATH}}"
     "MEGATRON=${MEGATRON}"
     "RELAX=${RELAX}"
     PYTHONNOUSERSITE=1
-    CUDA_DEVICE_MAX_CONNECTIONS=32
+    "CUDA_DEVICE_MAX_CONNECTIONS=${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
     TOKENIZERS_PARALLELISM=false
     RELAX_QWEN38_QSA_FUSED_ATTENTION=0
@@ -154,6 +172,9 @@ import sys
 print(json.dumps(dict(item.split("=", 1) for item in sys.argv[1:])))
 PYENV
 )
+# GPU actors consume TRAIN_ENV_JSON, while the GPU-less driver needs 1 for
+# Megatron's architecture-dependent argument validation before actors start.
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
 if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
 RUNTIME_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${TRAIN_ENV_JSON}" <<'PYRUNTIME'
@@ -162,6 +183,7 @@ import sys
 runtime = json.loads(sys.argv[1])
 runtime.setdefault("env_vars", {}).pop("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", None)
 runtime["env_vars"].update(json.loads(sys.argv[2]))
+runtime["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 print(json.dumps(runtime))
 PYRUNTIME
 )
@@ -178,8 +200,6 @@ PARALLEL_ARGS=(
     --expert-tensor-parallel-size 1
     --pipeline-model-parallel-layout "${PIPELINE_LAYOUT:-Et*10|t*14|t*14|t*10mL}"
     --sequence-parallel
-    --moe-token-dispatcher-type flex
-    --moe-flex-dispatcher-backend hybridep
     --moe-grouped-gemm
     --colocate
     --no-rope-fusion
@@ -193,6 +213,38 @@ PARALLEL_ARGS=(
     --empty-unused-memory-level 0
 )
 
+MOE_ARGS=()
+if [[ "${MOE_BACKEND}" == hybridep ]]; then
+    MOE_ARGS+=(
+        --moe-token-dispatcher-type flex
+        --moe-flex-dispatcher-backend hybridep
+        --moe-flex-dispatcher-num-sms 80
+        --moe-hybridep-pad-variable-tokens
+        --moe-shared-expert-overlap
+    )
+else
+    # TP2/SP: cover every sequence up to the limit, including the 32768-token
+    # physical packing alignment. Pad only compact MoK inputs, keeping the
+    # attention packing and native shared-expert workload unchanged.
+    MOK_LOCAL_TOKENS=$(( ((SEQ_LENGTH + 32767) / 32768) * 16384 ))
+    MOK_CONFIG=$(python3 - "${MOK_LOCAL_TOKENS}" "${MOK_BACKEND_CONFIG:-}" <<'PYMOK'
+import json
+import sys
+
+options = {"shared_expert_mode": "native", "fixed_num_local_tokens": int(sys.argv[1])}
+if sys.argv[2]:
+    options.update(json.loads(sys.argv[2]))
+print(json.dumps(options))
+PYMOK
+)
+    MOE_ARGS+=(
+        --moe-token-dispatcher-type alltoall
+        --moe-megakernel-backend mok
+        --moe-megakernel-backend-config "${MOK_CONFIG}"
+        --cuda-graph-impl none
+    )
+fi
+
 # Relax takes an integer interval and always saves on the final step.
 SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
 
@@ -202,23 +254,19 @@ CKPT_ARGS=(
     --megatron-to-hf-mode bridge
     --num-epoch "${NUM_EPOCH:-1}"
     --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
-    --save-interval "${SAVE_INTERVAL}"
     --ckpt-format torch_dist
     --max-actor-ckpt-to-keep 2
 )
+case "${SAVE_CHECKPOINTS:-1}" in
+    1) CKPT_ARGS+=(--save "${SAVE_DIR}/${EXP_NAME}" --save-interval "${SAVE_INTERVAL}") ;;
+    0) ;;
+    *) echo "SAVE_CHECKPOINTS must be 0 or 1" >&2; exit 2 ;;
+esac
 
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
     --eval-size "${EVAL_SIZE:-512}"
-    --input-key messages
-    --tool-key tools
-    --apply-chat-template
-    --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true,"add_non_thinking_prefix":false}'
-    --sft-invalid-multimodal-strategy skip
-    --sft-oversize-strategy custom
-    --sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
     --calculate-per-token-loss
     # The hook reads --seq-length after multimodal expansion. Do not set
     # rollout-max-context-len: this recipe deliberately permits long singletons.
@@ -240,10 +288,29 @@ SFT_ARGS=(
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
     --mtp-detach-paths none
-    --multimodal-keys '{"image":"images"}'
-    --image-max-token-num "${IMAGE_MAX_TOKENS:-128}"
-    --sft-image-preprocess-on-rank
 )
+if [[ "${SFT_TRAINING_MODE}" == cpt ]]; then
+    SFT_ARGS+=(
+        --sft-training-mode cpt
+        --sft-cpt-template raw
+        --input-key text
+        --tool-key ''
+        --sft-oversize-strategy skip
+    )
+else
+    SFT_ARGS+=(
+        --input-key messages
+        --tool-key tools
+        --apply-chat-template
+        --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true,"add_non_thinking_prefix":false}'
+        --sft-invalid-multimodal-strategy skip
+        --sft-oversize-strategy custom
+        --sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
+        --multimodal-keys '{"image":"images"}'
+        --image-max-token-num "${IMAGE_MAX_TOKENS:-128}"
+        --sft-image-preprocess-on-rank
+    )
+fi
 
 OPTIMIZER_ARGS=(
     --optimizer adam
@@ -279,9 +346,6 @@ MISC_ARGS=(
     --accumulate-allreduce-grads-in-fp32
     --use-health-check
     --train-env-vars "${TRAIN_ENV_JSON}"
-    --moe-flex-dispatcher-num-sms 80
-    --moe-hybridep-pad-variable-tokens
-    --moe-shared-expert-overlap
     --overlap-grad-reduce
     --overlap-param-gather
 )
@@ -299,12 +363,13 @@ TRAIN_ARGS=(
     --actor-num-gpus-per-node 8
     --sft-max-in-flight-steps 4
     # The first 256k step can exceed the default 30-minute queue timeout.
-    --sft-tq-timeout-minutes 120
+    --sft-tq-timeout-minutes "${SFT_TQ_TIMEOUT_MINUTES:-120}"
     --num-data-storage-units 2
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"
     "${SFT_ARGS[@]}"
     "${PARALLEL_ARGS[@]}"
+    "${MOE_ARGS[@]}"
     "${OPTIMIZER_ARGS[@]}"
     "${MISC_ARGS[@]}"
     "${METRICS_ARGS[@]}"
@@ -323,7 +388,8 @@ runtime = json.loads(sys.argv[2])
 # Only record explicitly selected training settings, not inherited credentials.
 selected = {key: value for key, value in runtime.get("env_vars", {}).items()
             if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_")) or key in
-            ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT")}
+            ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT",
+             "MEGATRON", "PYTHONPATH", "CUDA_HOME")}
 Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
 PYCONFIG
 fi

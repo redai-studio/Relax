@@ -95,7 +95,7 @@ def test_train_profiler_exports_python_operator_call_stacks(monkeypatch, tmp_pat
     assert not list(tmp_path.glob("*.partial"))
 
 
-def test_failed_trace_export_preserves_local_evidence(monkeypatch, tmp_path):
+def test_failed_trace_export_preserves_evidence_in_output_directory(monkeypatch, tmp_path):
     monkeypatch.setenv("RELAX_PROFILE_GZIP_LEVEL", "1")
     monkeypatch.setattr(profile_utils.tempfile, "tempdir", str(tmp_path))
     output = tmp_path / "published"
@@ -108,7 +108,8 @@ def test_failed_trace_export_preserves_local_evidence(monkeypatch, tmp_path):
     profiler.export_chrome_trace.side_effect = interrupted_export
     with pytest.raises(RuntimeError, match="simulated export interruption"):
         profile_utils._create_train_trace_handler(str(output), "rank0")(profiler)
-    retained = list(tmp_path.glob("relax-rank0-*.json"))
+    retained = list(output.glob("relax-rank0-*.json"))
     assert len(retained) == 1
     assert retained[0].read_text() == '{"traceEvents": ['
-    assert not list(output.iterdir())
+    assert not list(tmp_path.glob("relax-rank0-*.json"))
+    assert not list(output.glob("*.gz"))

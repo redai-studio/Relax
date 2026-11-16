@@ -1,0 +1,10 @@
+{
+  "shared_expert_mode": "native",
+  "fixed_num_local_tokens": 131072,
+  "fwd_num_comm_sms": 56,
+  "bwd_num_comm_sms": 56,
+  "minibatch_size": 8192,
+  "macrobatch_size": 1572864,
+  "schedule_capacity_multiplier": 0.5,
+  "all_gather_top_experts_chunk_bytes": 2048
+}

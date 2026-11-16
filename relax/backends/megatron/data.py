@@ -466,6 +466,12 @@ def get_batch(
     if isinstance(batch, PrepackedBatch):
         return batch
 
+    # Rank-side image inputs stay as descriptors for the full optimizer batch;
+    # materialize pixels only after this iterator has selected a microbatch.
+    from relax.engine.sft.image_prefetch import resolve_sft_image_micro_batch
+
+    resolve_sft_image_micro_batch(batch)
+
     if pack_device is not None:
         for key, dtype in (
             ("tokens", torch.long),

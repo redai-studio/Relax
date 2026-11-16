@@ -135,7 +135,15 @@ def _get_train_trace_dir(args):
 def _create_train_trace_handler(trace_dir: str, worker_name: str) -> Callable[[torch.profiler.profile], None]:
     compression = Envs.RELAX_PROFILE_GZIP_LEVEL
     if compression is None:
-        return torch.profiler.tensorboard_trace_handler(trace_dir, worker_name=worker_name, use_gzip=True)
+        handler = torch.profiler.tensorboard_trace_handler(trace_dir, worker_name=worker_name, use_gzip=True)
+
+        def export_default_trace(profiler: torch.profiler.profile) -> None:
+            handler(profiler)
+            from relax.utils.record_function_tags import export_profile_diagnostics
+
+            export_profile_diagnostics(trace_dir, worker_name)
+
+        return export_default_trace
     level = int(compression)
     if not 0 <= level <= 9:
         raise ValueError("RELAX_PROFILE_GZIP_LEVEL must be an integer from 0 through 9")
@@ -145,11 +153,11 @@ def _create_train_trace_handler(trace_dir: str, worker_name: str) -> Callable[[t
         directory.mkdir(parents=True, exist_ok=True)
         output = directory / f"{worker_name}.{time.time_ns()}.pt.trace.json.gz"
         partial = output.with_suffix(output.suffix + ".partial")
-        descriptor, local_name = tempfile.mkstemp(prefix=f"relax-{worker_name}-", suffix=".json")
+        descriptor, local_name = tempfile.mkstemp(prefix=f"relax-{worker_name}-", suffix=".json", dir=directory)
         os.close(descriptor)
         local = Path(local_name)
         # Long Python stacks can produce tens of GB of JSON. Keep serialization
-        # on local disk and allow fast compression without dropping stack data.
+        # beside the final trace without changing TMPDIR used by communication.
         # Retain incomplete files on errors for diagnosis; publish only on success.
         logger.info("Exporting training trace to %s, then %s (gzip level %s)", local, output, level)
         profiler.export_chrome_trace(str(local))
@@ -157,6 +165,9 @@ def _create_train_trace_handler(trace_dir: str, worker_name: str) -> Callable[[t
             shutil.copyfileobj(source, destination, length=2 * 1024 * 1024)
         partial.replace(output)
         local.unlink()
+        from relax.utils.record_function_tags import export_profile_diagnostics
+
+        export_profile_diagnostics(trace_dir, worker_name)
         logger.info("Training trace export completed: %s", output)
 
     return export_trace

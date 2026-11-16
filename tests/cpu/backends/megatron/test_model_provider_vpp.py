@@ -748,6 +748,8 @@ def test_raw_provider_uses_supplied_config_and_process_groups(monkeypatch, expli
     "name,value",
     [
         ("moe_hybridep_pad_variable_tokens", True),
+        ("moe_megakernel_backend", "mok"),
+        ("moe_megakernel_backend_config", {"shared_expert_mode": "native", "fwd_num_comm_sms": 40}),
         ("gdn_pre_gated_delta_rule_fusion", True),
         ("gdn_conv_pad_alignment", 8192),
     ],
