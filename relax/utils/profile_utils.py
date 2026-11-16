@@ -166,7 +166,7 @@ def _create_torch_profiler(args, name):
     trace_dir = _get_train_trace_dir(args)
     worker_name = f"{name}_{_get_rank_tag()}"
     if args.profile_with_stack:
-        # Load the CUPTI monitor before stack capture starts.
+        # Preload the CUPTI monitor to avoid corrupt call stacks (redai-studio/Relax#697).
         # TODO: Remove after upgrading to PyTorch 2.14.0 or newer (pytorch/pytorch#186359).
         with torch.profiler.record_function("relax_profiler_warmup"):
             pass
