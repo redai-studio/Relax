@@ -69,16 +69,12 @@ class RolloutPool:
         try:
             implementation.__init__(self.backend, args, binding, inference_only=True)
         except BaseException:
-            try:
-                if hasattr(self.backend, "_eviction_monitor_stop"):
-                    self.backend.dispose()
-                elif hasattr(self.backend, "servers"):
-                    self.backend._shutdown_all_engines()
-            finally:
-                try:
-                    stop_launched_routers()
-                finally:
-                    self._dispose_locks()
+            if hasattr(self.backend, "_eviction_monitor_stop"):
+                self.backend.dispose()
+            elif hasattr(self.backend, "servers"):
+                self.backend._shutdown_all_engines()
+            stop_launched_routers()
+            self._dispose_locks()
             raise
         self.synced_actor_ids = {
             engine._actor_id.hex()

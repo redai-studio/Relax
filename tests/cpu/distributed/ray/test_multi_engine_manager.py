@@ -399,6 +399,57 @@ def test_unknown_release_preserves_slot_and_placement(_patch_ray, monkeypatch, o
     assert engine not in _patch_ray.killed
 
 
+@pytest.mark.parametrize("exit_confirmed", [True, False])
+def test_permanently_dead_actor_requires_independent_exit_confirmation(_patch_ray, monkeypatch, exit_confirmed):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    original_get = mem.ray.get
+    checks = []
+
+    def get(ref, timeout=None):
+        if isinstance(ref, tuple) and ref[0] is engine:
+            raise mem.ray.exceptions.ActorDiedError()
+        return original_get(ref, timeout=timeout)
+
+    def confirm(rank):
+        checks.append(rank)
+        return exit_confirmed
+
+    monkeypatch.setattr(mem.ray, "get", get)
+    monkeypatch.setattr(manager, "_confirm_dead_engine_exit", confirm)
+    if exit_confirmed:
+        manager.offload()
+        assert manager.all_engines == [None]
+        manager.onload()
+        assert manager.is_onloaded()
+        assert manager.engines[0] is not engine
+    else:
+        with pytest.raises(RuntimeError, match="release is unconfirmed"):
+            manager.offload()
+        assert manager.all_engines == [engine]
+        assert manager.engines == [None]
+        assert engine not in _patch_ray.killed
+    assert checks == [0]
+
+
+def test_dead_actor_without_process_receipt_keeps_ownership(_patch_ray, monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+
+    def get(*args, **kwargs):
+        raise mem.ray.exceptions.ActorDiedError()
+
+    monkeypatch.setattr(mem.ray, "get", get)
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        manager.shutdown()
+    assert manager.all_engines == [engine]
+    assert engine not in _patch_ray.killed
+
+
 @pytest.mark.parametrize("failure", ["address", "init"])
 def test_recovery_init_and_cleanup_failure_never_marks_slot_ready(_patch_ray, monkeypatch, failure):
     import relax.distributed.ray.multi_engine_manager as mem

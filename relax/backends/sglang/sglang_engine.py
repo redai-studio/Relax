@@ -41,6 +41,7 @@ from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules, is_lora_enabled
 from relax.utils.model_source import ModelSource, SGLangLoadPlan
+from relax.utils.process_utils import process_is_live, server_session_exited
 from relax.utils.s3_model_loader import (
     get_s3_model_cached_path,
     is_s3_uri,
@@ -341,6 +342,10 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
     """
+    # Keep backend descendants identifiable after their Ray actor dies and
+    # they are reparented. This session never contains the actor itself.
+    os.setsid()
+
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -1036,6 +1041,21 @@ class SGLangEngine(RayActor):
                 raise TimeoutError("Timeout while flushing cache.")
             time.sleep(1)
 
+    def get_server_process_info(self) -> dict[str, int | str] | None:
+        """Retain an independent exit-check receipt before actor death."""
+        if self.args.rollout_external:
+            return None
+        process = getattr(self, "process", None)
+        if process is None:
+            return None
+        # A follower can return from init before its spawned target runs.
+        deadline = time.monotonic() + 30
+        while os.getsid(process.pid) != process.pid:
+            if not process.is_alive() or time.monotonic() >= deadline:
+                raise RuntimeError("SGLang server session startup is unconfirmed")
+            time.sleep(0.05)
+        return {"node_id": ray.get_runtime_context().get_node_id(), "session_id": process.pid}
+
     def shutdown(self):
         if self.args.rollout_external:
             if self.unregister_from_router(wait_for_removal=True, timeout=5.0) is False:
@@ -1055,18 +1075,38 @@ class SGLangEngine(RayActor):
 
                 # Freeze each parent before enumerating children so no scheduler
                 # can fork an untracked descendant between enumeration and kill.
-                processes = []
-                pending = [psutil.Process(process.pid)]
+                if not hasattr(self, "_shutdown_processes"):
+                    self._shutdown_processes = []
+                    try:
+                        self._shutdown_processes.append(psutil.Process(process.pid))
+                    except psutil.NoSuchProcess:
+                        pass
+                processes = self._shutdown_processes
+                # Reuse psutil's creation-time identity across retries. A fresh
+                # Process(old_pid) could suspend an unrelated reused PID.
+                pending = list(processes)
                 while pending:
                     current = pending.pop()
-                    current.suspend()
-                    processes.append(current)
-                    pending.extend(current.children())
+                    if not process_is_live(current):
+                        continue
+                    try:
+                        current.suspend()
+                        if current not in processes:
+                            processes.append(current)
+                        pending.extend(current.children())
+                    except psutil.NoSuchProcess:
+                        continue
                 for current in reversed(processes):
-                    current.kill()
+                    try:
+                        current.kill()
+                    except psutil.NoSuchProcess:
+                        pass
                 _, alive = psutil.wait_procs(processes, timeout=5)
+                alive = [current for current in alive if process_is_live(current)]
                 if alive:
                     raise RuntimeError(f"SGLang process exit unconfirmed: {[proc.pid for proc in alive]}")
+                if not server_session_exited(process.pid):
+                    raise RuntimeError("SGLang server session exit is unconfirmed")
                 self._server_exit_confirmed = True
 
     def __del__(self):

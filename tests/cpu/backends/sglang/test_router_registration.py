@@ -78,7 +78,9 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setattr(parent, "sglang_engine", getattr(parent, "sglang_engine", None), raising=False)
     monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
     del sys.modules[module_name]
-    yield importlib.import_module(module_name)
+    module = importlib.import_module(module_name)
+    monkeypatch.setattr(module, "server_session_exited", lambda _session_id: True)
+    yield module
 
 
 class _Response:
@@ -766,8 +768,8 @@ def test_pd_id_cleanup_rejects_url_shared_with_another_generation(monkeypatch, s
     assert requests.deletes == []
 
 
-@pytest.mark.parametrize("alive", [True, False])
-def test_shutdown_requires_process_exit(monkeypatch, sglang_engine_module, alive):
+@pytest.mark.parametrize("status", ["running", "zombie", "gone"])
+def test_shutdown_requires_process_exit(monkeypatch, sglang_engine_module, status):
     from unittest.mock import Mock
 
     import psutil
@@ -779,12 +781,14 @@ def test_shutdown_requires_process_exit(monkeypatch, sglang_engine_module, alive
     child = Mock(pid=124)
     parent.children.return_value = [child]
     child.children.return_value = []
+    parent.status.return_value = psutil.STATUS_RUNNING
+    child.status.return_value = psutil.STATUS_ZOMBIE if status == "zombie" else psutil.STATUS_RUNNING
     monkeypatch.setattr(psutil, "Process", lambda pid: parent)
-    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: ([], [child] if alive else []))
+    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: ([], [] if status == "gone" else [child]))
     monkeypatch.setattr(engine, "unregister_from_router", lambda **kwargs: None)
     monkeypatch.setattr(sglang_engine_module, "kill_process_tree", lambda pid: None)
     try:
-        if alive:
+        if status == "running":
             with pytest.raises(RuntimeError, match="exit unconfirmed"):
                 engine.shutdown()
             assert not getattr(engine, "_server_exit_confirmed", False)
@@ -799,6 +803,37 @@ def test_shutdown_before_address_allocation_is_safe(sglang_engine_module):
     engine = sglang_engine_module.SGLangEngine.__new__(sglang_engine_module.SGLangEngine)
     engine.args = SimpleNamespace(rollout_external=False)
     engine.shutdown()
+
+
+def test_shutdown_retry_reuses_process_identity(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    import psutil
+
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = False
+    engine.process = SimpleNamespace(pid=123)
+    parent = Mock(pid=123)
+    parent.children.return_value = []
+    parent.status.return_value = psutil.STATUS_RUNNING
+    parent.is_running.return_value = True
+    constructor = Mock(return_value=parent)
+    monkeypatch.setattr(psutil, "Process", constructor)
+    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: ([], [parent]))
+    monkeypatch.setattr(engine, "unregister_from_router", lambda **kwargs: True)
+    try:
+        with pytest.raises(RuntimeError, match="exit unconfirmed"):
+            engine.shutdown()
+        # psutil detects that the captured process exited or its PID was reused.
+        parent.is_running.return_value = False
+        parent.suspend.reset_mock()
+        parent.kill.side_effect = psutil.NoSuchProcess(123)
+        engine.shutdown()
+        constructor.assert_called_once_with(123)
+        parent.suspend.assert_not_called()
+        assert engine._server_exit_confirmed
+    finally:
+        engine.process = None
 
 
 @pytest.mark.parametrize("removed", [False, True])

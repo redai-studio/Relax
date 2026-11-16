@@ -58,6 +58,8 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     module = sglang_engine_module
     events = []
     http_server = ModuleType("sglang.srt.entrypoints.http_server")
+    session = Mock()
+    monkeypatch.setattr(module.os, "setsid", session)
     http_server.launch_server = Mock(side_effect=lambda *_args, **_kwargs: events.append("launch"))
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
     monkeypatch.setattr(
@@ -75,6 +77,7 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
     server_args = SimpleNamespace()
     module._launch_server_with_patches(server_args, 123)
+    session.assert_called_once_with()
 
     if parent_alive:
         assert events == ["guard", "parent_check", "launch"]

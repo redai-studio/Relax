@@ -68,6 +68,7 @@ def use_managed_rollout(args: Any) -> bool:
         is_offline_mode(args)
         or bool(getattr(args, "_genrm_instances_resolved", None))
         or bool(getattr(args, "use_opd", False))
+        or bool(getattr(args, "use_distributed_post", False))
         or bool(getattr(args, "use_agentic_rollout", False))
         or bool(getattr(args, "rollout_engine_class_path", None))
         or bool(getattr(args, "custom_reward_post_process_path", None))

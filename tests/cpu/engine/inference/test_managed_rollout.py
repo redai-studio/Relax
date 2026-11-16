@@ -177,6 +177,7 @@ async def test_pool_operation_cancellation_does_not_spin_the_actor_loop():
     [
         {"_genrm_instances_resolved": {"judge": {}}},
         {"use_opd": True},
+        {"use_distributed_post": True},
         {"loss_type": "sft"},
         {"use_agentic_rollout": True},
         {"rollout_engine_class_path": "custom.Engine"},
@@ -373,6 +374,73 @@ async def test_dispose_is_idempotent():
     await owner.dispose()
     assert owner.pool is None
     assert owner.state is LifecycleState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_failed_dispose_retries_without_reopening_admission():
+    owner = manager()
+    pool = owner.pool
+
+    def fail_dispose():
+        raise TimeoutError("engine exit unconfirmed")
+
+    original_dispose = pool.dispose
+    pool.dispose = fail_dispose
+    with pytest.raises(TimeoutError, match="exit unconfirmed"):
+        await owner.dispose()
+    assert owner.pool is pool
+    assert not (await owner.snapshot()).models[0].admission
+    pool.dispose = original_dispose
+    await owner.dispose()
+    assert owner.pool is None
+
+
+@pytest.mark.asyncio
+async def test_dispose_retry_finishes_after_the_cpu_worker_was_stopped(monkeypatch):
+    owner = manager()
+    pool = owner.pool
+    original_dispose = pool.dispose
+    stopped = []
+
+    async def close():
+        if stopped:
+            raise ray.exceptions.ActorDiedError()
+
+    def fail_dispose():
+        raise TimeoutError("engine exit unconfirmed")
+
+    worker = SimpleNamespace(close=SimpleNamespace(remote=close))
+    monkeypatch.setattr(ray, "kill", stopped.append)
+    pool.dispose = fail_dispose
+    with pytest.raises(TimeoutError, match="exit unconfirmed"):
+        await owner.dispose(worker)
+    assert stopped == [worker]
+    assert owner.pool is pool
+    pool.dispose = original_dispose
+    await owner.dispose(worker)
+    assert owner.pool is None
+    assert pool.backend.status == "disposed"
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_construction_retains_partial_owner_for_cleanup(monkeypatch):
+    import relax.distributed.ray.inference_pool as pool_module
+
+    class PartialPool(FakePool):
+        def __init__(self, args, binding):
+            super().__init__()
+            raise RuntimeError("partial startup failed")
+
+    monkeypatch.setattr(pool_module, "plan_rollout", lambda *args: None)
+    monkeypatch.setattr(pool_module, "RolloutPool", PartialPool)
+    owner = InferenceManager.__ray_metadata__.modified_class()
+    with pytest.raises(RuntimeError, match="partial startup failed"):
+        await owner.start(SimpleNamespace(), None)
+    partial = owner.pool
+    assert partial is not None
+    await owner.dispose()
+    assert partial.backend.status == "disposed"
+    assert owner.pool is None
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,9 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Failed rollback owners must outlive the failing factory stack.
+_FAILED_ROLLBACK_OWNERS: dict[int, Any] = {}
+
 # Explicit surface: private/workload methods cannot bypass the engine owner.
 POOL_METHODS = frozenset(
     {
@@ -105,7 +108,8 @@ class InferenceManager:
                 def create_pool() -> None:
                     # Publish ownership inside the operation, even if the RPC
                     # caller is cancelled before receiving the startup reply.
-                    self.pool = RolloutPool(args, binding)
+                    self.pool = RolloutPool.__new__(RolloutPool)
+                    RolloutPool.__init__(self.pool, args, binding)
 
                 await _blocking(create_pool)
                 self._recipients = set(self.pool.synced_actor_ids)
@@ -297,7 +301,10 @@ class InferenceManager:
     async def dispose(self, worker: Any = None) -> None:
         self._closing = True
         self.ledger.fences.add("shutdown")
-        if self._cleanup_task is None:
+        if self._cleanup_task is None or (
+            self._cleanup_task.done()
+            and (self._cleanup_task.cancelled() or self._cleanup_task.exception() is not None)
+        ):
             self._cleanup_task = asyncio.create_task(self._dispose(worker))
         cleanup = self._cleanup_task
         cancelled = False
@@ -341,7 +348,12 @@ class InferenceManager:
                 except Exception:
                     logger.exception("Could not abort residual requests during shutdown")
                 if worker is not None:
-                    await asyncio.wait_for(worker.close.remote(), timeout=30)
+                    try:
+                        await asyncio.wait_for(worker.close.remote(), timeout=30)
+                    except ray.exceptions.ActorDiedError:
+                        # A previous cleanup attempt may already have stopped
+                        # the CPU worker. GPU release is still checked below.
+                        pass
                 await self.ledger.drain("shutdown", timeout=10)
             finally:
                 try:
@@ -360,8 +372,11 @@ def dispose_managed_rollout(manager: Any, worker: Any) -> None:
     """Release the CPU owner after cleanup, including on global restarts."""
     try:
         ray.get(manager.dispose.remote(worker))
-    finally:
-        ray.kill(manager)
+    except BaseException:
+        _FAILED_ROLLBACK_OWNERS[id(manager)] = manager
+        raise
+    ray.kill(manager)
+    _FAILED_ROLLBACK_OWNERS.pop(id(manager), None)
 
 
 def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: Any) -> tuple[Any, Any]:
@@ -419,9 +434,10 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
     except BaseException:
         try:
             ray.get(manager.dispose.remote(worker), timeout=60)
-        except Exception:
-            logger.exception("Managed rollout startup rollback could not be confirmed")
-        finally:
+        except BaseException:
+            _FAILED_ROLLBACK_OWNERS[id(manager)] = manager
+            logger.exception("Managed rollout startup rollback could not be confirmed; retaining owner")
+        else:
             if worker is not None:
                 ray.kill(worker)
             ray.kill(manager)

@@ -453,6 +453,24 @@ def test_placement_binding_accepts_a_partial_node_that_slots_fit():
     assert slice_.gpu_ids == (0, 2, 6)
 
 
+def test_placement_binding_accepts_mixed_tp_after_a_partial_node():
+    planner = PlacementPlanner()
+    view = _bound_view(_node("node-a", range(3)) + _node("node-b", range(2)))
+
+    single, tensor_parallel = planner.plan(
+        (
+            _request("rollout/tp1", num_gpus=3, num_gpus_per_engine=1),
+            _request("rollout/tp2", num_gpus=2, num_gpus_per_engine=2),
+        ),
+        view,
+    )
+
+    assert single.referenced_offsets == (0, 1, 2)
+    assert tensor_parallel.referenced_offsets == (3,)
+    assert tensor_parallel.bundle_indices == (3,)
+    assert tensor_parallel.gpu_ids == (0,)
+
+
 def test_placement_binding_rejects_a_slot_across_a_partial_node_boundary():
     planner = PlacementPlanner()
     # 3 + 5 GPUs: offsets alone place slot [2, 4) inside "node 0" of 4 GPUs.

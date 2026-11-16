@@ -306,9 +306,10 @@ class PlacementPlanner:
             if request.active
             else ()
         )
-        self._validate_node_boundaries(request, referenced, slot_size)
         if placement_group.node_ids is not None:
             self._validate_binding(request, placement_group, referenced, slot_size)
+        else:
+            self._validate_node_boundaries(request, referenced, slot_size)
         for other_request, other in recorded.values():
             if other.phase != request.phase:
                 continue

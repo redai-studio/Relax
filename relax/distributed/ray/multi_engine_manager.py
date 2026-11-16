@@ -98,6 +98,7 @@ class MultiEngineManager:
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
         self._engine_addr_and_ports: dict[int, dict] = {}
+        self._engine_process_info: dict[int, dict] = {}
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
@@ -221,6 +222,9 @@ class MultiEngineManager:
             # Bounded: a bundle on a dead node never schedules, and an unbounded
             # ray.get would block the training step forever.
             ray.get(init_handles, timeout=_ENGINE_REBUILD_TIMEOUT_S)
+            if hasattr(self.engine_actor_cls, "get_server_process_info"):
+                for rank, engine in new_engines:
+                    self._engine_process_info[rank] = ray.get(engine.get_server_process_info.remote(), timeout=60)
         except Exception:
             self._onloaded = False
             self._retire_engines(ranks)
@@ -246,6 +250,19 @@ class MultiEngineManager:
     # ------------------------------------------------------------------
     # Health / lifecycle.
     # ------------------------------------------------------------------
+
+    def _confirm_dead_engine_exit(self, rank: int) -> bool:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from relax.utils.process_utils import server_session_exited
+
+        info = self._engine_process_info.get(rank)
+        if info is None:
+            return False
+        check = ray.remote(num_cpus=0)(server_session_exited).options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=info["node_id"], soft=False)
+        )
+        return ray.get(check.remote(info["session_id"]), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
 
     def health_check(self) -> bool:
         """Perform a health check on every engine."""
@@ -350,14 +367,22 @@ class MultiEngineManager:
                     # and keep holding GPU memory, so the rebuild can't fit.
                     ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
                 except Exception as exc:
-                    failures.append((i, exc))
-                    group_failed = True
-                    continue
+                    confirmed = False
+                    if isinstance(exc, ray.exceptions.ActorDiedError):
+                        try:
+                            confirmed = self._confirm_dead_engine_exit(i)
+                        except Exception:
+                            logger.exception(f"{self._log_prefix} engine rank={i} independent exit check failed")
+                    if not confirmed:
+                        failures.append((i, exc))
+                        group_failed = True
+                        continue
                 try:
                     ray.kill(engine)
                 except Exception as exc:
                     logger.warning(f"{self._log_prefix} engine rank={i} ray.kill failed: {exc}")
                 self.all_engines[i] = None
+                self._engine_process_info.pop(i, None)
                 logger.info(f"{self._log_prefix} engine rank={i} retired")
             # Followers share the head's owned PG. Stop every local process
             # before releasing it, even if one actor was never created.

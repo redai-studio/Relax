@@ -935,6 +935,11 @@ class RolloutManager(ReloadableMixin):
         self.args = args
         self._engine_actor_states = _get_engine_actor_states()
         self._dynamic_global_batch_size = None
+        # Disposal must remain usable if startup fails before creating locks or monitors.
+        self.servers = {}
+        self._health_monitors = []
+        self._eviction_monitor_stop = threading.Event()
+        self._eviction_monitor_thread = None
 
         init_tracking(args, primary=False)
 
