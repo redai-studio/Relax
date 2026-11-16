@@ -1,37 +1,43 @@
-# Qwen2-VL LamRA reranking
+# LamRA Rank SFT and evaluation / LamRA 重排训练与评测
 
 Train a generative ranker through Relax's existing multimodal SFT and Megatron
-Bridge path. For retrieval followed by reranking, initialize rank training from
-the completed retrieval model's **fully merged Qwen2-VL-2B checkpoint**, with a
-fresh rank LoRA adapter, optimizer and scheduler. The original
-Qwen2-VL-2B-Instruct checkpoint is also supported as a base. A query produces three supervised sequences: a positive
-candidate with `Yes`, a negative candidate with `No`, and a list of 2–5 candidates
-with an `Ans: (n)` answer. The vision encoder and projector stay frozen.
+Bridge path. For the [three-stage workflow](../seq_contrast_sft/README.md),
+initialize from the merged Ret SFT checkpoint with a fresh Rank LoRA adapter,
+optimizer and scheduler. The launcher also accepts an original supported HF
+base for a standalone Rank run. A query produces a positive pair labeled `Yes`,
+a negative pair labeled `No`, and a list of 2–5 candidates with an `Ans: (n)`
+answer. The vision encoder and projector stay frozen.
 
-The recipe uses language-only independent Q/K/V/O/gate/up/down LoRA adapters
-(`r=128`, `alpha=256`, dropout `0.05`), BF16, seed 42, LR `4e-5`, cosine decay,
-3% warmup, and one padded epoch. Eight GPUs use DP with TP=PP=CP=1. No additional
-framework arguments or dependencies are required.
+Supported models are Qwen2-VL-2B-Instruct and dense Qwen3.5-0.8B, 2B, 4B and 9B.
+Qwen2-VL targets independent Q/K/V/O/gate/up/down LoRA projections. Qwen3.5
+targets language attention output and MLP down projections, with thinking mode
+disabled in training and scoring. Both use `r=128`, `alpha=256`, dropout `0.05`,
+BF16, seed 42, LR `4e-5`, cosine decay, 3% warmup and one padded epoch. The
+launcher defaults to eight DP GPUs with TP=PP=CP=1.
+
+三段流程以合并后的 Ret SFT 模型初始化 Rank，重新创建 LoRA、优化器和调度器。支持
+Qwen2-VL-2B-Instruct 和 Qwen3.5 稠密版 0.8B、2B、4B、9B。Qwen3.5 的 Rank 训练和打分均关闭思考模式。
 
 ## Prepare training data
 
-Set `MODEL_DIR` to a directory containing `Qwen2-VL-2B-Instruct`, `DATA_DIR` to
-your dataset root, and `SAVE_DIR` to persistent checkpoint storage. M-BEIR image
-references must resolve beneath the supplied image root on all workers.
+Use the variables from the Ret README. `RANK_BASE` points directly to the HF
+directory with `config.json` and the tokenizer. Use this directory for data
+preparation, training and export. All workers must be able to resolve the M-BEIR
+images beneath `IMAGE_ROOT`.
 
-`Qwen2-VL-2B-Instruct` is the checkpoint directory name expected by the launcher;
-it can contain the fully merged retrieval checkpoint and its tokenizer. The launcher reads the model vocabulary size from its configuration.
-Use a new `EXP_NAME` for a fresh rank stage, and use the same base and tokenizer
-for data preparation, training and export.
+下列命令沿用 Ret 阶段的变量。`RANK_BASE` 直接指向含 `config.json` 和 tokenizer 的 HF 模型目录。
+数据准备、训练和导出使用同一底座，各 worker 都需能从 `IMAGE_ROOT` 读取图片。
 
 ```bash
+RANK_BASE="${RET_MODEL}"
+EXP_NAME="${EXP_PREFIX}-rank-sft"
+RANK_MODEL="${SAVE_DIR}/${EXP_NAME}/merged"
+
 python examples/lamra_rerank/tools/prepare_data.py \
-  --queries "${DATA_DIR}/M-BEIR/query/union_train/mbeir_union_up_train.jsonl" \
-  --candidates "${DATA_DIR}/M-BEIR/cand_pool/global/mbeir_union_train_cand_pool.jsonl" \
-  --instructions "${DATA_DIR}/M-BEIR/instructions/query_instructions.tsv" \
-  --rerank-data "${DATA_DIR}/rerank_data_for_training/rerank_data_all.json" \
-  --image-root "${DATA_DIR}/M-BEIR" \
-  --tokenizer "${MODEL_DIR}/Qwen2-VL-2B-Instruct" \
+  --queries "${TRAIN_QUERIES}" --candidates "${TRAIN_CANDIDATES}" \
+  --instructions "${INSTRUCTIONS}" --image-root "${IMAGE_ROOT}" \
+  --rerank-data "${TRAIN_RETRIEVAL}/rankings.json" \
+  --tokenizer "${RANK_BASE}" \
   --output "${DATA_DIR}/rerank/train.jsonl"
 ```
 
@@ -42,8 +48,8 @@ Queries with no true negative are skipped and listed in the manifest; a shortage
 of listwise negatives reduces the number of choices. This deliberately avoids
 the reference fallback that can label a positive candidate `No`.
 
-Generate the training top100 and fixed test rankings with the
-[Ret retrieval tool](../seq_contrast_sft/README.md#2-train-ret-sft-and-mine-candidates--训练-ret-sft-并挖候选).
+Generate the training top100 and fixed test rankings in the
+[Ret workflow](../seq_contrast_sft/README.md).
 
 Outputs include the JSONL, row counts, source/output hashes, skipped query IDs and
 unique image paths. Preparation does not decode or validate every image. A missing
@@ -52,10 +58,11 @@ or invalid image fails training rather than silently shortening a batch. Use
 
 `LamraRerankDataset` reuses the shared SFT pipeline while preserving the rank
 collator's supervision boundary: the assistant header, answer, end token and
-following newline contribute to loss. For the original tokenizer, the two
+following newline contribute to loss. With the Qwen2-VL reference tokenizer, the two
 pointwise answers have 6 supervised tokens each and the listwise answer has 10.
-Images follow the reference RGB conversion and factor-28 resize with 4–300 visual
-tokens. The script pins the PIL processor through `RELAX_HF_PROCESSOR_USE_FAST=0`,
+The recipe converts images to RGB and applies the factor-28 reference resize
+before passing them to the model's processor. The script pins the PIL processor
+through `RELAX_HF_PROCESSOR_USE_FAST=0`,
 including spawned processor workers. Full sequences are kept; the reference's `model_max_length=2048` did not
 actually truncate its processor output.
 
@@ -71,7 +78,7 @@ small-file latency; keep their durable sources and validate every copied image.
 ## Train and resume
 
 ```bash
-RAY_ADDRESS="http://your-ray-head:8265" \
+MODEL_DIR="${RANK_BASE}" EXP_NAME="${EXP_NAME}" \
   bash examples/lamra_rerank/scripts/run-qwen2-vl-2B-rerank-8xgpu.sh
 ```
 
@@ -81,7 +88,8 @@ corresponding in count to 64 query triplets. Relax shuffles individual sequences
 its update membership and sample order differ from the reference HF query
 sampler. This recipe does not promise numerical replay of that training run.
 
-`EXP_NAME` defaults to `qwen2-vl-2b-lamra-rank-r128-dp8`. Metrics are enabled and TensorBoard is disabled. `SAVE_INTERVAL` defaults to 1000 updates and the last two native
+The launcher default for `EXP_NAME` is `<model>-lamra-rank-r128-dp8`. Metrics are
+enabled and TensorBoard is disabled. `SAVE_INTERVAL` defaults to 1000 updates and the last two native
 checkpoints are retained. The final update is also saved. Native `--load` and
 `--save` both use `${SAVE_DIR}/${EXP_NAME}`: keep these values stable to resume,
 or explicitly change `EXP_NAME` for a new run.
@@ -93,17 +101,20 @@ rollout service and overlaps input preparation with training.
 
 ## Export for evaluation
 
-Export the final native checkpoint on CPU. Set `EXPECTED_UPDATES` to the completed
-update count and `ITERATION` to its checkpoint iteration (`EXPECTED_UPDATES - 1`).
-Pass the exact FP32 base checkpoint used to initialize rank training as `--base`.
+Export the final native checkpoint on CPU. Set `FINAL_CHECKPOINT` to the final
+`iter_*` directory under `${SAVE_DIR}/${EXP_NAME}` and `EXPECTED_UPDATES` to the
+completed update count. Pass `RANK_BASE`, the same HF directory loaded during
+training, as `--base`.
+
+在 CPU 导出 Rank 最终的 `iter_*`，`EXPECTED_UPDATES` 填已完成的优化器步数，底座沿用训练时的 `RANK_BASE`。
 
 ```bash
 CUDA_VISIBLE_DEVICES="" python examples/lamra_rerank/tools/export_checkpoint.py \
-  --checkpoint "${SAVE_DIR}/${EXP_NAME}/iter_$(printf '%07d' "${ITERATION}")" \
+  --checkpoint "${FINAL_CHECKPOINT}" \
   --expected-updates "${EXPECTED_UPDATES}" \
-  --base "${MODEL_DIR}/Qwen2-VL-2B-Instruct" \
+  --base "${RANK_BASE}" \
   --adapter-output "${SAVE_DIR}/${EXP_NAME}/final_adapter" \
-  --output "${SAVE_DIR}/${EXP_NAME}/merged"
+  --output "${RANK_MODEL}"
 ```
 
 The exporter checks scheduler/update counts, extracts every canonical adapter,
@@ -113,35 +124,35 @@ inspection before reuse.
 
 ## Evaluate fixed retrieval candidates
 
-Supply the retrieval model's saved query IDs, top candidates and raw scores,
-along with its `model_identity.json`. The following example evaluates all
-Fashion200K task0 queries, each with 50 fixed candidates. Retrieval candidates
-must come from the same query/candidate IDs and data split as the qrels.
+Use the four files produced by the Ret top50 command in `TEST_RETRIEVAL`, along
+with the same test queries, candidate pool and qrels. Set `EVAL_GPUS` to the number
+of local GPUs available for scoring. Each worker loads its own Rank model replica.
+Use a fresh `RANK_PAIRS` path and `RANK_EVAL` directory for each evaluation.
+
+直接用 `TEST_RETRIEVAL` 下的四个文件衔接 Rank 评测，query、候选池和 qrels 沿用同一批测试数据。
+`EVAL_GPUS` 填打分使用的卡数，每张卡加载一份 Rank 模型。
 
 ```bash
-python examples/lamra_rerank/tools/prepare_eval.py \
-  --queries "${DATA_DIR}/M-BEIR/query/test/mbeir_fashion200k_task0_test.jsonl" \
-  --candidates "${DATA_DIR}/M-BEIR/cand_pool/global/mbeir_union_test_cand_pool.jsonl" \
-  --instructions "${DATA_DIR}/M-BEIR/instructions/query_instructions.tsv" \
-  --qrels "${DATA_DIR}/M-BEIR/qrels/test/mbeir_fashion200k_task0_test_qrels.txt" \
-  --query-names "${DATA_DIR}/retrieval/mbeir_fashion200k_task0_test_model_query_names.json" \
-  --candidate-names "${DATA_DIR}/retrieval/mbeir_fashion200k_task0_test_model_cand_names.json" \
-  --scores "${DATA_DIR}/retrieval/mbeir_fashion200k_task0_test_model_scores.json" \
-  --retrieval-identity "${DATA_DIR}/retrieval/model_identity.json" \
-  --image-root "${DATA_DIR}/M-BEIR" \
-  --output "${DATA_DIR}/rerank/fashion200k_task0_pairs.jsonl"
+EVAL_GPUS=8
+RANK_EVAL="${SAVE_DIR}/${EXP_NAME}/evaluation"
+RANK_PAIRS="${DATA_DIR}/rerank/test_pairs.jsonl"
 
-torchrun --standalone --nproc_per_node=8 examples/lamra_rerank/tools/evaluate.py \
-  --model "${SAVE_DIR}/${EXP_NAME}/merged" \
-  --pairs "${DATA_DIR}/rerank/fashion200k_task0_pairs.jsonl" \
-  --output "${SAVE_DIR}/${EXP_NAME}/evaluation/fashion200k_task0" \
+python examples/lamra_rerank/tools/prepare_eval.py \
+  --queries "${TEST_QUERIES}" --candidates "${TEST_CANDIDATES}" \
+  --instructions "${INSTRUCTIONS}" --qrels "${TEST_QRELS}" \
+  --query-names "${TEST_RETRIEVAL}/query_names.json" \
+  --candidate-names "${TEST_RETRIEVAL}/candidate_names.json" \
+  --scores "${TEST_RETRIEVAL}/scores.json" \
+  --retrieval-identity "${TEST_RETRIEVAL}/model_identity.json" \
+  --image-root "${IMAGE_ROOT}" --output "${RANK_PAIRS}"
+
+torchrun --standalone --nproc_per_node="${EVAL_GPUS}" examples/lamra_rerank/tools/evaluate.py \
+  --model "${RANK_MODEL}" --pairs "${RANK_PAIRS}" --output "${RANK_EVAL}" \
   --batch-size 4
 
 python examples/lamra_rerank/tools/summarize.py \
-  --pairs "${DATA_DIR}/rerank/fashion200k_task0_pairs.jsonl" \
-  --scores "${SAVE_DIR}/${EXP_NAME}/evaluation/fashion200k_task0" \
-  --world-size 8 \
-  --output "${SAVE_DIR}/${EXP_NAME}/evaluation/fashion200k_task0_metrics.json"
+  --pairs "${RANK_PAIRS}" --scores "${RANK_EVAL}" \
+  --world-size "${EVAL_GPUS}" --output "${RANK_EVAL}/metrics.json"
 ```
 
 Scoring uses the first generated-token logits and

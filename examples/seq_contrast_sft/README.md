@@ -10,12 +10,19 @@ trainer or Actor implementation.
 Qwen2-VL 通过 `relax/models/qwen2_vl` 注册独立 Bridge：语言模型用 MCore，
 视觉塔和多模态位置编码沿用 Qwen2-VL 自身实现，不以 Qwen2.5-VL 替代。
 
+The workflow supports Qwen2-VL-2B-Instruct and dense Qwen3.5-0.8B, 2B, 4B, and 9B.
+The launchers keep their original `run-qwen2-vl-*` filenames and select the
+architecture using the `config.json` in the `MODEL_DIR` you pass.
+
+Qwen2-VL-2B-Instruct 和 Qwen3.5 稠密版 0.8B、2B、4B、9B 共用下文的命令。
+启动脚本沿用原文件名，通过 `MODEL_DIR` 下的 `config.json` 选择模型架构。
+
 ## Inputs / 输入
 
-- `${MODEL_DIR}/Qwen2-VL-2B-Instruct-emb`: a prepared HF checkpoint containing
-  `<emb>` in its tokenizer and a corresponding model embedding row. Preparation
-  must initialize and save the row consistently; training never adds tokens or
-  resizes the checkpoint. / 预先准备并保存 `<emb>` 及其 embedding 行，启动时只读检查。
+- `MODEL_DIR`: the HF checkpoint directory for the current stage. Ret PT uses
+  the prepared checkpoint containing `<emb>` in the tokenizer and its corresponding
+  embedding row. Ret SFT uses the merged Ret PT export. / `MODEL_DIR` 指向当前阶段的
+  HF checkpoint 目录。Ret PT 使用已准备好 `<emb>` 的底座，Ret SFT 使用合并后的 Ret PT 权重。
 - `${DATA_DIR}/nli/pairs.jsonl`: one complete query/positive pair per row. Use the
   native four-message form below, or `query`/`positive` dictionaries each with
   pretokenized `input_ids`. / 每行一个完整正例 pair，可使用下述四条消息，或两个预编码分支。
@@ -37,7 +44,8 @@ head; native checkpoint resume reconstructs that padded-epoch cursor.
 
 On an already provisioned, exclusively allocated Ray cluster, provide
 `MODEL_DIR`, `DATA_DIR`, a **persistent** `SAVE_DIR` and the Ray Jobs HTTP
-`RAY_ADDRESS`, then run from the repository root:
+`RAY_ADDRESS`, then run from the repository root. The SFT and Rank stages also
+need their prepared data and image paths accessible from the workers.
 
 在已分配给本任务的 Ray 集群上设置上述目录和 Jobs HTTP 地址，然后从仓库根目录运行：
 
@@ -63,7 +71,7 @@ new `EXP_NAME`. Other Relax recipes keep their existing initializer defaults.
 The native checkpoint path is `${SAVE_DIR}/${EXP_NAME}` for both save and load,
 with an interval of 200 updates and retention of two checkpoints. Reuse the same
 path to resume the same experiment; use a new `EXP_NAME` for a different run.
-The default experiment is `qwen2-vl-2b-nli-bridge-lora-kaiming-dp8`. Start this
+The default Ret PT experiment name is `<model>-nli-bridge-lora-kaiming-dp8`. Start this
 recipe in a new directory: historical precision-profile checkpoints used a
 different norm layout and optimizer/RNG settings and are not supported resume
 inputs for this recipe.
@@ -91,10 +99,10 @@ Each launch writes a local log while the resume path stays fixed. Submission blo
   dynamic CP, independent microbatch accumulation, periodic SFT eval/predict,
   CPU prepack, and in-training `--save-hf` are rejected. Resume from native
   checkpoints and use the offline exporter below to hand off weights.
-- The example uses Bridge's existing **CanonicalLoRA** with seven independent
-  Q/K/V, output, gate/up and down projection adapters, with the standard Bridge
-  forward and Transformer Engine layer specification. HF norm weights map to
-  the corresponding fused TE projection norms.
+- The Ret stages use Bridge's **CanonicalLoRA**. Qwen2-VL targets independent
+  Q/K/V, output, gate/up and down projections. Qwen3.5 targets language attention
+  output and MLP down projections. Its model dimensions, mRoPE and embedding
+  tying come from the HF checkpoint.
 - Data ordering uses the existing `NLIPairDataset`/`IndexManager` path. The script
   retains `--data-parallel-random-init` for per-rank RNG state. There are no
   reference-order replay, padded/eager projection overrides, HF norm/attention
@@ -102,7 +110,8 @@ Each launch writes a local log while the resume path stays fixed. Submission blo
 
 Pair 分卡后才展开；完整负例集合不拆成独立 microbatch。token 预算不能证明实际显存足够。
 当前只支持同步 DP、THD，明确拒绝尚未接入的并行模式和评测/导出组合。
-复用 Bridge CanonicalLoRA 保留七种独立投影，实际参数及保存恢复仍须验证；不能仅据此宣称 PT 已对齐。
+Ret 使用 Bridge CanonicalLoRA。Qwen2-VL 使用七种独立投影，Qwen3.5 使用语言侧 attention 输出和 MLP down 投影。
+Qwen3.5 的模型尺寸、mRoPE 和输入输出 embedding 共享设置来自 HF checkpoint。
 
 CPU tests exercise the production iterator/loss dispatch, pair/resume contracts,
 real two-process Gloo loss/gradients, HF vision embeddings/positions and mapping
@@ -111,44 +120,63 @@ through Ray's runtime environment while preserving the existing runtime options.
 The language boundary in the CPU vision tests is a recording module, not MCore
 attention.
 
-This cleaned recipe has not been rerun through full GPU training/evaluation.
-Previous alignment scores used different data-order/RNG settings and must not
-be attributed to this configuration. Multi-node training and exact GPU
-checkpoint-resume behavior remain unverified for this revision.
+The three-stage workflow has small-data single-node coverage. Full benchmark
+scores, multi-node training and exact GPU checkpoint-resume behavior require
+separate validation for the selected configuration.
 
 CPU 测试覆盖配对、共享训练/损失分派、Gloo 梯度、HF 视觉/位置编码与权重映射，
 以及 example 的初始化配置是否正确进入 Ray runtime env。语言模型的 CPU 测试使用
-记录边界，不能替代 MCore GPU 验证。本次清理版未重新跑完整 GPU 训练/评测；
-历史对齐分数使用不同的数据顺序/RNG 设置，不代表本配置的成绩。多机训练与 GPU
-精确断点续训仍需验证。历史精度实验的 checkpoint 请保留在原目录，不用于本例续训。
+记录边界，不能替代 MCore GPU 验证。三段流程已覆盖单机小数据，完整 benchmark、多机训练与 GPU
+精确断点续训需按实际配置验证。
 
 ## Three-stage workflow / 三段交付流程
 
 ### 1. Prepare Ret PT inputs / 准备 Ret PT 输入
 
-Use the original Qwen2-VL-2B-Instruct checkpoint as `BASE`, an NLI CSV with
-`sent0` and `sent1` columns as `NLI_CSV`, and the directories described above.
+Set `BASE` to the original HF checkpoint for either supported model family and
+`NLI_CSV` to a CSV with `sent0` and `sent1` columns. Use an `EXP_PREFIX` unique
+to the model and run, plus a separate `DATA_DIR` for each run's prepared files.
+Keep the original data and images at their source paths. Keep the derived
+directory variables in the same shell for the later stages.
+
+`BASE` 指向所选模型的原始 HF checkpoint，`NLI_CSV` 需含 `sent0` 和 `sent1` 两列。
+各实验用独立的 `EXP_PREFIX` 和 `DATA_DIR`，原始数据及图片可复用。后续步骤沿用同一 shell 中的目录变量。
 
 ```bash
+export DATA_DIR SAVE_DIR RAY_ADDRESS
+
+EMB_MODEL="${SAVE_DIR}/${EXP_PREFIX}-emb"
+PT_MODEL="${SAVE_DIR}/${EXP_PREFIX}-ret-pt/merged"
+RET_MODEL="${SAVE_DIR}/${EXP_PREFIX}-ret-sft/merged"
+TRAIN_RETRIEVAL="${SAVE_DIR}/${EXP_PREFIX}-ret-sft/retrieval/train"
+TEST_RETRIEVAL="${SAVE_DIR}/${EXP_PREFIX}-ret-sft/retrieval/test"
+
 python examples/seq_contrast_sft/tools/prepare_nli.py \
   --base "${BASE}" --input "${NLI_CSV}" \
-  --output-model "${MODEL_DIR}/Qwen2-VL-2B-Instruct-emb" \
+  --output-model "${EMB_MODEL}" \
   --pairs "${DATA_DIR}/nli/pairs.jsonl"
-bash examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-nli-pt-8xgpu.sh
+MODEL_DIR="${EMB_MODEL}" EXP_NAME="${EXP_PREFIX}-ret-pt" \
+  bash examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-nli-pt-8xgpu.sh
 ```
 
 ### 2. Train Ret SFT and mine candidates / 训练 Ret SFT 并挖候选
 
-Use the offline exporter described below to merge Ret PT into its input model.
-Point `PT_MODEL` at the merged HF directory. Prepare the M-BEIR training
-queries and candidate pool, then start Ret SFT using a new checkpoint directory.
+Use the [offline exporter](#offline-export) to merge Ret PT against `EMB_MODEL`
+and write `PT_MODEL`. Set `TRAIN_QUERIES` and `TRAIN_CANDIDATES` to the M-BEIR
+training query and candidate JSONLs, `INSTRUCTIONS` to the query instruction TSV,
+and `IMAGE_ROOT` to the directory from which M-BEIR image paths resolve. The
+preparer writes both `pairs.jsonl` and `pairs.meta.json` for the launcher.
+
+先把 Ret PT 合并到 `EMB_MODEL`，导出到 `PT_MODEL`。准备 M-BEIR 的训练 query、候选池、
+指令 TSV 和图片根目录。数据准备会同时生成启动器使用的 `pairs.jsonl` 和 `pairs.meta.json`。
 
 ```bash
 python examples/seq_contrast_sft/tools/prepare_mbeir.py \
   --queries "${TRAIN_QUERIES}" --candidates "${TRAIN_CANDIDATES}" \
   --instructions "${INSTRUCTIONS}" --image-root "${IMAGE_ROOT}" \
   --tokenizer "${PT_MODEL}" --output "${DATA_DIR}/mbeir/pairs.jsonl"
-MODEL_DIR="${PT_MODEL}" bash examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-mbeir-sft-8xgpu.sh
+MODEL_DIR="${PT_MODEL}" EXP_NAME="${EXP_PREFIX}-ret-sft" \
+  bash examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-mbeir-sft-8xgpu.sh
 ```
 
 The data loader shuffles queries and samples a positive and instruction at each
@@ -156,61 +184,70 @@ visit. The launcher computes updates from the prepared query count and batch
 size. The default batch size is 512; 1,332,790 queries take 2,604 updates.
 Images are checked when read by the processor.
 
-After exporting Ret SFT with `PT_MODEL` as its base, set `RET_MODEL` to the
-merged output. Rank training takes the `rankings.json` produced by searching its
-training candidate pool with this Ret checkpoint.
+Export Ret SFT against `PT_MODEL` to `RET_MODEL`. Use `RET_MODEL` to mine the
+training top100 and produce a separate fixed top50 for held-out evaluation. Set
+`TEST_QUERIES`, `TEST_CANDIDATES`, and `TEST_QRELS` to the files for the same test
+split. The training and test candidate pools need at least 100 and 50 entries,
+respectively.
+
+以 `PT_MODEL` 为底座把 Ret SFT 导出到 `RET_MODEL`。用它分别挖训练集 top100、生成测试集固定
+top50。测试 query、候选池和 qrels 应属于同一测试集，训练和测试候选池至少分别有 100 和 50 条。
 
 ```bash
 python examples/seq_contrast_sft/tools/retrieve.py \
   --model "${RET_MODEL}" --queries "${TRAIN_QUERIES}" \
   --candidates "${TRAIN_CANDIDATES}" --instructions "${INSTRUCTIONS}" \
   --image-root "${IMAGE_ROOT}" --top-k 100 --output "${TRAIN_RETRIEVAL}"
+
+python examples/seq_contrast_sft/tools/retrieve.py \
+  --model "${RET_MODEL}" --queries "${TEST_QUERIES}" \
+  --candidates "${TEST_CANDIDATES}" --instructions "${INSTRUCTIONS}" \
+  --qrels "${TEST_QRELS}" --image-root "${IMAGE_ROOT}" \
+  --top-k 50 --output "${TEST_RETRIEVAL}"
 ```
 
-For a test split, supply its query file, candidate pool and `--qrels`, and use
-`--top-k 50`. This produces Ret Recall in `metrics.json` and the query IDs,
-candidate IDs, cosine scores and model identity used by Rank evaluation.
+Each retrieval command writes to a new output directory. The held-out Ret Recall
+is in `${TEST_RETRIEVAL}/metrics.json`.
+
+每次检索写入新目录。测试集 Ret Recall 在 `${TEST_RETRIEVAL}/metrics.json`。
 
 ### 3. Train and evaluate Rank SFT / 训练并评测 Rank SFT
 
 Use `${TRAIN_RETRIEVAL}/rankings.json` as `--rerank-data` in the
 [Rank SFT recipe](../lamra_rerank/README.md#prepare-training-data). This prepares
-the pointwise and listwise training JSONL before submission. Set its model
-directory explicitly. The recipe supports the merged Ret model as its base
-under the `Qwen2-VL-2B-Instruct` directory name. After training, export against
-the same Rank base and use the Ret test files above in the
-[rerank evaluation recipe](../lamra_rerank/README.md#evaluate-fixed-retrieval-candidates).
+pointwise and listwise training JSONL before submission. Set `RANK_BASE` to
+`RET_MODEL` for the three-stage workflow and use a fresh Rank experiment name.
+The [Rank evaluation](../lamra_rerank/README.md#evaluate-fixed-retrieval-candidates)
+uses the files in `TEST_RETRIEVAL` and the exported Rank model.
 
-### Offline export / 离线导出
+Rank 以 `RET_MODEL` 初始化，训练样本来自 `${TRAIN_RETRIEVAL}/rankings.json`。
+评测使用 `TEST_RETRIEVAL` 里的固定候选和导出的 Rank 模型。
+
+### Offline export
 
 Use the same command for all three stages. `BASE_FOR_STAGE` is the exact HF
-checkpoint the stage loaded. Set `FINAL_CHECKPOINT` to the final
-`iter_*` directory and `UPDATES` to the number of optimizer updates.
+checkpoint the stage loaded. Set `FINAL_CHECKPOINT` to the final `iter_*`
+directory under `${SAVE_DIR}/${STAGE_EXP_NAME}` and `UPDATES` to the number of
+optimizer updates. Use fresh `ADAPTER_OUT` and `MERGED_OUT` paths.
+
+离线导出时，`BASE_FOR_STAGE` 指向训练该阶段实际加载的 HF checkpoint，`FINAL_CHECKPOINT` 指向
+实验目录内最终的 `iter_*`，`UPDATES` 填实际完成的优化器步数。adapter 和合并权重分别写入新目录。
+
+| Stage / 阶段 | `STAGE_EXP_NAME`         | `BASE_FOR_STAGE` | `MERGED_OUT`    |
+| ------------ | ------------------------ | ---------------- | --------------- |
+| Ret PT       | `${EXP_PREFIX}-ret-pt`   | `${EMB_MODEL}`   | `${PT_MODEL}`   |
+| Ret SFT      | `${EXP_PREFIX}-ret-sft`  | `${PT_MODEL}`    | `${RET_MODEL}`  |
+| Rank SFT     | `${EXP_PREFIX}-rank-sft` | `${RANK_BASE}`   | `${RANK_MODEL}` |
 
 ```bash
-python examples/lamra_rerank/tools/export_checkpoint.py \
+ADAPTER_OUT="${SAVE_DIR}/${STAGE_EXP_NAME}/final_adapter"
+CUDA_VISIBLE_DEVICES="" python examples/lamra_rerank/tools/export_checkpoint.py \
   --base "${BASE_FOR_STAGE}" --checkpoint "${FINAL_CHECKPOINT}" \
   --expected-updates "${UPDATES}" --adapter-output "${ADAPTER_OUT}" --output "${MERGED_OUT}"
 ```
 
 The exporter reads the saved LoRA tensors and verifies the FP32 merge and HF
-reload. Keep the native checkpoint for resume. Use the merged HF directory for
-the next stage or evaluation.
+reload. Resume training from the native checkpoint. Use the merged HF directory
+for the next stage or evaluation.
 
-### Qwen3.5 dense / 稠密模型
-
-The three launchers also accept the exact input checkpoint directory as
-`MODEL_DIR`. Supported Qwen3.5 sizes are 0.8B, 2B, 4B, and 9B. Give the original
-HF checkpoint for the chosen size to
-`prepare_nli.py` as `--base`, then set `MODEL_DIR` to its prepared
-`--output-model` for Ret PT, to the PT export for Ret SFT, and to the chosen
-Rank base for Rank SFT. Data preparation, top100 mining, and evaluation use
-the same commands.
-
-The dense Qwen3.5 recipe trains LoRA on language attention output and MLP
-down projections. The checkpoint exporter checks coverage against the actual
-HF layers, including the distinction between full attention and GDN layers.
-Rank uses the model's non-thinking chat mode.
-
-三个启动脚本支持 Qwen3.5-0.8B、2B、4B、9B。使用同一套数据准备、候选挖掘和评测命令。
-模型尺寸、mRoPE 和输入输出 embedding 共享设置来自当前阶段的 HF checkpoint。
+导出工具校验 FP32 合并和 HF 回读。续训用原生 checkpoint，下一阶段和评测用合并后的 HF 权重。
