@@ -3,6 +3,7 @@
 import sys
 from argparse import Namespace
 from types import ModuleType
+from unittest.mock import Mock
 
 
 def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
@@ -14,25 +15,8 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
 
     from relax.utils.opd import opd_utils
 
-    captured = {}
-
-    def fake_create_teacher_manager(
-        args,
-        *,
-        num_replicas,
-        gpus_per_replica,
-        pg=None,
-        shared_pg=False,
-        runtime_env=None,
-    ):
-        captured["num_replicas"] = num_replicas
-        captured["gpus_per_replica"] = gpus_per_replica
-        captured["pg"] = pg
-        captured["shared_pg"] = shared_pg
-        captured["runtime_env"] = runtime_env
-        return "teacher-manager-handle", ["http://teacher/generate"]
-
-    monkeypatch.setattr(opd_utils, "create_managed_opd_teacher_manager", fake_create_teacher_manager)
+    create_teacher = Mock(return_value=("teacher-manager-handle", ["http://teacher/generate"]))
+    monkeypatch.setattr(opd_utils, "create_managed_opd_teacher_manager", create_teacher)
 
     config = Namespace(
         use_opd=True,
@@ -44,18 +28,12 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         teacher_hf_checkpoint="/teacher",
     )
 
-    shared_pg, teacher_manager = opd_utils.maybe_start_managed_opd_teacher(
-        config,
-        runtime_env={"env_vars": {"A": "B"}},
-    )
+    runtime_env = {"env_vars": {"A": "B"}}
+    shared_pg, teacher_manager = opd_utils.maybe_start_managed_opd_teacher(config, runtime_env=runtime_env)
 
     assert shared_pg == full_pg
     assert teacher_manager == "teacher-manager-handle"
-    assert captured == {
-        "num_replicas": 1,
-        "gpus_per_replica": 4,
-        "pg": full_pg,
-        "shared_pg": True,
-        "runtime_env": {"env_vars": {"A": "B"}},
-    }
+    create_teacher.assert_called_once_with(
+        config, num_replicas=1, gpus_per_replica=4, pg=full_pg, shared_pg=True, runtime_env=runtime_env
+    )
     assert config.opd_teacher_url == "http://teacher/generate"

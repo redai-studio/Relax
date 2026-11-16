@@ -289,12 +289,10 @@ _MAX_CONSECUTIVE_CONNECT_ERRORS = 3
 
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
-    if args.colocate:
-        start_index = (rank * num_gpus) % args.num_gpus_per_node
-    else:
-        num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
-        start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
-    return start_index
+    start_index = rank * num_gpus
+    if not args.colocate and not args.debug_rollout_only:
+        start_index += args.actor_num_gpus_per_node * args.actor_num_nodes
+    return start_index % args.num_gpus_per_node
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
