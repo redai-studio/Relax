@@ -243,7 +243,20 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
 
-它刻意在**张量**层面合并，而不是用 `peft.merge_and_unload()`：`AutoModelForCausalLM` 会把多模态 checkpoint 静默解析成它的纯文本类（重新保存时丢掉 `vision_config` 和视觉塔），而 PEFT 按*模块*名匹配，看不到以 3 维 `nn.Parameter` 存储的 grouped MoE 专家——那恰恰是 A3B MoE 上训练容量的大头。该工具逐 shard 流式处理（内存上限是最大的单个 shard），原样拷贝 `config.json` 和各类辅助文件，并把「适配器张量配不上基座张量」视为硬错误而非静默丢弃。
+它刻意在**张量**层面合并，而不是用 `peft.merge_and_unload()`：`AutoModelForCausalLM` 会把多模态 checkpoint 静默解析成它的纯文本类（重新保存时丢掉 `vision_config` 和视觉塔），而 PEFT 按*模块*名匹配，看不到以 3 维 `nn.Parameter` 存储的 grouped MoE 专家——那恰恰是 A3B MoE 上训练容量的大头。对于未量化的 PEFT 输入，该工具逐 shard 流式处理，保留基座张量的 dtype，原样拷贝 `config.json` 和各类辅助文件，并把「适配器张量配不上基座张量」视为硬错误而非静默丢弃。
+
+GLM-5.3 使用 `--save-lora-only` 保存的 checkpoint，可以用 `--checkpoint` 替代 `--adapter-dir`。输入可以是某个 iteration 目录，也可以是包含 `latest_checkpointed_iteration.txt` 的 checkpoint 根目录：
+
+```bash
+python scripts/tools/merge_lora_adapter_to_hf.py \
+    --base-hf-dir /path/to/GLM-5.3 \
+    --checkpoint /path/to/save/iter_0000049 \
+    --output-dir /path/to/GLM-5.3-merged
+```
+
+DCP 输入目前仅支持 `glm_moe_dsa` 的 version-1 LoRA-only checkpoint，且 adapter dropout 必须为 0。请使用训练时的同一份基座；配置、索引和分片元信息必须与 checkpoint 记录的身份信息一致。工具将专家维度及 gate/up 布局映射为 HF 参数名，再复用统一合并流程。
+
+两种输入均支持 block-128 FP8 基座：先反量化并舍入为 BF16，再叠加 LoRA，输出中移除 scale 张量和配置中的 `quantization_config`。其他量化格式会报错。内存占用包括一个基座 shard、矩阵运算缓冲区，以及 DCP 最多四组 adapter 参数。`--cpu-threads` 默认为 16，`--device` 控制合并矩阵乘法的设备。`--dry-run` 只检查元信息和映射，不写出结果，也不检查所有张量的数值。DCP 导出要求新的输出目录，校验完成后才将 `.partial` 发布为成品；`--force` 仅供 PEFT 导出使用。
 
 ## 故障排除
 
