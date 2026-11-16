@@ -266,7 +266,7 @@ def test_cache_budget_rejects_before_tensor_loading_and_plan_releases_full_group
 
 
 def test_art_publisher_keeps_exact_byte_descriptors_and_rejects_before_publication(monkeypatch, tmp_path):
-    from tests.cpu.backends.sglang.test_sensenova_art_rollout import SenseNovaU1ImageEditAdapter, _pack, _pair
+    from tests.cpu.models.test_sensenova_rollout import SenseNovaU1ImageEditAdapter, _pack, _pair
 
     # Publishing retains reward images; keep them local to this test.
     monkeypatch.setattr(ng, "_CANDIDATE_IMAGE_CACHE", {})

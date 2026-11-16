@@ -7,7 +7,7 @@ from threading import enumerate as threads
 
 import pytest
 
-from relax.backends.sglang.art_http_lookahead import HeaderLookahead
+from relax.engine.rollout.art_http_lookahead import HeaderLookahead
 from relax.engine.rollout.group_pipeline import GroupPipeline
 
 
@@ -152,8 +152,8 @@ def test_engine_lookahead_uses_real_rpc_adapter_and_exact_candidate_order(monkey
     import requests
     import torch
 
-    from relax.backends.sglang import sensenova_rollout
     from relax.backends.sglang.diffusion_engine import SGLangNativeGenerationEngine
+    from relax.models.sensenova import rollout as sensenova_rollout
     from relax.utils.art_tensor_transport import TensorBuffer, unpack
 
     monkeypatch.setattr(sensenova_rollout, "pack_sensenova_rollout_requests", lambda reqs: reqs[0])

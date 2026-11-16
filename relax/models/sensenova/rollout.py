@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""SenseNova I2I rollout wire contract, usable before the training adapter
-lands.
+"""SenseNova I2I sampling requests and trajectory validation.
 
 The trainer owns group planning, policy choice and replay. These helpers build
 one candidate request and validate the server's actual sampling record; they

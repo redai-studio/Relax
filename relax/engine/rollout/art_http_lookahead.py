@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""B1 lookahead: the next GPU request starts only after previous headers.
+"""ART lookahead: start the next generation before decoding this response.
 
-The pinned server sends headers AFTER scheduler completion and body encoding.
-Only one unread response is retained; request/policy identity must match
-exactly.
+The backend's open_response callback must return after generation and body
+encoding complete. Only one unread response is retained; request/policy
+identity must match exactly.
 """
 
 import copy

@@ -597,7 +597,7 @@ class SGLangNativeGenerationEngine(RayActor):
         sequentially. The caller shards groups across engines. Results contain
         one trajectory per candidate in the original request order.
         """
-        from relax.backends.sglang.sensenova_rollout import (
+        from relax.models.sensenova.rollout import (
             can_batch_sensenova_requests,
             is_sensenova_rollout_request,
             pack_sensenova_rollout_requests,
@@ -653,8 +653,8 @@ class SGLangNativeGenerationEngine(RayActor):
         """Overlap one next ART generation with current response transfer."""
         import requests as http
 
-        from relax.backends.sglang.art_http_lookahead import HeaderLookahead
-        from relax.backends.sglang.sensenova_rollout import pack_sensenova_rollout_requests
+        from relax.engine.rollout.art_http_lookahead import HeaderLookahead
+        from relax.models.sensenova.rollout import pack_sensenova_rollout_requests
         from relax.utils.art_tensor_transport import pack
 
         if len(requests) != 1 or (next_requests is not None and len(next_requests) != 1):
@@ -726,7 +726,7 @@ class SGLangNativeGenerationEngine(RayActor):
         """Map one (base64-decoded) RolloutResponse to the adapter sidecar
         dict."""
         resp = _deserialize(dict(resp))
-        from relax.backends.sglang.sensenova_rollout import (
+        from relax.models.sensenova.rollout import (
             is_sensenova_rollout_request,
             validate_sensenova_rollout_response,
         )

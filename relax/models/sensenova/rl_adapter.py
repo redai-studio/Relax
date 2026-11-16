@@ -113,7 +113,7 @@ class SenseNovaU1ImageEditAdapter:
         return model
 
     def build_rollout_request(self, sample: Any, sampling: Mapping[str, Any], seed: int) -> Dict[str, Any]:
-        from relax.backends.sglang.sensenova_rollout import build_sensenova_rollout_request
+        from .rollout import build_sensenova_rollout_request
 
         guidance_scale = float(sampling.get("guidance_scale", 1.0))
         if guidance_scale != 1.0:
@@ -286,7 +286,7 @@ class SenseNovaU1ImageEditAdapter:
             "cond_t_eps": _as_tensor(condition.get("t_eps", 0.02)).float().reshape(()),
         }
         if art_capture:
-            from relax.backends.sglang.sensenova_rollout import _validate_art_ode_cache
+            from .rollout import _validate_art_ode_cache
 
             selected = _validate_art_ode_cache(
                 response["rollout_metadata"],

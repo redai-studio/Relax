@@ -7,12 +7,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.backends.sglang.sensenova_rollout import (
+from relax.models.sensenova.rl_adapter import SenseNovaU1ImageEditAdapter
+from relax.models.sensenova.rollout import (
     ART_PROTOCOL_VERSION,
     build_sensenova_rollout_request,
     validate_sensenova_rollout_response,
 )
-from relax.models.sensenova.rl_adapter import SenseNovaU1ImageEditAdapter
 
 
 def _request(member=0, storage_dtype="float16", **changes):
