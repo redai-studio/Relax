@@ -649,7 +649,7 @@ class PrefetchBuffer:
         stop_event = self._stop
         self._thread = threading.Thread(target=self._run, args=(stop_event,), daemon=True, name="prefetch-worker")
         self._thread.start()
-        logger.info(f"PrefetchBuffer: started prefetching {len(indices)} samples")
+        logger.debug(f"PrefetchBuffer: started prefetching {len(indices)} samples")
 
     def get(self, idx: int) -> Optional[Sample]:
         """Return the sample for *idx*.
@@ -1022,6 +1022,10 @@ class StreamingDataset(BaseDataset):
         if self._prefetch_buffer is not None and self.index_manager.indices is not None:
             remaining = self.index_manager.indices[self.index_manager.position :]
             self._prefetch_buffer.set_index_order(remaining)
+            logger.info(
+                f"Prefetch window: epoch={self.index_manager.current_epoch}, "
+                f"position={self.index_manager.position}, remaining={len(remaining)}"
+            )
 
     def _process_raw_data(self, data: dict) -> Optional[Sample]:
         """Process raw data into a Sample.
