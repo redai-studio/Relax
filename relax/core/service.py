@@ -252,16 +252,21 @@ class Service:
         """
         await self.handle.train.remote(step, clear_data=clear_data)
 
-    async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False):
+    async def update_weights_fully_async(
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        recovery_token: dict | None = None,
+    ):
         """Trigger a fully asynchronous weight update for Actor service."""
         return await self.handle.update_weights_fully_async.remote(
-            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, recovery_token=recovery_token
         )
 
-    async def recv_weight_fully_async(self):
+    async def recv_weight_fully_async(self, recovery_token: dict | None = None):
         """Trigger a fully asynchronous weight receive for Actor FWD
         service."""
-        return await self.handle.recv_weight_fully_async.remote()
+        return await self.handle.recv_weight_fully_async.remote(recovery_token=recovery_token)
 
     def restart(self, fault_observer: Callable[..., None] | None = None) -> None:
         """Restart this service in-place: reuse placement groups and dynamic

@@ -4,6 +4,7 @@ runtime."""
 
 import ast
 import sys
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -41,11 +42,18 @@ def heads(monkeypatch):
     native.LinearCrossEntropyModule = Native
     monkeypatch.setitem(sys.modules, native.__name__, native)
     path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/fused_linear_ce.py"
-    node = next(
-        n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "supported"
-    )
-    scope = {"Any": Any, "torch": torch, "Envs": SimpleNamespace(RELAX_SFT_FUSED_LINEAR_CE=True)}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+    nodes = [
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name in ("supported", "_hopper_runtime_available")
+    ]
+    scope = {
+        "Any": Any,
+        "torch": torch,
+        "Envs": SimpleNamespace(RELAX_SFT_FUSED_LINEAR_CE=True),
+        "lru_cache": lru_cache,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
     device = torch.device("cuda:0")
     hidden = SimpleNamespace(is_cuda=True, device=device, shape=(8, 1, 64))
@@ -57,6 +65,7 @@ def heads(monkeypatch):
         Native=Native,
         Adapter=Adapter,
         NativeAdapter=NativeAdapter,
+        scope=scope,
     )
 
 
@@ -92,3 +101,15 @@ def test_old_runtime_without_native_head_remains_supported(heads, monkeypatch):
 def test_fused_ce_accepts_cli_or_legacy_env(heads, cli, legacy):
     heads.settings.RELAX_SFT_FUSED_LINEAR_CE = legacy
     assert heads.supported(heads.Column(), enabled=cli) is (cli or legacy)
+
+
+@pytest.mark.parametrize("runtime_available", [False, True])
+def test_hopper_requires_quack_epilogue_runtime(heads, monkeypatch, runtime_available):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    heads.scope["_hopper_runtime_available"] = lambda: runtime_available
+    assert heads.supported(heads.Native()) is runtime_available
+
+
+def test_other_architectures_retain_native_head_fallback(heads, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (8, 0))
+    assert not heads.supported(heads.Native())

@@ -33,7 +33,7 @@ class AcceleratorType(str, Enum):
     CUDA = "cuda"  # NVIDIA GPU
     NPU = "npu"  # Ascend NPU (Huawei)
     XPU = "xpu"  # Intel / Kunlunxin XPU
-    PPU = "ppu"  # PPU (Enflame / custom)
+    PPU = "ppu"  # Zhenwu PPU
     KLX = "klx"  # Kunlunxin (P800; masquerades as CUDA: torch.cuda + nccl)
     ROCM = "rocm"  # AMD ROCm (uses 'cuda' device in PyTorch but HIP backend)
     CPU = "cpu"  # CPU fallback
@@ -68,6 +68,11 @@ def _is_klx() -> bool:
     return os.path.exists("/dev/xpuctrl")
 
 
+def _is_ppu() -> bool:
+    """Check if a Zhenwu PPU accelerator is available."""
+    return os.path.exists("/dev/alixpu")
+
+
 def _is_rocm() -> bool:
     """Check if the current CUDA build is actually AMD ROCm/HIP."""
     return getattr(torch.version, "hip", None) is not None
@@ -76,7 +81,7 @@ def _is_rocm() -> bool:
 is_cuda_available: bool = torch.cuda.is_available()
 is_npu_available: bool = _is_torch_device_module_available("npu")
 is_xpu_available: bool = _is_torch_device_module_available("xpu")
-is_ppu_available: bool = _is_torch_device_module_available("ppu")
+is_ppu_available: bool = _is_ppu()
 is_rocm: bool = _is_rocm()
 
 
@@ -106,7 +111,7 @@ _BACKEND = {
     AcceleratorType.ROCM: BackendSpec("nccl", "CUDA_VISIBLE_DEVICES", "GPU", "cuda", cuda_family_probe=_is_rocm),
     AcceleratorType.NPU: BackendSpec("hccl", "ASCEND_RT_VISIBLE_DEVICES", "NPU", "npu"),
     AcceleratorType.XPU: BackendSpec("xccl", "XPU_VISIBLE_DEVICES", "XPU", "xpu"),
-    AcceleratorType.PPU: BackendSpec("eccl", "PPU_VISIBLE_DEVICES", "PPU", "ppu"),
+    AcceleratorType.PPU: BackendSpec("nccl", "CUDA_VISIBLE_DEVICES", "GPU", "cuda", cuda_family_probe=_is_ppu),
     AcceleratorType.KLX: BackendSpec(
         "nccl",
         "CUDA_VISIBLE_DEVICES",
@@ -459,7 +464,7 @@ def set_numa_affinity(local_rank: int) -> None:
     warning.
     """
     accel = _detect_accelerator()
-    if accel in (AcceleratorType.CUDA,):
+    if accel in (AcceleratorType.CUDA, AcceleratorType.PPU):
         try:
             import pynvml
 
@@ -486,9 +491,9 @@ def set_numa_affinity(local_rank: int) -> None:
 def set_expandable_segments(enable: bool) -> None:
     """Configure CUDA memory allocator expandable segments.
 
-    Only effective on NVIDIA CUDA. No-op on other backends.
+    Only effective on NVIDIA CUDA and Zhenwu PPU. No-op on other backends.
     """
-    if _detect_accelerator() == AcceleratorType.CUDA:
+    if _detect_accelerator() in (AcceleratorType.CUDA, AcceleratorType.PPU):
         try:
             torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
         except Exception as e:
@@ -541,7 +546,7 @@ def maybe_backend_barrier_on_weight_chunk(group) -> None:
     Keeps hardware-specific synchronization out of the framework code: callers
     in the chunked weight-send loop invoke this unconditionally.
     """
-    if _is_klx():
+    if _is_klx() or _is_ppu():
         import torch.distributed as dist
 
         dist.barrier(group=group)

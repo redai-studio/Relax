@@ -1,7 +1,9 @@
 import importlib
+import json
 import sys
 import types
 from argparse import Namespace
+from datetime import timedelta
 
 import pytest
 import torch
@@ -65,6 +67,48 @@ def _make_iterator(stream_module, *, get_data_fn, all_consumed_fn, **kwargs):
     )
     monkeypatch_kwargs.update(kwargs)
     return stream_module.StreamingTQIterator(**monkeypatch_kwargs)
+
+
+def test_micro_batch_list_iterator_observability_excludes_vpp_padding(monkeypatch, tmp_path):
+    from relax.utils.agentic_obs import resolve_agentic_obs_config
+    from relax.utils.agentic_obs.train_hooks import (
+        capture_training_input,
+        close_train_appenders,
+        observe_train_step,
+        record_optimizer_result,
+    )
+
+    stream_module = _load_stream_module(monkeypatch)
+    mpu = stream_module.mpu
+    mpu.get_tensor_model_parallel_rank = lambda: 0
+    mpu.is_pipeline_last_stage = lambda **kwargs: True
+    mpu.get_context_parallel_world_size = lambda: 1
+    mpu.get_data_parallel_rank = lambda **kwargs: 0
+    mpu.get_data_parallel_world_size = lambda **kwargs: 1
+    batch = {
+        "sample_export_ids": [7, 8],
+        "agentic_group_ids": ["group-7", "group-8"],
+        "response_lengths": [2, 2],
+        "total_lengths": [4, 4],
+        "loss_masks": [torch.ones(2), torch.ones(2)],
+        "advantages": [torch.ones(2), torch.ones(2)],
+    }
+    iterator = stream_module.MicroBatchListIterator([(batch, None), (batch, None)], dummy_after=1)
+    args = Namespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="run_test")
+    with observe_train_step(args, 1, 0):
+        actual, _ = next(iterator)
+        capture_training_input(actual)
+        # Actual capture precedes dynamic CP's destructive subgroup selection.
+        actual["sample_export_ids"] = [8]
+        dummy, _ = next(iterator)
+        assert dummy["__is_dummy__"]
+        capture_training_input(dummy)
+        record_optimizer_result(True)
+    assert len(iterator.get_buffer()) == 2
+    close_train_appenders()
+    path = resolve_agentic_obs_config(args).train_scalar_path(1, 0)
+    (record,) = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(row["sample_export_id"], row["effective_tokens"]) for row in record["samples"]] == [("7", 2), ("8", 2)]
 
 
 def test_streaming_tq_iterator_sampling_config_carries_window_quota(monkeypatch):
@@ -367,7 +411,8 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     assert iterator._sample_count == 2  # dummies don't count as samples
 
 
-def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch):
+@pytest.mark.parametrize("dense_ids", [False, True])
+def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch, dense_ids):
     stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
@@ -385,6 +430,9 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
 
         def get_data(self, batch_meta):
             return {
+                "dataset_ids": torch.tensor([0, 1])
+                if dense_ids
+                else torch.nested.nested_tensor([torch.tensor([0]), torch.tensor([1])], layout=torch.jagged),
                 "response_lengths": torch.nested.nested_tensor(
                     [
                         torch.tensor([512]),
@@ -411,7 +459,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
         args=Namespace(),
         tq_client=_TQClient(),
-        data_fields=["response_lengths", "total_lengths", "rewards"],
+        data_fields=["response_lengths", "total_lengths", "rewards", "dataset_ids"],
         batch_size=2,
         partition_id="train_0",
         task_name="ref_log_probs",
@@ -424,6 +472,8 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     assert rollout_data["response_lengths"] == [512, 135]
     assert rollout_data["total_lengths"] == [1309, 842]
     assert rollout_data["rewards"] == [1.5, 2.5]
+    assert rollout_data["dataset_ids"] == [0, 1]
+    assert all(type(value) is int for value in rollout_data["dataset_ids"])
 
 
 def test_tensor_to_python_values_dense_tensor(monkeypatch):
@@ -578,3 +628,67 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
     torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
     torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
     assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows
+
+
+def _known_tensor_broadcast_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    torch.set_num_threads(1)
+    timeout = timedelta(seconds=90)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=8, timeout=timeout)
+    try:
+        coordinates = (rank // 4, rank // 2 % 2, rank % 2)  # PP2, TP2, CP2
+        axes = ("pipeline_model", "tensor_model", "context")
+        groups = {}
+        for index, axis in enumerate(axes):
+            for first in range(8):
+                if (first // (4, 2, 1)[index]) % 2:
+                    continue
+                members = [first, first + (4, 2, 1)[index]]
+                group = dist.new_group(members, backend="gloo", timeout=timeout)
+                if rank in members:
+                    groups[axis] = group
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            stream_module = _load_stream_module(monkeypatch)
+            for index, axis in enumerate(axes):
+                monkeypatch.setattr(
+                    stream_module.mpu,
+                    f"get_{axis}_parallel_rank",
+                    lambda index=index: coordinates[index],
+                    raising=False,
+                )
+                monkeypatch.setattr(stream_module.mpu, f"get_{axis}_parallel_world_size", lambda: 2, raising=False)
+                monkeypatch.setattr(
+                    stream_module.mpu, f"get_{axis}_parallel_group", lambda axis=axis: groups[axis], raising=False
+                )
+            calls = []
+            original_broadcast = dist.broadcast
+
+            def broadcast(tensor, src, group):
+                calls.append(group)
+                return original_broadcast(tensor, src=src, group=group)
+
+            monkeypatch.setattr(stream_module.dist, "broadcast", broadcast)
+            pp, tp, cp = coordinates
+            for broadcast_pp in (True, False):
+                calls.clear()
+                source = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3) + (0 if broadcast_pp else 100 * pp)
+                expected = source.clone()
+                is_src = tp == cp == 0 and (pp == 0 or not broadcast_pp)
+                result = stream_module._bcast_known_tensor(
+                    source if is_src else None, is_src, source.dtype, source.shape, torch.device("cpu"), broadcast_pp
+                )
+                assert torch.equal(result, expected)
+                assert torch.equal(source, expected), "Source CPU tensor must remain unchanged"
+                assert calls.count(groups["context"]) == int(tp == 0)
+                assert calls.count(groups["tensor_model"]) == 1
+                assert calls.count(groups["pipeline_model"]) == int(broadcast_pp)
+    finally:
+        dist.destroy_process_group(dist.group.WORLD)
+
+
+def test_known_tensor_broadcast_cpu_processes(tmp_path):
+    torch.multiprocessing.spawn(
+        _known_tensor_broadcast_worker, args=(str(tmp_path / "rendezvous"),), nprocs=8, join=True
+    )

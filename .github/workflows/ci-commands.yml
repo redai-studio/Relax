@@ -26,3 +26,5 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - uses: ./.github/actions/ci-commands
+        with:
+          cherry-pick-token: ${{ secrets.CHERRY_PICK_BOT_TOKEN }}

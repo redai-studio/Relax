@@ -8,6 +8,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, contextmanager
+from itertools import groupby
 from time import monotonic
 from typing import Any
 
@@ -383,6 +384,7 @@ async def generate(
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
+    opd_enabled = opd.is_opd_enabled(args, evaluation=evaluation)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, (
@@ -398,12 +400,11 @@ async def generate(
     _has_media = sample.multimodal_inputs is not None and any(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
-    native_image_opd = bool(state.opd_manager and not evaluation and _has_media)
+    native_image_opd = opd_enabled and _has_media
     if native_image_opd:
         image_inputs(sample.multimodal_inputs)
     if (
-        state.opd_manager
-        and not evaluation
+        opd_enabled
         and args.use_slime_router
         and "RadixTreeMiddleware" in args.slime_router_middleware_paths
         and (_has_media or image_inputs(sample.teacher_multimodal_inputs))
@@ -445,7 +446,7 @@ async def generate(
     if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
         payload["return_indexer_topk"] = True
 
-    if state.opd_manager and not evaluation:
+    if opd_enabled:
         state.opd_manager.before_rollout(payload)
     sc_sampling_mode = configure_score_centering_request(args, payload) if not evaluation else None
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
@@ -540,7 +541,7 @@ async def generate(
             new_response_tokens = output["output_ids"]
             new_response_log_probs = []
 
-        if state.opd_manager and not evaluation:
+        if opd_enabled:
             new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
                 output["meta_info"], new_response_tokens, new_response_log_probs
             )
@@ -617,7 +618,7 @@ async def generate(
         if sc_result is not None:
             append_score_centering_candidates(sample, sc_result[2], sc_result[3])
 
-        if state.opd_manager and not evaluation:
+        if opd_enabled:
             state.opd_manager.after_rollout(sample, output)
 
     if "routed_experts" in output["meta_info"]:
@@ -660,22 +661,12 @@ async def _dispatch_generate(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
-    """Resolve the generate function and run it under the correct permit scope.
+    """Run the selected generator with an inference permit.
 
-    Touches only ``state.aborted`` / ``state.dp_rank_context`` / ``state.semaphore``
-    so it can be unit-tested with a lightweight stub state (no GenerateState).
-
-    - Default (built-in ``generate`` or a custom function without the opt-in flag):
-      hold the session-level lock for the whole call, exactly as before.
-    - Opt-in (custom function with ``manages_inference_permit = True``): do NOT
-      hold the session lock; the function acquires a per-request permit per turn
-      via ``state.post_generate``/``state.inference_permit``.
-
-    ``GenerationAborted`` must never escape this function: ``generate_and_rm_group``
-    runs the per-sample tasks through ``asyncio.gather`` *without*
-    ``return_exceptions=True``, and no existing abort path raises -- so a leaked
-    exception would crash the whole rollout step. It is contained here and mapped
-    to an ABORTED sample (mirroring the legacy in-lock abort check).
+    By default, hold a permit until generation returns. Custom generators with
+    manages_inference_permit=True manage permits for individual requests.
+    Return an ABORTED sample on GenerationAborted so callers can handle an
+    unfinished response without failing the group call.
     """
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
@@ -686,12 +677,11 @@ async def _dispatch_generate(
             sample.status = Sample.Status.ABORTED
             return sample
         with state.dp_rank_context() as _:
-            if custom_generate_func is not None:
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                return await custom_generate_func(args, sample, sampling_params)
-            return await generate(args, sample, sampling_params, evaluation=evaluation)
+            if custom_generate_func is None:
+                return await generate(args, sample, sampling_params, evaluation=evaluation)
+            if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+            return await custom_generate_func(args, sample, sampling_params)
 
     try:
         if manages_permit:
@@ -709,7 +699,7 @@ async def _dispatch_generate(
 
 async def generate_and_rm(
     args: Namespace,
-    sample: Sample | list[Sample],
+    sample: Sample,
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
@@ -717,50 +707,41 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
-    # For samples with existing response, check if they're complete
-    if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
+    if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
         return sample
 
     state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled and not args.group_rm:
+        state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
 
-    # Resolve the generate function and run it under the right permit scope
-    # (session-level lock by default; per-request permits for opt-in functions).
-    sample = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
-
-    # for the rm that need the whole group, we will not do the rm here
+    generated = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    # Group reward and Teacher scoring run in generate_and_rm_group.
     if args.group_rm:
-        return sample
+        return generated
 
-    # multi samples
-    if isinstance(sample, list):
-        samples = sample
-        if any(sample.status == Sample.Status.ABORTED for sample in samples):
-            return samples
+    results = generated if isinstance(generated, list) else [generated]
+    if any(result.status == Sample.Status.ABORTED for result in results):
+        if teacher_routing_enabled:
+            state.opd_manager.response_stats.finish(sample.response_key)
+        return generated
 
-        # for multi agent system, the reward of some sample is calculated during generation.
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
+    # Custom generation may already have assigned rewards to some outputs.
+    if isinstance(generated, list):
+        samples_need_reward = [sample for sample in generated if sample.reward is None]
         rewards = await batched_async_rm(args, samples_need_reward)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
+    elif generated.reward is None:
+        generated.reward = await async_rm(args, generated)
 
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
+    if opd.is_opd_enabled(args, evaluation=evaluation):
+        await state.opd_manager.prefill(generated, _encode_multimodal_inputs)
 
-        return samples
-    else:
-        if sample.status == Sample.Status.ABORTED:
-            return sample
-        # for multi-turn environment, a reward could be assigned to the agent.
-        if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
-
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
-
-    return sample
+    return generated
 
 
 def _collect_timing_from_samples(samples: list[Sample]) -> dict[str, list[float]]:
@@ -819,6 +800,15 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled:
+        for sample in group:
+            opd.bind_teacher(args, sample)
+
+    if teacher_routing_enabled and args.group_rm:
+        for sample in group:
+            state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
+
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
@@ -831,19 +821,22 @@ async def generate_and_rm_group(
 
     group = await asyncio.gather(*tasks)
 
-    # A group with any aborted member (e.g. a weight-sync pre-dispatch 499) is
-    # incomplete: skip group reward for it in training so it is not scored on a
-    # partial trajectory. The group is carried to the resume buffer and finished
-    # under the next weight version. Eval is unaffected — it never converts a 499.
-    group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
-    # eval should still compute group reward even if abort was triggered by a concurrent rollout
-    if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+    # Group rewards require complete trajectories, including during evaluation.
+    group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
+    if not args.group_rm:
+        return group
+    if (state.aborted and not evaluation) or group_aborted:
+        if teacher_routing_enabled:
+            for sample in group:
+                state.opd_manager.response_stats.finish(sample.response_key)
+        return group
 
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+    rewards = await batched_async_rm(args, group)
+    for sample, reward in zip(group, rewards, strict=False):
+        sample.reward = reward
+
+    if opd.is_opd_enabled(args, evaluation=evaluation):
+        await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
 
@@ -948,6 +941,9 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args)
+    if teacher_routing_enabled:
+        state.opd_manager.response_stats.new_window()
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1320,6 +1316,8 @@ async def generate_rollout_async(
 
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()
+    if teacher_routing_enabled:
+        filter_metrics.update(state.opd_manager.response_stats.metrics())
     if CURRENT_ROLLOUT_BATCH:
         save_debug_rollout_data(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
@@ -1344,7 +1342,7 @@ async def generate_rollout_async(
 EVAL_PROMPT_DATASET = {}
 
 
-async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
+async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[RolloutFnEvalOutput, list[list[Sample]]]:
 
     state = GenerateState(args)
     # Increment evaluating counter so that abort() knows to wait for eval to finish.
@@ -1365,7 +1363,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
 
 async def eval_rollout_single_dataset(
     args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+) -> dict[str, dict[str, Any]]:
     """An example to implement the eval_rollout function for an rule based rm
     rollout generation.
 
@@ -1440,7 +1438,8 @@ async def eval_rollout_single_dataset(
         pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
         for coro in asyncio.as_completed(tasks):
             group = await coro
-            if do_print:
+            pbar.update(1)
+            if do_print and group:
                 sample = group[0]
                 logger.info(
                     "eval_rollout_single_dataset example data: "
@@ -1449,7 +1448,6 @@ async def eval_rollout_single_dataset(
                 )
                 do_print = False
             data.extend(group)
-            pbar.update(1)
         pbar.close()
     else:
         tasks = []
@@ -1492,11 +1490,34 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+    # Preserve original prompt boundaries for pass@k, including missing samples.
+    group_size = dataset_cfg.n_samples_per_eval_prompt
+    valid_data = []
+    for prompt_index, samples in groupby(data, key=lambda sample: sample.index // group_size):
+        group = list(samples)
+        expected_indices = range(prompt_index * group_size, (prompt_index + 1) * group_size)
+        if (
+            0 <= prompt_index < len(dataset.samples)
+            and [sample.index for sample in group] == list(expected_indices)
+            and all(sample.reward is not None and sample.status != Sample.Status.ABORTED for sample in group)
+        ):
+            valid_data.extend(group)
+    num_valid_prompts = len(valid_data) // group_size
+    if num_valid_prompts != len(dataset.samples):
+        logger.warning(
+            "eval_rollout_single_dataset: partial evaluation, retaining %d/%d complete prompts",
+            num_valid_prompts,
+            len(dataset.samples),
+        )
+    data = valid_data
     return {
         dataset_cfg.name: {
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "group_size": group_size,
+            "num_prompts": len(dataset.samples),
+            "num_valid_prompts": num_valid_prompts,
         }
     }
 

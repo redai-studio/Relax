@@ -17,6 +17,7 @@ def _sc_args(**overrides) -> SimpleNamespace:
         advantage_estimator="score_centering",
         loss_type="policy_loss",
         use_opd=False,
+        enable_weights_backuper=True,
         # The existing OPD coefficient defaults to 1 even when OPD is disabled.
         opd_kl_coef=1.0,
         rollout_temperature=1.0,

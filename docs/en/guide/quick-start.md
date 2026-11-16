@@ -194,6 +194,7 @@ Download the dataset and convert it to the Relax format:
 # Download dataset
 hf download --repo-type dataset harryhsing/AVQA-R1-6K \
   --local-dir /root/AVQA
+tar -zxvf /root/AVQA/AVQA_R1.tar.gz -C /root/AVQA
 
 # Convert to Relax format
 # --md-dir points to the directory containing image and audio files,

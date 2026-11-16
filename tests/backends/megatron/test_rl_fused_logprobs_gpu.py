@@ -1187,9 +1187,7 @@ def test_real_parallel_topology_prepares_only_output_stage(allgather, layout):
 
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("cli", [False, True])
-def test_sft_and_mtp_cli_hopper_fallback_matches_native(monkeypatch, cli, legacy):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("tests the real SM90 unsupported-hardware fallback")
+def test_sft_and_mtp_cli_unsupported_head_fallback_matches_native(monkeypatch, cli, legacy):
     from megatron.training import global_vars
 
     from relax.backends.megatron import fused_linear_ce as fused
@@ -1216,7 +1214,7 @@ def test_sft_and_mtp_cli_hopper_fallback_matches_native(monkeypatch, cli, legacy
     results = []
 
     def forbidden_kernel(*_args, **_kwargs):
-        raise AssertionError("SM90 must retain the native head, not execute SM100 CE")
+        raise AssertionError("An unaligned vocabulary must retain the native head")
 
     monkeypatch.setattr(fused, "linear_cross_entropy", forbidden_kernel)
 

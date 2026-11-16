@@ -82,10 +82,12 @@ def main() -> None:
                 for p in self.parameters():
                     p.normal_(0, 0.025)
             self.splits = [128, 128]
-            original_workspace = self.experts.linear_fc1.get_weight_workspace.__func__
+            original_workspace = getattr(self.experts.linear_fc1, "get_weight_workspace", None)
+            original_quantizers = getattr(self.experts.linear_fc1, "_get_weight_quantizers", None)
             install_mxfp4_qat(self, compute=compute)
             if compute == "stock_fp8":
-                assert self.experts.linear_fc1.get_weight_workspace.__func__ is original_workspace
+                assert getattr(self.experts.linear_fc1, "get_weight_workspace", None) == original_workspace
+                assert getattr(self.experts.linear_fc1, "_get_weight_quantizers", None) == original_quantizers
                 assert self.experts.linear_fc1.te_quant_params is None
 
         def forward(self, value: torch.Tensor) -> torch.Tensor:

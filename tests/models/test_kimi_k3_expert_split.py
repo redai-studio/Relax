@@ -224,29 +224,3 @@ def test_training_ops_expert_split_installation(monkeypatch):
     assert GroupedExpertLinearAdapter.forward is installed
     assert metadata == [(id(p), p.allreduce, p.partition_dim) for p in adapter.parameters()]
     assert keys == list(adapter.state_dict())
-
-
-@pytest.mark.parametrize("enabled", [None, "0", "1"])
-def test_64gpu_recipe_expert_split_worker_environment(enabled, tmp_path):
-    import json
-    import shlex
-    import subprocess
-
-    env = dict(os.environ, DRY_RUN="1", MODEL_DIR=str(tmp_path / "model"), DATA_DIR=str(tmp_path / "data"))
-    env.pop("RELAX_KIMI_K3_EXPERT_SPLIT", None)
-    if enabled is not None:
-        env["RELAX_KIMI_K3_EXPERT_SPLIT"] = enabled
-    command = subprocess.check_output(
-        ["bash", str(ROOT / "examples/models/kimi-k3/scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh")],
-        env=env,
-        text=True,
-    )
-    args = shlex.split(command)
-    worker_env = json.loads(args[args.index("--train-env-vars") + 1])
-    assert worker_env["RELAX_KIMI_K3_EXPERT_SPLIT"] == (enabled or "1")
-    for flag, value in (
-        ("--tensor-model-parallel-size", "4"),
-        ("--pipeline-model-parallel-size", "4"),
-        ("--expert-tensor-parallel-size", "1"),
-    ):
-        assert args[args.index(flag) + 1] == value

@@ -76,13 +76,31 @@ class PackedSafeGemma4DenseProvider(_PackedSafeBuildMixin, Gemma4DenseProvider):
 
 
 class PackedSafeGemma4DenseVLProvider(_PackedSafeBuildMixin, Gemma4DenseVLProvider):
-    """``Gemma4DenseVLProvider`` for the VL path.
-
-    Untested -- Relax's gemma-4
-    work is text-only SFT so far.
-    """
+    """Dense packed image SFT with one SP scatter after visual insertion."""
 
     relax_is_multimodal: ClassVar[bool] = True
+
+    def build(self, *args, **kwargs):
+        model = super().build(*args, **kwargs)
+        if model.pre_process:
+            model.embedding.scatter_to_sequence_parallel = False
+            model.embedding.reduce_scatter_embeddings = False
+            model.embedding.word_embeddings.reduce_scatter_embeddings = False
+        return model
+
+    def provide(self, *args, **kwargs):
+        from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
+
+        from relax.models.gemma4.multimodal_model import PackedGemma4VLModel
+
+        if self.context_parallel_size != 1 or self.pipeline_model_parallel_size != 1:
+            raise NotImplementedError("Packed Gemma4 image SFT requires CP1 and PP1")
+        model = super().provide(*args, **kwargs)
+        model.__class__ = PackedGemma4VLModel
+        hook_hf_module_setattr_for_tp_grad_sync(model.embed_vision)
+        if self.recompute_granularity == "full":
+            model.vision_tower.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        return model
 
 
 #: Where the bridge parks the ``(local, global)`` rope-theta pair. Deliberately

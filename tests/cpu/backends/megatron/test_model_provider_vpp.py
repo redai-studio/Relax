@@ -201,6 +201,30 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+@pytest.mark.parametrize("inherited_backend", ["none", "cudnn"])
+@pytest.mark.parametrize(
+    "backend,legacy_fusion,expected_backend",
+    [(None, None, "cudnn"), (None, False, "none"), ("none", None, "none"), ("cudnn", None, "cudnn")],
+)
+def test_dsv4_bridge_resolves_dsa_backend_before_finalize(
+    monkeypatch, inherited_backend, backend, legacy_fusion, expected_backend
+):
+    provider = _FakeProvider()
+    provider.experimental_attention_variant = "dsv4_hybrid"
+    provider.dsa_kernel_backend = inherited_backend
+    provider.apply_dsa_kernel_fusion = inherited_backend == "cudnn"
+    module, provider = _load_model_provider(monkeypatch, provider)
+
+    def finalize():
+        assert provider.dsa_kernel_backend == expected_backend
+        assert provider.apply_dsa_kernel_fusion is legacy_fusion
+
+    provider.finalize = finalize
+    module.get_model_provider_func(
+        _bridge_args(pipeline_model_parallel_size=1, dsa_kernel_backend=backend, apply_dsa_kernel_fusion=legacy_fusion)
+    )
+
+
 @pytest.mark.parametrize("path", ["bridge", "custom", "raw"])
 @pytest.mark.parametrize("processor", [False, True])
 @pytest.mark.parametrize("declared", [None, False, True])

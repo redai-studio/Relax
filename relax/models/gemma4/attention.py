@@ -135,6 +135,76 @@ def _is_sliding_layer(config, layer_number: int) -> bool:
     return False
 
 
+def _vision_block_mask(
+    groups: torch.Tensor,
+    query_length: int,
+    query_offset: int,
+    window_left: int,
+) -> "BlockMask":
+    """HF sliding-window AND (causal OR same-image), at block granularity.
+
+    Global layers remain causal. Image groups can reveal future image tokens,
+    but cannot reveal keys older than the sliding window (Transformers 5.16).
+    Only O((T/128)^2) coarse blocks and O(T) metadata are allocated.
+    """
+    from torch.nn.attention.flex_attention import BlockMask
+
+    if query_offset % _FLEX_BLOCK_SIZE:
+        raise ValueError("Gemma4 vision query chunks must start at a block boundary")
+    block_size = _FLEX_BLOCK_SIZE
+    key_length = groups.numel()
+    device = groups.device
+    q_starts = torch.arange((query_length + block_size - 1) // block_size, device=device) * block_size + query_offset
+    q_ends = torch.clamp(q_starts + block_size - 1, max=query_offset + query_length - 1)
+    k_starts = torch.arange((key_length + block_size - 1) // block_size, device=device) * block_size
+    k_ends = torch.clamp(k_starts + block_size - 1, max=key_length - 1)
+
+    padded = F.pad(groups, (0, (-key_length) % block_size), value=-1).reshape(-1, block_size)
+    block_min = torch.where(padded >= 0, padded, torch.iinfo(groups.dtype).max).amin(-1)
+    block_max = padded.amax(-1)
+    # Query chunks are block-aligned; the last block may be partial.
+    q_blocks = q_starts // block_size
+    same_image_possible = (block_max[q_blocks, None] >= block_min[None, :]) & (
+        block_max[None, :] >= block_min[q_blocks, None]
+    )
+    same_image_full = (
+        (padded.amin(-1)[q_blocks, None] >= 0)
+        & (padded.amin(-1)[q_blocks, None] == block_max[q_blocks, None])
+        & (padded.amin(-1)[None, :] == block_max[None, :])
+        & (block_max[q_blocks, None] == block_max[None, :])
+    )
+    possible = k_starts[None, :] <= q_ends[:, None]
+    full = k_ends[None, :] <= q_starts[:, None]
+    possible = possible | same_image_possible
+    full = full | same_image_full
+    if window_left >= 0:
+        possible = possible & (k_ends[None, :] >= q_starts[:, None] - window_left)
+        full = full & (k_starts[None, :] >= q_ends[:, None] - window_left)
+    partial_num, partial_indices = _ordered_block_indices(possible & ~full)
+    full_num, full_indices = _ordered_block_indices(full)
+
+    def mask_mod(_batch, _head, query_index, key_index):
+        q = query_index + query_offset
+        # Flex can evaluate rounded block lanes; clamp metadata reads and mask them out.
+        q_group = groups[torch.clamp(q, max=key_length - 1)]
+        k_group = groups[torch.clamp(key_index, max=key_length - 1)]
+        causal = key_index <= q
+        allowed = causal | ((q_group >= 0) & (q_group == k_group))
+        if window_left >= 0:
+            allowed = allowed & (q - key_index <= window_left)
+        return (query_index < query_length) & (key_index < key_length) & allowed
+
+    return BlockMask.from_kv_blocks(
+        partial_num,
+        partial_indices,
+        full_num,
+        full_indices,
+        BLOCK_SIZE=_FLEX_BLOCK_SIZE,
+        mask_mod=mask_mod,
+        seq_lengths=(query_length, key_length),
+    )
+
+
 def _window_pair(window_size) -> tuple:
     """Normalise gemma-4's two window conventions to flash-attn's ``(left,
     right)``.
@@ -264,6 +334,45 @@ class Gemma4CoreAttention(nn.Module):
                 outputs.append(output.transpose(1, 2).reshape(query_end - query_start, -1))
         return torch.cat(outputs, dim=0)
 
+    def _thd_vision_flex(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        boundaries: list[int],
+        groups: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.training and self.dropout_p:
+            raise NotImplementedError("Gemma4 image FlexAttention requires attention dropout to be zero")
+        from torch.nn.attention.flex_attention import flex_attention
+
+        outputs = []
+        attention_fn = _get_compiled_flex_attention() if query.is_cuda else flex_attention
+        options = {
+            k: v for k, v in _FLEX_KERNEL_OPTIONS.items() if k not in {"BLOCKS_ARE_CONTIGUOUS", "ROWS_GUARANTEED_SAFE"}
+        }
+        for start, end in zip(boundaries, boundaries[1:]):
+            sample_groups = groups[start:end]
+            for query_start in range(0, end - start, _FLEX_QUERY_CHUNK_SIZE):
+                query_end = min(query_start + _FLEX_QUERY_CHUNK_SIZE, end - start)
+                mask = _vision_block_mask(
+                    sample_groups,
+                    query_end - query_start,
+                    query_start,
+                    self.window_size[0],
+                )
+                output = attention_fn(
+                    query[start + query_start : start + query_end].unsqueeze(0).transpose(1, 2),
+                    key[start:end].unsqueeze(0).transpose(1, 2),
+                    value[start:end].unsqueeze(0).transpose(1, 2),
+                    block_mask=mask,
+                    scale=self._scale(query.shape[2]),
+                    enable_gqa=query.shape[1] != key.shape[1],
+                    kernel_options=options,
+                )
+                outputs.append(output.transpose(1, 2).reshape(query_end - query_start, -1))
+        return torch.cat(outputs, dim=0)
+
     # ---------------- entry ----------------
 
     def forward(
@@ -288,6 +397,12 @@ class Gemma4CoreAttention(nn.Module):
         if query.dim() == 3:  # thd: [T, np, hn]
             cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
             if cu_seqlens is not None:
+                groups = getattr(packed_seq_params, "gemma4_vision_group_ids", None)
+                if groups is not None and self.is_sliding:
+                    boundaries = getattr(packed_seq_params, "cu_seqlens_q_cpu", None)
+                    if boundaries is None:
+                        boundaries = cu_seqlens.detach().cpu().tolist()
+                    return self._thd_vision_flex(query, key, value, boundaries, groups)
                 if query.shape[2] <= 256:
                     max_seqlen = packed_seq_params.max_seqlen_q
                     if max_seqlen is None:
