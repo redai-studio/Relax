@@ -2312,7 +2312,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # wandb
         def add_wandb_arguments(parser):
             # wandb parameters
-            parser.add_argument("--use-wandb", action="store_true", default=False)
+            parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=False)
             parser.add_argument(
                 "--wandb-mode",
                 type=str,
@@ -2393,7 +2393,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_clearml_arguments(parser):
             # TODO(yuetian): Reuse tb-experiment-name --tb-project-name as the ClearML experiment name currently.
             # Need to refactor the experiment management part later.
-            parser.add_argument("--use-clearml", action="store_true", default=False)
+            parser.add_argument("--use-clearml", action=argparse.BooleanOptionalAction, default=False)
 
             return parser
 

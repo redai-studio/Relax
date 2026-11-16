@@ -55,25 +55,29 @@ def test_nonfinite_norm_does_not_drop_skip_counters(monkeypatch, bad_norm, queue
             "train/dataset/general/loss": 0.4,
             "train/dataset/code%2Fpython/loss": 0.6,
             "train/dataset/general/tokens": 12,
+            "train/dataset/code%2Fpython/tokens": 0,
             "train/dataset/general/samples": 2,
             "train/dataset/general/token_fraction": 0.3,
             "train/dataset/general/sample_fraction": 0.5,
         }
+        steps = [(271, metrics), (272, {"train/dataset/general/tokens": 5, "train/dataset/code%2Fpython/tokens": 0})]
         if queued:
             adapter = object.__new__(MetricsServiceAdapter)
             adapter.client = client
             adapter._timeline_enabled = False
             adapter._reporter = OrderedMetricsReporter()
             try:
-                assert adapter.log({"train/step": 271, **metrics}, step_key="train/step")
-                assert adapter.flush(271)
+                for step, values in steps:
+                    assert adapter.log({"train/step": step, **values}, step_key="train/step")
+                    assert adapter.flush(step)
             finally:
                 adapter.finish_async_reporting()
         else:
-            assert client.log_metrics_batch(271, metrics)
-            result = client.report_step(271)
-            assert result["status"] == "success"
-            assert result["results"]["clearml"] == "success"
+            for step, values in steps:
+                assert client.log_metrics_batch(step, values)
+                result = client.report_step(step)
+                assert result["status"] == "success"
+                assert result["results"]["clearml"] == "success"
 
     assert sdk_logger.report_scalar.call_args_list == [
         call(title="train", series="skipped_nonfinite_grad", value=1, iteration=271),
@@ -82,6 +86,10 @@ def test_nonfinite_norm_does_not_drop_skip_counters(monkeypatch, bad_norm, queue
         call(title="train", series="zero", value=0, iteration=271),
         call(title="train", series="loss/general", value=0.4, iteration=271),
         call(title="train", series="loss/code%2Fpython", value=0.6, iteration=271),
+        call(title="train", series="tokens/general", value=12, iteration=271),
+        call(title="train", series="tokens/code%2Fpython", value=0, iteration=271),
+        call(title="train", series="tokens/general", value=5, iteration=272),
+        call(title="train", series="tokens/code%2Fpython", value=0, iteration=272),
     ]
     assert metrics["train/grad_norm"] is bad_norm
-    assert not service.metrics_buffer.has_metrics_for_step(271)
+    assert all(not service.metrics_buffer.has_metrics_for_step(step) for step, _ in steps)

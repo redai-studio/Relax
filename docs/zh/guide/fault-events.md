@@ -2,11 +2,11 @@
 
 故障历史由训练 driver 持有，使用有界内存，独立于 MetricsService 和性能时间线。同一 driver 内重建 Ray 或 Controller 时可保留同一份历史；driver 退出后不持久化。
 
-HealthStatus 通过既有健康查询提供稳定故障身份，Controller 自动记录处理选择、局部恢复操作、未注册角色跳过、fatal 终止和全局重启预算耗尽。全局恢复完成与异步权重操作回执在下一批接入；仅有 global `handling_started` 不能证明恢复成功。
+HealthStatus 通过既有健康查询提供稳定故障身份和完成回执，Controller 自动记录处理选择、局部和全局恢复操作、未注册角色跳过、fatal 终止和全局重启预算耗尽。仅有 `handling_started` 或 `recovery_handoff` 不能证明恢复成功。
 
 ## 启用查询
 
-HTTP 端点要求 Uvicorn 0.36.0 或更新版本，已在 `requirements.txt` 声明。更早版本无法加载用于连接期限控制的自定义事件循环。正式验收环境使用 Uvicorn 0.54.0。
+HTTP 端点要求 Uvicorn 0.36.0 或更新版本，已在 `requirements.txt` 声明。更早版本无法加载用于连接期限控制的自定义事件循环。
 
 在已有训练命令中增加 `--use-health-check --fault-events-enabled`。功能默认关闭；只开启故障历史而未开启健康检查时，记录固定提示并保持采集关闭。
 
@@ -62,7 +62,34 @@ recovery_succeeded  expected=7 observed=7 failed=0
 
 同一个连续 unhealthy 周期保持同一发现 ID（D）和首次原因。非 fatal 后升级为 fatal 时只生成一个升级 ID（U）；首报 fatal 只需要 D。重复健康查询对尚未接纳的 D/U 每轮每 ID 最多尝试一次。健康清除后，缓存 ID 仍可补发，但不会再次触发恢复。替换或退休来源时，对每个未接纳的 D/U 只结算一次；已接纳项由消费者负责。例如 D 已接纳、U 被拒绝后退休，`known_lost_events` 增加 1；两者都拒绝则增加 2；成功重试则不增加。活动发布状态也会防止已淘汰正文的 D 再次出现。
 
-未注册角色产生 `handling_skipped`；Controller 仍将缺少恢复处理器视为错误，停止健康检查并取消待处理任务。fatal 沿用原回调及退出策略。全局成员共享 recovery ID，本批记录开始、明确异常和预算终止，全局完成仍未验证。同一故障在后续健康轮次仍不健康时，可以用新的 recovery ID 重试。
+未注册角色产生 `handling_skipped`；Controller 仍将缺少恢复处理器视为错误，停止健康检查并取消待处理任务。fatal 沿用原回调及退出策略。全局成员共享 recovery ID。同一故障在后续健康轮次仍不健康时，可以用新的 recovery ID 重试。
+
+## 全局恢复与完成回执
+
+重建前冻结角色图及决定恢复操作的配置分支。handoff 原子地比较重建后的计划、合并本地证据并选出终态。即使证据掩码相同，不同角色图也会使比较失败。普通 checkpoint 路径、router 地址和 step 值可以改变。
+
+| 全局启动分支 | 必需证据 |
+| --- | --- |
+| Colocate 或 hybrid，存在 actor | 初始化（1）、全部服务恢复 step（2）、提交任务（4）：7。 |
+| 纯 fully async，只有 actor | 上述操作加 actor 发送（8）：15。 |
+| 纯 fully async，actor + actor_fwd | 再加 actor_fwd 接收（16）：31。 |
+| 纯 fully async，actor + reference | 再加 reference 接收（32）：47。 |
+| 纯 fully async，三者都在 | 两项接收均要求：63。 |
+| 没有 actor，或任一全局 debug 开关 | 初始化和提交任务：5。 |
+
+local 在 debug 模式仍为 7。colocate/hybrid 中，仅当 actor 和 rollout 都存在、且执行原有非 offline 分支时，rollout-manager setter 才等待初次同步；不会为跳过的分支虚构权重回执。任务证据要求每个服务都有保存的引用，部分或空任务集不能证明提交，也不证明训练已经结束。
+
+纯 async 恢复由 Actor/ActorFwd 在实际 worker-group 调用返回或抛错后报告。Service 等待实际远程响应，Controller 使用 `asyncio.gather` 并发启动发送和接收，之后才恢复 step。新 HealthStatus 在部署前已获得固定回执 token。既有 unhealthy 查询在回调前合并三个回执槽，unhealthy 列表为空时也合并。Runtime 不保留训练响应，不新增 driver 轮询 RPC。
+
+例如 actor + actor_fwd 的 handoff 可能记录：
+
+```json
+{"event_type":"recovery_handoff","expected_evidence":31,"observed_evidence":7,"failed_evidence":0,"availability":"unverified"}
+```
+
+两项回执到达后，新建 `recovery_succeeded` 记录，expected=observed=31；旧记录保持不变。明确的操作失败产生 `recovery_failed/operation_failed` 及失败证据位。远程响应失败时，操作证据在完成回执到达前保持未验证；原始异常仍传播给训练。缺失回执保持未验证，时间流逝不会生成终态或增加 `known_lost_events`。冲突槽既不能证明成功也不能证明失败，但不能掩盖另一个操作的明确失败。`active_recoveries` 统计本次运行中的未决上下文，不提供逐 recovery 的 pending 状态接口。
+
+fault source 和回执接收端 generation 相互独立。G0 的故障启动面向 G1 的恢复，销毁 G0 不会中断该恢复；仅启动下一次恢复也不会结束它。只有实际退休 G1，才以 `source_retired` 中断其未决结果。source 观测失败不丢弃独立的回执槽。handoff 前被放弃的启动记录 `superseded`，旧 token 不能影响新尝试。成功终态不会反转，之后的相反回执只设置 `RECEIPT_CONFLICT`。`SOURCE_RETIRED` 可以与已验证成功同时存在。
 
 ## Python 存储接口
 
@@ -96,11 +123,11 @@ assert len(page["events"]) == 1
 
 ## 通过 OpenTelemetry 导出故障日志
 
-以下最小故障日志接口为提交给维护者确认的方案，确认位置为 [PR #455](https://github.com/redai-studio/Relax/pull/455#pullrequestreview-5628223210)。现有事件 schema、本地查询和恢复判据保持不变。不安装全局 OTel provider，不接管普通 Python 日志，也不启用其他观测信号。
+故障日志导出保持现有事件 schema、本地查询和恢复判据不变。不安装全局 OTel provider，不接管普通 Python 日志，也不启用其他观测信号。
 
 driver 统一持有一个官方 SDK 的私有 `LoggerProvider`，显式资源属性为 `service.name=relax`，并使用官方 OTLP HTTP exporter。只有 Store 新接纳并提交成功的事件，才将不可变的实际记录快照交给独立有界导出队列：最多 512 条排队、1 条在途。`offer` 在 Runtime 消费者线程上、Store 和接纳锁之外构造 SDK `LogRecord`；仅由独立导出线程执行 SDK emit、`SimpleLogRecordProcessor` 及导出／网络 I/O，也不再增加 SDK 批处理队列。
 
-依赖 Python 3.10 及更新版本的 `opentelemetry-sdk>=1.45.0,<1.46` 与 `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46`，并在同一范围声明 `opentelemetry-exporter-otlp` 汇总包，使镜像中预装的 gRPC exporter 与 SDK 保持同一版本；导出本身只走 HTTP。本地已实际验证 1.45.0 和 1.45.1 环境。约束在 1.45 系列，是为了保留 exporter 自有客户端的诊断接口，用于屏蔽可能包含敏感信息的传输错误细节；不修改全局 logger。若这一兼容契约不再满足，则拒绝启动导出，本地历史继续工作。只在启用故障日志导出时创建私有 provider 和 exporter。
+依赖 Python 3.10 及更新版本的 `opentelemetry-sdk>=1.45.0,<1.46` 与 `opentelemetry-exporter-otlp-proto-http>=1.45.0,<1.46`，并在同一范围声明 `opentelemetry-exporter-otlp` 汇总包，使镜像中预装的 gRPC exporter 与 SDK 保持同一版本；导出本身只走 HTTP。约束在 1.45 系列，是为了保留 exporter 自有客户端的诊断接口，用于屏蔽可能包含敏感信息的传输错误细节；不修改全局 logger。若这一兼容契约不再满足，则拒绝启动导出，本地历史继续工作。只在启用故障日志导出时创建私有 provider 和 exporter。
 
 导出要求同时启用故障历史的两个开关，并显式配置接收端。在已有本地 OTLP HTTP 接收端的情况下，先为 driver 设置环境，再运行既有训练命令：
 
@@ -142,7 +169,9 @@ export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf
 
 关闭先停止导出接纳，最多等待导出线程 50 ms。`otel_shutdown_dropped` 只统计关闭时放弃的排队记录，不把在途请求计为已丢弃：50 ms 等待结束后，在途结果仍为未知，直到工作线程返回，再按实际结果更新传输计数。未决时不能声称失败或已交付；进程硬退出仍可能丢失它。不因此延长本地 Runtime 的队列排空策略，也不等待 Ray。
 
-`tests/cpu/utils/test_fault_event_otel_exporter.py` 中的第二批验收测试使用真实的本地 OTLP HTTP 接收端解码二进制 protobuf 请求，并检查收到的 `relax.fault.*` 属性。接收端健康检查可使用其文档提供的命令或 `curl`；向 `/v1/logs` 发送普通 JSON 不是有效 OTLP 测试，因为本接口发送的是二进制 `http/protobuf`。
+全局恢复在 Controller 重建前后复用同一个 driver 持有的 provider、已提交记录映射和导出队列。回执和 trace 旁路上下文共用既有健康数据包；完成证据不会创建第二个 exporter。
+
+检查接收端时，使用其文档提供的健康检查命令或 `curl`。向 `/v1/logs` 发送普通 JSON 不是有效的检查方式，因为本接口发送的是二进制 `http/protobuf`。
 
 ## 容量、异常与退出
 
@@ -152,28 +181,6 @@ export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf
 
 HTTP 使用一个服务线程、四个活跃业务槽、有限 backlog／库级并发、2 KiB 请求目标、1 KiB 游标和 128 KiB 响应上限。槽位一直保留到发送及取消清理结束；连接生命周期、请求处理与发送使用三秒期限。关闭 keep-alive，并限制 h11 未完成消息缓冲。这些控制面向受信 loopback，不承诺操作系统 TCP 连接数或整个进程 RSS 的固定上限。
 
+每个相关副本懒创建一个回执 sender，最多八条排队、一条在途，单条编码回执最多 256 字节。业务方法只尝试本地入队。确认缓慢时持续占用同一槽，不启动替代请求或线程。普通调用和关闭采集时不启动 sender。接收端丢失或队列饱和可能使证据保持未验证，但不改变训练结果。
+
 driver 退出时向 Runtime 和 HTTP 发出关闭信号，不等待队列排空，不新增 Ray 等待。硬退出可能丢失末尾记录；缺少记录或完成回执不能被解释为业务失败。
-
-## CPU 验证
-
-在仓库根目录、装有既有测试及 HTTP 依赖的环境执行：
-
-```bash
-PYTHONPATH=. pytest -q \
-  tests/cpu/utils/test_fault_event_store.py \
-  tests/cpu/utils/test_fault_event_runtime.py \
-  tests/cpu/utils/test_fault_query_server.py \
-  tests/cpu/utils/test_fault_publication.py \
-  tests/cpu/utils/test_fault_health_flow.py \
-  tests/cpu/utils/test_health_checker_thread.py \
-  tests/cpu/core/test_fault_local_recovery_cpu.py \
-  tests/cpu/entrypoints/test_fault_events_lifecycle.py \
-  tests/cpu/entrypoints/test_startup_failure.py \
-  tests/cpu/utils/test_fault_event_otel_exporter.py \
-  tests/cpu/utils/test_fault_event_otel_runtime.py \
-  tests/cpu/utils/test_fault_event_trace_context.py \
-  tests/cpu/core/test_fault_event_otel_ray.py
-pre-commit run --all-files
-```
-
-这些用例执行实际 Store／Runtime、健康类、Controller／Service 定义、生产入口和真实 loopback socket。局部恢复测试对模型部署、placement group、HTTP／Ray 传输和进程退出提供明确替身；健康线程回归也实际验证原生线程停止。覆盖 D/U 重试结算、local step 失败、处理选择和开关两侧业务轨迹。真实 Ray 全局重建及操作回执属于下一批，不代表 GPU 数值或完整训练已验收。健康线程修复已经存在于 main。

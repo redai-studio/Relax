@@ -193,8 +193,10 @@ def test_real_ray_source_context_reaches_driver_runtime_and_otlp_once():
         timeout=180,
     )
     output = completed.stdout + completed.stderr
-    assert completed.returncode == 0, output
-    assert "1 passed" in completed.stdout and " skipped" not in completed.stdout, output
+    assert ray.is_initialized() == was_initialized
+    if completed.returncode != 0 or "1 passed" not in completed.stdout or " skipped" in completed.stdout:
+        # pytest.fail keeps the child's report intact; assertion messages are truncated.
+        pytest.fail(f"OTel Ray case failed in its subprocess:\n{output}", pytrace=False)
     if was_initialized:
         marker = {"ray_parent_probe": "still-owned"}
         assert ray.get(ray.put(marker)) == marker
