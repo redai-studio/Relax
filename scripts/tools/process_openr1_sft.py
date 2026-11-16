@@ -36,7 +36,7 @@ def convert_row(row, index: int, image_dir: Path, path_prefix: str):
             ext = (img.format or "JPEG").lower()
             ext = "jpg" if ext == "jpeg" else ext
             name = f"{index:07d}.{ext}" if offset == 0 else f"{index:07d}_{offset}.{ext}"
-            img.save(image_dir / name)
+            (image_dir / name).write_bytes(payload)
         images.append(f"{path_prefix}{name}")
 
     messages = [{"role": turn["role"], "content": turn["content"]} for turn in row["prompt"]]

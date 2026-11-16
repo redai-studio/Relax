@@ -174,12 +174,13 @@ SGLANG_ARGS=(
 )
 
 TRACKING_ARGS=(
-    --tb-experiment-name qwen3.8-flash-next-klx-${now}
-    --use-wandb
-    --wandb-project "${PROJECT_NAME//\//-}"
-    --wandb-group qwen3.8-flash-next-klx-${now}
-    --disable-wandb-random-suffix
-    --no-use-metrics-service
+    # --tb-experiment-name qwen3.8-flash-next-klx-${now}
+    # --use-wandb
+    # --wandb-project "${PROJECT_NAME//\//-}"
+    # --wandb-group qwen3.8-flash-next-klx-${now}
+    # --disable-wandb-random-suffix
+    # --no-use-metrics-service
+    # --wandb-key ${WANDB_KEY}
 )
 
 MISC_ARGS=(
