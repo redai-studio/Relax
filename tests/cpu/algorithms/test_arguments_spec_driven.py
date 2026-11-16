@@ -386,7 +386,7 @@ def test_training_argument_entrypoint_revalidates_yaml_algorithm(arguments_modul
     args = _opd_args()
     args.custom_config_path = _write_yaml(tmp_path, "advantage_estimator: m2po\ncontext_parallel_size: 2\n")
     with pytest.raises(ValueError, match="context-parallel-size 1"):
-        arguments_module.slime_validate_args(args)
+        arguments_module.relax_validate_args(args)
 
 
 def test_yaml_rejects_removed_sft_objective(arguments_module, tmp_path):
@@ -411,7 +411,7 @@ def test_arguments_reject_conflicting_kl_coefficients(arguments_module, tmp_path
         args.kl_loss_coef = 0.2
 
     with pytest.raises(AssertionError, match="Only one of kl_coef and kl_loss_coef can be set"):
-        arguments_module.slime_validate_args(args)
+        arguments_module.relax_validate_args(args)
 
 
 @pytest.mark.parametrize("source", ["cli", "yaml"])
@@ -435,7 +435,7 @@ def test_arguments_sync_ppo_keeps_kl_disabled_after_overrides(
     else:
         args.kl_coef, args.kl_loss_coef, args.use_kl_loss = kl_coef, kl_loss_coef, use_kl_loss
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert args.use_critic is True
     assert args.kl_coef == 0.0

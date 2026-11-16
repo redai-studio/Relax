@@ -44,6 +44,8 @@ def run_sft_predict(actor, rollout_id: int) -> None:
     from relax.backends.megatron.initialize import is_megatron_main_rank
 
     args = actor.args
+    scoring = bool(getattr(args, "custom_rm_path", None) or getattr(args, "rm_type", None))
+    predict_error = None
     # Cache the topology-derived role while Megatron process groups are live.
     # sleep() and update_weights() intentionally destroy the reloadable NCCL
     # groups until wake_up(), so querying mpu ranks during predict would access
@@ -74,9 +76,28 @@ def run_sft_predict(actor, rollout_id: int) -> None:
                 timeout=1800,
             )
             response.raise_for_status()
+            if scoring and response.json().get("status") != "ok":
+                raise RuntimeError(response.json().get("message", "SFT predict reward evaluation failed"))
         except Exception as e:
             logger.warning(f"SFT predict at rollout_id {rollout_id} failed: {e}")
+            predict_error = str(e)
         _t_http = time.monotonic() - _t
+    if scoring:
+        # A colocated judge must release memory before the actor wakes up.
+        # Eligible background judges promise to use independent resources.
+        # Use the HTTP caller rank: with PP it may differ from global rank 0,
+        # which could otherwise offload GenRM while /predict is still scoring.
+        if args.offload_rollout and is_main_rank:
+            try:
+                import ray
+
+                ray.get([manager.offload.remote() for manager in (getattr(actor, "genrm_manager", None) or [])])
+            except Exception as exc:
+                predict_error = f"SFT judge offload failed: {exc}"
+        errors = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(errors, predict_error, group=get_gloo_group())
+        if any(error is not None for error in errors):
+            raise RuntimeError(f"SFT predict/reward failed at step {rollout_id}: {errors}")
     dist.barrier(group=get_gloo_group())
     if args.offload_train:
         _t = time.monotonic()

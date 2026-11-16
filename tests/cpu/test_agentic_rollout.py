@@ -54,7 +54,10 @@ from relax.agentic.session.service import (
     _SessionResultCell,
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
+from relax.engine.lora_versions.manager import SessionKey
 from relax.utils.types import Sample
+from tests.cpu.engine.lora_versions.test_manager import publish
+from tests.cpu.engine.lora_versions.test_runtime import host_with_version, remote
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
@@ -108,25 +111,26 @@ def _runtime_args(**overrides):
     return SimpleNamespace(**base)
 
 
-async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) -> None:
-    calls: list[Sample] = []
+@pytest.mark.parametrize("rollout_mode", ["train", "eval"])
+async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch, rollout_mode) -> None:
+    calls: list[tuple[Sample, bool]] = []
 
-    async def fake_async_rm(args, sample):
+    async def fake_async_rm(args, sample, *, evaluation):
         del args
-        calls.append(sample)
+        calls.append((sample, evaluation))
         return 1.0
 
     monkeypatch.setattr("relax.agentic.pipeline.reward.async_rm", fake_async_rm)
     reward_domain = RewardDomain(
         args=_runtime_args(reward_max_concurrency=1),
-        rollout_mode="train",
+        rollout_mode=rollout_mode,
         group_filter=None,
     )
     sample = Sample(index=0, group_index=0, session_id="sample-0", metadata={})
 
     await reward_domain._score_sample(sample)
 
-    assert calls == [sample]
+    assert calls == [(sample, rollout_mode == "eval")]
     assert sample.reward == 1.0
 
 
@@ -253,18 +257,19 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
     assert second.samples[0][0].teacher_log_probs == [-0.5]
 
 
-async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> None:
-    calls: list[list[Sample]] = []
+@pytest.mark.parametrize("rollout_mode", ["train", "eval"])
+async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch, rollout_mode) -> None:
+    calls: list[tuple[list[Sample], bool]] = []
 
-    async def fake_batched_async_rm(args, samples):
+    async def fake_batched_async_rm(args, samples, *, evaluation):
         del args
-        calls.append(samples)
+        calls.append((samples, evaluation))
         return [float(sample.index) for sample in samples]
 
     monkeypatch.setattr("relax.agentic.pipeline.reward.batched_async_rm", fake_batched_async_rm)
     reward_domain = RewardDomain(
         args=_runtime_args(group_rm=True, reward_max_concurrency=1),
-        rollout_mode="train",
+        rollout_mode=rollout_mode,
         group_filter=None,
     )
     samples = [Sample(index=index, group_index=0, session_id=f"sample-{index}", metadata={}) for index in range(3)]
@@ -275,7 +280,7 @@ async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> 
 
     await reward_domain.score_group(group)
 
-    assert calls == [samples]
+    assert calls == [(samples, rollout_mode == "eval")]
     assert [sample.reward for sample in samples] == [0.0, 1.0, 2.0]
 
 
@@ -524,9 +529,10 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
         abort_count=0,
         messages_delta=[{"role": "assistant", "content": "a"}],
         token_delta=[97],
-        logprob_delta=[-1.0],
-        topk_token_ids_delta=np.array([[97, 98]], dtype=np.int32),
-        topk_logprob_delta=np.array([[-1.0, -2.0]], dtype=np.float32),
+        logprob_delta=[0.0],
+        topk_token_ids_delta=np.array([[97, -1]], dtype=np.int32),
+        topk_logprob_delta=np.array([[0.0, -np.inf]], dtype=np.float32),
+        topk_support_complete_delta=np.array([True]),
     )
     observation = forest.append_obs(
         parent_state_hash=first.state_hash,
@@ -550,11 +556,12 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
         sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
         assert sample.tokens == [10, 11, 97, 20, 21, token]
         assert sample.loss_mask == [1, 0, 0, 1]
-        assert sample.rollout_log_probs == [-1.0, 0.0, 0.0, -0.5]
-        np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 98], [-1, -1], [-1, -1], [token, 100]])
+        assert sample.rollout_log_probs == [0.0, 0.0, 0.0, -0.5]
+        np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, -1], [-1, -1], [-1, -1], [token, 100]])
         np.testing.assert_array_equal(
-            sample.rollout_topk_log_probs, [[-1.0, -2.0], [-np.inf, -np.inf], [-np.inf, -np.inf], [-0.5, -2.5]]
+            sample.rollout_topk_log_probs, [[0.0, -np.inf], [-np.inf, -np.inf], [-np.inf, -np.inf], [-0.5, -2.5]]
         )
+        np.testing.assert_array_equal(sample.rollout_topk_support_complete, [True, False, False, False])
 
 
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:
@@ -646,16 +653,18 @@ def test_partial_resume_request_kind(
         "debt",
         "previous_debt",
         "interrupted_count",
+        "max_staleness",
         "expected",
     ),
     [
-        (False, False, False, 0, 0, 0, True),
-        (False, False, True, 2, 0, 2, False),
-        (True, False, False, 2, 0, 2, False),
-        (True, False, True, 2, 0, 2, True),
-        (True, False, True, 2, 1, 2, False),
-        (True, False, True, 3, 0, 2, False),
-        (True, True, True, 2, 0, 2, False),
+        (False, False, False, 0, 0, 0, 1, True),
+        (False, False, True, 2, 0, 2, 1, False),
+        (True, False, False, 2, 0, 2, 1, False),
+        (True, False, True, 2, 0, 2, 1, True),
+        (True, False, True, 2, 1, 2, 1, False),
+        (True, False, True, 3, 0, 2, 1, False),
+        (True, True, True, 2, 0, 2, 1, False),
+        (True, False, True, 2, 0, 2, 0, False),
     ],
 )
 def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
@@ -665,10 +674,11 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     debt: int,
     previous_debt: int,
     interrupted_count: int,
+    max_staleness: int,
     expected: bool,
 ) -> None:
     pipeline = object.__new__(AgenticResidentPipeline)
-    pipeline.args = SimpleNamespace(fully_async=fully_async)
+    pipeline.args = SimpleNamespace(fully_async=fully_async, max_staleness=max_staleness)
     pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
@@ -676,7 +686,7 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     with patch("relax.agentic.rollout.get_local_rollout_manager", return_value=manager) as get_manager:
         assert pipeline._step_can_close(_StepContext(rollout_id=3, final_backfill=final_backfill)) is expected
 
-    if debt == 0 or not fully_async or final_backfill:
+    if debt == 0 or not fully_async or final_backfill or max_staleness == 0:
         get_manager.assert_not_called()
     else:
         get_manager.assert_called_once_with()
@@ -864,6 +874,9 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
+    adapter._request_endpoints = {}
+    adapter._session_endpoints = {}
+    adapter._session_requests = {}
     adapter.tokenizer = _FakeTokenizer()
     adapter.compiler = SimpleNamespace(processor=None)
     return adapter
@@ -1606,7 +1619,7 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
     session.forest = forest
     ir.parent_state_hash = observation.state_hash
     ir.pending_token_delta = []
-    for token, logprob, finish_type in ((97, -1.0, "abort"), (98, -0.5, "stop")):
+    for token, logprob, finish_type in ((97, 0.0, "abort"), (98, -0.5, "stop")):
         shard._apply_generate_result(
             ir,
             BackendGenerateResult(
@@ -1615,8 +1628,9 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
                 finish_type=finish_type,
                 meta_info={"prompt_tokens": 1},
                 elapsed=0.1,
-                new_topk_token_ids=np.array([[token, 100]], dtype=np.int32),
-                new_topk_log_probs=np.array([[logprob, -2.0]], dtype=np.float32),
+                new_topk_token_ids=np.array([[token, -1 if token == 97 else 100]], dtype=np.int32),
+                new_topk_log_probs=np.array([[logprob, -np.inf if token == 97 else -2.0]], dtype=np.float32),
+                new_topk_support_complete=np.array([True]) if token == 97 else None,
             ),
         )
     ir.pending_status = "completed"
@@ -1625,9 +1639,10 @@ async def test_score_centering_partial_attempts_commit_aligned_candidates() -> N
         leaf_state_hash=session.resp_state_hash_by_request_id[ir.request_id], tokenizer=_FakeTokenizer()
     )
     assert sample.tokens == [112, 97, 98]
-    assert sample.rollout_log_probs == [-1.0, -0.5]
-    np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, 100], [98, 100]])
-    np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[-1.0, -2.0], [-0.5, -2.0]])
+    assert sample.rollout_log_probs == [0.0, -0.5]
+    np.testing.assert_array_equal(sample.rollout_topk_token_ids, [[97, -1], [98, 100]])
+    np.testing.assert_array_equal(sample.rollout_topk_log_probs, [[0.0, -np.inf], [-0.5, -2.0]])
+    np.testing.assert_array_equal(sample.rollout_topk_support_complete, [True, False])
 
 
 @pytest.mark.parametrize("capacity_limit", ["budget", "backend_error", "zero_decode"])
@@ -1889,6 +1904,250 @@ async def test_agentic_503_is_pre_dispatch_before_permit_cleanup_finishes():
     assert task.done() and list(session.queued_irs) == [ir]
     assert ir.backend_started is False
     abort_request.assert_not_awaited()
+
+
+def _managed_shard_session():
+    shard, group, session, ir = _router_recovery_shard()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    host, manager = host_with_version()
+    manager.register_shard("s", "boot")
+    shard._lora_runtime = SimpleNamespace(
+        bind=remote(host.bind),
+        route=remote(host.route),
+        release=remote(host.release),
+        advance_watermark=remote(host.advance_watermark),
+        close_shard=remote(host.close_shard),
+    )
+    shard._lora_release_lock = asyncio.Lock()
+    shard._lora_shard_id = "s"
+    shard._lora_instance_id = "boot"
+    shard._lora_sequence = 1
+    shard._lora_live_sequences = {0}
+    shard._lora_pending_releases = set()
+    shard._session_records = {session.session_id: session}
+    shard.args.agentic_session_lifecycle = False
+    session.lora_key = SessionKey("s", "boot", 0)
+    return shard, group, session, ir, host, manager
+
+
+async def test_managed_session_bind_lost_reply_retries_original_key():
+    shard, _group, session, _ir, host, manager = _managed_shard_session()
+
+    async def lost_reply(key):
+        await host.bind(key)
+        raise TimeoutError("lost bind reply")
+
+    shard._lora_runtime.bind = remote(lost_reply)
+    with pytest.raises(TimeoutError):
+        await shard._bind_lora_session(session)
+    publish(manager, 1)
+    shard._lora_runtime.bind = remote(host.bind)
+    bound = await shard._bind_lora_session(session)
+    assert bound.version_id == 0
+    assert manager.publication(0).session_count == 1
+    assert manager.publication(1).session_count == 0
+
+
+async def test_managed_session_finish_joins_pending_bind_before_release():
+    shard, group, session, ir, host, manager = _managed_shard_session()
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def delayed_bind(key):
+        binding = await host.bind(key)
+        entered.set()
+        await resume.wait()
+        return binding
+
+    shard._lora_runtime.bind = remote(delayed_bind)
+    backend = SimpleNamespace(generate=AsyncMock(), abort_request=AsyncMock(), close_session=AsyncMock())
+    shard._generation_backend = backend
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await entered.wait()
+    closing = asyncio.create_task(shard._finish_session(session, None))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not closing.done()
+    assert manager.publication(0).session_count == 1
+    resume.set()
+    assert await asyncio.wait_for(closing, 2) is None
+    backend.generate.assert_not_awaited()
+    assert manager.publication(0).session_count == 0
+    assert session not in group.sessions
+    assert not shard._lora_live_sequences
+
+
+async def test_managed_release_retry_watermark_preserves_unbound_prelaunch_session():
+    shard, _group, session, _ir, host, manager = _managed_shard_session()
+    # Sequence zero is an older prelaunch Session, not yet bound.
+    session.lora_key = SessionKey("s", "boot", 1)
+    shard._lora_live_sequences = {0, 1}
+    shard._lora_sequence = 2
+    await shard._bind_lora_session(session)
+
+    async def lost_release(key):
+        await host.release(key)
+        raise TimeoutError("lost release reply")
+
+    shard._lora_runtime.release = remote(lost_release)
+    assert isinstance(await shard._release_lora_session(session), TimeoutError)
+    assert shard._lora_pending_releases == {session.lora_key}
+    assert shard._lora_live_sequences == {0, 1}
+    shard._lora_runtime.release = remote(host.release)
+    await shard.lora_heartbeat()
+    assert shard._lora_live_sequences == {0}
+    assert await host.bind(SessionKey("s", "boot", 0)) == session.lora_binding
+    assert manager.publication(0).session_count == 1
+
+
+async def test_managed_session_keeps_version_across_abort_resume_and_tool_gap():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    calls = []
+
+    async def generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            new_tokens=[], new_log_probs=[], finish_type="abort", meta_info={"weight_version": "mutable"}, elapsed=0.1
+        )
+
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    for iteration in range(2):
+        if iteration:
+            publish(manager, 1)
+            session.queued_irs.clear()
+        task = asyncio.create_task(shard._run_ir(session, ir))
+        ir.runner_task = task
+        await task
+    assert len(calls) == 2
+    assert calls[0]["lora_path"] == calls[1]["lora_path"] == session.lora_binding.lora_name
+    assert calls[0]["engine_url"] == calls[1]["engine_url"]
+    assert ir.pending_weight_version_delta == ["0", "0"]
+    assert ir.latest_backend_meta["engine_weight_version"] == "mutable"
+    assert manager.publication(0).session_count == 1
+
+
+async def test_managed_generation_transport_error_aborts_and_ends_session():
+    from relax.agentic.observability import SessionObservation
+
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    session.observation = SessionObservation()
+    backend = SimpleNamespace(
+        generate=AsyncMock(side_effect=httpx.ReadError("accepted then disconnected")),
+        abort_request=AsyncMock(),
+        close_session=AsyncMock(),
+        tokenizer=_FakeTokenizer(),
+    )
+    shard._generation_backend = backend
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await asyncio.wait_for(task, 2)
+    backend.generate.assert_awaited_once()
+    backend.abort_request.assert_awaited_once()
+    assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
+    assert isinstance(session.result_cell.payload, RuntimeGroupError)
+    assert session.session_id not in shard._session_records
+    assert manager.publication(0).session_count == 0
+    observation = session.observation
+    assert not observation.token_count_complete
+    (attempt,) = observation.calls[ir.request_id]["attempts"]
+    assert attempt["status"] == "failed" and attempt["reason_code"] == "ReadError"
+    assert attempt["started_at"] <= attempt["finished_at"]
+
+
+async def test_managed_backend_direct_transport_never_resends_and_cleans_endpoint_maps(monkeypatch):
+    adapter = _backend_adapter(lifecycle_enabled=True)
+    requests = []
+
+    async def transport(request):
+        requests.append(request)
+        raise httpx.ReadError("accepted then disconnected")
+
+    adapter._managed_http = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    monkeypatch.setattr(runtime_mod, "post", AsyncMock(side_effect=AssertionError("must not resend")))
+    try:
+        with pytest.raises(httpx.ReadError):
+            await adapter.generate(
+                input_ids=[1],
+                sampling_params={},
+                session_id="s",
+                request_id="r",
+                lora_path="version",
+                engine_url="http://managed",
+            )
+        assert len(requests) == 1
+        assert json.loads(requests[0].content)["lora_path"] == "version"
+        assert str(requests[0].url) == "http://managed/generate"
+        cleanup = AsyncMock(side_effect=TimeoutError("cleanup unavailable"))
+        monkeypatch.setattr(runtime_mod, "post", cleanup)
+        with pytest.raises(TimeoutError):
+            await adapter.abort_request("r")
+        assert cleanup.call_args.args[0] == "http://managed/abort_request"
+        assert not await adapter.close_session("s", timeout_s=1)
+        assert not adapter._request_endpoints
+        assert not adapter._session_endpoints
+        assert not adapter._session_requests
+    finally:
+        await adapter._managed_http.aclose()
+
+
+async def test_managed_transport_failure_and_concurrent_finish_do_not_wait_on_each_other():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def abort(_request_id):
+        entered.set()
+        await resume.wait()
+
+    shard._generation_backend = SimpleNamespace(
+        generate=AsyncMock(side_effect=httpx.ReadError("accepted then disconnected")),
+        abort_request=abort,
+        close_session=AsyncMock(),
+        tokenizer=_FakeTokenizer(),
+    )
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await entered.wait()
+    finishing = asyncio.create_task(shard._finish_session(session, None))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    resume.set()
+    await asyncio.wait_for(asyncio.gather(runner, finishing), 2)
+    assert manager.publication(0).session_count == 0
+
+
+async def test_managed_shard_shutdown_is_idempotent_after_host_exits():
+    shard, _group, session, _ir, _host, manager = _managed_shard_session()
+    shard._permit_cleanup_tasks = set()
+    shard._generation_backend = SimpleNamespace(
+        abort_request=AsyncMock(),
+        close_session=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    await shard._bind_lora_session(session)
+    await shard.shutdown()
+    assert manager.publication(0).session_count == 0
+    assert shard._lora_runtime is None
+    await shard.shutdown()
+    shard._generation_backend.shutdown.assert_awaited_once()
+
+
+async def test_managed_prepare_gate_does_not_bind_and_failed_fleet_injection_closes_all_shards():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    shard._train_generation_open = False
+    shard._generation_backend = SimpleNamespace(generate=AsyncMock())
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await runner
+    assert session.lora_bind_task is None
+    assert manager.publication(0).session_count == 0
+    handles = [SimpleNamespace(set_lora_runtime=remote(AsyncMock()), shutdown=remote(AsyncMock())) for _ in range(2)]
+    handles[1].set_lora_runtime.remote.side_effect = RuntimeError("failed injection")
+    bindings = [SimpleNamespace(actor_name=f"shard-{i}", handle=handle) for i, handle in enumerate(handles)]
+    domain = RuntimeDomain(Namespace(), "train", bindings, concurrency=1)
+    with pytest.raises(RuntimeError, match="failed to configure"):
+        await domain.bind_lora_runtime(object())
+    for handle in handles:
+        handle.shutdown.remote.assert_awaited_once()
 
 
 async def test_pause_abort_propagates_ordinary_error_after_finalization() -> None:

@@ -121,6 +121,13 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
                 raise ValueError(
                     f"Score Centering custom converter omitted required behavior probability fields: {missing}"
                 )
+            if "rollout_topk_support_complete" not in train_data:
+                log_probs = train_data["rollout_log_probs"]
+                train_data["rollout_topk_support_complete"] = (
+                    torch.zeros_like(log_probs, dtype=torch.bool)
+                    if isinstance(log_probs, torch.Tensor)
+                    else [torch.zeros(len(row), dtype=torch.bool) for row in log_probs]
+                )
         if agentic_obs_enabled(args):
             # Output rows may be reordered/expanded. Missing observation IDs
             # degrade to unknown, while both TQ columns must still be published.
@@ -227,6 +234,12 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             # TQ's numeric nested-list path expects one flat variable-length row
             # per sample. Restore [R, K] at the training ingestion boundary.
             train_data[field] = [getattr(sample, field).reshape(-1).tolist() for sample in samples]
+        train_data["rollout_topk_support_complete"] = [
+            torch.from_numpy(sample.rollout_topk_support_complete)
+            if sample.rollout_topk_support_complete is not None
+            else torch.zeros(sample.response_length, dtype=torch.bool)
+            for sample in samples
+        ]
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]

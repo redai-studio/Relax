@@ -165,6 +165,11 @@ def _create_train_trace_handler(trace_dir: str, worker_name: str) -> Callable[[t
 def _create_torch_profiler(args, name):
     trace_dir = _get_train_trace_dir(args)
     worker_name = f"{name}_{_get_rank_tag()}"
+    if args.profile_with_stack:
+        # Preload the CUPTI monitor to avoid corrupt call stacks (redai-studio/Relax#697).
+        # TODO: Remove after upgrading to PyTorch 2.14.0 or newer (pytorch/pytorch#186359).
+        with torch.profiler.record_function("relax_profiler_warmup"):
+            pass
     return torch.profiler.profile(
         schedule=torch.profiler.schedule(
             # TODO the train_actor and train_log_probs ones may need to have different args to control step

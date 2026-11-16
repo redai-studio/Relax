@@ -83,7 +83,7 @@ def test_offline_loss_selects_dataset_training(arguments_module, loss_type):
     args.per_rank_fetch = True
     args.sft_max_in_flight_steps = 2
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert args.loss_type == ("sft" if loss_type in {"sft_loss", "sft-loss"} else loss_type)
     assert not args.compute_advantages_and_returns
@@ -140,7 +140,7 @@ def test_dpo_initial_reference_and_resume_keep_separate_checkpoint_roles(
         no_load_rng=load_mode == "finetune",
     )
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert args.ref_load == str(reference)
     assert args.load == str(resume if load_mode == "resume" else reference)
@@ -171,7 +171,7 @@ def test_i2i_sft_preserves_native_checkpoint_and_image_batching(arguments_module
         no_load_rng=False,
         finetune=False,
     )
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
     assert args.load == str(tmp_path / "i2i_sft")
     assert args.start_rollout_id == 7
     assert not args.balance_data

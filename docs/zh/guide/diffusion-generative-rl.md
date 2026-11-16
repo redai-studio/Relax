@@ -458,7 +458,7 @@ FlowGRPO 更新里没有 reference model，也没有 KL 项。预检会拒绝任
 **告警**（记录日志，不阻断）：
 
 - `fsdp_trainable_mode='lora'` 但没有 `--fsdp-master-dtype fp32`。
-- `async_save`（DCP save 是同步的；不能硬报错，因为 `slime_validate_args` 要求它与 `--rotate-ckpt` 同时出现）。
+- `async_save`（DCP save 是同步的；不能硬报错，因为 `relax_validate_args` 要求它与 `--rotate-ckpt` 同时出现）。
 - 设了 `lr_decay_style` 而 `--fsdp-lr-scheduler` 仍是 `constant`。
 - `save_debug_train_data`（生成式 actor 产出的是数值索引 + 磁盘 sidecar，不是 token 序列）。
 
