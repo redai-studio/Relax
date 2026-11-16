@@ -388,6 +388,8 @@ Newer Qwen3.8 templates mark assistant turns with native `{% generation %}` tags
 
 ### Evaluation and Predict
 
+**SFT generation scoring, including async judging, requires `--sft-predict-interval N` and a scorer configured through `--custom-rm-path` or `--rm-type`.** The async setting only controls how scoring runs; it does not trigger evaluation by itself. `--eval-interval` only controls loss/PPL evaluation on reference answers and does not call the reward function.
+
 PPL evaluation is controlled by:
 
 ```bash
@@ -408,10 +410,35 @@ Generative prediction is controlled by:
 When `--sft-predict-interval` is set, Relax spins up the Rollout role automatically, and predictions are written under:
 
 ```text
-<save>/predict/predictions_step_<rollout_id>.jsonl
+<save>/predict/predictions_step_<train_step>.jsonl
 ```
 
 Use a longer `--eval-max-response-len` for math reasoning and a shorter value for captioning or image description tasks.
+
+Without a reward configuration, predict only writes the existing `prompt`, `reference`, and `completion` fields. To score generated answers, include the following options in your SFT launch arguments. Also set `--save` and provide exactly one eval source through `--eval-size` or `--eval-prompt-data`:
+
+```bash
+--sft-predict-interval 10
+--custom-rm-path your_module.reward_func
+--eval-reward-key score
+```
+
+You may use `--rm-type` instead for a built-in scorer. The reward receives a `Sample` with the generated response, token IDs, reference in `label`, and source metadata, with `evaluation=True`. SFT training still optimizes supervised loss; these rewards are evaluation metrics only. Neither an eval YAML nor a metadata flag is required. Scored SFT predict currently supports one answer per prompt (`--n-samples-per-eval-prompt 1`); a custom group reward receives a singleton prompt group.
+
+Async judge is enabled by default for eligible scorers. A custom scorer opts in as follows; a synchronous `def` still runs in the separate reward worker pool:
+
+```python
+def reward_func(args, sample, **kwargs):
+    assert kwargs["evaluation"]
+    return {"score": score_answer(sample.response, sample.label)}
+
+
+reward_func.supports_async_eval = True
+```
+
+This declaration requires the scorer to depend only on the supplied `Sample` and independent CPU or judge resources. It must return the actual score, and must not depend on live policy engines or a GenRM service that is offloaded for training. Built-in `remote_rm` is eligible automatically; other scorers without this declaration run inline. Use `--disable-eval-async-judge` to force inline scoring.
+
+Weight synchronization and answer generation still block the SFT predict cycle. Only eligible scoring runs in the background while training continues; normal shutdown waits for pending scores and propagates failures. Results are logged as `eval/sft_predict`, at the original completed training step, and saved to `<save>/rollout_result/eval/<train_step>.jsonl`. With `--save-debug-rollout-data`, the existing eval debug dump is also written. `--eval-interval` continues to control the separate loss/PPL evaluation.
 
 ### Parallelism and Resources
 

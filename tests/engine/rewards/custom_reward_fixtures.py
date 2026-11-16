@@ -25,6 +25,39 @@ async def async_pid_reward(args: Any, sample: Any, **kwargs: Any) -> dict[str, i
     return {"pid": os.getpid(), "index": sample.index}
 
 
+def _evaluation_result(sample: Any, evaluation: bool | None) -> Any:
+    if isinstance(sample, list):
+        return [_evaluation_result(item, evaluation) for item in sample]
+    return {"index": sample.index, "evaluation": evaluation}
+
+
+def sync_evaluation_reward(args: Any, sample: Any, *, evaluation: bool = False) -> Any:
+    del args
+    return _evaluation_result(sample, evaluation)
+
+
+async def async_evaluation_reward(args: Any, sample: Any, *, evaluation: bool = False) -> Any:
+    return sync_evaluation_reward(args, sample, evaluation=evaluation)
+
+
+def sync_evaluation_kwargs_reward(args: Any, sample: Any, **kwargs: Any) -> Any:
+    del args
+    return _evaluation_result(sample, kwargs["evaluation"])
+
+
+async def async_evaluation_kwargs_reward(args: Any, sample: Any, **kwargs: Any) -> Any:
+    return sync_evaluation_kwargs_reward(args, sample, **kwargs)
+
+
+def sync_legacy_reward(args: Any, sample: Any) -> Any:
+    del args
+    return _evaluation_result(sample, None)
+
+
+async def async_legacy_reward(args: Any, sample: Any) -> Any:
+    return sync_legacy_reward(args, sample)
+
+
 async def async_batch_pid_reward(args: Any, samples: list[Any], **kwargs: Any) -> list[dict[str, int]]:
     del args, kwargs
     pid = os.getpid()

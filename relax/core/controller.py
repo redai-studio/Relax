@@ -1235,14 +1235,15 @@ class Controller:
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
         self._validate_gpu_resources(roles_to_create, actor_rollout_colocate, actor_rollout_pg_roles)
 
-        shared_pg = None
-        if actor_rollout_colocate and not self.config.hybrid:
+        if teacher_pg is not None:
             shared_pg = teacher_pg
-            if shared_pg is None:
-                shared_pg = create_placement_group(
-                    num_gpus=self.config.resource.get(ROLES.actor)[1],
-                    node_group_affinity=self.config.enable_affinity,
-                )
+        elif actor_rollout_colocate and not self.config.hybrid:
+            shared_pg = create_placement_group(
+                num_gpus=self.config.resource[ROLES.actor][1],
+                node_group_affinity=self.config.enable_affinity,
+            )
+        else:
+            shared_pg = None
 
         service_args = [
             (
@@ -1400,6 +1401,17 @@ class Controller:
 
                 try:
                     await asyncio.gather(*task_refs)
+                    if (
+                        not getattr(self.config, "disable_eval_async_judge", False)
+                        and ROLES.rollout in self.serve_dict
+                    ):
+                        rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
+                        # Register a thread-safe future so restart can unblock
+                        # this wait before shutting down the Ray connection.
+                        drain_future = rollout_manager.drain_eval_judges.remote().future()
+                        with self._pending_task_refs_lock:
+                            self._pending_task_refs.append(drain_future)
+                        await asyncio.wrap_future(drain_future)
                     logger.info("Service task completed successfully")
                 except asyncio.CancelledError as e:
                     if not self._restarting:

@@ -22,6 +22,7 @@ def wiring(monkeypatch):
     manager = create_test_manager(servers={"default": server})
     manager.args.use_agentic_rollout = True
     manager.args.use_fault_tolerance = False
+    manager._eval_judge = None
     manager._lora_runtime = None
     manager._lora_configuring = False
     manager._lora_training_config = None

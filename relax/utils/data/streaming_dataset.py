@@ -649,7 +649,7 @@ class PrefetchBuffer:
         stop_event = self._stop
         self._thread = threading.Thread(target=self._run, args=(stop_event,), daemon=True, name="prefetch-worker")
         self._thread.start()
-        logger.info(f"PrefetchBuffer: started prefetching {len(indices)} samples")
+        logger.debug(f"PrefetchBuffer: started prefetching {len(indices)} samples")
 
     def get(self, idx: int) -> Optional[Sample]:
         """Return the sample for *idx*.
@@ -1017,13 +1017,15 @@ class StreamingDataset(BaseDataset):
         """
         self.index_manager.shuffle(epoch_id)
         self.epoch_id = epoch_id
-        # Trigger prefetch with the remaining upcoming index order
+        self._reset_prefetch_window()
+
+    def _reset_prefetch_window(self) -> None:
         if self._prefetch_buffer is not None and self.index_manager.indices is not None:
             remaining = self.index_manager.indices[self.index_manager.position :]
-            self._prefetch_buffer.set_index_order(list(remaining))
+            self._prefetch_buffer.set_index_order(remaining)
             logger.info(
-                f"Prefetch: triggered for epoch {epoch_id}, "
-                f"{len(remaining)} indices remaining (position={self.index_manager.position})"
+                f"Prefetch window: epoch={self.index_manager.current_epoch}, "
+                f"position={self.index_manager.position}, remaining={len(remaining)}"
             )
 
     def _record_processed(self, result: tuple[Optional[Sample], bool]) -> Optional[Sample]:
@@ -1098,16 +1100,8 @@ class StreamingDataset(BaseDataset):
             indices, epoch_crossed = self.index_manager.get_next_indices(1)
             if epoch_crossed and not crossed_epoch:
                 crossed_epoch = True
-                # IndexManager already shuffled the new epoch internally.
-                # Re-trigger prefetch immediately for the remaining indices
-                # so subsequent get() calls hit the cache instead of falling
-                # back to synchronous loading.
-                remaining = self.index_manager.indices[self.index_manager.position :]
-                self._prefetch_buffer.set_index_order(list(remaining))
-                logger.info(
-                    f"Prefetch: epoch crossing detected, re-triggered with "
-                    f"{len(remaining)} indices (epoch={self.index_manager.current_epoch})"
-                )
+                # IndexManager has shuffled the new epoch, but prefetch still follows the old order.
+                self._reset_prefetch_window()
             idx = indices[0]
 
             sample = self._prefetch_buffer.get(idx)
@@ -1160,7 +1154,8 @@ class StreamingDataset(BaseDataset):
 
             attempts += len(indices)
             for idx in indices:
-                sample = self._get_sample(idx, pending.pop(idx, None))
+                future = pending.pop(idx, None)
+                sample = self[idx] if future is None else self._get_sample(idx, future)
                 if sample is not None:
                     samples.append(sample)
 
