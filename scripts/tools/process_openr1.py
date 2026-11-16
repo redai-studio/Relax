@@ -6,8 +6,6 @@ import hashlib
 import io
 import json
 import re
-import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -33,63 +31,6 @@ def convert_dataset(input_file, output_file):
     df_out = pd.DataFrame(converted)
     df_out.to_parquet(output_file, index=False)
     print(len(df), len(df_out))
-
-
-def prepare_sft(source: Path, output: Path) -> None:
-    """Preserve OpenR1MM solutions and extract stable image references for
-    SFT."""
-    output.mkdir(parents=True, exist_ok=True)
-    images = output / "images"
-    images.mkdir(exist_ok=True)
-    rows = pq.read_table(source).to_pylist()
-    if not rows:
-        raise ValueError("No samples in SFT source")
-
-    def extract_image(row: dict) -> Path:
-        value = row["image"]["bytes"]
-        with Image.open(io.BytesIO(value)) as image:
-            image.verify()
-        path = images / (hashlib.sha256(value).hexdigest() + ".img")
-        if not path.exists():
-            path.write_bytes(value)
-        return path.resolve()
-
-    # Image extraction is dominated by shared-filesystem metadata latency.
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        paths = list(executor.map(extract_image, rows))
-    lengths = []
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=output, prefix=".sft-", delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            for index, (row, path) in enumerate(zip(rows, paths, strict=True)):
-                problem, solution = row["problem"].strip(), row["solution"].strip()
-                if not problem or not solution:
-                    raise ValueError(f"Empty problem or solution at row {index}")
-                record = {
-                    "id": f"openr1mm-{index}",
-                    "messages": [
-                        {"role": "user", "content": "<image>\n" + problem},
-                        {"role": "assistant", "content": solution},
-                    ],
-                    "images": [str(path)],
-                }
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-                lengths.append(len(solution))
-        temporary.replace(output / "sft.jsonl")
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    report = {
-        "source": str(source.resolve()),
-        "rows": len(lengths),
-        "assistant_field": "solution",
-        "solution_characters_min": min(lengths),
-        "solution_characters_max": max(lengths),
-    }
-    (output / "conversion.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 def download_eval(output: Path, mathvista_revision: str, mmmu_revision: str) -> None:
@@ -233,7 +174,7 @@ def prepare_eval(source: Path, train: Path, output: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Prepare OpenR1MM training or MathVista/MMMU evaluation data")
-    parser.add_argument("--mode", choices=("train", "sft", "download-eval", "prepare-eval"), default="train")
+    parser.add_argument("--mode", choices=("train", "download-eval", "prepare-eval"), default="train")
     parser.add_argument("--input-dir", type=Path, help="Original OpenR1MM training parquet (train mode)")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output parquet for train; directory for eval")
     parser.add_argument("--source", type=Path, help="Downloaded eval source directory (default: OUTPUT/source)")
@@ -241,13 +182,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--mathvista-revision", default="2b6ad69445fbb5695c9b165475e8decdbeb97747")
     parser.add_argument("--mmmu-revision", default="876ce5cb130f7f7e290ce4d9984357737d4db5cf")
     args = parser.parse_args(argv)
-    if args.mode in ("train", "sft"):
+    if args.mode == "train":
         if args.input_dir is None:
             parser.error("--input-dir is required in train mode")
-        if args.mode == "sft":
-            prepare_sft(args.input_dir, args.output_dir)
-        else:
-            convert_dataset(args.input_dir, args.output_dir)
+        convert_dataset(args.input_dir, args.output_dir)
     elif args.mode == "download-eval":
         download_eval(args.output_dir, args.mathvista_revision, args.mmmu_revision)
     else:

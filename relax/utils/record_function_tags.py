@@ -28,84 +28,6 @@ _checkpoint_owner: ContextVar[str | None] = ContextVar("rcd_checkpoint_owner", d
 _node_backward_enabled = False
 _grouped_checkpoint_layers = False
 _NODE_METADATA_KEY = "relax_rcd_node_ranges_v1"
-_profile_step = -1
-_microbatch: ContextVar[int | None] = ContextVar("rcd_microbatch", default=None)
-_moe_owner: ContextVar[str] = ContextVar("rcd_moe_owner", default="unknown")
-_mok_schedule_records: list[dict[str, Any]] = []
-
-
-def _wrap_mok_diagnostics() -> None:
-    """Tag optional MoK calls and retain only tiny schedule counters for
-    export."""
-    from mok import functional
-
-    for method, label in (("build_schedule", "Schedule"), ("forward", "Forward"), ("backward", "Backward")):
-        original = getattr(functional, method)
-        if getattr(original, "_relax_rcd_installed", False):
-            continue
-
-        def make_wrapper(original: Any, label: str) -> Any:
-            @wraps(original)
-            def tagged(*args: Any, **kwargs: Any) -> Any:
-                with torch.profiler.record_function(f"[RCD]MoK{label}|{_moe_owner.get()}"):
-                    result = original(*args, **kwargs)
-                if label == "Schedule" and torch.autograd._profiler_enabled():
-                    workspace = args[0] if args else kwargs["workspace"]
-                    config = args[1] if len(args) > 1 else kwargs["config"]
-                    # No device reads or copies in the measured path. Schedule
-                    # owns these small tensors; keep references until export.
-                    _mok_schedule_records.append(
-                        {
-                            "step": _profile_step,
-                            "microbatch": _microbatch.get(),
-                            "phase": _phase.get(),
-                            "owner": _moe_owner.get(),
-                            "local_input_tokens": workspace.num_local_tokens,
-                            "ep_size": workspace.ep_size,
-                            "topk": workspace.topk,
-                            "macrobatch_size": config.macrobatch_size,
-                            "minibatch_size": config.minibatch_size,
-                            "fwd_num_comm_sms": config.fwd_num_comm_sms,
-                            "bwd_num_comm_sms": config.bwd_num_comm_sms,
-                            "num_tokens_tensor": result.num_tokens,
-                            "tokens_per_expert_tensor": result.tokens_per_expert,
-                        }
-                    )
-                return result
-
-            tagged._relax_rcd_installed = True
-            return tagged
-
-        setattr(functional, method, make_wrapper(original, label))
-
-
-def export_profile_diagnostics(trace_dir: str, worker_name: str) -> None:
-    """Read schedule counters after capture, outside the measured training
-    path."""
-    from pathlib import Path
-
-    if not _mok_schedule_records:
-        return
-    records = list(_mok_schedule_records)
-    # The profiler has stopped. Batched device reads here cannot add CPU/GPU
-    # synchronizations to the captured forward/backward hot path.
-    totals = torch.cat([row["num_tokens_tensor"].reshape(-1) for row in records]).cpu().tolist()
-    lengths = [row["tokens_per_expert_tensor"].numel() for row in records]
-    experts = torch.cat([row["tokens_per_expert_tensor"].reshape(-1) for row in records]).cpu().tolist()
-    exported = []
-    offset = 0
-    for row, total, length in zip(records, totals, lengths):
-        values = {key: value for key, value in row.items() if not key.endswith("_tensor")}
-        values.update(
-            scheduled_routed_rows=total,
-            tokens_per_expert=experts[offset : offset + length],
-            macrobatches=(total + row["macrobatch_size"] - 1) // row["macrobatch_size"],
-        )
-        exported.append(values)
-        offset += length
-    output = Path(trace_dir) / f"{worker_name}.mok-schedules.json"
-    output.write_text(json.dumps({"read_after_capture": True, "records": exported}))
-    _mok_schedule_records.clear()
 
 
 def _tensor_nodes(value: Any) -> set[Any]:
@@ -150,9 +72,6 @@ def _tag_backward_nodes(boundaries: set[Any], outputs: Any, label: str) -> None:
                 # Children register first; enclosing parents append on return.
                 # Reverse registration order reconstructs outer-to-inner scopes.
                 for name in reversed(state["labels"]):
-                    if name.startswith("[RCD]MoKbwd|"):
-                        token = _moe_owner.set(name.split("|", 1)[1])
-                        stack.callback(_moe_owner.reset, token)
                     stack.enter_context(torch.profiler.record_function(name))
                 state["active"].setdefault(threading.get_ident(), []).append(stack)
 
@@ -184,15 +103,7 @@ def _wrap_checkpoint_owner(module: Any, suffix: str) -> None:
     module._checkpointed_forward = tagged
 
 
-def _wrap_forward(
-    module: Any,
-    kind: str,
-    suffix: str,
-    *,
-    layer: bool = False,
-    method: str = "forward",
-    cached_outputs: tuple[str, ...] = (),
-) -> None:
+def _wrap_forward(module: Any, kind: str, suffix: str, *, layer: bool = False, method: str = "forward") -> None:
     original = getattr(module, method)
 
     @wraps(original)
@@ -205,9 +116,7 @@ def _wrap_forward(
         node_scope = not layer or _grouped_checkpoint_layers or (_checkpoint_owner.get() or "").startswith("[RCD]MTP")
         record_nodes = _node_backward_enabled and torch.is_grad_enabled() and node_scope
         # Snapshot before forward: an in-place operation can replace input.grad_fn.
-        cached_inputs = tuple(getattr(module, name, None) for name in cached_outputs)
-        boundaries = _tensor_nodes((args, kwargs, cached_inputs)) if record_nodes else set()
-        moe_token = _moe_owner.set(suffix) if kind == "MoK" else None
+        boundaries = _tensor_nodes((args, kwargs)) if record_nodes else set()
         try:
             with torch.profiler.record_function(f"[RCD]{kind}{phase}|{suffix}"):
                 result = original(*args, **kwargs)
@@ -215,12 +124,9 @@ def _wrap_forward(
             # Legacy MTP owns that scope instead, so its inner QSA/GDN gets node
             # fragments to avoid mislabelling projection/norm as pure layer bwd.
             if record_nodes:
-                cached_results = tuple(getattr(module, name, None) for name in cached_outputs)
-                _tag_backward_nodes(boundaries, (result, cached_results), f"[RCD]{kind}bwd|{suffix}")
+                _tag_backward_nodes(boundaries, result, f"[RCD]{kind}bwd|{suffix}")
             return result
         finally:
-            if moe_token is not None:
-                _moe_owner.reset(moe_token)
             if token is not None:
                 _layer_depth.reset(token)
 
@@ -294,20 +200,14 @@ def _wrap_pipeline_steps(schedules: Any, pp_rank: int) -> None:
 
     @wraps(original_forward)
     def forward(*args: Any, **kwargs: Any) -> Any:
-        global _profile_step
         bound = signature.bind(*args, **kwargs)
         mb = bound.arguments.get("current_microbatch")
         if mb is None:
             raise RuntimeError("RCD pipeline tags require current_microbatch")
         if mb == 0:
             pending.clear()  # Also handles a preceding forward-only evaluation.
-            _profile_step += 1
-        token = _microbatch.set(mb)
-        try:
-            with torch.profiler.record_function(f"[RCD]mb{mb}fwd|PP{pp_rank}"):
-                result = original_forward(*args, **kwargs)
-        finally:
-            _microbatch.reset(token)
+        with torch.profiler.record_function(f"[RCD]mb{mb}fwd|PP{pp_rank}"):
+            result = original_forward(*args, **kwargs)
         pending.append(mb)
         return result
 
@@ -316,12 +216,8 @@ def _wrap_pipeline_steps(schedules: Any, pp_rank: int) -> None:
         if not pending:
             raise RuntimeError("RCD pipeline backward has no matching forward microbatch")
         mb = pending.popleft()
-        token = _microbatch.set(mb)
-        try:
-            with torch.profiler.record_function(f"[RCD]mb{mb}bwd|PP{pp_rank}"):
-                return original_backward(*args, **kwargs)
-        finally:
-            _microbatch.reset(token)
+        with torch.profiler.record_function(f"[RCD]mb{mb}bwd|PP{pp_rank}"):
+            return original_backward(*args, **kwargs)
 
     schedules.forward_step, schedules.backward_step = forward, backward
     schedules._relax_rcd_installed = True
@@ -354,10 +250,6 @@ def _instrument_chunks(chunks: Any, rank_suffix: str) -> list[dict[str, Any]]:
                 kind = "Attn"
             elif cls == "MoELayer":
                 kind = "MoE"
-            elif cls == "MoKMegakernel":
-                kind = "MoK"
-            elif cls == "SharedExpertMLP":
-                kind = "SharedExpert"
             elif leaf in ("self_attention_hyper_connection", "mlp_hyper_connection"):
                 kind = "ResidualPre"
             elif cls == "QSAIndexer":
@@ -410,40 +302,6 @@ def _instrument_chunks(chunks: Any, rank_suffix: str) -> list[dict[str, Any]]:
                     else "node fragments",
                 }
             )
-            if cls == "SharedExpertMLP":
-                # Overlap bypasses forward() and stages tensors in module
-                # caches. Tag each real method and only its newly created graph.
-                for method in (
-                    "pre_forward_comm",
-                    "linear_fc1_forward_and_act",
-                    "linear_fc2_forward",
-                    "post_forward_comm",
-                    "get_output",
-                ):
-                    _wrap_forward(
-                        module,
-                        "SharedExpert",
-                        suffix + "|" + method,
-                        method=method,
-                        cached_outputs=(
-                            "cached_fc1_input",
-                            "cached_fc2_input",
-                            "cached_fc2_output",
-                            "cached_output",
-                            "gate_score",
-                        ),
-                    )
-                    manifest.append(
-                        {
-                            "chunk": chunk_index,
-                            "path": path + "." + method,
-                            "class": cls,
-                            "kind": "SharedExpert",
-                            "suffix": suffix + "|" + method,
-                            "phases": ["fwd", "recomp", "bwd"],
-                            "backward_scope": "node fragments",
-                        }
-                    )
             if is_layer:
                 for method, part in (("_apply_self_attn_bda_step", "attn"), ("_apply_mlp_bda_step", "mlp")):
                     if hasattr(module, method):
@@ -521,8 +379,6 @@ def install_record_function_tags(args: Any, model_chunks: Any) -> list[dict[str,
     _node_backward_enabled = True
     _grouped_checkpoint_layers = args.recompute_num_layers > 1
     manifest = _instrument_chunks(model_chunks, suffix)
-    if any(item["kind"] == "MoK" for item in manifest):
-        _wrap_mok_diagnostics()
     if not any(item["kind"] in ("QSA", "GDN") for item in manifest):
         raise RuntimeError("RCD found no QSA/GDN transformer layers on selected rank")
     _wrap_checkpoint(tp_random.CheckpointFunction)

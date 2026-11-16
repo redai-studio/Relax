@@ -229,12 +229,12 @@ assert m.version('sglang') == '0.5.21' and m.version('tilelang') == '0.1.12', \
 # Preserve CP padding and head72 fallback without rebuilding the SGLang kernel.
 RUN --mount=type=bind,source=docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch,target=/tmp/te-patches/2.18.0-cp-padding-no-host-sync.patch \
     --mount=type=bind,source=docker/patch/transformer_engine/2.18.0-blackwell-fa4-head-dim.patch,target=/tmp/te-patches/2.18.0-blackwell-fa4-head-dim.patch \
-    --mount=type=bind,source=docker/patch/transformer_engine/2.18.0-fused-adam-bounded-tensor-lists.patch,target=/tmp/te-patches/2.18.0-fused-adam-bounded-tensor-lists.patch \
+    --mount=type=bind,source=docker/mok/patches/transformer-engine-fused-adam-bounded.patch,target=/tmp/te-patches/fused-adam-bounded.patch \
     python -c "import importlib.metadata as m; assert m.version('transformer-engine') == '2.18.0'" && \
     cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-cp-padding-no-host-sync.patch && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-blackwell-fa4-head-dim.patch && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-fused-adam-bounded-tensor-lists.patch
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/fused-adam-bounded.patch
 
 ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \

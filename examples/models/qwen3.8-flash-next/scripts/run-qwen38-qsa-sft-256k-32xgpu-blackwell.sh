@@ -15,7 +15,6 @@
 # Initialize from an HF checkpoint containing the MTP weights.
 # Default: one epoch, GBS4096, hold out 512 rows without periodic evaluation.
 # Keep SAVE_DIR/EXP_NAME stable to resume; save at completion and retain 2.
-# SAVE_CHECKPOINTS=0 disables checkpoint writes, including the final step.
 # Usage inside the unified image on an existing Ray cluster:
 # MODEL_DIR=... DATA_DIR=... SAVE_DIR=... MEGATRON=... RELAX_SKIP_CLUSTER_CLEANUP=1 \
 #   bash scripts/entrypoint/ray-job.sh \
@@ -63,14 +62,8 @@ print(":".join(dict.fromkeys(paths)))
 PYLIB
 )
 export LD_LIBRARY_PATH
-SFT_TRAINING_MODE="${SFT_TRAINING_MODE:-sft}"
-case "${SFT_TRAINING_MODE}" in
-    sft) DEFAULT_MAX_TOKENS_PER_GPU=131072 ;;
-    cpt) DEFAULT_MAX_TOKENS_PER_GPU=262144 ;;
-    *) echo "SFT_TRAINING_MODE must be sft or cpt" >&2; exit 2 ;;
-esac
 SEQ_LENGTH="${SEQ_LENGTH:-262144}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${DEFAULT_MAX_TOKENS_PER_GPU}}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-131072}"
 if [[ ! "${SEQ_LENGTH}" =~ ^[1-9][0-9]*$ || ! "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]] ||
     (( MAX_TOKENS_PER_GPU > SEQ_LENGTH )); then
     echo "Require positive MAX_TOKENS_PER_GPU <= SEQ_LENGTH for the custom SFT sample limit" >&2
@@ -111,7 +104,7 @@ ENV_ARGS=(
     "MEGATRON=${MEGATRON}"
     "RELAX=${RELAX}"
     PYTHONNOUSERSITE=1
-    "CUDA_DEVICE_MAX_CONNECTIONS=${QWEN38_CUDA_DEVICE_MAX_CONNECTIONS:-32}"
+    CUDA_DEVICE_MAX_CONNECTIONS=32
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
     TOKENIZERS_PARALLELISM=false
     RELAX_QWEN38_QSA_FUSED_ATTENTION=0
@@ -254,19 +247,23 @@ CKPT_ARGS=(
     --megatron-to-hf-mode bridge
     --num-epoch "${NUM_EPOCH:-1}"
     --load "${SAVE_DIR}/${EXP_NAME}"
+    --save "${SAVE_DIR}/${EXP_NAME}"
+    --save-interval "${SAVE_INTERVAL}"
     --ckpt-format torch_dist
     --max-actor-ckpt-to-keep 2
 )
-case "${SAVE_CHECKPOINTS:-1}" in
-    1) CKPT_ARGS+=(--save "${SAVE_DIR}/${EXP_NAME}" --save-interval "${SAVE_INTERVAL}") ;;
-    0) ;;
-    *) echo "SAVE_CHECKPOINTS must be 0 or 1" >&2; exit 2 ;;
-esac
 
 SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
     --eval-size "${EVAL_SIZE:-512}"
+    --input-key messages
+    --tool-key tools
+    --apply-chat-template
+    --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true,"add_non_thinking_prefix":false}'
+    --sft-invalid-multimodal-strategy skip
+    --sft-oversize-strategy custom
+    --sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
     --calculate-per-token-loss
     # The hook reads --seq-length after multimodal expansion. Do not set
     # rollout-max-context-len: this recipe deliberately permits long singletons.
@@ -288,29 +285,10 @@ SFT_ARGS=(
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
     --mtp-detach-paths none
+    --multimodal-keys '{"image":"images"}'
+    --image-max-token-num "${IMAGE_MAX_TOKENS:-128}"
+    --sft-image-preprocess-on-rank
 )
-if [[ "${SFT_TRAINING_MODE}" == cpt ]]; then
-    SFT_ARGS+=(
-        --sft-training-mode cpt
-        --sft-cpt-template raw
-        --input-key text
-        --tool-key ''
-        --sft-oversize-strategy skip
-    )
-else
-    SFT_ARGS+=(
-        --input-key messages
-        --tool-key tools
-        --apply-chat-template
-        --apply-chat-template-kwargs '{"add_generation_prompt":false,"preserve_thinking":true,"add_non_thinking_prefix":false}'
-        --sft-invalid-multimodal-strategy skip
-        --sft-oversize-strategy custom
-        --sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
-        --multimodal-keys '{"image":"images"}'
-        --image-max-token-num "${IMAGE_MAX_TOKENS:-128}"
-        --sft-image-preprocess-on-rank
-    )
-fi
 
 OPTIMIZER_ARGS=(
     --optimizer adam
@@ -363,7 +341,7 @@ TRAIN_ARGS=(
     --actor-num-gpus-per-node 8
     --sft-max-in-flight-steps 4
     # The first 256k step can exceed the default 30-minute queue timeout.
-    --sft-tq-timeout-minutes "${SFT_TQ_TIMEOUT_MINUTES:-120}"
+    --sft-tq-timeout-minutes 120
     --num-data-storage-units 2
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"

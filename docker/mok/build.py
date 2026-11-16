@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Build the pinned MoK wheel and apply the experiment's final Megatron
-adapter."""
+"""Build the pinned MoK wheel and apply the Megatron adapter."""
 
 import argparse
 import hashlib
@@ -32,12 +31,6 @@ def check_files(root: Path, expected: dict[str, str]) -> None:
 
 def check_megatron(root: Path, spec: dict, phase: str) -> None:
     check_files(root, spec[phase + "_sha256"])
-    files = {path.relative_to(root).as_posix(): digest(path) for path in root.rglob("*.py")}
-    encoded = json.dumps(sorted(files.items()), separators=(",", ":")).encode()
-    checksum = hashlib.sha256(encoded).hexdigest()
-    inventory = spec["python_inventory"]
-    if len(files) != inventory["count"] or checksum != inventory[phase + "_sha256"]:
-        raise RuntimeError(f"Wrong Megatron image snapshot: {len(files)} Python files, tree SHA256 {checksum}")
 
 
 def run(*command: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -84,7 +77,7 @@ def main() -> None:
     args = parser.parse_args()
     manifest = json.loads((PACKAGE / "manifest.json").read_text())
     check_megatron(args.megatron_root, manifest["megatron"], "before")
-    print("Exact original Megatron baseline verified (1509 Python files).", flush=True)
+    print("Megatron patch-target fingerprints verified.", flush=True)
     if args.check_base_only:
         return
     if args.mok_root is None:
