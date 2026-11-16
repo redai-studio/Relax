@@ -32,7 +32,6 @@ from relax.engine.sft.dataset.gemma4_chat_template_patch import (
     try_patch_gemma4_thinking,
 )
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
-    _qwen38_open_thinking_text,
     is_qwen38_chat_template,
     split_qwen38_leading_thinking,
     try_patch_qwen_chat_template,
@@ -75,7 +74,6 @@ def _to_chat_messages(
     for m in sample.messages:
         content = m.content
         reasoning_content = m.reasoning_content
-        open_thinking = None
         if normalize_deepseek_reasoning and m.role == "assistant" and reasoning_content is None:
             reasoning_content, content = split_embedded_thinking(content)
         if normalize_qwen38_reasoning and m.role == "assistant":
@@ -88,17 +86,9 @@ def _to_chat_messages(
                 and isinstance(content[0].get("text"), str)
                 else None
             )
-            open_thinking = _qwen38_open_thinking_text(content)
-            if open_thinking is not None:
-                if reasoning_content is not None or m.tool_calls:
-                    raise ValueError("Qwen3.8 open thinking cannot be combined with reasoning_content or tool_calls")
-                reasoning_content = open_thinking[len("<think>") :]
-                content = "" if text_item is None else [{**text_item, "text": ""}]
-                split = None
-            else:
-                split = split_qwen38_leading_thinking(
-                    content if isinstance(content, str) else text_item["text"] if text_item is not None else ""
-                )
+            split = split_qwen38_leading_thinking(
+                content if isinstance(content, str) else text_item["text"] if text_item is not None else ""
+            )
             if split is not None:
                 if reasoning_content is not None:
                     raise ValueError("Qwen3.8 assistant has both reasoning_content and a leading <think> block")
@@ -107,8 +97,6 @@ def _to_chat_messages(
         d: dict[str, Any] = {"role": m.role, "content": content}
         if reasoning_content is not None:
             d["reasoning_content"] = reasoning_content
-        if open_thinking is not None:
-            d["_relax_qwen38_open_thinking"] = open_thinking
         if m.tool_calls is not None:
             d["tool_calls"] = m.tool_calls
         if include_tool_correlation and m.tool_call_id is not None:

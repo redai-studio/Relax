@@ -7,10 +7,8 @@ Megatron process groups or a real processor: background prefetch stashing,
 foreground re-attachment before get_batch, and failure surfacing.
 """
 
-import gc
 import multiprocessing
 import time
-import weakref
 from argparse import Namespace
 from datetime import timedelta
 from pathlib import Path
@@ -21,7 +19,7 @@ import torch
 import torch.distributed as dist
 
 from relax.engine.sft import image_prefetch as image_prefetch_module
-from relax.engine.sft.image_prefetch import LazySFTImageInput, SFTImagePrefetch, resolve_sft_image_micro_batch
+from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
 
 
@@ -74,9 +72,12 @@ def _resolve_failure_worker(rank: int, rendezvous: str, output_dir: str) -> None
         "multimodal_train_inputs": [{"image_grid_thw": torch.tensor([[1, 2, 4]])}],
     }
     if rank == 0:
-        # Rollout preparation still agrees on metadata errors before training;
-        # pixel decoding itself is deliberately deferred to microbatches.
-        rollout_data["multimodal_train_inputs"][0] = None
+        from relax.utils.data import image_rebuild
+
+        def fail_rebuild(*_args, **_kwargs):
+            raise ValueError("vision rebuild failed")
+
+        image_rebuild.build_batch_image_features = fail_rebuild
     else:
         # Model a DP replica that polls an empty partition before receiving its
         # cached slice and joining the actor-world failure agreement.
@@ -92,16 +93,16 @@ def _resolve_failure_worker(rank: int, rendezvous: str, output_dir: str) -> None
     Path(output_dir, f"rank-{rank}.txt").write_text(outcome)
 
 
-def test_background_prefetch_keeps_only_metadata_for_vision_rank(monkeypatch):
+def test_background_prefetch_stashes_rebuilt_pixels_for_vision_rank(monkeypatch):
     actor = _actor(vision=True)
     descriptor = _descriptor()
+    features = {"pixel_values": torch.zeros(4, 3), "image_grid_thw": torch.tensor([[1, 2, 4]])}
     monkeypatch.setattr(
         actor,
         "fetch_data",
         lambda **_kwargs: [[{SFT_IMAGE_REFS_FIELD: [descriptor]}, "meta"], 0.5],
     )
-    builder = MagicMock(side_effect=AssertionError("whole-rollout prefetch must not decode image pixels"))
-    monkeypatch.setattr("relax.utils.data.image_rebuild.build_batch_image_features", builder)
+    monkeypatch.setattr("relax.utils.data.image_rebuild.build_batch_image_features", _fake_builder(features))
     actor._ensure_pool = lambda: MagicMock()
 
     prefetched = actor.fetch(
@@ -115,8 +116,7 @@ def test_background_prefetch_keeps_only_metadata_for_vision_rank(monkeypatch):
     )
 
     assert prefetched[1] == 0.5  # the raw TQ payload is returned untouched
-    assert actor.features == {}
-    builder.assert_not_called()
+    assert actor.features == {7: ([features], {})}
 
 
 def test_background_prefetch_skips_rebuild_for_non_vision_rank(monkeypatch):
@@ -145,13 +145,11 @@ def test_background_prefetch_skips_rebuild_for_non_vision_rank(monkeypatch):
     assert actor.features == {}
 
 
-def test_resolve_attaches_lazy_inputs_and_drops_descriptor_field(monkeypatch):
+def test_resolve_attaches_prefetched_pixels_and_drops_descriptor_field():
     actor = _actor(vision=True)
     descriptor = _descriptor()
     features = {"pixel_values": torch.zeros(4, 3), "image_grid_thw": torch.tensor([[1, 2, 4]])}
-    builder = MagicMock(side_effect=_fake_builder(features))
-    monkeypatch.setattr("relax.utils.data.image_rebuild.build_batch_image_features", builder)
-    actor._ensure_pool = lambda: MagicMock()
+    actor.features = {5: ([features], {})}
     rollout_data = {
         "tokens": [[1, 2, 3, 4]],
         SFT_IMAGE_REFS_FIELD: [descriptor],
@@ -162,15 +160,9 @@ def test_resolve_attaches_lazy_inputs_and_drops_descriptor_field(monkeypatch):
 
     assert SFT_IMAGE_REFS_FIELD not in rollout_data
     mm = rollout_data["multimodal_train_inputs"][0]
-    assert isinstance(mm, LazySFTImageInput)
-    assert "pixel_values" not in mm
+    assert mm["pixel_values"] is features["pixel_values"]
     assert mm["image_grid_thw"].tolist() == [[1, 2, 4]]
     assert actor.features == {}
-    builder.assert_not_called()
-    microbatch = {"multimodal_train_inputs": [mm]}
-    resolve_sft_image_micro_batch(microbatch)
-    assert microbatch["multimodal_train_inputs"][0]["pixel_values"] is features["pixel_values"]
-    assert "pixel_values" not in rollout_data["multimodal_train_inputs"][0]
 
 
 def test_resolve_keeps_only_grid_metadata_on_non_vision_rank():
@@ -189,24 +181,21 @@ def test_resolve_keeps_only_grid_metadata_on_non_vision_rank():
     assert mm["image_grid_thw"].tolist() == [[1, 2, 4]]
 
 
-def test_microbatch_resolution_rejects_grid_mismatch(monkeypatch):
+def test_resolve_rejects_grid_mismatch():
     actor = _actor(vision=True)
     descriptor = _descriptor()
-    features = {"pixel_values": torch.zeros(4, 3), "image_grid_thw": torch.tensor([[1, 8, 8]])}
-    monkeypatch.setattr("relax.utils.data.image_rebuild.build_batch_image_features", _fake_builder(features))
-    actor._ensure_pool = lambda: MagicMock()
+    actor.features = {5: ([{"pixel_values": torch.zeros(4, 3), "image_grid_thw": torch.tensor([[1, 8, 8]])}], {})}
     rollout_data = {
         "tokens": [[1, 2, 3, 4]],
         SFT_IMAGE_REFS_FIELD: [descriptor],
         "multimodal_train_inputs": [{"image_grid_thw": torch.tensor([[1, 2, 4]])}],
     }
 
-    actor.resolve(rollout_data, 5, model=actor.model)
-    with pytest.raises(RuntimeError, match="rollout_id=5 sample 0.*does not match the"):
-        resolve_sft_image_micro_batch(rollout_data)
+    with pytest.raises(ValueError, match="does not match the"):
+        actor.resolve(rollout_data, 5, model=actor.model)
 
 
-def test_microbatch_resolution_rebuilds_without_rollout_stash(monkeypatch):
+def test_resolve_falls_back_to_synchronous_rebuild_without_stash(monkeypatch):
     actor = _actor(vision=True)
     descriptor = _descriptor()
     features = {"pixel_values": torch.zeros(4, 3), "image_grid_thw": torch.tensor([[1, 2, 4]])}
@@ -219,7 +208,6 @@ def test_microbatch_resolution_rebuilds_without_rollout_stash(monkeypatch):
     }
 
     actor.resolve(rollout_data, 5, model=actor.model)
-    resolve_sft_image_micro_batch(rollout_data)
 
     assert rollout_data["multimodal_train_inputs"][0]["pixel_values"] is features["pixel_values"]
 
@@ -280,38 +268,7 @@ def test_resolve_across_ranks_propagates_vision_failure_to_delayed_peer(tmp_path
                 process.terminate()
             process.join(timeout=5)
 
-    assert "image references without grid metadata" in (tmp_path / "rank-0.txt").read_text()
+    assert (tmp_path / "rank-0.txt").read_text() == "ValueError: vision rebuild failed"
     assert (
         "RuntimeError: SFT rank-side image resolution failed on a peer rank" in (tmp_path / "rank-1.txt").read_text()
     )
-
-
-def test_large_rollout_materializes_only_selected_microbatch_and_releases_pixels(monkeypatch):
-    actor = _actor(vision=True)
-    actor._ensure_pool = lambda: MagicMock()
-    decoded = []
-    weak_pixels = []
-
-    def build(_pool, descriptors):
-        assert len(descriptors) == 1
-        decoded.append(descriptors[0]["image_refs"][0])
-        pixels = torch.zeros(4, 3)
-        weak_pixels.append(weakref.ref(pixels))
-        return [{"pixel_values": pixels, "image_grid_thw": torch.tensor([[1, 2, 4]])}], {}
-
-    monkeypatch.setattr("relax.utils.data.image_rebuild.build_batch_image_features", build)
-    rollout = {
-        SFT_IMAGE_REFS_FIELD: [_descriptor(image_refs=[f"/data/{i}.jpg"]) for i in range(1024)],
-        "multimodal_train_inputs": [{"image_grid_thw": torch.tensor([[1, 2, 4]])} for _ in range(1024)],
-    }
-    actor.resolve(rollout, 0, model=actor.model)
-    assert decoded == []
-    for index in [0, 1, 0]:  # Iterator reset/replay reconstructs from metadata.
-        microbatch = {"multimodal_train_inputs": [rollout["multimodal_train_inputs"][index]]}
-        resolve_sft_image_micro_batch(microbatch)
-        assert weak_pixels[-1]() is not None
-        assert all("pixel_values" not in value for value in rollout["multimodal_train_inputs"])
-        del microbatch
-        gc.collect()
-        assert all(reference() is None for reference in weak_pixels)
-    assert decoded == ["/data/0.jpg", "/data/1.jpg", "/data/0.jpg"]

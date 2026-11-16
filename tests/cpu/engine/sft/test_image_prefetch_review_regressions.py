@@ -72,7 +72,7 @@ def test_worker_capability_controls_hf_reference_transport(processor, supported)
         split.assert_not_called()
 
 
-def test_background_fetch_defers_pixels_and_timer_writes_until_microbatch(monkeypatch):
+def test_background_rebuild_defers_timer_writes_until_foreground_resolve(monkeypatch):
     main_thread = threading.get_ident()
     writes = []
 
@@ -100,23 +100,12 @@ def test_background_fetch_defers_pixels_and_timer_writes_until_microbatch(monkey
     module = ModuleType("relax.utils.data.image_rebuild")
     module.build_batch_image_features = builder
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    lazy_class = load_definition(
-        "relax/engine/sft/image_prefetch.py",
-        "LazySFTImageInput",
-        Timer=timer,
-        current_thread=threading.current_thread,
-        main_thread=threading.main_thread,
-    )
-    resolve_microbatch = load_definition(
-        "relax/engine/sft/image_prefetch.py", "resolve_sft_image_micro_batch", LazySFTImageInput=lazy_class
-    )
     helper_class = load_definition(
         "relax/engine/sft/image_prefetch.py",
         "SFTImagePrefetch",
         Timer=timer,
         SFT_IMAGE_REFS_FIELD="refs",
         extract_image_ref_descriptors=lambda raw: raw["refs"],
-        LazySFTImageInput=lazy_class,
     )
     helper = helper_class(SimpleNamespace(), lambda **kw: ([{"refs": [{}, None, {}]}, None], 0.1))
     helper.owns_vision = lambda model: True
@@ -132,21 +121,15 @@ def test_background_fetch_defers_pixels_and_timer_writes_until_microbatch(monkey
             task_name="train",
             sampling_config={},
         ).result()
-    assert pending == []
+    assert len(pending) == 2
     assert writes == []
     batch = {"refs": [{}, None, {}], "multimodal_train_inputs": [{}, None, {}]}
     helper.resolve(batch, 3, model=None)
-    assert writes == []
-    resolve_microbatch(batch)
-    assert writes == [("sft_rank_image_read", 0.25), ("sft_rank_image_process", 0.5)] * 2
+    assert writes == [("sft_rank_image_read", 0.5), ("sft_rank_image_process", 1.0)]
     assert helper.features == {}
     assert batch["multimodal_train_inputs"][0]["pixel_values"] is features["pixel_values"]
     helper.resolve(batch, 3, model=None)
-    assert len(writes) == 4
-    # CPU prepacking may resolve a microbatch on another thread; its Timer is
-    # intentionally untouched while the decoded payload remains transient.
-    background_batch = {"refs": [{}], "multimodal_train_inputs": [{}]}
-    helper.resolve(background_batch, 4, model=None)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        executor.submit(resolve_microbatch, background_batch).result()
-    assert len(writes) == 4
+    assert len(writes) == 2
+    # Synchronous eval/fallback records the returned timings on this same thread.
+    helper.resolve({"refs": [{}], "multimodal_train_inputs": [{}]}, 4, model=None)
+    assert writes[-2:] == [("sft_rank_image_read", 0.25), ("sft_rank_image_process", 0.5)]

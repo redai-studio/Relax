@@ -6,14 +6,14 @@ from __future__ import annotations
 from argparse import Namespace
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from threading import Event, current_thread, main_thread
+from threading import Event
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.distributed as dist
 
 from relax.engine.sft.image import ImageBatchSampler, assign_image_batch
-from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
+from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD, extract_image_ref_descriptors
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
 from relax.utils.timer import Timer
@@ -88,15 +88,17 @@ class ImagePrefetch:
         self.pending.clear()
 
 
-# Only samples selected for the current microbatch reach this bounded pool;
-# retaining a complete rollout of decoded multi-image samples exhausts host RAM.
-# Each worker limits its own torch intra-op threads.
+# Samples of one prefetched batch are rebuilt in parallel — one processor call
+# per sample (a sample carries ~20 images), submitted together by
+# ``build_batch_image_features``. The vision rank is the prefetch's tail, so
+# size the pool like the producer's ``--sft-prefetch-num-workers`` instead of a
+# single worker: only one vision rank per node rebuilds (VPP-aware
+# ``pre_process`` check), and its workers cap their own torch intra-op threads.
 _REBUILD_POOL_SIZE = 8
 
 
 def _raise_if_sft_image_resolution_error(local_error: Exception | None, *, rollout_id: int) -> None:
-    """Propagate rollout-level image metadata failures across the actor
-    world."""
+    """Propagate rank-local image rebuild failures across the actor world."""
     error_flag = torch.tensor([int(local_error is not None)], dtype=torch.int32, device="cpu")
     dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
     if int(error_flag.item()) != 0:
@@ -106,68 +108,6 @@ def _raise_if_sft_image_resolution_error(local_error: Exception | None, *, rollo
             f"SFT rank-side image resolution failed on a peer rank for rollout_id={rollout_id}; "
             "aborting before model collectives."
         )
-
-
-class LazySFTImageInput(dict):
-    """Keep rollout-sized image payloads as metadata until one microbatch
-    consumes them.
-
-    Decoded tensors are returned in a fresh dictionary, never cached on this
-    object or its owning rollout. Iterator replay can reconstruct them again;
-    pipeline/recompute lifetimes remain owned by the resulting model tensors.
-    """
-
-    def __init__(
-        self, metadata: dict, descriptor: dict, owner: "SFTImagePrefetch", rollout_id: int, sample_index: int
-    ) -> None:
-        super().__init__(metadata)
-        self.descriptor = descriptor
-        self.owner = owner
-        self.rollout_id = rollout_id
-        self.sample_index = sample_index
-
-    def materialize(self) -> dict:
-        from relax.utils.data.image_rebuild import build_batch_image_features
-
-        try:
-            rebuilt, timings = build_batch_image_features(self.owner._ensure_pool(), [self.descriptor])
-            features = rebuilt[0]
-            if features is None:
-                raise ValueError("image descriptor did not produce pixel tensors")
-            producer_grid = self.get("image_grid_thw")
-            rebuilt_grid = features.get("image_grid_thw")
-            if producer_grid is not None and rebuilt_grid is not None:
-                if torch.as_tensor(producer_grid).tolist() != torch.as_tensor(rebuilt_grid).tolist():
-                    raise ValueError(
-                        "rank-rebuilt image grid does not match the producer grid; "
-                        "the consumer processor config diverged from the producer"
-                    )
-            # CPU prepacking may call this helper from a background thread.
-            # Its timers must not mutate the training thread's Timer state.
-            if current_thread() is main_thread():
-                for name, elapsed in timings.items():
-                    Timer().add(name, elapsed)
-            return {**self, "pixel_values": features["pixel_values"]}
-        except Exception as exc:
-            raise RuntimeError(
-                f"rollout_id={self.rollout_id} sample {self.sample_index}: "
-                f"rank-side microbatch image reconstruction failed: {exc}"
-            ) from exc
-
-
-def resolve_sft_image_micro_batch(batch: dict) -> None:
-    """Decode only this selected microbatch without retaining pixels in the
-    rollout.
-
-    No distributed collectives belong here: pipeline stages request different
-    microbatches at different times. Resolution errors retain their sample
-    context and propagate through the training task's ordinary error handling.
-    """
-    inputs = batch.get("multimodal_train_inputs")
-    if inputs is not None and any(isinstance(value, LazySFTImageInput) for value in inputs):
-        batch["multimodal_train_inputs"] = [
-            value.materialize() if isinstance(value, LazySFTImageInput) else value for value in inputs
-        ]
 
 
 class SFTImagePrefetch:
@@ -237,12 +177,14 @@ class SFTImagePrefetch:
         sampling_config: dict,
         cancel_event: Event | None = None,
     ) -> tuple[list, float]:
-        """Prefetch CPU tokens, image references and grids, without decoding
-        pixels.
+        """Background SFT prefetch with the rank-side pixel rebuild.
 
-        A full DP-local rollout can contain thousands of multi-image samples.
-        Pixel reconstruction belongs to microbatch consumption, not this
-        rollout-sized lookahead slot.
+        Extends the CPU-only TQ read of ``--sft-train-data-prefetch`` with the
+        ``--sft-image-preprocess-on-rank`` reconstruction: the payload carries
+        image references instead of pixel tensors, so this thread reads the
+        referenced files and rebuilds CPU ``pixel_values`` in the processor
+        worker process. No collectives and no GPU work happen here; the main
+        thread re-attaches the finished tensors in ``resolve``.
         """
         fetch_kwargs = dict(
             data_fields=data_fields,
@@ -260,6 +202,18 @@ class SFTImagePrefetch:
             prefetched = _prefetch_data_from_transfer_queue(
                 tq_client=None, fetch_data=self.fetch_data, cancel_event=cancel_event, **fetch_kwargs
             )
+        raw_batch = prefetched[0][0]
+        if raw_batch is None or not self.owns_vision(model):
+            return prefetched
+        descriptors = extract_image_ref_descriptors(raw_batch)
+        if descriptors is None:
+            return prefetched
+        from relax.utils.data.image_rebuild import build_batch_image_features
+
+        features = build_batch_image_features(self._ensure_pool(), descriptors)
+        # Keep only the newest entry so the stash stays bounded by one batch;
+        # stale prefetches are discarded in _take_sft_train_prefetch.
+        self.features = {rollout_id: features}
         return prefetched
 
     def resolve_across_ranks(
@@ -282,8 +236,15 @@ class SFTImagePrefetch:
         return True
 
     def resolve(self, rollout_data: dict, rollout_id: int, *, model: Any, log: bool = False) -> None:
-        """Attach lazy image inputs, preserving the producer's tokens and
-        grids."""
+        """Re-attach rank-rebuilt CPU pixels before the batch reaches
+        get_batch.
+
+        The descriptor field is dropped on every rank. Vision ranks re-attach
+        the ``pixel_values`` rebuilt during prefetch — falling back to a
+        synchronous rebuild when prefetch was paused (eval / checkpoint
+        lookahead) — and verify the rebuilt grid against the producer's. The
+        producer tokens, masks and grid are never replaced.
+        """
         descriptors = rollout_data.pop(SFT_IMAGE_REFS_FIELD, None)
         if descriptors is None:
             return
@@ -293,24 +254,46 @@ class SFTImagePrefetch:
                 f"rollout_id={rollout_id}: image-ref descriptors present but multimodal_train_inputs is missing."
             )
         owns_vision = self.owns_vision(model)
-        self.features.pop(rollout_id, None)
-        if len(mm_inputs) != len(descriptors):
-            raise ValueError(f"rollout_id={rollout_id}: image reference and multimodal input counts differ")
+        features_by_sample, timings = self.features.pop(rollout_id, (None, {})) if owns_vision else (None, {})
+        for name, elapsed in timings.items():
+            Timer().add(name, elapsed)
         resolved_samples = 0
+        pixel_bytes = 0
         for index, descriptor in enumerate(descriptors):
             if descriptor is None:
                 continue
             if not owns_vision:
                 continue
+            features = None
+            if features_by_sample is not None and index < len(features_by_sample):
+                features = features_by_sample[index]
+            if features is None:
+                from relax.utils.data.image_rebuild import build_batch_image_features
+
+                rebuilt, timings = build_batch_image_features(self._ensure_pool(), [descriptor])
+                features = rebuilt[0]
+                for name, elapsed in timings.items():
+                    Timer().add(name, elapsed)
             mm = mm_inputs[index]
             if mm is None:
                 raise RuntimeError(f"rollout_id={rollout_id} sample {index}: image references without grid metadata.")
-            mm_inputs[index] = LazySFTImageInput(mm, descriptor, self, rollout_id, index)
+            rebuilt_grid = features.get("image_grid_thw")
+            producer_grid = mm.get("image_grid_thw")
+            if rebuilt_grid is not None and producer_grid is not None:
+                # Cheap in-memory re-check; the authoritative comparison against
+                # the descriptor grid already ran in the prefetch worker.
+                if torch.as_tensor(producer_grid).tolist() != torch.as_tensor(rebuilt_grid).tolist():
+                    raise ValueError(
+                        f"rollout_id={rollout_id} sample {index}: rank-rebuilt image grid does not match the "
+                        "producer grid; the consumer processor config diverged from the producer."
+                    )
+            mm_inputs[index] = {**mm, "pixel_values": features["pixel_values"]}
             resolved_samples += 1
+            pixel_bytes += features["pixel_values"].numel() * features["pixel_values"].element_size()
         if resolved_samples and log:
             logger.info(
-                "Prepared lazy rank-side image rebuild for rollout_id=%d: %d sample(s); "
-                "pixels are decoded only for each consumed microbatch.",
+                "Rank-side image rebuild for rollout_id=%d: %d sample(s), %.1f MiB of CPU pixel tensors.",
                 rollout_id,
                 resolved_samples,
+                pixel_bytes / 1024 / 1024,
             )

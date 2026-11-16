@@ -112,15 +112,6 @@ _QWEN_TOOL_CALL_SEPARATOR_PATCH = """{%- if reasoning_content|trim %}
                         {%- else %}
                             {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}
                         {%- endif %}"""
-_QWEN38_OPEN_THINKING_RENDER = "\n".join(
-    (
-        "{%- if message._relax_qwen38_open_thinking is defined %}",
-        "    {{- '<|im_start|>' + message.role + '\\n' + message._relax_qwen38_open_thinking }}",
-        "{%- else %}",
-        _QWEN_ASSISTANT_TOOL_CALL,
-        "{%- endif %}",
-    )
-)
 
 _QWEN38_LEADING_THINK_RE = re.compile(r"\A<think>\n(.*?)\n</think>\n\n(.*)\Z", re.DOTALL)
 
@@ -155,22 +146,6 @@ def split_qwen38_leading_thinking(content: str) -> tuple[str, str] | None:
     return reasoning, answer
 
 
-def _qwen38_open_thinking_text(content: str | list[dict] | None) -> str | None:
-    """Recognize a nonempty truncated thinking prefix without rewriting it."""
-    if isinstance(content, list) and len(content) == 1:
-        item = content[0]
-        content = item.get("text") if isinstance(item, dict) and item.get("type") == "text" else None
-    if (
-        isinstance(content, str)
-        and content.startswith("<think>")
-        and content.count("<think>") == 1
-        and "</think>" not in content
-        and content[len("<think>") :].strip()
-    ):
-        return content
-    return None
-
-
 def _content_as_text(content: str | list[dict] | None) -> str:
     if isinstance(content, str):
         return content
@@ -188,7 +163,7 @@ def _is_tool_response_user_message(content: str | list[dict] | None) -> bool:
     return text.startswith("<tool_response>") and text.endswith("</tool_response>")
 
 
-def _has_learnable_historical_thinking(sample: CanonicalSample, *, allow_open_thinking: bool = False) -> bool:
+def _has_learnable_historical_thinking(sample: CanonicalSample) -> bool:
     """Whether the last user turn makes supervised assistant thinking
     historical."""
     last_user_index = max(
@@ -208,7 +183,6 @@ def _has_learnable_historical_thinking(sample: CanonicalSample, *, allow_open_th
         and (
             "</think>" in _content_as_text(message.content)
             or bool(_content_as_text(message.reasoning_content).strip())
-            or (allow_open_thinking and _qwen38_open_thinking_text(message.content) is not None)
         )
         for index, message in enumerate(sample.messages)
     )
@@ -314,16 +288,6 @@ def _patch_qwen_tool_call_content(template: str) -> tuple[str, bool]:
 
 
 @lru_cache(maxsize=32)
-def _patch_qwen38_open_thinking(template: str) -> tuple[str, bool]:
-    """Pass through validated raw prefixes inside the native preserve gate."""
-    if template.count(_QWEN38_OPEN_THINKING_RENDER) == 1:
-        return template, False
-    if template.count(_QWEN_ASSISTANT_TOOL_CALL) != 1:
-        raise RuntimeError("Cannot safely patch Qwen3.8 open thinking: expected one known assistant scaffold")
-    return template.replace(_QWEN_ASSISTANT_TOOL_CALL, _QWEN38_OPEN_THINKING_RENDER, 1), True
-
-
-@lru_cache(maxsize=32)
 def _patch_qwen_generation_markers(template: str) -> tuple[str, bool]:
     """Add HF generation markers around Qwen assistant output when safe."""
     if _GENERATION_MARKER_RE.search(template):
@@ -365,25 +329,18 @@ def try_patch_qwen_chat_template(
     legacy_tool_calls = kwargs.get("legacy_tool_call_content", False)
     if not isinstance(legacy_tool_calls, bool):
         raise ValueError("apply_chat_template_kwargs.legacy_tool_call_content must be true or false")
-    native_qwen38 = is_qwen38_chat_template(template)
-    if native_qwen38 or legacy_tool_calls:
+    if is_qwen38_chat_template(template) or legacy_tool_calls:
         patched_template, tool_call_changed = _patch_legacy_qwen_tool_call_content(patched_template)
     else:
         patched_template, tool_call_changed = _patch_qwen_tool_call_content(patched_template)
     changed = history_changed or tool_call_changed
-    if native_qwen38 and any(
-        message.role == "assistant" and _qwen38_open_thinking_text(message.content) is not None
-        for message in sample.messages
-    ):
-        patched_template, open_thinking_changed = _patch_qwen38_open_thinking(patched_template)
-        changed = changed or open_thinking_changed
     resolved_kwargs = dict(kwargs)
     preserve_thinking = resolved_kwargs.get("preserve_thinking")
     if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
         raise ValueError("apply_chat_template_kwargs.preserve_thinking must be true, false, or null")
 
     # Explicit booleans are hard overrides; missing/null enables sample-aware auto-preserve.
-    if preserve_thinking is None and _has_learnable_historical_thinking(sample, allow_open_thinking=native_qwen38):
+    if preserve_thinking is None and _has_learnable_historical_thinking(sample):
         resolved_kwargs["preserve_thinking"] = True
 
     if _assistant_generation_mask_matches_sample(sample):
