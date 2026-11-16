@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Export a native Qwen2-VL CanonicalLoRA checkpoint and verify an FP32
-merge."""
+"""Export a native LamRA LoRA checkpoint and verify an FP32 merge."""
 
 import argparse
 import hashlib
@@ -55,7 +54,7 @@ def main() -> None:
     import torch.distributed.checkpoint as dcp
     from megatron.core.dist_checkpointing import load_common_state_dict, load_tensors_metadata
     from peft import PeftModel
-    from transformers import AutoConfig, AutoProcessor, Qwen2VLForConditionalGeneration
+    from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
     from examples.lamra_rerank.tools.prepare_data import sha256
     from relax.models.qwen2_vl.configuration import checkpoint_prefixes
@@ -70,12 +69,23 @@ def main() -> None:
     if common["opt_param_scheduler"]["num_steps"] != args.expected_updates * saved.global_batch_size:
         raise ValueError("Checkpoint scheduler and optimizer update counts disagree")
     config = AutoConfig.from_pretrained(args.base)
-    num_layers = getattr(config, "text_config", config).num_hidden_layers
-    if config.model_type != "qwen2_vl" or saved.task_type not in {"causal_lm", "seq_contrast"}:
-        raise ValueError("This exporter requires a Qwen2-VL retrieval or rank checkpoint")
+    text_config = getattr(config, "text_config", config)
+    num_layers = text_config.num_hidden_layers
+    if config.model_type not in {"qwen2_vl", "qwen3_5"} or saved.task_type not in {"causal_lm", "seq_contrast"}:
+        raise ValueError("This exporter requires a LamRA retrieval or rank checkpoint")
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    if config.model_type == "qwen3_5":
+        target_modules = ["o_proj", "down_proj"]
     with torch.device("meta"):
-        reference = Qwen2VLForConditionalGeneration(config)
-    prefix, _ = checkpoint_prefixes(reference.state_dict())
+        reference = AutoModelForImageTextToText.from_config(config)
+    base_names = list(reference.state_dict())
+    prefix, _ = checkpoint_prefixes(base_names)
+    projection_names = {
+        name.removesuffix(".weight")
+        for name in base_names
+        if name.startswith(f"{prefix}.layers.")
+        and name.endswith(tuple(f".{module}.weight" for module in target_modules))
+    }
     metadata = {
         key: value
         for key, value in load_tensors_metadata(str(args.checkpoint)).items()
@@ -100,21 +110,22 @@ def main() -> None:
             if target in converted or not bool(torch.isfinite(value).all()):
                 raise ValueError(f"Duplicate or non-finite adapter: {target}")
             converted[target] = value.contiguous()
-    if len(converted) != num_layers * 7 * 2:
-        raise ValueError("Expected independent Q/K/V/O/gate/up/down adapters on every layer")
+    expected_keys = {f"{name}.lora_{side}.weight" for name in projection_names for side in ("A", "B")}
+    if set(converted) != expected_keys:
+        raise ValueError("Checkpoint adapters do not cover the expected language projections")
     write_hf_peft_adapter(
         converted,
         args.adapter_output,
         lora_rank=saved.lora_rank,
         lora_alpha=saved.lora_alpha,
         lora_dropout=saved.lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=target_modules,
     )
 
     def tensor_sha(tensor: torch.Tensor) -> str:
         return hashlib.sha256(tensor.detach().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
 
-    base, info = Qwen2VLForConditionalGeneration.from_pretrained(
+    base, info = AutoModelForImageTextToText.from_pretrained(
         args.base, torch_dtype=torch.float32, device_map="cpu", output_loading_info=True
     )
     if any(info.get(key) for key in ["missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"]):
@@ -143,7 +154,7 @@ def main() -> None:
         raise ValueError("A frozen base parameter changed during merge")
     merged.save_pretrained(args.output, safe_serialization=True, max_shard_size="10GB", save_original_format=False)
     AutoProcessor.from_pretrained(args.base, use_fast=False).save_pretrained(args.output)
-    reloaded, info = Qwen2VLForConditionalGeneration.from_pretrained(
+    reloaded, info = AutoModelForImageTextToText.from_pretrained(
         args.output, torch_dtype=torch.float32, device_map="cpu", output_loading_info=True
     )
     if any(info.get(key) for key in ["missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"]):

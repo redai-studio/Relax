@@ -28,29 +28,26 @@ print(json.dumps(runtime))
 PY
 )
 export RUNTIME_ENV_JSON
-read -r QWEN2_VL_VOCAB_SIZE DATASET_STEPS WARMUP_STEPS GLOBAL_BATCH_SIZE < <(
-    python3 - "${MODEL_DIR}/config.json" "${DATA_DIR}/mbeir/pairs.meta.json" <<'PY'
+HF_CHECKPOINT="${MODEL_DIR}"
+source "${RELAX_ROOT}/examples/seq_contrast_sft/scripts/model.sh"
+read -r DATASET_STEPS WARMUP_STEPS GLOBAL_BATCH_SIZE < <(
+    python3 - "${DATA_DIR}/mbeir/pairs.meta.json" <<'PY'
 import json
 import math
 import sys
 
 with open(sys.argv[1]) as stream:
-    config = json.load(stream)
-with open(sys.argv[2]) as stream:
     data = json.load(stream)
-if config["model_type"] != "qwen2_vl":
-    raise SystemExit("Expected a Qwen2-VL PT checkpoint")
 if data["stage"] != "prepared" or data["sampling"] != "native_runtime":
     raise SystemExit("Prepare M-BEIR pairs with prepare_mbeir.py")
 queries, batch = data["raw_queries"], data["global_batch_size"]
 if queries <= 0 or batch <= 0 or data["prepared_rows"] != queries:
     raise SystemExit("Invalid M-BEIR pair or batch count")
 steps = math.ceil(queries / batch)
-print(config.get("text_config", config)["vocab_size"], steps, math.ceil(steps * 0.03), batch)
+print(steps, math.ceil(steps * 0.03), batch)
 PY
 )
-source "${RELAX_ROOT}/scripts/models/qwen2-vl-2B.sh"
-EXP_NAME="${EXP_NAME:-qwen2-vl-2b-mbeir-from-pt-r128-dp8}"
+EXP_NAME="${EXP_NAME:-${LAMRA_MODEL_NAME}-mbeir-from-pt-r128-dp8}"
 now=$(date "+%Y%m%d-%H%M%S")
 
 CKPT_ARGS=(
@@ -74,7 +71,7 @@ SFT_ARGS=(
 )
 LORA_ARGS=(
     --lora-rank 128 --lora-alpha 256 --lora-dropout 0.05
-    --lora-target-modules linear_q linear_k linear_v linear_proj linear_fc1_gate linear_fc1_up linear_fc2
+    --lora-target-modules "${LAMRA_LORA_TARGETS[@]}"
     --lora-scope language --lora-merge-mode
     --freeze-vision-model --freeze-vision-projection
 )

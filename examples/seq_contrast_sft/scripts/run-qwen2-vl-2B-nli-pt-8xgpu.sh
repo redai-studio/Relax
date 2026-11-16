@@ -32,23 +32,17 @@ PYENV
 )
 export RUNTIME_ENV_JSON
 
-QWEN2_VL_VOCAB_SIZE=$(python3 - "${MODEL_DIR}/Qwen2-VL-2B-Instruct-emb/config.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1]) as file:
-    config = json.load(file)
-assert config["model_type"] == "qwen2_vl"
-print(config.get("text_config", config)["vocab_size"])
-PY
-)
-source "${RELAX_ROOT}/scripts/models/qwen2-vl-2B.sh"
+HF_CHECKPOINT="${MODEL_DIR}"
+if [ ! -f "${HF_CHECKPOINT}/config.json" ]; then
+    HF_CHECKPOINT="${MODEL_DIR}/Qwen2-VL-2B-Instruct-emb"
+fi
+source "${RELAX_ROOT}/examples/seq_contrast_sft/scripts/model.sh"
 # Keep this standard TE/Kaiming recipe separate from older precision profiles.
-EXP_NAME="${EXP_NAME:-qwen2-vl-2b-nli-bridge-lora-kaiming-dp8}"
+EXP_NAME="${EXP_NAME:-${LAMRA_MODEL_NAME}-nli-bridge-lora-kaiming-dp8}"
 now=$(date "+%Y%m%d-%H%M%S")
 
 CKPT_ARGS=(
-    --hf-checkpoint "${MODEL_DIR}/Qwen2-VL-2B-Instruct-emb"
+    --hf-checkpoint "${HF_CHECKPOINT}"
     --megatron-to-hf-mode bridge
     --load "${SAVE_DIR}/${EXP_NAME}"
     --save "${SAVE_DIR}/${EXP_NAME}"
@@ -77,7 +71,7 @@ LORA_ARGS=(
     --lora-rank 64
     --lora-alpha 128
     --lora-dropout 0.05
-    --lora-target-modules linear_q linear_k linear_v linear_proj linear_fc1_gate linear_fc1_up linear_fc2
+    --lora-target-modules "${LAMRA_LORA_TARGETS[@]}"
     --lora-scope language
     --lora-merge-mode
 )

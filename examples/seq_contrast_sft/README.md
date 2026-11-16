@@ -196,3 +196,17 @@ python examples/lamra_rerank/tools/export_checkpoint.py \
 The exporter reads the saved LoRA tensors and verifies the FP32 merge and HF
 reload. Keep the native checkpoint for resume. Use the merged HF directory for
 the next stage or evaluation.
+
+### Qwen3.5-0.8B
+
+The three launchers also accept the exact input checkpoint directory as
+`MODEL_DIR`. To use Qwen3.5-0.8B, give its original HF checkpoint to
+`prepare_nli.py` as `--base`, then set `MODEL_DIR` to its prepared
+`--output-model` for Ret PT, to the PT export for Ret SFT, and to the chosen
+Rank base for Rank SFT. Data preparation, top100 mining, and evaluation use
+the same commands.
+
+The dense Qwen3.5-0.8B recipe trains LoRA on language attention output and MLP
+down projections. The checkpoint exporter checks coverage against the actual
+HF layers, including the distinction between full attention and GDN layers.
+Rank uses the model's non-thinking chat mode.

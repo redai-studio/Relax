@@ -31,19 +31,12 @@ print(json.dumps(runtime))
 PY
 )
 export RUNTIME_ENV_JSON
-QWEN2_VL_VOCAB_SIZE=$(python3 - "${MODEL_DIR}/Qwen2-VL-2B-Instruct/config.json" <<'PYCONF'
-import json
-import sys
-
-with open(sys.argv[1]) as stream:
-    config = json.load(stream)
-if config["model_type"] != "qwen2_vl":
-    raise SystemExit("Rank SFT requires a Qwen2-VL checkpoint")
-print(config.get("text_config", config)["vocab_size"])
-PYCONF
-)
-source "${RELAX_ROOT}/scripts/models/qwen2-vl-2B.sh"
-EXP_NAME="${EXP_NAME:-qwen2-vl-2b-lamra-rank-r128-dp8}"
+HF_CHECKPOINT="${MODEL_DIR}"
+if [ ! -f "${HF_CHECKPOINT}/config.json" ]; then
+    HF_CHECKPOINT="${MODEL_DIR}/Qwen2-VL-2B-Instruct"
+fi
+source "${RELAX_ROOT}/examples/seq_contrast_sft/scripts/model.sh"
+EXP_NAME="${EXP_NAME:-${LAMRA_MODEL_NAME}-lamra-rank-r128-dp8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-192}"
 read -r DATASET_STEPS WARMUP_STEPS < <(python3 - "${DATA_DIR}/rerank/train.manifest.json" "${GLOBAL_BATCH_SIZE}" <<'PY'
 import json
@@ -61,7 +54,7 @@ PY
 now=$(date "+%Y%m%d-%H%M%S")
 
 CKPT_ARGS=(
-    --hf-checkpoint "${MODEL_DIR}/Qwen2-VL-2B-Instruct"
+    --hf-checkpoint "${HF_CHECKPOINT}"
     --megatron-to-hf-mode bridge
     --load "${SAVE_DIR}/${EXP_NAME}"
     --save "${SAVE_DIR}/${EXP_NAME}"
@@ -96,7 +89,7 @@ LORA_ARGS=(
     --lora-rank 128
     --lora-alpha 256
     --lora-dropout 0.05
-    --lora-target-modules linear_q linear_k linear_v linear_proj linear_fc1_gate linear_fc1_up linear_fc2
+    --lora-target-modules "${LAMRA_LORA_TARGETS[@]}"
     --lora-scope language
     --lora-merge-mode
     --freeze-vision-model

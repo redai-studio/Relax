@@ -120,6 +120,7 @@ def test_reference_mask_keeps_assistant_header_and_masks_images():
     mask = reference_loss_mask(tokens, 151644, 151643)
     assert mask[:16].sum() == 0
     assert mask[16:].tolist() == [1] * 6
+    torch.testing.assert_close(reference_loss_mask(tokens[11:], 151644, 151643), mask[11:])
     with pytest.raises(ValueError, match="chat template"):
         reference_loss_mask(tokens[1:], 151644, 151643)
 
@@ -158,7 +159,7 @@ def test_evaluation_serializes_loading_sets_and_keeps_strict_checks(monkeypatch,
     transformers = SimpleNamespace(
         __version__="test",
         AutoProcessor=SimpleNamespace(from_pretrained=lambda *args, **kwargs: Processor()),
-        Qwen2VLForConditionalGeneration=SimpleNamespace(from_pretrained=lambda *args, **kwargs: (model, info)),
+        AutoModelForImageTextToText=SimpleNamespace(from_pretrained=lambda *args, **kwargs: (model, info)),
     )
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Prepare the Qwen2-VL <emb> checkpoint and NLI pair JSONL for Ret PT."""
+"""Prepare the LamRA <emb> checkpoint and NLI pair JSONL for Ret PT."""
 
 import argparse
 import csv
@@ -39,8 +39,8 @@ def prepare_model(source: Path, output: Path) -> None:
 
     processor = AutoProcessor.from_pretrained(source, use_fast=False)
     model, loading = AutoModelForImageTextToText.from_pretrained(source, dtype="auto", output_loading_info=True)
-    if model.config.model_type != "qwen2_vl":
-        raise ValueError("Ret PT requires a Qwen2-VL base")
+    if model.config.model_type not in {"qwen2_vl", "qwen3_5"}:
+        raise ValueError("Ret PT requires a Qwen2-VL or Qwen3.5 base")
     if any(loading.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         raise ValueError(f"Incomplete base checkpoint load: {loading}")
     tokenizer = processor.tokenizer

@@ -15,11 +15,21 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-nli-pt-8xgpu.sh"
 
 
-@pytest.mark.parametrize("initializer", [None, "xavier"])
-def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, initializer):
-    model = tmp_path / "models/Qwen2-VL-2B-Instruct-emb"
+@pytest.mark.parametrize(
+    ("model_type", "initializer"), [("qwen2_vl", None), ("qwen2_vl", "xavier"), ("qwen3_5", None)]
+)
+def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, model_type, initializer):
+    qwen35 = model_type == "qwen3_5"
+    model = tmp_path / "models" / ("Qwen3.5-0.8B-emb" if qwen35 else "Qwen2-VL-2B-Instruct-emb")
     model.mkdir(parents=True)
-    (model / "config.json").write_text(json.dumps({"model_type": "qwen2_vl", "vocab_size": 151665}))
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": model_type,
+                "text_config": {"vocab_size": 248320 if qwen35 else 151665, "hidden_size": 1024 if qwen35 else 1536},
+            }
+        )
+    )
     binaries = tmp_path / "bin"
     binaries.mkdir()
     capture = tmp_path / "submission.json"
@@ -35,7 +45,7 @@ def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, initiali
         **os.environ,
         "PATH": f"{binaries}:{os.environ['PATH']}",
         "CAPTURE": str(capture),
-        "MODEL_DIR": str(tmp_path / "models"),
+        "MODEL_DIR": str(model if qwen35 else model.parent),
         "DATA_DIR": str(tmp_path / "data"),
         "SAVE_DIR": str(tmp_path / "checkpoints"),
         "RAY_ADDRESS": "http://127.0.0.1:8265",
@@ -67,6 +77,13 @@ def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, initiali
     assert "--custom-megatron-before-train-step-hook-path" not in args
     assert "--use-tensorboard" not in args
     assert "--no-wait" not in args
-    experiment = "explicit-xavier-run" if initializer else "qwen2-vl-2b-nli-bridge-lora-kaiming-dp8"
+    profile = "qwen35-0.8b" if qwen35 else "qwen2-vl-2b"
+    experiment = "explicit-xavier-run" if initializer else f"{profile}-nli-bridge-lora-kaiming-dp8"
+    if qwen35:
+        assert args[args.index("--hidden-size") + 1] == "1024"
+        assert args[args.index("--lora-target-modules") + 1 : args.index("--lora-scope")] == [
+            "linear_proj",
+            "linear_fc2",
+        ]
     expected_checkpoint = str(tmp_path / "checkpoints" / experiment)
     assert args[args.index("--load") + 1] == args[args.index("--save") + 1] == expected_checkpoint

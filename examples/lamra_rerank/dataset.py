@@ -44,10 +44,10 @@ def reference_loss_mask(tokens: torch.Tensor, im_start_id: int, pad_id: int | No
     """Supervise assistant header, answer and terminator; mask system and
     user."""
     starts = torch.where(tokens == im_start_id)[0].tolist()
-    if len(starts) != 3 or starts[0] != 0 or starts[1] != 11:
-        raise ValueError("LamRA rerank requires the reference system/user/assistant chat template")
+    if len(starts) not in (2, 3) or starts[0] != 0:
+        raise ValueError("LamRA rerank requires the user/assistant chat template with an optional system turn")
     mask = torch.zeros_like(tokens)
-    mask[starts[2] :] = 1
+    mask[starts[-1] :] = 1
     if pad_id is not None:
         mask[tokens == pad_id] = 0
     return mask
@@ -68,7 +68,7 @@ class LamraRerankDataset(SFTStreamingDataset):
         cls, config: Any, *, tokenizer: Any, processor_pool: Any, pad_token_ids: Any
     ) -> "LamraRerankDataset":
         if config.task_type != "causal_lm" or config.context_parallel_size != 1:
-            raise ValueError("The Qwen2-VL rank recipe requires causal_lm and CP=1")
+            raise ValueError("The LamRA rank recipe requires causal_lm and CP=1")
         if config.sft_oversize_strategy != "keep":
             raise ValueError("Keep complete multi-candidate rank examples instead of truncating visual tokens")
         return cls(
@@ -81,6 +81,7 @@ class LamraRerankDataset(SFTStreamingDataset):
             multimodal_keys=config.multimodal_keys,
             metadata_key=config.metadata_key,
             system_prompt=config.system_prompt,
+            apply_chat_template_kwargs={"enable_thinking": False},
             seed=config.seed,
             prefetch_max_cached=config.sft_prefetch_buffer_size,
             prefetch_chunk_size=config.sft_prefetch_chunk_size,

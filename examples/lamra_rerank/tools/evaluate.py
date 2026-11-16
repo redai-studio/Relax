@@ -28,7 +28,7 @@ def main() -> None:
     args = parser.parse_args()
     import torch
     import transformers
-    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -41,7 +41,7 @@ def main() -> None:
     no_ids = processor.tokenizer("No", add_special_tokens=False)["input_ids"]
     if len(yes_ids) != 1 or len(no_ids) != 1:
         raise ValueError("The reference scoring protocol requires single-token Yes and No")
-    model, info = Qwen2VLForConditionalGeneration.from_pretrained(
+    model, info = AutoModelForImageTextToText.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, output_loading_info=True
     )
     if any(info.get(key) for key in ["missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"]):
@@ -57,7 +57,7 @@ def main() -> None:
                 "rank": rank,
                 "pid": os.getpid(),
                 "model": str(args.model.resolve()),
-                "loader": "Qwen2VLForConditionalGeneration",
+                "loader": type(model).__name__,
                 "loading_info": {
                     key: sorted(value) if isinstance(value, set) else value for key, value in info.items()
                 },
@@ -84,7 +84,9 @@ def main() -> None:
             rows = pairs[offset : offset + args.batch_size]
             messages = [row["messages"] for row in rows]
             texts = [
-                processor.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+                processor.apply_chat_template(
+                    message, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                )
                 for message in messages
             ]
             images = list(
