@@ -1,9 +1,12 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Text SFT: 6 x 8 H20, TP2/PP3/VPP4/DP8/EP8/CP1, 64K packing.
-# Configured context: 256K; keep oversized samples; no MTP/checkpoints.
+# Configured context: 256K; keep oversized samples; no MTP.
 # Validated sample lengths reached 113,569 tokens; 256K samples are not yet validated.
 # Existing 48-GPU Ray head; MODEL_DIR, DATA_DIR and SAVE_DIR are required.
+# Default: one epoch, with resumable checkpoints under SAVE_DIR/EXP_NAME.
+# NUM_STEPS overrides NUM_EPOCH; native epochs count complete global batches.
+# Short benchmark: NUM_STEPS=10 SAVE_CHECKPOINT=0 LR_DECAY_ITERS=32.
 # DRY_RUN=1 prints the effective argv/runtime environment without cluster access.
 set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,7 +14,7 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
 export RELAX="${RELAX_ROOT}"
 : "${MODEL_DIR:?Set MODEL_DIR to the HF model directory}"
 : "${DATA_DIR:?Set DATA_DIR to the JSONL file or directory}"
-: "${SAVE_DIR:?Set SAVE_DIR to a new run output directory}"
+: "${SAVE_DIR:?Set SAVE_DIR to a persistent output and checkpoint directory}"
 export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
 export RELAX_SKIP_CLUSTER_CLEANUP=1
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
@@ -24,6 +27,29 @@ export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 PROMPT_DATA="${DATA_DIR}"
 if [[ "${DATA_DIR}" != *.jsonl ]]; then PROMPT_DATA="${DATA_DIR}/train.jsonl"; fi
+RUN_ARGS=()
+if [[ -n "${NUM_STEPS:-}" ]]; then
+    RUN_ARGS+=(--num-rollout "${NUM_STEPS}")
+else
+    RUN_ARGS+=(--num-epoch "${NUM_EPOCH:-1}")
+fi
+if [[ -n "${LR_DECAY_ITERS:-}" ]]; then
+    RUN_ARGS+=(--lr-decay-iters "${LR_DECAY_ITERS}")
+fi
+CKPT_ARGS=()
+case "${SAVE_CHECKPOINT:-1}" in
+    1)
+        CKPT_ARGS=(
+            --load "${SAVE_DIR}/${EXP_NAME}"
+            --save "${SAVE_DIR}/${EXP_NAME}"
+            --save-interval "${SAVE_INTERVAL:-100}"
+            --max-actor-ckpt-to-keep "${MAX_CKPT_TO_KEEP:-2}"
+        )
+        ;;
+    0) ;;
+    *) echo 'SAVE_CHECKPOINT must be 0 or 1' >&2; exit 2 ;;
+esac
+source "${RELAX}/scripts/models/qwen38-flash-next.sh"
 ENV_ARGS=(
     RELAX_SKIP_NONFINITE_GRAD=0
     RELAX_SFT_SELECTIVE_LOGITS=1
@@ -115,35 +141,12 @@ TRAIN_ARGS=(
     --actor-num-gpus-per-node 8
     --sft-max-in-flight-steps 2
     --num-data-storage-units 2
-    --num-layers 48
-    --hidden-size 2560
-    --ffn-hidden-size 640
-    --num-attention-heads 24
-    --group-query-attention
-    --num-query-groups 2
-    --kv-channels 256
-    --normalization RMSNorm
-    --norm-epsilon 1e-6
-    --apply-layernorm-1p
-    --position-embedding-type rope
-    --rotary-percent 0.25
-    --rotary-base 10000000
-    --disable-bias-linear
-    --qk-layernorm
-    --swiglu
-    --untie-embeddings-and-output-weights
-    --vocab-size 248320
-    --num-experts 512
-    --moe-ffn-hidden-size 640
-    --moe-router-topk 10
-    --moe-router-load-balancing-type global_aux_loss
-    --moe-router-dtype fp32
-    --moe-permute-fusion
-    --moe-shared-expert-intermediate-size 640
+    "${MODEL_ARGS[@]}"
     --hf-checkpoint "${MODEL_DIR}"
     --ref-load "${MODEL_DIR}"
     --megatron-to-hf-mode bridge
-    --num-rollout "${NUM_STEPS:-10}"
+    "${RUN_ARGS[@]}"
+    "${CKPT_ARGS[@]}"
     --loss-type sft
     --prompt-data "${PROMPT_DATA}"
     --input-key messages
@@ -187,7 +190,6 @@ TRAIN_ARGS=(
     --optimizer adam
     --lr 3e-6
     --lr-decay-style cosine
-    --lr-decay-iters 32
     --min-lr 3e-7
     --lr-warmup-fraction 0.05
     --lr-warmup-init 3e-7
@@ -199,7 +201,6 @@ TRAIN_ARGS=(
     --use-distributed-optimizer
     --use-precision-aware-optimizer
     --no-store-param-remainders
-    --moe-aux-loss-coeff 0.001
     --seed 42
     --rollout-seed 42
     --bf16
@@ -219,8 +220,6 @@ TRAIN_ARGS=(
     --chunked-optimizer-state-offload
     --optimizer-state-offload-fraction 1.0
     --optimizer-state-offload-chunk-size-mb 512
-    --no-save-optim
-    --no-load-optim
     --empty-unused-memory-level 1
     --max-global-restart 0
     --num-layers-per-virtual-pipeline-stage 4
