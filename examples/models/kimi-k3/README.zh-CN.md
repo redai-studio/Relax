@@ -2,11 +2,136 @@
 
 [English](./README.md)
 
+## Kimi K3.1 训练入口
+
+K3.1 只保留 `scripts/run-kimi-k3.1-pro-sft.sh`（全参）和 `scripts/run-kimi-k3.1-pro-lora.sh`（LoRA）两个入口，支持文本和多模态数据。两者通过 `scripts/entrypoint/ray-job.sh` 提交，默认阻塞等待；`DRY_RUN=1` 仅输出参数。
+
+必填 `MODEL_DIR`（原始 HF 基座）、`DATA_DIR`、`SAVE_DIR`（持久化 checkpoint 根）。`EXP_NAME` 是稳定实验名，保存/恢复共用 `${SAVE_DIR}/${EXP_NAME}`；`LOAD_DIR` 可显式指定其他恢复目录。新实验更换保存目录或实验名。
+
+| Variable                                                   | Full SFT             | LoRA                |
+| ---------------------------------------------------------- | -------------------- | ------------------- |
+| `NUM_GPUS` / `TP_SIZE` / `PP_SIZE` / `CP_SIZE` / `EP_SIZE` | 128 / 4 / 4 / 8 / 32 | 64 / 4 / 4 / 4 / 16 |
+| `NUM_ROLLOUT`                                              | 1000                 | 200                 |
+| `GLOBAL_BATCH_SIZE`                                        | 512                  | 128                 |
+| `TRAIN_FILE` / `RAW_TEXT`                                  | train.parquet / 0    | train.parquet / 0   |
+| `SAVE_INTERVAL` / `SAVE_OPTIMIZER`                         | 100 / 1              | 10 / 1              |
+| `EVAL_INTERVAL`                                            | 0                    | 0                   |
+
+`PROMPT_DATA` 可覆盖训练文件路径；启用评测时指定 `EVAL_INTERVAL` 和 `EVAL_FILE`（相对 `DATA_DIR`）。`NUM_ROLLOUT` 对应训练参数 `--num-rollout`；学习率、调度长度、序列长度、LoRA rank/alpha 及 PP 首末层数分别由 `LR`、`LR_DECAY_STEPS`、`MAX_TOKENS_PER_GPU`、`LORA_RANK`/`LORA_ALPHA`、`PP_FIRST_LAYERS`/`PP_LAST_LAYERS` 覆盖。后续 CLI 参数也会原样传入训练入口。
+
+```bash
+# Set MODEL_DIR, DATA_DIR, SAVE_DIR and Ray addresses before submitting.
+TRAIN_FILE=train.jsonl RAW_TEXT=1 GLOBAL_BATCH_SIZE=256 NUM_ROLLOUT=100 EXP_NAME=k31-text bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=336 EXP_NAME=k31-multimodal bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=1000 LR_DECAY_STEPS=1000 EXP_NAME=k31-lora bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-lora.sh
+TRAIN_FILE=train.absolute-images.jsonl GLOBAL_BATCH_SIZE=128 MAX_TOKENS_PER_GPU=16384 NUM_ROLLOUT=241 LR_DECAY_STEPS=241 EXP_NAME=k31-aim bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+```
+
+DSA 复用及融合为显式实验开关：`RELAX_KIMI_K31_DSA_SELECTION_REUSE=1`、`RELAX_KIMI_K31_DSA_FUSED_INDEXER=1`，默认关闭。完整训练严格数值一致性尚未验收。模型权重单独保存（`SAVE_OPTIMIZER=0`）不能精确恢复 Adam 状态。
+
 ## 概述
 
 Relax 支持 Kimi K3 的全参和 LoRA SFT，包括图片输入、packing、固定 CP、PP 和 EP。模型配置位于 `scripts/models/kimi-k3.sh`，公开示例位于 `examples/models/kimi-k3/scripts/`。
 
 请使用按照 `docker/Dockerfile` 或 `docker/Dockerfile.cu13` 中固定的 Megatron/Bridge、FLA 和 NVRx 依赖构建的训练镜像。所有训练节点都必须能读取模型和数据目录。这些脚本是参考配置；长跑前需要在目标集群验证内存占用和数值行为。
+
+## 开源数据集复现结果
+
+以下 Kimi K3 实验使用 HellaSwag、multimodal-open-r1-8k-verified（OpenR1-MM）、Pokémon captions 和 LLaVA-OneVision v1.5 Instruct。全参 SFT/GRPO 使用 128×280G Blackwell，LoRA 使用 64×280G Blackwell。结果对应当时的实验配置，当前脚本默认值可能已有变化。曲线横轴为 raw step，平滑系数为 0.25，背景保留未平滑曲线。
+
+| 数据集                        | 实验                       | 观察结果                                                                          |
+| ----------------------------- | -------------------------- | --------------------------------------------------------------------------------- |
+| HellaSwag                     | 原始 context/target SFT    | 100 步内训练 loss 收敛至约 1.4，验证 loss 降至约 1.93。                           |
+| OpenR1-MM                     | 全参多模态 SFT             | 转换后的 MXFP4 checkpoint 在 256 条留出评估样本上的 pass@k 提升，评分口径见下表。 |
+| Pokémon captions（中文）      | 语言主干 LoRA              | 训练记录至 step 198，loss 持续下降。                                              |
+| LLaVA-OneVision v1.5 Instruct | 冻结视觉模型的长上下文 SFT | 记录至 step 680；packing 后序列约 110k token，单步约 60 秒，偶有尖峰。            |
+| OpenR1-MM                     | 多模态 GRPO                | rollout reward 上升，训推 logprob 差异维持较小量级并逐步下降。                    |
+
+### HellaSwag SFT
+
+原始文本脚本以 context 为输入、target ending 为监督目标。这里展示语言模型 loss，不代表 HellaSwag 多选题准确率。128×280G Blackwell 上记录的训练单步耗时约 40 秒。
+
+|                      训练 loss                      |                        验证 loss                         |
+| :-------------------------------------------------: | :------------------------------------------------------: |
+| ![HellaSwag 训练 loss](./assets/hellaswag-loss.png) | ![HellaSwag 验证 loss](./assets/hellaswag-eval-loss.png) |
+
+脚本：[`run-kimi-k3-hellaswag-128xblackwell-rawtext.sh`](./scripts/run-kimi-k3-hellaswag-128xblackwell-rawtext.sh)。
+
+### OpenR1-MM SFT 与评估
+
+从 multimodal-open-r1-8k-verified 中划分 7424 条训练样本和 256 条留出评估样本，对比原始 Kimi K3 与 **SFT iter86 转换为原生 MXFP4 HF 权重后的模型**。
+
+| 评分口径                           | 模型         |     pass@1 |     pass@4 |     pass@8 |    pass@16 |
+| ---------------------------------- | ------------ | ---------: | ---------: | ---------: | ---------: |
+| 原始 OpenR1-MM reward：格式 + 答案 | 原始 Kimi K3 |      7.50% |     11.92% |     14.98% |     20.00% |
+| 原始 OpenR1-MM reward：格式 + 答案 | SFT iter86   | **66.25%** | **77.64%** | **84.00%** | **90.00%** |
+| 最终答案评分器 v2                  | 原始 Kimi K3 |     43.44% |     49.31% |     52.29% |     55.00% |
+| 最终答案评分器 v2                  | SFT iter86   | **56.25%** | **64.84%** | **70.10%** | **75.00%** |
+
+两种口径使用独立的评分实现，得分并非包含关系，只应在同一评分口径内比较。这是 SFT 数据集的留出评估，并非独立 benchmark 套件。实验汇总未记录完整解码参数，因此这些数值还不能作为配置齐全的评估协议。当前 [`eval_openr1mm.py`](../../../scripts/tools/eval_openr1mm.py) 提供最终答案评估工具，其默认值不代表历史实验参数。
+
+|                       SFT 训练 loss 示例                       |
+| :------------------------------------------------------------: |
+| ![OpenR1-MM SFT 首段训练 loss](./assets/openr1mm-sft-loss.png) |
+
+上图为其中一段训练记录，不是到 iter86 的完整训练轨迹。128×280G Blackwell 上的上下文容量实验结果如下：
+
+| 全局 batch size | 上下文 | 视觉模型 | 结果             |
+| --------------: | -----: | -------- | ---------------- |
+|             256 |    64k | 联合训练 | 该次实验稳定训练 |
+|             256 |    96k | 联合训练 | step 16 OOM      |
+|             256 |    96k | 冻结     | 该次实验稳定训练 |
+|             512 |   128k | 冻结     | 该次实验稳定训练 |
+
+脚本：[`run-kimi-k3-openr1mm-128xblackwell.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell.sh)。
+
+### Pokémon LoRA
+
+64×280G Blackwell LoRA 实验使用 Pokémon GPT-4o captions 的中文数据文件 `pokemon_gpt4o_zh.parquet`。该结果展示图像描述数据上的 LoRA 训练收敛情况，没有对应的留出集准确率。
+
+|                         训练 loss                         |                           梯度范数                            |
+| :-------------------------------------------------------: | :-----------------------------------------------------------: |
+| ![Pokémon LoRA 训练 loss](./assets/pokemon-lora-loss.png) | ![Pokémon LoRA 梯度范数](./assets/pokemon-lora-grad-norm.png) |
+
+脚本：[`run-kimi-k3-pokemon-lora-64xblackwell.sh`](./scripts/run-kimi-k3-pokemon-lora-64xblackwell.sh)。
+
+### LLaVA-OneVision 长上下文 SFT
+
+128×280G Blackwell 实验冻结视觉模型，全局 batch size 为 512，使用 CP8。训练记录覆盖 step 0–680，在 128k 上下文预算下，packing 后序列通常约 110k token。loss 总体下降，多数单步耗时约 60 秒，初始化和个别尖峰耗时更长。该次实验出现过一次较大的梯度范数尖峰，后续定位为 FLA KDA 问题，记录中报告升级 FLA 0.5.2 后修复。该实验没有报告下游准确率。
+
+|                      训练 loss                      |                     单步耗时（秒）                      |                           packing 后 token 数                            |
+| :-------------------------------------------------: | :-----------------------------------------------------: | :----------------------------------------------------------------------: |
+| ![OneVision 训练 loss](./assets/onevision-loss.png) | ![OneVision 单步耗时](./assets/onevision-step-time.png) | ![OneVision packing 后序列 token 数](./assets/onevision-pack-tokens.png) |
+
+脚本：[`run-kimi-k3-llava-onevision-128xblackwell.sh`](./scripts/run-kimi-k3-llava-onevision-128xblackwell.sh)。
+
+### OpenR1-MM GRPO
+
+全参多模态 GRPO 使用 128×280G Blackwell。下图所示实验覆盖 step 0–60，rollout reward 从约 0.16 升至 0.44，训推 mismatch KL 维持在 0.002–0.003 左右，logprob 平均绝对差异约为 0.03。这些是训练诊断指标，不是留出集 pass@k。
+
+|                           Rollout reward                            |                           训推 mismatch KL                            |                              Logprob 绝对差异                               |
+| :-----------------------------------------------------------------: | :-------------------------------------------------------------------: | :-------------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO rollout reward](./assets/openr1mm-grpo-reward.png) | ![OpenR1-MM GRPO mismatch KL](./assets/openr1mm-grpo-mismatch-kl.png) | ![OpenR1-MM GRPO logprob 绝对差异](./assets/openr1mm-grpo-logprob-diff.png) |
+
+优化记录中的代表性迭代耗时从约 **1100 秒降至 770 秒**，降低约 30%；权重同步从约 **270 秒降至 80 秒**，降低约 70%。这些是不同运行中的近似观测值，不是受控的吞吐对比。下方耗时对比包含一条仅记录至 step 8 的优化后短跑；启动开销和序列长度变化都会影响曲线。蓝色为 9 月 29 日的优化后实验，黄色为 9 月 28 日的对照实验。
+
+|                             优化前迭代耗时（秒）                              |                          后续实验迭代耗时（秒）                          |
+| :---------------------------------------------------------------------------: | :----------------------------------------------------------------------: |
+| ![OpenR1-MM GRPO 优化前迭代耗时](./assets/openr1mm-grpo-step-time-before.png) | ![OpenR1-MM GRPO 后续迭代耗时对比](./assets/openr1mm-grpo-step-time.png) |
+
+脚本：[`run-kimi-k3-openr1mm-128xblackwell-grpo.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh)。
+
+## Kimi K3.1 Pro
+
+使用官方 `moonshotai/Kimi-K3.1-Pro` checkpoint，并配置 `--trust-remote-code` 和 `--megatron-to-hf-mode bridge`。Relax 根据 `KimiK31ForConditionalGeneration` / `kimi_k31` 自动选择本地 K3.1 bridge。模型配置位于 `scripts/models/kimi-k3.1-pro.sh`，复用 K3 的主干尺寸。现有 K3 SFT 脚本也可以将 `MODEL_DIR` 指向 K3.1 目录，同时设置新的 `EXP_NAME` 和 checkpoint 目录。
+
+K3.1 保留 93 层主干、KDA、latent MoE、AttnRes 和图像处理流程，在 24 个 MLA 层中增加 NoPE DSA 索引器：32 个头、每头 128 维，每个 query 选择 top-2048 keys。Bridge 为每个 MLA 层映射五个新增索引器张量。SFT/RL 中索引器保持冻结，因为硬 top-k 选择没有语言模型损失梯度；本次接入没有新增索引器蒸馏目标。K3.1 的 HF 仓库省略了 K3 动态加载所需的 modeling 文件，因此使用本地可训练的 MoonViT 和 projector。现有 FLOPs 估算尚未计入稀疏注意力及冻结索引器，K3.1 暂不报告 FLOPs/MFU，仍报告吞吐和耗时。
+
+训练路径使用 Core 的 TileLang 稀疏注意力，必要时对 K3 的 96 个注意力头进行计算块补齐。如果 LoRA 包装了 `kv_b_proj`，则使用展开注意力路径以保留 adapter 梯度和 dropout，但长上下文的内存开销更大。KDA 的固定 CP 依赖两个训练 Dockerfile 都会应用的 Relax Megatron patch：它移除了上游 Bridge 的 CP 拒绝检查，并加入 headwise/chunkwise CP 实现。请使用包含该 patch 的训练镜像；未打 patch 的固定版本 Bridge 不支持 KDA CP。K3.1 DSA 的 CP key gather 和 packed zigzag 重排由 Core 负责。完整脚本保留 CP8，但 K3.1 端到端 CP 数值和多节点训练仍需验证。下文 K3 的其他并行限制仍然适用。
+
+当前固定的 Megatron-Bridge 已提供可复用的 K3 主干。Bridge `v0.7.0` 和 main 的 `20874c8db` 均未实现 K3.1，单独升级 Bridge 无法获得支持，因此本次保留依赖版本。可参考[官方模型配置](https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/config.json)和 [Bridge 版本差异](https://github.com/NVIDIA-NeMo/Megatron-Bridge/compare/6862ee170a2569607e8ebc5dde91f119779093ca...20874c8dbf87af6eafa8c93c0f44586ddc47fe5a)。
+
+RL rollout 或 serving 需要包含 [SGLang #48415](https://github.com/sgl-project/sglang/pull/48415)（`61a3c7f2`，K3.1 支持）的运行环境，并移植、验证 Relax 的权重重载 patch；仓库当前的 SGLang `v0.5.21` 基础版本尚不支持。本次没有升级或验证该推理环境。下文 K3 专用的离线导出与 streaming LoRA 工具也尚未扩展到 K3.1。GPU 数值、分布式 checkpoint 和在线 rollout 权重重载仍需在目标训练镜像及集群验证。
 
 ## 训练
 

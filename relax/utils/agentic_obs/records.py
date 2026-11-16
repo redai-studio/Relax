@@ -28,6 +28,8 @@ OBSERVATION_DATA_FIELDS = ("sample_export_ids", "agentic_group_ids")
 # A major bump covers incompatible field/type changes; a minor bump is additive.
 # Version 2 writes sample_export_id as a JSON string instead of a number.
 SCHEMA_VERSION = "3.0.0"
+# The training stream versions its mask encoding independently.
+TRAIN_SCHEMA_VERSION = "4.0.0"
 
 
 def utc_now() -> str:
@@ -362,8 +364,8 @@ class TrainRecord:
     stage_id: str | None = None
     train_generation_id: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": SCHEMA_VERSION, **asdict(self)}
+    def to_dict(self, *, schema_version: str = SCHEMA_VERSION) -> dict[str, Any]:
+        return {"schema_version": schema_version, **asdict(self)}
 
 
 __all__ = [

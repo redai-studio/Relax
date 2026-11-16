@@ -48,6 +48,7 @@ class Sample:
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
     rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
+    rollout_topk_support_complete: np.ndarray | None = None  # [response_length], bool; verified sampler coverage
     rollout_routed_experts: np.ndarray | None = None  # [seq_len - 1, num_layers, topk]
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
@@ -104,6 +105,10 @@ class Sample:
     agentic_prompt_source: dict[str, Any] | None = None
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
+
+    @property
+    def response_key(self) -> int | str | None:
+        return self.index if self.index is not None else self.session_id
 
     @dataclass
     class SpecInfo:

@@ -62,6 +62,7 @@ def _manager(**overrides) -> OpdManager:
         opd_kl_coef=1.0,
         opd_loss_coef=0.0,
         opd_teacher_url="http://teacher/generate",
+        opd_teacher_routes_map=None,
         sglang_router_ip="student",
         sglang_router_port=80,
     )

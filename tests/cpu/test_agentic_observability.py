@@ -192,10 +192,17 @@ def test_trajectory_media_respects_sidecar_switch(tmp_path, dump_media) -> None:
 
 
 def test_resolve_shard_ordinal_falls_back_outside_a_ray_actor() -> None:
-    # Driver-side unit tests construct the recorder with no actor context; that
-    # must degrade to shard 0 rather than raise into the export path.
-    assert resolve_shard_ordinal() == 0
-    assert resolve_shard_ordinal(default=4) == 4
+    import ray
+
+    # A metadata probe in a standalone test must not implicitly own a cluster.
+    was_initialized = ray.is_initialized()
+    try:
+        assert resolve_shard_ordinal() == 0
+        assert resolve_shard_ordinal(default=4) == 4
+        assert ray.is_initialized() == was_initialized
+    finally:
+        if not was_initialized and ray.is_initialized():
+            ray.shutdown()
 
 
 # --------------------------------------------------------------------------
@@ -591,6 +598,8 @@ def rollout_module(monkeypatch):
     logging_module._log_rollout_data = lambda *args, **kwargs: None
     logging_module.get_local_rollout_manager = lambda: SimpleNamespace(training_weight_updating=False)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", logging_module)
+    # Reimporting also replaces the rollout attribute on the parent package.
+    monkeypatch.setattr(sys.modules["relax.agentic"], "rollout", None, raising=False)
     monkeypatch.delitem(sys.modules, "relax.agentic.rollout", raising=False)
     module = importlib.import_module("relax.agentic.rollout")
     yield module
@@ -624,7 +633,7 @@ async def _lease_observed_group(pipeline, module, stream, reward_domain, collect
     pipeline._changed = asyncio.Event()
     pipeline._opd_manager = None
     pipeline.reward_domain = reward_domain
-    pipeline.prepare_domain.take_ready = lambda count: [stream]
+    pipeline.prepare_domain.take_ready = lambda count: [(stream, None, ())]
     pipeline.runtime_domain.lease_group = AsyncMock()
     pipeline.runtime_domain.drop_group = AsyncMock()
     pipeline.runtime_domain.collect_group = collect_group
@@ -652,7 +661,8 @@ def test_cancel_records_exports_while_reward_is_pending(tmp_path, rollout_module
         pipeline = _obs_pipeline(rollout_module, args)
         rm_started = asyncio.Event()
 
-        async def slow_rm(*args):
+        async def slow_rm(*args, evaluation=False):
+            assert evaluation is False
             rm_started.set()
             await asyncio.Event().wait()
 
@@ -978,15 +988,17 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     config = resolve_agentic_obs_config(args)
     first, second = _read_jsonl(config.train_scalar_path(8, 0))
     assert first["update_id"] != second["update_id"]
-    assert first["schema_version"] == "3.0.0"
+    assert first["schema_version"] == "4.0.0"
+    assert json.loads(config.manifest_path.read_text())["train_schema_version"] == first["schema_version"]
     assert first["run_id"] == "run_test"
     assert first["capture_phase"] == "training_input"
     assert [row["sample_export_id"] for row in first["samples"]] == [str(2**60 + 1), "2"]
-    assert first["samples"][0]["loss_mask"] == [1, 0, 1, 0]
+    assert first["samples"][0]["loss_mask"] == {"ranges": [[0, 1, 1], [2, 3, 1]]}
     assert first["samples"][0]["effective_tokens"] == 2
     assert first["samples"][0]["advantage_mean"] == pytest.approx(2.0)
     assert first["samples"][0]["advantage_absmax"] == pytest.approx(3.0)
     assert first["samples"][1]["effective_tokens"] == 0
+    assert first["samples"][1]["loss_mask"] == {"ranges": []}
     assert first["samples"][1]["advantage_mean"] == pytest.approx(0.0)
     stages = [r for path in config.stages_dir.glob("actor_*.jsonl") for r in _read_jsonl(path)]
     inputs = [r for path in config.train_debug_dir.glob("*.jsonl") for r in _read_jsonl(path)]
@@ -998,6 +1010,39 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     assert not committed["groups_finalized"]  # Unassigned rows cannot establish membership.
     assert not committed["input_complete"]
     assert merged["actor:9:0"]["optimizer_step"] == 2
+
+
+def test_train_jsonl_loss_mask_ranges_roundtrip(tmp_path, fake_mpu):
+    from relax.utils.agentic_obs import train_hooks
+
+    fake_mpu()
+    args = _train_args(tmp_path)
+    mask = [0] * 6 + [1] * 16 + [0] * 3 + [2] * 9 + [0] * 8
+    data = _rollout_data(
+        [7],
+        response_lengths=[len(mask)],
+        total_lengths=[len(mask) + 2],
+        loss_masks=[torch.tensor(mask)],
+        advantages=None,
+        returns=None,
+    )
+    _emit_update(args, 1, data)
+    train_hooks.close_train_appenders()
+    config = resolve_agentic_obs_config(args)
+    (record,) = _read_jsonl(config.train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["loss_mask"] == {"ranges": [[6, 22, 1], [25, 34, 2]]}
+    restored = [0] * sample["response_length"]
+    for start, end, value in sample["loss_mask"]["ranges"]:
+        restored[start:end] = [value] * (end - start)
+    assert restored == mask
+    assert sample["effective_tokens"] == sum(mask)
+    assert len(json.dumps(sample["loss_mask"])) < len(json.dumps(mask))
+    legacy = {**record, "schema_version": "3.0.0", "samples": [{**sample, "loss_mask": mask}]}
+    stages = [row for path in config.stages_dir.glob("actor_*.jsonl") for row in _read_jsonl(path)]
+    (summary,) = merge_train_updates(stages, [record])
+    assert summary["status"] == "committed" and summary["input_complete"]
+    assert merge_train_updates(stages, [legacy]) == [summary]
 
 
 def test_update_joins_remote_dp_members_even_when_local_input_is_empty(tmp_path, fake_mpu, monkeypatch):

@@ -2,6 +2,7 @@
 
 import abc
 import os
+import tempfile
 from pathlib import Path
 
 import torch
@@ -262,7 +263,17 @@ class RolloutDataSource(DataSource):
 
         path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+        # Publish only a complete snapshot, including when replacing an earlier
+        # save of the same rollout after recovery.
+        fd, temporary = tempfile.mkstemp(prefix=".dataset-", suffix=".tmp", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                torch.save(state_dict, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:

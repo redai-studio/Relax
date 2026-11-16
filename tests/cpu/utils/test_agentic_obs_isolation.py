@@ -131,7 +131,8 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
     async def scenario():
         entered = asyncio.Event()
 
-        async def score(rm_args, samples):
+        async def score(rm_args, samples, *, evaluation):
+            assert evaluation is False
             entered.set()
             if cancelled:
                 await asyncio.Event().wait()
@@ -146,6 +147,7 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
         exec("from __future__ import annotations\n" + ast.unparse(cls), scope)
         domain = scope["RewardDomain"]()
         domain.args = args
+        domain._evaluation = False
         group = NS(samples=[NS(sample_export_id=export_id, reward=None) for export_id in (7, 8)])
         recorder = StageRecorder(args)
         task = asyncio.create_task(
@@ -156,6 +158,8 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
                 ),
             )
         )
+        # Propagate failures before the scorer starts instead of waiting forever.
+        task.add_done_callback(lambda _: entered.set())
         await entered.wait()
         if cancelled:
             task.cancel()
@@ -166,7 +170,7 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
         assert [sample.reward for sample in group.samples] == ([None, None] if cancelled else [1.0, 2.0])
         await recorder.aclose()
 
-    asyncio.run(scenario())
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
     rows = [
         json.loads(line)
         for line in (Path(args.dump_agentic_obs) / "run/stages/rollout_00000001.jsonl").read_text().splitlines()
@@ -658,7 +662,7 @@ def test_six_streams_keep_prompt_session_export_and_update_links(args, mpu):
         == rows["train"][0]["samples"][0]["sample_export_id"]
         == str(export_id)
     )
-    assert rows["train"][0]["samples"][0]["loss_mask"] == [1, 0]
+    assert rows["train"][0]["samples"][0]["loss_mask"] == {"ranges": [[0, 1, 1]]}
     (update,) = merge_train_updates(rows["stages"], rows["train"])
     assert update["status"] == "committed" and update["input_complete"] and update["group_ids"] == ["g"]
     assert update["started_at"] <= update["occurred_at"]

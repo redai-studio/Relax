@@ -521,6 +521,61 @@ selects that value. Leave reward unset on sibling contexts. Put any outcome need
 metadata. In multi-context training, reward reports the task outcome and custom advantage determines each export's
 advantage.
 
+### Background Eval Judging
+
+The built-in Agentic and standard SGLang eval paths can run expensive judges in the background after generating
+trajectories. Background judging is enabled by default without any flag; pass `--disable-eval-async-judge` to disable it
+and wait for scoring. This works with both colocated and separate training/rollout GPUs. Generating eval trajectories still uses
+the existing policy inference resources, and background scoring must not continue to depend on those resources.
+
+The independent HTTP reward `remote_rm` uses this mechanism automatically. A custom `--custom-rm-path` must declare
+support explicitly. For example, with existing `train_reward` and `eval_reward` implementations, the entry point can
+remain a synchronous function:
+
+```python
+def reward_func(args, sample, *, evaluation=False, **kwargs):
+    if evaluation:
+        return eval_reward(args, sample)
+    return train_reward(args, sample)
+
+
+reward_func.supports_async_eval = True
+```
+
+Synchronous `def` functions still run in the Ray reward process pool; `async def` functions can also declare support.
+The built-in Agentic and standard SGLang rollout paths pass `evaluation=False` during training and `evaluation=True`
+during evaluation, for both inline and background scoring. Functions accepting an `evaluation` keyword or `**kwargs`
+receive the argument; existing strict two-argument functions receive no extra argument. If you implement a complete
+rollout or eval function, explicitly pass `evaluation` when calling `async_rm` / `batched_async_rm`; Relax does not infer
+the phase from shared `args` or metadata. You do not need metadata phase markers or an extra YAML file to distinguish
+the phases. Configure the evaluation data directly through the CLI:
+
+```bash
+--eval-prompt-data agent_eval "<eval-data-path>"
+```
+
+You can still use `--eval-config` for dataset-specific sampling parameters or metadata.
+
+Declaring `supports_async_eval` means eval scoring only needs the exported Sample snapshot, persistent artifacts, and
+independent CPU or remote judge resources. Export the actions, tool results, and intermediate traces needed for scoring
+before the Session ends. The scorer must not depend on a live Session, temporary files, or a colocated model that may
+be offloaded. Return the final real reward; do not submit a background job yourself and return its ID or a placeholder
+score. The complete-list input and corresponding-list output contract for `group_rm` is unchanged.
+
+Relax uses a CPU reward pool separate from training scoring, then records metrics and dumps under the original eval
+iteration once the real scores arrive. Ordinary rule rewards, custom rewards without the declaration, managed
+`dapo-genrm`, and native image scoring keep their existing paths. Training rewards are also unaffected by this option.
+In ordinary RM mode, a reward already supplied by the Agent is reused without another scoring call.
+
+The eval pool for synchronous judges uses `--reward-num-workers` and `--reward-max-concurrency` independently of the
+training pool. Reserve CPU resources for the additional scoring processes.
+
+Normal training completion waits for pending judges and records their results. Background scoring failures are logged
+and raised during this final drain. This is not a durable job queue that survives the training job: failures or forced
+shutdown can interrupt scoring. Judges that consistently run slower than eval submission will accumulate a backlog,
+so set timeouts on remote calls and provision enough scoring capacity. Separate worker pools do not remove contention
+at a shared remote judge service.
+
 ## Configure Runtime Behavior
 
 ::: danger Required external-agent capacity
@@ -721,10 +776,14 @@ The current train producer covers the Megatron policy actor. An update ID is
 `actor:<rollout_id>:<step_id>`, scoped by `(run_id, train_generation_id)`; one rollout
 may contain several updates. Inputs are captured as micro-batches are consumed, before packing or
 dynamic CP splitting. Dummy batches are omitted, but real samples with zero
-loss masks remain. Each sample includes the full response-space `loss_mask`,
-lengths, effective tokens, and masked advantage/return statistics. Static CP
-statistics are `null`; dynamic CP captures full sequences before splitting.
-The mask is the training input mask, before loss-local TIS/OPSM filtering.
+loss masks remain. Each sample includes lengths, effective tokens, and masked
+advantage/return statistics. Train records with schema `4.0.0` encode
+`loss_mask.ranges` as zero-based, half-open `[start, end, value]` intervals over
+the response. Fill uncovered positions with zero up to `response_length`.
+For example, `[1, 1, 0, 1]` becomes `{"ranges": [[0, 2, 1], [3, 4, 1]]}`.
+Train records with schema `3.0.0` store `loss_mask` as a per-token array.
+Static CP statistics are `null`; dynamic CP captures full sequences before
+splitting. The mask describes training input before loss-local TIS/OPSM filtering.
 
 Identify each DP fragment by `(run_id, train_generation_id, update_id, dp_rank)`
 and join by `(run_id, train_generation_id, update_id)`. The actor-group initializer
@@ -815,8 +874,9 @@ Missing records, missing log files, unacknowledged export delivery, and partial 
 tails mean **unknown**, never proof of a pending or rejected training update.
 Managed logs snapshot the final 1 MiB locally before temporary-directory cleanup;
 `log_ref` names an accepted background write, so readers must check file availability.
-The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`;
-v3 readers merge DP facts instead of expecting a producer-side global commit event.
+The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`.
+Its `train_schema_version` identifies the train stream's schema. Readers merge
+DP facts to determine the update outcome.
 
 Eager and streaming readers preserve source identity before custom prompt processing,
 templating, filtering, shuffling, or replication. `source_row_id` is the zero-based

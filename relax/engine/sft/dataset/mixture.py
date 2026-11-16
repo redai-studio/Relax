@@ -118,6 +118,8 @@ class WeightedMixtureStreamingReader:
         weights: list[float | None] = []
         for raw_name, raw_entry in datasets.items():
             name = str(raw_name)
+            if name in names:
+                raise ValueError(f"Prompt-data mixture dataset names must be unique as strings: {name!r}")
             entry = {"path": raw_entry} if isinstance(raw_entry, (str, list)) else raw_entry
             if not isinstance(entry, dict):
                 raise ValueError(f"Prompt-data mixture dataset {name!r} must be a path or mapping")
@@ -171,6 +173,10 @@ class WeightedMixtureStreamingReader:
     def __getitem__(self, idx: int) -> dict:
         reader_idx, local_idx = self._locate(idx)
         return self.readers[reader_idx][local_idx]
+
+    def dataset_id(self, idx: int) -> int:
+        """Return the source of a logical row without modifying its payload."""
+        return self._locate(idx)[0]
 
     def iter_batch(self, indices: list[int]) -> Iterator[tuple[int, dict]]:
         groups: dict[int, list[tuple[int, int, int]]] = {}

@@ -18,10 +18,11 @@ from argparse import Namespace
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from itertools import groupby
 from typing import Any, Iterator
 
 from relax.utils.agentic_obs.config import AgenticObsConfig, resolve_agentic_obs_config, write_manifest
-from relax.utils.agentic_obs.records import ExportStageRecord, TrainRecord, decode_group_ids
+from relax.utils.agentic_obs.records import TRAIN_SCHEMA_VERSION, ExportStageRecord, TrainRecord, decode_group_ids
 from relax.utils.agentic_obs.writers import (
     CLOSE_TIMEOUT,
     BoundedWorker,
@@ -287,6 +288,18 @@ def record_optimizer_result(successful: bool) -> None:
     _submit_stage(state, state.stage)
 
 
+def _loss_mask_ranges(values: list[float]) -> list[tuple[int, int, int]]:
+    """Encode nonzero mask runs as half-open response-token intervals."""
+    ranges = []
+    start = 0
+    for value, run in groupby(values, key=int):
+        end = start + sum(1 for _ in run)
+        if value:
+            ranges.append((start, end, value))
+        start = end
+    return ranges
+
+
 def _write_update(state: _Update) -> None:
     try:
         samples = []
@@ -297,19 +310,20 @@ def _write_update(state: _Update) -> None:
             values = snapshot.values.tolist()
             cursor = 3 * len(snapshot.identities)
             for index, (export_id, group, response, total) in enumerate(snapshot.identities):
-                mask = [int(value) for value in values[cursor : cursor + response]]
+                mask_start = cursor
                 cursor += response
                 if export_id < 0:
                     continue
+                mask_ranges = _loss_mask_ranges(values[mask_start:cursor])
                 samples.append(
                     {
                         "sample_export_id": export_id,
                         "group_id": group,
                         "dp_rank": state.dp_rank,
-                        "effective_tokens": int(sum(mask)),
+                        "effective_tokens": sum((end - start) * value for start, end, value in mask_ranges),
                         "response_length": response,
                         "total_length": total,
-                        "loss_mask": mask,
+                        "loss_mask": {"ranges": mask_ranges},
                         "advantage_mean": values[3 * index] if snapshot.advantage_available else None,
                         "advantage_absmax": values[3 * index + 1] if snapshot.advantage_available else None,
                         "returns_mean": values[3 * index + 2] if snapshot.returns_available else None,
@@ -329,7 +343,7 @@ def _write_update(state: _Update) -> None:
                 dp_rank=state.dp_rank,
                 dp_world_size=state.dp_size,
                 input_complete=state.capture_ok,
-            )
+            ).to_dict(schema_version=TRAIN_SCHEMA_VERSION)
         )
         appender.close()
     except Exception as error:  # noqa: BLE001
