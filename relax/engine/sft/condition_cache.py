@@ -14,6 +14,17 @@ import torch
 
 @dataclass(frozen=True)
 class ConditionFieldSpec:
+    """Declaration of one cacheable condition output of a model adapter.
+
+    ``fields`` names the keys of the cached mapping. ``dependency_paths`` lists
+    the submodules whose parameters, buffers and training flags determine the
+    output. ``input_dependencies`` and ``preprocessing_dependencies`` name the
+    request metadata entries that every cache key must contain. ``max_tensors``
+    and ``max_depth`` bound the cached structure. ``deterministic`` declares
+    that equal inputs produce equal outputs, and both version numbers are part
+    of every key.
+    """
+
     name: str
     fields: tuple[str, ...]
     dependency_paths: tuple[str, ...]
@@ -28,11 +39,25 @@ class ConditionFieldSpec:
 
 @dataclass(frozen=True)
 class ConditionRequest:
+    """Cache request of one condition field for the current micro-batch.
+
+    ``metadata`` identifies the inputs and preprocessing that are hashed into
+    the key. ``eligible`` is ``False`` when the sample must be encoded online,
+    for example when random condition processing is enabled.
+    """
+
     metadata: dict[str, Any]
     eligible: bool = True
 
 
 def condition_key(spec: ConditionFieldSpec, metadata: dict[str, Any], generation: int) -> str:
+    """Return the SHA256 cache key of a condition request.
+
+    The key covers the declaration versions, the encoder generation and the
+    canonical JSON of ``metadata``. ``metadata`` must contain ``weights``,
+    ``text``, ``precision`` and every declared input and preprocessing
+    dependency.
+    """
     required = {"weights", "text", "precision", *spec.input_dependencies, *spec.preprocessing_dependencies}
     missing = required - metadata.keys()
     if missing:
@@ -66,6 +91,18 @@ def _tensor_metadata(tensor: torch.Tensor) -> tuple[Any, ...]:
 
 
 class ConditionCache:
+    """Bounded LRU store of frozen condition outputs on one device.
+
+    Entries are addressed by a field name and a key from ``condition_key``. A
+    value must be a mapping of the declared fields whose leaves are frozen
+    dense tensors on ``device``, nested only through tuples and mappings. Each
+    entry is charged the bytes of the distinct tensor storages it references,
+    so views of one storage are counted once. Insertion evicts the least
+    recently used entries until both ``max_entries`` and ``max_bytes`` hold.
+    Tensor metadata and version counters are recorded on insertion and checked
+    on every read.
+    """
+
     def __init__(
         self, specs: tuple[ConditionFieldSpec, ...], device: torch.device, max_entries: int, max_bytes: int
     ) -> None:
@@ -149,6 +186,12 @@ class ConditionCache:
         return result, tuple(tensors), sum(storages.values())
 
     def get(self, spec_name: str, key: str) -> Any | None:
+        """Return the cached value of ``key``, or ``None`` on a miss.
+
+        A hit marks the entry as most recently used. Raises ``ValueError`` and
+        drops the entry when its tensors were replaced, resized or modified in
+        place after insertion.
+        """
         spec = self._check(spec_name, key)
         self._stats["lookups"] += 1
         identity = (spec_name, key)
@@ -176,6 +219,12 @@ class ConditionCache:
         self._stats["charged_bytes"] -= size
 
     def put(self, spec_name: str, key: str, value: Any) -> bool:
+        """Store ``value`` under ``key`` and return whether it was inserted.
+
+        Tensors are kept as detached references without copying. Returns
+        ``False`` when ``key`` is already present or the value alone exceeds
+        ``max_bytes``.
+        """
         spec = self._check(spec_name, key)
         entry = self._inspect(spec, value, detach=True)
         identity = (spec_name, key)
@@ -199,15 +248,18 @@ class ConditionCache:
         return True
 
     def clear(self, spec_name: str | None = None) -> None:
+        """Remove all entries, or only the entries of ``spec_name``."""
         for identity in tuple(self._entries):
             if spec_name is None or identity[0] == spec_name:
                 self._remove(identity)
 
     def close(self) -> None:
+        """Release all entries and reject further use."""
         self.clear()
         self._closed = True
 
     def stats(self) -> dict[str, Any]:
+        """Return counters, the entry count and an entry size histogram."""
         return {
             **self._stats,
             "entries": len(self._entries),

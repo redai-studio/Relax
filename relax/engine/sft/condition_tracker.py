@@ -75,6 +75,7 @@ def _read_cpu_memory_bytes() -> tuple[int, int]:
 
 
 def compute_past_key_values_bytes(past_key_values: Any) -> int:
+    """Return the tensor bytes held by a K/V cache or a nested container."""
     if past_key_values is None:
         return 0
     if isinstance(past_key_values, torch.Tensor):
@@ -151,6 +152,16 @@ def _summarize_feature_bytes(values: list[int]) -> dict[str, Any]:
 
 
 class ConditionTracker:
+    """Record the online condition encoding baseline of one rank.
+
+    The tracker detects repeated samples, encoder calls and host-to-device
+    transfers by content keys, times host and GPU stages, and records step and
+    lifetime memory peaks. ``end_step`` appends one JSON line per step to
+    ``rank_<rank>_steps.jsonl`` under ``output_dir``, and ``save_summary``
+    writes ``rank_<rank>_summary.json``. Steps before ``warmup_steps`` are
+    excluded from the performance window.
+    """
+
     def __init__(
         self,
         rank: int,
@@ -177,7 +188,7 @@ class ConditionTracker:
         self.summary_json_path = self.output_dir / f"rank_{self.rank}_summary.json"
         self.steps_jsonl_path.write_text("", encoding="utf-8")
 
-        # 预分配 CUDA Event 事件池，每个 (micro, stage) 预分配两对事件以支持正负双分支调用
+        # Preallocate two CUDA event pairs per (micro, stage) for the positive and negative branches
         self._cuda_available = torch.cuda.is_available()
         self._use_cuda_events = False
         self._event_pool: dict[tuple[int, str], list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
@@ -310,6 +321,11 @@ class ConditionTracker:
         return [bool(is_pad) for _, is_pad in rank_slice]
 
     def begin_step(self, step: int, device: torch.device) -> None:
+        """Start ``step`` on ``device`` and reset the per-step records.
+
+        On CUDA devices the previous peaks are folded into the lifetime peaks
+        before the peak memory statistics are reset.
+        """
         self.current_step = int(step)
         self.current_device = device
         self._use_cuda_events = self._cuda_available and device.type == "cuda"
@@ -340,6 +356,13 @@ class ConditionTracker:
         height: int,
         width: int,
     ) -> None:
+        """Start a micro-batch and derive the content keys of its sample.
+
+        ``row`` is the dataset row of ``sample_id``. Its reference images,
+        prompt and target image, with ``config``, ``height`` and ``width``,
+        form the keys that detect repeated work. Only LoRA training is eligible
+        for reuse.
+        """
         self.current_micro = int(micro)
         self.current_sample_id = int(sample_id)
         self.current_training_mode = str(training_mode)
@@ -422,6 +445,7 @@ class ConditionTracker:
         }
 
     def set_prefix_context(self, prompt: str, is_positive: bool, think_mode: bool) -> None:
+        """Set the prefix key of the next positive or negative encode."""
         self.current_is_positive = bool(is_positive)
         key = _sha256_key(
             [
@@ -443,10 +467,12 @@ class ConditionTracker:
 
     @staticmethod
     def compute_kv_bytes(past_key_values: Any) -> int:
+        """Return the tensor bytes held by ``past_key_values``."""
         return compute_past_key_values_bytes(past_key_values)
 
     @contextmanager
     def host_stage(self, name: str) -> Iterator[None]:
+        """Add the wall-clock time of a host stage to the micro-batch."""
         t0 = time.perf_counter()
         try:
             yield
@@ -458,6 +484,11 @@ class ConditionTracker:
 
     @contextmanager
     def gpu_stage(self, name: str) -> Iterator[None]:
+        """Time a GPU stage of the current micro-batch or step.
+
+        On CUDA devices the stage is timed with CUDA events that ``end_step``
+        resolves; otherwise wall-clock time is used.
+        """
         if self._use_cuda_events:
             if name in self._step_event_pool:
                 start_ev, end_ev = self._step_event_pool[name]
@@ -499,6 +530,12 @@ class ConditionTracker:
                         micro_rec["timings_ms"][name] = micro_rec["timings_ms"].get(name, 0.0) + elapsed_ms
 
     def record_transfer(self, kind: str, tensor: torch.Tensor, image_index: int = 0, key: str | None = None) -> None:
+        """Record a host-to-device transfer of ``tensor``.
+
+        A transfer repeats when ``key`` was seen before. ``key`` defaults to
+        the content key of the current reference image, prefix or target image
+        for ``kind``.
+        """
         if kind not in self.transfer_stats:
             raise ValueError(f"Unknown transfer kind: {kind!r}")
         if key is None:
@@ -547,6 +584,13 @@ class ConditionTracker:
         eligible: bool | None = None,
         indexes_image_bytes: int = 0,
     ) -> None:
+        """Record one encoder call of ``kind`` over ``num_items`` inputs.
+
+        A call repeats when ``key`` was seen before; ``key`` defaults to the
+        current reference vision or prefix key. ``output_bytes`` and
+        ``indexes_image_bytes`` record the produced feature sizes. Generated
+        image encodes are never eligible for reuse.
+        """
         if kind not in self.encode_stats:
             raise ValueError(f"Unknown encode kind: {kind!r}")
         if kind == "gen_vision_encode":
@@ -625,6 +669,10 @@ class ConditionTracker:
                     micro_rec["feature_bytes"]["indexes_image_bytes"] = idx_bytes
 
     def consume_step_memory(self, device: torch.device) -> tuple[int, int]:
+        """Record the step memory peaks of ``device``.
+
+        Returns the lifetime ``(max_allocated, max_reserved)`` peaks in bytes.
+        """
         if self._cuda_available and device.type == "cuda":
             step_alloc = int(torch.cuda.max_memory_allocated(device))
             step_reserved = int(torch.cuda.max_memory_reserved(device))
@@ -638,6 +686,11 @@ class ConditionTracker:
         return self.max_allocated, self.max_reserved
 
     def end_step(self, step: int, data_wait_seconds: float, train_seconds: float) -> None:
+        """Finish ``step`` and append its record to the steps file.
+
+        Waits for the CUDA events of the step. ``data_wait_seconds`` and
+        ``train_seconds`` are measured by the caller.
+        """
         if int(step) != self.current_step:
             raise ValueError(f"Expected step {self.current_step}, received {step}")
         if self._current_step_peak_allocated is None or self._current_step_peak_reserved is None:
@@ -746,6 +799,7 @@ class ConditionTracker:
             handle.write(json.dumps(step_record, ensure_ascii=False) + "\n")
 
     def build_summary(self) -> dict[str, Any]:
+        """Aggregate the recorded steps of this rank into a summary."""
         perf_records = [r for r in self.step_records if r["step"] >= self.warmup_steps]
         window_records = perf_records if perf_records else self.step_records
 
@@ -869,6 +923,7 @@ class ConditionTracker:
         }
 
     def save_summary(self) -> dict[str, Any]:
+        """Write and return the summary of this rank."""
         summary = self.build_summary()
         if hasattr(self, "condition_cache_stats"):
             summary["condition_cache"] = self.condition_cache_stats
@@ -877,6 +932,11 @@ class ConditionTracker:
 
 
 def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
+    """Combine the rank files under ``output_dir`` into a run summary.
+
+    Reads every ``rank_*_steps.jsonl`` and ``rank_*_summary.json``, measures
+    local and cross-rank repeats, and writes ``baseline_summary.json``.
+    """
     out_path = Path(output_dir)
     step_files = sorted(out_path.glob("rank_*_steps.jsonl"))
     if not step_files:
@@ -910,7 +970,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     global_batch_size = micro_batches * world_size
     steps_per_epoch = math.ceil(dataset_size / global_batch_size) if dataset_size > 0 else 1
 
-    # 按 (step, micro, rank) 顺序遍历全量 micro 记录，统计本地与跨 rank 重复
+    # Walk all micro records in (step, micro, rank) order to count local and cross-rank repeats
     all_micro_events: list[tuple[int, int, int, dict[str, Any]]] = []
     for rank in ranks:
         for step_rec in rank_step_records[rank]:
@@ -966,7 +1026,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     local_repeat_evidence: list[dict[str, Any]] = []
     global_repeat_evidence: list[dict[str, Any]] = []
 
-    # 记录每个 (rank, step) 的全局重复工作耗时
+    # Time spent on globally repeated work per (rank, step)
     global_repeated_step_timings: dict[tuple[int, int], dict[str, float]] = {}
 
     for step_idx, micro_idx, rank, micro_rec in all_micro_events:
@@ -1003,7 +1063,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             },
         )
 
-        # 转移字节聚合
+        # Aggregate transfer bytes
         ref_image_keys = micro_rec.get("ref_image_keys", [])
         ref_img_glob_rep = any(k in global_seen_transfer_keys["ref_pixel_values"] for k in ref_image_keys)
         for k in ref_image_keys:
@@ -1050,7 +1110,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             step_glob_rep["target_image_preprocess_ms"] += t_ms
             step_glob_rep["train_ms"] += t_ms
 
-        # 编码调用聚合与证据收集
+        # Aggregate encoder calls and collect repeat examples
         for ekind in ENCODE_KINDS:
             enc_info = micro_rec.get("encodes", {}).get(ekind)
             if enc_info is None:
@@ -1189,7 +1249,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
         "global_repeat_byte_rate": float(tgb / tb) if tb > 0 else 0.0,
     }
 
-    # 聚合性能窗口阶段耗时：按 step 取跨 rank 均值序列后计算 Mean / P50 / P95
+    # Stage timings in the performance window: average each step across ranks, then compute mean, P50 and P95
     all_steps_by_idx: dict[int, list[dict[str, Any]]] = {}
     for rank in ranks:
         for rec in rank_step_records[rank]:

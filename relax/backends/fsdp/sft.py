@@ -243,6 +243,12 @@ class FSDPSFTTrainer:
             raise ValueError("Condition field declarations differ between ranks")
 
     def bump_encoder_version(self, spec_name: str | None = None, version_tag: Any = None) -> None:
+        """Invalidate cached conditions after an encoder weight update.
+
+        Call between micro-batches when frozen encoder weights change outside
+        ``load_state_dict``. A call on any rank reaches all ranks at the next
+        micro-batch. Does nothing when the condition cache is disabled.
+        """
         if self.condition_cache is not None:
             self.condition_cache.bump_encoder_version(spec_name, version_tag)
 

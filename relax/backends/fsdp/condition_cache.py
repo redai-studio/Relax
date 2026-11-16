@@ -11,6 +11,18 @@ from relax.engine.sft.condition_cache import ConditionCache, ConditionFieldSpec,
 
 
 class ConditionCacheBinding:
+    """Coordinate condition reuse of one FSDP SFT model across ranks.
+
+    Each micro-batch calls ``prepare``, gathers the returned states from all
+    ranks, calls ``decide``, runs forward and backward, and ends with
+    ``end_micro``. A value is reused only when every rank hits the same key at
+    the same encoder generation; otherwise every rank encodes online, so FSDP
+    collectives keep the same order on all ranks. Plain tensor dependencies are
+    compared with a snapshot before each request. FSDP-managed parameters need
+    an explicit ``bump_encoder_version`` call, and ``load_state_dict`` on a
+    dependency invalidates the cache through a hook.
+    """
+
     def __init__(self, model: torch.nn.Module, adapter: Any, device: torch.device, config: dict[str, Any]) -> None:
         self.model, self.adapter = model, adapter
         self.specs = adapter.condition_field_specs(model)
@@ -116,6 +128,13 @@ class ConditionCacheBinding:
         self.bump_encoder_version()
 
     def bump_encoder_version(self, spec_name: str | None = None, version_tag: Any = None) -> None:
+        """Invalidate cached outputs after the encoder weights change.
+
+        Clears the entries of ``spec_name``, or of every field when it is
+        ``None``, and advances their generation; the next ``decide`` spreads
+        the change to all ranks. ``version_tag`` is kept for adapters that
+        include it in their keys. Must be called between micro-batches.
+        """
         if self._closed or self._active:
             raise RuntimeError("Encoder updates require an open, idle condition cache")
         names = tuple(self.generations) if spec_name is None else (spec_name,)
@@ -130,6 +149,12 @@ class ConditionCacheBinding:
         self._refresh = True
 
     def prepare(self, data: Any) -> list[tuple[int, int, int, int]]:
+        """Look up the micro-batch ``data`` and return this rank's states.
+
+        Each state is ``(changed, generation, eligible, hit)`` for one declared
+        field, in declaration order. The caller gathers the states of all ranks
+        and passes them to ``decide``.
+        """
         if self._closed or self._active:
             raise RuntimeError("Condition requests require an open, idle cache")
         self.counters["requests"] += 1
@@ -172,6 +197,13 @@ class ConditionCacheBinding:
         return states
 
     def decide(self, states: list[list[tuple[int, int, int, int]]]) -> None:
+        """Apply the states gathered from all ranks and start the micro-batch.
+
+        ``states`` holds the ``prepare`` result of every rank. A field is
+        reused only when no rank changed its encoder and every rank is eligible
+        and hit. When any rank changed, all ranks clear the field and move to
+        the same new generation.
+        """
         for index, spec in enumerate(self.specs):
             name = spec.name
             ranks = [state[index] for state in states]
@@ -196,6 +228,11 @@ class ConditionCacheBinding:
         self._active = True
 
     def put(self, spec_name: str, value: Any) -> bool:
+        """Cache the online output of ``spec_name`` in the active micro-batch.
+
+        Returns ``False`` when the request was not eligible or the cache
+        skipped the value.
+        """
         if not self._active:
             raise RuntimeError("Condition insertion requires an active micro-batch")
         if spec_name not in self.keys or not self._eligible[spec_name]:
@@ -203,6 +240,7 @@ class ConditionCacheBinding:
         return self.cache.put(spec_name, self.keys[spec_name], value)
 
     def end_micro(self) -> None:
+        """Finish the micro-batch after backward and drop its references."""
         self.values.clear()
         self.keys.clear()
         self._hits.clear()
@@ -210,12 +248,14 @@ class ConditionCacheBinding:
         self._active = False
 
     def stats(self) -> dict[str, Any]:
+        """Return cache and coordination counters with hit and reuse rates."""
         stats = {**self.cache.stats(), **self.counters}
         stats["local_hit_rate"] = stats["local_hits"] / max(stats["lookups"], 1)
         stats["effective_reuse_rate"] = stats["effective_reuses"] / max(stats["requests"], 1)
         return stats
 
     def close(self) -> None:
+        """Release cached tensors, hooks and the adapter binding."""
         if self._closed:
             return
         self.end_micro()

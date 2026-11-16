@@ -144,7 +144,7 @@ class SenseNovaSFTModel(torch.nn.Module):
                     from transformers.cache_utils import DynamicCache, DynamicLayer
 
                     started = time.monotonic()
-                    # 直接设置层属性，共享缓存中的 K/V Tensor
+                    # Set the layer attributes directly so the restored cache shares the cached K/V tensors
                     restored = DynamicCache()
                     for key, value in condition["past_key_values"]:
                         layer = DynamicLayer()
@@ -267,7 +267,7 @@ class SenseNovaSFTAdapter:
             "weights": model._condition_model_path,
             "text": {
                 "files": files,
-                # 完整 tokenizer JSON：词表、merges、normalizer、pre-tokenizer、post-processor 与新增 token
+                # Full tokenizer JSON: vocabulary, merges, normalizer, pre-tokenizer, post-processor and added tokens
                 "backend": hashlib.sha256(tokenizer.backend_tokenizer.to_str().encode("utf-8")).hexdigest(),
                 "special_tokens": tokenizer.special_tokens_map,
                 "added_vocab": tokenizer.get_added_vocab(),

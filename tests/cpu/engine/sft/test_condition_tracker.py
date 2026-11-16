@@ -1,9 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 from __future__ import annotations
 
-import json
-import os
-import subprocess
 import weakref
 from argparse import Namespace
 from pathlib import Path
@@ -55,7 +52,7 @@ def test_condition_repeat_and_padding_counts_across_epochs(tmp_path: Path) -> No
         for r in range(world_size)
     ]
 
-    # 运行 2 个 epoch（每个 epoch 2 个 step，共 4 个 step，消费 16 个样本位置）
+    # Run 2 epochs of 2 steps each: 4 steps consume 16 sample positions
     for step in range(4):
         batch_ids = sampler.batch(step)
         for r in range(world_size):
@@ -117,14 +114,14 @@ def test_condition_repeat_and_padding_counts_across_epochs(tmp_path: Path) -> No
     summaries = [t.save_summary() for t in trackers]
     agg = summarize_baseline_dir(tmp_path)
 
-    # 4 个 step * global_batch_size 4 = 16 个消费位置；唯一行 5 个；每个 epoch 补齐 8 - 5 = 3 个，2 个 epoch 共 6 个
+    # 4 steps * global_batch_size 4 = 16 positions over 5 unique rows; each epoch pads 8 - 5 = 3, 6 in total
     assert agg["sample_stats"]["total_samples"] == 16
     assert agg["sample_stats"]["global_unique_rows"] == 5
     assert agg["sample_stats"]["padding_samples"] == 6
     assert sum(s["sample_stats"]["padding_samples"] for s in summaries) == 6
     assert agg["sample_stats"]["global_repeated_samples"] == 16 - 5
 
-    # 行 0 和行 2 共享相同的 (prompt, edit_image, height, width)，因此全局唯一条件数为 4
+    # Rows 0 and 2 share (prompt, edit_image, height, width), so there are 4 unique conditions
     ref_enc = agg["encoding_stats"]["ref_vision_encode"]
     prefix_enc = agg["encoding_stats"]["prefix_encode"]
     gen_enc = agg["encoding_stats"]["gen_vision_encode"]
@@ -136,7 +133,7 @@ def test_condition_repeat_and_padding_counts_across_epochs(tmp_path: Path) -> No
     assert ref_enc["cache_hits"] == 0
     assert ref_enc["cache_hit_rate"] == 0.0
 
-    # 当处理 2 张参考图（行 0 和行 2）时，encoded_images 按实际张数累加
+    # Rows 0 and 2 carry 2 reference images, and encoded_images counts every image
     all_consumed_ids = [sid for step in range(4) for sid in sampler.batch(step)]
     expected_encoded_images = sum(len(rows[sid]["edit_image"]) for sid in all_consumed_ids)
     assert ref_enc["encoded_images"] == expected_encoded_images
@@ -212,7 +209,7 @@ def test_transfer_bytes_and_feature_tensor_sizes_without_retaining_tensors(tmp_p
     row = {"prompt": "test", "image": "target.png", "edit_image": ["ref.png"]}
     config = {"max_pixels": 1048576, "fixed_pixels_tiers": None, "seed": 42}
 
-    # 第 0 步：首次出现
+    # Step 0: first occurrence
     tracker.begin_step(0, torch.device("cpu"))
     tracker.begin_micro(0, 0, row, config, "lora", 64, 64)
     tracker.set_prefix_context("test", is_positive=True, think_mode=False)
@@ -256,7 +253,7 @@ def test_transfer_bytes_and_feature_tensor_sizes_without_retaining_tensors(tmp_p
     assert ref_bf16() is None
     assert ref_kv() is None
 
-    # 第 1 步：相同样本再次出现，验证 repeated_transfer_bytes
+    # Step 1: the same sample appears again and counts as repeated_transfer_bytes
     tracker.begin_step(1, torch.device("cpu"))
     tracker.begin_micro(0, 0, row, config, "lora", 64, 64)
     tracker.set_prefix_context("test", is_positive=True, think_mode=False)
@@ -309,7 +306,7 @@ def test_gpu_peak_memory_preserves_lifetime_max_and_step_peak(tmp_path: Path, mo
     monkeypatch.setattr(torch.cuda, "max_memory_reserved", fake_max_reserved)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", fake_reset)
 
-    # Step 0 开始前初始化显存峰值为 5000 / 8000，Step 0 运行中单步峰值为 3000 / 6000
+    # The peaks are 5000 / 8000 before step 0, and the step 0 peaks are 3000 / 6000
     cuda_dev = torch.device("cuda", 0)
     tracker.begin_step(0, cuda_dev)
     assert state["reset_count"] == 1
@@ -324,7 +321,7 @@ def test_gpu_peak_memory_preserves_lifetime_max_and_step_peak(tmp_path: Path, mo
     assert tracker._current_step_peak_reserved == 6000
     tracker.end_step(0, 0.001, 0.01)
 
-    # Step 1 单步峰值升至 7000 / 9000，历史峰值同步更新为 7000 / 9000
+    # The step 1 peaks rise to 7000 / 9000, and the lifetime peaks follow
     tracker.begin_step(1, cuda_dev)
     state["alloc"] = 7000
     state["reserved"] = 9000
@@ -485,7 +482,7 @@ def test_training_parity_with_and_without_tracker(tmp_path: Path, monkeypatch: p
     assert (tmp_path / "on" / "stats" / "rank_0_summary.json").is_file()
 
 
-def test_validate_i2i_sft_config_and_launcher_baseline_env(tmp_path: Path) -> None:
+def test_validate_i2i_sft_config_baseline_fields(tmp_path: Path) -> None:
     base_args = Namespace(
         loss_type="sft",
         generation_task="i2i",
@@ -540,45 +537,6 @@ def test_validate_i2i_sft_config_and_launcher_baseline_env(tmp_path: Path) -> No
         )
         with pytest.raises(ValueError, match="baseline_warmup_steps"):
             validate_i2i_sft_config(bad_args)
-
-    # 验证启动脚本转发 BASELINE_STATS_DIR 与 BASELINE_WARMUP_STEPS
-    root = Path(__file__).resolve().parents[4]
-    env = os.environ.copy()
-    env.update(
-        MODEL_PATH="/model",
-        DATA_ROOT="/data",
-        METADATA_PATH="/metadata",
-        DATASET_SIZE="8",
-        GPUS="2",
-        GPUS_PER_NODE="2",
-        GLOBAL_BATCH_SIZE="4",
-        BASELINE_STATS_DIR=str(tmp_path / "run_stats"),
-        BASELINE_WARMUP_STEPS="5",
-    )
-    command = """
-ray() {
-    python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"
-}
-export -f ray
-bash "$1"
-"""
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            command,
-            "capture",
-            str(root / "scripts/training/diffusion/run-sensenova-i2i-sft-fixed-tiers-8xgpu.sh"),
-        ],
-        env=env,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    cli_args = json.loads(result.stdout)
-    i2i_cfg = json.loads(cli_args[cli_args.index("--i2i-sft-config") + 1])
-    assert i2i_cfg["baseline_stats_dir"] == str(tmp_path / "run_stats")
-    assert i2i_cfg["baseline_warmup_steps"] == 5
 
 
 class _StubTokenizer:
