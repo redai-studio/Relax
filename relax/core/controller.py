@@ -1235,14 +1235,15 @@ class Controller:
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
         self._validate_gpu_resources(roles_to_create, actor_rollout_colocate, actor_rollout_pg_roles)
 
-        shared_pg = None
-        if actor_rollout_colocate and not self.config.hybrid:
+        if teacher_pg is not None:
             shared_pg = teacher_pg
-            if shared_pg is None:
-                shared_pg = create_placement_group(
-                    num_gpus=self.config.resource.get(ROLES.actor)[1],
-                    node_group_affinity=self.config.enable_affinity,
-                )
+        elif actor_rollout_colocate and not self.config.hybrid:
+            shared_pg = create_placement_group(
+                num_gpus=self.config.resource[ROLES.actor][1],
+                node_group_affinity=self.config.enable_affinity,
+            )
+        else:
+            shared_pg = None
 
         service_args = [
             (

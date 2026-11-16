@@ -24,6 +24,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
+    is_managed_opd_teacher_colocate,
     is_managed_opd_teacher_enabled,
     teacher_sglang_parse_args,
     validate_managed_opd_teacher_colocate_args,
@@ -4059,6 +4060,10 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
 
 
 def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
+    if is_managed_opd_teacher_colocate(args):
+        # The configured rollout/teacher split also applies without a training actor.
+        return
+
     if args.colocate and not args.rollout_num_gpus:
         args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
     else:
