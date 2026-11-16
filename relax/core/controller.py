@@ -798,6 +798,10 @@ class Controller:
             if role == "sft" and getattr(self, "_sft_line_offsets_cache", None) is not None:
                 service_config = copy.copy(self.config)
                 service_config._sft_line_offsets_cache = self._sft_line_offsets_cache
+            elif role == "rollout" and getattr(self.config, "opd_shared_teacher", False):
+                # Only rollout workers need this live Ray handle.
+                service_config = copy.copy(self.config)
+                service_config._opd_shared_teacher_manager = self._teacher_manager[0]
             service = Service(
                 cls,
                 role=role,
