@@ -1,0 +1,837 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/arg_groups/hicache_hook.py b/python/sglang/srt/arg_groups/hicache_hook.py
+--- a/python/sglang/srt/arg_groups/hicache_hook.py	2026-10-01 06:43:50.000000000 +0800
++++ b/python/sglang/srt/arg_groups/hicache_hook.py	2026-11-22 18:56:43.646392729 +0800
+@@ -178,6 +178,12 @@
+ 
+ def resolve_storage_layout_compatibility(server_args: Any):
+     cfg = resolving_view(server_args)
++    if cfg.hicache_storage_backend == "mooncake" and cfg.enable_lora:
++        raise ValueError(
++            "Mooncake HiCache L3 does not support LoRA: adapter updates bypass "
++            "the L3 weight-epoch invalidation and could restore KV/Mamba state "
++            "computed with an older adapter. Disable LoRA or use a non-L3 backend."
++        )
+     if (
+         cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
+         or cfg.hicache_mem_layout != "layer_first"
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/hardware_backend/npu/batch_invariant_ops/npu_batch_invariant_ops.py b/python/sglang/srt/hardware_backend/npu/batch_invariant_ops/npu_batch_invariant_ops.py
+--- a/python/sglang/srt/hardware_backend/npu/batch_invariant_ops/npu_batch_invariant_ops.py	2026-10-01 06:43:50.000000000 +0800
++++ b/python/sglang/srt/hardware_backend/npu/batch_invariant_ops/npu_batch_invariant_ops.py	2026-11-22 18:56:43.894383366 +0800
+@@ -1,105 +1,105 @@
+-# Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
+-
+-import batch_invariant_ops  # noqa: F401
+-import torch
+-import torch_npu
+-from torch_npu.npu import NpuGraphOpHandler, register_npu_graph_handler
+-
+-
+-def npu_mm_batch_invariant(a, b):
+-    return torch.ops.batch_invariant_ops.npu_mm_batch_invariant(a, b)
+-
+-
+-def npu_matmul_batch_invariant(a, b):
+-    return torch.ops.batch_invariant_ops.npu_matmul_batch_invariant(a, b)
+-
+-
+-def npu_mean_batch_invariant(
+-    input, dim, keepdim=False, dtype: torch.dtype | None = None
+-):
+-    assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
+-    if len(dim) == 1:
+-        return torch.ops.batch_invariant_ops.npu_reduce_mean_batch_invariant(
+-            input, dim[0], keepdim=keepdim
+-        )
+-    else:
+-        assert input.dtype in {
+-            torch.float16,
+-            torch.bfloat16,
+-            torch.float32,
+-        }, "only float types supported for now"
+-        n_elems = 1
+-        for d in dim:
+-            n_elems *= input.shape[d]
+-        return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
+-
+-
+-def npu_log_softmax_batch_invariant(input, dim, _half_to_float):
+-    assert not _half_to_float, "not implemented"
+-    return torch.ops.batch_invariant_ops.npu_log_softmax_batch_invariant(input, dim=dim)
+-
+-
+-# Preserve the OpOverloadPacket, including its graph-compatible .out overload.
+-npu_fused_infer_attention_score_batch_invariant = (
+-    torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant
+-)
+-npu_fia_batch_invariant_get_max_workspace = torch.ops.batch_invariant_ops._npu_fused_infer_attention_score_batch_invariant_get_max_workspace
+-
+-
+-def npu_add_rms_norm_batch_invariant(
+-    x: torch.Tensor,
+-    residual: torch.Tensor,
+-    weight: torch.Tensor,
+-    eps: float,
+-):
+-    """
+-    AclnnAddRmsNorm can't ensure batch invariant,
+-    so we need to split it into add and rms_norm.
+-    """
+-    x_ = x + residual
+-    residual_ = x_
+-    x_, _ = torch_npu.npu_rms_norm(x_, weight, eps)
+-    return x_, None, residual_
+-
+-
+-@register_npu_graph_handler(
+-    [
+-        "npu_fused_infer_attention_score_batch_invariant.default",
+-        "npu_fused_infer_attention_score_batch_invariant.out",
+-    ]
+-)
+-class NativeFIAGraphHandler(NpuGraphOpHandler):
+-    """Rebind the native FIA's keyword-only CPU lengths on graph updates."""
+-
+-    @classmethod
+-    def prepare_capture(cls, func, args, kwargs):
+-        ops = torch.ops.batch_invariant_ops
+-        out_op = npu_fused_infer_attention_score_batch_invariant.out
+-        # graph.update replaces matching kwargs; include optional lengths too.
+-        kwargs = dict(kwargs)
+-        kwargs.setdefault("actual_seq_lengths", None)
+-        kwargs.setdefault("actual_seq_lengths_kv", None)
+-        if func is out_op:
+-            return func, args, kwargs
+-        workspace = npu_fia_batch_invariant_get_max_workspace(*args, **kwargs)
+-        # Match infer_output's keyword-only schema; omit absent kwargs to keep
+-        # its defaults. Sequence lengths are not accepted by this helper;
+-        # they remain in kwargs for FIA execution and graph updates.
+-        keys = [
+-            "input_layout",
+-            "quant_scale2",
+-            "block_table",
+-            "num_heads",
+-            "num_key_value_heads",
+-            "softmax_lse_flag",
+-            "query_rope",
+-        ]
+-        # FIA positional args are (query, key, value): args[0] is Q, args[2] is V.
+-        # This helper derives output shapes/dtypes from Q, V and the options
+-        # above, then allocates (attention_output, softmax_lse) for .out.
+-        # It does not compute attention; .out fills these buffers.
+-        output = ops._npu_fused_infer_attention_score_batch_invariant_infer_output(
+-            args[0], args[2], **{k: kwargs[k] for k in keys if k in kwargs}
+-        )
+-        kwargs.update(workspace=workspace, out=list(output))
+-        return out_op, args, kwargs
++# Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
++
++import batch_invariant_ops  # noqa: F401
++import torch
++import torch_npu
++from torch_npu.npu import NpuGraphOpHandler, register_npu_graph_handler
++
++
++def npu_mm_batch_invariant(a, b):
++    return torch.ops.batch_invariant_ops.npu_mm_batch_invariant(a, b)
++
++
++def npu_matmul_batch_invariant(a, b):
++    return torch.ops.batch_invariant_ops.npu_matmul_batch_invariant(a, b)
++
++
++def npu_mean_batch_invariant(
++    input, dim, keepdim=False, dtype: torch.dtype | None = None
++):
++    assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
++    if len(dim) == 1:
++        return torch.ops.batch_invariant_ops.npu_reduce_mean_batch_invariant(
++            input, dim[0], keepdim=keepdim
++        )
++    else:
++        assert input.dtype in {
++            torch.float16,
++            torch.bfloat16,
++            torch.float32,
++        }, "only float types supported for now"
++        n_elems = 1
++        for d in dim:
++            n_elems *= input.shape[d]
++        return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
++
++
++def npu_log_softmax_batch_invariant(input, dim, _half_to_float):
++    assert not _half_to_float, "not implemented"
++    return torch.ops.batch_invariant_ops.npu_log_softmax_batch_invariant(input, dim=dim)
++
++
++# Preserve the OpOverloadPacket, including its graph-compatible .out overload.
++npu_fused_infer_attention_score_batch_invariant = (
++    torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant
++)
++npu_fia_batch_invariant_get_max_workspace = torch.ops.batch_invariant_ops._npu_fused_infer_attention_score_batch_invariant_get_max_workspace
++
++
++def npu_add_rms_norm_batch_invariant(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++):
++    """
++    AclnnAddRmsNorm can't ensure batch invariant,
++    so we need to split it into add and rms_norm.
++    """
++    x_ = x + residual
++    residual_ = x_
++    x_, _ = torch_npu.npu_rms_norm(x_, weight, eps)
++    return x_, None, residual_
++
++
++@register_npu_graph_handler(
++    [
++        "npu_fused_infer_attention_score_batch_invariant.default",
++        "npu_fused_infer_attention_score_batch_invariant.out",
++    ]
++)
++class NativeFIAGraphHandler(NpuGraphOpHandler):
++    """Rebind the native FIA's keyword-only CPU lengths on graph updates."""
++
++    @classmethod
++    def prepare_capture(cls, func, args, kwargs):
++        ops = torch.ops.batch_invariant_ops
++        out_op = npu_fused_infer_attention_score_batch_invariant.out
++        # graph.update replaces matching kwargs; include optional lengths too.
++        kwargs = dict(kwargs)
++        kwargs.setdefault("actual_seq_lengths", None)
++        kwargs.setdefault("actual_seq_lengths_kv", None)
++        if func is out_op:
++            return func, args, kwargs
++        workspace = npu_fia_batch_invariant_get_max_workspace(*args, **kwargs)
++        # Match infer_output's keyword-only schema; omit absent kwargs to keep
++        # its defaults. Sequence lengths are not accepted by this helper;
++        # they remain in kwargs for FIA execution and graph updates.
++        keys = [
++            "input_layout",
++            "quant_scale2",
++            "block_table",
++            "num_heads",
++            "num_key_value_heads",
++            "softmax_lse_flag",
++            "query_rope",
++        ]
++        # FIA positional args are (query, key, value): args[0] is Q, args[2] is V.
++        # This helper derives output shapes/dtypes from Q, V and the options
++        # above, then allocates (attention_output, softmax_lse) for .out.
++        # It does not compute attention; .out fills these buffers.
++        output = ops._npu_fused_infer_attention_score_batch_invariant_infer_output(
++            args[0], args[2], **{k: kwargs[k] for k in keys if k in kwargs}
++        )
++        kwargs.update(workspace=workspace, out=list(output))
++        return out_op, args, kwargs
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+--- a/python/sglang/srt/managers/cache_controller.py	2026-11-16 23:13:54.708987497 +0800
++++ b/python/sglang/srt/managers/cache_controller.py	2026-11-22 18:56:43.662392125 +0800
+@@ -266,6 +266,8 @@
+ 
+         self._lock = threading.Lock()
+         self._terminated_flag = False
++        # An allocated host buffer cannot be reused until its reader exits.
++        self.io_done = threading.Event()
+         self.storage_hit_count = 0
+         self.start_time = time.monotonic()
+ 
+@@ -492,7 +494,10 @@
+         except Exception:
+             pass
+ 
+-        # Best-effort joins (threads are daemon, but join keeps state clean).
++        # The prefetch thread creates its IO child. Join the parent first,
++        # then discover the child; snapshotting all threads before joining can
++        # miss a child created during a startup/reset race.
++        deadline = time.monotonic() + 10.0
+         threads = []
+         if hasattr(self, "prefetch_thread"):
+             threads.append(self.prefetch_thread)
+@@ -505,9 +510,9 @@
+ 
+         for t in threads:
+             try:
+-                t.join(timeout=10)
+-            except Exception:
+-                pass
++                t.join(timeout=max(0.0, deadline - time.monotonic()))
++            except RuntimeError:
++                pass  # Partially initialized controller; checked below.
+ 
+         alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+         if alive:
+@@ -1170,15 +1175,32 @@
+                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                 if operation is None:
+                     continue
+-                self._page_transfer(operation)
++                try:
++                    self._page_transfer(operation)
+ 
+-                self.prefetch_sync_queue.put(
+-                    PrefetchAck(
+-                        rid=operation.request_id,
+-                        completed_req=True,
+-                        operation=operation,
++                    self.prefetch_sync_queue.put(
++                        PrefetchAck(
++                            rid=operation.request_id,
++                            completed_req=True,
++                            operation=operation,
++                        )
+                     )
+-                )
++                except Exception:
++                    # A failed storage read must not kill the shared I/O worker or
++                    # leave wait_complete requests waiting forever. The transfer
++                    # has unwound: only its already-published prefix is usable;
++                    # hybrid callers still validate every component across TP.
++                    operation.mark_terminate()
++                    logger.warning(
++                        "HiCache prefetch I/O failed; terminating the operation.",
++                        exc_info=True,
++                    )
++                finally:
++                    # IO has unwound, including a failed Full or Mamba read.
++                    self.append_host_mem_release(
++                        operation.host_indices[operation.completed_tokens :]
++                    )
++                    operation.io_done.set()
+             except Empty:
+                 continue
+ 
+@@ -1239,7 +1261,12 @@
+                 if operation.is_terminated():
+                     hash_value, storage_hit_count = [], 0
+                 else:
+-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
++                    try:
++                        hash_value, storage_hit_count = self._storage_hit_query(operation)
++                    except Exception:
++                        # Every rank must still enter the hit-count collective.
++                        hash_value, storage_hit_count = [], 0
++                        logger.warning("HiCache storage lookup failed; recomputing.", exc_info=True)
+                 storage_hit_count_tensor = torch.tensor(
+                     storage_hit_count, dtype=torch.int
+                 )
+@@ -1323,9 +1350,14 @@
+                 if operation is None:
+                     continue
+ 
+-                if not self.backup_skip:
+-                    self._page_backup(operation)
+-                self.ack_backup_queue.put(operation)
++                try:
++                    if not self.backup_skip:
++                        self._page_backup(operation)
++                except Exception:
++                    logger.warning("HiCache storage backup failed; retaining host cache.", exc_info=True)
++                finally:
++                    # The writer has exited; release its host lock even on failure.
++                    self.ack_backup_queue.put(operation)
+ 
+             except Empty:
+                 continue
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py	2026-11-16 23:13:54.728987052 +0800
++++ b/python/sglang/srt/managers/scheduler.py	2026-11-22 18:56:43.658392276 +0800
+@@ -116,6 +116,7 @@
+ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+ from sglang.srt.lora.lora_drainer import LoRADrainer
+ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
++from sglang.srt.managers import mm_utils
+ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+ from sglang.srt.managers.io_struct import (
+@@ -5222,6 +5223,12 @@
+             if self.draft_worker:
+                 self.draft_worker.clear_cache_pool()
+ 
++            # Drop cached embeddings so weight updates cannot reuse stale encoder
++            # outputs. Do this before trimming the allocator so colocated workloads
++            # can reclaim the memory.
++            if mm_utils.embedding_cache is not None:
++                mm_utils.embedding_cache.clear()
++
+             if empty_cache:
+                 current_platform.empty_cache()
+             # Per-DP-group leader logs once: ranks within a DP group are
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py	2026-11-16 23:13:54.708987497 +0800
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py	2026-11-22 18:56:43.666391974 +0800
+@@ -124,6 +124,7 @@
+             if req.finished():
+                 self._maybe_collect_routed_experts(req)
+                 req.time_stats.set_quick_finish_time()
++                self._maybe_collect_routed_experts(req)
+                 if get_memory().enable_hisparse:
+                     self.hisparse_coordinator.request_finished(req)
+                 release_kv_cache(req, self.tree_cache)
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py	2026-11-16 23:13:54.712987408 +0800
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py	2026-11-22 18:56:43.666391974 +0800
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import logging
+ import time
+ import traceback
+@@ -102,6 +104,97 @@
+     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
+     _session: Optional[_WeightUpdateSession] = None
+ 
++    def _storage_weight_backend(self):
++        cache = getattr(self.scheduler, "tree_cache", None)
++        controller = getattr(cache, "cache_controller", None)
++        backend = getattr(controller, "storage_backend", None)
++        if backend is None or not hasattr(backend, "weight_namespace"):
++            return None
++        if not backend.weight_namespace:
++            raise RuntimeError("Mooncake L3 weight updates require an initialized cache namespace")
++        return backend
++
++    def _log_storage_lifecycle(self, event: str) -> None:
++        cache = getattr(self.scheduler, "tree_cache", None)
++        controller = getattr(cache, "cache_controller", None)
++        backend = getattr(controller, "storage_backend", None)
++        if not getattr(backend, "weight_namespace", None):
++            return
++        logger.info("MOONCAKE_L3_LIFECYCLE %s", json.dumps({
++            "event": event, "tp_rank": self.scheduler.ps.tp_rank,
++            "namespace": backend.weight_namespace, "epoch": backend.weight_epoch,
++            "backend": type(backend).__name__,
++            "offload_tags": sorted(self.offload_tags),
++        }, sort_keys=True))
++
++    @contextmanager
++    def _storage_weight_update(self):
++        backend = self._storage_weight_backend()
++        outcome = {"success": False}
++        if backend is None:
++            yield outcome
++            return
++        cache = self.scheduler.tree_cache
++        controller = cache.cache_controller
++        try:
++            deadline = time.monotonic() + 10.0
++            while True:
++                cache.check_hicache_events()
++                states = torch.tensor([int(not self.is_fully_idle())], dtype=torch.int)
++                torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++                if not states[0].item():
++                    break
++                expired = torch.tensor([int(time.monotonic() >= deadline)], dtype=torch.int)
++                torch.distributed.all_reduce(expired, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++                if expired[0].item():
++                    raise RuntimeError("Mooncake L3 weight update requires a fully idle engine")
++                time.sleep(0.001)
++            error = None
++            try:
++                controller._stop_storage_threads()
++            except Exception as exc:
++                error = exc
++            states = torch.tensor([int(error is not None)], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Mooncake L3 storage workers did not stop on every rank") from error
++            backend.advance_weight_namespace()
++            error = None
++            try:
++                flushed = self.flush_cache(empty_cache=False)
++            except Exception as exc:
++                flushed, error = False, exc
++            states = torch.tensor([int(not flushed)], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Mooncake L3 cache flush failed before weight mutation") from error
++            digest = torch.tensor(list(hashlib.sha256(backend.weight_namespace.encode()).digest()), dtype=torch.int)
++            low, high = digest.clone(), digest.clone()
++            cache._all_reduce_attn_groups(low, torch.distributed.ReduceOp.MIN)
++            cache._all_reduce_attn_groups(high, torch.distributed.ReduceOp.MAX)
++            states = torch.tensor([int(not torch.equal(low, high))], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Mooncake L3 weight namespaces differ within an attention owner")
++            self._log_storage_lifecycle("before_weight_mutation")
++            mutation_error = None
++            try:
++                yield outcome
++            except BaseException as exc:
++                mutation_error = exc
++            states = torch.tensor([int(mutation_error is not None or not outcome["success"])], dtype=torch.int)
++            torch.distributed.all_reduce(states, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group)
++            if states[0].item():
++                raise RuntimeError("Weight mutation failed; Mooncake L3 engine must be rebuilt") from mutation_error
++            self._log_storage_lifecycle("after_weight_mutation")
++        except BaseException:
++            # Partial mutation cannot safely resume generation or reuse the old
++            # namespace. The supervisor observes an engine failure, never a gain.
++            # Do not request graceful host-pool destruction: a failed stop may
++            # still own an IO pointer. Propagate to the scheduler's fatal path.
++            controller.storage_stop_event.set()
++            raise
++
+     @contextmanager
+     def _observe_weight_load(self, source: str) -> Iterator[None]:
+         # Edge-trigger weight_load_duration_seconds at the end of each
+@@ -110,7 +203,8 @@
+         # `source` distinguishes disk vs distributed vs tensor vs ipc.
+         t0 = time.perf_counter()
+         try:
+-            yield
++            with self._storage_weight_update() as outcome:
++                yield outcome
+         finally:
+             if self.metrics_collector is not None:
+                 self.metrics_collector.observe_weight_load(
+@@ -118,6 +212,10 @@
+                 )
+ 
+     def flush_cache_after_weight_update(self, recv_req) -> None:
++        if self._storage_weight_backend() is not None:
++            # Already collectively flushed before mutation. A rank-local worker
++            # success must not select a second collective flush before agreement.
++            return
+         if recv_req.flush_cache:
+             flush_cache_success = self.flush_cache(
+                 empty_cache=recv_req.torch_empty_cache
+@@ -129,7 +227,7 @@
+ 
+     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+         """In-place update of the weights from disk."""
+-        with self._observe_weight_load("disk"):
++        with self._observe_weight_load("disk") as outcome:
+             success, message = True, "Succeeded to update model weights."
+             target_updated = False
+             for role, runner in self._select_runners():
+@@ -148,6 +246,7 @@
+                 self.record_weight_version_after_update(recv_req.weight_version)
+             else:
+                 logger.error(message)
++            outcome["success"] = bool(success)
+             return UpdateWeightFromDiskReqOutput(
+                 success=success, message=message, num_paused_requests=0
+             )
+@@ -221,7 +320,7 @@
+         """Update the online model parameter from tensors on the selected runners."""
+         # Legacy clients stream buckets while paused and run post_process_weights
+         # themselves. New clients can still use an explicit begin/end session.
+-        with self._observe_weight_load("tensor"):
++        with self._observe_weight_load("tensor") as outcome:
+             named_tensors = self.tp_worker.deserialize_own_rank(
+                 recv_req.serialized_named_tensors
+             )
+@@ -252,12 +351,14 @@
+                 self.record_weight_version_after_update(recv_req.weight_version)
+             else:
+                 logger.error(message)
+-            torch.distributed.barrier(group=self.tp_cpu_group)
++            if self._storage_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+ 
+     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+         """Update the online model parameter from IPC for checkpoint-engine integration."""
+-        with self._observe_weight_load("ipc"):
++        with self._observe_weight_load("ipc") as outcome:
+             success, message = True, "Succeeded to update model weights."
+             target_updated = False
+             for role, runner in self._select_runners():
+@@ -274,7 +375,9 @@
+                 self.record_weight_version_after_update(recv_req.weight_version)
+             else:
+                 logger.error(message)
+-            torch.distributed.barrier(group=self.tp_cpu_group)
++            if self._storage_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
+ 
+     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+@@ -431,6 +534,7 @@
+ 
+         torch.get_device_module().synchronize()
+ 
++        self._log_storage_lifecycle("after_release")
+         return ReleaseMemoryOccupationReqOutput()
+ 
+     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+@@ -472,9 +576,12 @@
+                     if queue is not None:
+                         queue.resume_memory_occupation()
+ 
++        self._log_storage_lifecycle("after_resume")
+         return ResumeMemoryOccupationReqOutput()
+ 
+     def check_weights(self, recv_req: CheckWeightsReqInput):
++        if recv_req.action == "reset_tensors" and self._storage_weight_backend() is not None:
++            return CheckWeightsReqOutput(success=False, message="reset_tensors is disabled with Mooncake L3; use a full weight update")
+         try:
+             role_payloads = []
+             for role, runner in self._select_runners(recv_req.selector):
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py	2026-10-01 06:43:50.000000000 +0800
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py	2026-11-22 18:56:43.910382762 +0800
+@@ -150,6 +150,7 @@
+         self.request_id = handle.rid
+         self._lock = threading.Lock()
+         self._terminated_flag = False
++        self.io_done = threading.Event()
+         self.storage_hit_count = 0
+         self.start_time = time.monotonic()
+         # Take the whole span as present instead of querying for it; the read
+@@ -456,6 +457,22 @@
+                 release_queue, transfer.host_indices, entry.host_pool.page_size
+             )
+ 
++    def release_unsubmitted_prefetch(self, extra_pools: list[PoolTransfer]) -> None:
++        """Roll back scheduler-owned buffers before any reader is submitted.
++
++        Local allocation can fail asymmetrically across TP. These buffers must
++        not enter release queues whose lengths are reduced with MIN.
++        """
++        for transfer in extra_pools:
++            entry = self.mem_pool_host.entry_map.get(transfer.name)
++            if (
++                entry is not None
++                and not entry.is_primary_index_anchor
++                and transfer.indices_from_pool is None
++                and transfer.host_indices is not None
++            ):
++                entry.host_pool.free(transfer.host_indices)
++
+     def reset(self):
+         self._stop_pp_prefetch_thread()
+         super().reset()
+@@ -850,6 +867,8 @@
+         prefix_keys: Optional[List[str]] = None,
+         extra_pools: Optional[list[PoolTransfer]] = None,
+         assume_stored: bool = False,
++        *,
++        revoke_with_operation: bool = False,
+     ) -> PrefetchOperation:
+         operation = PrefetchOperation(
+             handle,
+@@ -859,6 +878,7 @@
+             pool_transfers=extra_pools,
+             assume_stored=assume_stored,
+         )
++        operation.revoke_with_operation = revoke_with_operation
+         self.prefetch_queue.put(operation)
+         return operation
+ 
+@@ -1428,8 +1448,12 @@
+                 operation = self.backup_queue.get(block=True, timeout=1)
+                 if operation is None:
+                     continue
+-                self._page_backup(operation)
+-                self.ack_backup_queue.put(operation)
++                try:
++                    self._page_backup(operation)
++                except Exception:
++                    logger.warning("HiCache hybrid backup failed; retaining host cache.", exc_info=True)
++                finally:
++                    self.ack_backup_queue.put(operation)
+             except Empty:
+                 continue
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+--- a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py	2026-10-01 06:43:50.000000000 +0800
++++ b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py	2026-11-22 18:56:43.918382460 +0800
+@@ -427,6 +427,8 @@
+             # Use the backend tag and model name as a prefix to isolate tenants
+             # and models sharing one store.
+             self.config_prefix = None
++            self.weight_namespace = None
++            self.weight_epoch = 0
+             config_prefix_parts = []
+             if extra_config and extra_config.get("extra_backend_tag") is not None:
+                 config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
+@@ -735,10 +737,32 @@
+         for buf in self._iter_host_pool_buffers(host_pool):
+             super().register_buffer(buf)
+ 
++    def initialize_weight_namespace(self, incarnation: str) -> None:
++        """Start a fresh Unified cache owner; never reuse previous model state."""
++        if not incarnation or self.weight_namespace is not None:
++            raise RuntimeError("Mooncake cache namespace must be initialized once")
++        self._weight_incarnation = incarnation
++        self.weight_epoch = 0
++        self.weight_namespace = f"relax-v1-{incarnation}-w0"
++        logger.info(
++            "Mooncake L3 owner initialized namespace=%s config_prefix=%s tp_rank=%s",
++            self.weight_namespace, self.config_prefix, self.local_rank,
++        )
++
++    def advance_weight_namespace(self) -> None:
++        """Called only after all storage workers have stopped before mutation."""
++        if self.weight_namespace is None:
++            raise RuntimeError("Mooncake cache namespace is not initialized")
++        self.weight_epoch += 1
++        self.weight_namespace = f"relax-v1-{self._weight_incarnation}-w{self.weight_epoch}"
++
+     def _tag_keys(self, keys: List[str]) -> List[str]:
+-        if self.config_prefix is None:
++        prefix = self.config_prefix
++        if self.weight_namespace is not None:
++            prefix = f"{prefix}_{self.weight_namespace}" if prefix else self.weight_namespace
++        if prefix is None:
+             return keys
+-        return [f"{self.config_prefix}_{key}" for key in keys]
++        return [f"{prefix}_{key}" for key in keys]
+ 
+     def _can_use_group_semantics(self) -> bool:
+         return self._use_group_semantics
+@@ -1334,7 +1358,10 @@
+         pass
+ 
+     def clear(self) -> None:
+-        self.store.remove_all()
++        raise RuntimeError(
++            "Mooncake Store is shared; global clear is disabled. "
++            "Flush resets GPU/CPU state only; restart the engine to invalidate its L3 namespace."
++        )
+ 
+     def _put_batch_zero_copy_impl(
+         self,
+@@ -1369,10 +1396,16 @@
+         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+     ) -> List[int]:
+         if self._uses_multi_buffer(buffer_ptrs):
+-            return self.store.batch_get_into_multi_buffers(
++            results = self.store.batch_get_into_multi_buffers(
+                 key_strs, buffer_ptrs, buffer_sizes
+             )
+-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
++            expected_sizes = [sum(sizes) for sizes in buffer_sizes]
++        else:
++            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
++            expected_sizes = buffer_sizes
++        if len(results) != len(key_strs):
++            raise RuntimeError("Mooncake returned an incomplete zero-copy read result")
++        return [result if result == size else -1 for result, size in zip(results, expected_sizes)]
+ 
+     def _batch_exist(
+         self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+diff -ruN '--exclude=__pycache__' '--exclude=.ruff_cache' a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py	2026-11-16 23:13:54.716987319 +0800
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py	2026-11-22 18:56:43.930382007 +0800
+@@ -9,6 +9,7 @@
+ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+ 
+ import torch
++import uuid
+ 
+ from sglang.srt.distributed.communication_tags import P2PTag
+ from sglang.srt.environ import envs
+@@ -315,14 +316,19 @@
+         )
+ 
+     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+-        reduced = False
+         for group in (self.attn_cp_group, self.attn_tp_group):
+             if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                 torch.distributed.all_reduce(tensor, op=op, group=group)
+-                reduced = True
+-        if not reduced and self.tp_world_size > 1:
++        if self.attn_cp_group is None and self.attn_tp_group is None and self.tp_world_size > 1:
+             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+ 
++    def _barrier_attn_groups(self):
++        for group in (self.attn_cp_group, self.attn_tp_group):
++            if group is not None and torch.distributed.get_world_size(group=group) > 1:
++                torch.distributed.barrier(group=group)
++        if self.attn_cp_group is None and self.attn_tp_group is None and self.tp_world_size > 1:
++            torch.distributed.barrier(group=self.tp_group)
++
+     def _drain_async_work(self):
+         """
+         Block until all outstanding async sends are consumed, then clear.
+@@ -402,6 +408,8 @@
+             CacheRequestHandle, int
+         ] = {}
+         self.storage_prefetch_retries = StoragePrefetchRetries()
++        self.aborted_prefetch: set[str] = set()
++        self._native_prefetch_sequence = 0
+         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+         if self.buffer_pipeline is not None:
+             self.buffer_pipeline.reset()
+@@ -474,6 +482,14 @@
+         )
+         self.cache_controller.routed_experts_backup = self._backup_routed_experts
+         self.cache_controller.routed_experts_restore = self._restore_routed_experts
++        if storage_backend == "mooncake":
++            # Isolate each attention-DP owner and engine incarnation.
++            # Only the attention TP/CP participants share a storage namespace.
++            incarnation = torch.tensor(list(uuid.uuid4().bytes), dtype=torch.int)
++            self._all_reduce_attn_groups(incarnation, torch.distributed.ReduceOp.MIN)
++            self.cache_controller.storage_backend.initialize_weight_namespace(
++                bytes(incarnation.tolist()).hex()
++            )
+         # Tag HiCache enablement on the TreeCore.
+         if self.cache_controller is not None:
+             self.tree_core.set_hicache_enabled()
+@@ -601,6 +617,10 @@
+         self._host_routed_experts = None
+         if self.linker is not None:
+             self.linker.close()
++        if self.cache_controller is not None and self.cache_controller.enable_storage:
++            # Graceful shutdown can arrive with an active zero-copy read. Never
++            # unregister/free its host buffers until every storage worker exits.
++            self.cache_controller._stop_storage_threads()
+         if self.host_pool_group is not None:
+             self.host_pool_group.destroy()
+ 
+@@ -2133,9 +2153,13 @@
+             return submission.decision
+ 
+         buffer_mode = self.host_memory_mode == "buffer_only"
+-        if request in self.ongoing_prefetch or (
+-            self.buffer_pipeline is not None
+-            and self.buffer_pipeline.has_staged(request)
++        if (
++            request in self.ongoing_prefetch
++            or req_id in self.aborted_prefetch
++            or (
++                self.buffer_pipeline is not None
++                and self.buffer_pipeline.has_staged(request)
++            )
+         ):
+             return
+         # Prefix-covered writes justify extending a known hit to the left,
+@@ -2223,7 +2247,6 @@
+         sidecar_xfers = self._build_sidecar_transfers(
+             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+         )
+-
+         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+         aux_xfers.extend(sidecar_xfers)
+         submission = self.cache_controller.submit_prefetch(
+@@ -2248,6 +2271,8 @@
+         # rank-synchronized query outcome.
+         operation.stats_requested_tokens = prefetch_length
+         operation.storage_start = storage_start
++        self._native_prefetch_sequence += 1
++        operation.native_sequence = self._native_prefetch_sequence
+         if submission.decision is not None:
+             return submission.decision
+ 
+@@ -2921,8 +2946,8 @@
+             self.buffer_pipeline.pop_prefix_ctx(request)
+             self.buffer_pipeline.release_anchor_lock(request)
+         cc = self.cache_controller
+-        cc.append_host_mem_release(
+-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
++        cc.release_unsubmitted_prefetch(
++            [x for xfers in comp_xfers.values() for x in xfers]
+         )
+         if anchor_lock_params is not None:
+             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
