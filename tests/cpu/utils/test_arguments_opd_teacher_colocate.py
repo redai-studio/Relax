@@ -146,6 +146,7 @@ def _opd_args() -> SimpleNamespace:
         critic_lr=None,
         lr=1e-6,
         offload=False,
+        train_memory_margin_bytes=0,
         debug_rollout_only=False,
         debug_train_only=False,
         balance_data=False,
@@ -201,6 +202,35 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+@pytest.mark.parametrize("rollout_gpus", [None, 4])
+def test_rollout_only_preserves_multi_teacher_gpu_split(arguments_module, rollout_gpus: int | None) -> None:
+    args = _opd_args()
+    args.debug_rollout_only = args.colocate = True
+    args.teacher_hf_checkpoint = None
+    args.opd_teacher_routes = '{"math": "/math", "code": "/code"}'
+    args.rollout_num_gpus = rollout_gpus
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.colocate
+    assert args.rollout_num_gpus == 4
+    assert args.actor_num_gpus_per_node * args.actor_num_nodes == 8
+    assert args.offload_rollout is False
+
+
+def test_rollout_only_with_external_teacher_uses_student_gpus(arguments_module) -> None:
+    args = _opd_args()
+    args.debug_rollout_only = args.colocate = True
+    args.teacher_hf_checkpoint = None
+    args.opd_teacher_url = "http://teacher/generate"
+    del args.resource["teacher"]
+
+    arguments_module.slime_validate_args(args)
+
+    assert not args.colocate
+    assert args.actor_num_gpus_per_node * args.actor_num_nodes == args.rollout_num_gpus == 4
 
 
 def test_sequence_classification_accepts_multimodal_keys(arguments_module):
