@@ -835,6 +835,7 @@ class VersionStore:
         if path.exists():
             prior = self.manifest(m["stream"], m["version"])
             if prior == m:
+                sync_directory(path.parent)
                 return
             if prior["root"] != m["root"] or prior.get("update_id") != m.get("update_id"):
                 raise ValueError("Version identity reused with different content")
@@ -844,6 +845,7 @@ class VersionStore:
             if path.exists():
                 if self.manifest(m["stream"], m["version"], prefer_full=True) != m:
                     raise ValueError("FULL artifact already exists")
+                sync_directory(path.parent)
                 return
         if m["kind"] == "delta":
             base = self.manifest(m["stream"], m["base_version"])
