@@ -13,6 +13,8 @@ ART 补丁保留默认 RoPE 缓存与原生注意力路径，不包含 SenseNova
 TP/SP/分布式 CFG 或可选 FA3 适配。通用补丁中的已有能力保持不变。
 TextPecker 示例需要独立 OpenAI 兼容 OCR 服务、CPU LPIPS 及离线 AlexNet 权重。
 模型、图片、奖励地址和输出路径均由使用者显式提供。
+推理部署默认读取启动脚本旁的 `scripts/training/diffusion/configs/sglang-sensenova-art-8xgpu.yaml`，
+可通过 `SGLANG_CONFIG_PATH` 指定其他配置。
 
 每轮使用完整条件组的原始标量奖励计算终态协方差，将每组候选均分成两个不重叠
 窗口，执行两次 AdamW 更新后只发布一次 live 权重，不使用 EMA、重新加噪或旧策略前向。

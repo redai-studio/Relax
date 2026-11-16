@@ -71,6 +71,8 @@ RAY_NO_WAIT=1 bash scripts/entrypoint/ray-job.sh \
 ```
 
 `--mode config` prints the generated training arguments without loading models.
+The recipe uses `scripts/training/diffusion/configs/sglang-sensenova-art-8xgpu.yaml`
+for eight single-GPU engines; set `SGLANG_CONFIG_PATH` to use another config.
 For resume, set `LOAD_DIR` to the previous checkpoint root, choose fresh output
 directories and set `NUM_ROLLOUT` above the restored cursor. Only completed
 two-window acquisitions are resumable. Per-rank RNG, optimizer/LR counters,

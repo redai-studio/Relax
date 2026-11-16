@@ -182,7 +182,7 @@ def build_argv(env: Mapping[str, str]) -> list[str]:
         "--rollout-num-gpus-per-engine",
         "1",
         "--sglang-config",
-        env.get("SGLANG_CONFIG_PATH", "configs/sglang-sensenova-art-8xgpu.json"),
+        env.get("SGLANG_CONFIG_PATH", "scripts/training/diffusion/configs/sglang-sensenova-art-8xgpu.yaml"),
         "--save",
         save,
         "--save-interval",
