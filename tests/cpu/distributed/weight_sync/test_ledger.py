@@ -9,6 +9,40 @@ from relax.distributed.weight_sync.store import VersionStore, digest
 from relax.distributed.weight_sync.transport import ObjectServer, TCPTransport
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_repeated_requests_keep_storage_and_diagnostic_memory_bounded(tmp_path, enabled):
+    from relax.distributed.weight_sync.store import stored_bytes
+
+    store = VersionStore(tmp_path, disk_budget=1 << 20, max_weight_bytes=1024)
+    data = b"cached object"
+    store.put_object(digest(data), data)
+    before = stored_bytes(tmp_path)
+    metrics = SyncMetrics("server") if enabled else None
+    with ObjectServer(("127.0.0.1", 0), store, metrics=metrics) as server:
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        try:
+            client = TCPTransport(server.server_address)
+            for _ in range(260):
+                assert client.object(digest(data)) == data
+        finally:
+            server.shutdown()
+            thread.join()
+    assert stored_bytes(tmp_path) == before
+    assert server.ledger.report()["bytes"]["sent"]["X"] == 260 * len(data)
+    if metrics:
+        report = metrics.report()
+        assert report["related_report_count"] == 260
+        assert len(report["related_reports"]) == 128
+
+
+def test_bounded_related_details_preserve_complete_byte_totals():
+    metrics = SyncMetrics("server")
+    for i in range(260):
+        metrics.related({"bytes_by_scope": {"file_write": {"W": i}}}, limit=128)
+    assert metrics.report()["related_bytes_by_scope"] == {"file_write": {"W": sum(range(260))}}
+
+
 def test_full_repair_writes_are_captured_in_server_worker(tmp_path):
     store = VersionStore(tmp_path / "store", disk_budget=1 << 20, max_weight_bytes=1024)
     raw = tmp_path / "input"

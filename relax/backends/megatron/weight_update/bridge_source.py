@@ -32,6 +32,10 @@ class BridgeSourceAdapter:
     def normalize_weights(self, weights):
         return {name: weights[key] for name, key in self.iterator._vanilla_key_map.items() if key in weights}
 
+    @property
+    def gdn_split_sizes(self):
+        return self.iterator._gdn_split_sizes
+
     def source_mapping(self, info, tp_size):
         name = info.name.replace(".to_wrap.", ".")
         # These specialized gather kernels rearrange several components.

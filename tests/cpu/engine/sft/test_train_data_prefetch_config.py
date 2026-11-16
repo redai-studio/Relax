@@ -108,6 +108,8 @@ def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
 
 
 def test_pipeline_selection_runs_after_custom_and_backend_validation():
+    from relax.utils.arguments import is_offline_mode
+
     tree = ast.parse(_SOURCE.read_text())
     parse = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_parse_args_impl")
     start = next(
@@ -116,7 +118,7 @@ def test_pipeline_selection_runs_after_custom_and_backend_validation():
         if isinstance(n, ast.Expr)
         and isinstance(n.value, ast.Call)
         and isinstance(n.value.func, ast.Name)
-        and n.value.func.id == "slime_validate_args"
+        and n.value.func.id == "relax_validate_args"
     )
     end = next(
         i
@@ -138,8 +140,9 @@ def test_pipeline_selection_runs_after_custom_and_backend_validation():
 
     namespace = dict(
         args=args,
-        slime_validate_args=custom,
+        relax_validate_args=custom,
         megatron_validate_args=backend,
+        is_offline_mode=is_offline_mode,
         configure_sft_data_pipeline=configure_sft_data_pipeline,
     )
     exec(compile(ast.Module(body=parse.body[start : end + 1], type_ignores=[]), str(_SOURCE), "exec"), namespace)
@@ -172,7 +175,7 @@ def test_late_custom_budget_controls_automatic_pipeline(steps, expected):
     normalize = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_normalize_sft_max_in_flight_steps"
     )
-    validate = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "slime_validate_args")
+    validate = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "relax_validate_args")
     names = {"apply_custom_config_overrides", "_normalize_sft_max_in_flight_steps"}
     calls = [
         n

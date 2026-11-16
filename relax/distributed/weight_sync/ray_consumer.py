@@ -59,6 +59,7 @@ def create_actor_consumer(actor) -> ConsumptionRunner:
         pp_size=options.pp_size,
         audit_directory=directory / "audit",
         api_key=options.api_key,
+        admin_api_key=getattr(options, "admin_api_key", None),
     )
     session = InstallSession(
         directory / "installation",

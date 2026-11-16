@@ -51,33 +51,43 @@ def create_version_publisher(actor: object, process_group: object) -> MegatronVe
 
 
 def _create_version_publisher(actor, process_group, config, store):
-    from .common import named_params_and_buffers
-    from .hf_weight_iterator_base import HfWeightIteratorBase
-
-    source_root = Path(__file__).resolve().parent.parent
-    fingerprint = hashlib.sha256()
-    for directory in (source_root / "weight_conversion", source_root / "weight_update"):
-        for source in sorted(directory.rglob("*.py")):
-            fingerprint.update(source.relative_to(source_root).as_posix().encode())
-            fingerprint.update(source.read_bytes())
-
-    # Export the logical unquantized checkpoint. Inference quantization belongs
-    # to the target Loader, as in a normal checkpoint startup.
     def agreement(error):
         import torch.distributed as dist
 
         failures = [None] * dist.get_world_size(process_group)
         traffic.all_gather_object(failures, error, group=process_group)
         if any(failures):
-            raise RuntimeError(f"Bridge initialization failed: {failures}")
+            raise RuntimeError(f"Source converter initialization failed: {failures}")
 
-    extra = {"publication_agreement": agreement} if actor.args.megatron_to_hf_mode == "bridge" else {}
+    error = None
+    try:
+        from relax.utils.megatron_peft_utils import is_lora_adapter_mode, is_lora_enabled
+
+        from .common import named_params_and_buffers
+        from .hf_weight_iterator_base import HfWeightIteratorBase
+
+        if is_lora_enabled(actor.args) and is_lora_adapter_mode(actor.args):
+            raise ValueError("Independent checkpoints require merged LoRA weights; use merge mode or adapter sync")
+        source_root = Path(__file__).resolve().parent.parent
+        fingerprint = hashlib.sha256()
+        for directory in (source_root / "weight_conversion", source_root / "weight_update"):
+            for source in sorted(directory.rglob("*.py")):
+                fingerprint.update(source.relative_to(source_root).as_posix().encode())
+                fingerprint.update(source.read_bytes())
+        model_config = actor.hf_config.to_dict()
+        model_name = actor.args.model_name or type(actor.hf_config).__name__.lower()
+    except Exception as caught:
+        error = f"{type(caught).__name__}: {caught}"
+    agreement(error)
+
+    # Export the logical unquantized checkpoint. Inference quantization belongs
+    # to the target Loader, as in a normal checkpoint startup.
     iterator = HfWeightIteratorBase.create(
         actor.args,
         actor.model,
-        model_name=actor.args.model_name or type(actor.hf_config).__name__.lower(),
+        model_name=model_name,
         quantization_config=None,
-        **extra,
+        publication_agreement=agreement,
     )
 
     def weights() -> dict:
@@ -99,7 +109,7 @@ def _create_version_publisher(actor, process_group, config, store):
         store,
         config.stream,
         config.scratch,
-        model_config=actor.hf_config.to_dict(),
+        model_config=model_config,
         converter_revision=f"relax-{actor.args.megatron_to_hf_mode}-{type(iterator).__name__}:{fingerprint.hexdigest()}",
         compression=config.compression,
         encode_workers=config.encode_workers,

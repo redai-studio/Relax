@@ -39,6 +39,53 @@ def _agreement_worker(rank, rendezvous, output):
             raise AssertionError("The peer failure was lost")
         assert Path(output, "writer-drained").read_text() == "finished"
         assert agree_errors(None, group) == [None, None]
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from relax.backends.megatron.weight_update.hf_weight_iterator_base import HfWeightIteratorBase
+        from relax.backends.megatron.weight_update.version_integration import _create_version_publisher
+
+        actor = SimpleNamespace(
+            args=SimpleNamespace(megatron_to_hf_mode="raw", model_name="qwen3", lora_rank=0),
+            model=[],
+            hf_config=SimpleNamespace(to_dict=lambda: {}),
+        )
+        read = Path.read_bytes
+
+        def read_source(path):
+            if rank == 1 and path.name == "version_integration.py":
+                raise OSError("converter identity read failed")
+            return read(path)
+
+        with patch.object(Path, "read_bytes", read_source):
+            try:
+                _create_version_publisher(actor, group, None, None)
+            except RuntimeError as error:
+                assert "converter identity read failed" in str(error)
+            else:
+                raise AssertionError("Converter setup failure was not agreed")
+        actor.args.lora_rank = 8 if rank == 1 else 0
+        actor.args.lora_adapter_mode = True
+        try:
+            _create_version_publisher(actor, group, None, None)
+        except RuntimeError as error:
+            assert "merged LoRA weights" in str(error)
+        else:
+            raise AssertionError("Adapter-only publication was accepted")
+        actor.args.lora_rank = 0
+
+        def fail_iterator(*args, publication_agreement, **kwargs):
+            publication_agreement("local iterator metadata failed" if rank == 1 else None)
+
+        for mode in ("raw", "bridge"):
+            actor.args.megatron_to_hf_mode = mode
+            with patch.object(HfWeightIteratorBase, "create", fail_iterator):
+                try:
+                    _create_version_publisher(actor, group, None, None)
+                except RuntimeError as error:
+                    assert "local iterator metadata failed" in str(error)
+                else:
+                    raise AssertionError("Iterator setup failure was not agreed")
         Path(output, f"rank-{rank}.json").write_text(json.dumps({"passed": True}))
         # Both ranks finish their assertions before either tears down Gloo.
         dist.barrier(group=group)

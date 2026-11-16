@@ -69,6 +69,7 @@ def _get_megatron_full_params(
     megatron_local_weights,
     *,
     agreement=None,
+    gdn_split_sizes=None,
 ) -> Sequence[torch.Tensor]:
     monkey_patch_torch_reductions()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -139,7 +140,9 @@ def _get_megatron_full_params(
 
     # Batch async all_gather for all parameters
     gathered_params = all_gather_params_async(
-        list(zip(megatron_local_param_infos, params, strict=False)), agreement=agreement
+        list(zip(megatron_local_param_infos, params, strict=False)),
+        gdn_split_sizes=gdn_split_sizes,
+        agreement=agreement,
     )
 
     return gathered_params

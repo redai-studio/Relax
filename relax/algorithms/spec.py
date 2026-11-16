@@ -222,6 +222,7 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
             "sc_importance_weight",
             "sc_is_clip_fraction",
             "sc_zero_weight_fraction",
+            "sc_support_aligned",
         ),
     ),
     "gspo": AlgorithmSpec(

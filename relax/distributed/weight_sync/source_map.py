@@ -57,6 +57,12 @@ class TensorMapping:
                 raise ValueError("Gated MLP mapping requires equal gate/up halves")
             if self.shape[0] % 2:
                 raise ValueError("Local gate/up rows must split evenly")
+        elif self.kind == "vision_qkv":
+            if min(self.qkv_groups, self.head_dim) < 1 or self.partition_dim not in (None, 0):
+                raise ValueError("Vision QKV requires attention heads and row partitioning")
+            expected = 3 * self.qkv_groups * self.head_dim * math.prod(self.shape[1:])
+            if sizes != [expected] or total != expected:
+                raise ValueError("Vision QKV mapping does not cover the fused output")
         elif self.kind == "qkv":
             if min(self.qkv_groups, self.q_heads_per_group, self.head_dim) < 1:
                 raise ValueError("QKV head dimensions are required")
@@ -99,6 +105,12 @@ class TensorMapping:
                 for part, (name, _) in enumerate(self.outputs)
             }
         kv = self.head_dim * math.prod(self.shape[1:])
+        if self.kind == "vision_qkv":
+            # Native [head, Q/K/V, head_dim] becomes HF [Q/K/V, head, head_dim].
+            group = logical // (3 * kv)
+            component = logical // kv % 3
+            targets = (component * self.qkv_groups + group) * kv + logical % kv
+            return {self.outputs[0][0]: (positions, targets)}
         query = self.q_heads_per_group * kv
         group_size = query + 2 * kv
         group, local = logical // group_size, logical % group_size

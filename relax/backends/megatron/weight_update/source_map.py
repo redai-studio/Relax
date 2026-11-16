@@ -35,14 +35,22 @@ def qwen_source_mapping(args, model_name, info, tp_size):
     )
     crop = name.endswith(("embedding.word_embeddings.weight", "output_layer.weight"))
     head_dim = getattr(args, "kv_channels", None) or args.hidden_size // args.num_attention_heads
+    groups = args.num_query_groups
+    heads_per_group = args.num_attention_heads // groups
+    if "vision_model" in name and name.endswith(("linear_qkv.weight", "linear_qkv.bias")):
+        from relax.utils.misc import get_hf_config
+
+        vision = get_hf_config(args.hf_checkpoint).vision_config
+        kind, groups, heads_per_group = "vision_qkv", vision.num_heads, 1
+        head_dim = vision.hidden_size // groups
     return TensorMapping(
         shape=shape,
         tp_size=tp_size,
         partition_dim=dimension,
         outputs=tuple((key, tuple(value.shape)) for key, value in outputs),
         kind=kind,
-        qkv_groups=args.num_query_groups,
-        q_heads_per_group=args.num_attention_heads // args.num_query_groups,
+        qkv_groups=groups,
+        q_heads_per_group=heads_per_group,
         head_dim=head_dim,
         crop_vocabulary=crop,
     )

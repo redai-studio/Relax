@@ -302,11 +302,12 @@ def test_packed_experts_reject_invalid_schema_or_content(tmp_path, fault):
 
 
 @pytest.mark.parametrize("tp", [1, 2])
-def test_pipeline_ranges_cover_global_layers_and_boundary_weights(tmp_path, tp):
+@pytest.mark.parametrize("model_type", ["qwen3", "qwen3_moe"])
+def test_pipeline_ranges_cover_global_layers_and_boundary_weights(tmp_path, tp, model_type):
     checkpoint, dump = tmp_path / "checkpoint", tmp_path / "dump"
     checkpoint.mkdir()
     dump.mkdir()
-    config = {"model_type": "qwen3", "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 4}
+    config = {"model_type": model_type, "num_attention_heads": 2, "num_key_value_heads": 2, "num_hidden_layers": 4}
     (checkpoint / "config.json").write_text(json.dumps(config))
     logical = {
         f"model.layers.{layer}.input_layernorm.weight": torch.arange(4, dtype=torch.float32) + layer
@@ -341,6 +342,8 @@ def test_pipeline_ranges_cover_global_layers_and_boundary_weights(tmp_path, tp):
             }
             key = "model.embed_tokens.weight" if pp == 0 else "lm_head.weight"
             weights[key] = logical[key].chunk(tp)[tr].clone()
+            if model_type == "qwen3_moe":
+                weights["lm_head.weight"] = logical["lm_head.weight"].chunk(tp)[tr].clone()
             if pp == 1:
                 weights["model.norm.weight"] = logical["model.norm.weight"]
             save_file(weights, dump / f"model-rank-{worker}-part-0.safetensors")
@@ -365,6 +368,44 @@ def test_pipeline_ranges_cover_global_layers_and_boundary_weights(tmp_path, tp):
         layouts[rank]["start_layer"] = 1
     with pytest.raises(ValueError, match="overlap or leave a gap"):
         verify_qwen3_dense(checkpoint, dump, tp_size=tp, pp_size=2, layouts=layouts)
+
+
+def test_http_control_uses_admin_key_and_generation_uses_api_key(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import requests
+
+    from relax.distributed.weight_sync.sglang_loader import EmbeddedSGLangGroup, SGLangHTTPGroup
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+    save_file({"model.norm.weight": torch.ones(4)}, tmp_path / "model.safetensors")
+
+    def identify(group, phase):
+        group.worker_receipts = [{"rank": 0, "layout": {}, "physical_schema": {}}]
+        return {"0": {"instance": "worker"}}
+
+    observed = []
+
+    def request(url, **kwargs):
+        observed.append((url.rsplit("/", 1)[-1], kwargs["headers"]))
+        return SimpleNamespace(ok=True, json=lambda: {}, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(EmbeddedSGLangGroup, "_rpc", identify)
+    monkeypatch.setattr(requests, "post", request)
+    group = SGLangHTTPGroup(
+        "http://localhost:1",
+        tmp_path,
+        tp_size=1,
+        audit_directory=tmp_path / "audit",
+        api_key="test-generation",
+        admin_api_key="test-installation",
+    )
+    group._control("close")
+    group.generate(text="test")
+    assert observed == [
+        ("relax_weight_version", {"Authorization": "Bearer test-installation"}),
+        ("generate", {"Authorization": "Bearer test-generation"}),
+    ]
 
 
 @pytest.mark.parametrize("model_type", ["qwen3", "qwen3_moe", "qwen3_vl", "qwen3_vl_moe"])

@@ -3,9 +3,11 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from relax.distributed.weight_sync.source_map import TensorMapping, apply_replacements, sync_replacements
 from relax.distributed.weight_sync.store import digest
@@ -23,6 +25,61 @@ def reconstruct(mapping, shards):
         if np.any(values == -1):
             raise AssertionError("Missing logical elements")
     return outputs
+
+
+@pytest.mark.parametrize("model_name", ["qwen3vl", "qwen3vlmoe"])
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+def test_vision_qkv_replacements_match_full_converter(tmp_path, monkeypatch, model_name, tp_size, bias, native):
+    import torch
+
+    from relax.backends.megatron.weight_conversion import convert_to_hf
+    from relax.backends.megatron.weight_update.source_map import qwen_source_mapping
+    from relax.utils import misc
+
+    monkeypatch.setattr(
+        misc, "get_hf_config", lambda _: SimpleNamespace(vision_config=SimpleNamespace(num_heads=4, hidden_size=8))
+    )
+    args = SimpleNamespace(
+        hf_checkpoint="unused",
+        hidden_size=16,
+        num_attention_heads=8,
+        num_query_groups=4,
+        q_lora_rank=None,
+        vocab_size=64,
+    )
+    suffix = "bias" if bias else "weight"
+    local_name = "decoder.layers.0.self_attention.linear_qkv" if native else "blocks.0.attn.qkv"
+    name = f"module.module.vision_model.{local_name}.{suffix}"
+    shape = (24,) if bias else (24, 8)
+    bits = (np.arange(np.prod(shape), dtype=np.uint16) + 0x3F00).reshape(shape)
+    shards = [part.copy() for part in np.split(bits, tp_size)]
+    info = SimpleNamespace(
+        name=name,
+        shape=shards[0].shape,
+        dtype=torch.bfloat16,
+        attrs={"tensor_model_parallel": True, "partition_dim": 0},
+    )
+    mapping = qwen_source_mapping(args, model_name, info, tp_size)
+
+    def converted(values):
+        tensor = torch.from_numpy(np.concatenate(values).copy()).view(torch.bfloat16)
+        [(key, value)] = convert_to_hf(args, model_name, name, tensor)
+        return key, value.contiguous().view(torch.uint8).numpy().tobytes()
+
+    key, original = converted(shards)
+    actual = reconstruct(mapping, shards)[key].astype(np.uint16).tobytes()
+    assert actual == original
+    target = tmp_path / (digest(key.encode()) + ".bin")
+    target.write_bytes(original)
+    for rank, shard in enumerate(shards):
+        indices = [0, shard.size // 2, shard.size - 1]
+        values = [0x8000, 0x7FC1, 0x3F80 + rank]
+        shard.reshape(-1)[indices] = values
+        frame = b"".join(struct.pack("<IH", index, value) for index, value in zip(indices, values, strict=True))
+        apply_replacements(mapping, rank, 0, frame, 2, tmp_path)
+    assert target.read_bytes() == converted(shards)[1]
 
 
 class SourceMapTests(unittest.TestCase):

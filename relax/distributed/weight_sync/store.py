@@ -955,10 +955,16 @@ class VersionStore:
                 raise ValueError("Object integrity mismatch")
             path = self.object_path(key)
             _wait_file_sync(path)
-            if path.exists() and path.stat().st_size > MAX_CHUNK_BYTES:
-                raise ValueError("Existing object exceeds the size bound")
-            if path.exists() and digest(path.read_bytes()) == key:
-                return
+            if path.exists():
+                previous_size = path.stat().st_size
+                if previous_size <= MAX_CHUNK_BYTES and digest(path.read_bytes()) == key:
+                    return
+                # Reclaim corrupt bytes before reserving space for their repair.
+                path.unlink()
+                sync_directory(path.parent)
+                with self._budget_lock:
+                    if self._remaining_bytes is not None:
+                        self._remaining_bytes += min(previous_size, len(payload))
             self._reserve(len(payload))
             atomic_write(path, payload)
 
@@ -996,6 +1002,7 @@ class VersionStore:
         if path.exists():
             prior = self.manifest(m["stream"], m["version"])
             if prior == m:
+                sync_directory(path.parent)
                 return
             if prior["root"] != m["root"] or prior.get("update_id") != m.get("update_id"):
                 raise ValueError("Version identity reused with different content")
@@ -1005,6 +1012,7 @@ class VersionStore:
             if path.exists():
                 if self.manifest(m["stream"], m["version"], prefer_full=True) != m:
                     raise ValueError("FULL artifact already exists")
+                sync_directory(path.parent)
                 return
         if m["kind"] == "delta":
             base = self.manifest(m["stream"], m["base_version"])

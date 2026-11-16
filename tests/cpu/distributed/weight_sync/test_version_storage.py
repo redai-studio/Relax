@@ -207,3 +207,29 @@ def test_post_rename_error_preserves_visible_publication(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "atomic_write", atomic_write)
     assert store.materialize("s", 0)["version"] == 0
     assert store.publish("s", 0, {"w": ("U8", [64], source)}) == store.manifest("s", 0)
+
+
+def test_existing_manifest_retry_repeats_directory_sync(tmp_path, monkeypatch):
+    import pytest
+
+    from relax.distributed.weight_sync import store as module
+
+    store = VersionStore(tmp_path / "store", disk_budget=100_000, max_weight_bytes=64)
+    source = tmp_path / "input"
+    source.write_bytes(bytes(range(64)))
+    manifest = store.publish("s", 0, {"w": ("U8", [64], source)})
+    sync = module.sync_directory
+    attempts = []
+
+    def sync_manifest(directory):
+        if directory == store.manifest_path("s", 0).parent:
+            attempts.append(directory)
+            if len(attempts) == 1:
+                raise OSError("directory still unavailable")
+        return sync(directory)
+
+    monkeypatch.setattr(module, "sync_directory", sync_manifest)
+    with pytest.raises(OSError, match="directory still unavailable"):
+        store.commit(manifest)
+    store.commit(manifest)
+    assert len(attempts) == 2

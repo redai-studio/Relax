@@ -47,7 +47,7 @@ def main():
         install_requires=get_requires(),
         extras_require=extra_require,
         entry_points={
-            "sglang.srt.plugins": ["relax_weight_versions=relax.distributed.weight_sync.sglang_plugin:register"]
+            "sglang.srt.plugins": ["relax_weight_versions=relax.distributed.weight_sync.sglang_plugin:register"],
         },
         classifiers=[
             "Development Status :: 4 - Beta",

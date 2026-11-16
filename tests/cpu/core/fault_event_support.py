@@ -52,9 +52,11 @@ def load_definitions(path, namespace, selected=None):
 def production_method(path, cls, method):
     tree = ast.parse((ROOT / path).read_text())
     node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
-    function = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == method)
+    function = next(
+        n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == method
+    )
     module = ast.Module(body=ast.parse("from __future__ import annotations").body + [function], type_ignores=[])
-    ns = {"ray": ray}
+    ns = {"ray": ray, "asyncio": asyncio}
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), ns)
     return ns[method]
 
@@ -121,8 +123,8 @@ class CPUReplica:
         self.done = asyncio.Event()
         self.actor_model = CPUTrainGroup(role, fail_weights, gate)
 
-    def update_weights_fully_async(self, **kwargs):
-        return SEND(self, **kwargs)
+    async def update_weights_fully_async(self, **kwargs):
+        return await SEND(self, **kwargs)
 
     def recv_weight_fully_async(self, **kwargs):
         return RECV(self, **kwargs)

@@ -78,7 +78,8 @@ async def test_out_of_order_generation_keeps_bound_teacher(monkeypatch, rollout)
         sample.response_length = 1
         return sample
 
-    async def reward(args, sample):
+    async def reward(args, sample, *, evaluation=False):
+        assert evaluation is False
         return 1.0
 
     async def post(session, url, payload, sample, tag, expected_ids):
@@ -143,7 +144,8 @@ async def test_group_retry_scores_both_responses_but_only_regenerates_aborted_me
     assert all(s.reward is None and s.teacher_log_probs is None for s in group)
     assert _counts(manager, "A") == (2, 0)
 
-    async def group_reward(args, samples):
+    async def group_reward(args, samples, *, evaluation=False):
+        assert evaluation is False
         assert _counts(manager, "A") == (2, 2)
         return [1.0, 1.0]
 

@@ -208,7 +208,13 @@ def snapshot_tensors(
 
 
 def write_checkpoint(
-    store: VersionStore, stream: str, version: int, destination: str | Path, *, config_source: str | Path | None = None
+    store: VersionStore,
+    stream: str,
+    version: int,
+    destination: str | Path,
+    *,
+    config_source: str | Path | None = None,
+    retention_owner: str | None = None,
 ) -> Path:
     """Create a verified HF checkpoint while retaining its source version.
 
@@ -223,7 +229,7 @@ def write_checkpoint(
     # Collection is allowed to remove unpinned versions. Hold a durable pin
     # from before materialization until every source chunk has been copied and
     # the staged checkpoint has been validated and atomically published.
-    owner = f"checkpoint-{uuid.uuid4().hex}"
+    owner = retention_owner or f"checkpoint-{uuid.uuid4().hex}"
     store.pin(stream, version, owner)
     staging = None
     try:
@@ -298,7 +304,8 @@ def write_checkpoint(
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
-        store.unpin(owner)
+        if retention_owner is None:
+            store.unpin(owner)
 
 
 if __name__ == "__main__":

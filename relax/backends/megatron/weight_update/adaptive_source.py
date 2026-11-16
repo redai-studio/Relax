@@ -244,7 +244,12 @@ class AdaptiveSourceExporter:
             exported, error, host = {}, None, None
             if route == "FULL":
                 # All ranks enter the original collectives in the same order.
-                complete = _get_megatron_full_params([info], frozen, agreement=self._check)
+                complete = _get_megatron_full_params(
+                    [info],
+                    frozen,
+                    agreement=self._check,
+                    gdn_split_sizes=getattr(self.iterator, "gdn_split_sizes", None),
+                )
                 tensors = None
                 try:
                     tensors = self.iterator._convert_to_hf_named_tensors(complete, [info])
