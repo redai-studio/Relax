@@ -150,7 +150,7 @@ class MultiEngineManager:
         """First positional argument passed to the engine actor constructor."""
         return self.args
 
-    def _build_engine_ctor_kwargs(self, rank: int) -> dict:
+    def _build_engine_ctor_kwargs(self, pg_tuple: tuple, gpu_index: int) -> dict:
         """Extra keyword arguments passed to the engine actor constructor
         (beyond rank/worker_type/base_gpu_id)."""
         return {}
@@ -199,7 +199,7 @@ class MultiEngineManager:
                     rank=rank,
                     worker_type="regular",
                     base_gpu_id=base_gpu_id,
-                    **self._build_engine_ctor_kwargs(rank),
+                    **self._build_engine_ctor_kwargs(pg_tuple, gpu_index),
                 )
                 new_engines.append((rank, engine))
                 self.all_engines[rank] = engine

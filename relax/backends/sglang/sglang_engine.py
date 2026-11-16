@@ -6,6 +6,7 @@ import ipaddress
 import json
 import multiprocessing
 import os
+import pickle
 import signal
 import subprocess
 import sys
@@ -331,7 +332,7 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
+def _launch_server_with_patches(server_args: ServerArgs | dict, parent_pid: int):
     """Top-level picklable ``multiprocessing.Process`` target that applies the
     SGLang patches, each gated by its own env flag so any combination is valid:
 
@@ -348,6 +349,8 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     if os.getppid() != parent_pid:
         return
 
+    if isinstance(server_args, dict):
+        server_args = ServerArgs(**server_args)
     if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
@@ -381,6 +384,37 @@ def _resolve_external_model_arch(package_name):
                     continue
                 return entry.__name__
     return None
+
+
+class _BoundServerProcess(subprocess.Popen):
+    def is_alive(self) -> bool:
+        return self.poll() is None
+
+
+def _start_bound_teacher(server_args: dict, gpu_ids: list[int]) -> _BoundServerProcess:
+    devices = [str(device) for device in gpu_ids]
+    inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if (
+        len(devices) != len(set(devices))
+        or len(devices) != server_args["tp_size"]
+        or (inherited is not None and not set(devices).issubset(d.strip() for d in inherited.split(",")))
+    ):
+        raise ValueError(f"Invalid Teacher GPU assignment {devices} under CUDA_VISIBLE_DEVICES={inherited!r}")
+
+    # ServerArgs may probe CUDA during construction. Set the mask before the
+    # child imports SGLang, and keep the Ray worker's device namespace intact.
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(devices))
+    entry = (
+        "import multiprocessing, pickle, sys; "
+        "sys.path[:], args, parent = pickle.load(sys.stdin.buffer); "
+        "multiprocessing.set_start_method('spawn', force=True); "
+        "from relax.backends.sglang.sglang_engine import _launch_server_with_patches; "
+        "_launch_server_with_patches(args, parent)"
+    )
+    with tempfile.TemporaryFile() as payload:
+        pickle.dump((sys.path, {**server_args, "base_gpu_id": 0, "gpu_id_step": 1}, os.getpid()), payload)
+        payload.seek(0)
+        return _BoundServerProcess([sys.executable, "-c", entry], env=env, stdin=payload)
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -482,11 +516,13 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        server_gpu_ids: list[int] | None = None,
     ):
         self.args = args
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
+        self.server_gpu_ids = server_gpu_ids
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
         self._is_scaled_out = register_sigterm_handler
@@ -695,12 +731,27 @@ class SGLangEngine(RayActor):
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
-        server_args = ServerArgs(**server_args_dict)
-        self._router_bootstrap_port = (
-            server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
-        )
-        self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args)
+        if (
+            self.worker_type == "regular"
+            and self.server_gpu_ids is not None
+            and server_args_dict["dp_size"] == server_args_dict["pp_size"] == 1
+            and server_args_dict.get("device") in (None, "cuda")
+            and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
+        ):
+            self._router_bootstrap_port = None
+            self._router_dp_size = 1
+            self.process = _start_bound_teacher(server_args_dict, self.server_gpu_ids)
+            host = {"0.0.0.0": "127.0.0.1", "[::]": "[::1]", "": "127.0.0.1"}.get(self.server_host, self.server_host)
+            scheme = "https" if server_args_dict.get("ssl_certfile") else "http"
+            url = f"{scheme}://{host}:{self.server_port}"
+            _wait_server_healthy(url, server_args_dict.get("api_key"), self.process.is_alive)
+        else:
+            server_args = ServerArgs(**server_args_dict)
+            self._router_bootstrap_port = (
+                server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
+            )
+            self._router_dp_size = server_args.dp_size
+            self.process = launch_server_process(server_args)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
