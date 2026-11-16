@@ -136,6 +136,8 @@ def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enab
         Path("relax/backends/megatron/model.py"),
         {
             "train",
+            "_get_distributed_wrapper_classes",
+            "_is_distributed_wrapper",
             "should_disable_forward_pre_hook",
             "enable_forward_pre_hook",
             "disable_forward_pre_hook",

@@ -101,7 +101,8 @@ def _train_loop(monkeypatch, step, *, enable_mtp=True, per_token=False):
         "get_args": lambda: args,
         "get_model_config": lambda _: SimpleNamespace(),
         "DataIterator": type("UnusedDataIterator", (), {}),
-        "DDP": type("UnusedDDP", (), {}),
+        # The harness uses an unwrapped Identity model, without Megatron DDP/FSDP.
+        "_is_distributed_wrapper": lambda _: False,
         "StreamingTQIterator": _Stream,
         "resident_sft_param_overlap_enabled": lambda _: False,
         "has_conditional_branch_sync": lambda _: False,

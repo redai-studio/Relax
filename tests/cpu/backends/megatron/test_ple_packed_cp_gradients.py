@@ -24,7 +24,8 @@ PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20261016-qw
 
 
 def _added_source(relative: str) -> str:
-    text = PATCH.read_text()
+    patch = PATCH.with_name("20260915-4a4de8657.patch") if relative.endswith("hyper_connection.py") else PATCH
+    text = patch.read_text()
     section = text.split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
     return "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++"))
 

@@ -28,7 +28,7 @@
 
 import os
 from contextlib import nullcontext
-from typing import ContextManager, Iterator, List, Optional, Protocol
+from typing import ContextManager, Iterator, List, Optional, Protocol, Tuple
 
 import torch
 
@@ -149,6 +149,7 @@ class _SelectiveOffloadStrategy:
         # manages its own CPU/GPU tensor placement; moving optimizer state ourselves
         # would break its invariants (_fused_adam device mismatch).
         self._skip_optimizer: bool = bool(getattr(args, "optimizer_cpu_offload", False))
+        self._fsdp_cpu_params: list[torch.Tensor] = []
 
     def _iter_optimizers(self) -> Iterator:
         """Yield every Megatron DistributedOptimizer (unwrapping
@@ -167,12 +168,69 @@ class _SelectiveOffloadStrategy:
         if self.model is None:
             return
         for ddp_model in self.model:
-            for buffers in [
-                getattr(ddp_model, "buffers", []) or [],
-                getattr(ddp_model, "expert_parallel_buffers", []) or [],
-            ]:
+            for name in ("buffers", "expert_parallel_buffers"):
+                buffers = getattr(ddp_model, name, None)
+                # MegatronFSDP inherits nn.Module.buffers(), which is a method rather
+                # than the flat-buffer list exposed by ordinary Megatron DDP.
+                if buffers is None or callable(buffers):
+                    continue
                 for buffer in buffers:
                     yield buffer
+
+    def _iter_fsdp_buffers(self) -> Iterator[Tuple[object, bool]]:
+        """Yield Megatron-FSDP persistent buffers and whether their data must
+        survive.
+
+        Hybrid FSDP's helper buffers own the storage while the ordinary
+        model/grad buffers are views into it, so only the owner is yielded in
+        that topology.
+        """
+        if self.model is None:
+            return
+        for fsdp_model in self.model:
+            param_and_grad_buffer = getattr(fsdp_model, "param_and_grad_buffer", None)
+            if param_and_grad_buffer is None:
+                continue
+            for group in getattr(param_and_grad_buffer, "parameter_groups", []) or []:
+                weight_buffers = (
+                    getattr(group, "hfsdp_helper_wbuf", None) or getattr(group, "model_weight_buffer", None),
+                    getattr(group, "hfsdp_helper_wtbuf", None) or getattr(group, "transpose_weight_buffer", None),
+                    getattr(group, "main_weight_buffer", None),
+                )
+                for buffer in weight_buffers:
+                    if buffer is not None:
+                        yield buffer, True
+
+                grad_buffer = getattr(group, "hfsdp_helper_gbuf", None) or getattr(group, "main_grad_buffer", None)
+                if grad_buffer is not None:
+                    yield grad_buffer, False
+
+    def _iter_unique_fsdp_storages(self) -> Iterator[Tuple[object, bool]]:
+        """Yield one representative for each live FSDP storage allocation.
+
+        Megatron-FSDP packs several gradient buffers into one dtype-level
+        storage. Collecting and de-duplicating before any resize prevents the
+        first slice from invalidating later slices. If a storage ever mixes
+        state kinds, preserving it takes precedence over discarding it.
+        """
+        storages = {}
+        for buffer, preserve in self._iter_fsdp_buffers():
+            data = getattr(buffer, "data", None)
+            if not isinstance(data, torch.Tensor):
+                continue
+            storage = data._typed_storage()
+            if storage._size() == 0:
+                continue
+            key = storage._cdata
+            current = storages.get(key)
+            if current is None or (preserve and not current[1]):
+                storages[key] = (buffer, preserve)
+        yield from storages.values()
+
+    @staticmethod
+    def _flat_storage_view(data: torch.Tensor, size: int) -> torch.Tensor:
+        """Return a 1-D tensor spanning ``data``'s entire typed storage."""
+        return data.new_empty(0).set_(data._typed_storage(), 0, (size,), (1,))
 
     @staticmethod
     def _param_index_map(buffer) -> dict:
@@ -255,6 +313,58 @@ class _SelectiveOffloadStrategy:
                 buffer.grad_data_size = buffer.grad_data.storage().size()
                 buffer.grad_data.storage().resize_(0)
 
+        # Megatron-FSDP keeps persistent weights and gradients in DataParallelBuffer.data.
+        # Gradient slices may share one dtype-level storage, so operate once per storage.
+        fsdp_params = []
+        for model_chunk in self.model or []:
+            if hasattr(model_chunk, "param_and_grad_buffer"):
+                for candidate in (model_chunk, getattr(model_chunk, "module", None)):
+                    normalize = getattr(candidate, "_replace_param_with_distributed_if_needed", None)
+                    if callable(normalize):
+                        normalize()
+                        break
+                fsdp_params.extend(model_chunk.parameters())
+        cpu_storages = {}
+        for buffer, preserve in self._iter_unique_fsdp_storages():
+            data = buffer.data
+            storage = data._typed_storage()
+            storage_size = storage._size()
+            flat_data = self._flat_storage_view(data, storage_size)
+            if preserve:
+                cpu_data = getattr(buffer, "_relax_cpu_data", None)
+                if cpu_data is None:
+                    cpu_data = torch.empty_like(flat_data, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                    buffer._relax_cpu_data = cpu_data
+                else:
+                    assert cpu_data.shape == flat_data.shape, (
+                        f"FSDP cpu_data shape {tuple(cpu_data.shape)} != storage shape {tuple(flat_data.shape)}"
+                    )
+                    assert cpu_data.dtype == flat_data.dtype, (
+                        f"FSDP cpu_data dtype {cpu_data.dtype} != storage dtype {flat_data.dtype}"
+                    )
+                cpu_data.copy_(flat_data, non_blocking=False)
+                cpu_storages[storage._cdata] = cpu_data
+            buffer._relax_storage_size = storage_size
+            buffer._relax_preserve_data = preserve
+            storage._resize_(0)
+
+        # Export may run while the actor sleeps with weights_backuper disabled.
+        # Keep the DTensor spec, but point its local shard at the existing CPU
+        # backup, including offsets for parameters sharing a flat allocation.
+        if fsdp_params:
+            from torch.distributed.tensor import DTensor
+
+            for param in fsdp_params:
+                local = param.to_local() if isinstance(param, DTensor) else param
+                cpu_data = cpu_storages.get(local.untyped_storage()._cdata)
+                if cpu_data is None:
+                    continue
+                cpu_view = cpu_data.as_strided(local.shape, local.stride(), local.storage_offset())
+                param._relax_cpu_offload_data = (
+                    DTensor(cpu_view, param._spec, requires_grad=False) if isinstance(param, DTensor) else cpu_view
+                )
+                self._fsdp_cpu_params.append(param)
+
         if not self._skip_optimizer:
             # 2. Optimizer fp32 master params (shard_fp32_from_float16_groups).
             for opt in self._iter_optimizers():
@@ -308,6 +418,27 @@ class _SelectiveOffloadStrategy:
                         del param._relax_cpu_offload_data
                 # param_data_size and the pinned cpu_data deliberately outlive this call:
                 # the next offload() reuses the same host buffer (see offload()).
+
+        # Restore each FSDP storage through the representative selected by offload().
+        # A flat storage view is required for packed gradient buffers: zeroing only the
+        # representative group's slice would leave the other groups uninitialized.
+        for buffer, _preserve in self._iter_fsdp_buffers():
+            if not hasattr(buffer, "_relax_storage_size"):
+                continue
+            data = buffer.data
+            storage = data._typed_storage()
+            if storage._size() == 0:
+                storage._resize_(buffer._relax_storage_size)
+                flat_data = self._flat_storage_view(data, buffer._relax_storage_size)
+                if buffer._relax_preserve_data:
+                    flat_data.copy_(buffer._relax_cpu_data, non_blocking=_NON_BLOCKING)
+                else:
+                    flat_data.zero_()
+                del buffer._relax_storage_size
+                del buffer._relax_preserve_data
+        for param in self._fsdp_cpu_params:
+            del param._relax_cpu_offload_data
+        self._fsdp_cpu_params.clear()
         if _NON_BLOCKING:
             # The H2D copies above are async; make them observable to non-stream code
             # (and to the optimizer-state moves below) before returning.

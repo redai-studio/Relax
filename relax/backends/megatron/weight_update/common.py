@@ -17,6 +17,149 @@ from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 
+def _allgather_dim0_uneven(local: torch.Tensor, group) -> torch.Tensor:
+    """Eager all-gather of ``local`` along tensor dim 0 over ``group``,
+    tolerating unequal per-rank dim-0 sizes (DTensor ``Shard(0)`` gives the
+    trailing ranks a smaller shard when dim 0 does not divide evenly).
+    ``dist.all_gather`` requires identical shapes, so we exchange the per-rank
+    sizes, pad everyone up to the max, gather, then trim each contribution back
+    to its real size before concatenating in group-rank order.
+
+    Uses plain ``dist.all_gather`` (monkey-patched to unwrap
+    ReloadableProcessGroup and target the current NCCL comm) — the same eager
+    path the TP all-gather uses. This deliberately avoids DTensor functional
+    collectives, which resolve groups by name and deadlock on the reloaded FSDP
+    groups.
+    """
+    world = dist.get_world_size(group)
+    if world == 1:
+        return local
+    local = local.contiguous()
+    # Exchange each rank's dim-0 size so we can pad to a common length for all_gather.
+    n0 = torch.tensor([local.shape[0]], device=local.device, dtype=torch.long)
+    size_bufs = [torch.zeros_like(n0) for _ in range(world)]
+    dist.all_gather(size_bufs, n0, group=group)
+    sizes = [int(s.item()) for s in size_bufs]  # one-shot sync; weight-sync path, not a hot loop
+    max_n = max(sizes)
+    if local.shape[0] < max_n:
+        pad = torch.zeros((max_n - local.shape[0], *local.shape[1:]), dtype=local.dtype, device=local.device)
+        local = torch.cat([local, pad], dim=0)
+    bufs = [torch.empty_like(local) for _ in range(world)]
+    dist.all_gather(bufs, local, group=group)
+    return torch.cat([b[: sizes[r]] for r, b in enumerate(bufs)], dim=0)
+
+
+def fsdp_gather_local_param(param, name: str = ""):
+    """Undo Megatron-FSDP parameter sharding, returning the plain per-TP-rank
+    tensor.
+
+    Megatron-FSDP stores every parameter as a ``DTensor`` sharded over the FSDP
+    (data-parallel) mesh dim(s). For TP-parallel params an extra trailing mesh
+    dim carries the original Megatron TP placement (see megatron_fsdp
+    ``param_and_grad_buffer._get_fsdp_tensor_spec``). HSDP may additionally have
+    an outer mesh dim with ``Replicate()`` placement.
+
+    We eagerly all-gather the FSDP shard dim over its DeviceMesh subgroup,
+    excluding any replicated outer-DP dim and keeping the TP dim sharded, so the
+    result matches the ordinary per-TP-rank Megatron parameter the TP all-gather
+    path below already handles. DTensor's own ``redistribute`` / ``full_tensor``
+    are avoided on purpose: use eager ``dist.all_gather`` as on the TP-gather
+    path. Relax keeps the mesh's native process groups alive under Megatron-FSDP.
+
+    Expert (MoE) params are sharded over the *expert* data-parallel submesh, not
+    the regular one: megatron_fsdp builds their DeviceMesh with the SAME dim name
+    (``dp_shard``) but ``is_expert_parallel=True`` (see
+    ``param_and_grad_buffer.py`` FSDP tensor-spec / ``dist_index.get_submesh``).
+    The parameter's own mesh therefore selects the correct expert or dense
+    shard group without including unrelated ranks or outer replicas.
+
+    Non-DTensor params (non-FSDP runs) pass through unchanged. Megatron TP metadata
+    is re-attached so downstream code keeps working.
+
+    The gathered result is checked against the shape implied by the DTensor spec.
+    Megatron-FSDP guarantees the per-rank shards sum to the logical dim-0 size
+    (``make_fsdp_dtensor`` is called with ``run_check=True`` for the optimizer
+    params we read here, which runs ``validate_uneven_dtensor``), but that
+    invariant lives in another repo and is not re-checked at this boundary. A
+    violation would silently ship padded or truncated weights to the rollout
+    engine — non-TP params return straight from here, skipping the TP all-gather
+    and the bridge shape checks that would otherwise catch it.
+    """
+    data = getattr(param, "data", param)
+    from torch.distributed.tensor import DTensor  # local import: only needed under Megatron-FSDP
+
+    if not isinstance(data, DTensor):
+        return param
+
+    from torch.distributed.tensor import Shard
+
+    mesh = data.device_mesh
+    dim_names = getattr(mesh, "mesh_dim_names", None) or ()
+    placements = list(data.placements)
+
+    # FSDP dims are every mesh dim NOT named like TP. Deciding by mesh dim name
+    # (identical on all ranks) avoids per-parameter attribute skew that would make
+    # ranks issue mismatched collectives.
+    fsdp_dims = [
+        i for i, n in enumerate(dim_names) if not ("tp" in (n or "").lower() and "dp" not in (n or "").lower())
+    ]
+    fsdp_shard_dims = [i for i in fsdp_dims if isinstance(placements[i], Shard)]
+    if len(fsdp_shard_dims) > 1:
+        raise NotImplementedError(
+            "[FSDP weight sync] more than one sharded FSDP mesh dim (hybrid FSDP) is not supported yet"
+        )
+
+    local = data.to_local()
+    if fsdp_shard_dims:
+        shard = placements[fsdp_shard_dims[0]]
+        if shard.dim != 0:
+            raise NotImplementedError(
+                f"[FSDP weight sync] unexpected FSDP shard dim {shard.dim}, only dim 0 supported"
+            )
+        fsdp_group = mesh.get_group(fsdp_shard_dims[0])
+        local = _allgather_dim0_uneven(local, fsdp_group)
+
+    _check_fsdp_gathered_shape(local, data, mesh, placements, fsdp_dims, name)
+
+    local = local.detach()
+    # Preserve Megatron TP metadata that all_gather_param / bridge convert read.
+    for attr in ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode", "allreduce"):
+        if hasattr(param, attr):
+            setattr(local, attr, getattr(param, attr))
+    return local
+
+
+def _check_fsdp_gathered_shape(local, data, mesh, placements, fsdp_dims, name: str) -> None:
+    """Verify the FSDP dim(s) were undone exactly, leaving the per-TP-rank
+    param.
+
+    Expected dim 0 is the DTensor's global dim 0 divided by every *non*-FSDP
+    (i.e. TP) mesh dim that shards dim 0 — those splits must survive, since the
+    caller hands the result to the existing TP all-gather. Purely local
+    arithmetic, no collective. Raises rather than asserts so ``python -O``
+    cannot turn a silent weight corruption back on.
+    """
+    from torch.distributed.tensor import Shard
+
+    if data.dim() == 0:  # scalar params carry no dim-0 split to verify
+        return
+
+    expected_dim0 = data.shape[0]
+    for i, placement in enumerate(placements):
+        if i not in fsdp_dims and isinstance(placement, Shard) and placement.dim == 0:
+            expected_dim0 //= mesh.size(i)
+
+    if local.shape[0] != expected_dim0:
+        raise RuntimeError(
+            f"[FSDP weight sync] {name}: gathered dim0={local.shape[0]} but expected {expected_dim0}. "
+            f"Megatron-FSDP's shard-sum invariant is broken at this boundary; refusing to publish "
+            f"possibly padded/truncated weights. "
+            f"global_shape={tuple(data.shape)} local_shape={tuple(local.shape)} "
+            f"mesh_dim_names={getattr(mesh, 'mesh_dim_names', None)} placements={placements} "
+            f"fsdp_dims={fsdp_dims}"
+        )
+
+
 def gdn_component_sizes(config, tp_size: int, name: str) -> tuple[int, ...] | None:
     """Component-major GDN layout; unrelated parameters use ordinary TP
     metadata."""
@@ -58,6 +201,8 @@ def _gather_tp_weights(named_params, *, split_sizes, async_op):
     tasks, handles = [], []
     for name, param in named_params:
         name = name.replace(".to_wrap.", ".")
+        # Undo FSDP sharding before the shared synchronous/asynchronous TP gather.
+        param = fsdp_gather_local_param(param, name)
         if "expert_bias" in name:
             tasks.append((name, param, None, None))
             continue
@@ -118,6 +263,33 @@ def all_gather_params_async(
     )
 
 
+def _ensure_fsdp_params_distributed(args: Namespace, model: Sequence[torch.nn.Module]) -> None:
+    """Normalize Megatron-FSDP params to their canonical *distributed* DTensor
+    form.
+
+    After a forward pass, Megatron-FSDP leaves the module's parameters in the "raw"
+    state — unsharded / heterogeneous, with some shard storage already freed. Reading
+    those raw params (for the colocate weight backup or the actor→rollout weight sync)
+    is unsafe: ``copy_`` mixes DTensor with plain tensors or raises CUDA "invalid
+    argument", and all-gathering them hits an "illegal memory access".
+
+    ``MegatronFSDP._replace_param_with_distributed_if_needed()`` swaps the module
+    params to the consistent, sharded DTensors held by the FSDP buffer (the same ones
+    the optimizer uses) — a safe snapshot to copy and all-gather. It is idempotent
+    (guarded by ``is_param_fsdp_distributed``) and does no collective, and the next
+    ``MegatronFSDP.forward`` restores the raw state first, so this is safe to call
+    before every param read.
+    """
+    if not getattr(args, "use_megatron_fsdp", False):
+        return
+    for chunk in model:
+        for candidate in (chunk, getattr(chunk, "module", None)):
+            fn = getattr(candidate, "_replace_param_with_distributed_if_needed", None)
+            if callable(fn):
+                fn()
+                break
+
+
 def named_params_and_buffers(
     args: Namespace,
     model: Sequence[torch.nn.Module],
@@ -125,6 +297,9 @@ def named_params_and_buffers(
     translate_gpu_to_cpu: bool = False,
     include_persistent_buffers: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
+    # Normalize raw FSDP parameters before backup or weight export reads them.
+    _ensure_fsdp_params_distributed(args, model)
+
     if convert_to_global_name:
         ans = _named_params_and_buffers_global(args, model, include_persistent_buffers=include_persistent_buffers)
     else:
@@ -141,7 +316,10 @@ def _maybe_get_cpu_backup(x: torch.Tensor) -> torch.Tensor:
     # frees a param's GPU storage via storage().resize_(0), it stashes the CPU copy
     # on the tensor as ``_relax_cpu_offload_data``. If the GPU storage is empty, read
     # from that CPU copy instead of touching the now-invalid CUDA storage.
-    if getattr(x, "_relax_cpu_offload_data", None) is not None and x.storage().size() == 0:
+    if (
+        getattr(x, "_relax_cpu_offload_data", None) is not None
+        and getattr(x, "_local_tensor", x).untyped_storage().nbytes() == 0
+    ):
         return x._relax_cpu_offload_data
 
     # torch_memory_saver path: only usable when its LD_PRELOAD hook is active;

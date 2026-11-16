@@ -81,7 +81,8 @@ class TinySelfAttention(torch.nn.Module):
 
 
 def native_source(relative):
-    section = PATCH.read_text().split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
+    patch = PATCH.with_name("20260915-4a4de8657.patch") if relative.endswith("hyper_connection.py") else PATCH
+    section = patch.read_text().split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
     return ast.parse(
         "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++"))
     )

@@ -36,10 +36,10 @@ def receiver(backend="triton", **overrides):
     )
 
 
-@pytest.mark.parametrize("failure", ["none", "layout", "query", "source", "peer"])
+@pytest.mark.parametrize("failure", ["none", "layout", "query", "source", "peer", "fsdp"])
 def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypatch, failure):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater.args = SimpleNamespace(num_experts=4)
+    updater.args = SimpleNamespace(num_experts=4, use_megatron_fsdp=failure == "fsdp")
     updater._route_experts = updater._auto_expert_routing = False
     updater.rollout_engines = [Mock()]
     configured, reductions = [], []
@@ -77,7 +77,11 @@ def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypat
     monkeypatch.setattr(sync.dist, "all_reduce", reduce)
     updater._configure_auto_expert_routing([2], [0])
     assert updater._auto_expert_routing == updater._route_experts == (failure == "none")
-    if failure != "none":
+    if failure == "fsdp":
+        assert not configured
+        assert reductions == [0]
+        sync.ray.get.assert_not_called()
+    elif failure != "none":
         assert configured[-1] is None
 
 

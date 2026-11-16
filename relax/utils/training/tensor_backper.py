@@ -76,6 +76,7 @@ class _TensorBackuperNormal(TensorBackuper):
         """Snapshot to host memory, or to each source device with
         on_device=True."""
         from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
+        from torch.distributed.tensor import DTensor
 
         backup_dict = self._backups[tag]
         missing = [(name, param) for name, param in self._source_getter() if name not in backup_dict]
@@ -83,6 +84,13 @@ class _TensorBackuperNormal(TensorBackuper):
             # Share storage per device/dtype to avoid per-parameter allocation fragmentation.
             by_device_dtype: dict[tuple[torch.device, torch.dtype], list[tuple[str, torch.Tensor]]] = defaultdict(list)
             for name, param in missing:
+                if isinstance(param, DTensor):
+                    # Preserve the mesh and local shard shape instead of allocating
+                    # a plain tensor with the global shape.
+                    snapshot = torch.empty_like(param, device=param.device)
+                    _attach_tp_attrs(snapshot, param, set_defaults_if_not_set_tensor_model_parallel_attributes)
+                    backup_dict[name] = snapshot
+                    continue
                 by_device_dtype[(param.device, param.dtype)].append((name, param))
             for (device, dtype), entries in by_device_dtype.items():
                 flat_buffer = torch.empty(sum(p.numel() for _, p in entries), dtype=dtype, device=device)
@@ -150,6 +158,9 @@ def _compute_hash_dict(tensors: dict[str, torch.Tensor]):
 
 
 def _compute_hash_tensor(x: torch.Tensor):
+    # Check this rank's shard. A CPU-offloaded DTensor still carries its NCCL
+    # mesh; reducing its distributed hash would issue a collective on CPU data.
+    x = getattr(x, "_local_tensor", x)
     # Not a real/good hash, but pretty fast
     raw = x.contiguous().view(-1).view(torch.uint8)
     full_word_bytes = raw.numel() // 4 * 4

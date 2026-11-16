@@ -22,6 +22,8 @@ _gma_takes_fsdp_arg = len(inspect.signature(_get_main_grad_attr).parameters) >= 
 
 
 def _grad_attr(param, fsdp_on):
+    if fsdp_on and hasattr(param, "decoupled_grad"):
+        return "decoupled_grad"
     if _gma_takes_fsdp_arg:
         return _get_main_grad_attr(param, fsdp_on)
     return _get_main_grad_attr(param)

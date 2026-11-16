@@ -57,8 +57,8 @@ def _qwen38_mix(
 def _supported(hc: Any, x: torch.Tensor, ensure_ready: Callable | None) -> bool:
     if x.device.type != "cuda" or x.dtype != torch.bfloat16 or x.ndim != 3 or hc.n != 4:
         return False
-    # Functional linear must not bypass adapters or hooks that transform its
-    # inputs/outputs. Native DDP publication is handled explicitly below.
+    # Functional norm/linear must not bypass adapters or FSDP gather hooks.
+    # Native DDP publication is handled explicitly below.
     from torch.nn.modules import module as module_hooks
 
     if any(
@@ -71,22 +71,22 @@ def _supported(hc: Any, x: torch.Tensor, ensure_ready: Callable | None) -> bool:
         )
     ):
         return False
-    for linear in (hc.input_mix_weight_down, hc.input_mix_weight_up, hc.block_inject_weight):
-        if linear is None:
+    for module in (hc.hc_norm, hc.input_mix_weight_down, hc.input_mix_weight_up, hc.block_inject_weight):
+        if module is None:
             continue
-        if type(linear) is not torch.nn.Linear or linear.bias is not None:
+        if module._forward_hooks or module._backward_hooks or module._backward_pre_hooks:
             return False
-        if linear.weight.dtype != x.dtype or linear.weight.device != x.device:
-            return False
-        if linear._forward_hooks or linear._backward_hooks or linear._backward_pre_hooks:
-            return False
-        for hook in linear._forward_pre_hooks.values():
+        for hook in module._forward_pre_hooks.values():
             if (
                 ensure_ready is None
                 or getattr(hook, "__module__", "") != "megatron.core.distributed.distributed_data_parallel"
                 or getattr(hook, "__qualname__", "") != "DistributedDataParallel._make_forward_pre_hook.<locals>.hook"
             ):
                 return False
+        if module is not hc.hc_norm and (type(module) is not torch.nn.Linear or module.bias is not None):
+            return False
+        if module.weight.dtype != x.dtype or module.weight.device != x.device:
+            return False
     return True
 
 

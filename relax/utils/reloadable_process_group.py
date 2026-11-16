@@ -18,11 +18,19 @@ logger = get_logger(__name__)
 
 old_new_group_dict = {}
 _wrap_low_level_call_enabled = False
+# Megatron-FSDP captures the *raw* NCCL group (resolved by DeviceMesh, not the
+# ReloadableProcessGroup wrapper) and reuses it every forward for param
+# all-gather. Destroying/recreating groups mid-iteration aborts that raw comm and
+# FSDP never sees the reloaded one -> "NCCL communicator was aborted". So under
+# Megatron-FSDP we keep the groups alive (they are small NCCL comm buffers; FSDP
+# already saves memory via sharding).
+_skip_reload_for_fsdp = False
 
 
 def monkey_patch_torch_dist(args=None):
-    global _wrap_low_level_call_enabled
+    global _wrap_low_level_call_enabled, _skip_reload_for_fsdp
     _wrap_low_level_call_enabled = getattr(args, "enable_cuda_memory_check", False) if args is not None else False
+    _skip_reload_for_fsdp = getattr(args, "use_megatron_fsdp", False) if args is not None else False
 
     pid = os.getpid()
     if pid in old_new_group_dict:
@@ -364,11 +372,25 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def bound_device_id(self, dev):
         self.group.bound_device_id = dev
 
+    # ``group_name`` / ``group_desc`` are C++ properties defined on the base
+    # ``ProcessGroup`` class, so normal attribute lookup resolves them on this
+    # wrapper (which was built via ``super().__init__(rank, size)`` and never had
+    # ``_set_group_name`` called) instead of falling through to ``__getattr__``.
+    # Reading them then raises "ProcessGroup name not set", which breaks
+    # ``DeviceMesh.from_group`` (used by Megatron-FSDP). Forward to the inner PG.
+    @property
+    def group_name(self):
+        return self.group.group_name
+
+    @property
+    def group_desc(self):
+        return self.group.group_desc
+
 
 def _should_skip_reload_and_destroy() -> bool:
     """Whether destroy/reload of process groups should be skipped on this
     backend."""
-    return device_utils.is_klx()
+    return device_utils.is_klx() or _skip_reload_for_fsdp
 
 
 def destroy_process_groups(post_destroy_delay: float = 2.0, *, force: bool = False):
