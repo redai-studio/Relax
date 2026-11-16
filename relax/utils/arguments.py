@@ -827,6 +827,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-mask-reasoning",
+                action="store_true",
+                default=False,
+                help=(
+                    "Native causal-LM SFT only. Keep reasoning in the rendered model input but exclude "
+                    "complete reasoning blocks and their delimiters from loss. Supports ChatML/Qwen, "
+                    "DeepSeek-V4 and Gemma4 templates. Default off; unlike --sft-ignore-empty-think, "
+                    "also masks nonempty reasoning. Requires a fast tokenizer with offset mappings."
+                ),
+            )
+            parser.add_argument(
                 "--sft-ignore-empty-think",
                 action="store_true",
                 default=False,
@@ -3389,6 +3400,18 @@ def _normalize_mtp_only_training_args(args) -> None:
     args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
+def _validate_sft_mask_reasoning_args(args) -> None:
+    if not getattr(args, "sft_mask_reasoning", False):
+        return
+    if (
+        not is_sft_mode(args)
+        or getattr(args, "task_type", "causal_lm") != "causal_lm"
+        or getattr(args, "sft_training_mode", "sft") != "sft"
+        or getattr(args, "custom_dataset_class_path", None)
+    ):
+        raise ValueError("--sft-mask-reasoning requires native causal-LM SFT without --custom-dataset-class")
+
+
 def _validate_cpt_args(args) -> None:
     if getattr(args, "sft_training_mode", "sft") != "cpt":
         if getattr(args, "sft_cpt_template", "raw") != "raw":
@@ -3407,6 +3430,7 @@ def _validate_cpt_args(args) -> None:
         "--apply-chat-template-kwargs": getattr(args, "apply_chat_template_kwargs", None),
         "--sft-loss-last-turn-only": getattr(args, "sft_loss_last_turn_only", False),
         "--sft-ignore-empty-think": getattr(args, "sft_ignore_empty_think", False),
+        "--sft-mask-reasoning": getattr(args, "sft_mask_reasoning", False),
         "--sft-predict-interval": getattr(args, "sft_predict_interval", None),
         "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
         "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
@@ -4506,6 +4530,7 @@ def relax_validate_args(args):
         args.debug_train_only = True
 
     _validate_cpt_args(args)
+    _validate_sft_mask_reasoning_args(args)
 
     if is_offline:
         if not args.custom_dataset_class_path and not args.prompt_data:

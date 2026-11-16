@@ -16,6 +16,15 @@ from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
 arguments_module = _arguments_module_fixture
 
 
+def test_sft_reasoning_mask_is_opt_in(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = arguments_module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    assert parser.parse_args([]).sft_mask_reasoning is False
+    args = parser.parse_args(["--loss-type", "sft", "--sft-mask-reasoning"])
+    assert args.sft_mask_reasoning is True
+    arguments_module._validate_sft_mask_reasoning_args(args)
+
+
 def test_sft_legacy_prepack_allows_single_in_flight_step(arguments_module):
     args = SimpleNamespace(sft_max_in_flight_steps=1, sft_async_prepack=True, max_staleness=0)
 

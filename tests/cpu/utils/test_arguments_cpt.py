@@ -41,6 +41,7 @@ def test_qwen_template_requires_cpt_mode(arguments_module):
         ("apply_chat_template_kwargs", {"enable_thinking": True}),
         ("sft_loss_last_turn_only", True),
         ("sft_ignore_empty_think", True),
+        ("sft_mask_reasoning", True),
         ("sft_predict_interval", 10),
         ("custom_dataset_class_path", "custom.Dataset"),
         ("sft_oversize_strategy", "custom"),

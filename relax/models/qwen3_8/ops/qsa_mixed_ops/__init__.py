@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import Any
 
@@ -67,7 +68,28 @@ def forward(
         raise NotImplementedError("Mixed QSA supports CP1 frozen Stage-1 indexers")
     if any(parameter.requires_grad for parameter in self.parameters()):
         raise NotImplementedError("Mixed QSA requires a frozen indexer")
-    selection = selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
+    if os.environ.get("RELAX_QWEN38_QSA_MIXED_PRESERVE_BITS_SELECTOR", "0") == "1":
+        from relax.models.qwen3_8.ops.qsa_mixed_ops.bits_to_ids import bits_to_ids
+        from relax.models.qwen3_8.qsa_cp import _cached
+
+        if not Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:
+            raise ValueError("Preserved-bit mixed QSA requires the original fused bits selector")
+        selection = selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, "bits")
+        # Consume the selector replay entry before recording conversion; nested
+        # tape builds would reverse the order consumed during recomputation.
+        ids = _cached(
+            "mixed_ids_from_bits",
+            self,
+            lambda: bits_to_ids(
+                selection.selected_bits.view(selection.positions.numel(), selection.bits_per_row),
+                selection.positions,
+                self.block_topk,
+                selection.compress_ratio,
+            ),
+        )
+        selection = replace(selection, selected_ids=ids)
+    else:
+        selection = selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
     # Keep all-short batches on the source's Flash varlen path as well.
     # Native all_selected would otherwise bypass this backend through TE.
     selection = replace(selection, all_selected=False)

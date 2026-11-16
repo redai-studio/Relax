@@ -206,6 +206,7 @@ def _create_sft_train_dataset(
             classification_sentinel_token_id=classification_sentinel_token_id,
             loss_last_turn_only=getattr(config, "sft_loss_last_turn_only", False),
             loss_ignore_empty_think=getattr(config, "sft_ignore_empty_think", False),
+            loss_mask_reasoning=getattr(config, "sft_mask_reasoning", False),
             image_preprocess_on_rank=image_preprocess_on_rank,
         )
     return dataset_cls.from_args(
@@ -737,6 +738,9 @@ class SFT(Base):
             num_labels=getattr(self.config, "num_labels", None),
             problem_type=getattr(self.config, "problem_type", "single_label_classification"),
             classification_sentinel_token_id=classification_sentinel_token_id,
+            loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
+            loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
+            loss_mask_reasoning=getattr(self.config, "sft_mask_reasoning", False),
             image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
         )
 
@@ -875,6 +879,7 @@ class SFT(Base):
                     classification_sentinel_token_id=classification_sentinel_token_id,
                     loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
                     loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
+                    loss_mask_reasoning=getattr(self.config, "sft_mask_reasoning", False),
                     image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
                 )
 

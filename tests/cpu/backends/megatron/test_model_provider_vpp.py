@@ -790,3 +790,14 @@ def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
     module.get_model_provider_func(_bridge_args(**policy), role="actor")
     assert provider.finalized
     assert {name: getattr(provider, name) for name in policy} == policy
+
+
+@pytest.mark.parametrize("overlap", [True, False, None])
+def test_bridge_provider_preserves_p2p_cli_choice(monkeypatch, overlap):
+    provider = _FakeProvider()
+    provider.overlap_p2p_comm = False
+    provider.batch_p2p_comm = True
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(overlap_p2p_comm=overlap), role="actor")
+    assert provider.overlap_p2p_comm is (False if overlap is None else overlap)
+    assert provider.batch_p2p_comm is (True if overlap is None else not overlap)

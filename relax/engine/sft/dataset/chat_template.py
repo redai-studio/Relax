@@ -126,6 +126,8 @@ def _render_with_assistant_mask(
     normalize_deepseek_reasoning: bool = False,
     normalize_qwen38_reasoning: bool = False,
     last_turn_only: bool = False,
+    mask_reasoning: bool = False,
+    ignore_empty_think: bool = False,
     effective_template: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 1: ask tokenizer for the assistant-only mask directly."""
@@ -165,16 +167,18 @@ def _render_with_assistant_mask(
         not msg.learn and msg.role in _ASSISTANT_MASKED_ROLES and (not last_turn_only or i > last_user_index)
         for i, msg in enumerate(sample.messages)
     )
-    if needs_message_exclusions:
-        # Keep HF's exact generation boundaries, intersecting only with message
-        # selection. Full rendering handles templates that rewrite past turns.
+    if needs_message_exclusions or mask_reasoning:
+        # Keep HF's exact generation boundaries, intersecting with message
+        # selection and optional reasoning exclusions in the full render.
         selected_ids, selected_mask = _render_per_message_fallback(
             sample,
             tokenizer=tokenizer,
             apply_chat_template_kwargs=apply_chat_template_kwargs,
             effective_template=effective_template,
             last_turn_only=last_turn_only,
-            message_selection_only=True,
+            message_selection_only=not mask_reasoning,
+            mask_reasoning=mask_reasoning,
+            ignore_empty_think=ignore_empty_think,
         )
         if not torch.equal(input_ids, selected_ids):
             raise RuntimeError("Native generation mask and message selection token sequences differ.")
@@ -550,6 +554,30 @@ def _empty_think_region_end(rendered_text: str, content_start: int, span_end: in
     return end
 
 
+def _reasoning_region_end(text: str, start: int, end: int, reasoning: str | None) -> int:
+    """Exclude a leading think block, retaining the original rendered input.
+
+    A structured reasoning field disambiguates literal closing tags inside
+    reasoning or answers. Without it, reject ambiguous or incomplete blocks
+    instead of silently supervising reasoning or masking an answer.
+    """
+    if not text.startswith(_THINK_OPEN_TAG, start):
+        return start
+    body_start = start + len(_THINK_OPEN_TAG)
+    close = text.find(_THINK_CLOSE_TAG, body_start, end)
+    if isinstance(reasoning, str):
+        while close >= 0 and text[body_start:close].strip() != reasoning.strip():
+            close = text.find(_THINK_CLOSE_TAG, close + len(_THINK_CLOSE_TAG), end)
+        if close < 0:
+            raise ValueError("Cannot align reasoning_content with the rendered thinking block")
+    elif close >= 0 and text[body_start:close].strip():
+        if text.find(_THINK_CLOSE_TAG, close + len(_THINK_CLOSE_TAG), end) >= 0:
+            raise ValueError("Ambiguous thinking block; provide structured reasoning_content to mask reasoning")
+    if close < 0:
+        raise ValueError("Cannot mask an unterminated thinking block")
+    return close + len(_THINK_CLOSE_TAG)
+
+
 def _render_per_message_fallback(
     sample: CanonicalSample,
     *,
@@ -558,6 +586,7 @@ def _render_per_message_fallback(
     effective_template: str | None = None,
     last_turn_only: bool = False,
     ignore_empty_think: bool = False,
+    mask_reasoning: bool = False,
     message_selection_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 2: single full render + char-level mask projected back through
@@ -624,6 +653,11 @@ def _render_per_message_fallback(
         )
 
     dialect = _detect_dialect(rendered_text)
+    if mask_reasoning:
+        if dialect.name.startswith("gemma4"):
+            dialect = _GEMMA4
+        elif deepseek_dialect.name != "deepseek_v4" and "<|im_start|>" not in rendered_text:
+            raise ValueError("Reasoning masking requires a ChatML, DeepSeek-V4, or Gemma4 chat template")
     if (
         not message_selection_only
         and dialect.name.startswith("gemma4")
@@ -637,7 +671,7 @@ def _render_per_message_fallback(
             last_turn_only=last_turn_only,
             tool_turn_boundary=GEMMA4_SFT_TOOL_TURN_BOUNDARY_SENTINEL in (effective_template or ""),
         )
-        return _project_char_mask(token_ids, offset_mapping, char_mask)
+        return _project_char_mask(token_ids, offset_mapping, char_mask, require_full_token=mask_reasoning)
 
     last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
     char_mask = bytearray(len(rendered_text))  # zeros
@@ -646,7 +680,18 @@ def _render_per_message_fallback(
         if deepseek_dialect.name == "deepseek_v4":
             span = deepseek_dialect.locate(rendered_text, cursor, msg)
             if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
-                for pos in range(cursor if message_selection_only else span.learn_start, span.span_end):
+                mask_start = cursor if message_selection_only else span.learn_start
+                if mask_reasoning and msg.role == "assistant":
+                    # The dialect skips the opener by default; recover its
+                    # start to locate the complete leading reasoning block.
+                    for opener in (_THINK_OPEN, _THINK_OPEN_TAG):
+                        start = span.learn_start - len(opener)
+                        if start >= cursor and rendered_text[start : span.learn_start] == opener:
+                            mask_start = _reasoning_region_end(
+                                rendered_text, start, span.span_end, msgs[msg_idx].get("reasoning_content")
+                            )
+                            break
+                for pos in range(mask_start, span.span_end):
                     char_mask[pos] = 1
             cursor = span.next_cursor
             continue
@@ -703,6 +748,10 @@ def _render_per_message_fallback(
                 # empty `<think>…</think>` region (plus trailing whitespace)
                 # stays out of the loss.
                 mask_start = think_end
+            elif mask_reasoning and dialect is _CHATML:
+                mask_start = _reasoning_region_end(
+                    rendered_text, content_start, span_end, msgs[msg_idx].get("reasoning_content")
+                )
             elif dialect.think_open is not None and rendered_text.startswith(dialect.think_open, content_start):
                 if dialect.think_close is None:
                     # ms-swift's Qwen3.8 ignore_empty_think policy learns the
@@ -719,7 +768,7 @@ def _render_per_message_fallback(
         for pos in range(mask_start, span_end):
             char_mask[pos] = 1
 
-    return _project_char_mask(token_ids, offset_mapping, char_mask)
+    return _project_char_mask(token_ids, offset_mapping, char_mask, require_full_token=mask_reasoning)
 
 
 def _gemma4_context_safe_render(
@@ -891,7 +940,13 @@ def _mask_gemma4_model_turns(
     return char_mask
 
 
-def _project_char_mask(token_ids: list[int], offset_mapping: list[tuple[int, int]], char_mask: bytearray):
+def _project_char_mask(
+    token_ids: list[int],
+    offset_mapping: list[tuple[int, int]],
+    char_mask: bytearray,
+    *,
+    require_full_token: bool = False,
+):
     """Project a rendered-text character mask onto tokenizer offsets."""
     psum = [0] * (len(char_mask) + 1)
     for index, value in enumerate(char_mask):
@@ -899,7 +954,9 @@ def _project_char_mask(token_ids: list[int], offset_mapping: list[tuple[int, int
 
     loss_mask = [0] * len(token_ids)
     for index, (start, end) in enumerate(offset_mapping):
-        if end > start and psum[end] - psum[start] > 0:
+        covered = psum[end] - psum[start]
+        # A boundary token must not leak masked reasoning into the loss.
+        if end > start and (covered == end - start if require_full_token else covered > 0):
             loss_mask[index] = 1
     return torch.tensor(token_ids, dtype=torch.long), torch.tensor(loss_mask, dtype=torch.long)
 
@@ -943,6 +1000,7 @@ def render_with_loss_mask(
     apply_chat_template_kwargs: dict | None = None,
     last_turn_only: bool = False,
     ignore_empty_think: bool = False,
+    mask_reasoning: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Render a single sample.
 
@@ -965,12 +1023,20 @@ def render_with_loss_mask(
     because HF assistant masks do not distinguish empty thinking. Other native
     generation templates keep their assistant-mask path and warn if unsupported.
 
+    ``mask_reasoning``: exclude complete leading reasoning blocks, including
+    their delimiters, without changing input tokens. Supports ChatML,
+    DeepSeek-V4 and Gemma4 templates; intersects native generation masks.
+
     ``RELAX_SFT_RAW_TEXT_CONCAT=1`` bypasses chat templates for upstream
     raw-text comparison recipes.
     """
     if raw_text_concat_enabled():
+        if mask_reasoning:
+            raise ValueError("Reasoning masking is unsupported with raw-text concatenation")
         return _render_raw_text_concat(sample, tokenizer=tokenizer)
     if is_kimi_k3_tokenizer(tokenizer):
+        if mask_reasoning:
+            raise ValueError("Reasoning masking is not implemented for the Kimi K3 encoder")
         request = make_kimi_k3_sft_request(
             sample,
             apply_chat_template_kwargs,
@@ -1022,7 +1088,7 @@ def render_with_loss_mask(
     has_generation_marker = HAS_GENERATION_MARKER(effective_template)
     use_empty_think_fallback = ignore_empty_think and patch_result.patch_name == "qwen_history_thinking"
     if has_generation_marker and not use_empty_think_fallback:
-        if ignore_empty_think and tok_id not in _EMPTY_THINK_UNSUPPORTED_WARNED:
+        if ignore_empty_think and not mask_reasoning and tok_id not in _EMPTY_THINK_UNSUPPORTED_WARNED:
             logger.warning(
                 "--sft-ignore-empty-think is unsupported for this native generation template; "
                 "preserving its assistant-mask path."
@@ -1036,6 +1102,8 @@ def render_with_loss_mask(
             normalize_qwen38_reasoning=is_qwen38_chat_template(effective_template),
             last_turn_only=last_turn_only,
             effective_template=effective_template,
+            mask_reasoning=mask_reasoning,
+            ignore_empty_think=ignore_empty_think,
         )
 
     if has_generation_marker:
@@ -1055,6 +1123,7 @@ def render_with_loss_mask(
         effective_template=effective_template,
         last_turn_only=last_turn_only,
         ignore_empty_think=ignore_empty_think,
+        mask_reasoning=mask_reasoning,
     )
 
 
