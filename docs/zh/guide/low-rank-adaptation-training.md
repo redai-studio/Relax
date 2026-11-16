@@ -205,6 +205,33 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 两者都设置了 `--expert-tensor-parallel-size 1`。
 
+## GLM-5.3 SFT
+
+`scripts/training/sft/run-glm5.3-744B-A40B-lora-40k-32xgpu.sh` 是统一的 32 卡 SFT 入口，使用完整 78 层模型、40K 序列、TP4 / PP2 / CP4 / EP16 和 LoRA rank16 / alpha32。数据路径通过环境变量传入，脚本不绑定数据集。
+
+在 Relax 训练镜像中，从仓库根目录向空闲的 32 卡 Ray 集群提交。替换下面的模型、数据、checkpoint 和集群地址；JSONL 每条记录须包含 `messages` 对话，基座和数据须对所有节点可见。
+
+```bash
+export MODEL_DIR=/path/to/models
+export MODEL_NAME=GLM-5.3
+export SAVE_DIR=/path/to/checkpoints
+export PROMPT_DATA=/path/to/train.jsonl
+export EVAL_DATA=/path/to/heldout.jsonl
+export EXP_NAME=glm53-sft-run1
+export LEARNING_RATE=2e-6 NUM_ROLLOUT=50 SAVE_INTERVAL=50 EVAL_INTERVAL=50
+export RAY_ADDRESS=ray-head:6379
+export RAY_JOB_ADDRESS=http://ray-head:8265
+export WORKING_DIR=.
+export RELAX_SKIP_CLUSTER_CLEANUP=1
+export RAY_NO_WAIT=
+bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-glm5.3-744B-A40B-lora-40k-32xgpu.sh
+```
+
+`PROMPT_DATA` 必填。`EVAL_DATA` 可选：提供后，驻留训练模型每隔 `EVAL_INTERVAL` 步计算 heldout loss/PPL（默认 50）；不提供或设置 `EVAL_INTERVAL=0` 则关闭评测。`EVAL_DATASET_NAME` 默认为 `heldout`。训练与验证文件应按题目去重。
+
+命令等待训练结束。Checkpoint 保存在 `$SAVE_DIR/$EXP_NAME`；恢复训练时保持这两个值不变，启动新实验时更换实验名。ClearML 新任务链接会输出在日志中，`PROJECT_NAME` 默认为 `Relax/sft/glm5.3`。保存后使用下文命令合并 LoRA checkpoint；独立生成评测使用 `scripts/training/sft/eval-glm5.3-744B-A40B-aime-32xgpu.sh`。
+
 ## Checkpoint 与导出
 
 默认情况下，`--save` 写入常规的完整 Megatron 分布式 checkpoint。增加 `--save-lora-only` 后，改为写入更小、可续训的 actor checkpoint：其中包含 LoRA 张量以及 optimizer、scheduler、RNG、iteration 和 common state；恢复时，冻结的基座权重从 `--hf-checkpoint` 重新加载。
