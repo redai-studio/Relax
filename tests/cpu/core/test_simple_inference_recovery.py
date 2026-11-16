@@ -12,7 +12,7 @@ import pytest
 
 def _source():
     from relax.components import recovery
-    from relax.core import inference_recovery_executor
+    from relax.core.controller import Controller
     from relax.distributed import settlement
 
     return {
@@ -20,7 +20,7 @@ def _source():
         "RecoveryGate": recovery.RecoveryGate,
         "UnsafeInferenceError": settlement.UnsafeInferenceError,
         "wait_all": settlement.wait_all,
-        "configure_recovery": inference_recovery_executor.configure_recovery,
+        "Controller": Controller,
         "ray": recovery.ray,
     }
 
@@ -192,7 +192,9 @@ def test_explicit_disable_skips_eligibility_checks(monkeypatch, flag, hybrid):
         sys.modules, "relax.core.node_group_affinity", SimpleNamespace(with_control_plane_affinity=affinity)
     )
     config = SimpleNamespace(hybrid=hybrid, inference_recovery=True, inference_recovery_state=object())
-    assert module["configure_recovery"](config) is None
+    controller = object.__new__(module["Controller"])
+    controller.config = config
+    assert controller._create_inference_recovery_state() is None
     assert config.inference_recovery is False
     assert config.inference_recovery_state is None
     affinity.assert_not_called()

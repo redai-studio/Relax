@@ -386,7 +386,11 @@ class Actor(Base):
             else:
                 ray.get(refs)
         if self._recovery.state is not None:
-            self._recovery.synchronize(lambda: complete_inference_step(self.config, self.actor_model, self.step))
+            synchronized = self._recovery.synchronize(
+                lambda: complete_inference_step(self.config, self.actor_model, self.step)
+            )
+            if self.config.fully_async or self.config.hybrid or not synchronized:
+                wait_all(self.actor_model.async_inference_call("finish_training_metrics", self.step))
             if self.config.fully_async and not self.config.hybrid:
                 self._maybe_save_model()
         return True

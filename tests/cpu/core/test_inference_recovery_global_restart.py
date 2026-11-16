@@ -11,7 +11,6 @@ import pytest
 
 try:
     from relax.core import controller as controller_module
-    from relax.core.inference_recovery_executor import InferenceRecoveryExecutor, InferenceRecoveryResult
 
     Controller = controller_module.Controller
 except (ImportError, AssertionError) as exc:
@@ -358,7 +357,12 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         return observed
 
     rollout.get_step = observe_rollout_step
-    rollout.data_source = SimpleNamespace(discard_pending=SimpleNamespace(remote=discard))
+
+    async def discard_window():
+        await discard()
+        await reset()
+
+    rollout.handle = SimpleNamespace(discard_recovery_window=SimpleNamespace(remote=discard_window))
     drained = Future()
     drained.set_result(None)
     rollout.get_rollout_manager = AsyncMock(
@@ -372,7 +376,7 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
     controller.serve_dict = {service.role: service for service in (actor, rollout, forward)}
     # This case isolates preparation from replacement weight transport, as before.
     synchronize = AsyncMock(return_value=1)
-    monkeypatch.setattr(InferenceRecoveryExecutor, "_synchronize", synchronize)
+    monkeypatch.setattr(Controller, "_synchronize_inference_recovery", synchronize)
     controller._activate_inference_recovery = AsyncMock(side_effect=lambda *args: asyncio.create_task(completed()))
 
     def global_restart():
@@ -396,8 +400,8 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         discard.assert_awaited_once_with()
         reset.assert_awaited_once_with()
         forward.rebuild_for_recovery.assert_called_once()
-        role, recovery_state, recovery = controller._activate_inference_recovery.await_args.args
-        assert (role, recovery_state, recovery.step) == ("actor_fwd", state, 2)
+        assert controller._activate_inference_recovery.await_args.args == ("actor_fwd", state)
+        assert synchronize.await_args.args == ("actor_fwd", state, 2)
 
 
 @pytest.mark.parametrize("takeover", [None, "during_lookup", "after_registration"])
@@ -585,32 +589,22 @@ async def test_activation_publishes_and_registers_only_current_recovery(
     failed = controller.serve_dict[role]
     monkeypatch.setattr(controller_module.ray, "get", lambda value: value)
 
-    executor = InferenceRecoveryExecutor(
-        controller.config,
-        controller.serve_dict,
-        state,
-        controller._inference_recovery_timeout,
-        lambda: controller._check_inference_recovery(state),
-    )
     sender = controller.serve_dict["actor"].handle
     if sync_failure:
         sender.update_weights_fully_async.remote.side_effect = RuntimeError("Replacement weight sync incomplete")
         with pytest.raises(RuntimeError, match="Replacement weight sync incomplete"):
-            await executor._synchronize(role, step=3)
+            await controller._synchronize_inference_recovery(role, state, step=3)
         state.end_sync.remote.assert_not_called()
         state.resume.remote.assert_not_called()
         failed.run.assert_not_called()
         return
-    generation = await executor._synchronize(role, step=3)
+    assert await controller._synchronize_inference_recovery(role, state, step=3) == 1
     sender.reset_inference_transport.remote.assert_awaited_once_with(role)
     sync_options = {"expected_rollout_actor_ids": ["A", "B"]} if role == "rollout" else {}
     sender.update_weights_fully_async.remote.assert_awaited_once_with(
         rollout_only=role == "rollout", actor_fwd_only=role == "actor_fwd", **sync_options
     )
-    recovery = InferenceRecoveryResult(
-        step=3, attempt=1, generation=generation, started=controller_module.time.monotonic()
-    )
-    activation = controller._activate_inference_recovery(role, state, recovery)
+    activation = controller._activate_inference_recovery(role, state)
     if global_takeover:
         with pytest.raises(RuntimeError, match="Global restart has taken over"):
             await activation
@@ -674,17 +668,18 @@ async def test_colocate_recovery_owns_inference_memory_lifecycle(monkeypatch, fa
         resume=SimpleNamespace(remote=Mock(return_value=1)),
     )
     monkeypatch.setattr(controller_module.ray, "get", lambda value: value)
-    executor = InferenceRecoveryExecutor(
-        SimpleNamespace(fully_async=False, hybrid=False), {"actor": actor, "rollout": rollout}, state, 1, Mock()
-    )
+    controller = _controller_shell()
+    controller.config = SimpleNamespace(fully_async=False, hybrid=False)
+    controller.serve_dict = {"actor": actor, "rollout": rollout}
+    controller._inference_recovery = state
     if failure:
         with pytest.raises(RuntimeError, match=f"{failure} failed"):
-            await executor._synchronize("rollout", 3)
+            await controller._synchronize_inference_recovery("rollout", state, 3)
         state.end_sync.remote.assert_not_called()
         state.resume.remote.assert_not_called()
         assert events == (["weights", "export"] if failure == "export" else ["weights", "export", "kv"])
     else:
-        assert await executor._synchronize("rollout", 3) == 1
+        assert await controller._synchronize_inference_recovery("rollout", state, 3) == 1
         assert events == ["weights", "export", "kv", "published"]
         state.end_sync.remote.assert_called_once()
         state.resume.remote.assert_called_once_with(3)

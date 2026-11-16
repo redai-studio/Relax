@@ -5,10 +5,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from relax.core import inference_recovery_executor as inference_recovery
-from relax.core.inference_recovery_executor import configure_recovery
+from relax.core import controller as inference_recovery
 from relax.core.registry import process_role
 from relax.utils.env import Envs, known_env_names, validate_env
+
+
+def configure_recovery(config):
+    controller = object.__new__(inference_recovery.Controller)
+    controller.config = config
+    return controller._create_inference_recovery_state()
 
 
 def role_config(*, hybrid=False):

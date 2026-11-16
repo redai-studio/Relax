@@ -25,11 +25,7 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.algorithms import algorithm_needs_critic
-from relax.core.inference_recovery_executor import (
-    InferenceRecoveryExecutor,
-    InferenceRecoveryResult,
-    configure_recovery,
-)
+from relax.components.recovery import InferenceRecoveryState, inference_recovery_enabled
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
@@ -211,7 +207,7 @@ class Controller:
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
-        self._inference_recovery = configure_recovery(config)
+        self._inference_recovery = self._create_inference_recovery_state()
         self._health_manager = HealthManager(
             check_interval=1.0, config=config, fault_events=fault_events, fault_recovery=fault_recovery
         )
@@ -1330,22 +1326,126 @@ class Controller:
             return
         shutdown_agentic_chat_api_services()
 
+    def _create_inference_recovery_state(self) -> Any:
+        """Create this Controller generation's component admission state."""
+        config = self.config
+        config.inference_recovery = False
+        config.inference_recovery_state = None
+        if not inference_recovery_enabled(config):
+            return None
+        max_attempts = Envs.RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS
+        if max_attempts < 0:
+            raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer")
+        state = InferenceRecoveryState.options(**with_control_plane_affinity(config)).remote(
+            config.fully_async
+            and not getattr(config, "hybrid", False)
+            and not getattr(config, "true_on_policy_mode", False),
+            max_attempts=max_attempts,
+        )
+        config.inference_recovery_state = state
+        config.inference_recovery = True
+        return state
+
     def _check_inference_recovery(self, state: Any) -> None:
         if self._restarting or state is not self._inference_recovery:
             raise RuntimeError("Global restart has taken over inference recovery")
 
     def _recover_inference(self, role: str, state: Any) -> Any:
-        executor = InferenceRecoveryExecutor(
-            self.config,
-            self.serve_dict,
-            state,
-            self._inference_recovery_timeout,
-            partial(self._check_inference_recovery, state),
-        )
-        recovery = executor.recover(role)
-        return run(self._activate_inference_recovery(role, state, recovery))
+        """Run on the tracked recovery worker, including the entire rebuild."""
+        self._check_inference_recovery(state)
+        attempt = ray.get(state.request_recovery.remote(str(role)))
+        started = time.monotonic()
+        deadline = started + self._inference_recovery_timeout
+        actor = self.serve_dict["actor"]
+        while True:
+            self._check_inference_recovery(state)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Old operations did not finish; require global restart")
+            status = ray.get(state.snapshot.remote(), timeout=remaining)
+            if status["unsafe"] or status["sync"] or set(status["failures"]) != {str(role)}:
+                raise RuntimeError("Training or inference state changed during recovery")
+            if not status["active"]:
+                break
+            # Release a healthy Fwd already waiting for the original Actor's weights.
+            if "actor" not in status["active"] and status["fwd_ready"] and str(role) == "rollout":
+                if not ray.get(state.begin_sync.remote(maintenance=True), timeout=remaining):
+                    raise RuntimeError("Cannot release the healthy forward receiver")
+                remaining = max(0, deadline - time.monotonic())
+                run(asyncio.wait_for(actor.handle.update_weights_fully_async.remote(actor_fwd_only=True), remaining))
+                ray.get(state.end_sync.remote(), timeout=max(0, deadline - time.monotonic()))
+            time.sleep(0.05)
 
-    async def _activate_inference_recovery(self, role: str, state: Any, recovery: InferenceRecoveryResult) -> Any:
+        step = run(self._prepare_inference_recovery(role, state))
+        self._check_inference_recovery(state)
+        # Cancellation of the waiter must not detach an untracked rebuild thread.
+        self.serve_dict[role].rebuild_for_recovery(lambda: self._check_inference_recovery(state))
+        self._check_inference_recovery(state)
+        generation = run(self._synchronize_inference_recovery(role, state, step))
+        response = run(self._activate_inference_recovery(role, state))
+        logger.info(
+            f"Local recovery completed role={role} attempt={attempt} generation={generation} "
+            f"next_training_step={step} elapsed_s={time.monotonic() - started:.3f}"
+        )
+        return response
+
+    async def _prepare_inference_recovery(self, role: str, state: Any) -> int:
+        self._check_inference_recovery(state)
+        rollout = self.serve_dict["rollout"]
+        # The old loop tail can still exit after generation has drained.
+        if str(role) == "actor_fwd" and await rollout.get_step() >= self.config.num_rollout - 1:
+            raise RuntimeError("Rollout reached its final generation; require global restart")
+        step = await self.serve_dict["actor"].get_step()
+        client = tq.get_client()
+        from relax.utils.tq.recovery_storage import clear_pending_training_partitions
+
+        await clear_pending_training_partitions(client, step)
+        await rollout.handle.discard_recovery_window.remote()
+        return step
+
+    async def _synchronize_inference_recovery(self, role: str, state: Any, step: int) -> int:
+        self._check_inference_recovery(state)
+        actor = self.serve_dict["actor"]
+        rollout = self.serve_dict["rollout"]
+        failed = self.serve_dict[role]
+        for component_role in ("rollout", "actor_fwd", "advantages"):
+            if component_role in self.serve_dict:
+                await self.serve_dict[component_role].set_step(step)
+        if str(role) == "rollout":
+            manager = await rollout.get_rollout_manager()
+            await actor.handle.rebind_rollout_manager.remote(manager)
+            await rollout.handle.resume_data_source.remote()
+            if not getattr(self.config, "fully_async", False) and not getattr(self.config, "hybrid", False):
+                await actor.set_barriers(rollout=RolloutOffloadBarrier(manager, logger=logger))
+        if not ray.get(state.begin_sync.remote(maintenance=True)):
+            raise RuntimeError("Cannot reserve replacement weight synchronization")
+        if self.config.fully_async or getattr(self.config, "hybrid", False):
+            sync_options = dict(rollout_only=str(role) == "rollout", actor_fwd_only=str(role) == "actor_fwd")
+            if str(role) == "rollout":
+                engines, *_ = await manager.get_rollout_engines_and_lock.remote()
+                if not engines or any(engine is None for engine in engines):
+                    raise RuntimeError("Replacement Rollout engines are incomplete; require global restart")
+                sync_options["expected_rollout_actor_ids"] = [engine._actor_id.hex() for engine in engines]
+            await actor.handle.reset_inference_transport.remote(str(role))
+            sends = [actor.handle.update_weights_fully_async.remote(**sync_options)]
+            if str(role) == "actor_fwd":
+                sends.append(failed.handle.recv_weight_fully_async.remote())
+            await asyncio.gather(*sends)
+        else:
+            # Service lifecycle belongs here, not to the training rank or tensor updater.
+            engines, lock, _, counts, offsets = await manager.get_rollout_engines_and_lock.remote()
+            if not engines or any(engine is None for engine in engines):
+                raise RuntimeError("Replacement Rollout engines are incomplete; require global restart")
+            await manager.onload_weights.remote()
+            await actor.handle.recovery_update_weights_colocate.remote(engines, lock, counts, offsets)
+            await manager.onload_kv.remote()
+            await manager.clear_num_new_engines.remote()
+        ray.get(state.end_sync.remote())
+        # Every old writer is terminal and every replacement weight RPC succeeded.
+        self._check_inference_recovery(state)
+        return ray.get(state.resume.remote(step))
+
+    async def _activate_inference_recovery(self, role: str, state: Any) -> Any:
         """Publish on the original async loop under Controller's restart
         lock."""
         with self._restart_lock:
@@ -1354,10 +1454,6 @@ class Controller:
             response = self.serve_dict[role].run()
             with self._pending_task_refs_lock:
                 self._pending_task_refs.append(response)
-        logger.info(
-            f"Local recovery completed role={role} attempt={recovery.attempt} generation={recovery.generation} "
-            f"next_training_step={recovery.step} elapsed_s={time.monotonic() - recovery.started:.3f}"
-        )
         return response
 
     def _run_inference_recovery(self, role: str, state: Any, result: concurrent.futures.Future) -> None:

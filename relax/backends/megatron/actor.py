@@ -2341,11 +2341,13 @@ class MegatronTrainRayActor(TrainRayActor):
             self.save_model(rollout_id, force_sync=is_train_done)
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
-        with timer("train_metrics_flush"):
-            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done)
         if not defer_inference:
             if getattr(self, "rollout_manager", None) is not None and self._per_step_rollout:
                 self.update_weights()
+            with timer("train_metrics_flush"):
+                tracking_utils.flush_metrics(
+                    self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done
+                )
             dist.barrier(group=get_gloo_group())
             self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
             if is_train_done:
@@ -2826,7 +2828,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.evaluate_after_training(rollout_id, end_update_weight=True)
                 if is_train_done:
                     self._wait_for_previous_eval()
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        if not defer_inference:
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
     @manual_gc_training
     def train_async(self, rollout_id, defer_inference: bool = False) -> None:
@@ -2893,6 +2896,16 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.use_routing_replay:
                 RoutingReplay.clear_all()
 
+        if defer_inference:
+            self._pending_training_metrics = rollout_data
+            # Resume the same train interval across the component-owned tail.
+            Timer().end("train_wait")
+            Timer().start("train")
+            return
+        self._log_async_training_perf(rollout_id, rollout_data)
+        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+
+    def _log_async_training_perf(self, rollout_id: int, rollout_data: dict) -> None:
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
@@ -2933,7 +2946,25 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+
+    def finish_training_metrics(self, rollout_id: int) -> None:
+        if self.args.fully_async and not self.args.hybrid:
+            Timer().end("train")
+            Timer().start("train_wait")
+            self._log_async_training_perf(rollout_id, self._pending_training_metrics)
+            del self._pending_training_metrics
+        if not self.args.fully_async and not self.args.hybrid:
+            with timer("train_metrics_flush"):
+                tracking_utils.flush_metrics(
+                    self.args,
+                    compute_rollout_step(self.args, rollout_id),
+                    wait=rollout_id + 1 == self.args.num_rollout,
+                )
+        else:
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+
+    def record_inference_wait(self, elapsed_seconds: float) -> None:
+        Timer().add("wait update_weights_fully_async", elapsed_seconds)
 
     @timer
     @annotate_failure_stage("checkpoint")

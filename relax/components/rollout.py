@@ -336,6 +336,12 @@ class Rollout(Base):
         super().__init__()
         self.config = config
         self._recovery_gate = RecoveryGate(config, "rollout")
+        state = self._recovery_gate.state
+        if state is not None and ray.get(state.snapshot.remote(), timeout=60)["paused"]:
+            # Only the replacement's serialized config is changed. Initial
+            # deployment keeps an explicitly configured router port.
+            config.sglang_router_ip = None
+            config.sglang_router_port = None
         self._resume_data_source = False
         self.healthy = healthy
 
@@ -392,6 +398,12 @@ class Rollout(Base):
 
     def resume_data_source(self) -> None:
         self._resume_data_source = True
+
+    async def discard_recovery_window(self) -> None:
+        """Discard settled carryover without rewinding the shared input
+        cursor."""
+        await self.data_source.discard_pending.remote()
+        await self.rollout_manager.reset_data_window.remote()
 
     async def stop_for_recovery(self) -> list:
         if self._run_task is not None and not self._run_task.done():

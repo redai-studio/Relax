@@ -11,6 +11,7 @@ import ray
 
 from relax.distributed.settlement import UnsafeInferenceError
 from relax.utils.async_utils import run
+from relax.utils.env import Envs
 
 
 class RecoveryGate:
@@ -158,3 +159,69 @@ class InferenceRecoveryState:
         self.fwd_ready = False
         self.paused = False
         return self.generation
+
+
+def inference_recovery_enabled(config: Namespace) -> bool:
+    """Enable supported full-async/hybrid recovery by default; colocate is opt-
+    in."""
+    choice = Envs.RELAX_ENABLE_INFERENCE_RECOVERY
+    if choice is False:
+        return False
+    hybrid = bool(getattr(config, "hybrid", False))
+    fully_async = bool(getattr(config, "fully_async", False))
+    if choice is None and not (fully_async or hybrid):
+        return False
+
+    conflicts = [
+        f"{name}={getattr(config, name, None)!r} (requires {required!r})"
+        for name, required in (
+            ("train_backend", "megatron"),
+            ("advantage_estimator", "grpo"),
+            ("kl_coef", 0),
+            ("multimodal_keys", None),
+            ("rollout_function_path", "relax.engine.rollout.sglang_rollout.generate_rollout"),
+        )
+        if getattr(config, name, None) != required
+    ]
+    conflicts.extend(
+        f"{name}={getattr(config, name)!r} (requires disabled or empty)"
+        for name in (
+            "use_kl_loss",
+            "use_agentic_rollout",
+            "use_opd",
+            "use_critic",
+            "rollout_external",
+            "debug_train_only",
+            "debug_rollout_only",
+            "use_dynamic_global_batch_size",
+            "use_fault_tolerance",
+            "use_slime_router",
+            "autoscaler_config",
+            "sglang_config",
+            "lora_adapter_mode",
+            "custom_generate_function_path",
+            "dynamic_sampling_filter_path",
+            "_genrm_instances_resolved",
+            "sglang_router_ip",
+        )
+        if getattr(config, name, False)
+    )
+    if fully_async and getattr(config, "use_routing_replay", False):
+        conflicts.append(f"use_routing_replay={config.use_routing_replay!r} (requires disabled when fully_async=True)")
+    if hybrid:
+        conflicts.extend(
+            f"{name}={getattr(config, name)!r} (requires disabled when hybrid=True)"
+            for name in ("offload_train", "offload_rollout")
+            if getattr(config, name, False)
+        )
+    elif getattr(config, "colocate", False):
+        conflicts.extend(
+            f"{name}={getattr(config, name, False)!r} (requires enabled when colocate=True)"
+            for name in ("offload_train", "offload_rollout", "enable_weights_backuper")
+            if not getattr(config, name, False)
+        )
+    if conflicts:
+        if choice is True:
+            raise ValueError("Unsupported inference recovery configuration: " + "; ".join(conflicts))
+        return False
+    return True

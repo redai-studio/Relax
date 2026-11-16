@@ -246,9 +246,15 @@ def test_hybrid_training_waits_for_all_ranks_when_recovery_enabled(enabled):
     actor.step = 4
     actor._recovery = SimpleNamespace(state=object() if enabled else None, synchronize=Mock())
     refs = ["rank0", "rank1"]
-    actor.actor_model = SimpleNamespace(train_hybrid=Mock(return_value=refs))
+    actor.actor_model = SimpleNamespace(
+        train_hybrid=Mock(return_value=refs), async_inference_call=Mock(return_value=[])
+    )
     assert actor._execute_training()
-    (wait if enabled else get).assert_called_once_with(refs)
+    if enabled:
+        assert wait.call_args_list[0].args == (refs,)
+        actor.actor_model.async_inference_call.assert_called_once_with("finish_training_metrics", 4)
+    else:
+        get.assert_called_once_with(refs)
     (get if enabled else wait).assert_not_called()
 
 
@@ -290,6 +296,13 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     monkeypatch.setitem(execute.__globals__, "complete_inference_step", inference_sync.complete_inference_step)
 
     def tail(method, *args, **options):
+        if method == "record_inference_wait":
+            assert len(args) == 1 and args[0] >= 0
+            return "wait_recorded"
+        if method == "finish_training_metrics":
+            assert args == (4,)
+            events.append("flush")
+            return "flushed"
         if method == "evaluate_after_training":
             assert args == (4,) and options == {"end_update_weight": mode != "colocate"}
             events.append("evaluate")
@@ -325,11 +338,64 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     if outcome != "training_error":
         expected += ["reserve"]
         if outcome != "paused":
+            if mode != "colocate":
+                expected += ["wait_recorded"]
             expected += ["dispatch_tail", "tail"]
             if outcome == "success":
+                if mode == "colocate":
+                    expected += ["flush", "flushed"]
                 expected += ["evaluate", "evaluated", "release"]
+        if outcome in {"success", "paused"} and (mode != "colocate" or outcome == "paused"):
+            expected += ["flush", "flushed"]
         if mode == "fully_async" and outcome in {"success", "paused"}:
             expected += ["save"]
     assert events == expected
     method = {"colocate": "async_train", "hybrid": "train_hybrid", "fully_async": "train_fully_async"}[mode]
     getattr(group, method).assert_called_once_with(4, defer_inference=True)
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_rollout_replacement_reselects_router_endpoint(monkeypatch, paused):
+    import copy
+
+    from relax.components import rollout as rollout_module
+
+    driver_config = SimpleNamespace(sglang_router_ip=None, sglang_router_port=31000, tq_config={})
+    config = copy.deepcopy(driver_config)
+    state = SimpleNamespace(snapshot=remote(lambda: {"paused": paused}))
+    # Serve copies the ingress class; patch its external boundaries directly.
+    component_type = rollout_module.Rollout.func_or_class.__mro__[1]
+    bindings = component_type.__init__.__globals__
+    monkeypatch.setitem(bindings, "RecoveryGate", lambda *_args: SimpleNamespace(state=state))
+    monkeypatch.setitem(bindings, "ray", SimpleNamespace(get=lambda value, **kwargs: value))
+    monkeypatch.setitem(bindings, "attach_tq_client", lambda *_args, **kwargs: None)
+    manager = Mock(return_value=(object(), 1))
+    monkeypatch.setitem(bindings, "create_rollout_manager", manager)
+    component = component_type(None, None, config)
+
+    assert manager.call_args.args[0].sglang_router_port == (None if paused else 31000)
+    assert component.config.sglang_router_ip is None
+    assert driver_config.sglang_router_port == 31000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("discard_fails", [False, True])
+async def test_rollout_discard_window_waits_for_its_data_source(monkeypatch, discard_fails):
+    from relax.components import rollout as rollout_module
+
+    discard, reset = AsyncMock(), AsyncMock()
+    if discard_fails:
+        discard.side_effect = RuntimeError("unsettled pending data")
+    component = SimpleNamespace(
+        data_source=SimpleNamespace(discard_pending=remote(discard)),
+        rollout_manager=SimpleNamespace(reset_data_window=remote(reset)),
+    )
+    operation = rollout_module.Rollout.func_or_class.discard_recovery_window
+    if discard_fails:
+        with pytest.raises(RuntimeError, match="unsettled pending data"):
+            await operation(component)
+        reset.assert_not_awaited()
+    else:
+        await operation(component)
+        discard.assert_awaited_once_with()
+        reset.assert_awaited_once_with()

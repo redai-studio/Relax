@@ -182,7 +182,6 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
         ACTOR_ROLLOUT_PG_ROLES=[],
         _S3_MODEL_CLEANUP_SAFE_LOAD_FORMATS={"dummy"},
         require_control_plane_resource=lambda _: None,
-        configure_recovery=lambda _: None,  # These cases exercise global recovery without a local admission gate.
         with_control_plane_affinity=lambda *args: {},
         resolve_sft_num_rollout=lambda _: None,
         create_dcs_deployment=lambda **kwargs: (None, "unused"),
@@ -198,6 +197,8 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
         set_managed_opd_teacher_on_actor_service=noop,
     )
     cls = load_definitions("relax/core/controller.py", namespace)["Controller"]
+    # These cases isolate global recovery; local admission has its own runtime tests.
+    cls._create_inference_recovery_state = lambda self: None
     cls._initialize_data_system = lambda self: None
     cls._shutdown_agentic_rollout_services = lambda self: None
     cls._cleanup_s3_model_weights_after_init = lambda *args, **kwargs: None

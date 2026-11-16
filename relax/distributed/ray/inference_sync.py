@@ -118,7 +118,9 @@ def complete_inference_step(config: Namespace, train_group: Any, step: int) -> N
     asynchronous = config.fully_async or config.hybrid
     if asynchronous:
         wait_for_previous_eval()
+        started = time.monotonic()
         rollout_only, actor_fwd_only = check_services_health(config)
+        wait_all(train_group.async_inference_call("record_inference_wait", time.monotonic() - started))
         if config.hybrid and actor_fwd_only:
             try:
                 response = requests.get(
@@ -137,6 +139,8 @@ def complete_inference_step(config: Namespace, train_group: Any, step: int) -> N
     else:
         refs = train_group.async_inference_call("update_weights")
     wait_all(refs)
+    if not asynchronous:
+        wait_all(train_group.async_inference_call("finish_training_metrics", step))
     wait_all(train_group.async_inference_call("evaluate_after_training", step, end_update_weight=asynchronous))
     if step + 1 == config.num_rollout:
         wait_for_previous_eval()
