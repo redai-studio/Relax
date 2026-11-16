@@ -186,6 +186,7 @@ def compute_reward_metrics(
     group_indices: Sequence[Sequence[int]],
     degenerate: bool,
     primary: str | None = None,
+    valid_mask: Sequence[bool] | None = None,
 ) -> Dict[str, float]:
     """Pure reward/advantage statistics for observability (design doc 11.2).
 
@@ -196,27 +197,30 @@ def compute_reward_metrics(
     ``_ADV_VARIANCE_FLOOR`` makes a round degenerate (``loss=0`` no-op step).
     """
     metrics: Dict[str, float] = {}
+    valid = [True] * len(advantages) if valid_mask is None else [bool(value) for value in valid_mask]
     for comp, vals in component_rewards.items():
-        t = torch.tensor([float(v) for v in vals], dtype=torch.float32)
+        t = torch.tensor([float(value) for value, keep in zip(vals, valid) if keep], dtype=torch.float32)
         if t.numel() == 0:
             continue
         metrics[f"reward/{comp}_mean"] = float(t.mean())
         metrics[f"reward/{comp}_std"] = float(t.std(unbiased=False))
         metrics[f"reward/{comp}_min"] = float(t.min())
         metrics[f"reward/{comp}_max"] = float(t.max())
-    adv = torch.tensor([float(a) for a in advantages], dtype=torch.float32)
+    adv = torch.tensor([float(value) for value, keep in zip(advantages, valid) if keep], dtype=torch.float32)
     if adv.numel():
         metrics["reward/advantage_mean"] = float(adv.mean())
         metrics["reward/advantage_std"] = float(adv.std(unbiased=False))
     metrics["reward/degenerate"] = 1.0 if degenerate else 0.0
     metrics["reward/num_groups"] = float(len(group_indices))
+    metrics["reward/valid_fraction"] = float(sum(valid)) / max(1, len(valid))
+    metrics["reward/invalid_samples"] = float(len(valid) - sum(valid))
     primary = primary or (next(iter(component_rewards), None))
     if primary is not None and primary in component_rewards:
         pv = [float(v) for v in component_rewards[primary]]
         group_stds = [
-            float(torch.tensor([pv[i] for i in idxs], dtype=torch.float32).std(unbiased=False))
+            float(torch.tensor([pv[i] for i in idxs if valid[i]], dtype=torch.float32).std(unbiased=False))
             for idxs in group_indices
-            if len(idxs) > 1
+            if sum(valid[i] for i in idxs) > 1
         ]
         if group_stds:
             metrics["reward/group_std_mean"] = sum(group_stds) / len(group_stds)
@@ -241,77 +245,130 @@ def score_samples(args, samples) -> Dict[str, List[float]]:
     finally:
         _release_memory_images(requests)
     _validate_reward_lengths(component_rewards, len(flat))
+
+    component_rewards.pop("__valid_mask__", None)
     return component_rewards
+
+
+def prefetch_group_rewards(args: Any, samples: Any) -> None:
+    """Score raw rewards early; never normalize a partial acquisition batch.
+
+    Only the CPU runtime is safe alongside generation. Keep the validity mask
+    (unlike the evaluation-only score_samples helper). The private attributes
+    are consumed once by post_process and never enter serialized train rows.
+    """
+    if getattr(args, "reward_runtime", "cpu") != "cpu":
+        raise ValueError("Overlapped rewards require reward_runtime=cpu")
+    flat = _flatten(samples)
+    if any(hasattr(sample, "_prefetched_generative_reward") for sample in flat):
+        raise RuntimeError("A candidate was submitted for reward twice")
+    requests = [_build_reward_request(args, sample) for sample in flat]
+    manager = _get_manager(args)
+    try:
+        components = manager.score(requests)
+    finally:
+        _release_memory_images(requests)
+    _validate_reward_lengths(components, len(flat))
+    valid = components.get("__valid_mask__", [True] * len(flat))
+    for index, sample in enumerate(flat):
+        sample._prefetched_generative_reward = (
+            (sample.train_metadata or {}).get("rollout_id"),
+            {name: values[index] for name, values in components.items() if name != "__valid_mask__"},
+            bool(valid[index]),
+        )
+
+
+def _consume_prefetched_rewards(flat: List[Sample]) -> Dict[str, List[float]] | None:
+    cached = [getattr(sample, "_prefetched_generative_reward", None) for sample in flat]
+    if not any(value is not None for value in cached):
+        return None
+    if any(value is None for value in cached):
+        raise RuntimeError("Partially prefetched reward batch; refusing duplicate scoring")
+    names = list(cached[0][1])  # Preserve serial scorer component-reduction order.
+    if any(set(value[1]) != set(names) for value in cached):
+        raise ValueError("Prefetched groups returned different reward components")
+    for sample, value in zip(flat, cached):
+        if value[0] != (sample.train_metadata or {}).get("rollout_id"):
+            raise ValueError("Prefetched reward belongs to a different rollout")
+    result = {name: [value[1][name] for value in cached] for name in names}
+    result["__valid_mask__"] = [value[2] for value in cached]
+    for sample in flat:
+        del sample._prefetched_generative_reward
+    return result
 
 
 def post_process(args, samples) -> List[float]:
     """``custom_reward_post_process_path`` entry point (design doc 11.2)."""
-    import time
-
+    if (getattr(args, "sampling_config", None) or {}).get("algorithm") != "art":
+        return _post_process_grpo(args, samples)
     flat: List[Sample] = _flatten(samples)
-    manager = _get_manager(args)
-
-    requests = [_build_reward_request(args, s) for s in flat]
-    # Time the scorer on its own: the rollout driver's `perf/reward_time` lumps
-    # convert + scoring + the TransferQueue put together (~104 s/rollout at 256
-    # samples), so it cannot say whether a CPU-pinned scorer is the bottleneck.
-    score_t0 = time.time()
-    try:
-        component_rewards = manager.score(requests)
-    finally:
-        _release_memory_images(requests)
-    score_time = time.time() - score_t0
+    component_rewards = _consume_prefetched_rewards(flat)
+    if component_rewards is None:
+        manager = _get_manager(args)
+        requests = [_build_reward_request(args, s) for s in flat]
+        try:
+            component_rewards = manager.score(requests)
+        finally:
+            _release_memory_images(requests)
     _validate_reward_lengths(component_rewards, len(flat))
+    valid_mask = [bool(value) for value in component_rewards.pop("__valid_mask__", [True] * len(flat))]
 
     group_indices = _group_index_lists(flat)
+    # A singleton surviving a judge failure has no relative reward signal.
+    # Keep its row for collective-safe sharding, but exclude it from both the
+    # policy objective and any reference KL added by the actor.
+    for group in group_indices:
+        if sum(valid_mask[index] for index in group) < 2:
+            for index in group:
+                valid_mask[index] = False
     component_weights = getattr(args, "reward_component_weights", None) or {}
     configured_required = getattr(args, "reward_required_components", None)
     required = list(component_weights.keys()) if configured_required is None else list(configured_required)
-    std_mode = _advantage_std_mode(args)
 
-    advantages, degenerate = combine_group_advantages(
-        component_rewards,
-        group_indices,
-        component_weights,
-        required_components=required,
-        advantage_std_mode=std_mode,
-        # Backward-compatible fallback when the explicit generative mode is not
-        # present on older args objects: the shared flag is on by default and
-        # `--disable-grpo-std-normalization` turns the std divisor OFF.
-        std_normalization=bool(getattr(args, "grpo_std_normalization", True)),
-    )
+    if (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art":
+        from relax.engine.rewards.art import scalarize_art_rewards
 
-    # Raw reward = the primary (highest-weight) component, for logging.
-    primary = max(component_weights, key=component_weights.get) if component_weights else next(iter(component_rewards))
-    raw_rewards = [float(v) for v in component_rewards[primary]]
-    if len(advantages) != len(flat):
-        raise ValueError(f"generative reward length mismatch: samples={len(flat)} advantages={len(advantages)}")
+        skip_acquisition = not all(valid_mask)
+        # Validate the component schema/finite values even for a skipped
+        # acquisition. Failed judges remain invalid, and their placeholder
+        # scores are never consumed by covariance or an optimizer update.
+        scalar_rewards = scalarize_art_rewards(
+            component_rewards, component_weights, required=required, valid_mask=[True] * len(flat)
+        )
+        primary = max(component_weights, key=component_weights.get)
+        for sample, scalar, raw, valid in zip(flat, scalar_rewards, component_rewards[primary], valid_mask):
+            sample.reward = float(raw)
+            if sample.train_metadata is None:
+                sample.train_metadata = {}
+            sample.train_metadata.update(art_reward=scalar, valid_mask=valid, advantage=0.0)
+            if skip_acquisition:
+                sample.train_metadata["skip_optimizer_step"] = True
+            else:
+                sample.train_metadata.pop("skip_optimizer_step", None)
+        # ART degeneracy depends on endpoint covariance, not reward variance.
+        metrics = compute_reward_metrics(
+            component_rewards, scalar_rewards, group_indices, False, primary, valid_mask=valid_mask
+        )
+        for suffix in ("mean", "std"):
+            key = f"reward/advantage_{suffix}"
+            if key in metrics:
+                metrics[f"reward/art_scalar_{suffix}"] = metrics.pop(key)
+        metrics.pop("reward/degenerate", None)
+        metrics["reward/art_skipped_acquisition"] = float(skip_acquisition)
+        if skip_acquisition:
+            logger.warning(
+                f"ART skipping entire acquisition after {len(valid_mask) - sum(valid_mask)} invalid rewards; "
+                "no optimizer/LR/policy advance."
+            )
+        _log_reward_metrics(args, flat, metrics)
+        # Keep the generic numeric schema, but never disguise scalar rewards
+        # as GRPO advantages. ART consumes its dedicated art_rewards column.
+        return [0.0] * len(flat)
 
-    # Keep the RAW reward on the Sample. Overwriting it with the advantage made
-    # every downstream `get_reward_value` consumer (rollout dumps, filters, the
-    # sample-level metrics) report a group-centered number whose mean is ~0 by
-    # construction as if it were a reward. The advantage is returned to the
-    # caller and rides the TQ's `advantages` column; it does not belong on the
-    # Sample's reward field. Stash it in train_metadata for anyone who wants
-    # both.
-    for s, raw, adv in zip(flat, raw_rewards, advantages):
-        s.reward = float(raw)
-        if s.train_metadata is None:
-            s.train_metadata = {}
-        s.train_metadata["advantage"] = float(adv)
-    if degenerate:
-        for s in flat:
-            s.train_metadata["skip_optimizer_step"] = True
 
-    # Observability: reward/advantage distribution (design doc 11.2). This is the
-    # signal that diagnoses a degenerate (loss=0) round — reward/group_std_mean is
-    # the per-group std whose collapse trips the degenerate floor.
-    metrics = compute_reward_metrics(component_rewards, advantages, group_indices, degenerate, primary)
-    metrics.update(_advantage_std_mode_metrics(std_mode))
-    metrics["reward/score_time"] = float(score_time)
-    metrics["reward/score_samples_per_s"] = float(len(flat)) / score_time if score_time > 0 else 0.0
-    _log_reward_metrics(args, flat, metrics)
-    return advantages
+# Wrappers may declare the same capability only when they delegate the full
+# acquisition batch here, without re-scoring or normalizing groups early.
+post_process.supports_prefetched_generative_rewards = True
 
 
 def _log_reward_metrics(args, flat: List[Sample], metrics: Dict[str, float]) -> None:
@@ -474,3 +531,73 @@ def _get_manager(args):
         else:
             _MANAGER_CACHE[key] = GenerativeRewardManager.local(args)
     return _MANAGER_CACHE[key]
+
+
+def _post_process_grpo(args, samples) -> List[float]:
+    """``custom_reward_post_process_path`` entry point (design doc 11.2)."""
+    import time
+
+    flat: List[Sample] = _flatten(samples)
+    manager = _get_manager(args)
+
+    requests = [_build_reward_request(args, s) for s in flat]
+    # Time the scorer on its own: the rollout driver's `perf/reward_time` lumps
+    # convert + scoring + the TransferQueue put together (~104 s/rollout at 256
+    # samples), so it cannot say whether a CPU-pinned scorer is the bottleneck.
+    score_t0 = time.time()
+    try:
+        component_rewards = manager.score(requests)
+    finally:
+        _release_memory_images(requests)
+    score_time = time.time() - score_t0
+    _validate_reward_lengths(component_rewards, len(flat))
+
+    group_indices = _group_index_lists(flat)
+    component_weights = getattr(args, "reward_component_weights", None) or {}
+    configured_required = getattr(args, "reward_required_components", None)
+    required = list(component_weights.keys()) if configured_required is None else list(configured_required)
+    std_mode = _advantage_std_mode(args)
+
+    advantages, degenerate = combine_group_advantages(
+        component_rewards,
+        group_indices,
+        component_weights,
+        required_components=required,
+        advantage_std_mode=std_mode,
+        # Backward-compatible fallback when the explicit generative mode is not
+        # present on older args objects: the shared flag is on by default and
+        # `--disable-grpo-std-normalization` turns the std divisor OFF.
+        std_normalization=bool(getattr(args, "grpo_std_normalization", True)),
+    )
+
+    # Raw reward = the primary (highest-weight) component, for logging.
+    primary = max(component_weights, key=component_weights.get) if component_weights else next(iter(component_rewards))
+    raw_rewards = [float(v) for v in component_rewards[primary]]
+    if len(advantages) != len(flat):
+        raise ValueError(f"generative reward length mismatch: samples={len(flat)} advantages={len(advantages)}")
+
+    # Keep the RAW reward on the Sample. Overwriting it with the advantage made
+    # every downstream `get_reward_value` consumer (rollout dumps, filters, the
+    # sample-level metrics) report a group-centered number whose mean is ~0 by
+    # construction as if it were a reward. The advantage is returned to the
+    # caller and rides the TQ's `advantages` column; it does not belong on the
+    # Sample's reward field. Stash it in train_metadata for anyone who wants
+    # both.
+    for s, raw, adv in zip(flat, raw_rewards, advantages):
+        s.reward = float(raw)
+        if s.train_metadata is None:
+            s.train_metadata = {}
+        s.train_metadata["advantage"] = float(adv)
+    if degenerate:
+        for s in flat:
+            s.train_metadata["skip_optimizer_step"] = True
+
+    # Observability: reward/advantage distribution (design doc 11.2). This is the
+    # signal that diagnoses a degenerate (loss=0) round — reward/group_std_mean is
+    # the per-group std whose collapse trips the degenerate floor.
+    metrics = compute_reward_metrics(component_rewards, advantages, group_indices, degenerate, primary)
+    metrics.update(_advantage_std_mode_metrics(std_mode))
+    metrics["reward/score_time"] = float(score_time)
+    metrics["reward/score_samples_per_s"] = float(len(flat)) / score_time if score_time > 0 else 0.0
+    _log_reward_metrics(args, flat, metrics)
+    return advantages

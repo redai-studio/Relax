@@ -52,6 +52,7 @@ __all__ = [
     "get_cached_candidate_image",
     "group_sidecar_path",
     "prune_stale_artifacts",
+    "pack_trajectory_provenance",
 ]
 
 
@@ -75,6 +76,22 @@ _CANDIDATE_IMAGE_CACHE: Dict[str, Any] = {}
 _CANDIDATE_IMAGE_ROLLOUT_IDS: Dict[str, int] = {}
 
 
+def _discard_unpublished_art_refs(rollout_id: int, initial_keys: set[Tuple[int, int]]) -> None:
+    """Release only this failed acquisition, after writers join and before TQ.
+
+    Serialized ObjectRefs remain owner-pinned after a dict pop. Never use this
+    helper after publication has started: consumers may already need the refs.
+    """
+    keys = [key for key in _TRAJECTORY_REF_CACHE if key not in initial_keys and key[0] == int(rollout_id)]
+    if not keys:
+        return
+    from ray._private.internal_api import free
+
+    free([_TRAJECTORY_REF_CACHE[key] for key in keys], local_only=False)
+    for key in keys:
+        del _TRAJECTORY_REF_CACHE[key]
+
+
 def prune_stale_artifacts(args, rollout_id: int) -> None:
     """Release stale in-memory trajectories and delete old artifact
     directories.
@@ -92,8 +109,20 @@ def prune_stale_artifacts(args, rollout_id: int) -> None:
     root = getattr(args, "artifact_root", None)
     if keep <= 0:
         return
-    memory_cutoff = int(rollout_id) - max(keep, _DEFAULT_ARTIFACT_RETENTION_ROLLOUTS)
-    for key in [key for key in _TRAJECTORY_REF_CACHE if key[0] <= memory_cutoff]:
+    is_art = (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art"
+    memory_cutoff = int(rollout_id) - (keep if is_art else max(keep, _DEFAULT_ARTIFACT_RETENTION_ROLLOUTS))
+    stale_keys = [key for key in _TRAJECTORY_REF_CACHE if key[0] <= memory_cutoff]
+    if is_art and stale_keys:
+        # Private API checked against the pinned Ray 2.56 runtime; revalidate
+        # when upgrading Ray. Never silently fall back to dropping Python refs.
+        from ray._private.internal_api import free
+
+        # ART consumes an acquisition synchronously before this boundary.
+        # cloudpickle.dumps(ObjectRef) pins the trajectory for the owner's
+        # lifetime, so dropping our Python reference alone leaks spilled data.
+        free([_TRAJECTORY_REF_CACHE[key] for key in stale_keys], local_only=False)
+        logger.info("Released %d stale ART trajectory groups before rollout %d", len(stale_keys), rollout_id)
+    for key in stale_keys:
         del _TRAJECTORY_REF_CACHE[key]
     for uri in [
         uri for uri, image_rollout_id in _CANDIDATE_IMAGE_ROLLOUT_IDS.items() if image_rollout_id <= memory_cutoff
@@ -173,12 +202,75 @@ def _put_group_batch(
     a trainer actor can wait forever because that actor does not know which
     worker owns the object.
     """
+    return _put_group_payload(rollout_id, group_index, {**common, **conditions, **tracks})
+
+
+def _put_group_payload(rollout_id: int, group_index: int, batch: Mapping[str, Any]) -> bytes:
     import ray
 
-    batch = {**common, **conditions, **tracks}
     ref = ray.put(batch)
     _TRAJECTORY_REF_CACHE[(int(rollout_id), int(group_index))] = ref
     return ray.cloudpickle.dumps(ref)
+
+
+def _publish_group_trajectory(
+    args: Any,
+    sampling: Mapping[str, Any],
+    rollout_id: int,
+    group_index: int,
+    common: Mapping[str, torch.Tensor],
+    conditions: Mapping[str, torch.Tensor],
+    tracks: Mapping[str, torch.Tensor],
+) -> Tuple[Optional[bytes], str]:
+    """Opt-in durable transport for memory-constrained rollout heads."""
+    storage = sampling.get("trajectory_storage", "ray")
+    if storage == "sidecar":
+        path = group_sidecar_path(args.artifact_root, args.generation_task, rollout_id, group_index)
+        return None, write_group_sidecar(path, common, conditions, tracks)
+    if storage != "ray":
+        raise ValueError(f"Unsupported trajectory_storage: {storage!r}")
+    if sampling.get("algorithm") == "art":
+        from relax.utils.art_tensor_transport import pack
+
+        ref = _put_group_payload(rollout_id, group_index, pack({**common, **conditions, **tracks}))
+    else:
+        ref = _put_group_batch(rollout_id, group_index, common, conditions, tracks)
+    return ref, f"ray://{ref.hex()}"
+
+
+def _wave_group_count(sampling: Mapping[str, Any], num_engines: int) -> int:
+    count = sampling.get("wave_groups", num_engines)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= num_engines:
+        raise ValueError("wave_groups must be a positive integer no larger than the engine count")
+    return count
+
+
+def _validate_pipeline_options(args: Any, sampling: Mapping[str, Any], data_system_client: Any) -> bool:
+    """Reject unsafe overlap settings before consuming the data source.
+
+    A hook's capability marker only promises to consume the prefetched raw
+    results. It does not make an arbitrary scorer independent across groups.
+    """
+    overlap = sampling.get("overlap_group_processing", False)
+    if type(overlap) is not bool:
+        raise ValueError("overlap_group_processing must be a boolean")
+    if not overlap:
+        return False
+    pending = sampling.get("overlap_pending_groups", 2)
+    if type(pending) is not int or pending < 1:
+        raise ValueError("overlap_pending_groups must be a positive integer")
+    if (
+        getattr(args, "reward_runtime", "cpu") != "cpu"
+        or getattr(args, "reward_scorer_path", None) != "relax.engine.rewards.textpecker_reward.TextPeckerRewardScorer"
+        or data_system_client is None
+    ):
+        raise ValueError("Group overlap currently requires CPU TextPecker and a training data-system client")
+    from relax.utils.utils import load_function
+
+    hook_path = getattr(args, "custom_reward_post_process_path", None)
+    if not hook_path or getattr(load_function(hook_path), "supports_prefetched_generative_rewards", False) is not True:
+        raise ValueError("Group overlap requires a hook declaring supports_prefetched_generative_rewards=True")
+    return True
 
 
 _LOGGED_CANDIDATE_IMAGE_SHAPE = False
@@ -324,6 +416,152 @@ def build_candidate_manifest(
     )
 
 
+def _sha256_tensor(value: str, field_name: str) -> torch.Tensor:
+    digest = str(value).lower()
+    try:
+        raw = bytes.fromhex(digest)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a 64-character hexadecimal SHA-256 digest.") from exc
+    if len(raw) != 32:
+        raise ValueError(f"{field_name} must be a 64-character hexadecimal SHA-256 digest.")
+    return torch.tensor(list(raw), dtype=torch.uint8)
+
+
+def pack_trajectory_provenance(
+    responses: List[Mapping[str, Any]], sampling_fingerprint: str
+) -> Dict[str, torch.Tensor]:
+    """Pack behavior-policy identity beside a group's trajectory tensors.
+
+    These fields travel with the Ray object/sidecar, not only in the artifact
+    JSON.  The actor can therefore reject stale or mixed-policy rollouts before
+    any replay forward/backward. SHA digests are fixed-width byte tensors so no
+    strings enter the TransferQueue or tensor sidecar.
+    """
+    if not responses:
+        raise ValueError("Cannot pack provenance for an empty response group.")
+    versions = torch.tensor([int(response["policy_version"]) for response in responses], dtype=torch.long)
+    if torch.unique(versions).numel() != 1:
+        raise ValueError(f"A rollout group contains mixed policy versions: {versions.tolist()}.")
+    manifest_digests = torch.stack(
+        [
+            _sha256_tensor(str(response.get("weight_manifest_sha256", "")), "weight_manifest_sha256")
+            for response in responses
+        ]
+    )
+    if not torch.equal(manifest_digests, manifest_digests[0].unsqueeze(0).expand_as(manifest_digests)):
+        raise ValueError("A rollout group contains mixed weight_manifest_sha256 values.")
+    valid_masks = torch.tensor(
+        [bool(_scalar_value(response.get("valid_mask", True), "valid_mask")) for response in responses],
+        dtype=torch.bool,
+    )
+    packed = {
+        "policy_versions": versions,
+        "weight_manifest_sha256": manifest_digests,
+        "sampling_fingerprint": _sha256_tensor(sampling_fingerprint, "sampling_fingerprint"),
+        "valid_masks": valid_masks,
+    }
+    for field_name in ("condition_fingerprint", "scheduler_fingerprint"):
+        values = [response.get(field_name) for response in responses]
+        if not any(value is not None for value in values):
+            continue
+        if any(value is None for value in values):
+            raise ValueError(f"A rollout group only partially populated {field_name}.")
+        digests = torch.stack([_sha256_tensor(str(value), field_name) for value in values])
+        if not torch.equal(digests, digests[0].unsqueeze(0).expand_as(digests)):
+            raise ValueError(f"A rollout group contains mixed {field_name} values.")
+        packed[field_name] = digests[0]
+    return packed
+
+
+def _scalar_value(value: Any, name: str) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"{name} must be scalar, got shape {tuple(value.shape)}.")
+        return value.reshape(-1)[0]
+    return value
+
+
+def _prepare_generated_group(
+    args: Any,
+    sampling: Mapping[str, Any],
+    adapter: Any,
+    rollout_id: int,
+    fp: str,
+    group: List[Sample],
+    responses: List[Dict[str, Any]],
+    art_budget: Optional[Dict[str, List[int]]] = None,
+) -> List[Sample]:
+    group_index = group[0].group_index
+    if sampling.get("overlap_group_processing", False):
+        if (int(rollout_id), int(group_index)) in _TRAJECTORY_REF_CACHE or (
+            sampling.get("trajectory_storage") == "sidecar"
+            and os.path.exists(group_sidecar_path(args.artifact_root, args.generation_task, rollout_id, group_index))
+        ):
+            raise RuntimeError("Overlapped rollout refuses to overwrite an existing group trajectory")
+    if len(responses) != len(group):
+        raise RuntimeError(
+            f"group {group_index}: engine returned {len(responses)} candidates for {len(group)} samples"
+        )
+    for response in responses:
+        adapter.validate_rollout_response(response)
+    common, conditions, tracks = adapter_pack_group(adapter, responses)
+    common.update(pack_trajectory_provenance(responses, fp))
+    art_bytes_metadata = {}
+    if sampling.get("algorithm") == "art":
+        from relax.engine.rollout.art_cache import check_art_cache_budget, tensor_payload_bytes
+
+        if art_budget is None:
+            raise ValueError("ART acquisition requires a rollout-owned cache budget.")
+        cache_bytes = tensor_payload_bytes({**common, **conditions, **tracks})
+        guidance_bytes = tracks["terminal_state"][0].numel() * 4
+        check_art_cache_budget(
+            sampling, [*art_budget["sizes"], cache_bytes], [*art_budget["guidance"], guidance_bytes]
+        )
+        art_budget["sizes"].append(cache_bytes)
+        art_budget["guidance"].append(guidance_bytes)
+        art_bytes_metadata = {"art_cache_bytes": cache_bytes, "art_guidance_bytes": guidance_bytes}
+    trajectory_ref, trajectory_uri = _publish_group_trajectory(
+        args, sampling, rollout_id, group_index, common, conditions, tracks
+    )
+    for slot, (sample, response) in enumerate(zip(group, responses)):
+        if getattr(args, "reward_runtime", "cpu") == "remote":
+            uri, height, width, digest = save_candidate_image(
+                response.get("generated_output"),
+                args.artifact_root,
+                args.generation_task,
+                rollout_id,
+                group_index,
+                slot,
+            )
+        else:
+            uri, height, width, digest = cache_candidate_image(
+                response.get("generated_output"), args.generation_task, rollout_id, group_index, slot
+            )
+        if uri:
+            response["output"] = {"uri": uri, "mime": "image/png", "sha256": digest, "height": height, "width": width}
+        manifest = build_candidate_manifest(
+            task=args.generation_task,
+            sample_index=sample.index if sample.index is not None else slot,
+            group_index=group_index,
+            policy_version=int(response.get("policy_version", 0)),
+            artifact_tracks=adapter.artifact_tracks(response),
+            trajectory_uri=trajectory_uri,
+            sampling_fingerprint=fp,
+            weight_manifest_sha256=str(response.get("weight_manifest_sha256", "")),
+        )
+        sample.train_metadata = {
+            **art_bytes_metadata,
+            "group_index": group_index,
+            "trajectory_slot": slot,
+            "policy_version": int(response.get("policy_version", 0)),
+            "rollout_id": int(rollout_id),
+            "trajectory_ref": trajectory_ref,
+            "manifest": manifest,
+        }
+        sample.status = Sample.Status.COMPLETED
+    return group
+
+
 # ---------------------------------------------------------------------------
 # Rollout driver
 # ---------------------------------------------------------------------------
@@ -341,9 +579,13 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
     if evaluation:
         return evaluate_rollout(args, rollout_id)
 
+    sampling = getattr(args, "sampling_config", None) or {}
+    overlap = _validate_pipeline_options(args, sampling, data_system_client)
     adapter = _load_adapter(args)
     engines = _get_engines(args, data_system_client)
-    sampling = getattr(args, "sampling_config", None) or {}
+    wave_groups = _wave_group_count(sampling, len(engines))
+    if overlap and wave_groups != 1:
+        raise ValueError("Bounded group overlap currently requires wave_groups=1")
 
     # Pin the trained/stochastic SDE steps ONCE per rollout and hand every request
     # the same explicit list. With --sampling-config sde_resample_per_rollout this
@@ -356,7 +598,38 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
         sampling = {**sampling, "sde_indices": rollout_sde}
         logger.info(f"[rollout {rollout_id}] trained SDE steps: {rollout_sde}")
 
+    lookahead = sampling.get("generation_prefetch", False)
+    if type(lookahead) is not bool:
+        raise ValueError("generation_prefetch must be a boolean")
+    if lookahead and (
+        not overlap
+        or sampling.get("algorithm") != "art"
+        or wave_groups != 1
+        or sampling.get("overlap_pending_groups", 2) < 2
+    ):
+        raise ValueError("ART prefetch requires overlap with >=2 slots and wave_groups=1")
     groups = _get_samples(data_source, args.rollout_batch_size)
+    if lookahead and any(len(group) != len(engines) for group in groups):
+        raise ValueError("ART prefetch requires one candidate per engine")
+    art_budget = {"sizes": [], "guidance": []} if sampling.get("algorithm") == "art" else None
+    if art_budget is not None:
+        from relax.engine.rollout.art_cache import art_cache_limits
+
+        cache_limit, _ = art_cache_limits(sampling)
+        # Dense trajectory lower bound before ANY engine request. Prefix and
+        # provenance bytes are checked exactly after packing, before publishing.
+        minimum_bytes = 0
+        for group in groups:
+            request = adapter.build_rollout_request(group[0], sampling, seed=0)
+            minimum_bytes += (
+                len(group)
+                * 3
+                * request["height"]
+                * request["width"]
+                * (6 * len(sampling["art"]["train_step_indices"]) + 2)
+            )
+        if minimum_bytes > cache_limit:
+            raise ValueError("ART dense trajectory lower bound exceeds max_cache_bytes before dispatch.")
     out_groups: List[List[Sample]] = []
     base_seed = int(getattr(args, "generation_seed", 1234))
     request_sampling_base = {**sampling, "_rollout_id": int(rollout_id), "_base_seed": base_seed}
@@ -367,7 +640,32 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
     prune_stale_artifacts(args, rollout_id)
     import time
 
+    initial_image_keys = set(_CANDIDATE_IMAGE_CACHE)
+    initial_trajectory_keys = set(_TRAJECTORY_REF_CACHE)
+    pipeline = None
+    if overlap:
+        from relax.engine.rewards.generative import prefetch_group_rewards
+        from relax.engine.rollout.group_pipeline import GroupPipeline
+
+        def prepare(group: List[Sample], responses: List[Dict[str, Any]]) -> List[Sample]:
+            return _prepare_generated_group(
+                args,
+                sampling,
+                adapter,
+                rollout_id,
+                fp,
+                group,
+                responses,
+                **({"art_budget": art_budget} if art_budget is not None else {}),
+            )
+
+        def score(group: List[Sample]) -> None:
+            prefetch_group_rewards(args, group)
+
+        pipeline = GroupPipeline(prepare, score, sampling.get("overlap_pending_groups", 2))
+
     gen_t0 = time.time()
+
     # Dispatch a WAVE of groups at a time, with every candidate of the wave
     # spread across all engines.
     #
@@ -382,15 +680,14 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
     # generation (num_outputs_per_prompt = n). It is the bigger win and the
     # plumbing exists, but Qwen-Image's denoising path does not repeat the text
     # conditioning to the expanded batch -- see build_rollout_request.
-    for wave_start in range(0, len(groups), len(engines)):
-        wave = groups[wave_start : wave_start + len(engines)]
+    def build_wave_requests(wave: List[List[Sample]]) -> List[List[Dict[str, Any]]]:
         requests = []
         for group in wave:
             group_index = group[0].group_index
             group_requests = []
             for slot, sample in enumerate(group):
                 sample_id = _native_generation_sample_id(sample, group_index, slot, sampling)
-                request_sampling = {**request_sampling_base, "_sample_id": sample_id}
+                request_sampling = {**request_sampling_base, "_sample_id": sample_id, "_member_id": slot}
                 # Each candidate in the group gets a DISTINCT seed so the G samples
                 # per prompt are diverse (different initial + SDE noise). Identical
                 # seeds → identical generations → zero intra-group reward variance →
@@ -401,79 +698,102 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
                 engine_seed = base_seed if driver_xt else base_seed + int(group_index or 0) * len(group) + slot
                 group_requests.append(adapter.build_rollout_request(sample, request_sampling, engine_seed))
             requests.append(group_requests)
-        wave_responses = _dispatch_groups(engines, requests)
+        return requests
 
-        for group, responses in zip(wave, wave_responses):
-            group_index = group[0].group_index
-            if len(responses) != len(group):
-                raise RuntimeError(
-                    f"group {group_index}: engine returned {len(responses)} candidates for a group of {len(group)}."
+    next_requests = None
+    failed = True
+    try:
+        for wave_start in range(0, len(groups), wave_groups):
+            wave = groups[wave_start : wave_start + wave_groups]
+            if pipeline is not None:
+                pipeline.reserve(slots=2 if lookahead and wave_start + wave_groups < len(groups) else 1)
+            if lookahead:
+                requests = next_requests if next_requests is not None else build_wave_requests(wave)
+                next_wave = groups[wave_start + wave_groups : wave_start + 2 * wave_groups]
+                next_requests = build_wave_requests(next_wave) if next_wave else None
+                wave_responses = _dispatch_groups(
+                    engines, requests, next_group_requests=next_requests, lookahead=True, use_art_transport=True
+                )
+            else:
+                requests = build_wave_requests(wave)
+                wave_responses = _dispatch_groups(
+                    engines, requests, use_art_transport=sampling.get("algorithm") == "art"
                 )
 
-            # Fail fast on a malformed / short engine response (missing trajectory,
-            # timesteps or sde_indices) with a clear per-field error, instead of a deep
-            # opaque tensor error later in pack_trajectory.
-            for resp in responses:
-                adapter.validate_rollout_response(resp)
-
-            common, conditions, tracks = adapter_pack_group(adapter, responses)
-            trajectory_ref = _put_group_batch(rollout_id, group_index, common, conditions, tracks)
-            trajectory_uri = f"ray://{trajectory_ref.hex()}"
-
-            for slot, (sample, resp) in enumerate(zip(group, responses)):
-                # Keep the decoded image in process for local rewards. Only an
-                # external scorer needs a durable URI it can open.
-                if getattr(args, "reward_runtime", "cpu") == "remote":
-                    # External scorers receive JSON and cannot resolve this
-                    # process's memory:// image cache.
-                    img_uri, img_h, img_w, img_sha256 = save_candidate_image(
-                        resp.get("generated_output"),
-                        args.artifact_root,
-                        args.generation_task,
-                        rollout_id,
-                        group_index,
-                        slot,
-                    )
+            for group, responses in zip(wave, wave_responses):
+                if pipeline is not None:
+                    pipeline.submit(group, responses)
                 else:
-                    img_uri, img_h, img_w, img_sha256 = cache_candidate_image(
-                        resp.get("generated_output"),
-                        args.generation_task,
+                    _prepare_generated_group(
+                        args,
+                        sampling,
+                        adapter,
                         rollout_id,
-                        group_index,
-                        slot,
+                        fp,
+                        group,
+                        responses,
+                        **({"art_budget": art_budget} if art_budget is not None else {}),
                     )
-                if img_uri:
-                    resp["output"] = {
-                        "uri": img_uri,
-                        "mime": "image/png",
-                        "sha256": img_sha256,
-                        "height": img_h,
-                        "width": img_w,
-                    }
-                manifest = build_candidate_manifest(
-                    task=args.generation_task,
-                    # `or slot` would rewrite a legitimate index 0 into the slot.
-                    sample_index=sample.index if sample.index is not None else slot,
-                    group_index=group_index,
-                    policy_version=int(resp.get("policy_version", 0)),
-                    artifact_tracks=adapter.artifact_tracks(resp),
-                    trajectory_uri=trajectory_uri,
-                    sampling_fingerprint=fp,
-                    weight_manifest_sha256=str(resp.get("weight_manifest_sha256", "")),
-                )
-                sample.train_metadata = {
-                    "group_index": group_index,
-                    "trajectory_slot": slot,
-                    "policy_version": int(resp.get("policy_version", 0)),
-                    # Carry the rollout_id so the reward post-process can log its metrics
-                    # against the same compute_rollout_step x-axis as train/* and perf/*
-                    # (policy_version diverges from rollout_id after resume / early steps).
-                    "rollout_id": int(rollout_id),
-                    "trajectory_ref": trajectory_ref,
-                    "manifest": manifest,
-                }
-                sample.status = Sample.Status.COMPLETED
-            out_groups.append(group)
+                out_groups.append(group)
+            del wave_responses, responses
+        if pipeline is not None:
+            pipeline.finish()
+        failed = False
+    finally:
+        cleanup_errors = []
+        if lookahead:
+            import ray
+
+            cleanup = []
+            for engine in engines:
+                try:
+                    cleanup.append(engine.clear_art_lookahead.remote())
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            # Await all actors even if a submission or another actor cleanup failed.
+            for ref in cleanup:
+                try:
+                    ray.get(ref)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+        if pipeline is not None:
+            try:
+                pipeline.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            failed = True
+        if overlap or (failed and art_budget is not None):
+            for uri in set(_CANDIDATE_IMAGE_CACHE) - initial_image_keys:
+                if _CANDIDATE_IMAGE_ROLLOUT_IDS.get(uri) == int(rollout_id):
+                    get_cached_candidate_image(uri, remove=True)
+            if failed:
+                release_failed = False
+                if art_budget is not None:
+                    try:
+                        _discard_unpublished_art_refs(rollout_id, initial_trajectory_keys)
+                    except Exception:
+                        release_failed = True
+                        logger.exception(
+                            "Unpublished ART trajectory release failed; retaining owner refs for diagnosis"
+                        )
+                if not release_failed:
+                    for key in set(_TRAJECTORY_REF_CACHE) - initial_trajectory_keys:
+                        if key[0] == int(rollout_id):
+                            _TRAJECTORY_REF_CACHE.pop(key, None)
+        # Failed rounds must not leave prefetched scores or cached image arrays.
+        # Successful raw scoring has already released its images. Sidecars are
+        # left to the existing retention guard, never deleted after a possible put.
+        for group in groups:
+            for sample in group:
+                if failed and hasattr(sample, "_prefetched_generative_reward"):
+                    del sample._prefetched_generative_reward
+                for output in ((sample.train_metadata or {}).get("manifest") or {}).get("outputs", []):
+                    uri = output.get("uri", "")
+                    if overlap and uri.startswith("memory://"):
+                        get_cached_candidate_image(uri, remove=True)
+        if cleanup_errors:
+            raise RuntimeError("ART lookahead cleanup failed") from cleanup_errors[0]
     gen_time = time.time() - gen_t0
 
     # Transfer the generated groups to the data system: convert each group to the
@@ -484,20 +804,33 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
     # this the actor blocks forever polling an empty partition.
     reward_time = 0.0
     if data_system_client is not None and out_groups:
+        from relax.utils import utils as transfer_utils
         from relax.utils.async_utils import run
         from relax.utils.utils import transfer_batch_to_data_system
 
         reward_t0 = time.time()
-        run(
-            transfer_batch_to_data_system(
-                args,
-                out_groups,
-                len(out_groups),
-                rollout_id,
-                data_system_client,
-                is_last=True,
+        batch_before = {id(sample) for sample in transfer_utils.CURRENT_ROLLOUT_BATCH}
+        try:
+            run(
+                transfer_batch_to_data_system(
+                    args,
+                    out_groups,
+                    len(out_groups),
+                    rollout_id,
+                    data_system_client,
+                    is_last=True,
+                )
             )
-        )
+        finally:
+            if overlap:
+                owned_ids = {id(sample) for group in out_groups for sample in group} - batch_before
+                transfer_utils.CURRENT_ROLLOUT_BATCH[:] = [
+                    sample for sample in transfer_utils.CURRENT_ROLLOUT_BATCH if id(sample) not in owned_ids
+                ]
+                for group in out_groups:
+                    for sample in group:
+                        if hasattr(sample, "_prefetched_generative_reward"):
+                            del sample._prefetched_generative_reward
         reward_time = time.time() - reward_t0
 
     _log_raw_reward(args, rollout_id, out_groups)
@@ -757,7 +1090,9 @@ def _log_rollout_perf(args, rollout_id: int, gen_time: float, reward_time: float
 
     ``perf/rollout_time`` (generation dispatch + image save) and
     ``perf/reward_time`` (convert + reward scoring + TQ transfer), logged via
-    the framework tracking sink from the RolloutManager worker.
+    the framework tracking sink from the RolloutManager worker. With group
+    overlap, rollout_time instead covers the sampling/reward pipeline through
+    its drain; reward_time is only the final advantage/conversion/TQ barrier.
     """
     from relax.utils.metrics.metric_utils import compute_rollout_step
 
@@ -766,14 +1101,18 @@ def _log_rollout_perf(args, rollout_id: int, gen_time: float, reward_time: float
         "perf/reward_time": float(reward_time),
         "rollout/step": compute_rollout_step(args, rollout_id),
     }
+    overlapped = bool((getattr(args, "sampling_config", None) or {}).get("overlap_group_processing", False))
+    metrics["perf/group_overlap"] = float(overlapped)
+    generation_label = "sampling_reward_pipeline_wall" if overlapped else "gen_time"
+    reward_label = "finalize+convert+tq_time" if overlapped else "reward+convert+tq_time"
     if gen_time > 0 and num_samples:
         metrics["perf/rollout_samples_per_s"] = float(num_samples) / gen_time
     # Print to the run log too — every other emission site does, and without it
     # "which stage is slow" cannot be triaged from the log alone. Note
     # reward_time covers convert + scoring + TQ put, not scoring alone.
     logger.info(
-        f"[rollout {rollout_id}] samples={num_samples} gen_time={gen_time:.2f}s "
-        f"reward+convert+tq_time={reward_time:.2f}s "
+        f"[rollout {rollout_id}] samples={num_samples} {generation_label}={gen_time:.2f}s "
+        f"{reward_label}={reward_time:.2f}s "
         f"samples_per_s={metrics.get('perf/rollout_samples_per_s', 0.0):.3f}"
     )
     _emit_tracking_metrics(args, metrics, int(metrics["rollout/step"]), "native generate_rollout")
@@ -832,7 +1171,7 @@ def adapter_pack_group(adapter, responses: List[Mapping[str, Any]]):
                 conditions[key] = torch.stack([p[key] for p in packed], dim=0)
             continue
         values = [p[key] for p in packed]
-        if key in ("sigmas", "sde_indices"):
+        if key in _GROUP_SHARED_KEYS:
             first = values[0]
             for candidate_index, value in enumerate(values[1:], start=1):
                 if not torch.equal(first, value):
@@ -907,9 +1246,17 @@ def convert_samples_to_train_data(args, samples):
         # zero-gradient round is an explicit skip, not a silent no-op.
         "skip_optimizer_step": [int((s.train_metadata or {}).get("skip_optimizer_step", 0)) for s in flat],
     }
+    if (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art":
+        if any("art_reward" not in (sample.train_metadata or {}) for sample in flat):
+            raise ValueError("ART requires raw scalar rewards from the ART reward post-process hook.")
+        train_data["valid_masks"] = [int(bool((s.train_metadata or {}).get("valid_mask", True))) for s in flat]
+        train_data["art_rewards"] = [float(sample.train_metadata["art_reward"]) for sample in flat]
+        for key in ("art_cache_bytes", "art_guidance_bytes"):
+            train_data[key] = [int(sample.train_metadata[key]) for sample in flat]
     if args.debug_train_only:
         return train_data
-    return dict_to_tensordict(train_data, len(flat))
+    result = dict_to_tensordict(train_data, len(flat))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -981,9 +1328,12 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
             )
         group_slots[int(slot)] = i
 
+    if (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art":
+        return _hydrate_art_micro_batches(args, adapter, rollout_id, rows, by_group, dp_rank, dp_world)
+
     micro_batches: List[Dict[str, Any]] = []
-    # Deterministic group order so every rank iterates identically (lockstep).
-    for group_index in sorted(by_group):
+    group_order = sorted(by_group)
+    for group_index in group_order:
         group_slots = by_group[group_index]
         group_size = len(group_slots)
         missing = sorted(set(range(group_size)) - set(group_slots))
@@ -996,6 +1346,22 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
         # candidate j regardless of the order the TQ handed the rows back.
         positions = [group_slots[slot] for slot in range(group_size)]
         batch = _load_group_batch_for_rows(args, adapter, rollout_id, group_index, rows, positions)
+        group_valid = batch.get("valid_masks")
+        if group_valid is None:
+            # Backward compatibility for pre-provenance sidecars in offline
+            # replay/tests. The production actor separately requires the field
+            # before training, so a live run cannot silently take this fallback.
+            group_valid = torch.ones(group_size, dtype=torch.bool)
+        else:
+            group_valid = group_valid.reshape(-1).bool()
+        if "valid_masks" in rows:
+            group_valid = group_valid & rows["valid_masks"][positions].reshape(-1).bool()
+        if group_valid.numel() != group_size:
+            raise ValueError(
+                f"hydrate_micro_batches: group {group_index} valid_masks has {group_valid.numel()} entries, "
+                f"expected {group_size}."
+            )
+        group_has_signal = int(group_valid.sum()) >= 2
         # Even split → shard candidates across ranks; else full replay on all ranks.
         if dp_world > 1 and group_size % dp_world == 0:
             local_idx = list(range(group_size))[dp_rank::dp_world]
@@ -1003,12 +1369,17 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
             local_idx = list(range(group_size))
         batch = _shard_group_batch(batch, group_size, local_idx)
         step_indices = batch["sde_indices"].tolist()
-        advantages = rows["advantages"][positions].float()[local_idx]
+        advantage_dtype = torch.float32
+        advantages = rows["advantages"][positions].to(advantage_dtype)[local_idx]
+        local_valid = group_valid[local_idx]
+        batch["valid_masks"] = local_valid
+        advantages = advantages * local_valid.to(advantages.dtype)
         # Degenerate round → skip the optimizer step (flag is uniform across the
         # round; read any of this group's rows). Absent column → never skip.
         skip = False
         if "skip_optimizer_step" in rows:
             skip = bool(int(rows["skip_optimizer_step"][positions].max()))
+        skip = skip or not group_has_signal
         # old_logp is recomputed by the actor (replay anchor); pass a batch view.
         local_size = len(local_idx)
         for chunk in _candidate_chunks(local_size, int(getattr(args, "micro_batch_size", 0) or 0)):
@@ -1017,12 +1388,38 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
                 {
                     "batch": _expand_shared_conditions(chunk_batch, len(chunk)),
                     "advantages": advantages[chunk],
+                    "valid_masks": local_valid[chunk],
                     "step_indices": [int(s) for s in step_indices],
                     "local_idx": [local_idx[c] for c in chunk],
                     "skip_optimizer_step": skip,
                 }
             )
     return micro_batches
+
+
+def _hydrate_art_micro_batches(
+    args: Any,
+    adapter: Any,
+    rollout_id: int,
+    rows: Any,
+    by_group: Dict[int, Dict[int, int]],
+    dp_rank: int,
+    dp_world: int,
+) -> List[Dict[str, Any]]:
+    from relax.engine.rollout.art_replay import hydrate_art_micro_batches
+
+    return hydrate_art_micro_batches(
+        args,
+        rollout_id,
+        rows,
+        by_group,
+        dp_rank,
+        dp_world,
+        load_group=lambda group, positions: _load_group_batch_for_rows(
+            args, adapter, rollout_id, group, rows, positions
+        ),
+        shard_group=_shard_group_batch,
+    )
 
 
 def _expand_shared_conditions(batch: Dict[str, torch.Tensor], num_candidates: int) -> Dict[str, torch.Tensor]:
@@ -1059,7 +1456,19 @@ def _candidate_chunks(local_size: int, micro_batch_size: int) -> List[List[int]]
 
 # Keys that are shared across the group (not per-candidate) and must NOT be sliced
 # along the candidate dimension when DP-sharding a group batch.
-_GROUP_SHARED_KEYS = frozenset({"sigmas", "sde_indices"})
+_GROUP_SHARED_KEYS = frozenset(
+    {
+        "sigmas",
+        "sde_indices",
+        "art_step_indices",
+        "art_timesteps",
+        "art_sigmas",
+        "art_ode_dts",
+        "sampling_fingerprint",
+        "condition_fingerprint",
+        "scheduler_fingerprint",
+    }
+)
 
 
 def _shard_group_batch(
@@ -1139,7 +1548,12 @@ def _load_group_batch_for_rows(args, adapter, rollout_id: int, group_index: int,
         if payload:
             import ray
 
-            return ray.get(ray.cloudpickle.loads(payload))
+            batch = ray.get(ray.cloudpickle.loads(payload))
+            from relax.utils.art_tensor_transport import TensorBuffer, unpack
+
+            if isinstance(batch, dict) and any(isinstance(value, TensorBuffer) for value in batch.values()):
+                return unpack(batch)
+            return batch
     sidecar = group_sidecar_path(args.artifact_root, args.generation_task, rollout_id, group_index)
     return _load_group_batch(sidecar, adapter)
 
@@ -1210,7 +1624,14 @@ def _get_engines(args, data_system_client):
     return []
 
 
-def _dispatch_groups(engines, group_requests: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+def _dispatch_groups(
+    engines,
+    group_requests: List[List[Dict[str, Any]]],
+    *,
+    use_art_transport: bool = False,
+    next_group_requests: Optional[List[List[Dict[str, Any]]]] = None,
+    lookahead: bool = False,
+) -> List[List[Dict[str, Any]]]:
     """Spread every candidate of every group across all engines; regroup on
     return.
 
@@ -1238,15 +1659,38 @@ def _dispatch_groups(engines, group_requests: List[List[Dict[str, Any]]]) -> Lis
     shards: List[List[int]] = [[] for _ in engines]
     for i in range(len(flat)):
         shards[i % len(engines)].append(i)
+    next_flat = (
+        [request for group in next_group_requests for request in group] if next_group_requests is not None else None
+    )
+    if lookahead and (
+        not use_art_transport or len(flat) != len(engines) or (next_flat is not None and len(next_flat) != len(flat))
+    ):
+        raise ValueError("ART prefetch requires one candidate per engine and ART transport")
     refs, order = [], []
     for engine, idxs in zip(engines, shards):
         if not idxs:
             continue
-        refs.append(engine.generate_batch.remote([flat[i] for i in idxs]))
+        if lookahead:
+            refs.append(
+                engine.generate_art_lookahead.remote(
+                    [flat[i] for i in idxs],
+                    next_requests=[next_flat[i] for i in idxs] if next_flat is not None else None,
+                )
+            )
+        else:
+            generate = engine.generate_art_batch_transport if use_art_transport else engine.generate_batch
+            refs.append(generate.remote([flat[i] for i in idxs]))
         order.append(idxs)
 
     out: List[Optional[Dict[str, Any]]] = [None] * len(flat)
-    for idxs, shard_result in zip(order, ray.get(refs)):
+    shard_results = ray.get(refs)
+    if use_art_transport:
+        from relax.utils.art_tensor_transport import unpack_shards
+
+        # Copy Ray's read-only buffers before reward/replay code can mutate them.
+        # Bounded parallel copies retain shard order and join on failure.
+        shard_results = unpack_shards(shard_results)
+    for idxs, shard_result in zip(order, shard_results):
         if len(shard_result) != len(idxs):
             raise RuntimeError(f"engine returned {len(shard_result)} responses for {len(idxs)} requests.")
         for i, resp in zip(idxs, shard_result):

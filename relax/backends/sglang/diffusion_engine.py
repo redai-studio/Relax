@@ -1,14 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """SGLang native-diffusion generation engine (RL rollout + weight update).
 
-Drives SGLang multimodal-gen's RL API. **Rollout is fully upstreamed** in
-v0.5.12.post1: the diffusion HTTP server already exposes ``POST /rollout/generate``
-(returning the DiT trajectory, per-step log-probs and frozen conditions) — no
-patch needed there. **Weight update is the one gap**: upstream only ships disk
-reload; the fast in-memory CUDA-IPC path (``/update_weights_from_tensor``,
-``/set_lora_from_tensor``) is added to the diffusion scheduler by a focused Relax
-patch (design doc §10 / §9). This engine drives both so ``RolloutManager``
-creates it like the text ``SGLangEngine``.
+Drives model-specific contracts behind ``POST /rollout/generate``. The legacy
+Qwen route requires Relax's pinned diffusion patch. SenseNova I2I uses the
+v0.5.21 rollout protocol, including sparse pixel trajectories. Weight updates
+use the existing tensor transport and engine-local version bookkeeping.
+``RolloutManager`` creates this engine like the text ``SGLangEngine``.
 
 The server always runs as a framework-managed ``multiprocessing.Process``
 executing SGLang's own diffusion ``launch_server`` (mirroring the text
@@ -43,7 +40,7 @@ __all__ = ["SGLangNativeGenerationEngine"]
 # timeout has to outlast a full multi-step rollout batch.
 _HEALTH_TIMEOUT_S = 1800.0
 _REQUEST_TIMEOUT_S = 3600.0
-_SGLANG_DIFFUSION_PATCH_PATH = "docker/patch/sglang/v0.5.15.post1.patch"
+_SGLANG_DIFFUSION_PATCH_PATH = "docker/patch/sglang/v0.5.21.patch"
 _REQUIRED_DIFFUSION_SAMPLING_FIELDS = frozenset(
     {
         "initial_noise_group_ids",
@@ -56,10 +53,29 @@ _REQUIRED_DIFFUSION_SAMPLING_FIELDS = frozenset(
 )
 
 
-def _verify_diffusion_patch_contract() -> None:
-    """Fail fast when the pinned SGLang tree is missing Relax's static
-    patch."""
+def _verify_diffusion_patch_contract(pipeline_config=None) -> None:
+    """Check the model-specific rollout contract before creating workers."""
     import inspect
+
+    if pipeline_config is not None and type(pipeline_config).__name__ == "SenseNovaU1PipelineConfig":
+        from sglang.multimodal_gen.configs.sample.sensenova_u1 import SenseNovaU1SamplingParams
+        from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import NEOChatModel
+        from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import SenseNovaU1Pipeline
+
+        if "rollout_options" not in {field.name for field in fields(SenseNovaU1SamplingParams)}:
+            raise RuntimeError("SenseNova sampling parameters lack the rollout protocol")
+        if not callable(getattr(SenseNovaU1Pipeline, "set_lora_from_tensors", None)) or (
+            "replay_conditions" not in inspect.getsource(NEOChatModel.prepare_it2i_conditioning)
+        ):
+            raise RuntimeError(
+                "SenseNova lacks online LoRA or canonical replay conditions. Apply the integrated "
+                f"{_SGLANG_DIFFUSION_PATCH_PATH} to the pinned SGLang source before launching RL."
+            )
+        from sglang.multimodal_gen.runtime.models.sensenova_u1.weights import validate_dense_bucket
+
+        if not callable(validate_dense_bucket):
+            raise RuntimeError("SenseNova lacks strict dense weight-bucket validation")
+        return
 
     try:
         import sglang.multimodal_gen.configs.pipeline_configs.qwen_image as qwen_image
@@ -159,8 +175,6 @@ def _launch_diffusion_server(server_args_dict: Dict[str, Any], cuda_visible_devi
     # Static patch contract check: a miss raises, this process dies, and
     # ``_wait_healthy`` reports "server exited early" instead of the job quietly
     # training on a stock rollout.
-    _verify_diffusion_patch_contract()
-
     from sglang.multimodal_gen.runtime.launch_server import launch_server
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -172,6 +186,13 @@ def _launch_diffusion_server(server_args_dict: Dict[str, Any], cuda_visible_devi
     server_args = (
         ServerArgs.from_dict(server_args_dict) if hasattr(ServerArgs, "from_dict") else ServerArgs(**server_args_dict)
     )
+    if type(server_args.pipeline_config).__name__ == "SenseNovaU1PipelineConfig":
+        from sglang.multimodal_gen.configs.task_type import ModelTaskType
+
+        if server_args.num_gpus != 1:
+            raise ValueError("SenseNova RL rollout requires one GPU per engine; shard candidates across replicas")
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+    _verify_diffusion_patch_contract(server_args.pipeline_config)
     try:
         launch_server(server_args)
     finally:
@@ -229,6 +250,10 @@ def _deserialize(obj: Any) -> Any:
     producing something else.
     """
     if isinstance(obj, dict):
+        if "__art_mask_bitpack__" in obj:
+            from sglang.multimodal_gen.runtime.entrypoints.post_training.mask_codec import decode_mask
+
+            return decode_mask(obj)
         if obj.get("__tensor__"):
             if isinstance(obj.get("data"), str):
                 return _local_maybe_deserialize(obj)
@@ -300,6 +325,17 @@ class SGLangNativeGenerationEngine(RayActor):
         ``nccl_port`` is consumed, by ``_compute_server_args``.
         """
         self._url = self._launch_server(host, port, engine_args)
+        self._wait_healthy(timeout=_HEALTH_TIMEOUT_S)
+        return {"rank": self.rank, "url": self._url, "active_version": self._active_version}
+
+    def attach_server(self, url: str) -> Dict[str, Any]:
+        """Connect a standalone validation client without creating a Ray
+        cluster."""
+        if self.process is not None:
+            raise RuntimeError("Cannot attach an external server while owning a managed server process")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise ValueError("url must be an HTTP(S) server URL")
+        self._url = url.rstrip("/")
         self._wait_healthy(timeout=_HEALTH_TIMEOUT_S)
         return {"rank": self.rank, "url": self._url, "active_version": self._active_version}
 
@@ -420,6 +456,16 @@ class SGLangNativeGenerationEngine(RayActor):
             "host": host,
             "port": port,
             "num_gpus": num_gpus,
+            # Keep the two frozen encoders off the card during the denoising loop.
+            # The text encoder runs once before it and the VAE once after, so both
+            # sit idle for the whole 12-step loop while still holding their weights.
+            # SGLang defaults both to False; overriding them here (and not in the
+            # launch script) keeps every diffusion rollout on the cheap path.
+            # These flags affect rollout residency, not the training peak when
+            # --offload-rollout already evicts the engine.
+            # Overridable: the sglang_overrides merge below runs after this dict.
+            "text_encoder_cpu_offload": True,
+            "vae_cpu_offload": True,
         }
         # Distinct torch-distributed master port per engine. The diffusion launcher
         # defaults master_port to a fixed value, so N single-GPU servers on one node
@@ -543,17 +589,118 @@ class SGLangNativeGenerationEngine(RayActor):
 
     # -- generation -----------------------------------------------------------
 
-    def generate_batch(self, requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def generate_batch(self, requests: List[Dict[str, Any]], *, max_batch_size: int = 1) -> List[Dict[str, Any]]:
         """POST each RolloutRequest to /rollout/generate; return mapped
         trajectories.
 
         ``requests`` are ``RolloutRequest``-shaped dicts built by the model
-        adapter's ``build_rollout_request``. SGLang has no cross-request
-        dynamic batching for every diffusion pipeline, so requests are issued
-        sequentially (design doc §9) and the caller shards across engines. The
-        result is one trajectory per request, in request order.
+        adapter's ``build_rollout_request``. Compatible SenseNova candidates
+        share one explicit batch up to ``max_batch_size``; other requests run
+        sequentially. The caller shards groups across engines. Results contain
+        one trajectory per candidate in the original request order.
         """
-        return [self._map_responses(self._post("/rollout/generate", req), req) for req in requests]
+        from relax.backends.sglang.sensenova_rollout import (
+            can_batch_sensenova_requests,
+            is_sensenova_rollout_request,
+            pack_sensenova_rollout_requests,
+        )
+
+        if type(max_batch_size) is not int or max_batch_size < 1:
+            raise ValueError("max_batch_size must be a positive integer")
+        outputs = []
+        index = 0
+        while index < len(requests):
+            group = [requests[index]]
+            while (
+                len(group) < max_batch_size
+                and index + len(group) < len(requests)
+                and can_batch_sensenova_requests(group[0], requests[index + len(group)])
+            ):
+                group.append(requests[index + len(group)])
+            if len(group) == 1:
+                wire_request = (
+                    pack_sensenova_rollout_requests(group) if is_sensenova_rollout_request(group[0]) else group[0]
+                )
+                outputs.append(self._map_responses(self._post("/rollout/generate", wire_request), group[0]))
+            else:
+                packed = pack_sensenova_rollout_requests(group)
+                response = self._post("/rollout/generate", packed)
+                if not isinstance(response, list) or len(response) != len(group):
+                    raise RuntimeError("Batched rollout returned the wrong number of candidates")
+                for entry, request in zip(response, group):
+                    mapped = self._map_response(entry, request)
+                    if mapped["rollout_metadata"].get("actual_batch_size") != len(group):
+                        raise RuntimeError("Server did not execute the declared native rollout batch")
+                    outputs.append(mapped)
+            index += len(group)
+        return outputs
+
+    def generate_art_batch_transport(self, requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return ART training trajectories as lossless Ray tensor buffers."""
+        from relax.utils.art_tensor_transport import pack
+
+        for request in requests:
+            options = (request.get("extra_sampling_params") or {}).get("rollout_options") or {}
+            if (
+                options.get("capture") != "ode_states"
+                or not request.get("rollout_return_dit_trajectory")
+                or not request.get("rollout_return_denoising_env")
+            ):
+                raise ValueError("ART tensor transport requires full ODE training trajectories")
+        return pack(self.generate_batch(requests))
+
+    def generate_art_lookahead(
+        self, requests: List[Dict[str, Any]], *, next_requests: Optional[List[Dict[str, Any]]] = None
+    ) -> List[Dict[str, Any]]:
+        """Overlap one next ART generation with current response transfer."""
+        import requests as http
+
+        from relax.backends.sglang.art_http_lookahead import HeaderLookahead
+        from relax.backends.sglang.sensenova_rollout import pack_sensenova_rollout_requests
+        from relax.utils.art_tensor_transport import pack
+
+        if len(requests) != 1 or (next_requests is not None and len(next_requests) != 1):
+            raise ValueError("ART lookahead requires exactly one candidate per engine")
+        for request in requests + (next_requests or []):
+            options = (request.get("extra_sampling_params") or {}).get("rollout_options") or {}
+            if (
+                options.get("capture") != "ode_states"
+                or not request.get("rollout_return_dit_trajectory")
+                or not request.get("rollout_return_denoising_env")
+            ):
+                raise ValueError("ART lookahead only supports ART ode_states")
+        if self._url is None:
+            raise RuntimeError("Engine URL is not initialized")
+        cache = getattr(self, "_art_header_lookahead", None)
+        if cache is None:
+            cache = HeaderLookahead(
+                lambda body: http.post(
+                    f"{self._url}/rollout/generate", json=body, timeout=_REQUEST_TIMEOUT_S, stream=True
+                )
+            )
+            self._art_header_lookahead = cache
+        body = pack_sensenova_rollout_requests(requests)
+        next_body = pack_sensenova_rollout_requests(next_requests) if next_requests is not None else None
+        policy = [self._active_version, self._active_weight_manifest_sha256]
+
+        def decode(response):
+            content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if content_type == "application/msgpack":
+                import msgspec
+
+                decoded = msgspec.msgpack.decode(response.content)
+            else:
+                decoded = response.json()
+            return pack([self._map_responses(decoded, requests[0])])
+
+        return cache.consume(body, next_body, policy, decode)
+
+    def clear_art_lookahead(self) -> Dict[str, bool]:
+        cache = getattr(self, "_art_header_lookahead", None)
+        self._art_header_lookahead = None
+        if cache is not None:
+            cache.close()
+        return {"success": True}
 
     def _map_responses(self, resp: Any, request: Mapping[str, Any]) -> Dict[str, Any]:
         """Map the single RolloutResponse in a server reply to an adapter
@@ -581,6 +728,17 @@ class SGLangNativeGenerationEngine(RayActor):
         """Map one (base64-decoded) RolloutResponse to the adapter sidecar
         dict."""
         resp = _deserialize(dict(resp))
+        from relax.backends.sglang.sensenova_rollout import (
+            is_sensenova_rollout_request,
+            validate_sensenova_rollout_response,
+        )
+
+        if is_sensenova_rollout_request(request):
+            out = validate_sensenova_rollout_response(resp, request)
+            # Like other diffusion models, these are local synchronization records.
+            out["policy_version"] = self._active_version
+            out["weight_manifest_sha256"] = self._active_weight_manifest_sha256
+            return out
         dit = resp.get("dit_trajectory") or {}
         rollout_log_probs = resp.get("rollout_log_probs")
         if isinstance(rollout_log_probs, Mapping):
@@ -594,8 +752,17 @@ class SGLangNativeGenerationEngine(RayActor):
             "weight_manifest_sha256": self._active_weight_manifest_sha256,
             "trajectory_latents": dit.get("latents"),  # [T+1, ...] (per-sample)
             "timesteps": dit.get("timesteps"),  # [T]
+            "sigmas": dit.get("sigmas"),  # [T+1], including terminal sigma
+            "transition_noise": dit.get("noise") if dit.get("noise") is not None else resp.get("transition_noise"),
+            "model_outputs": (
+                dit.get("model_outputs") if dit.get("model_outputs") is not None else resp.get("model_outputs")
+            ),
             "rollout_log_probs": rollout_log_probs,
             "denoising_env": resp.get("denoising_env"),
+            "valid_mask": resp.get("valid_mask", True),
+            "step_valid_mask": resp.get("step_valid_mask"),
+            "condition_fingerprint": resp.get("condition_fingerprint"),
+            "scheduler_fingerprint": resp.get("scheduler_fingerprint"),
             # Only populated when the request sets SGLang's ``rollout_debug_mode``;
             # this passthrough is what makes the dance step's debug branch reach
             # the driver at all.
@@ -620,12 +787,9 @@ class SGLangNativeGenerationEngine(RayActor):
 
     # -- weight update --------------------------------------------------------
     #
-    # Colocate hot path: in-memory tensor transport (CUDA IPC), mirroring SGLang
-    # text `srt`'s update_weights_from_tensor. The endpoint is NOT in SGLang's
-    # diffusion scheduler upstream (multimodal_gen only upstreams disk update) —
-    # it is added by the focused Relax patch (design doc §10; see
-    # examples/diffusion/readme.md). The NCCL-broadcast variant the text/Megatron
-    # path uses has no diffusion caller and is deliberately not exposed here.
+    # Colocate hot path: CUDA IPC transport from the legacy Relax patch or
+    # upstream v0.5.21. Module selection is supplied by the model adapter.
+    # The text/Megatron NCCL-broadcast path has no diffusion caller here.
 
     def update_weights_from_tensor(
         self, serialized_named_tensors: Any, flush_cache: bool = False, target_modules: Optional[List[str]] = None
@@ -654,7 +818,7 @@ class SGLangNativeGenerationEngine(RayActor):
         """Install a freshly-trained LoRA adapter from in-memory tensors.
 
         Requires the combined SGLang patch at
-        ``docker/patch/sglang/v0.5.15.post1.patch``. Stock SGLang's
+        ``docker/patch/sglang/v0.5.21.patch``. Stock SGLang's
         ``/v1/set_lora`` only reads a *file path*, and it short-circuits when the
         path is unchanged (``loaded_adapter_paths[nickname] != path``), so
         rewriting the same directory every step is a complete no-op after step 1.
@@ -690,6 +854,7 @@ class SGLangNativeGenerationEngine(RayActor):
     def commit_weight_version(self, version: int, weight_manifest_sha256: str) -> Dict[str, Any]:
         """Record the active policy version after a successful weight
         update."""
+        self.clear_art_lookahead()
         digest = str(weight_manifest_sha256)
         try:
             valid = len(digest) == 64 and int(digest, 16) >= 0
@@ -808,6 +973,8 @@ class SGLangNativeGenerationEngine(RayActor):
         (the actor owns the engine while streaming), so this is bookkeeping
         only.
         """
+        if updating:
+            self.clear_art_lookahead()
         self._weight_updating = bool(updating)
         return {"success": True, "weight_updating": self._weight_updating}
 
@@ -838,7 +1005,10 @@ class SGLangNativeGenerationEngine(RayActor):
         self._unsupported("check_weights")
 
     def shutdown(self) -> None:
-        self._kill_server()
+        try:
+            self.clear_art_lookahead()
+        finally:
+            self._kill_server()
 
     def __del__(self):  # best-effort reap if Serve tears the actor down abruptly
         try:
@@ -887,6 +1057,13 @@ class SGLangNativeGenerationEngine(RayActor):
     # -- http -----------------------------------------------------------------
 
     def _post(self, path: str, body: Mapping[str, Any]) -> Any:
+        if path in (
+            "/update_weights_from_tensor",
+            "/set_lora_from_tensor",
+            "/release_memory_occupation",
+            "/resume_memory_occupation",
+        ):
+            self.clear_art_lookahead()
         import requests
 
         if self._url is None:

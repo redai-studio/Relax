@@ -733,3 +733,6 @@ actor 在 rank 0 的进程内初始化 tracking adapter，所以常规的 `--use
 
 - [架构设计](./architecture.md) —— 生成式路径接入的 controller / service / component 模型
 - [OOM 排查](./oom-troubleshooting.md) —— 通用的显存压力排查手册
+
+
+基于已合入 SFT 模型实现的 [SenseNova ART 图像编辑 RL](./diffusion-art.md)。

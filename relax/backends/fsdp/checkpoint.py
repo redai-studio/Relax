@@ -126,18 +126,30 @@ def _rng_paths(ckpt_dir: str) -> List[str]:
     return [os.path.join(ckpt_dir, f"rng_rank{rank}.pt") for rank in range(world)]
 
 
-def _load_rng(ckpt_dir: str) -> None:
-    """Restore this rank's RNG state if present (best-effort).
+def _load_rng(ckpt_dir: str, *, strict: bool = False) -> None:
+    """Restore this rank's RNG state; strict callers reject incomplete state.
 
     Skips silently when the file is absent (older checkpoint, or a resume with
-    a different world size than the save) so resume never hard-fails on RNG.
+    a different world size than the save) for legacy best-effort callers only.
     """
     path = os.path.join(ckpt_dir, f"rng_rank{_rank()}.pt")
     if not os.path.exists(path):
+        if strict:
+            raise FileNotFoundError(f"Required RNG state is missing: {path}")
         logger.warning(f"No RNG state for rank {_rank()} at {path}; resume RNG not restored.")
         return
     try:
-        state = torch.load(path, map_location="cpu")
+        # Locally produced RNG checkpoints include Python/NumPy state, not just
+        # tensors. Torch >=2.6's weights-only default cannot restore that state.
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if strict and not {"torch", "python", "numpy", "cuda"} <= set(state):
+            raise ValueError("Required RNG state is incomplete.")
+        if (
+            strict
+            and torch.cuda.is_available()
+            and (state["cuda"] is None or len(state["cuda"]) != torch.cuda.device_count())
+        ):
+            raise ValueError("Required CUDA RNG states disagree with the current visible device count.")
         torch.set_rng_state(state["torch"])
         if state.get("cuda") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda"])
@@ -150,6 +162,8 @@ def _load_rng(ckpt_dir: str) -> None:
 
             _np.random.set_state(state["numpy"])
     except Exception as e:
+        if strict:
+            raise
         logger.warning(f"RNG state restore skipped: {e}")
 
 
@@ -420,6 +434,7 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer],
     *,
     adapter_only: bool = False,
+    require_rng_state: bool = False,
 ) -> Dict[str, Any]:
     """Restore model/optimizer from a committed checkpoint; return
     trainer_state.
@@ -433,6 +448,22 @@ def load_checkpoint(
     after a run has accumulated apparently-successful checkpoints.
     """
     ckpt_dir = os.path.join(_task_root(save_dir, task), iter_dir_name(iteration))
+    trainer_state = None
+    if require_rng_state:
+        preflight_error = None
+        try:
+            if not _is_committed(ckpt_dir):
+                raise FileNotFoundError(f"Required checkpoint is not committed: {ckpt_dir}")
+            if not os.path.isfile(os.path.join(ckpt_dir, f"rng_rank{_rank()}.pt")):
+                raise FileNotFoundError("Required per-rank checkpoint RNG file is missing.")
+            with open(os.path.join(ckpt_dir, "trainer_state.json"), encoding="utf-8") as f:
+                trainer_state = json.load(f)
+        except Exception as exc:
+            preflight_error = exc
+        if not _all_ranks_ok(0 if preflight_error is not None else 1):
+            raise RuntimeError(
+                "Required checkpoint metadata/RNG preflight failed on at least one rank."
+            ) from preflight_error
     if not _is_committed(ckpt_dir):
         raise FileNotFoundError(f"Refusing to resume from uncommitted checkpoint: {ckpt_dir}")
     fsdp_dir = os.path.join(ckpt_dir, "fsdp")
@@ -471,8 +502,19 @@ def load_checkpoint(
     )
 
     # Restore this rank's RNG state (best-effort) for deterministic resume.
-    _load_rng(ckpt_dir)
+    if require_rng_state:
+        rng_error = None
+        try:
+            _load_rng(ckpt_dir, strict=True)
+        except Exception as exc:
+            rng_error = exc
+        if not _all_ranks_ok(0 if rng_error is not None else 1):
+            raise RuntimeError("Required checkpoint RNG restore failed on at least one rank.") from rng_error
+    else:
+        _load_rng(ckpt_dir)
 
+    if trainer_state is not None:
+        return trainer_state
     with open(os.path.join(ckpt_dir, "trainer_state.json"), encoding="utf-8") as f:
         return json.load(f)
 

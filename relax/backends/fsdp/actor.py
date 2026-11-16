@@ -386,6 +386,7 @@ class FSDPTrainRayActor(TrainRayActor):
             cpu_offload=args.fsdp_cpu_offload,
             activation_checkpointing=getattr(args, "fsdp_activation_checkpointing", False),
             master_dtype=getattr(args, "fsdp_master_dtype", None),
+            cast_root_forward_inputs=is_i2i_sft(args) or self._sampling_cfg().get("algorithm", "grpo") != "art",
         )
         if self._trainable_mode == "lora" and not is_i2i_sft(args):
             from relax.backends.fsdp.lora import build_lora_sync_plan
@@ -403,6 +404,7 @@ class FSDPTrainRayActor(TrainRayActor):
         self._lr_steps = 0
         self._base_lr = float(args.lr)
         self.policy_version = 0
+        self._active_weight_manifest_sha256 = ""
         # Observability counters surfaced as train/* series (a rolled-back or
         # retried weight sync must be correlatable with a reward regression).
         self._checkpoint_failures = 0
@@ -565,6 +567,9 @@ class FSDPTrainRayActor(TrainRayActor):
             return [str(t) for t in explicit]
         default = getattr(self.adapter, "lora_target_modules", None)
         if default:
+            resolver = getattr(self.adapter, "resolve_lora_target_modules", None)
+            if callable(resolver):
+                return [str(t) for t in resolver(self.model)]
             return [str(t) for t in default]
         raise ValueError(
             f"fsdp_trainable_mode='lora' needs target modules: pass --lora-target-modules, or give "
@@ -594,6 +599,10 @@ class FSDPTrainRayActor(TrainRayActor):
                     f"fsdp_trainable_mode='lora' requires a frozen base; trainable non-adapter params: "
                     f"{trainable_base[:5]}..."
                 )
+            return
+        validate_boundary = getattr(self.adapter, "validate_full_trainable_boundary", None)
+        if callable(validate_boundary):
+            validate_boundary(self.model)
             return
         frozen_trainable = [n for n, p in self.model.named_parameters() if not p.requires_grad]
         if frozen_trainable:
@@ -686,12 +695,73 @@ class FSDPTrainRayActor(TrainRayActor):
         the adapter's ``replay_transition`` into a GPU->CPU sync, which
         CLAUDE.md forbids in hot paths.
         """
-        host_only = ("sde_indices", "image_grid")
+        host_only = (
+            "sde_indices",
+            "art_step_indices",
+            "image_grid",
+            "policy_versions",
+            "weight_manifest_sha256",
+            "sampling_fingerprint",
+            "condition_fingerprint",
+            "scheduler_fingerprint",
+        )
+        if "art_update_index" in mb:
+            # ART endpoints are used for CPU covariance before replay, not by
+            # the model. Preserve the cache field without another GPU copy.
+            host_only = (*host_only, "terminal_state")
+        source = mb["art_load"]() if "art_load" in mb else mb["batch"]
         batch = {
             k: (v if k in host_only else (v.to(self.device) if isinstance(v, torch.Tensor) else v))
-            for k, v in mb["batch"].items()
+            for k, v in source.items()
         }
         return batch, mb["advantages"].to(self.device)
+
+    def _validate_trajectory_provenance(self, micro_batches, rollout_id: int) -> None:
+        """Reject stale/mixed behavior-policy data before the first forward."""
+        expected_digest = self._active_weight_manifest_sha256
+        for index, mb in enumerate(micro_batches):
+            batch = mb.get("batch") or {}
+            missing = [
+                key
+                for key in ("policy_versions", "weight_manifest_sha256", "sampling_fingerprint", "valid_masks")
+                if key not in batch
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"[rollout {rollout_id}] trajectory micro-batch {index} is missing provenance {missing}."
+                )
+            versions = batch["policy_versions"].reshape(-1).long()
+            if versions.numel() == 0 or not torch.all(versions == int(self.policy_version)):
+                raise RuntimeError(
+                    f"[rollout {rollout_id}] stale/mixed policy version in micro-batch {index}: "
+                    f"got {versions.tolist()}, expected {self.policy_version}."
+                )
+            digests = batch["weight_manifest_sha256"]
+            if digests.ndim == 1:
+                digests = digests.unsqueeze(0)
+            if digests.shape[-1] != 32:
+                raise RuntimeError(
+                    f"[rollout {rollout_id}] invalid weight manifest digest shape {tuple(digests.shape)}."
+                )
+            if not torch.equal(digests, digests[0].unsqueeze(0).expand_as(digests)):
+                raise RuntimeError(f"[rollout {rollout_id}] mixed weight manifest digests in micro-batch {index}.")
+            actual_digest = bytes(digests[0].tolist()).hex()
+            if expected_digest and actual_digest != expected_digest:
+                raise RuntimeError(
+                    f"[rollout {rollout_id}] weight manifest mismatch in micro-batch {index}: "
+                    f"got {actual_digest}, expected {expected_digest}."
+                )
+            sampling_fingerprint = batch["sampling_fingerprint"].reshape(-1)
+            if sampling_fingerprint.numel() != 32:
+                raise RuntimeError(
+                    f"[rollout {rollout_id}] invalid sampling fingerprint shape "
+                    f"{tuple(batch['sampling_fingerprint'].shape)}."
+                )
+            for field_name in ("condition_fingerprint", "scheduler_fingerprint"):
+                if field_name in batch and batch[field_name].reshape(-1).numel() != 32:
+                    raise RuntimeError(
+                        f"[rollout {rollout_id}] invalid {field_name} shape {tuple(batch[field_name].shape)}."
+                    )
 
     def _freeze_anchor(self, batch, mb, eta: float, sigma_max: float, sde_type: str) -> torch.Tensor:
         """Frozen pi_old log-prob for one micro-batch."""
@@ -811,6 +881,8 @@ class FSDPTrainRayActor(TrainRayActor):
         """
         if is_i2i_sft(self.args):
             return self.sft.train(rollout_id)
+        if self._sampling_cfg().get("algorithm") == "art":
+            return self._train_art(rollout_id, rollout_data_ref)
         from relax.utils.timer import Timer, timer
 
         # Bracket the whole step so log_perf_data_raw emits perf/step_time
@@ -1006,6 +1078,166 @@ class FSDPTrainRayActor(TrainRayActor):
         # Emit train/* + perf/*_time metrics (after the sync so weight_sync_time is
         # captured). log_perf_data_raw reads + resets the Timer.
         self._log_train_metrics(rollout_id, agg, skips, len(micro_batches))
+
+    def _train_art(self, rollout_id: int, rollout_data_ref=None) -> None:
+        """Two explicit cached-ODE windows, followed by ONE live-policy
+        publish.
+
+        CPU loading/provenance/H2D failures are agreed before a model forward.
+        Any partial-window failure poisons this actor: retry must restore the
+        last committed rollout, never repeat window zero on mutated weights.
+        """
+        from relax.backends.fsdp.art import art_replay_update
+        from relax.utils.timer import Timer, timer
+
+        if getattr(self, "_art_failed", False):
+            raise RuntimeError(
+                "ART actor has a failed acquisition; restore the last committed checkpoint before retry."
+            )
+        if getattr(self, "_resume_initial_sync_pending", False) and not getattr(self.args, "debug_train_only", False):
+            raise RuntimeError("ART resume must publish the restored live policy before acquiring new data.")
+        if "train_wait" in Timer().start_time:
+            Timer().end("train_wait")
+        Timer().start("train")
+        batches, windows = [], []
+        self._trained_samples = self._trained_transitions = 0
+        self._ratio_max_local, self._ratio_min_local = float("-inf"), float("inf")
+        agg = {
+            key: []
+            for key in (
+                "loss",
+                "policy_loss",
+                "reference_kl",
+                "kl_loss",
+                "ratio_mean",
+                "ratio_std",
+                "clip_fraction",
+                "approx_kl",
+                "grad_norm",
+                "adv_mean",
+                "adv_std",
+                "art_kept_fraction",
+                "art_masked_fraction",
+            )
+        }
+        try:
+            batches = self._load_train_batches(rollout_id, rollout_data_ref)
+            self._assert_microbatch_count_aligned(len(batches), rollout_id)
+            local_error = None
+            try:
+                self._validate_trajectory_provenance(batches, rollout_id)
+                windows = [[mb for mb in batches if mb["art_update_index"] == update] for update in range(2)]
+                if not batches or not windows[0] or len(windows[0]) != len(windows[1]):
+                    raise ValueError("ART requires two nonempty equal windows.")
+                descriptors = {
+                    (
+                        mb["art_global_item_count"],
+                        mb["art_dp_world"],
+                        len(mb["step_indices"]),
+                        mb["skip_optimizer_step"],
+                    )
+                    for mb in batches
+                }
+                if len(descriptors) != 1 or len(windows[0]) * 2 != len(batches):
+                    raise ValueError("ART windows disagree on global denominator, skip flag or selected-time count.")
+                item_count, world, times, skip = descriptors.pop()
+                if item_count != len(windows[0]) * world * times:
+                    raise ValueError("ART original global item denominator disagrees with the routed windows.")
+            except Exception as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+            errors = _collect_weight_sync_errors(local_error)
+            if errors:
+                raise RuntimeError(f"ART window validation failed: {errors}")
+            geometry = (len(windows[0]), item_count, world, times, skip)
+            if any(value != geometry for value in _collect_rank_objects(geometry)):
+                raise RuntimeError("ART ranks disagree on window geometry or global zero signal.")
+            self._art_unchanged_policy = bool(skip)
+            with timer("actor_train"):
+                if not skip:
+                    wake_error = None
+                    try:
+                        if getattr(self.args, "offload_train", False):
+                            self.wake_up(include_optimizer=True)
+                        self.model.train()
+                    except Exception as exc:
+                        wake_error = f"{type(exc).__name__}: {exc}"
+                    errors = _collect_weight_sync_errors(wake_error)
+                    if errors:
+                        raise RuntimeError(f"ART model onload failed: {errors}")
+                    for update, window in enumerate(windows):
+                        self.optimizer.zero_grad(set_to_none=True)
+                        totals = torch.zeros(3, device=self.device)
+                        for mb in window:
+                            prepare_error, batch = None, None
+                            try:
+                                batch, _unused_advantages = self._prepare_micro_batch(mb)
+                            except Exception as exc:
+                                prepare_error = f"{type(exc).__name__}: {exc}"
+                            errors = _collect_weight_sync_errors(prepare_error)
+                            if errors:
+                                raise RuntimeError(f"ART candidate preparation failed before forward: {errors}")
+                            result = art_replay_update(
+                                self.model,
+                                self.adapter,
+                                batch,
+                                global_item_count=item_count,
+                                data_parallel_world_size=world,
+                            )
+                            totals += torch.stack(
+                                [result[key].float() for key in ("loss_sum", "kept_items", "masked_items")]
+                            )
+                            self._trained_samples += 1
+                            self._trained_transitions += times
+                            del batch
+                        import torch.distributed as dist
+
+                        if dist.is_initialized() and dist.get_world_size(self._device_group()) > 1:
+                            dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=self._device_group())
+                        loss, kept, masked = (totals / item_count).tolist()
+                        norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), getattr(self.args, "clip_grad", 1.0), error_if_nonfinite=True
+                        )
+                        # Even a fully masked second window has zero grads, not
+                        # absent grads: AdamW momentum/decay must still advance.
+                        self._apply_lr()
+                        self.optimizer.step()
+                        self._lr_steps += 1
+                        agg["loss"].append(loss)
+                        agg["policy_loss"].append(loss)
+                        agg["grad_norm"].append(float(norm))
+                        agg["art_kept_fraction"].append(kept)
+                        agg["art_masked_fraction"].append(masked)
+                        if self._rank == 0:
+                            logger.info(
+                                f"[rollout {rollout_id} u{update}] ART loss={loss:.5f} kept={kept:.4f} masked={masked:.4f}"
+                            )
+                else:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    agg["loss"].append(0.0)
+                    if self._rank == 0:
+                        logger.info(f"[rollout {rollout_id}] ART global zero signal: no optimizer/LR/policy advance.")
+            # Drop this rank's guidance/leases before weight gather and DCP.
+            count = len(batches)
+            for window in windows:
+                window.clear()
+            mb = None
+            windows.clear()
+            batches.clear()
+            self._sync_save_and_release(rollout_id)
+            self._run_step_evaluation(rollout_id)
+            Timer().end("train")
+            Timer().start("train_wait")
+            self._log_train_metrics(rollout_id, agg, 2 if skip else 0, count)
+        except Exception:
+            self._art_failed = True
+            raise
+        finally:
+            for window in windows:
+                window.clear()
+            batches.clear()
+            if "train" in Timer().start_time:
+                Timer().end("train")
+                Timer().start("train_wait")
 
     def _run_step_evaluation(self, rollout_id: int) -> None:
         """Trigger the RolloutManager's held-out eval pass (rank 0, best-
@@ -1328,6 +1560,10 @@ class FSDPTrainRayActor(TrainRayActor):
             if train_time > 0:
                 metrics["perf/train_transitions_per_s"] = float(self._trained_transitions) / train_time
                 metrics["perf/train_samples_per_s"] = float(self._trained_samples) / train_time
+            if self._sampling_cfg().get("algorithm") == "art":
+                for key in ("art_kept_fraction", "art_masked_fraction"):
+                    if agg.get(key):
+                        metrics[f"train/{key}"] = sum(agg[key]) / len(agg[key])
             logger.info(
                 f"[train {rollout_id}] "
                 + " ".join(f"{k.split('/', 1)[-1]}={v:.4f}" for k, v in metrics.items() if k != "rollout/step")
@@ -1360,6 +1596,12 @@ class FSDPTrainRayActor(TrainRayActor):
         if getattr(self.args, "debug_train_only", False):
             return False
 
+        previous_version = self.policy_version
+        republish = getattr(self, "_resume_initial_sync_pending", False) or getattr(
+            self, "_art_unchanged_policy", False
+        )
+        target_version = previous_version if republish else previous_version + 1
+
         def _mem(tag: str) -> None:
             a = torch.cuda.memory_allocated(self.device) / 1e9
             r = torch.cuda.memory_reserved(self.device) / 1e9
@@ -1390,20 +1632,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # (it may have been offloaded after the previous step's rollout). Params
         # only — the optimizer is not needed for the sync and is already on CPU
         # after the train loop's bracketed step.
-        if getattr(self.args, "offload_train", False):
-            self.wake_up(include_optimizer=False)
-            # Free any grads the just-finished optimizer.step materialized (the
-            # optimizer states are already CPU-resident): the weight sync only
-            # needs PARAMS on GPU (full_tensor gather → IPC). Keeping grads
-            # resident makes the actor + the engine transformer onload below
-            # co-exceed the card.
-            self.optimizer.zero_grad(set_to_none=True)
-            self._move_optimizer_state(torch.device("cpu"))
-            # Return the freed blocks to the driver so the engine transformer onload
-            # below has room (PyTorch caches freed memory; nvidia-smi otherwise still
-            # shows it held by this process, colliding with the engine on GPU).
-            self.clear_memory()
-            _mem("after wake_up + optimizer offload + empty_cache")
+        self._prepare_weight_sync_memory_state_and_agree(target_version)
         _lap("actor_onload")
         # Colocate memory time-share: the engine was offloaded to CPU after rollout
         # (offload_rollout). The full-FT actor + full engine do not co-fit, but the
@@ -1423,12 +1652,12 @@ class FSDPTrainRayActor(TrainRayActor):
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
-                self.policy_version + 1,
+                target_version,
                 "rollout-engine weights onload",
                 _collect_weight_sync_errors(onload_error),
             )
         _lap("engine_weights_onload")
-        self.policy_version += 1
+        self.policy_version = target_version
         manifest = self._build_manifest()
         self._last_sync_tensors = int(manifest.tensor_count)
         self._last_sync_bytes = int(manifest.total_bytes)
@@ -1444,7 +1673,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 # SAME version number — otherwise the actor's policy_version and the
                 # engines' committed version drift apart across a recovery (every
                 # rank bumped and every rank lands here, so the rollback is uniform).
-                self.policy_version -= 1
+                self.policy_version = previous_version
                 self._weight_sync_failures += 1
                 # With fault tolerance, rebuild the engines from the last committed
                 # disk checkpoint (RolloutManager.recover_rollout_engines) and let
@@ -1467,6 +1696,9 @@ class FSDPTrainRayActor(TrainRayActor):
                 finally:
                     self._invalidate_ipc_topology()
                 raise
+        self._active_weight_manifest_sha256 = manifest.sha256()
+        self._resume_initial_sync_pending = False
+        self._art_unchanged_policy = False
         _mem("after weight transaction")
         _lap("bucket_loop")
         if offload_after_sync:
@@ -1484,6 +1716,32 @@ class FSDPTrainRayActor(TrainRayActor):
                 f"({self._last_sync_tensors} tensors, {self._last_sync_bytes / 1e9:.1f}GB)"
             )
         return offload_engine
+
+    def _prepare_weight_sync_memory_state(self) -> None:
+        """Keep parameters resident but release training-only GPU memory.
+
+        Complete this before restoring the engine's weight modules: leftover
+        gradients or Adam states can make the two models exceed GPU capacity.
+        FSDP storage aliases and the optimizer's parameter objects stay intact.
+        """
+        if not getattr(self.args, "offload_train", False):
+            return
+        self.wake_up(include_optimizer=False)
+        self.optimizer.zero_grad(set_to_none=True)
+        self._move_optimizer_state(torch.device("cpu"))
+        self.clear_memory()
+
+    def _prepare_weight_sync_memory_state_and_agree(self, policy_version: int) -> None:
+        prepare_error = None
+        try:
+            self._prepare_weight_sync_memory_state()
+        except Exception as exc:
+            prepare_error = f"{type(exc).__name__}: {exc}"
+        _raise_weight_sync_errors(
+            policy_version,
+            "training-memory preparation",
+            _collect_weight_sync_errors(prepare_error),
+        )
 
     def _finish_weight_sync_memory_state(
         self, offload_engine: bool, phase_lap: Optional[Callable[[str], None]] = None
@@ -1533,6 +1791,9 @@ class FSDPTrainRayActor(TrainRayActor):
             # step-driven, so the step count must round-trip or a resumed run
             # restarts warmup from zero.
             "lr_scheduler_steps": int(self._lr_steps),
+            "reference_policy": str(getattr(self.args, "generative_reference_policy", "fixed")),
+            "generative_kl_type": str(getattr(self.args, "generative_kl_type", "v-based")),
+            "generative_kl_coef": float(getattr(self.args, "generative_kl_coef", 0.0) or 0.0),
         }
         ckpt.save_checkpoint(
             self.args.save,
@@ -1545,6 +1806,7 @@ class FSDPTrainRayActor(TrainRayActor):
             adapter_contract=self._adapter_contract(),
             adapter_only=(self._trainable_mode == "lora"),
             is_rank0=(int(os.environ.get("RANK", 0)) == 0),
+            require_rng_state=self._sampling_cfg().get("algorithm") == "art",
         )
 
         # Rotate only AFTER the new snapshot is committed. Failed/in-progress
@@ -1884,23 +2146,11 @@ class FSDPTrainRayActor(TrainRayActor):
             # until the engine has actually opened the handles -- that lifetime
             # requirement is why the global drain agreement exists, and it is
             # what makes this a hold-a-reference change rather than fire-and-forget.
-            #
-            # MEASURED: this alone did NOT move bucket_loop (70.4s vs 70.0/73.9/69.6s
-            # before). The transport was not the bottleneck. Hence the breakdown
-            # below -- `gather` is the 1933 per-parameter DTensor full_tensor()
-            # all-gathers the iterator drives, and at ~36ms each they are ~400x
-            # their own bandwidth cost, i.e. collective LATENCY, not payload. Keep
-            # this instrumentation until that is fixed (coalescing the per-tensor
-            # collectives), so the next attempt is measured rather than guessed.
-            import time as _time
-
-            t_gather = t_serialize = t_transport = 0.0
             pending: Optional[Tuple[Any, Any, Any]] = None
 
-            def _drain(p) -> Tuple[float, List[Tuple[int, str]]]:
+            def _drain(p) -> List[Tuple[int, str]]:
                 if p is None:
-                    return 0.0, _collect_weight_sync_errors(None)
-                t0 = _time.perf_counter()
+                    return _collect_weight_sync_errors(None)
                 ref, _named, _blob = p
                 local_error = None
                 if ref is not None:
@@ -1911,12 +2161,10 @@ class FSDPTrainRayActor(TrainRayActor):
                 # Global agreement replaces the old block-local barrier. It keeps
                 # every block's source tensors alive until all engine RPCs finish,
                 # and makes a failure on any engine src visible to every FSDP rank.
-                errors = _collect_weight_sync_errors(local_error)
-                return _time.perf_counter() - t0, errors
+                return _collect_weight_sync_errors(local_error)
 
             bucket_iter = iter(iterator)
             while True:
-                t0 = _time.perf_counter()
                 bucket = None
                 iterator_error = None
                 has_bucket = True
@@ -1927,14 +2175,12 @@ class FSDPTrainRayActor(TrainRayActor):
                 except Exception as exc:
                     iterator_error = f"{type(exc).__name__}: {exc}"
                 iterator_states = _collect_rank_objects((has_bucket, iterator_error))
-                t_gather += _time.perf_counter() - t0
                 iterator_errors = [
                     (rank, error) for rank, (_has_bucket, error) in enumerate(iterator_states) if error is not None
                 ]
                 has_bucket_states = {state[0] for state in iterator_states}
                 if iterator_errors or len(has_bucket_states) != 1:
-                    drain_time, drain_errors = _drain(pending)
-                    t_transport += drain_time
+                    drain_errors = _drain(pending)
                     pending = None
                     _raise_weight_sync_errors(version, "pending engine RPC", drain_errors)
                     if not iterator_errors:
@@ -1944,7 +2190,6 @@ class FSDPTrainRayActor(TrainRayActor):
                     break
                 assert bucket is not None
 
-                t0 = _time.perf_counter()
                 # CUDA-IPC requires the source tensors on GPU. Under --fsdp-cpu-offload
                 # the DTensor shards live on CPU and full_tensor() gathers to CPU, so
                 # move each bucket to this rank's device before serializing; it is a
@@ -1961,8 +2206,7 @@ class FSDPTrainRayActor(TrainRayActor):
                     local_error = f"{type(exc).__name__}: {exc}"
                 prepare_errors = _collect_weight_sync_errors(local_error)
                 if prepare_errors:
-                    drain_time, drain_errors = _drain(pending)
-                    t_transport += drain_time
+                    drain_errors = _drain(pending)
                     pending = None
                     _raise_weight_sync_errors(version, "pending engine RPC", drain_errors)
                     _raise_weight_sync_errors(version, "IPC tensor preparation/serialization", prepare_errors)
@@ -1971,9 +2215,6 @@ class FSDPTrainRayActor(TrainRayActor):
                 # would otherwise silently commit a partial weight set.
                 sent_count += len(named)
                 sent_bytes += sum(int(t.numel()) * t.element_size() for _, t in named)
-                t_serialize += _time.perf_counter() - t0
-
-                t0 = _time.perf_counter()
                 # Gather (block_offset, blob) so the src can order blobs by engine
                 # worker index regardless of the Gloo group's rank ordering: worker
                 # i needs the IPC handle for the tensor on physical GPU base+i.
@@ -1998,22 +2239,17 @@ class FSDPTrainRayActor(TrainRayActor):
                         launch_error = f"{type(exc).__name__}: {exc}"
                 current = (ref, named, blob)
                 launch_errors = _collect_weight_sync_errors(launch_error)
-                t_transport += _time.perf_counter() - t0
-                drain_time, drain_errors = _drain(pending)
-                t_transport += drain_time
+                drain_errors = _drain(pending)
                 pending = None
                 if launch_errors or drain_errors:
-                    current_time, current_errors = _drain(current)
-                    t_transport += current_time
+                    current_errors = _drain(current)
                     _raise_weight_sync_errors(version, "engine RPC launch", launch_errors)
                     _raise_weight_sync_errors(version, "pending engine RPC", drain_errors + current_errors)
                 pending = current
                 del named, blob, gathered
-            drain_time, drain_errors = _drain(pending)
-            t_transport += drain_time
+            drain_errors = _drain(pending)
             pending = None
             _raise_weight_sync_errors(version, "final engine RPC", drain_errors)
-            self._last_sync_breakdown = (t_gather, t_serialize, t_transport)
 
             # Validate the streamed snapshot against the manifest BEFORE committing —
             # every rank streams the identical full set, so every rank checks the
@@ -2310,6 +2546,8 @@ class FSDPTrainRayActor(TrainRayActor):
         ]
         if is_i2i_sft(self.args):
             data_fields = ["sample_id"]
+        elif self._sampling_cfg().get("algorithm") == "art":
+            data_fields.extend(["valid_masks", "art_rewards", "art_cache_bytes", "art_guidance_bytes"])
         deadline = time.time() + float(getattr(self.args, "rollout_request_timeout", 3600.0))
         while time.time() < deadline:
             meta = client.get_meta(
@@ -2347,7 +2585,7 @@ class FSDPTrainRayActor(TrainRayActor):
         )
 
     def _adapter_contract(self) -> Dict[str, Any]:
-        return {
+        contract = {
             "family": self.adapter.family,
             "tasks": list(self.adapter.supported_tasks),
             "trainable_mode": self._trainable_mode,
@@ -2355,6 +2593,42 @@ class FSDPTrainRayActor(TrainRayActor):
             "base_model_sha256": self._base_model_sha256,
             "lora": self._lora_contract(),
         }
+        if self._sampling_cfg().get("algorithm") == "art":
+            contract["reference"] = {"policy": "live", "ema": None, "kl_coef": 0.0}
+            fields = (
+                "seed",
+                "generation_seed",
+                "global_batch_size",
+                "n_samples_per_prompt",
+                "actor_num_nodes",
+                "actor_num_gpus_per_node",
+                "fsdp_param_dtype",
+                "fsdp_reduce_dtype",
+                "fsdp_master_dtype",
+                "lr",
+                "weight_decay",
+                "adam_beta1",
+                "adam_beta2",
+                "adam_eps",
+                "clip_grad",
+                "fsdp_lr_scheduler",
+                "lr_warmup_iters",
+                "lr_decay_iters",
+                "min_lr",
+                "reward_component_weights",
+                "reward_required_components",
+            )
+            contract["art"] = {
+                "version": 1,
+                "profile": "scalar-image-raw-velocity-linear-sigma-scheduler-mask",
+                "protocol_version": 5,
+                "window_rng": "cpu-global-seed-plus-1000003-rollout-v1",
+                "sampling": dict(self._sampling_cfg()),
+                "training": {key: getattr(self.args, key, None) for key in fields},
+                "targets": list(self.adapter.full_trainable_targets),
+                "resume_boundary": "complete-two-window-acquisition",
+            }
+        return contract
 
     def _assert_resumable(self, ckpt_dir: str) -> None:
         """Reject a checkpoint whose adapter contract disagrees with this run.
@@ -2369,6 +2643,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
         path = os.path.join(ckpt_dir, "adapter_contract.json")
         if not os.path.exists(path):
+            if self._sampling_cfg().get("algorithm", "grpo") == "art":
+                raise ValueError("ART resume requires the recorded algorithm adapter contract.")
             return  # pre-contract checkpoint; nothing to compare against
         with open(path, encoding="utf-8") as f:
             recorded = json.load(f)
@@ -2384,20 +2660,56 @@ class FSDPTrainRayActor(TrainRayActor):
             from relax.backends.fsdp.lora import contract_mismatches
 
             problems.extend(contract_mismatches(recorded.get("lora") or {}, self._lora_contract() or {}))
+        if self._art_resume_contract(recorded.get("art")) != self._art_resume_contract(
+            self._adapter_contract().get("art")
+        ):
+            problems.append("ART algorithm/sampling/optimizer/window contract differs from the checkpoint.")
         if problems:
             raise ValueError(
                 f"Refusing to resume {ckpt_dir}: adapter contract mismatch:\n  - " + "\n  - ".join(problems)
             )
+
+    @staticmethod
+    def _art_resume_contract(contract: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if contract is None:
+            return None
+        # These bounded scheduling choices change neither samples nor the
+        # complete-acquisition update. Keep every mathematical field strict and
+        # never mutate the checkpoint's recorded contract.
+        sampling = {
+            key: value
+            for key, value in contract.get("sampling", {}).items()
+            if key not in ("overlap_group_processing", "overlap_pending_groups", "generation_prefetch")
+        }
+        return {**contract, "sampling": sampling}
 
     def _maybe_resume(self) -> int:
         from relax.backends.fsdp import checkpoint as ckpt
 
         if not getattr(self.args, "load", None):
             return 0
-        latest = ckpt.find_latest_committed(self.args.load, self.args.generation_task)
+        is_art = self._sampling_cfg().get("algorithm") == "art"
+        if is_art:
+            read_error, latest = None, None
+            try:
+                latest = ckpt.find_latest_committed(self.args.load, self.args.generation_task)
+                if latest is not None:
+                    self._assert_resumable(
+                        os.path.join(self.args.load, self.args.generation_task, ckpt.iter_dir_name(latest))
+                    )
+            except Exception as exc:
+                read_error = f"{type(exc).__name__}: {exc}"
+            errors = _collect_weight_sync_errors(read_error)
+            if errors:
+                raise RuntimeError(f"ART resume contract validation failed: {errors}")
+            if any(value != latest for value in _collect_rank_objects(latest)):
+                raise RuntimeError("ART ranks disagree on the latest committed checkpoint.")
+        else:
+            latest = ckpt.find_latest_committed(self.args.load, self.args.generation_task)
         if latest is None:
             return 0
-        self._assert_resumable(os.path.join(self.args.load, self.args.generation_task, ckpt.iter_dir_name(latest)))
+        if not is_art:
+            self._assert_resumable(os.path.join(self.args.load, self.args.generation_task, ckpt.iter_dir_name(latest)))
         state = ckpt.load_checkpoint(
             self.args.load,
             self.args.generation_task,
@@ -2405,8 +2717,16 @@ class FSDPTrainRayActor(TrainRayActor):
             self.model,
             self.optimizer,
             adapter_only=(self._trainable_mode == "lora"),
+            require_rng_state=self._sampling_cfg().get("algorithm") == "art",
         )
         self.policy_version = int(state.get("policy_version", 0))
+        # A fresh rollout engine needs the saved sampling policy, not another
+        # optimizer version. Consume only after a successful initial publication.
+        self._resume_initial_sync_pending = self._sampling_cfg().get("algorithm", "grpo") == "art"
+        if self._sampling_cfg().get("algorithm") == "art":
+            if not {"rollout_id", "policy_version", "lr_scheduler_steps"} <= set(state):
+                raise ValueError("ART checkpoint is missing complete-rollout trainer counters.")
+            self._art_failed = False
         # Resume the LR schedule where it left off (warmup must not restart).
         self._lr_steps = int(state.get("lr_scheduler_steps", 0))
         logger.info(
