@@ -574,6 +574,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--response-only-lm-head",
+                action="store_true",
+                help="Megatron policy loss: project only response hidden states to vocabulary logits. "
+                "Preserves entropy metrics and loss recomputation; default off.",
+            )
+            parser.add_argument(
                 "--sft-logits-chunk-size",
                 type=int,
                 default=1024,
@@ -4783,6 +4789,29 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    if getattr(args, "response_only_lm_head", False):
+        assert args.train_backend == "megatron" and args.loss_type == "policy_loss", (
+            "--response-only-lm-head requires Megatron policy_loss."
+        )
+        assert args.advantage_estimator != "score_centering", (
+            "--response-only-lm-head does not support score_centering candidate scoring."
+        )
+        # Empty-response CP shards do not call the head. Overlapped gradient
+        # reduction expects its parameter hooks; deferred wgrad and combined
+        # 1F1B require scheduling that the loss callback does not provide.
+        for option in (
+            "overlap_grad_reduce",
+            "defer_embedding_wgrad_compute",
+            "overlap_moe_expert_parallel_comm",
+            "enable_mtp_training",
+            "opd_log_prob_top_k",
+            "fp8",
+            "fp4",
+        ):
+            assert not getattr(args, option, None), (
+                f"--response-only-lm-head does not support --{option.replace('_', '-')}."
+            )
+
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
