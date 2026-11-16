@@ -42,8 +42,7 @@ On an already provisioned, exclusively allocated Ray cluster, provide
 在已分配给本任务的 Ray 集群上设置上述目录和 Jobs HTTP 地址，然后从仓库根目录运行：
 
 ```bash
-bash scripts/entrypoint/ray-job.sh \
-  examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-nli-pt-8xgpu.sh
+bash examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-nli-pt-8xgpu.sh
 ```
 
 The script requests eight GPUs, TP=PP=CP=1 and a 512-**pair** global batch. The
@@ -68,14 +67,13 @@ The default experiment is `qwen2-vl-2b-nli-bridge-lora-kaiming-dp8`. Start this
 recipe in a new directory: historical precision-profile checkpoints used a
 different norm layout and optimizer/RNG settings and are not supported resume
 inputs for this recipe.
-ClearML project defaults to `Relax/sft/seq-contrast`; each launch has a new task
-name and local log, while the resume path stays fixed. Submission blocks unless
+Each launch writes a local log while the resume path stays fixed. Submission blocks unless
 `RAY_NO_WAIT` is explicitly nonempty.
 
 默认申请八卡，global batch 的单位是 **pair**，保存完整原生 checkpoint，每 200 步保存，
 保留两份。相同实验沿用稳定的 load/save 路径；新实验改 `EXP_NAME`。
 默认 1,078 步只对应 275,601 行数据的两个补齐 epoch，其他规模需显式改步数。
-ClearML 每次启动新任务，训练恢复由持久化 checkpoint 决定。
+每次启动单独记录本地日志，训练恢复由持久化 checkpoint 决定。
 
 ## Training contract and validation limits / 训练契约与验证边界
 
@@ -91,8 +89,8 @@ ClearML 每次启动新任务，训练恢复由持久化 checkpoint 决定。
   `1/DP` parameter-gradient scale through the shared Megatron loss wrapper.
 - Initial support is synchronous, DP-only, THD training. Model parallelism,
   dynamic CP, independent microbatch accumulation, periodic SFT eval/predict,
-  CPU prepack, and portable HF export are rejected. Native checkpoints remain
-  the supported resume artifacts.
+  CPU prepack, and in-training `--save-hf` are rejected. Resume from native
+  checkpoints and use the offline exporter below to hand off weights.
 - The example uses Bridge's existing **CanonicalLoRA** with seven independent
   Q/K/V, output, gate/up and down projection adapters, with the standard Bridge
   forward and Transformer Engine layer specification. HF norm weights map to
@@ -123,3 +121,78 @@ CPU 测试覆盖配对、共享训练/损失分派、Gloo 梯度、HF 视觉/位
 记录边界，不能替代 MCore GPU 验证。本次清理版未重新跑完整 GPU 训练/评测；
 历史对齐分数使用不同的数据顺序/RNG 设置，不代表本配置的成绩。多机训练与 GPU
 精确断点续训仍需验证。历史精度实验的 checkpoint 请保留在原目录，不用于本例续训。
+
+## Three-stage workflow / 三段交付流程
+
+### 1. Prepare Ret PT inputs / 准备 Ret PT 输入
+
+Use the original Qwen2-VL-2B-Instruct checkpoint as `BASE`, an NLI CSV with
+`sent0` and `sent1` columns as `NLI_CSV`, and the directories described above.
+
+```bash
+python examples/seq_contrast_sft/tools/prepare_nli.py \
+  --base "${BASE}" --input "${NLI_CSV}" \
+  --output-model "${MODEL_DIR}/Qwen2-VL-2B-Instruct-emb" \
+  --pairs "${DATA_DIR}/nli/pairs.jsonl"
+bash examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-nli-pt-8xgpu.sh
+```
+
+### 2. Train Ret SFT and mine candidates / 训练 Ret SFT 并挖候选
+
+Use the offline exporter described below to merge Ret PT into its input model.
+Point `PT_MODEL` at the merged HF directory. Prepare the M-BEIR training
+queries and candidate pool, then start Ret SFT using a new checkpoint directory.
+
+```bash
+python examples/seq_contrast_sft/tools/prepare_mbeir.py \
+  --queries "${TRAIN_QUERIES}" --candidates "${TRAIN_CANDIDATES}" \
+  --instructions "${INSTRUCTIONS}" --image-root "${IMAGE_ROOT}" \
+  --tokenizer "${PT_MODEL}" --output "${DATA_DIR}/mbeir/pairs.jsonl"
+MODEL_DIR="${PT_MODEL}" bash examples/seq_contrast_sft/scripts/run-qwen2-vl-2B-mbeir-sft-8xgpu.sh
+```
+
+The data loader shuffles queries and samples a positive and instruction at each
+visit. The launcher computes updates from the prepared query count and batch
+size. The default batch size is 512; 1,332,790 queries take 2,604 updates.
+Images are checked when read by the processor.
+
+After exporting Ret SFT with `PT_MODEL` as its base, set `RET_MODEL` to the
+merged output. Rank training takes the `rankings.json` produced by searching its
+training candidate pool with this Ret checkpoint.
+
+```bash
+python examples/seq_contrast_sft/tools/retrieve.py \
+  --model "${RET_MODEL}" --queries "${TRAIN_QUERIES}" \
+  --candidates "${TRAIN_CANDIDATES}" --instructions "${INSTRUCTIONS}" \
+  --image-root "${IMAGE_ROOT}" --top-k 100 --output "${TRAIN_RETRIEVAL}"
+```
+
+For a test split, supply its query file, candidate pool and `--qrels`, and use
+`--top-k 50`. This produces Ret Recall in `metrics.json` and the query IDs,
+candidate IDs, cosine scores and model identity used by Rank evaluation.
+
+### 3. Train and evaluate Rank SFT / 训练并评测 Rank SFT
+
+Use `${TRAIN_RETRIEVAL}/rankings.json` as `--rerank-data` in the
+[Rank SFT recipe](../lamra_rerank/README.md#prepare-training-data). This prepares
+the pointwise and listwise training JSONL before submission. Set its model
+directory explicitly. The recipe supports the merged Ret model as its base
+under the `Qwen2-VL-2B-Instruct` directory name. After training, export against
+the same Rank base and use the Ret test files above in the
+[rerank evaluation recipe](../lamra_rerank/README.md#evaluate-fixed-retrieval-candidates).
+
+### Offline export / 离线导出
+
+Use the same command for all three stages. `BASE_FOR_STAGE` is the exact HF
+checkpoint the stage loaded. Set `FINAL_CHECKPOINT` to the final
+`iter_*` directory and `UPDATES` to the number of optimizer updates.
+
+```bash
+python examples/lamra_rerank/tools/export_checkpoint.py \
+  --base "${BASE_FOR_STAGE}" --checkpoint "${FINAL_CHECKPOINT}" \
+  --expected-updates "${UPDATES}" --adapter-output "${ADAPTER_OUT}" --output "${MERGED_OUT}"
+```
+
+The exporter reads the saved LoRA tensors and verifies the FP32 merge and HF
+reload. Keep the native checkpoint for resume. Use the merged HF directory for
+the next stage or evaluation.

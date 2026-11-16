@@ -71,8 +71,8 @@ def main() -> None:
         raise ValueError("Checkpoint scheduler and optimizer update counts disagree")
     config = AutoConfig.from_pretrained(args.base)
     num_layers = getattr(config, "text_config", config).num_hidden_layers
-    if config.model_type != "qwen2_vl" or saved.task_type != "causal_lm":
-        raise ValueError("This exporter requires a Qwen2-VL causal-LM rank checkpoint")
+    if config.model_type != "qwen2_vl" or saved.task_type not in {"causal_lm", "seq_contrast"}:
+        raise ValueError("This exporter requires a Qwen2-VL retrieval or rank checkpoint")
     with torch.device("meta"):
         reference = Qwen2VLForConditionalGeneration(config)
     prefix, _ = checkpoint_prefixes(reference.state_dict())

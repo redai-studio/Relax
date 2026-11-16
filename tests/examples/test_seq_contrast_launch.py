@@ -55,7 +55,10 @@ def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, initiali
     actual_runtime = json.loads(next(arg.split("=", 1)[1] for arg in args if arg.startswith("--runtime-env-json=")))
     assert actual_runtime == {
         **runtime,
-        "env_vars": {**runtime["env_vars"], "RELAX_LORA_A_INIT_METHOD": initializer or "kaiming"},
+        "env_vars": {
+            **runtime["env_vars"],
+            "RELAX_LORA_A_INIT_METHOD": initializer or "kaiming",
+        },
     }
     assert args[args.index("--custom-dataset-class") + 1] == "relax.engine.sft.dataset.retrieval.NLIPairDataset"
     assert "--data-parallel-random-init" in args

@@ -13,6 +13,7 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 : "${DATA_DIR:?Set DATA_DIR to the NLI dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs HTTP address}"
+export RELAX_SKIP_CLUSTER_CLEANUP=1
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${RELAX_ROOT}/scripts/entrypoint/ray-job.sh"
 fi
@@ -42,7 +43,6 @@ print(config.get("text_config", config)["vocab_size"])
 PY
 )
 source "${RELAX_ROOT}/scripts/models/qwen2-vl-2B.sh"
-PROJECT_NAME="${PROJECT_NAME:-Relax/sft/seq-contrast}"
 # Keep this standard TE/Kaiming recipe separate from older precision profiles.
 EXP_NAME="${EXP_NAME:-qwen2-vl-2b-nli-bridge-lora-kaiming-dp8}"
 now=$(date "+%Y%m%d-%H%M%S")
@@ -111,12 +111,7 @@ PERF_ARGS=(
     --attention-softmax-in-fp32
     --attention-backend flash
 )
-TRACKING_ARGS=(
-    --use-clearml
-    --use-metrics-service
-    --tb-project-name "${PROJECT_NAME}"
-    --tb-experiment-name "${EXP_NAME}-${now}"
-)
+TRACKING_ARGS=(--use-metrics-service --no-use-tensorboard)
 
 RUN_LOG_DIR="${RELAX_RUN_LOG_DIR:-${SCRIPT_DIR}/log}"
 mkdir -p "${RUN_LOG_DIR}"

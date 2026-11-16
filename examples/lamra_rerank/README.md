@@ -20,8 +20,7 @@ your dataset root, and `SAVE_DIR` to persistent checkpoint storage. M-BEIR image
 references must resolve beneath the supplied image root on all workers.
 
 `Qwen2-VL-2B-Instruct` is the checkpoint directory name expected by the launcher;
-it can contain the fully merged retrieval checkpoint and its tokenizer. Set
-`QWEN2_VL_VOCAB_SIZE` to that base's vocabulary size, including any added tokens.
+it can contain the fully merged retrieval checkpoint and its tokenizer. The launcher reads the model vocabulary size from its configuration.
 Use a new `EXP_NAME` for a fresh rank stage, and use the same base and tokenizer
 for data preparation, training and export.
 
@@ -42,6 +41,9 @@ per training query. Both negative branches exclude **all known positives**.
 Queries with no true negative are skipped and listed in the manifest; a shortage
 of listwise negatives reduces the number of choices. This deliberately avoids
 the reference fallback that can label a positive candidate `No`.
+
+Generate the training top100 and fixed test rankings with the
+[Ret retrieval tool](../seq_contrast_sft/README.md#2-train-ret-sft-and-mine-candidates--训练-ret-sft-并挖候选).
 
 Outputs include the JSONL, row counts, source/output hashes, skipped query IDs and
 unique image paths. Preparation does not decode or validate every image. A missing
@@ -70,8 +72,7 @@ small-file latency; keep their durable sources and validate every copied image.
 
 ```bash
 RAY_ADDRESS="http://your-ray-head:8265" \
-  bash scripts/entrypoint/ray-job.sh \
-  examples/lamra_rerank/scripts/run-qwen2-vl-2B-rerank-8xgpu.sh
+  bash examples/lamra_rerank/scripts/run-qwen2-vl-2B-rerank-8xgpu.sh
 ```
 
 The script derives the number of updates from `train.manifest.json` and uses
@@ -80,9 +81,7 @@ corresponding in count to 64 query triplets. Relax shuffles individual sequences
 its update membership and sample order differ from the reference HF query
 sampler. This recipe does not promise numerical replay of that training run.
 
-`PROJECT_NAME` defaults to `Relax/sft/lamra-rerank`; `EXP_NAME` defaults to
-`qwen2-vl-2b-lamra-rank-r128-dp8`. ClearML and metrics are enabled, TensorBoard is
-disabled. `SAVE_INTERVAL` defaults to 1000 updates and the last two native
+`EXP_NAME` defaults to `qwen2-vl-2b-lamra-rank-r128-dp8`. Metrics are enabled and TensorBoard is disabled. `SAVE_INTERVAL` defaults to 1000 updates and the last two native
 checkpoints are retained. The final update is also saved. Native `--load` and
 `--save` both use `${SAVE_DIR}/${EXP_NAME}`: keep these values stable to resume,
 or explicitly change `EXP_NAME` for a new run.

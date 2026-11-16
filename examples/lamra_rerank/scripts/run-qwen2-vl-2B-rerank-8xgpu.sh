@@ -11,6 +11,7 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 : "${DATA_DIR:?Set DATA_DIR to the prepared rerank dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs HTTP address}"
+export RELAX_SKIP_CLUSTER_CLEANUP=1
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${RELAX_ROOT}/scripts/entrypoint/ray-job.sh"
 fi
@@ -30,8 +31,18 @@ print(json.dumps(runtime))
 PY
 )
 export RUNTIME_ENV_JSON
+QWEN2_VL_VOCAB_SIZE=$(python3 - "${MODEL_DIR}/Qwen2-VL-2B-Instruct/config.json" <<'PYCONF'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    config = json.load(stream)
+if config["model_type"] != "qwen2_vl":
+    raise SystemExit("Rank SFT requires a Qwen2-VL checkpoint")
+print(config.get("text_config", config)["vocab_size"])
+PYCONF
+)
 source "${RELAX_ROOT}/scripts/models/qwen2-vl-2B.sh"
-PROJECT_NAME="${PROJECT_NAME:-Relax/sft/lamra-rerank}"
 EXP_NAME="${EXP_NAME:-qwen2-vl-2b-lamra-rank-r128-dp8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-192}"
 read -r DATASET_STEPS WARMUP_STEPS < <(python3 - "${DATA_DIR}/rerank/train.manifest.json" "${GLOBAL_BATCH_SIZE}" <<'PY'
@@ -41,7 +52,8 @@ import sys
 
 with open(sys.argv[1]) as stream:
     manifest = json.load(stream)
-assert manifest["status"] == "prepared"
+if manifest["status"] != "prepared" or "database" in manifest:
+    raise SystemExit("Generate offline rerank data with examples/lamra_rerank/tools/prepare_data.py.")
 steps = math.ceil(manifest["sequences"] / int(sys.argv[2]))
 print(steps, math.ceil(steps * 0.03))
 PY
@@ -120,13 +132,7 @@ PERF_ARGS=(
     --attention-softmax-in-fp32
     --attention-backend flash
 )
-TRACKING_ARGS=(
-    --use-clearml
-    --use-metrics-service
-    --no-use-tensorboard
-    --tb-project-name "${PROJECT_NAME}"
-    --tb-experiment-name "${EXP_NAME}-${now}"
-)
+TRACKING_ARGS=(--use-metrics-service --no-use-tensorboard)
 RUN_LOG_DIR="${RELAX_RUN_LOG_DIR:-${SCRIPT_DIR}/log}"
 mkdir -p "${RUN_LOG_DIR}"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS}" \
