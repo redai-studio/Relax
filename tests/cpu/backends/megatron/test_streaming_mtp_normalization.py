@@ -99,6 +99,7 @@ def _train_loop(monkeypatch, step, *, enable_mtp=True, per_token=False):
     namespace = {
         "torch": torch,
         "get_args": lambda: args,
+        "is_lora_enabled": lambda _: False,
         "get_model_config": lambda _: SimpleNamespace(),
         "DataIterator": type("UnusedDataIterator", (), {}),
         "DDP": type("UnusedDDP", (), {}),

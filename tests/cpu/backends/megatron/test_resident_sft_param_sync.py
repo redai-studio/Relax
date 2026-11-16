@@ -113,6 +113,7 @@ def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enab
     namespace = dict(
         Envs=Envs,
         get_args=lambda: args,
+        is_lora_enabled=lambda _: False,
         get_model_config=lambda _: config,
         DDP=DDP,
         DataIterator=Iterator,

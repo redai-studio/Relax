@@ -27,12 +27,16 @@ NUM_ROLLOUT="${NUM_ROLLOUT:-1000}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
-: "${RAY_JOB_ADDRESS:?Set RAY_JOB_ADDRESS to the Ray Jobs HTTP URL}"
 now=$(date "+%Y%m%d-%H%M%S")
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
+# local.sh starts the dashboard on port 8265; preserve an explicit Jobs URL.
+if [[ "${RELAX_ENTRYPOINT_MODE}" == "local" ]]; then
+    RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://${MASTER_ADDR}:8265}"
+fi
+: "${RAY_JOB_ADDRESS:?Set RAY_JOB_ADDRESS to the existing cluster Ray Jobs HTTP URL}"
 source "${SCRIPT_DIR}/../../models/glm5.3-744B-A40B.sh"
 
 CKPT_ARGS=(

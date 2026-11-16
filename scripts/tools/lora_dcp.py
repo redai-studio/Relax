@@ -17,6 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from scripts.tools.convert_checkpoint_mapping import model_key
 from scripts.tools.convert_checkpoint_to_hf_cpu import check_chunks, resolve_checkpoint
 
 
@@ -31,16 +32,17 @@ _ATTENTION = {
 }
 
 
-def base_identity(base: Path, weight_map: dict[str, str]) -> dict[str, str]:
+def base_identity(base: Path, weight_map: dict[str, str]) -> dict[str, str | None]:
     """Match version-1 lightweight checkpoint identity, including shard
     stats."""
     stats = []
     for name in sorted(set(weight_map.values())):
         stat = (base / name).stat()
         stats.append((name, stat.st_size, stat.st_mtime_ns))
+    index = base / "model.safetensors.index.json"
     return {
         "config_sha256": hashlib.sha256((base / "config.json").read_bytes()).hexdigest(),
-        "index_sha256": hashlib.sha256((base / "model.safetensors.index.json").read_bytes()).hexdigest(),
+        "index_sha256": hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else None,
         "shard_stat_sha256": hashlib.sha256(
             json.dumps(stats, separators=(",", ":"), ensure_ascii=True).encode()
         ).hexdigest(),
@@ -147,10 +149,12 @@ class DcpAdapter:
         if spec.get("base_hf_checkpoint") != identity:
             raise ValueError("Base checkpoint identity differs from the training checkpoint")
         tensor_metadata = {
-            k: v for k, v in metadata.state_dict_metadata.items() if isinstance(v, TensorStorageMetadata)
+            k: v
+            for k, v in metadata.state_dict_metadata.items()
+            if model_key(k) and isinstance(v, TensorStorageMetadata)
         }
         shapes = {k: tuple(v.size) for k, v in tensor_metadata.items() if ".adapter." in k}
-        if any(k.startswith(("decoder.", "embedding.", "output_layer.")) and k not in shapes for k in tensor_metadata):
+        if any(k not in shapes for k in tensor_metadata):
             raise ValueError("Expected adapter-only model tensors")
         for key in shapes:
             check_chunks(key, tensor_metadata[key])

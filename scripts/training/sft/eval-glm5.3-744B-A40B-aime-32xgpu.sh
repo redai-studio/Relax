@@ -10,7 +10,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 : "${MODEL_NAME:?Set MODEL_NAME to the fixed checkpoint directory name}"
 : "${DATA_DIR:?Set DATA_DIR to the evaluation dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent evaluation output root}"
-: "${RAY_JOB_ADDRESS:?Set RAY_JOB_ADDRESS to the Ray Jobs HTTP URL}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/dapo-math}"
 EXP_NAME="${EXP_NAME:-glm5.3-aime-fixed-checkpoint-32xgpu}"
 EVAL_DATA_FILE="${EVAL_DATA_FILE:-aime-2024/aime-2024.jsonl}"
@@ -18,6 +17,11 @@ now=$(date "+%Y%m%d-%H%M%S")
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
+# local.sh starts the dashboard on port 8265; preserve an explicit Jobs URL.
+if [[ "${RELAX_ENTRYPOINT_MODE}" == "local" ]]; then
+    RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://${MASTER_ADDR}:8265}"
+fi
+: "${RAY_JOB_ADDRESS:?Set RAY_JOB_ADDRESS to the existing cluster Ray Jobs HTTP URL}"
 source "${SCRIPT_DIR}/../../models/glm5.3-744B-A40B.sh"
 
 EVAL_ARGS=(

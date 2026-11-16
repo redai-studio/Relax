@@ -6,6 +6,7 @@ Existing PEFT-merge tests do not cover DCP's expert/gate layout or an FP8 base.
 These small single-process checkpoints require no model or GPU runtime.
 """
 
+import hashlib
 import io
 import json
 from argparse import Namespace
@@ -21,7 +22,8 @@ from scripts.tools.merge_lora_adapter_to_hf import merge
 
 
 @pytest.fixture
-def checkpoint(tmp_path):
+def checkpoint(tmp_path, request):
+    layout = getattr(request, "param", "sharded")
     torch.manual_seed(7)
     base = tmp_path / "base"
     base.mkdir()
@@ -77,9 +79,11 @@ def checkpoint(tmp_path):
         {k: v for k, v in weights.items() if not k.endswith("_scale_inv")},
         {k: v for k, v in weights.items() if k.endswith("_scale_inv")},
     ]
+    if layout == "single_file":
+        groups = [weights]
     weight_map = {}
     for i, values in enumerate(groups):
-        name = f"model-{i}.safetensors"
+        name = "model.safetensors" if layout == "single_file" else f"model-{i}.safetensors"
         save_file(values, base / name)
         weight_map.update(dict.fromkeys(values, name))
     config = {
@@ -90,19 +94,42 @@ def checkpoint(tmp_path):
     }
     (base / "config.json").write_text(json.dumps(config))
     (base / "tokenizer_config.json").write_text('{"chat_template": "keep exactly"}')
-    (base / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    index_path = base / "model.safetensors.index.json"
+    if layout != "single_file":
+        index_path.write_text(json.dumps({"weight_map": weight_map}))
+    # Construct the saved training identity independently of the export helper.
+    stats = [
+        (name, (base / name).stat().st_size, (base / name).stat().st_mtime_ns)
+        for name in sorted(set(weight_map.values()))
+    ]
+    identity = {
+        "config_sha256": hashlib.sha256((base / "config.json").read_bytes()).hexdigest(),
+        "index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest() if index_path.exists() else None,
+        "shard_stat_sha256": hashlib.sha256(json.dumps(stats, separators=(",", ":")).encode()).hexdigest(),
+        "shard_count": str(len(stats)),
+    }
     spec = {
         "format_version": 1,
         "lora_rank": 2,
         "lora_alpha": 4,
         "lora_dropout": 0,
-        "base_hf_checkpoint": base_identity(base, weight_map),
+        "base_hf_checkpoint": identity,
     }
     common = io.BytesIO()
     torch.save([{"args": Namespace(relax_lora_checkpoint_metadata=spec)}], common)
     common.seek(0)
     # Match MCore's embedded common object and TE adapter extra-state objects.
     state = dict(adapters)
+    if layout == "optimizer":
+        # Fully reshardable Adam state uses the model parameter names too.
+        for prefix in ("optimizer", "chained_0.optimizer"):
+            for moment in ("exp_avg", "exp_avg_sq"):
+                state.update(
+                    {
+                        f"{prefix}.state.{moment}.{key}": torch.ones_like(value).float()
+                        for key, value in adapters.items()
+                    }
+                )
     state["common_state/shard_0_1"] = common
     for key in adapters:
         state[key.removesuffix("weight") + "_extra_state/shard_0_1"] = io.BytesIO()
@@ -110,8 +137,12 @@ def checkpoint(tmp_path):
     return dcp_dir, base, tmp_path / "output", adapters, expected
 
 
+@pytest.mark.parametrize("checkpoint", ["sharded", "optimizer", "single_file"], indirect=True)
 def test_real_dcp_export_merges_every_adapter_and_removes_quantization(checkpoint):
     dcp_dir, base, output, adapters, expected = checkpoint
+    preview = merge(base, output, checkpoint=dcp_dir, dry_run=True)
+    assert preview["adapter_tensors"] == len(adapters)
+    assert not output.exists()
     report = merge(base, output, checkpoint=dcp_dir)
     assert report["adapter_tensors"] == len(adapters)
     assert report["all_finite"]
