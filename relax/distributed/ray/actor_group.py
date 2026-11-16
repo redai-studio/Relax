@@ -240,10 +240,9 @@ class RayTrainGroup:
 
         self._actor_handlers = []
 
-    def async_train(self, rollout_id, *, defer_inference: bool = False):
+    def async_train(self, rollout_id):
         """Do one rollout training."""
-        options = {"defer_inference": True} if defer_inference else {}
-        return [actor.train.remote(rollout_id, **options) for actor in self._actor_handlers]
+        return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
 
     def get_recovery_children(self) -> list[Any]:
         """Owned workers and lock; placement groups belong to the Service."""
@@ -261,20 +260,17 @@ class RayTrainGroup:
         """Compute reference log prob for routing replay."""
         return [actor.compute_ref_log_prob.remote(rollout_id) for actor in self._actor_handlers]
 
-    def async_compute_actor_log_prob(self, rollout_id, *, defer_weight_receive: bool = False):
+    def async_compute_actor_log_prob(self, rollout_id):
         """Compute actor log prob for routing replay."""
-        options = {"defer_weight_receive": True} if defer_weight_receive else {}
-        return [actor.compute_actor_log_prob.remote(rollout_id, **options) for actor in self._actor_handlers]
+        return [actor.compute_actor_log_prob.remote(rollout_id) for actor in self._actor_handlers]
 
-    def train_fully_async(self, rollout_id, *, defer_inference: bool = False):
+    def train_fully_async(self, rollout_id):
         """Do one rollout training without ref log prob computation."""
-        options = {"defer_inference": True} if defer_inference else {}
-        return [actor.train_async.remote(rollout_id, **options) for actor in self._actor_handlers]
+        return [actor.train_async.remote(rollout_id) for actor in self._actor_handlers]
 
-    def train_hybrid(self, rollout_id, *, defer_inference: bool = False):
+    def train_hybrid(self, rollout_id):
         """Hybrid mode: actor handles ref/actor_fwd/adv internally."""
-        options = {"defer_inference": True} if defer_inference else {}
-        return [actor.train_hybrid.remote(rollout_id, **options) for actor in self._actor_handlers]
+        return [actor.train_hybrid.remote(rollout_id) for actor in self._actor_handlers]
 
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model."""

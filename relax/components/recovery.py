@@ -9,7 +9,7 @@ from typing import Any
 
 import ray
 
-from relax.distributed.settlement import UnsafeInferenceError
+from relax.distributed.settlement import UnsafeInferenceError, wait_all
 from relax.utils.async_utils import run
 from relax.utils.env import Envs
 
@@ -49,6 +49,13 @@ class RecoveryGate:
             and tuple(status.shape) == (size, len(fields))
             and bool((status == 1).all())
         )
+
+    def wait(self, refs: list) -> list:
+        """Settle all ranks for local recovery; otherwise propagate
+        failures."""
+        if self.state is None:
+            return ray.get(refs)
+        return wait_all(refs)
 
     def synchronize(self, operation: Callable[[], None]) -> bool:
         """Reserve the inference tail after all training ranks have settled.

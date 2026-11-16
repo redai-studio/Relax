@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-import torch
 
 from tests.cpu.engine.lora_versions.test_training import ThreadRanks, assert_rank_errors
 
@@ -56,38 +55,6 @@ def test_managed_weight_sync_releases_topology_lease_on_all_exit_paths(monkeypat
         assert_rank_errors(results, f"{failure} failed")
     assert [call.args for call in manager.set_weight_updating.remote.call_args_list] == [(True,), (False,)]
     assert lock.release.remote.call_count == (0 if failure == "acquire" else 1)
-
-
-@pytest.mark.parametrize("actor_fwd_absent", [False, True])
-def test_managed_health_check_never_enters_legacy_rollout_pause(monkeypatch, actor_fwd_absent):
-    ranks = ThreadRanks(monkeypatch)
-    monkeypatch.setattr(actor_module, "get_gloo_group", lambda: ranks)
-
-    def reduce(tensor, *, op, group):
-        values = ranks.exchange("reduce", tensor.tolist())
-        tensor.copy_(torch.tensor(values).max(dim=0).values)
-
-    monkeypatch.setattr(actor_module.dist, "all_reduce", reduce)
-    get_url = Mock(return_value="http://actor-fwd")
-    request = Mock(return_value=Mock())
-    monkeypatch.setattr(actor_module, "get_serve_url", get_url)
-    monkeypatch.setattr(actor_module.requests, "get", request)
-    actors = []
-    for _rank in range(2):
-        actor = object.__new__(actor_module.MegatronTrainRayActor)
-        actor._managed_lora_publication = True
-        actor.args = SimpleNamespace(true_on_policy_mode=actor_fwd_absent, hybrid=False, rollout_http_timeout=10)
-        actors.append(actor)
-    assert (
-        ranks.run(lambda rank: actor_module.MegatronTrainRayActor._check_services_health.__wrapped__(actors[rank]))
-        == [(actor_fwd_absent, False)] * 2
-    )
-    if actor_fwd_absent:
-        get_url.assert_not_called()
-        request.assert_not_called()
-    else:
-        get_url.assert_called_once_with("actor_fwd")
-        request.assert_called_once_with("http://actor-fwd/get_step", timeout=10)
 
 
 @pytest.mark.parametrize("failure", ["lookup", "group_init"])

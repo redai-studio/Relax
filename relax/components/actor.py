@@ -72,6 +72,8 @@ class Actor(Base):
         self.healthy = healthy
         self.role = role
         self._recovery = RecoveryGate(config, role)
+        self.rollout_manager = None
+        self._managed_lora_publication = False
         self.genrm_manager = None  # Set later via set_genrm_manager if genRM is enabled
 
         # Threading primitives so the training loop doesn't block the Serve/FastAPI thread
@@ -118,6 +120,8 @@ class Actor(Base):
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         """Set the rollout manager and initialize weights."""
         self.rollout_manager = rollout_manager
+        if self.config.train_backend == "megatron":
+            self._managed_lora_publication = ray.get(rollout_manager.get_lora_training_config.remote()) is not None
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
         # The backend owns sync and offload lifecycles. SFT syncs before predict.
@@ -128,6 +132,8 @@ class Actor(Base):
         """Replace the inference target while the original training workers are
         idle."""
         self.rollout_manager = rollout_manager
+        if self.config.train_backend == "megatron":
+            self._managed_lora_publication = ray.get(rollout_manager.get_lora_training_config.remote()) is not None
         wait_all(self.actor_model.async_inference_call("set_rollout_manager", rollout_manager))
 
     def recovery_update_weights_colocate(
@@ -175,6 +181,7 @@ class Actor(Base):
         actor_fwd_only: bool = False,
         recovery_token: dict | None = None,
         expected_rollout_actor_ids: Optional[list[str]] = None,
+        sync_step: int = 0,
     ) -> None:
         from relax.utils.fault_events.receipts import emit_receipt
 
@@ -182,12 +189,9 @@ class Actor(Base):
         if expected_rollout_actor_ids is not None:
             sync_options["expected_rollout_actor_ids"] = expected_rollout_actor_ids
         try:
-            if self._recovery.state is not None:
-                wait_all(
-                    self.actor_model.async_inference_call("update_weights_fully_async", self.step, **sync_options)
-                )
-            else:
-                self.actor_model.update_weights_fully_async(0, **sync_options)
+            self._recovery.wait(
+                self.actor_model.async_inference_call("update_weights_fully_async", sync_step, **sync_options)
+            )
         except Exception:
             emit_receipt(self, recovery_token, "actor_send", "failed")
             raise
@@ -361,38 +365,28 @@ class Actor(Base):
                 self.actor_model.update_weights()
             return False
 
-        # The component owns inference admission; backend training can return first.
-        options = {"defer_inference": True} if self._recovery.state is not None else {}
-        # Use appropriate training method based on mode
         if self.config.hybrid:
-            # hybrid mode: actor handles ref/actor_fwd/adv internally
-            refs = self.actor_model.train_hybrid(self.step, **options)
-            if self._recovery.state is not None:
-                wait_all(refs)
-            else:
-                ray.get(refs)
+            refs = self.actor_model.train_hybrid(self.step)
         elif self.config.fully_async:
-            refs = self.actor_model.train_fully_async(self.step, **options)
-            if self._recovery.state is not None:
-                wait_all(refs)
-            else:
-                ray.get(refs)
-            if self._recovery.state is None:
-                self._maybe_save_model()
+            refs = self.actor_model.train_fully_async(self.step)
         else:
-            refs = self.actor_model.async_train(self.step, **options)
-            if self._recovery.state is not None:
-                wait_all(refs)
-            else:
-                ray.get(refs)
-        if self._recovery.state is not None:
+            refs = self.actor_model.async_train(self.step)
+        self._recovery.wait(refs)
+        if self.config.train_backend == "megatron":
             synchronized = self._recovery.synchronize(
-                lambda: complete_inference_step(self.config, self.actor_model, self.step)
+                lambda: complete_inference_step(
+                    self.config,
+                    self.actor_model,
+                    self.step,
+                    has_rollout=self.rollout_manager is not None,
+                    managed=self._managed_lora_publication,
+                    settle=self._recovery.wait,
+                )
             )
-            if self.config.fully_async or self.config.hybrid or not synchronized:
-                wait_all(self.actor_model.async_inference_call("finish_training_metrics", self.step))
-            if self.config.fully_async and not self.config.hybrid:
-                self._maybe_save_model()
+            if not synchronized:
+                self._recovery.wait(self.actor_model.async_inference_call("finish_training_metrics", self.step))
+        if self.config.fully_async and not self.config.hybrid:
+            self._maybe_save_model()
         return True
 
     def _maybe_save_model(self) -> None:

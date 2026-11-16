@@ -12,7 +12,6 @@ from threading import Event
 from typing import Any, List
 
 import ray
-import requests
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
@@ -29,7 +28,6 @@ from transformers import AutoConfig, AutoTokenizer
 
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
-from relax.distributed.ray.inference_sync import check_services_health, wait_for_previous_eval
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
@@ -106,7 +104,6 @@ from relax.utils.utils import (
     _extract_image_grids,
     _has_image_inputs,
     get_debug_data,
-    get_serve_url,
     merge_dict_list,
     process_args,
 )
@@ -1363,85 +1360,36 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
-    def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
-        is_offline = is_offline_mode(self.args)
+    def _run_step_evaluation(self, rollout_id: int) -> None:
+        """Run backend-local offline evaluation and prediction on every
+        rank."""
         has_rollout = getattr(self, "rollout_manager", None) is not None
-
-        if not is_offline and dist.get_rank() != 0:
-            return
-
-        if is_offline:
-            should_run_eval = should_run_sft_eval(self.args, rollout_id)
-            should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
-            if should_run_eval or should_run_predict:
-                self._flush_resident_sft_parameters()
-            try:
-                if should_run_eval:
-                    if rollout_id > 0 and dist.get_rank() == 0:
-                        for partition_id in sft_partition_ids(self.args, rollout_id - 1):
-                            run(
-                                self.data_system_client.async_clear_partition(
-                                    partition_id=partition_id,
-                                )
+        should_run_eval = should_run_sft_eval(self.args, rollout_id)
+        should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
+        if should_run_eval or should_run_predict:
+            self._flush_resident_sft_parameters()
+        try:
+            if should_run_eval:
+                if rollout_id > 0 and dist.get_rank() == 0:
+                    for partition_id in sft_partition_ids(self.args, rollout_id - 1):
+                        run(
+                            self.data_system_client.async_clear_partition(
+                                partition_id=partition_id,
                             )
-                    dist.barrier(group=get_gloo_group())
-                    with manual_gc_eval(self.args):
-                        run_sft_eval(self, rollout_id)
+                        )
+                dist.barrier(group=get_gloo_group())
+                with manual_gc_eval(self.args):
+                    run_sft_eval(self, rollout_id)
 
-                if should_run_predict:
-                    with manual_gc_eval(self.args):
-                        run_sft_predict(self, rollout_id)
-            except Exception as e:
-                logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
-                raise
-            return
-
-        # RL path: trigger rollout-based evaluation if configured.
-        # Telemetry marks for RL eval live on the Rollout side
-        # (see Rollout._run_eval_with_mark), so we don't emit them here.
-        if not has_rollout:
-            return
-        rollout_serve_url = get_serve_url("rollout")
-        try:
-            # NOTE: /evaluate runs rollout-side inference and can legitimately
-            # take much longer than a short RPC, so it is intentionally left
-            # without an HTTP timeout -- a fixed timeout would falsely abort a
-            # long eval. This block's failure is non-fatal (logged, training
-            # continues).
-            response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
-            response.raise_for_status()
+            if should_run_predict:
+                with manual_gc_eval(self.args):
+                    run_sft_predict(self, rollout_id)
         except Exception as e:
-            logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
-        finally:
-            # Cleanup MUST run even if /evaluate failed, otherwise rollout + health
-            # monitoring stay paused forever. Short call -> keep the timeout;
-            # swallow its own errors independently.
-            if end_update_weight:
-                self._end_rollout_weight_update(rollout_id)
-
-    def _end_rollout_weight_update(self, rollout_id: int) -> None:
-        """Release the rollout handshake even when no new policy was
-        published."""
-        if (
-            getattr(self, "_managed_lora_publication", False)
-            or getattr(self, "rollout_manager", None) is None
-            or dist.get_rank(group=dist.group.WORLD) != 0
-        ):
-            return
-        try:
-            response = requests.get(
-                f"{get_serve_url('rollout')}/end_update_weight", timeout=self.args.rollout_http_timeout
-            )
-            response.raise_for_status()
-        except Exception as e:
-            logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
-
-    def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
-        """Backward-compatible name kept for existing internal call sites."""
-        self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
+            logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
+            raise
 
     @manual_gc_training
-    def train(self, rollout_id: int, defer_inference: bool = False) -> None:
+    def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
@@ -1484,7 +1432,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.role == "critic":
                 return self.train_critic(rollout_id, rollout_data)
             else:
-                return self.train_actor(rollout_id, rollout_data, defer_inference=defer_inference)
+                return self.train_actor(rollout_id, rollout_data)
         else:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train with mcore.")
             if is_offline_mode(self.args):
@@ -1525,7 +1473,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data,
                     prepared_data_iterator=[prepared_iterator],
                     prepared_num_microbatches=[num_microbatches],
-                    defer_inference=defer_inference,
                 )
             empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
@@ -1588,7 +1535,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.role == "critic":
                         return self.train_critic(rollout_id, rollout_data)
                     else:
-                        return self.train_actor(rollout_id, rollout_data, defer_inference=defer_inference)
+                        return self.train_actor(rollout_id, rollout_data)
                 rollout_mini_batches.append(rollout_data)
                 rollout_mini_batch_metas.append(batch_meta)
                 rollout_mini_local_sample_counts.append(len(rollout_data["total_lengths"]))
@@ -1610,7 +1557,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self.role == "critic":
                     return self.train_critic(rollout_id, rollout_data)
                 else:
-                    return self.train_actor(rollout_id, rollout_data, defer_inference=defer_inference)
+                    return self.train_actor(rollout_id, rollout_data)
 
     def _get_prefetched_sft_window(
         self,
@@ -2092,7 +2039,6 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data: RolloutBatch,
         prepared_data_iterator: list[_SFTPrepackedDeviceIterator] | None = None,
         prepared_num_microbatches: list[int] | None = None,
-        defer_inference: bool = False,
     ) -> None:
         resident_overlap = self._resident_sft_overlap_enabled()
         if is_preference_mode(self.args):
@@ -2341,17 +2287,6 @@ class MegatronTrainRayActor(TrainRayActor):
             self.save_model(rollout_id, force_sync=is_train_done)
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
-        if not defer_inference:
-            if getattr(self, "rollout_manager", None) is not None and self._per_step_rollout:
-                self.update_weights()
-            with timer("train_metrics_flush"):
-                tracking_utils.flush_metrics(
-                    self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done
-                )
-            dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
-            if is_train_done:
-                self._wait_for_previous_eval()
 
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
@@ -2392,10 +2327,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self._put_data_to_transfer_queue(output_dict, batch_meta, data)
         self.prof.step(rollout_id=rollout_id)
 
-        self.recv_weight_fully_async(rollout_id)
-        log_perf_data_fwd(self.args, rollout_id)
-
-    def compute_actor_log_prob(self, rollout_id: int, defer_weight_receive: bool = False) -> None:
+    def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             if self.args.use_rollout_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -2445,8 +2377,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     RoutingReplay.clear_all_forward()
         self.prof.step(rollout_id=rollout_id)
 
-        if not defer_weight_receive:
-            self.recv_weight_fully_async(rollout_id)
+    def finish_forward_metrics(self, rollout_id: int) -> None:
         log_perf_data_fwd(self.args, rollout_id)
 
     def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch) -> None:
@@ -2595,7 +2526,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 RoutingReplay.clear_all_forward()
 
     @manual_gc_training
-    def train_hybrid(self, rollout_id, defer_inference: bool = False) -> None:
+    def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
         pipeline (transfer queue with max-staleness).
@@ -2811,28 +2742,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             self.sleep()
 
-        if self.args.debug_train_only:
-            # In debug_train_only mode no rollout/eval services exist, so skip the
-            # weight-sync + eval coordination below (mirrors `train`'s debug path
-            # which never touches those services). Metrics are still flushed.
-            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-            return
-
-        if not defer_inference:
-            self._wait_for_previous_eval()
-            _, actor_fwd_only = self._check_services_health()
-            if actor_fwd_only:
-                self._end_rollout_weight_update(rollout_id)
-            else:
-                self.update_weights()
-                self.evaluate_after_training(rollout_id, end_update_weight=True)
-                if is_train_done:
-                    self._wait_for_previous_eval()
-        if not defer_inference:
-            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-
     @manual_gc_training
-    def train_async(self, rollout_id, defer_inference: bool = False) -> None:
+    def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 
@@ -2885,25 +2796,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
             )
 
-            if not defer_inference:
-                self._wait_for_previous_eval()
-                rollout_only, actor_fwd_only = self._check_services_health()
-                self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
-                self.evaluate_after_training(rollout_id, end_update_weight=True)
-                if (rollout_id + 1) == self.args.num_rollout:
-                    self._wait_for_previous_eval()
-
             if self.args.use_routing_replay:
                 RoutingReplay.clear_all()
 
-        if defer_inference:
-            self._pending_training_metrics = rollout_data
-            # Resume the same train interval across the component-owned tail.
-            Timer().end("train_wait")
-            Timer().start("train")
-            return
-        self._log_async_training_perf(rollout_id, rollout_data)
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        self._pending_training_metrics = rollout_data
+        # Keep the step interval open until the component finishes its tail.
+        Timer().end("train_wait")
+        Timer().start("train")
 
     def _log_async_training_perf(self, rollout_id: int, rollout_data: dict) -> None:
         total_lengths = rollout_data["total_lengths"]
@@ -3043,13 +2942,11 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             self.weights_backuper.backup("old_actor")
 
-    def evaluate_after_training(self, rollout_id: int, end_update_weight: bool = False) -> None:
+    def evaluate_after_training(self, rollout_id: int) -> None:
         """Evaluate the admitted model version using the backend's local
         state."""
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(
-            evaluation_step_for_rollout(self.args, rollout_id), end_update_weight=end_update_weight
-        )
+        self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
     def reset_inference_transport(self, role: str) -> None:
         """Called on every idle original Actor rank under a recovery
@@ -3220,22 +3117,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 handles.extend(manager.onload.remote() for manager in self.genrm_manager)
             if handles:
                 ray.get(handles)
-
-    @timer("wait update_weights_fully_async")
-    def _check_services_health(self) -> tuple[bool, bool]:
-        """Compatibility path for callers driving the backend directly."""
-        group = get_gloo_group()
-        flags = (False, False)
-        if dist.get_rank(group) == 0:
-            flags = check_services_health(self.args, managed=getattr(self, "_managed_lora_publication", False))
-        flags = torch.tensor([int(flag) for flag in flags], dtype=torch.int32, device="cpu")
-        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
-        return bool(flags[0].item()), bool(flags[1].item())
-
-    def _wait_for_previous_eval(self, max_wait_seconds: int = 1800) -> None:
-        if dist.get_rank(group=get_gloo_group()) == 0:
-            wait_for_previous_eval(max_wait_seconds)
-        dist.barrier(group=get_gloo_group())
 
     @timer
     def update_weights_fully_async(

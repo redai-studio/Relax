@@ -1372,7 +1372,14 @@ class Controller:
                 if not ray.get(state.begin_sync.remote(maintenance=True), timeout=remaining):
                     raise RuntimeError("Cannot release the healthy forward receiver")
                 remaining = max(0, deadline - time.monotonic())
-                run(asyncio.wait_for(actor.handle.update_weights_fully_async.remote(actor_fwd_only=True), remaining))
+                sync_step = run(asyncio.wait_for(actor.get_step(), remaining))
+                remaining = max(0, deadline - time.monotonic())
+                run(
+                    asyncio.wait_for(
+                        actor.handle.update_weights_fully_async.remote(actor_fwd_only=True, sync_step=sync_step),
+                        remaining,
+                    )
+                )
                 ray.get(state.end_sync.remote(), timeout=max(0, deadline - time.monotonic()))
             time.sleep(0.05)
 
@@ -1427,9 +1434,9 @@ class Controller:
                     raise RuntimeError("Replacement Rollout engines are incomplete; require global restart")
                 sync_options["expected_rollout_actor_ids"] = [engine._actor_id.hex() for engine in engines]
             await actor.handle.reset_inference_transport.remote(str(role))
-            sends = [actor.handle.update_weights_fully_async.remote(**sync_options)]
+            sends = [actor.handle.update_weights_fully_async.remote(**sync_options, sync_step=step)]
             if str(role) == "actor_fwd":
-                sends.append(failed.handle.recv_weight_fully_async.remote())
+                sends.append(failed.handle.recv_weight_fully_async.remote(sync_step=step))
             await asyncio.gather(*sends)
         else:
             # Service lifecycle belongs here, not to the training rank or tensor updater.

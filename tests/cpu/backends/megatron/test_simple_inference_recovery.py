@@ -28,8 +28,7 @@ def _actor(backend, **args):
     return SimpleNamespace(args=SimpleNamespace(**args))
 
 
-@pytest.mark.parametrize("mode", ["normal", "deferred", "tail_error"])
-def test_train_async_sync_tail(backend, monkeypatch, mode):
+def test_train_async_metrics_include_the_component_owned_tail(backend, monkeypatch):
     from relax.utils import timer as timing
     from relax.utils.training import train_metric_utils
 
@@ -65,16 +64,10 @@ def test_train_async_sync_tail(backend, monkeypatch, mode):
     worker.data_iterator = [Mock(get_buffer=Mock(return_value=buffer))]
     worker.num_microbatches = 1
     worker.prof, worker.tokenizer, worker.flops_counter = Mock(), None, None
-    worker._wait_for_previous_eval = Mock()
-    worker._check_services_health = Mock(return_value=(False, False))
     worker.update_weights_fully_async = Mock(side_effect=lambda *args, **kwargs: advance(2.0))
-    worker._run_step_evaluation = Mock()
-    worker.evaluate_after_training = Mock()
     worker._log_async_training_perf = lambda step, data: backend.MegatronTrainRayActor._log_async_training_perf(
         worker, step, data
     )
-    if mode == "tail_error":
-        worker.evaluate_after_training.side_effect = RuntimeError("sender failed")
     monkeypatch.setattr(backend, "train", Mock(side_effect=lambda *args: advance(1.0)))
     monkeypatch.setattr(backend, "log_rollout_data", Mock())
     monkeypatch.setattr(
@@ -89,26 +82,19 @@ def test_train_async_sync_tail(backend, monkeypatch, mode):
     monkeypatch.setattr(backend, "evaluation_step_for_rollout", lambda *args: 0)
     monkeypatch.setattr(backend, "mpu", Mock(get_data_parallel_world_size=Mock(return_value=1)))
     backend.dist.all_gather_object.side_effect = lambda output, value, **kwargs: output.__setitem__(0, value)
-    if mode == "tail_error":
-        with pytest.raises(RuntimeError, match="sender failed"):
-            backend.MegatronTrainRayActor.train_async(worker, 0, defer_inference=mode == "deferred")
-    else:
-        backend.MegatronTrainRayActor.train_async(worker, 0, defer_inference=mode == "deferred")
-        if mode == "deferred":
-            backend.log_perf_data.assert_not_called()
-            backend.tracking_utils.flush_metrics.assert_not_called()
-            worker.update_weights_fully_async(0)
-            backend.MegatronTrainRayActor.finish_training_metrics(worker, 0)
-        backend.tracking_utils.flush_metrics.assert_called_once()
-        metrics = backend.tracking_utils.log.call_args.args[1]
-        assert metrics["perf/train_time"] == pytest.approx(3.0)
-        assert metrics["perf/train_wait_time"] == pytest.approx(0.0)
-        assert "train" not in timing_state.start_time
-    if mode == "tail_error":
-        backend.tracking_utils.flush_metrics.assert_not_called()
+    backend.MegatronTrainRayActor.train_async(worker, 0)
+    backend.log_perf_data.assert_not_called()
+    backend.tracking_utils.flush_metrics.assert_not_called()
+    worker.update_weights_fully_async.assert_not_called()
+    worker.update_weights_fully_async(0)
+    backend.MegatronTrainRayActor.finish_training_metrics(worker, 0)
+    backend.tracking_utils.flush_metrics.assert_called_once()
+    metrics = backend.tracking_utils.log.call_args.args[1]
+    assert metrics["perf/train_time"] == pytest.approx(3.0)
+    assert metrics["perf/train_wait_time"] == pytest.approx(0.0)
+    assert "train" not in timing_state.start_time
     backend.train.assert_called_once()
     assert backend.train.call_args.args[1:4] == (worker.model, worker.optimizer, worker.opt_param_scheduler)
-    assert worker.evaluate_after_training.call_count == (mode != "deferred")
 
 
 @pytest.mark.parametrize("mode", ["success", "export_error", "cleanup_error"])

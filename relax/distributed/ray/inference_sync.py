@@ -5,11 +5,12 @@ ranks."""
 
 import time
 from argparse import Namespace
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
 from relax.distributed.settlement import wait_all
+from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url
 
@@ -109,26 +110,54 @@ def wait_for_previous_eval(max_wait_seconds: int = 1800) -> None:
         logger.warning(f"Error checking eval status: {e}, proceeding with weight update.")
 
 
-def complete_inference_step(config: Namespace, train_group: Any, step: int) -> None:
-    """Run an admitted version's sender/evaluation RPCs and settle every rank.
+def _end_rollout_update(config: Namespace, step: int, *, managed: bool) -> None:
+    if managed:
+        return
+    try:
+        response = requests.get(f"{get_serve_url('rollout')}/end_update_weight", timeout=config.rollout_http_timeout)
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning(f"Error ending update weight for rollout_id {step}: {exc}")
 
-    The component holds recovery admission across this entire operation. The
-    training workers receive one recipient decision and own only model work.
-    """
+
+def _evaluate_rollout(config: Namespace, step: int, *, asynchronous: bool, managed: bool) -> None:
+    try:
+        # Generation can take much longer than a health probe.
+        response = requests.get(f"{get_serve_url('rollout')}/evaluate", params={"train_step": step})
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning(f"Error during actor post-train evaluation for rollout_id {step}: {exc}")
+    finally:
+        if asynchronous:
+            _end_rollout_update(config, step, managed=managed)
+
+
+def complete_inference_step(
+    config: Namespace,
+    train_group: Any,
+    step: int,
+    *,
+    has_rollout: bool,
+    managed: bool,
+    settle: Callable[[list], list] = wait_all,
+) -> None:
+    """Coordinate the same post-training stages with or without recovery."""
+    if is_offline_mode(config):
+        settle(train_group.async_inference_call("finish_training_metrics", step))
+        settle(train_group.async_inference_call("evaluate_after_training", step))
+        return
+    if not has_rollout or config.debug_train_only or config.debug_rollout_only:
+        settle(train_group.async_inference_call("finish_training_metrics", step))
+        return
     asynchronous = config.fully_async or config.hybrid
     if asynchronous:
         wait_for_previous_eval()
         started = time.monotonic()
-        rollout_only, actor_fwd_only = check_services_health(config)
-        wait_all(train_group.async_inference_call("record_inference_wait", time.monotonic() - started))
+        rollout_only, actor_fwd_only = check_services_health(config, managed=managed)
+        settle(train_group.async_inference_call("record_inference_wait", time.monotonic() - started))
         if config.hybrid and actor_fwd_only:
-            try:
-                response = requests.get(
-                    f"{get_serve_url('rollout')}/end_update_weight", timeout=config.rollout_http_timeout
-                )
-                response.raise_for_status()
-            except Exception as exc:
-                logger.warning(f"Error ending update weight for rollout_id {step}: {exc}")
+            _end_rollout_update(config, step, managed=managed)
+            settle(train_group.async_inference_call("finish_training_metrics", step))
             return
         if config.hybrid:
             refs = train_group.async_inference_call("update_weights")
@@ -138,9 +167,11 @@ def complete_inference_step(config: Namespace, train_group: Any, step: int) -> N
             )
     else:
         refs = train_group.async_inference_call("update_weights")
-    wait_all(refs)
+    settle(refs)
     if not asynchronous:
-        wait_all(train_group.async_inference_call("finish_training_metrics", step))
-    wait_all(train_group.async_inference_call("evaluate_after_training", step, end_update_weight=asynchronous))
+        settle(train_group.async_inference_call("finish_training_metrics", step))
+    _evaluate_rollout(config, step, asynchronous=asynchronous, managed=managed)
     if step + 1 == config.num_rollout:
         wait_for_previous_eval()
+    if asynchronous:
+        settle(train_group.async_inference_call("finish_training_metrics", step))

@@ -131,15 +131,12 @@ class ActorFwd(Base):
         wait_all(self.actor_model.async_inference_call("unregister_inference_transport"))
         return self.actor_model.get_recovery_children()
 
-    def recv_weight_fully_async(self, recovery_token: dict | None = None) -> None:
+    def recv_weight_fully_async(self, recovery_token: dict | None = None, sync_step: int = 0) -> None:
         from relax.utils.fault_events.receipts import emit_receipt
 
         operation = "reference_recv" if self.role == "reference" else "actor_fwd_recv"
         try:
-            if self._recovery.state is None:
-                self.actor_model.recv_weight_fully_async(0)
-            else:
-                wait_all(self.actor_model.async_inference_call("recv_weight_fully_async", self.step))
+            self._recovery.wait(self.actor_model.async_inference_call("recv_weight_fully_async", sync_step))
         except Exception:
             emit_receipt(self, recovery_token, operation, "failed")
             raise
@@ -167,19 +164,22 @@ class ActorFwd(Base):
         return {"status": "ok"}
 
     def compute_actor_log_prob(self, step: int) -> None:
-        options = {"defer_weight_receive": True} if self._recovery.state is not None else {}
-        refs = self.actor_model.async_compute_actor_log_prob(step, **options)
-        if self._recovery.state is None:
-            ray.get(refs)
-            return
-        wait_all(refs)
-        ray.get(self._recovery.state.set_fwd_ready.remote(True))
+        self._recovery.wait(self.actor_model.async_compute_actor_log_prob(step))
+        self._receive_after_forward(step)
+
+    def compute_ref_log_prob(self, step: int) -> None:
+        self._recovery.wait(self.actor_model.async_compute_ref_log_prob(step))
+        self._receive_after_forward(step)
+
+    def _receive_after_forward(self, step: int) -> None:
+        state = self._recovery.state if self.role == "actor_fwd" else None
+        if state is not None:
+            ray.get(state.set_fwd_ready.remote(True))
         try:
-            wait_all(self.actor_model.async_inference_call("recv_weight_fully_async", step))
+            self._recovery.wait(self.actor_model.async_inference_call("recv_weight_fully_async", step))
         except Exception as exc:
             raise UnsafeInferenceError("Forward weight receive failed; require global restart") from exc
         finally:
-            ray.get(self._recovery.state.set_fwd_ready.remote(False))
-
-    def compute_ref_log_prob(self, step: int) -> None:
-        ray.get(self.actor_model.async_compute_ref_log_prob(step))
+            if state is not None:
+                ray.get(state.set_fwd_ready.remote(False))
+        self._recovery.wait(self.actor_model.async_inference_call("finish_forward_metrics", step))

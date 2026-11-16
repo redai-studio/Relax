@@ -418,8 +418,8 @@ def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exc
     exec(compile(ast.fix_missing_locations(module), "Actor", "exec"), ns)
     calls = []
     owner = SimpleNamespace(
-        actor_model=SimpleNamespace(update_weights_fully_async=lambda *a, **k: calls.append(k)),
-        _recovery=SimpleNamespace(state=None),
+        actor_model=SimpleNamespace(async_inference_call=lambda *a, **k: calls.append(k)),
+        _recovery=SimpleNamespace(state=None, wait=lambda refs: refs),
     )
     ns[fn.name](owner)
     assert calls == [{"rollout_only": False, "actor_fwd_only": False}]
@@ -438,7 +438,7 @@ def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exc
     token = {"run_id": new_id(), "recovery_id": new_id(), "recovery_generation": 1}
     ns[fn.name](owner, recovery_token=token)
     assert len(calls) == 2
-    owner.actor_model.update_weights_fully_async = broken_worker
+    owner.actor_model.async_inference_call = broken_worker
     with pytest.raises(ValueError, match="original worker error"):
         ns[fn.name](owner, recovery_token=token)
 

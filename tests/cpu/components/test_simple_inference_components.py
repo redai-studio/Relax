@@ -139,14 +139,15 @@ def test_actor_fwd_receive_stays_ready_until_all_receive_results_return():
     worker = component_methods(
         "actor_fwd.py",
         "ActorFwd",
-        ["compute_actor_log_prob"],
+        ["compute_actor_log_prob", "_receive_after_forward"],
         ray=SimpleNamespace(get=lambda value: value),
         wait_all=wait_all,
     )
-    worker._recovery = SimpleNamespace(state=SimpleNamespace(set_fwd_ready=remote(set_ready)))
+    worker.role = "actor_fwd"
+    worker._recovery = SimpleNamespace(state=SimpleNamespace(set_fwd_ready=remote(set_ready)), wait=wait_all)
     worker.actor_model = SimpleNamespace(
         async_compute_actor_log_prob=lambda step, **options: ["compute-rank0", "compute-rank1"],
-        async_inference_call=lambda method, step: ["receive-rank0", "receive-rank1"],
+        async_inference_call=lambda method, step: [f"{method}-rank0", f"{method}-rank1"],
     )
 
     worker.compute_actor_log_prob(2)
@@ -154,8 +155,9 @@ def test_actor_fwd_receive_stays_ready_until_all_receive_results_return():
     assert events == [
         ("wait", ("compute-rank0", "compute-rank1"), False),
         ("ready", True),
-        ("wait", ("receive-rank0", "receive-rank1"), True),
+        ("wait", ("recv_weight_fully_async-rank0", "recv_weight_fully_async-rank1"), True),
         ("ready", False),
+        ("wait", ("finish_forward_metrics-rank0", "finish_forward_metrics-rank1"), False),
     ]
 
 
@@ -219,12 +221,13 @@ def test_forward_receive_error_requires_global_even_after_sender_finishes(failed
     worker = component_methods(
         "actor_fwd.py",
         "ActorFwd",
-        ["compute_actor_log_prob"],
+        ["compute_actor_log_prob", "_receive_after_forward"],
         ray=SimpleNamespace(get=lambda value: value),
         wait_all=wait_all,
         UnsafeInferenceError=UnsafeInferenceError,
     )
-    worker._recovery = SimpleNamespace(state=SimpleNamespace(set_fwd_ready=remote(events.append)))
+    worker.role = "actor_fwd"
+    worker._recovery = SimpleNamespace(state=SimpleNamespace(set_fwd_ready=remote(events.append)), wait=wait_all)
     worker.actor_model = SimpleNamespace(
         async_compute_actor_log_prob=lambda step, **options: "compute",
         async_inference_call=lambda method, step: "recv",
@@ -239,23 +242,21 @@ def test_forward_receive_error_requires_global_even_after_sender_finishes(failed
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_hybrid_training_waits_for_all_ranks_when_recovery_enabled(enabled):
+def test_hybrid_training_uses_the_same_stages_with_or_without_recovery(enabled):
     wait, get = Mock(), Mock()
-    actor = component_methods("actor.py", "Actor", ["_execute_training"], wait_all=wait, ray=SimpleNamespace(get=get))
-    actor.config = SimpleNamespace(hybrid=True, fully_async=True, num_critic_only_steps=0)
+    actor = component_methods("actor.py", "Actor", ["_execute_training"], ray=SimpleNamespace(get=get))
+    actor.config = SimpleNamespace(hybrid=True, fully_async=True, num_critic_only_steps=0, train_backend="megatron")
     actor.step = 4
-    actor._recovery = SimpleNamespace(state=object() if enabled else None, synchronize=Mock())
-    refs = ["rank0", "rank1"]
-    actor.actor_model = SimpleNamespace(
-        train_hybrid=Mock(return_value=refs), async_inference_call=Mock(return_value=[])
+    actor._recovery = SimpleNamespace(
+        state=object() if enabled else None, wait=wait, synchronize=Mock(return_value=True)
     )
+    refs = ["rank0", "rank1"]
+    actor.actor_model = SimpleNamespace(train_hybrid=Mock(return_value=refs))
     assert actor._execute_training()
-    if enabled:
-        assert wait.call_args_list[0].args == (refs,)
-        actor.actor_model.async_inference_call.assert_called_once_with("finish_training_metrics", 4)
-    else:
-        get.assert_called_once_with(refs)
-    (get if enabled else wait).assert_not_called()
+    wait.assert_called_once_with(refs)
+    actor._recovery.synchronize.assert_called_once()
+    actor.actor_model.train_hybrid.assert_called_once_with(4)
+    get.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -269,7 +270,8 @@ def test_hybrid_training_waits_for_all_ranks_when_recovery_enabled(enabled):
         ("hybrid", "training_error"),
     ],
 )
-def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, outcome):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, outcome, enabled):
     from relax.components import actor as actor_module
     from relax.components import recovery
     from relax.distributed.ray import inference_sync
@@ -280,7 +282,9 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
         snapshot=remote(lambda: {"paused": True}),
         end_sync=remote(lambda: events.append("release")),
     )
-    gate = recovery.RecoveryGate(SimpleNamespace(inference_recovery_state=state), "actor")
+    if outcome == "paused" and not enabled:
+        outcome = "success"
+    gate = recovery.RecoveryGate(SimpleNamespace(inference_recovery_state=state if enabled else None), "actor")
     monkeypatch.setattr(recovery.ray, "get", lambda value, **kw: value)
 
     def settle(refs):
@@ -288,7 +292,11 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
         if (refs == "tail" and outcome == "tail_error") or (refs == "training" and outcome == "training_error"):
             raise RuntimeError("rank failed")
 
-    monkeypatch.setattr(inference_sync, "wait_all", settle)
+    monkeypatch.setattr(recovery, "wait_all", lambda refs, **kwargs: settle(refs))
+    monkeypatch.setattr(
+        recovery.ray, "get", lambda value, **kwargs: settle(value) if isinstance(value, str) else value
+    )
+    monkeypatch.setattr(inference_sync, "_evaluate_rollout", lambda *args, **kwargs: events.append("evaluate"))
     monkeypatch.setattr(inference_sync, "wait_for_previous_eval", Mock())
     monkeypatch.setattr(inference_sync, "check_services_health", Mock(return_value=(False, False)))
     execute = actor_module.Actor.func_or_class._execute_training
@@ -322,10 +330,18 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
     )
     actor = SimpleNamespace(
         config=SimpleNamespace(
-            hybrid=mode == "hybrid", fully_async=mode != "colocate", num_critic_only_steps=0, num_rollout=5
+            hybrid=mode == "hybrid",
+            fully_async=mode != "colocate",
+            num_critic_only_steps=0,
+            num_rollout=5,
+            train_backend="megatron",
+            debug_train_only=False,
+            debug_rollout_only=False,
         ),
         step=4,
         actor_model=group,
+        rollout_manager=object(),
+        _managed_lora_publication=False,
         _recovery=gate,
         _maybe_save_model=lambda: events.append("save"),
     )
@@ -336,7 +352,8 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
         assert execute(actor)
     expected = ["training"]
     if outcome != "training_error":
-        expected += ["reserve"]
+        if enabled:
+            expected += ["reserve"]
         if outcome != "paused":
             if mode != "colocate":
                 expected += ["wait_recorded"]
@@ -344,14 +361,18 @@ def test_component_owns_sync_after_all_training_ranks_settle(monkeypatch, mode, 
             if outcome == "success":
                 if mode == "colocate":
                     expected += ["flush", "flushed"]
-                expected += ["evaluate", "evaluated", "release"]
-        if outcome in {"success", "paused"} and (mode != "colocate" or outcome == "paused"):
+                expected += ["evaluate"]
+                if mode != "colocate":
+                    expected += ["flush", "flushed"]
+                if enabled:
+                    expected += ["release"]
+        else:
             expected += ["flush", "flushed"]
         if mode == "fully_async" and outcome in {"success", "paused"}:
             expected += ["save"]
     assert events == expected
     method = {"colocate": "async_train", "hybrid": "train_hybrid", "fully_async": "train_fully_async"}[mode]
-    getattr(group, method).assert_called_once_with(4, defer_inference=True)
+    getattr(group, method).assert_called_once_with(4)
 
 
 @pytest.mark.parametrize("paused", [False, True])
@@ -399,3 +420,78 @@ async def test_rollout_discard_window_waits_for_its_data_source(monkeypatch, dis
         await operation(component)
         discard.assert_awaited_once_with()
         reset.assert_awaited_once_with()
+
+
+def test_fsdp_component_does_not_dispatch_megatron_tail():
+    actor = component_methods("actor.py", "Actor", ["_execute_training"])
+    actor.config = SimpleNamespace(train_backend="fsdp", hybrid=False, fully_async=False, num_critic_only_steps=0)
+    actor.step = 2
+    actor.actor_model = SimpleNamespace(async_train=Mock(return_value=["fsdp-step"]))
+    actor._recovery = SimpleNamespace(wait=Mock(), synchronize=Mock())
+    assert actor._execute_training()
+    actor.actor_model.async_train.assert_called_once_with(2)
+    actor._recovery.wait.assert_called_once_with(["fsdp-step"])
+    actor._recovery.synchronize.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["actor_fwd", "reference"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_forward_roles_receive_once_and_only_actor_fwd_sets_readiness(role, enabled):
+    events = []
+    worker = component_methods(
+        "actor_fwd.py",
+        "ActorFwd",
+        ["compute_actor_log_prob", "compute_ref_log_prob", "_receive_after_forward"],
+        ray=SimpleNamespace(get=lambda value: value),
+    )
+    worker.role = role
+    state = SimpleNamespace(set_fwd_ready=remote(lambda value: events.append(("ready", value)))) if enabled else None
+    worker._recovery = SimpleNamespace(state=state, wait=lambda refs: events.append(refs))
+    worker.actor_model = SimpleNamespace(
+        async_compute_actor_log_prob=lambda step: ("compute", step),
+        async_compute_ref_log_prob=lambda step: ("compute", step),
+        async_inference_call=lambda method, step: (method, step),
+    )
+    method = worker.compute_actor_log_prob if role == "actor_fwd" else worker.compute_ref_log_prob
+    method(5)
+    expected = [("compute", 5)]
+    if enabled and role == "actor_fwd":
+        expected += [("ready", True)]
+    expected += [("recv_weight_fully_async", 5)]
+    if enabled and role == "actor_fwd":
+        expected += [("ready", False)]
+    assert events == expected + [("finish_forward_metrics", 5)]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_recovery_gate_changes_wait_deadline_without_changing_stages(monkeypatch, enabled):
+    from relax.components import recovery
+
+    wait = Mock(return_value=["done"])
+    monkeypatch.setattr(recovery, "wait_all", wait)
+    get = Mock(return_value=["done"])
+    monkeypatch.setattr(recovery.ray, "get", get)
+    gate = recovery.RecoveryGate(SimpleNamespace(inference_recovery_state=object() if enabled else None), "actor")
+    assert gate.wait(["rank"]) == ["done"]
+    if enabled:
+        wait.assert_called_once_with(["rank"])
+        get.assert_not_called()
+    else:
+        get.assert_called_once_with(["rank"])
+        wait.assert_not_called()
+
+
+@pytest.mark.parametrize("sync_step", [0, 7])
+def test_initial_and_recovery_sync_use_one_explicit_step_for_sender_and_receiver(sync_step):
+    sender = component_methods("actor.py", "Actor", ["update_weights_fully_async"])
+    receiver = component_methods("actor_fwd.py", "ActorFwd", ["recv_weight_fully_async"])
+    sender.step, receiver.step = 5, 0
+    receiver.role = "reference"
+    for service in (sender, receiver):
+        service.actor_model = SimpleNamespace(async_inference_call=Mock(return_value=[]))
+        service._recovery = SimpleNamespace(wait=lambda refs: refs)
+    options = {"sync_step": sync_step} if sync_step else {}
+    sender.update_weights_fully_async(**options)
+    receiver.recv_weight_fully_async(**options)
+    assert sender.actor_model.async_inference_call.call_args.args[:2] == ("update_weights_fully_async", sync_step)
+    receiver.actor_model.async_inference_call.assert_called_once_with("recv_weight_fully_async", sync_step)

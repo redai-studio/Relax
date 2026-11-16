@@ -600,10 +600,14 @@ async def test_activation_publishes_and_registers_only_current_recovery(
         return
     assert await controller._synchronize_inference_recovery(role, state, step=3) == 1
     sender.reset_inference_transport.remote.assert_awaited_once_with(role)
-    sync_options = {"expected_rollout_actor_ids": ["A", "B"]} if role == "rollout" else {}
+    sync_options = {"sync_step": 3}
+    if role == "rollout":
+        sync_options["expected_rollout_actor_ids"] = ["A", "B"]
     sender.update_weights_fully_async.remote.assert_awaited_once_with(
         rollout_only=role == "rollout", actor_fwd_only=role == "actor_fwd", **sync_options
     )
+    if role == "actor_fwd":
+        failed.handle.recv_weight_fully_async.remote.assert_awaited_once_with(sync_step=3)
     activation = controller._activate_inference_recovery(role, state)
     if global_takeover:
         with pytest.raises(RuntimeError, match="Global restart has taken over"):

@@ -524,16 +524,18 @@ def test_actual_actor_setter_sync_matches_plan_condition(fully_async, hybrid, lo
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Actor")
     fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "set_rollout_manager")
     module = ast.Module(body=ast.parse("from __future__ import annotations").body + [fn], type_ignores=[])
-    namespace = {"is_offline_mode": is_offline_mode}
+    namespace = {"is_offline_mode": is_offline_mode, "ray": SimpleNamespace(get=lambda value: value)}
     exec(compile(ast.fix_missing_locations(module), str(ROOT / "relax/components/actor.py"), "exec"), namespace)
     calls = []
     worker = SimpleNamespace(
         set_rollout_manager=lambda m: calls.append("manager"), update_weights=lambda: calls.append("sync")
     )
     owner = SimpleNamespace(
-        config=SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type), actor_model=worker
+        config=SimpleNamespace(fully_async=fully_async, hybrid=hybrid, loss_type=loss_type, train_backend="megatron"),
+        actor_model=worker,
     )
-    namespace[fn.name](owner, object())
+    manager = SimpleNamespace(get_lora_training_config=SimpleNamespace(remote=lambda: None))
+    namespace[fn.name](owner, manager)
     assert calls == (["manager", "sync"] if (not fully_async or hybrid) and loss_type is None else ["manager"])
 
 
