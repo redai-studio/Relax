@@ -1830,11 +1830,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
             # change the default value of eval_interval from Megatron to None
             _add_step_or_epoch_interval(parser, "--eval-interval")
-            parser.add_argument(
-                "--sft-eval-before-train",
-                action="store_true",
-                help="Evaluate native Megatron SFT before the first update; checkpoint resumes skip this pass.",
-            )
 
             parser.add_argument(
                 "--eval-prompt-data",
@@ -3420,15 +3415,14 @@ def _normalize_mtp_only_training_args(args) -> None:
 
 def _validate_sft_epoch_eval_args(args) -> None:
     epoch_interval = "epoch" in (getattr(args, "save_interval", None), getattr(args, "eval_interval", None))
-    initial_eval = getattr(args, "sft_eval_before_train", False)
-    if not (epoch_interval or initial_eval):
+    if not epoch_interval:
         return
     from relax.engine.sft.runtime import is_i2i_sft
 
     if not is_sft_mode(args) or is_i2i_sft(args) or getattr(args, "train_backend", "megatron") != "megatron":
-        raise ValueError("Epoch intervals and --sft-eval-before-train require native Megatron SFT.")
+        raise ValueError("Epoch intervals require native Megatron SFT.")
     if getattr(args, "custom_dataset_class_path", None):
-        raise ValueError("Epoch intervals and initial SFT eval require the native dataset.")
+        raise ValueError("Epoch intervals require the native dataset.")
     if epoch_interval and getattr(args, "rotate_ckpt", False):
         raise ValueError("Epoch intervals cannot be combined with --rotate-ckpt.")
     if epoch_interval and getattr(args, "save_retain_interval", None):
@@ -3441,14 +3435,7 @@ def _validate_sft_epoch_eval_args(args) -> None:
         or getattr(args, "debug_rollout_only", False)
         or getattr(args, "load_debug_rollout_data", None) is not None
     ):
-        raise ValueError(
-            "Epoch intervals and initial SFT eval require offline training without prediction/debug data."
-        )
-    if initial_eval:
-        if getattr(args, "eval_interval", None) is None:
-            raise ValueError("--sft-eval-before-train requires --eval-interval and an evaluation source.")
-        if getattr(args, "skip_eval_before_train", False):
-            raise ValueError("--sft-eval-before-train conflicts with --skip-eval-before-train.")
+        raise ValueError("Epoch intervals require offline training without prediction/debug data.")
 
 
 def _validate_sft_mask_reasoning_args(args) -> None:

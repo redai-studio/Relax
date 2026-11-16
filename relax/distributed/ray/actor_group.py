@@ -243,10 +243,6 @@ class RayTrainGroup:
         """Do one rollout training."""
         return [actor.train.remote(rollout_id) for actor in self._actor_handlers]
 
-    def evaluate_sft(self, completed_steps: int) -> None:
-        """All ranks must participate in the offline eval collectives."""
-        ray.get([actor.evaluate_sft.remote(completed_steps) for actor in self._actor_handlers])
-
     def async_compute_ref_log_prob(self, rollout_id):
         """Compute reference log prob for routing replay."""
         return [actor.compute_ref_log_prob.remote(rollout_id) for actor in self._actor_handlers]

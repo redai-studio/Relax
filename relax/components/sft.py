@@ -9,7 +9,7 @@ inside `backends/megatron/data.py:get_batch` — the producer only filters
 oversized samples and emits per-sample lists.
 
 When ``--eval-interval`` is set, the producer also pushes an eval batch on
-each configured step or epoch boundary, optionally before the first update. The eval set is split
+each configured step or epoch boundary. The eval set is split
 into ``ceil(n_eval / global_batch_size)`` chunks and pushed serially under
 ``partition_id=f"sft_eval_{step}_n{N}_{i}"`` (with backpressure between
 chunks) so each partition fits within TQ's per-step storage cap. The
@@ -1261,8 +1261,6 @@ class SFT(Base):
 
     async def _async_run(self) -> None:
         try:
-            if self.step == 0 and self.config.num_rollout > 0 and not self._stop_event.is_set():
-                await self._maybe_produce_eval(0)
             while self.step < self.config.num_rollout and not self._stop_event.is_set():
                 await self._produce_one_step()
         except Exception as exc:

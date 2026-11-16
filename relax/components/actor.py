@@ -18,7 +18,6 @@ from relax.engine.sft.runtime import (
     is_offline_mode,
     sft_partition_ids,
     sft_task_name,
-    should_run_sft_eval,
 )
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
@@ -180,7 +179,6 @@ class Actor(Base):
         """
 
         try:
-            self._maybe_run_initial_sft_eval()
             while True:
                 if self._stop_event.is_set():
                     break
@@ -234,18 +232,6 @@ class Actor(Base):
         # A requested stop is incomplete training, but not a health failure.
         if self.step < self.config.num_rollout:
             raise RuntimeError("Actor stopped before all training steps finished")
-
-    def _maybe_run_initial_sft_eval(self) -> None:
-        if (
-            self.step == 0
-            and self.config.num_rollout > 0
-            and not self._stop_event.is_set()
-            and not getattr(self, "_initial_sft_eval_done", False)
-            and should_run_sft_eval(self.config, 0)
-        ):
-            # The producer waits for eval to drain before publishing train_0.
-            self.actor_model.evaluate_sft(0)
-            self._initial_sft_eval_done = True
 
     def _wait_for_rollout_data(self) -> bool:
         """Wait for rollout data to be ready in async colocate mode.
@@ -353,7 +339,6 @@ class Actor(Base):
         metrics = {}
 
         try:
-            self._maybe_run_initial_sft_eval()
             # Check if rollout data is available for this step
             partition_ids = sft_partition_ids(self.config, step)
             partition_list = run(self.data_system_client.async_get_partition_list())

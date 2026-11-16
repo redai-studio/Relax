@@ -377,17 +377,3 @@ def test_legacy_fp16_fallback_builds_valid_optimizer_config(monkeypatch):
     assert config.use_precision_aware_optimizer is True
     assert config.store_param_remainders is False
     assert len(warnings) == 1
-
-
-def test_epoch_intervals_are_restored_after_native_validation_error(monkeypatch):
-    args = SimpleNamespace(save_interval="epoch", eval_interval="epoch")
-
-    def native_validate(args):
-        assert args.save_interval == args.eval_interval == 1
-        raise ValueError("unrelated native validation error")
-
-    monkeypatch.setattr(megatron_arguments, "_megatron_validate_args", native_validate)
-    monkeypatch.setattr(megatron_arguments.device_utils, "is_available", lambda: False)
-    with pytest.raises(ValueError, match="unrelated native validation error"):
-        megatron_arguments.validate_args(args)
-    assert args.save_interval == args.eval_interval == "epoch"

@@ -273,8 +273,6 @@ def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     interval = getattr(args, "eval_interval", None)
     if interval is None:
         return False
-    if completed_steps == 0:
-        return bool(getattr(args, "sft_eval_before_train", False))
     return interval_is_due(args, interval, completed_steps)
 
 

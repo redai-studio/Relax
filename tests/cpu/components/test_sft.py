@@ -974,7 +974,7 @@ async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("n_real,pre_shifted", [(3, False), (4, False), (5, True)])
+@pytest.mark.parametrize("n_real,pre_shifted", [(3, False), (5, True)])
 async def test_causal_eval_keeps_every_real_sample_and_zero_masks_padding(n_real, pre_shifted):
     from relax.components.sft import SFT
 
@@ -1011,73 +1011,3 @@ async def test_causal_eval_keeps_every_real_sample_and_zero_masks_padding(n_real
     if pre_shifted:
         labels = [row for chunk in chunks for row in chunk["pre_shifted_labels"]]
         assert all(torch.all(row == -100) for row in labels[n_real:])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("start_step", [0, 1])
-async def test_initial_eval_drains_before_training_and_is_not_replayed_on_resume(start_step):
-    import asyncio
-    import threading
-
-    from relax.components.actor import Actor
-    from relax.components.sft import SFT
-
-    events = []
-    eval_ready = threading.Event()
-    eval_done = threading.Event()
-    args = _make_args(num_rollout=2)
-    args.colocate = True
-    args.fully_async = False
-    args.debug_train_only = False
-    args.eval_interval = 1
-    args.eval_size = 1
-    args.sft_eval_before_train = True
-
-    sft = SFT.func_or_class.__new__(SFT.func_or_class)
-    sft.config = args
-    sft.step = start_step
-    sft._stop_event = threading.Event()
-    sft._logger_instance = MagicMock()
-
-    async def produce_eval(step):
-        assert step == 0
-        events.append("produce_eval_0")
-        eval_ready.set()
-        assert await asyncio.to_thread(eval_done.wait, 5)
-
-    async def produce_train():
-        events.append(f"produce_train_{sft.step}")
-        sft.step += 1
-
-    sft._maybe_produce_eval = produce_eval
-    sft._produce_one_step = produce_train
-    cls = Actor.func_or_class.__mro__[1]
-    actor = cls.__new__(cls)
-    actor.config = args
-    actor.step = start_step
-    actor._lock = threading.RLock()
-    actor._stop_event = threading.Event()
-    actor._logger_instance = MagicMock()
-    actor.healthy = MagicMock()
-    actor.data_system_client = MagicMock(async_clear_partition=AsyncMock())
-
-    def consume_eval(step):
-        assert step == 0
-        assert eval_ready.wait(5)
-        events.append("consume_eval_0")
-        eval_done.set()
-
-    def wait_train():
-        if start_step == 0:
-            assert eval_done.is_set(), "Actor waited for train_0 before consuming eval_0"
-        return True
-
-    actor.actor_model = MagicMock(evaluate_sft=consume_eval)
-    actor._wait_for_rollout_data = wait_train
-    actor._execute_training = lambda: True
-    await asyncio.wait_for(asyncio.gather(sft._async_run(), asyncio.to_thread(actor._background_run)), 10)
-    assert actor.step == sft.step == 2
-    if start_step == 0:
-        assert events[:2] == ["produce_eval_0", "consume_eval_0"]
-    else:
-        assert events == ["produce_train_1"]

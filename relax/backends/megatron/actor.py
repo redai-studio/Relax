@@ -1358,13 +1358,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
-    def evaluate_sft(self, completed_steps: int) -> None:
-        """Run offline evaluation on every rank before requesting training
-        data."""
-        if not is_offline_mode(self.args):
-            raise ValueError("evaluate_sft requires offline training.")
-        self._run_step_evaluation(completed_steps)
-
     def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         is_offline = is_offline_mode(self.args)
         has_rollout = getattr(self, "rollout_manager", None) is not None
