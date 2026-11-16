@@ -3169,7 +3169,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
-    slime_validate_args(args)
+    relax_validate_args(args)
 
     if args.train_backend == "fsdp":
         from relax.backends.fsdp.arguments import validate_generative_config
@@ -4058,7 +4058,16 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
         )
 
 
-def slime_validate_args(args):
+def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
+    if args.colocate and not args.rollout_num_gpus:
+        args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
+    else:
+        args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
+        args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
+    args.colocate = False
+
+
+def relax_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
@@ -4566,12 +4575,7 @@ def slime_validate_args(args):
     del args.offload
 
     if args.debug_rollout_only:
-        if args.colocate and (not args.rollout_num_gpus):
-            args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-        else:
-            args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
-            args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
-        args.colocate = False
+        _configure_rollout_only_gpus(args)
         args.offload_train = args.offload_rollout = False
         if args.train_memory_margin_bytes > 0:
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
