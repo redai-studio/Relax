@@ -203,6 +203,7 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
     engine.num_gpus_per_engine = 1
     engine.server_host = "engine-b"
     engine.server_port = 30000
+    engine._sync_nextn_draft = False
     engine.args = SimpleNamespace(fully_async=True, coordinator_url="http://coordinator")
     create_client = AsyncMock()
     monkeypatch.setattr(sglang_engine, "create_client", create_client)
@@ -212,6 +213,7 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
     )
     engine.register_dcs()
     assert create_client.call_args.kwargs["metadata"]["actor_id"] == "actor-b"
+    assert create_client.call_args.kwargs["metadata"]["sync_nextn_draft"] is False
 
 
 @pytest.mark.asyncio

@@ -192,14 +192,14 @@ def test_opd_sampled_token_loss_is_accepted(arguments_module):
 
     # student_sampled + loss mode is supported via the 1D reverse-KL path
     # (see compute_policy_opd_loss); validation must not reject it.
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
 
 def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments_module):
     args = _opd_args()
     args.colocate = True
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert args.rollout_num_gpus == 4
 
@@ -212,7 +212,7 @@ def test_rollout_only_preserves_multi_teacher_gpu_split(arguments_module, rollou
     args.opd_teacher_routes = '{"math": "/math", "code": "/code"}'
     args.rollout_num_gpus = rollout_gpus
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert args.colocate
     assert args.rollout_num_gpus == 4
@@ -227,7 +227,7 @@ def test_rollout_only_with_external_teacher_uses_student_gpus(arguments_module) 
     args.opd_teacher_url = "http://teacher/generate"
     del args.resource["teacher"]
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert not args.colocate
     assert args.actor_num_gpus_per_node * args.actor_num_nodes == args.rollout_num_gpus == 4
@@ -250,7 +250,7 @@ def test_sequence_classification_accepts_multimodal_keys(arguments_module):
     args.custom_dataset_class_path = None
     args.save_hf = None
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert args.multimodal_keys == {"image": "images"}
 
@@ -268,7 +268,7 @@ def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     args.max_tokens_per_gpu = 4096
     args.rollout_max_context_len = 4096
 
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
 
     assert args.dynamic_context_parallel is True
     assert args.eval_interval == 10
