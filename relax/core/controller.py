@@ -1515,9 +1515,12 @@ class Controller:
                         rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
                         # Register a thread-safe future so restart can unblock
                         # this wait before shutting down the Ray connection.
-                        drain_future = rollout_manager.drain_eval_judges.remote().future()
-                        with self._pending_task_refs_lock:
-                            self._pending_task_refs.append(drain_future)
+                        with self._restart_lock:
+                            if self._restarting:
+                                raise RuntimeError("Global restart has taken over eval judge drain")
+                            drain_future = rollout_manager.drain_eval_judges.remote().future()
+                            with self._pending_task_refs_lock:
+                                self._pending_task_refs.append(drain_future)
                         await asyncio.wrap_future(drain_future)
                     logger.info("Service task completed successfully")
                 except asyncio.CancelledError as e:

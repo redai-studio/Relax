@@ -400,6 +400,103 @@ def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
         assert (role, recovery_state, recovery.step) == ("actor_fwd", state, 2)
 
 
+@pytest.mark.parametrize("takeover", [None, "during_lookup", "after_registration"])
+def test_eval_drain_registration_respects_global_takeover(monkeypatch, takeover):
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    controller.config = SimpleNamespace(
+        fully_async=True, hybrid=False, debug_train_only=False, debug_rollout_only=False
+    )
+    controller._teacher_manager = None
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    controller._report_error_to_metrics_service = Mock()
+    monkeypatch.setattr(controller_module, "run", asyncio.run)
+    monkeypatch.setattr(controller_module, "set_managed_opd_teacher_on_actor_service", AsyncMock())
+    monkeypatch.setattr(controller_module, "_needs_rollout_manager_setup", lambda services: False)
+    lookup_started, release_lookup, waiting = threading.Event(), threading.Event(), threading.Event()
+
+    class DrainFuture(Future):
+        def add_done_callback(self, callback):
+            super().add_done_callback(callback)
+            waiting.set()  # wrap_future runs only after the drain was registered.
+
+    drained = DrainFuture()
+    submit = Mock(return_value=SimpleNamespace(future=lambda: drained))
+    manager = SimpleNamespace(drain_eval_judges=SimpleNamespace(remote=submit))
+
+    async def get_manager():
+        lookup_started.set()
+        if takeover == "during_lookup":
+            assert await asyncio.to_thread(release_lookup.wait, 2)
+        return manager
+
+    async def completed():
+        return None
+
+    controller.serve_dict = {
+        "rollout": SimpleNamespace(
+            role="rollout", run=lambda: asyncio.create_task(completed()), get_rollout_manager=get_manager
+        )
+    }
+    cancel_pending = controller._cancel_pending_tasks
+
+    def cancel():
+        cancel_pending()
+        release_lookup.set()  # The delayed lookup returns after the cancellation snapshot.
+
+    controller._cancel_pending_tasks = cancel
+
+    def rebuild():
+        assert controller._training_wait_done.is_set()
+        controller.serve_dict.clear()  # A fresh empty generation completes without a model.
+
+    controller._run_global_restart = Mock(side_effect=rebuild)
+    exit_process = Mock(side_effect=SystemExit(1))
+    monkeypatch.setattr(controller_module.os, "_exit", exit_process)
+    errors = []
+
+    def train():
+        try:
+            controller.training_loop()
+        except BaseException as error:
+            errors.append(error)
+
+    training = threading.Thread(target=train)
+    restart = threading.Thread(target=controller.restart_serve, args=("actor",))
+    training.start()
+    try:
+        if takeover == "during_lookup":
+            assert lookup_started.wait(2)
+        else:
+            assert waiting.wait(2)
+        if takeover is None:
+            assert training.is_alive() and not controller._training_wait_done.is_set()
+            drained.set_result(None)
+        else:
+            restart.start()
+            restart.join(timeout=3)
+            assert not restart.is_alive()
+        exit_process.assert_not_called()
+        training.join(timeout=3)
+        assert not training.is_alive() and not errors
+        assert controller._training_wait_done.is_set()
+        if takeover is None:
+            submit.assert_called_once_with()
+            controller._run_global_restart.assert_not_called()
+        else:
+            controller._run_global_restart.assert_called_once_with()
+            if takeover == "during_lookup":
+                submit.assert_not_called()
+            else:
+                assert drained.cancelled()
+    finally:
+        release_lookup.set()
+        drained.cancel()
+        training.join(timeout=3)
+        if restart.ident is not None:
+            restart.join(timeout=3)
+
+
 def test_old_global_owner_does_not_publish_completion_into_next_cycle(monkeypatch):
     controller = _controller_shell()
     _patch_restart_entry(monkeypatch, controller)
