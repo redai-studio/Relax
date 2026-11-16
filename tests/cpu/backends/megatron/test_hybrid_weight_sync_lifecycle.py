@@ -167,6 +167,31 @@ def test_hybrid_training_restores_offload_before_first_parallel_query(hybrid_act
         actor.train_hybrid(0)
 
 
+@pytest.mark.parametrize("startup_offloaded", [False, True])
+def test_sft_startup_restores_once_before_resumed_training(hybrid_actor, monkeypatch, startup_offloaded):
+    actor, state = hybrid_actor
+    vars(actor.args).update(loss_type="sft", hybrid=False, fully_async=False, global_batch_size=4)
+    actor._sft_startup_offloaded = startup_offloaded
+    if startup_offloaded:
+        actor.sleep()
+    state.events.clear()
+
+    class StopBeforeTraining(Exception):
+        pass
+
+    def query(**kwargs):
+        assert state.awake and state.tp_group is not None
+        raise StopBeforeTraining
+
+    monkeypatch.setattr(actor_module.mpu, "get_data_parallel_world_size", query)
+    # A resumed run starts at a nonzero step; subsequent SFT steps stay resident.
+    for step in (4, 5):
+        with pytest.raises(StopBeforeTraining):
+            actor.train(step)
+    assert state.events == (["reload", "reload_groups"] if startup_offloaded else [])
+    assert not actor._sft_startup_offloaded
+
+
 @pytest.mark.parametrize("save_checkpoint", [False, True])
 @pytest.mark.parametrize("handshake_ok", [False, True])
 def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(

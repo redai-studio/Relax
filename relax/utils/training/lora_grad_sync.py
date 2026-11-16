@@ -3,6 +3,32 @@
 from typing import Any
 
 import torch
+import torch.distributed as dist
+
+
+def mark_expert_adapter_optimizer_replicas(optimizer: Any, *, expert_group: dist.ProcessGroup) -> int:
+    """Exclude EP copies of shared adapters from distributed optimizer norms.
+
+    Only optimizer-owned views may be marked: Bridge's model parameter-norm
+    routine requires expert model parameters themselves to remain unshared.
+    Expert-DP shards on every EP-rank-zero participant still contribute, and
+    clipping/updates continue to visit all replicas. Non-distributed optimizers
+    without a model-to-owned-shard mapping are outside this helper's scope.
+    """
+    if dist.get_rank(group=expert_group) == 0:
+        return 0
+    marked = 0
+    for member in getattr(optimizer, "chained_optimizers", [optimizer]):
+        for model_param, (group_index, group_order) in getattr(member, "model_param_group_index_map", {}).items():
+            if not getattr(model_param, "expert_parallel_replicated", False):
+                continue
+            shard = member.optimizer.param_groups[group_index]["params"][group_order]
+            if shard is model_param:
+                raise RuntimeError("Shared expert norm exclusion requires an optimizer-owned parameter view")
+            if not getattr(shard, "shared", False):
+                shard.shared = True
+                marked += 1
+    return marked
 
 
 def exclude_replicated_expert_adapter_grads_from_norm(optimizer: Any, *, ep_rank: int) -> None:

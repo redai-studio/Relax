@@ -1,13 +1,124 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from datetime import timedelta
+from time import monotonic
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 
 pytest.importorskip("megatron.core", exc_type=ImportError)
+
+
+def _expert_adapter_finalize_worker(rank: int, rendezvous: str) -> None:
+    import torch
+    import torch.distributed as dist
+    from megatron.bridge.peft.utils import mark_expert_parallel_replicated
+
+    from relax.backends.megatron import model as module
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        singletons = [dist.new_group([index], backend="gloo") for index in range(2)]
+        groups = SimpleNamespace(
+            ep=dist.group.WORLD,
+            dp_cp=dist.group.WORLD,
+            tp=singletons[rank],
+            pp=singletons[rank],
+            embd=None,
+            pos_embd=None,
+        )
+
+        class Chunk(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fused = torch.nn.Parameter(torch.ones(1))
+                self.eager = torch.nn.Parameter(torch.ones(1))
+                self.unshared = torch.nn.Parameter(torch.ones(1))
+                self.config = SimpleNamespace(
+                    timers=None,
+                    moe_router_enable_expert_bias=False,
+                    moe_router_load_balancing_type="none",
+                    sequence_parallel=False,
+                    qk_layernorm=False,
+                    mtp_num_layers=None,
+                )
+
+            def finish_grad_sync(self, **kwargs) -> None:
+                # The DDP boundary is already complete; exercise real MCore
+                # token normalization and Bridge EP reduction below.
+                pass
+
+            def scale_gradients(self, scaling: torch.Tensor) -> None:
+                for parameter in self.parameters():
+                    grad = getattr(parameter, "main_grad", parameter.grad)
+                    if grad is not None:
+                        grad.mul_(scaling)
+
+        class Configured(Exception):
+            pass
+
+        for level in (0, 1):
+            chunk = Chunk()
+            mark_expert_parallel_replicated(chunk.fused, ep_group=groups.ep)
+            mark_expert_parallel_replicated(chunk.eager, ep_group=groups.ep)
+            args = Namespace(
+                lora_rank=16, empty_unused_memory_level=level, overlap_grad_reduce=False, overlap_param_gather=False
+            )
+            with (
+                patch.object(module, "get_args", return_value=args),
+                patch.object(module.mpu, "get_expert_model_parallel_group", return_value=groups.ep),
+                patch.object(module, "resident_sft_param_overlap_enabled", side_effect=Configured),
+                patch.object(module.device_module, "empty_cache"),
+                patch.object(module, "available_memory", return_value={}),
+            ):
+                # Repeated rollout setup must not stack reducers or retain
+                # per-layer fallback hooks (which double-count eager grads).
+                for _ in range(2):
+                    try:
+                        module.train(0, [chunk], SimpleNamespace(scale_loss=lambda x: x), None, [[]], [])
+                    except Configured:
+                        pass
+                chunk.fused.main_grad = torch.tensor([float(rank + 1)])
+                chunk.fused.grad_added_to_main_grad = True
+                (chunk.eager * (rank + 3) + chunk.unshared * (rank + 5)).sum().backward()
+                chunk.config.finalize_model_grads_func([chunk], torch.tensor(rank + 2), pg_collection=groups)
+            torch.testing.assert_close(chunk.fused.main_grad, torch.tensor([3 / 5]))
+            torch.testing.assert_close(chunk.eager.grad, torch.tensor([7 / 5]))
+            torch.testing.assert_close(chunk.unshared.grad, torch.tensor([(rank + 5) / 5]))
+            chunk.fused.grad = chunk.fused.main_grad
+            torch.optim.SGD([chunk.fused, chunk.eager], lr=0.1).step()
+            values = torch.cat([chunk.fused.detach(), chunk.eager.detach()])
+            copies = [torch.empty_like(values) for _ in range(2)]
+            dist.all_gather(copies, values, group=groups.ep)
+            torch.testing.assert_close(copies[0], copies[1], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_lora_finalize_sums_fused_and_eager_expert_grads_once(tmp_path):
+    """Two CPU ranks cover EP synchronization absent from metadata-only
+    tests."""
+    import torch.multiprocessing as mp
+
+    context = mp.spawn(
+        _expert_adapter_finalize_worker,
+        args=((tmp_path / "gloo-rendezvous").as_uri(),),
+        nprocs=2,
+        join=False,
+    )
+    deadline = monotonic() + 120
+    try:
+        while not context.join(timeout=max(0, deadline - monotonic())):
+            if monotonic() >= deadline:
+                raise TimeoutError("expert adapter gradient regression exceeded 120 seconds")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
 
 
 def test_gradient_finalization_releases_cache_before_collectives(monkeypatch):

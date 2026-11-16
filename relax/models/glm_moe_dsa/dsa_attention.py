@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 """
 DSAMLASelfAttention: Fused Dynamic Sparse Attention with Multi-Latent Attention.
 
@@ -6,7 +8,7 @@ Ported from https://github.com/THUDM/slime (slime_plugins/models/glm5/glm5.py).
 Key improvements over Megatron Core's native DSAttention:
   1. Context Parallelism (CP) support via gather/scatter on sequence parallel regions
   2. Fused SparseMLA kernel (tilelang) — never materializes O(n^2) attention matrix
-  3. Fused indexer kernel (tilelang) — avoids O(n^2) score materialization
+  3. Query-blocked indexer kernel and GLM-5.2/5.3 cross-layer index sharing
   4. Absorbed MLA — absorbs KV up-projection into query for memory efficiency
 """
 
@@ -36,7 +38,10 @@ from megatron.core.transformer.moe.moe_utils import RouterGatingLinearFunction a
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+from .index_sharing import shared_topk, validate_stage
+from .lora import absorbed_kv_weight, fused_norm_weight
 from .ops.indexer import generate_varlen_mask_params, lighting_indexer
 from .ops.sparse_mla import SparseMLA
 
@@ -79,6 +84,8 @@ class DSAMultiLatentAttention(Attention):
         cp_comm_type: str | None = None,
         model_comm_pgs=None,
         pg_collection=None,
+        pp_layer_offset: int | None = None,
+        name: str | None = None,
     ) -> None:
         super().__init__(
             config=config,
@@ -88,6 +95,9 @@ class DSAMultiLatentAttention(Attention):
             attn_mask_type=attn_mask_type,
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
+            name=name,
         )
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
@@ -142,7 +152,13 @@ class DSAMultiLatentAttention(Attention):
             tp_group=self.pg_collection.tp,
         )
 
-        self.index_topk = 2048
+        self.index_topk = getattr(config, "dsa_indexer_topk", 2048)
+        sources = getattr(config, "glm_dsa_index_sources", ())
+        # MTP uses local layer numbers and its own indexer weights. It must not
+        # accidentally consume a decoder entry with the same layer number.
+        self.index_share = not is_mtp_layer and any(i != source for i, source in enumerate(sources, 1))
+        self.index_source_layer = sources[layer_number - 1] if self.index_share else layer_number
+        self.skip_topk = self.index_source_layer != layer_number
 
     def forward(
         self,
@@ -184,9 +200,9 @@ class DSAMultiLatentAttention(Attention):
             inference_context=inference_context,
         )
 
-        def fused_select_topk(index_q, index_k, w, starts, ends, block_size=8192):
+        @torch.no_grad()
+        def fused_select_topk(index_q, index_k, w, starts, ends, block_size=1024):
             seq_len = index_q.shape[0]
-            indexer_topk_scores = []
             topk_indices = []
             for start in range(0, seq_len, block_size):
                 end = min(start + block_size, seq_len)
@@ -194,7 +210,7 @@ class DSAMultiLatentAttention(Attention):
                 w_block = w[start:end]
                 starts_block = starts[start:end]
                 ends_block = ends[start:end]
-                indexer_topk_scores_block, topk_indices_block = lighting_indexer(
+                _, topk_indices_block = lighting_indexer(
                     index_q_block,
                     index_k,
                     w_block,
@@ -203,19 +219,24 @@ class DSAMultiLatentAttention(Attention):
                     self.index_topk,
                     topk_indices=None,
                 )
-                indexer_topk_scores_block = torch.softmax(indexer_topk_scores_block, dim=-1)
-                indexer_topk_scores.append(indexer_topk_scores_block)
                 topk_indices.append(topk_indices_block)
-            return torch.cat(indexer_topk_scores, dim=0), torch.cat(topk_indices, dim=0).unsqueeze(1)
+            return torch.cat(topk_indices, dim=0).unsqueeze(1)
 
-        starts, ends = generate_varlen_mask_params(packed_seq_params.cu_seqlens_q)
-        index_key = index_key.squeeze(1)
-        head_weights = head_weights.unsqueeze(-1)
+        def compute_topk():
+            # CP uses contiguous allgather-CP query shards and globally gathered K.
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+            if cu_seqlens is None:
+                cu_seqlens = packed_seq_params.cu_seqlens_q
+            starts, ends = generate_varlen_mask_params(cu_seqlens, seq_len=kv.shape[0])
+            starts = scatter_to_sequence_parallel_region(starts, group=self.pg_collection.cp)
+            ends = scatter_to_sequence_parallel_region(ends, group=self.pg_collection.cp)
+            return fused_select_topk(index_query, index_key.squeeze(1), head_weights.unsqueeze(-1), starts, ends)
 
-        starts = scatter_to_sequence_parallel_region(starts, group=parallel_state.get_context_parallel_group())
-        ends = scatter_to_sequence_parallel_region(ends, group=parallel_state.get_context_parallel_group())
-
-        _, topk_indices = fused_select_topk(index_query, index_key, head_weights, starts, ends)
+        topk_indices = (
+            shared_topk(packed_seq_params, self.layer_number, self.index_source_layer, compute_topk)
+            if self.index_share
+            else compute_topk()
+        )
 
         core_attn_out, _ = SparseMLA.apply(q, kv, topk_indices, self.softmax_scale)
         core_attn_out = torch.einsum("thm,hdm->thd", core_attn_out, wv)
@@ -251,6 +272,8 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         cp_comm_type: str | None = None,
         model_comm_pgs=None,
         pg_collection=None,
+        pp_layer_offset: int | None = None,
+        name: str | None = None,
     ):
         super().__init__(
             config=config,
@@ -262,6 +285,8 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             cp_comm_type=cp_comm_type,
             model_comm_pgs=model_comm_pgs,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
         q_down_proj_kwargs = {}
@@ -356,6 +381,10 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             eps=self.config.layernorm_epsilon,
         )
 
+        # Shared layers have no indexer tensors in the HF checkpoint.
+        if self.skip_topk:
+            return
+
         # added for indexer
         indexer_linear_kwargs = dict(
             config=self.config,
@@ -439,8 +468,15 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         else:
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
 
-        cu_seqlens_q = packed_seq_params.cu_seqlens_q
-        cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+        # Allgather CP keeps real lengths separate from the physical buffer.
+        # Apex writes only the rows covered by cu_seqlens; using real lengths
+        # leaves the padded RoPE tail uninitialized and poisons backward.
+        cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+        if cu_seqlens_q is None:
+            cu_seqlens_q = packed_seq_params.cu_seqlens_q
+        cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+        if cu_seqlens_kv is None:
+            cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
 
         # =========================================
         # QKV down projection and layernorm
@@ -466,10 +502,14 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
         q_no_pe, q_pos_emb = torch.split(q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1)
 
-        w_kc, w_vc = self.linear_kv_up_proj.weight.unflatten(
-            0,
-            (-1, self.config.qk_head_dim + self.config.v_head_dim),
-        ).split([self.config.qk_head_dim, self.config.v_head_dim], dim=1)
+        w_kc, w_vc = (
+            absorbed_kv_weight(self.linear_kv_up_proj)
+            .unflatten(
+                0,
+                (-1, self.config.qk_head_dim + self.config.v_head_dim),
+            )
+            .split([self.config.qk_head_dim, self.config.v_head_dim], dim=1)
+        )
 
         # absorb
         q_no_pe = torch.einsum("thd,hdm->thm", q_no_pe, w_kc)
@@ -478,7 +518,7 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         kv_compressed = torch.nn.functional.rms_norm(
             kv_compressed.float(),
             normalized_shape=(kv_compressed.shape[-1],),
-            weight=self.linear_kv_up_proj.layer_norm_weight.float(),
+            weight=fused_norm_weight(self.linear_kv_up_proj).float(),
             eps=self.config.layernorm_epsilon,
         ).to(kv_compressed.dtype)
 
@@ -517,6 +557,9 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         query = query.contiguous()
         key = key.contiguous()
 
+        if self.skip_topk:
+            return query, key, w_vc, None, None, None
+
         # =========================================
         # Indexer
         # =========================================
@@ -533,7 +576,7 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         q_compressed = torch.nn.functional.rms_norm(
             q_compressed.float(),
             normalized_shape=(q_compressed.shape[-1],),
-            weight=self.linear_q_up_proj.layer_norm_weight.float(),
+            weight=fused_norm_weight(self.linear_q_up_proj).float(),
             eps=self.config.layernorm_epsilon,
         ).to(q_compressed.dtype)
         q_compressed = q_compressed.detach()
@@ -652,9 +695,24 @@ def get_glm5_dsa_spec(config, vp_stage=None):
 
     transformer_layer_spec = get_gpt_decoder_block_spec(config, **kwargs)
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+    sources = getattr(config, "glm_dsa_index_sources", ())
+    if sources:
+        validate_stage(sources, get_transformer_layer_offset(config, vp_stage=vp_stage), num_layers_to_build)
 
+    for layer_id in range(num_layers_to_build):
+        transformer_layer_spec.layer_specs[layer_id] = transform_glm5_layer_spec(
+            config, transformer_layer_spec.layer_specs[layer_id]
+        )
+
+    return transformer_layer_spec
+
+
+def transform_glm5_layer_spec(config: MLATransformerConfig, spec: ModuleSpec) -> ModuleSpec:
+    """Apply GLM attention to decoder specs and standalone MTP pipeline
+    specs."""
     backend = TESpecProvider()
-    self_attn_module_spec = ModuleSpec(
+    layer_spec = copy.deepcopy(spec)
+    layer_spec.submodules.self_attention = ModuleSpec(
         module=DSAMLASelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
         submodules=DSASelfAttentionSubmodules(
@@ -674,9 +732,4 @@ def get_glm5_dsa_spec(config, vp_stage=None):
         ),
     )
 
-    for layer_id in range(num_layers_to_build):
-        layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
-        layer_specs.submodules.self_attention = self_attn_module_spec
-        transformer_layer_spec.layer_specs[layer_id] = layer_specs
-
-    return transformer_layer_spec
+    return layer_spec

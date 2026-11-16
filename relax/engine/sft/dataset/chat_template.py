@@ -429,10 +429,40 @@ class _DeepSeekV4Dialect:
         return _MsgSpan(learn_start=cursor, span_end=cursor, next_cursor=cursor)
 
 
+class _GLMDialect:
+    """GLM role tokens delimit turns without a separate end-of-message
+    token."""
+
+    name = "glm"
+    _headers = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+
+    def matches(self, template: str | None) -> bool:
+        return bool(template) and "<|assistant|>" in template and "<|user|>" in template
+
+    def locate(self, text: str, cursor: int, msg: CanonicalMessage) -> _MsgSpan:
+        if msg.role == "tool":
+            opener, closer = "<tool_response>", "</tool_response>"
+            start = text.find(opener, cursor)
+            end = text.find(closer, start + len(opener)) if start >= 0 else -1
+            if start < 0 or end < 0:
+                raise RuntimeError(f"could not locate GLM tool response after cursor {cursor}")
+            return _MsgSpan(start + len(opener), end, end + len(closer))
+        header = f"<|{msg.role}|>"
+        start = text.find(header, cursor)
+        if start < 0:
+            raise RuntimeError(f"could not locate GLM {msg.role!r} message after cursor {cursor}")
+        start += len(header)
+        ends = [pos for marker in self._headers if (pos := text.find(marker, start)) >= 0]
+        end = min(ends, default=len(text))
+        if msg.role == "assistant" and text.startswith(_THINK_OPEN_TAG, start):
+            start += len(_THINK_OPEN_TAG)
+        return _MsgSpan(start, end, end)
+
+
 # ChatML is the implicit default: unknown non-ChatML templates degrade to it
 # rather than mis-parsing. Non-default dialects are sniffed from the effective
 # template first.
-_NON_DEFAULT_DIALECTS: tuple[_ChatTemplateDialect, ...] = (_DeepSeekV4Dialect(),)
+_NON_DEFAULT_DIALECTS: tuple[_ChatTemplateDialect, ...] = (_DeepSeekV4Dialect(), _GLMDialect())
 _DEFAULT_DIALECT: _ChatTemplateDialect = _ChatMLDialect()
 
 
@@ -630,7 +660,7 @@ def _render_per_message_fallback(
       5. project char-mask → token-mask via a prefix-sum on ``offset_mapping``
 
     Requires a fast tokenizer; raises ``ValueError`` otherwise. Templates
-    outside the supported ChatML, DeepSeek-V4, and Gemma4 dialects should expose
+    outside the supported ChatML, DeepSeek-V4, GLM, and Gemma4 dialects should expose
     ``{% generation %}`` markers so Path 1 handles them natively.
     """
     deepseek_dialect = _select_dialect(effective_template)
@@ -698,7 +728,7 @@ def _render_per_message_fallback(
     char_mask = bytearray(len(rendered_text))  # zeros
     cursor = 0
     for msg_idx, msg in enumerate(sample.messages):
-        if deepseek_dialect.name == "deepseek_v4":
+        if deepseek_dialect.name in ("deepseek_v4", "glm"):
             span = deepseek_dialect.locate(rendered_text, cursor, msg)
             if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
                 mask_start = cursor if message_selection_only else span.learn_start
