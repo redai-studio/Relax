@@ -16,7 +16,8 @@ import torch.distributed.checkpoint as dcp
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from scripts.tools.convert_glm_lora_to_hf import adapter_targets, base_identity, convert
+from scripts.tools.lora_dcp import adapter_targets, base_identity
+from scripts.tools.merge_lora_adapter_to_hf import merge
 
 
 @pytest.fixture
@@ -111,7 +112,7 @@ def checkpoint(tmp_path):
 
 def test_real_dcp_export_merges_every_adapter_and_removes_quantization(checkpoint):
     dcp_dir, base, output, adapters, expected = checkpoint
-    report = convert(dcp_dir, base, output)
+    report = merge(base, output, checkpoint=dcp_dir)
     assert report["adapter_tensors"] == len(adapters)
     assert report["all_finite"]
     index = json.loads((output / "model.safetensors.index.json").read_text())
@@ -129,7 +130,7 @@ def test_base_identity_mismatch_refuses_to_publish(checkpoint):
     dcp_dir, base, output, _, _ = checkpoint
     (base / "config.json").write_text((base / "config.json").read_text() + "\n")
     with pytest.raises(ValueError, match="identity"):
-        convert(dcp_dir, base, output)
+        merge(base, output, checkpoint=dcp_dir)
     assert not output.exists()
 
 
@@ -144,3 +145,63 @@ def test_unknown_or_unmatched_adapter_is_rejected(suffix):
 def test_missing_adapter_half_is_rejected():
     with pytest.raises(ValueError, match="Incomplete"):
         adapter_targets({"decoder.layers.0.mlp.linear_fc1.adapter.linear_in.weight": (2, 3)}, {}, 2)
+
+
+def test_dcp_cli_dry_run_and_publish(checkpoint, monkeypatch):
+    from scripts.tools.merge_lora_adapter_to_hf import main
+
+    dcp_dir, base, output, _, expected = checkpoint
+    argv = [
+        "merge",
+        "--checkpoint",
+        str(dcp_dir),
+        "--base-hf-dir",
+        str(base),
+        "--output-dir",
+        str(output),
+        "--cpu-threads",
+        "1",
+    ]
+    monkeypatch.setattr("sys.argv", [*argv, "--dry-run"])
+    main()
+    assert not output.exists()
+    assert not output.with_name(output.name + ".partial").exists()
+    monkeypatch.setattr("sys.argv", argv)
+    main()
+    report = json.loads((output / "relax_conversion_report.json").read_text())
+    assert report["merged_matrices"] == len(expected) - 2
+    assert report["all_finite"]
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        main()
+
+
+def test_dcp_nonfinite_adapter_does_not_publish(checkpoint):
+    dcp_dir, base, output, adapters, _ = checkpoint
+    key = next(iter(adapters))
+    adapters[key].flatten()[0] = float("nan")
+    spec = {
+        "format_version": 1,
+        "lora_rank": 2,
+        "lora_alpha": 4,
+        "lora_dropout": 0,
+        "base_hf_checkpoint": base_identity(
+            base, json.loads((base / "model.safetensors.index.json").read_text())["weight_map"]
+        ),
+    }
+    dcp.save(adapters, checkpoint_id=dcp_dir)
+    torch.save({"args": Namespace(relax_lora_checkpoint_metadata=spec)}, dcp_dir / "common.pt")
+    with pytest.raises(ValueError, match="Nonfinite adapter"):
+        merge(base, output, checkpoint=dcp_dir)
+    assert not output.exists()
+
+
+def test_cli_rejects_ambiguous_adapter_input(monkeypatch):
+    from scripts.tools.merge_lora_adapter_to_hf import main
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["merge", "--checkpoint", "dcp", "--adapter-dir", "peft", "--base-hf-dir", "base", "--output-dir", "output"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2

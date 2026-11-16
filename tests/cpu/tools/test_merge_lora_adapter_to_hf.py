@@ -9,7 +9,7 @@ Its correctness rests on three pure steps that this file pins down:
 - resolving a pair to its base tensor, incl. grouped 3-D MoE expert parameters
 - the merge arithmetic itself (2-D linear and batched per-expert)
 
-Everything else (safetensors streaming, aux-file copying) is plumbing.
+Real-file CLI tests additionally cover shard I/O, FP8 bases and auxiliary files.
 """
 
 from __future__ import annotations
@@ -165,3 +165,78 @@ class TestReadAdapterScaling:
         (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
         with pytest.raises(ValueError, match="missing 'r' / 'lora_alpha'"):
             merge_lora._read_adapter_scaling(tmp_path)
+
+
+@pytest.mark.parametrize("layout", ["single", "sharded", "fp8"])
+def test_peft_cli_merges_real_shards_and_preserves_auxiliary_files(tmp_path, monkeypatch, layout):
+    """Exercise the shared writer, absent from the existing arithmetic tests.
+
+    Tiny CPU safetensors cover the old PEFT CLI and cross-shard FP8 scales; no
+    model, GPU, subprocess or distributed process is required.
+    """
+    from safetensors.torch import load_file, save_file
+
+    base, adapter, output = (tmp_path / name for name in ("base", "adapter", "output"))
+    base.mkdir()
+    adapter.mkdir()
+    weight = torch.tensor([[0.5, -0.25], [0.75, 1.0]], dtype=torch.bfloat16)
+    untouched = torch.tensor([0.125, 0.375], dtype=torch.float32)
+    a, b = torch.tensor([[0.2, -0.3]]), torch.tensor([[0.4], [-0.5]])
+    config = {"model_type": "test_vlm", "vision_config": {"hidden_size": 2}}
+    tensors = {"w.weight": weight, "vision.weight": untouched}
+    if layout == "fp8":
+        config["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+        tensors["w.weight"] = weight.to(torch.float8_e4m3fn)
+        tensors["w.weight_scale_inv"] = torch.tensor([[0.173]])
+        weight = (tensors["w.weight"].float() * 0.173).bfloat16()
+    if layout == "single":
+        groups = {"model.safetensors": tensors}
+    else:
+        groups = {
+            "model-1.safetensors": {"w.weight": tensors["w.weight"]},
+            "model-2.safetensors": {k: v for k, v in tensors.items() if k != "w.weight"},
+        }
+        index = {"weight_map": {key: name for name, values in groups.items() for key in values}}
+        (base / "model.safetensors.index.json").write_text(json.dumps(index))
+    for name, values in groups.items():
+        save_file(values, base / name)
+    (base / "config.json").write_text(json.dumps(config))
+    (base / "tokenizer_config.json").write_text('{"chat_template": "keep exactly"}')
+    (adapter / "adapter_config.json").write_text('{"r": 1, "lora_alpha": 2}')
+    save_file({"w.lora_A.weight": a, "w.lora_B.weight": b}, adapter / "adapter_model.safetensors")
+    before = {p.name: p.read_bytes() for p in base.iterdir()}
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "merge",
+            "--base-hf-dir",
+            str(base),
+            "--adapter-dir",
+            str(adapter),
+            "--output-dir",
+            str(output),
+            "--cpu-threads",
+            "1",
+        ],
+    )
+    merge_lora.main()
+    if (output / "model.safetensors.index.json").exists():
+        output_map = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    else:
+        output_map = dict.fromkeys(tensors, "model.safetensors")
+    actual = load_file(output / output_map["w.weight"])["w.weight"]
+    torch.testing.assert_close(actual, (weight.float() + 2 * (b @ a)).bfloat16(), rtol=0, atol=0)
+    torch.testing.assert_close(load_file(output / output_map["vision.weight"])["vision.weight"], untouched)
+    assert json.loads((output / "config.json").read_text())["vision_config"] == config["vision_config"]
+    assert (output / "tokenizer_config.json").read_bytes() == before["tokenizer_config.json"]
+    assert {p.name: p.read_bytes() for p in base.iterdir()} == before
+    if layout == "fp8":
+        assert "quantization_config" not in json.loads((output / "config.json").read_text())
+        assert "w.weight_scale_inv" not in output_map
+    else:
+        assert (output / "config.json").read_bytes() == before["config.json"]
+        if layout == "sharded":
+            assert (output / "model-2.safetensors").read_bytes() == before["model-2.safetensors"]
+    dry_output = tmp_path / "dry-output"
+    assert merge_lora.merge(base, dry_output, adapter_dir=adapter, dry_run=True)["dry_run"]
+    assert not dry_output.exists()

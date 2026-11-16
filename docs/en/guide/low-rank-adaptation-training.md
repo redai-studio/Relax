@@ -243,7 +243,20 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
 
-It merges at the **tensor** level rather than via `peft.merge_and_unload()`, on purpose: `AutoModelForCausalLM` silently resolves a multimodal checkpoint to its text-only class (dropping `vision_config` and the vision tower on re-save), and PEFT matches *modules* by name so it cannot see grouped MoE experts, which are 3-D `nn.Parameter` tensors — the bulk of the trained capacity on an A3B MoE. The tool streams one shard at a time (memory is bounded by the largest shard), copies `config.json` and auxiliary files verbatim, and treats an adapter tensor that fails to pair with a base tensor as a hard error rather than a silent drop.
+It merges at the **tensor** level rather than via `peft.merge_and_unload()`, on purpose: `AutoModelForCausalLM` silently resolves a multimodal checkpoint to its text-only class (dropping `vision_config` and the vision tower on re-save), and PEFT matches *modules* by name so it cannot see grouped MoE experts, which are 3-D `nn.Parameter` tensors — the bulk of the trained capacity on an A3B MoE. For unquantized PEFT input, the tool streams one shard at a time, preserves the base tensor dtypes, copies `config.json` and auxiliary files verbatim, and treats an adapter tensor that fails to pair with a base tensor as a hard error rather than a silent drop.
+
+For GLM-5.3 checkpoints saved with `--save-lora-only`, use `--checkpoint` instead of `--adapter-dir`. It accepts an iteration directory or a checkpoint root with `latest_checkpointed_iteration.txt`:
+
+```bash
+python scripts/tools/merge_lora_adapter_to_hf.py \
+    --base-hf-dir /path/to/GLM-5.3 \
+    --checkpoint /path/to/save/iter_0000049 \
+    --output-dir /path/to/GLM-5.3-merged
+```
+
+DCP input currently supports only `glm_moe_dsa` version-1 LoRA-only checkpoints with zero adapter dropout. Use the exact training base: its configuration, index and shard metadata must match the identity recorded at training time. Expert and gate/up layouts are mapped to HF keys before using the shared merge pipeline.
+
+Both input formats support block-128 FP8 bases: weights are dequantized and rounded to BF16 before adding LoRA, scale tensors are removed, and the output configuration drops `quantization_config`. Other quantization schemes are rejected. Memory use includes one base shard, arithmetic buffers, and up to four adapter pairs for DCP. `--cpu-threads` defaults to 16; `--device` controls merge matmuls. `--dry-run` checks metadata and mappings without writing outputs or validating all tensor values. DCP exports require a new output directory and publish from `.partial` only after validation; `--force` remains available only for PEFT exports.
 
 ## Troubleshooting
 
