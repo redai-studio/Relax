@@ -5,8 +5,8 @@
 # Validated sample lengths reached 113,569 tokens; 256K samples are not yet validated.
 # Existing 48-GPU Ray head; MODEL_DIR, DATA_DIR and SAVE_DIR are required.
 # Default: one epoch, with resumable checkpoints under SAVE_DIR/EXP_NAME.
-# NUM_STEPS overrides NUM_EPOCH; SAVE_INTERVAL=epoch rounds up to cover every epoch.
-# Integer intervals retain native full-batch counting. Eval flags can be passed as script arguments.
+# NUM_STEPS overrides NUM_EPOCH; SAVE_INTERVAL=epoch follows nominal epochs without changing training length.
+# Training length retains native full-batch counting. Eval flags can be passed as script arguments.
 # Short benchmark: NUM_STEPS=10 SAVE_CHECKPOINT=0 LR_DECAY_ITERS=32.
 # DRY_RUN=1 prints the effective argv/runtime environment without cluster access.
 set -eo pipefail
