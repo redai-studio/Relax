@@ -27,7 +27,9 @@ The default run makes two optimizer updates with four pairs per update. Use a
 whole number of batches in the JSONL file. Set `NUM_UPDATES` to change the
 training length. Use the same `SAVE_DIR` and `EXP_NAME` to resume from a saved
 native checkpoint. Set a new `EXP_NAME` for a fresh run.
-The example defaults to the Triton backend for Flash Linear Attention.
+Use a training image with a working Gated DeltaNet backward kernel. If the
+image provides a separate FLA compatibility runtime, set `RELAX_LEGACY_FLA_ROOT`
+to its directory to pass it to the Ray workers.
 
 The framework keeps each pair together through data-parallel assignment and
 uses the positives from the full data-parallel batch as InfoNCE candidates.

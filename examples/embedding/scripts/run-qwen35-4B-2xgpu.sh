@@ -19,18 +19,19 @@ if [[ -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
 fi
 source "${RELAX_ROOT}/scripts/models/qwen35-4B.sh"
 
-# Use FLA's Triton path for the portable two-GPU example.
-export FLA_TILELANG="${FLA_TILELANG:-0}"
-RUNTIME_ENV_JSON=$(python3 - <<'PY'
+if [[ -n "${RELAX_LEGACY_FLA_ROOT:-}" ]]; then
+    RUNTIME_ENV_JSON=$(python3 - <<'PY'
 import json
 import os
 
 runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
-runtime.setdefault("env_vars", {})["FLA_TILELANG"] = os.environ["FLA_TILELANG"]
+env = runtime.setdefault("env_vars", {})
+env["PYTHONPATH"] = os.pathsep.join(filter(None, (os.environ["RELAX_LEGACY_FLA_ROOT"], env.get("PYTHONPATH"))))
 print(json.dumps(runtime))
 PY
-)
-export RUNTIME_ENV_JSON
+    )
+    export RUNTIME_ENV_JSON
+fi
 
 EXP_NAME="${EXP_NAME:-qwen35-4b-embedding-2xgpu}"
 now=$(date '+%Y%m%d-%H%M%S')
