@@ -108,6 +108,11 @@ ENV_ARGS=(
     RELAX_SFT_MTP_ACCEPTANCE_METRICS=0
     RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K=32
     RELAX_QWEN38_QSA_SELECTOR_COMPILE=1
+    "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-torch}"
+    "RELAX_QWEN38_QSA_CP=${RELAX_QWEN38_QSA_CP:-0}"
+    "RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE=${RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE:-0}"
+    "RELAX_QWEN38_PLE_CP_FUSED_CONV=${RELAX_QWEN38_PLE_CP_FUSED_CONV:-0}"
+    "RELAX_QWEN38_QSA_CP_TP_SELECTOR=${RELAX_QWEN38_QSA_CP_TP_SELECTOR:-0}"
 )
 unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
 export "${ENV_ARGS[@]}"
@@ -130,11 +135,11 @@ PYRUNTIME
 )
 
 # Multimodal default: 12 / 14 / 14 / 8. Text recipe: 14 / 12 / 12 / 10.
-# DP = 32 / TP2 / PP4 / CP1 = 4 in both cases.
+# DP = 32 / TP2 / PP4 / CP; CP defaults to 1.
 PARALLEL_ARGS=(
     --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
-    --context-parallel-size 1
+    --context-parallel-size "${QWEN38_CP_SIZE:-1}"
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --pipeline-model-parallel-layout "${QWEN38_PP_LAYOUT:-Et*12|t*14|t*14|t*8mL}"

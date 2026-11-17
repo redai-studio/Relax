@@ -78,6 +78,8 @@ def test_mixed_bounds_survive_checkpoint_forward_and_replay(checkpoint_modules, 
     )
     selection = metadata.bind_document_bounds(native, (0, 2, 5))
     assert isinstance(selection, qsa.QSASelection)
+    selection._relax_qsa_query_positions = torch.tensor([0, 1, 8, 9, 10])
+    selection._relax_qsa_key_reorder = torch.tensor([0, 1, 4, 5, 2, 3, 6, 7])
     calls, replay, seen = [], [], []
 
     def checkpoint(fn, distributed, *args):
@@ -101,6 +103,8 @@ def test_mixed_bounds_survive_checkpoint_forward_and_replay(checkpoint_modules, 
     def sparse(q, k, v, selected, is_thd):
         seen.append(selected)
         assert selected is not selection
+        assert selected._relax_qsa_query_positions is selection._relax_qsa_query_positions
+        assert selected._relax_qsa_key_reorder is selection._relax_qsa_key_reorder
         assert selected.index_query is native.index_query
         assert selected.compressed_key is native.compressed_key
         return mixed.attention_for_selection(q, k, v, selected, 256**-0.5, is_thd)

@@ -383,12 +383,12 @@ class EngineGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
-    def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
+    def start_engines(self, port_cursors: dict[str, int] | None = None) -> tuple[list, dict[str, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()``
         without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
-        of Ray ObjectRefs and *port_cursors* maps node index → next free port.
+        of Ray ObjectRefs and *port_cursors* maps node IP → next free port.
         The caller should ``ray.get()`` on the handles to block until the
         engines are healthy, and pass *port_cursors* to the next engine group
         so that different groups on the same node don't race for ports.
@@ -783,7 +783,7 @@ class RolloutServer:
                 )
 
         all_handles = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
         groups_to_remove = []
 
         for g_idx, g in enumerate(groups):
@@ -999,7 +999,7 @@ class RolloutManager(ReloadableMixin):
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
-        self._port_cursors: dict[int, int] = {}
+        self._port_cursors: dict[str, int] = {}
 
         # Elastic scale-in tracking
         self._scale_in_requests: dict[str, ScaleInRequest] = {}
@@ -4856,14 +4856,8 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     rank_offset=0,
     base_port=15000,
 ):
-    # get ports
-    # there are 4 ports we need to allocate
-    # 1. server port
-    # 2. nccl port
-    # 3. dist_init_addr port
-    # 4. other ports for dp_attention, which is of size 4 + dp_size
-    _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
+    gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
+    nodes_per_engine = max(1, gpus_per_engine // args.num_gpus_per_node)
     addr_and_ports: dict[int, dict] = {}
 
     genrm_instances = getattr(args, "_genrm_instances_resolved", None)
@@ -4878,79 +4872,35 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
         genrm_ports = (_GENRM_PORT_BASE, _GENRM_PORT_BASE + genrm_count * _GENRM_PORT_WINDOW_SIZE)
 
-    # Track per-node port cursors so that different engine groups (called
-    # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
+    node_port_cursor: dict[str, int] = {}
 
-    visited_nodes = set()
-    for rank, engine in rollout_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_engines_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
+    def allocate_port(engine, host: str, consecutive: int = 1) -> int:
+        start = node_port_cursor.get(host, base_port)
+        while True:
+            _, port = ray.get(
+                engine._get_current_node_ip_and_free_port.remote(start_port=start, consecutive=consecutive)
+            )
+            # GenRM can reserve a window before it binds any of its ports.
+            if genrm_ports and port < genrm_ports[1] and port + consecutive > genrm_ports[0]:
+                start = genrm_ports[1]
+                continue
+            node_port_cursor[host] = port + consecutive
+            return port
 
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+    for rank, engine in sorted(rollout_engines, key=lambda item: item[0]):
+        host, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
+        ports = dict(host=host, port=allocate_port(engine, host), nccl_port=allocate_port(engine, host))
+        if worker_type == "prefill":
+            ports["disaggregation_bootstrap_port"] = allocate_port(engine, host)
 
-            def port(consecutive=1):
-                nonlocal start_port
-                while True:
-                    _, port = ray.get(
-                        engine._get_current_node_ip_and_free_port.remote(
-                            start_port=start_port,
-                            consecutive=consecutive,
-                        )
-                    )
-                    # GenRM may have allocated ports without binding yet. Exclude
-                    # its whole window, including blocks that cross the boundary.
-                    if genrm_ports and port < genrm_ports[1] and port + consecutive > genrm_ports[0]:
-                        start_port = genrm_ports[1]
-                        continue
-                    break
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
-
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-            if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
-
-        if _gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
-                # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
+        # Only the distributed rendezvous belongs to the TP group's head.
+        head_rank = rank - (rank - rank_offset) % nodes_per_engine
+        if rank == head_rank:
+            ports["dist_init_addr"] = f"{host}:{allocate_port(engine, host, 30 + args.sglang_dp_size)}"
         else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
-    for i, _ in rollout_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
-        logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
+            ports["dist_init_addr"] = addr_and_ports[head_rank]["dist_init_addr"]
+        addr_and_ports[rank] = ports
+        logger.info(f"Ports for engine {rank}: {ports}")
 
     return addr_and_ports, node_port_cursor
 
@@ -5364,7 +5314,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
 
         engine_groups: list[EngineGroup] = []
         all_init_handles: list = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
 
         for group_cfg in model_cfg.engine_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine
