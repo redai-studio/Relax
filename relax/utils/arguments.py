@@ -24,6 +24,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
+    is_managed_opd_teacher_colocate,
     is_managed_opd_teacher_enabled,
     teacher_sglang_parse_args,
     validate_managed_opd_teacher_colocate_args,
@@ -863,9 +864,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "When set under --loss-type sft, every N rollout steps run a predict pass "
-                    "over the eval dataset (--eval-prompt-data/--eval-config or --eval-size) and write "
-                    "completions to <save>/predict/predictions_step_<rollout_id>.jsonl. "
+                    "When set under --loss-type sft, every N completed training steps run a predict pass "
+                    "over the eval dataset (--eval-prompt-data or --eval-size) and write "
+                    "completions to <save>/predict/predictions_step_<train_step>.jsonl. "
+                    "With --custom-rm-path or --rm-type, also score predictions with evaluation=True; "
+                    "eligible judges run asynchronously unless --disable-eval-async-judge is set. "
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
@@ -1781,6 +1784,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_eval_arguments(parser):
             parser.add_argument(
+                "--disable-eval-async-judge",
+                action="store_true",
+                help=(
+                    "Disable background eval judging and wait for scoring after trajectory generation. "
+                    "Background judging is enabled by default. "
+                    "Supports remote_rm and custom rewards declaring reward_func.supports_async_eval = True. "
+                    "Uses a separate CPU reward pool; training and other rewards keep their existing behavior. "
+                    "Normal shutdown waits for pending scores."
+                ),
+            )
+            parser.add_argument(
                 "--eval-function-path",
                 type=str,
                 default=None,
@@ -2312,7 +2326,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # wandb
         def add_wandb_arguments(parser):
             # wandb parameters
-            parser.add_argument("--use-wandb", action="store_true", default=False)
+            parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=False)
             parser.add_argument(
                 "--wandb-mode",
                 type=str,
@@ -2393,7 +2407,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_clearml_arguments(parser):
             # TODO(yuetian): Reuse tb-experiment-name --tb-project-name as the ClearML experiment name currently.
             # Need to refactor the experiment management part later.
-            parser.add_argument("--use-clearml", action="store_true", default=False)
+            parser.add_argument("--use-clearml", action=argparse.BooleanOptionalAction, default=False)
 
             return parser
 
@@ -3169,7 +3183,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
-    slime_validate_args(args)
+    relax_validate_args(args)
 
     if args.train_backend == "fsdp":
         from relax.backends.fsdp.arguments import validate_generative_config
@@ -4058,7 +4072,20 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
         )
 
 
-def slime_validate_args(args):
+def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
+    if is_managed_opd_teacher_colocate(args):
+        # The configured rollout/teacher split also applies without a training actor.
+        return
+
+    if args.colocate and not args.rollout_num_gpus:
+        args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
+    else:
+        args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
+        args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
+    args.colocate = False
+
+
+def relax_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
@@ -4566,12 +4593,7 @@ def slime_validate_args(args):
     del args.offload
 
     if args.debug_rollout_only:
-        if args.colocate and (not args.rollout_num_gpus):
-            args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-        else:
-            args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
-            args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
-        args.colocate = False
+        _configure_rollout_only_gpus(args)
         args.offload_train = args.offload_rollout = False
         if args.train_memory_margin_bytes > 0:
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")

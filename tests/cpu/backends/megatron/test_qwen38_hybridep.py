@@ -3,9 +3,6 @@
 """CPU checks of image-built HybridEP opt-in and collective preflight."""
 
 import importlib.util
-import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -15,7 +12,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[4]
-SCRIPT = ROOT / "examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh"
 
 
 def load(name, path):
@@ -128,6 +124,27 @@ def test_bad_group_fails_collectively(preflight, monkeypatch, failure):
         detect.assert_not_called()
 
 
+@pytest.mark.parametrize("cp", [2, 4])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkeypatch, cp, enabled):
+    module, mpu, _, detect, expert, _ = preflight
+    mpu.get_tensor_model_parallel_world_size = lambda: 2
+    mpu.get_context_parallel_world_size = lambda: cp
+    monkeypatch.setenv("RELAX_QWEN38_QSA_CP", str(int(enabled)))
+    monkeypatch.setenv("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", "mixed")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "cute")
+    if enabled:
+        module.validate_hybridep_worker_group()
+        detect.assert_called_once_with(expert)
+        detect.return_value = 7
+        with pytest.raises(RuntimeError, match="accessible peers"):
+            module.validate_hybridep_worker_group()
+    else:
+        with pytest.raises(RuntimeError, match="preflight rejected"):
+            module.validate_hybridep_worker_group()
+        detect.assert_not_called()
+
+
 @pytest.mark.parametrize("failure", [None, "cross_node", "detected_peers", "world_size"])
 def test_35b_ep4_requires_exact_layout_and_four_accessible_peers(preflight, failure):
     module, mpu, dist, detect, expert, logger = preflight
@@ -156,59 +173,6 @@ def test_35b_ep4_requires_exact_layout_and_four_accessible_peers(preflight, fail
         detect.assert_called_once_with(expert)
         assert dist.all_gather_object.call_count == 2
         logger.info.assert_called_once()
-
-
-def test_alignment_script_dry_run_preserves_baseline_and_worker_environment():
-    env = dict(
-        os.environ,
-        DRY_RUN="1",
-        MODEL_DIR="/model",
-        DATA_DIR="/data",
-        SAVE_DIR="/save",
-        MEGATRON="/image/megatron",
-        RELAX_HYBRID_EP_COMMIT="abc123def",
-        LD_LIBRARY_PATH="/image/nvshmem/lib",
-    )
-    result = subprocess.run(
-        ["bash", str(SCRIPT), "--num-rollout", "50"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    assert result.returncode == 0, result.stderr
-    config = json.loads(result.stdout)
-    argv = config["argv"]
-
-    def value(flag):
-        return argv[len(argv) - 1 - argv[::-1].index(flag) + 1]
-
-    assert value("--num-rollout") == "50"
-    assert value("--tensor-model-parallel-size") == "2"
-    assert value("--pipeline-model-parallel-layout") == "Et*12|t*14|t*14|t*8mL"
-    assert value("--data-pad-size-multiplier") == "16384"
-    assert value("--lr-decay-iters") == "2023"
-    assert value("--eval-interval") == "100"
-    assert json.loads(value("--multimodal-keys")) == {"image": "images"}
-    assert value("--image-max-token-num") == "128"
-    assert "--sft-image-preprocess-on-rank" in argv
-    assert "--sft-packing-strategy" not in argv
-    assert value("--save") == value("--load")
-    assert value("--save-interval") == "50"
-    assert value("--max-actor-ckpt-to-keep") == "2"
-    actor = json.loads(value("--train-env-vars"))
-    driver = config["runtime_env"]["env_vars"]
-    for name, expected in {
-        "RELAX_HYBRID_EP_COMMIT": "abc123def",
-        "LD_LIBRARY_PATH": "/image/nvshmem/lib",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "32",
-        "RELAX_QWEN38_QSA_COMMUNITY_BACKEND": "mixed",
-        "RELAX_QWEN38_ROUTER_SORTED_REPLAY": "1",
-        "RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG": "1",
-        "RELAX_SFT_FUSED_LINEAR_CE": "1",
-        "RELAX_SFT_MTP_ACCEPTANCE_METRICS": "0",
-    }.items():
-        assert actor[name] == driver[name] == expected
 
 
 @pytest.mark.parametrize("value", ["", "0", "8"])

@@ -297,7 +297,7 @@ def get_model_provider_func(
 
     args._relax_qwen35_optimized = optimized_recipe(args)
     if args._relax_qwen35_optimized:
-        assert not getattr(args, "sft_async_prepack", False), "Whole-pack recipe requires foreground packing"
+        assert not getattr(args, "sft_async_prepack", False), "Qwen optimization recipe requires foreground packing"
         from relax.models.qwen3_5.deepep_backend import ensure_backend
 
         ensure_backend(args)
@@ -404,6 +404,8 @@ def get_model_provider_func(
             "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
+            "moe_megakernel_backend",
+            "moe_megakernel_backend_config",
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",

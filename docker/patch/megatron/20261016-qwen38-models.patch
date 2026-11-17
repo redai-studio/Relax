@@ -4151,7 +4151,7 @@ diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/trans
 index 3d88d5d..0d709f6 100644
 --- a/megatron/core/transformer/hyper_connection.py
 +++ b/megatron/core/transformer/hyper_connection.py
-@@ -990,6 +990,241 @@ class HyperConnectionModule(MegatronModule):
+@@ -990,6 +990,243 @@ class HyperConnectionModule(MegatronModule):
          return output
  
  
@@ -4180,7 +4180,7 @@ index 3d88d5d..0d709f6 100644
 +
 +
 +class GatedResidualMTPHiddenNorm(MegatronModule):
-+    """Normalize each MTP residual stream independently, with one gain per feature."""
++    """Normalize flattened MTP hidden streams, matching the SGLang draft model."""
 +
 +    def __init__(self, config: TransformerConfig, hidden_size: int, eps: float):
 +        super().__init__(config)
@@ -4197,10 +4197,12 @@ index 3d88d5d..0d709f6 100644
 +    def forward(self, hidden_states: Tensor) -> Tensor:
 +        shape = hidden_states.shape
 +        assert shape[-2:] == (self.num_streams, self.hidden_size)
-+        result = gated_residual_group_rmsnorm(
-+            hidden_states.flatten(-2), self.weight, self.num_streams, self.eps
-+        )
-+        return result.reshape(shape)
++        # MTP normalizes n*H jointly; backbone HC keeps independent stream norms.
++        flattened = hidden_states.flatten(-2).float()
++        variance = flattened.pow(2).mean(dim=-1, keepdim=True)
++        result = flattened * torch.rsqrt(variance + self.eps)
++        result = result * (1.0 + self.weight.float())
++        return result.to(hidden_states.dtype).reshape(shape)
 +
 +
 +class GatedResidualHyperConnection(MegatronModule):

@@ -23,6 +23,39 @@ from relax.backends.megatron.cp_utils import gdn_cp_slice, slice_with_cp
 DIRECTIONS = [("zigzag", "contiguous"), ("contiguous", "zigzag")]
 
 
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_producer_route_reused_after_mapping_and_geometry_changes(cp_size, monkeypatch):
+    """Exercise the real producer/map path; identical totals cannot identify a
+    route."""
+    from relax.backends.megatron.data import _prebuild_cp_route, move_tensors_to_device
+
+    packs = []
+    for lengths in ([3, 1, 2], [1, 3, 2]):
+        cu = _cu(lengths, 2 * cp_size)
+        packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+        _prebuild_cp_route(packed, cu.tolist(), cp_size, 0, torch.device("cpu"))
+        mapped = move_tensors_to_device(packed, torch.device("cpu"))
+        assert mapped.cp_partition_route is not packed.cp_partition_route
+        plans = [mapped.cp_partition_route]
+        plans.extend(routes.build_thd_cp_partition_route(cu, cp_size, rank) for rank in range(1, cp_size))
+        full = _tagged_tokens(int(cu[-1]))
+        for source, target in DIRECTIONS:
+            got = _apply_route_across_ranks(full, cu, cp_size, source, target, plans)
+            for rank, value in enumerate(got):
+                torch.testing.assert_close(value, full[_reference_rank_indices(cu, cp_size, rank, target)])
+        packs.append(mapped)
+
+    def unexpected_build(*args, **kwargs):
+        raise AssertionError("A producer route must be reused without consulting device cu-seqlens")
+
+    monkeypatch.setattr(routes, "build_thd_cp_partition_route", unexpected_build)
+    for packed in packs:
+        for source, target in DIRECTIONS:
+            assert routes.get_thd_cp_partition_route(packed, source, target) is packed.cp_partition_route
+    assert packs[0].cp_partition_route is not packs[1].cp_partition_route
+    assert not torch.equal(packs[0].cu_seqlens_q, packs[1].cu_seqlens_q)
+
+
 # Packed boundary shapes worth covering: single sequence, uneven multi-sequence,
 # and a duplicated boundary (an empty padding slot), which the compaction step
 # has to drop before the segments line up.

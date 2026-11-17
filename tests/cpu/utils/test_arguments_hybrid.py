@@ -21,40 +21,40 @@ def test_hybrid_parser_needs_no_backend_flag():
 @pytest.mark.parametrize("offload_flag", ["--offload-rollout", "--offload"])
 @pytest.mark.parametrize("elastic", [False, True])
 def test_hybrid_accepts_rollout_offload(offload_flag, elastic):
-    from relax.utils.arguments import slime_validate_args
+    from relax.utils.arguments import relax_validate_args
     from tests.cpu.utils.test_arguments_opd_teacher_colocate import _opd_args
 
     parser = argparse.ArgumentParser()
     get_slime_extra_args_provider()(parser)
     args = parser.parse_args(["--hybrid", offload_flag], namespace=Namespace(**vars(_opd_args())))
     args.autoscaler_config = "elastic.yaml" if elastic else None
-    slime_validate_args(args)
+    relax_validate_args(args)
     assert args.offload_rollout is True
     assert args.offload_train is (offload_flag == "--offload")
 
 
 @pytest.mark.parametrize("extra_flags", [[], ["--offload-train"], ["--no-offload-rollout"]])
 def test_hybrid_accepts_training_only_offload(extra_flags):
-    from relax.utils.arguments import slime_validate_args
+    from relax.utils.arguments import relax_validate_args
     from tests.cpu.utils.test_arguments_opd_teacher_colocate import _opd_args
 
     parser = argparse.ArgumentParser()
     get_slime_extra_args_provider()(parser)
     args = parser.parse_args(["--hybrid", *extra_flags], namespace=Namespace(**vars(_opd_args())))
-    slime_validate_args(args)
+    relax_validate_args(args)
     assert args.offload_rollout is False
     assert args.offload_train is ("--offload-train" in extra_flags)
 
 
 @pytest.mark.parametrize("offload_flag", ["--offload-rollout", "--offload"])
 def test_colocate_still_accepts_rollout_offload(offload_flag):
-    from relax.utils.arguments import slime_validate_args
+    from relax.utils.arguments import relax_validate_args
     from tests.cpu.utils.test_arguments_opd_teacher_colocate import _opd_args
 
     parser = argparse.ArgumentParser()
     get_slime_extra_args_provider()(parser)
     args = parser.parse_args(["--colocate", offload_flag], namespace=Namespace(**vars(_opd_args())))
-    slime_validate_args(args)
+    relax_validate_args(args)
     assert args.offload_rollout is True
 
 
@@ -84,7 +84,7 @@ def test_hybrid_init_weight_sync_routes_elastic_and_skips_offline(enabled, loss_
 
 @pytest.mark.parametrize("elastic", [False, True])
 def test_hybrid_requires_real_weights_backuper(elastic):
-    from relax.utils.arguments import slime_validate_args
+    from relax.utils.arguments import relax_validate_args
     from tests.cpu.utils.test_arguments_opd_teacher_colocate import _opd_args
 
     parser = argparse.ArgumentParser()
@@ -95,7 +95,7 @@ def test_hybrid_requires_real_weights_backuper(elastic):
     args.enable_weights_backuper = False
     args.autoscaler_config = "elastic.yaml" if elastic else None
     with pytest.raises(ValueError, match="Hybrid training requires the weights backuper"):
-        slime_validate_args(args)
+        relax_validate_args(args)
 
 
 @pytest.mark.parametrize("config_path", [None, "elastic.yaml"])

@@ -2,6 +2,33 @@
 
 [中文](./README.zh-CN.md)
 
+## Kimi K3.1 training entrypoints
+
+K3.1 uses two entrypoints: `scripts/run-kimi-k3.1-pro-sft.sh` for full SFT and `scripts/run-kimi-k3.1-pro-lora.sh` for LoRA. Both support text and multimodal data. Submit through `scripts/entrypoint/ray-job.sh`; submission blocks by default. `DRY_RUN=1` only prints arguments.
+
+Set `MODEL_DIR` to the original HF base, `DATA_DIR` to the dataset, and `SAVE_DIR` to a persistent checkpoint root. `EXP_NAME` identifies the experiment; save and resume share `${SAVE_DIR}/${EXP_NAME}`. `LOAD_DIR` can select another training checkpoint directory. Use a new save directory or experiment name for a new experiment.
+
+| Variable                                                   | Full SFT             | LoRA                |
+| ---------------------------------------------------------- | -------------------- | ------------------- |
+| `NUM_GPUS` / `TP_SIZE` / `PP_SIZE` / `CP_SIZE` / `EP_SIZE` | 128 / 4 / 4 / 8 / 32 | 64 / 4 / 4 / 4 / 16 |
+| `NUM_ROLLOUT`                                              | 1000                 | 200                 |
+| `GLOBAL_BATCH_SIZE`                                        | 512                  | 128                 |
+| `TRAIN_FILE` / `RAW_TEXT`                                  | train.parquet / 0    | train.parquet / 0   |
+| `SAVE_INTERVAL` / `SAVE_OPTIMIZER`                         | 100 / 1              | 10 / 1              |
+| `EVAL_INTERVAL`                                            | 0                    | 0                   |
+
+`PROMPT_DATA` overrides the training path. For evaluation, set `EVAL_INTERVAL` and `EVAL_FILE` relative to `DATA_DIR`. `NUM_ROLLOUT` maps to `--num-rollout`. Override learning rate, schedule length, token limit, adapter rank/alpha and first/last PP layers with `LR`, `LR_DECAY_STEPS`, `MAX_TOKENS_PER_GPU`, `LORA_RANK`/`LORA_ALPHA` and `PP_FIRST_LAYERS`/`PP_LAST_LAYERS`. Additional CLI arguments pass through to training.
+
+```bash
+# Set MODEL_DIR, DATA_DIR, SAVE_DIR and Ray addresses before submitting.
+TRAIN_FILE=train.jsonl RAW_TEXT=1 GLOBAL_BATCH_SIZE=256 NUM_ROLLOUT=100 EXP_NAME=k31-text bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=336 EXP_NAME=k31-multimodal bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+TRAIN_FILE=train.parquet NUM_ROLLOUT=1000 LR_DECAY_STEPS=1000 EXP_NAME=k31-lora bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-lora.sh
+TRAIN_FILE=train.absolute-images.jsonl GLOBAL_BATCH_SIZE=128 MAX_TOKENS_PER_GPU=16384 NUM_ROLLOUT=241 LR_DECAY_STEPS=241 EXP_NAME=k31-aim bash scripts/entrypoint/ray-job.sh examples/models/kimi-k3/scripts/run-kimi-k3.1-pro-sft.sh
+```
+
+DSA selection reuse and fused indexer are opt-in experiments: `RELAX_KIMI_K31_DSA_SELECTION_REUSE=1` and `RELAX_KIMI_K31_DSA_FUSED_INDEXER=1`, both off by default. Strict full-training numerical equivalence remains unverified. Model-only checkpoints (`SAVE_OPTIMIZER=0`) cannot restore Adam state exactly.
+
 ## Overview
 
 Relax provides full-parameter and LoRA SFT for Kimi K3, with image inputs, packing, fixed CP, PP and EP. The model configuration is `scripts/models/kimi-k3.sh`; public recipes live in `examples/models/kimi-k3/scripts/`.
@@ -93,6 +120,18 @@ The recorded optimization results reduced representative iteration time from abo
 | ![OpenR1-MM GRPO iteration time before optimization](./assets/openr1mm-grpo-step-time-before.png) | ![OpenR1-MM GRPO later iteration-time comparison](./assets/openr1mm-grpo-step-time.png) |
 
 Recipe: [`run-kimi-k3-openr1mm-128xblackwell-grpo.sh`](./scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh).
+
+## Kimi K3.1 Pro
+
+Use the official `moonshotai/Kimi-K3.1-Pro` checkpoint with `--trust-remote-code` and `--megatron-to-hf-mode bridge`. Relax selects its local K3.1 bridge from `KimiK31ForConditionalGeneration` / `kimi_k31`. The model configuration is `scripts/models/kimi-k3.1-pro.sh`; it reuses K3's backbone dimensions. Existing K3 SFT recipes can also read a K3.1 checkpoint by setting `MODEL_DIR` to that directory and using a new `EXP_NAME` and checkpoint directory.
+
+K3.1 keeps the 93-layer backbone, KDA, latent MoE, AttnRes and image processor. Its 24 MLA layers add a NoPE DSA indexer with 32 heads of dimension 128 and top-2048 key selection. The bridge maps the five new indexer tensors per MLA layer. Indexer weights remain frozen during SFT/RL: hard top-k selection has no language-loss gradient, and this integration does not add an indexer distillation objective. K3.1 uses local trainable MoonViT and projector modules because its HF repository omits the modeling files loaded by K3. FLOPs/MFU are omitted for K3.1 until the estimator accounts for sparse attention and the frozen indexer; throughput and timing are still reported.
+
+The training path uses Core's TileLang sparse attention, padding head tiles when needed for K3's 96 attention heads. If LoRA wraps `kv_b_proj`, the expanded attention path preserves adapter gradients and dropout but uses more memory at long context lengths. KDA fixed context parallelism relies on Relax's Megatron patch, applied by both training Dockerfiles: it removes upstream Bridge's CP rejection and adds headwise/chunkwise CP. Use the patched training image; the unpatched pinned Bridge does not support KDA CP. K3.1 DSA delegates CP key gathering and packed zigzag permutations to Core. The full recipe retains CP8, but end-to-end K3.1 CP numerics and multi-node training still require validation. The other K3 parallelism limits below still apply.
+
+The pinned Megatron-Bridge already supplies the reusable K3 backbone. Neither Bridge `v0.7.0` nor main at `20874c8db` includes K3.1; upgrading Bridge alone does not enable it. This integration keeps the existing dependency pins. See the [official model config](https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/config.json) and [Bridge comparison](https://github.com/NVIDIA-NeMo/Megatron-Bridge/compare/6862ee170a2569607e8ebc5dde91f119779093ca...20874c8dbf87af6eafa8c93c0f44586ddc47fe5a).
+
+For RL rollout or serving, the repository's SGLang `v0.5.21` base is insufficient. Use a runtime containing [SGLang #48415](https://github.com/sgl-project/sglang/pull/48415) (`61a3c7f2`, K3.1 support) with Relax's weight-reload patches ported and validated. This change does not upgrade or validate that inference runtime. The K3-specific offline export/streaming LoRA tools below have not been extended to K3.1. GPU numerics, distributed checkpointing and online rollout reload still require validation in the target training image and cluster.
 
 ## Training
 

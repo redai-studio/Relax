@@ -511,9 +511,11 @@ class TestHandleEvictions:
         manager = create_test_manager(servers={"default": server})
         manager.args.scale_in_drain_timeout = 0
 
-        manager._handle_evictions([("default", group, 0)])
-        manager._handle_evictions([("default", group, 0)])
+        with patch("ray.util.remove_placement_group") as remove_pg:
+            manager._handle_evictions([("default", group, 0)])
+            manager._handle_evictions([("default", group, 0)])
 
+        remove_pg.assert_called_once_with(group.pg[0])
         engine.unregister_from_router.remote.assert_called_once()
         engine.unregister_dcs.remote.assert_called_once()
         engine.shutdown.remote.assert_called_once()
@@ -530,9 +532,10 @@ class TestHandleEvictions:
         mock_monitor._engine_group = g
         manager._health_monitors.append(mock_monitor)
 
-        with patch("ray.kill"):
+        with patch("ray.kill"), patch("ray.util.remove_placement_group") as remove_pg:
             manager._handle_evictions([("default", g, 0)])
 
+        remove_pg.assert_called_once_with(g.pg[0])
         mock_monitor.mark_intentionally_removed.assert_called_with(0)
 
     def test_sets_engine_to_none(self, patch_ray_get):
@@ -543,9 +546,10 @@ class TestHandleEvictions:
         manager = create_test_manager(servers={"default": srv})
         manager.args.scale_in_drain_timeout = 0
 
-        with patch("ray.kill"):
+        with patch("ray.kill"), patch("ray.util.remove_placement_group") as remove_pg:
             manager._handle_evictions([("default", g, 0)])
 
+        remove_pg.assert_called_once_with(g.pg[0])
         assert g.all_engines[0] is None
 
     def test_cleans_up_empty_groups(self, patch_ray_get):
@@ -556,9 +560,10 @@ class TestHandleEvictions:
         manager = create_test_manager(servers={"default": srv})
         manager.args.scale_in_drain_timeout = 0
 
-        with patch("ray.kill"):
+        with patch("ray.kill"), patch("ray.util.remove_placement_group") as remove_pg:
             manager._handle_evictions([("default", g, 0)])
 
+        remove_pg.assert_called_once_with(g.pg[0])
         # Group should be cleaned up since it's now empty
         assert len(srv.engine_groups) == 0
 

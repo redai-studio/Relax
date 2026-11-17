@@ -250,19 +250,13 @@ def patch_checkpoint_write():
 
     This function is idempotent — calling it multiple times is safe.
     """
-    try:
-        from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
-    except ModuleNotFoundError as exc:
-        if exc.name != "megatron.core.dist_checkpointing.strategies.filesystem_async":
-            raise
-        # Newer MCore delegates synchronous writes to DCP and async writes to NVRx.
+    # Only Ascend's Core 0.16.1 still uses this writer. The CUDA and ROCm
+    # images use DCP for synchronous writes and NVRx for asynchronous writes.
+    if device_utils.get_accelerator_type() != device_utils.AcceleratorType.NPU:
         return
 
     global _patched
-    # NOTE(wuhuan): the latest Megatron-LM of 20260506 use write_preloaded_data_multithread instead of
-    # write_preloaded_data_multiproc, which has solved this issue.
-    can_patch = hasattr(FileSystemWriterAsync, "write_preloaded_data_multiproc")
-    if _patched or not can_patch:
+    if _patched:
         return
 
     _patch_write_preloaded_data_multiproc()
