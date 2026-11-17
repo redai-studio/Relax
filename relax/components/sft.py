@@ -1194,21 +1194,13 @@ class SFT(Base):
                 int(getattr(self.config, "data_parallel_size", 1)),
             )
             n_chunks = len(chunk_sizes)
-            n_dropped = 0
         else:
             n_chunks = n_samples // chunk_size
-            n_dropped = n_samples - n_chunks * chunk_size
             chunk_sizes = [chunk_size] * n_chunks
         if n_chunks == 0:
             raise RuntimeError(
                 f"Eval @ completed_steps={completed_steps}: eval pool of {n_samples} samples is smaller than "
                 f"global_batch_size ({chunk_size}); cannot push the full partition expected by the consumer."
-            )
-        if n_dropped > 0:
-            self._logger.warning(
-                f"Eval @ completed_steps={completed_steps}: dropping {n_dropped} trailing sample(s) so eval "
-                f"chunks align to global_batch_size ({chunk_size}); raise eval pool size or "
-                f"reduce global_batch_size if this matters."
             )
         # Per-chunk drain timeout. If consumers crash mid-eval (the actor's
         # try/except swallows the failure), the producer would otherwise spin
