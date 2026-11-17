@@ -208,3 +208,7 @@ Relax 是一个跨越 Python、PyTorch、Ray/Serve、Megatron、SGLang 的分布
 - 我是否保持了中文输出、未引入与本次评审无关的配置或模型设定？
 
 若任一项存疑，回到第三节重新梳理，再输出结论。
+
+## 八、参考案例
+
+涉及跨服务编排、恢复职责或内部兼容双路径时，按需阅读[架构评审参考案例](../../.opencode/references/arch-expert.md)，了解职责如何收敛及调整理由。
