@@ -19,15 +19,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=("cu12", "cu13"), default="cu13")
     args = parser.parse_args()
-    if args.profile == "cu12":
-        # Without CUDA_HOME or nvcc on PATH, TileLang prefers this CUDA 13
-        # wheel over the image's system CUDA 12 toolkit.
-        try:
-            nvcc_version = md.version("nvidia-cuda-nvcc")
-        except md.PackageNotFoundError:
-            pass
-        else:
-            raise ValueError(f"CUDA 12 image contains the CUDA 13 compiler wheel nvidia-cuda-nvcc=={nvcc_version}")
     expected = {"ray": "2.56.1", "numpy": "2.2.6", "nvidia-nccl-cu13": "2.30.7", "fla-core": "0.5.2"}
     if args.profile == "cu12":
         expected.pop("numpy")

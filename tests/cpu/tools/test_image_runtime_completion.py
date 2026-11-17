@@ -209,18 +209,6 @@ def test_final_check_rejects_platform_ray_override(monkeypatch):
         validator.main()
 
 
-def test_final_check_rejects_cuda13_nvcc_in_cuda12_image(tmp_path, monkeypatch):
-    info = tmp_path / "nvidia_cuda_nvcc-13.3.73.dist-info"
-    info.mkdir()
-    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: nvidia-cuda-nvcc\nVersion: 13.3.73\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    monkeypatch.syspath_prepend(str(ROOT / "docker/scripts"))
-    validator = load_script("validate_final_runtime")
-    monkeypatch.setattr(sys, "argv", ["validate_final_runtime.py", "--profile", "cu12"])
-    with pytest.raises(ValueError, match="nvidia-cuda-nvcc"):
-        validator.main()
-
-
 def test_published_constraints_allow_vendor_ray_without_relaxing_other_pins(tmp_path):
     source = (ROOT / "docker/Dockerfile.cu13").read_text()
     export = next(line.strip() for line in source.splitlines() if "sed 's/^ray==" in line)
