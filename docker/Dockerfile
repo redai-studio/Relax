@@ -284,6 +284,7 @@ RUN python /opt/relax/install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2
     rm /tmp/fla042.patch
 COPY --from=hybridep_builder /opt/ep-wheels /tmp/ep-wheels
 COPY docker/patch/sglang/v0.5.17-transformers5-compat.patch /tmp/sglang-transformers5.patch
+COPY docker/patch/sglang/v0.5.17-cu12-humming.patch /tmp/sglang-cu12-humming.patch
 COPY docker/cu12-runtime-requirements.txt /opt/relax/cu12-runtime-requirements.txt
 COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-wheel-tag.patch
 # Apply after all pip installs; this cache specialization requires Frontend 1.27.0 / CuTe DSL 4.6.0.
@@ -298,11 +299,14 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
     patch --batch --forward --fuzz=0 -d /sgl-workspace/sglang -p1 < /tmp/sglang-transformers5.patch && \
+    patch --batch --forward --fuzz=0 -d /sgl-workspace/sglang -p1 < /tmp/sglang-cu12-humming.patch && \
     pip install --no-cache-dir setuptools-scm==9.2.2 && \
     SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
         pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
-    rm /tmp/sglang-transformers5.patch && \
+    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt "humming-kernels[cu12]==0.1.10" && \
+    pip uninstall -y nvidia-cuda-nvcc && \
+    rm /tmp/sglang-transformers5.patch /tmp/sglang-cu12-humming.patch && \
     python -c 'from importlib.metadata import version; \
         assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
         assert version("sglang") == "0.5.17"; \
