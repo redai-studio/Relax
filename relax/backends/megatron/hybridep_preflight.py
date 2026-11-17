@@ -34,7 +34,19 @@ def validate_hybridep_worker_group() -> None:
     expected_size = actual["etp"] * actual["ep"]
     # Dense TP/PP and total world size do not define physical expert peers.
     # Retain the separately audited CP4 layout until other CP paths are validated.
-    cp_supported = actual["cp"] == 1 or actual == {"tp": 1, "pp": 2, "cp": 4, "ep": 4, "etp": 1, "world": 16}
+    from relax.utils.env import Envs
+
+    qsa_cp = (
+        Envs.RELAX_QWEN38_QSA_CP
+        and Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND == "mixed"
+        and Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND == "cute"
+        and actual["tp"] == 2
+        and actual["pp"] == 4
+        and actual["cp"] in (2, 4)
+        and actual["ep"] == 8
+        and actual["world"] == 32
+    )
+    cp_supported = actual["cp"] == 1 or actual == {"tp": 1, "pp": 2, "cp": 4, "ep": 4, "etp": 1, "world": 16} or qsa_cp
     topology_supported = (
         all(value > 0 for value in actual.values())
         and actual["etp"] == 1

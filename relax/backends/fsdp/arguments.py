@@ -610,7 +610,7 @@ def validate_generative_config(args: Namespace) -> None:
     )
 
     if getattr(args, "async_save", False):
-        # slime_validate_args REQUIRES --async-save alongside --rotate-ckpt, so this
+        # relax_validate_args REQUIRES --async-save alongside --rotate-ckpt, so this
         # cannot be a hard error; the FSDP DCP save is synchronous regardless.
         warnings.append("async_save has no effect for train_backend=fsdp (the DCP save is synchronous).")
     if getattr(args, "lr_decay_style", None) and getattr(args, "fsdp_lr_scheduler", "constant") == "constant":

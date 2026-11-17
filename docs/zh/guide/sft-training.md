@@ -388,6 +388,8 @@ patch 按样本、按调用生效，绝不会修改 `tokenizer.chat_template`。
 
 ### 评估与 predict
 
+**SFT 的生成式评分（包括异步 judge）必须设置 `--sft-predict-interval N`，并配置 `--custom-rm-path` 或 `--rm-type`。** 异步设置只控制评分的执行方式，不会单独触发评测；`--eval-interval` 只控制参考答案的 loss/PPL 评估，不调用 reward 函数。
+
 PPL 评估由以下参数控制：
 
 ```bash
@@ -408,10 +410,35 @@ PPL 评估由以下参数控制：
 设置 `--sft-predict-interval` 后，Relax 会自动拉起 Rollout 角色，并把预测结果写到：
 
 ```text
-<save>/predict/predictions_step_<rollout_id>.jsonl
+<save>/predict/predictions_step_<train_step>.jsonl
 ```
 
 math 推理任务通常需要更长的 `--eval-max-response-len`；caption 或图像描述任务可以设短一些。
+
+没有配置 reward 时，predict 仍只保存原有的 `prompt`、`reference`、`completion` 三个字段。要为生成答案评分，在现有 SFT 启动参数中配置以下选项，并确保已设置 `--save`，以及 `--eval-size` 或 `--eval-prompt-data` 二选一的评测数据来源：
+
+```bash
+--sft-predict-interval 10
+--custom-rm-path your_module.reward_func
+--eval-reward-key score
+```
+
+也可以用 `--rm-type` 指定内置评分函数。Reward 会收到包含生成回答、token ID、参考答案 `label` 和来源 metadata 的 `Sample`，以及 `evaluation=True`。SFT 训练仍优化监督学习 loss；这些 reward 只用于评测指标。无需 eval YAML 或额外的 metadata 标记。目前 SFT 评分支持每题一个答案（`--n-samples-per-eval-prompt 1`）；自定义 group reward 收到的是每个 prompt 对应的单样本组。
+
+异步 judge 默认对符合条件的 scorer 开启。自定义函数通过以下声明接入；同步 `def` 仍可使用独立的 reward worker 池：
+
+```python
+def reward_func(args, sample, **kwargs):
+    assert kwargs["evaluation"]
+    return {"score": score_answer(sample.response, sample.label)}
+
+
+reward_func.supports_async_eval = True
+```
+
+该声明要求 scorer 只依赖传入的 `Sample` 和独立 CPU / judge 资源，返回真实分数，不依赖实时 policy 引擎或训练时会被 offload 的 GenRM 服务。内置 `remote_rm` 自动符合异步条件；未声明的其他 scorer 仍同步执行。传入 `--disable-eval-async-judge` 可强制同步评分。
+
+权重同步和答案生成仍会阻塞 SFT predict 周期，只有符合条件的评分在后台执行并与后续训练重叠；正常退出前会等待所有评分完成，并传播失败。评分指标记录为 `eval/sft_predict`，step 使用本次评测对应的已完成训练步数，同时保存到 `<save>/rollout_result/eval/<train_step>.jsonl`。设置 `--save-debug-rollout-data` 时也会保存已有的 eval debug dump。`--eval-interval` 继续控制独立的 loss/PPL 评估。
 
 ### 并行与资源
 

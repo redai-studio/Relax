@@ -192,10 +192,17 @@ def test_trajectory_media_respects_sidecar_switch(tmp_path, dump_media) -> None:
 
 
 def test_resolve_shard_ordinal_falls_back_outside_a_ray_actor() -> None:
-    # Driver-side unit tests construct the recorder with no actor context; that
-    # must degrade to shard 0 rather than raise into the export path.
-    assert resolve_shard_ordinal() == 0
-    assert resolve_shard_ordinal(default=4) == 4
+    import ray
+
+    # A metadata probe in a standalone test must not implicitly own a cluster.
+    was_initialized = ray.is_initialized()
+    try:
+        assert resolve_shard_ordinal() == 0
+        assert resolve_shard_ordinal(default=4) == 4
+        assert ray.is_initialized() == was_initialized
+    finally:
+        if not was_initialized and ray.is_initialized():
+            ray.shutdown()
 
 
 # --------------------------------------------------------------------------
@@ -654,7 +661,8 @@ def test_cancel_records_exports_while_reward_is_pending(tmp_path, rollout_module
         pipeline = _obs_pipeline(rollout_module, args)
         rm_started = asyncio.Event()
 
-        async def slow_rm(*args):
+        async def slow_rm(*args, evaluation=False):
+            assert evaluation is False
             rm_started.set()
             await asyncio.Event().wait()
 
