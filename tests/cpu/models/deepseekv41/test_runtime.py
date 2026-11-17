@@ -24,6 +24,7 @@ from relax.models.deepseekv41.runtime import (  # noqa: E402
     v41_unpack_carry,
     v41_unpack_pre,
 )
+from relax.models.deepseekv41.thd.layout import ThdLayout  # noqa: E402
 
 
 @pytest.fixture
@@ -47,9 +48,11 @@ def runtime_config() -> SimpleNamespace:
     )
 
 
-def _populate(plan: V41CarryPlan, s: int, b: int, *, gradients: bool = False) -> V41Runtime:
-    runtime = V41Runtime()
-    for section in plan.sections(s, b):
+def _populate(
+    plan: V41CarryPlan, s: int, b: int, *, gradients: bool = False, layout: ThdLayout | None = None
+) -> V41Runtime:
+    runtime = V41Runtime(thd_layout=layout)
+    for section in plan.sections(s, b, layout):
         if section.encoding == "pre":
             value = torch.randn(section.shape, dtype=torch.float32, requires_grad=gradients)
         elif section.encoding == "int":
@@ -72,6 +75,7 @@ def _populate(plan: V41CarryPlan, s: int, b: int, *, gradients: bool = False) ->
 
 
 def _assert_state_equal(expected: V41Runtime, actual: V41Runtime) -> None:
+    assert actual.thd_layout is expected.thd_layout
     if expected.pre is None:
         assert actual.pre is None
     else:
@@ -252,6 +256,44 @@ def test_runtime_cp_compression_requires_aligned_local_chunk(runtime_config) -> 
     plan = V41CarryPlan(runtime_config, 1)
     with pytest.raises(ValueError, match="CP chunk length"):
         plan.sections(3, 1)
+
+
+@pytest.mark.parametrize("tp,cp,rank,local_length", [(1, 2, 0, 3), (2, 2, 1, 4), (2, 3, 2, 4)])
+def test_runtime_thd_carry_uses_segment_compression_and_preserves_gradients(
+    runtime_config, tp, cp, rank, local_length
+) -> None:
+    runtime_config.sequence_parallel = tp > 1
+    runtime_config.tensor_model_parallel_size = tp
+    runtime_config.context_parallel_size = cp
+    runtime_config.v41_candidate_source_layer_id = 1
+    metadata = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q_cpu=(0, 3, 6),
+        cu_seqlens_q_padded_cpu=(0, 3, cp * local_length),
+        valid_seqlens_q_cpu=(3, 3),
+        cp_partition_mode="contiguous",
+    )
+    layout = ThdLayout.from_packed_seq_params(metadata, cp_rank=rank, cp_size=cp, seqlen_local=local_length)
+    plan = V41CarryPlan(runtime_config, 1)
+    s = local_length // tp
+    original = _populate(plan, s, 1, gradients=True, layout=layout)
+    hidden = torch.randn(s, 1, plan.base_cols, dtype=torch.bfloat16, requires_grad=True)
+    restored = V41Runtime(thd_layout=layout, latent={99: torch.ones(1)})
+    result = v41_unpack_carry(v41_pack_carry(hidden, original, plan), restored, plan)
+    assert torch.equal(result, hidden)
+    _assert_state_equal(original, restored)
+    # Two length-three samples have two compressed keys, never floor(6/2).
+    assert restored.latent[1].shape == (1, 2, runtime_config.kv_lora_rank)
+    assert restored.input_ids.shape == (1, local_length)
+    assert restored.topk.shape == (1, local_length, runtime_config.dsa_indexer_topk)
+    assert restored.candidates.shape == (1, local_length, 0 if rank == 2 else 1)
+    assert 99 not in restored.latent
+    (result.float().sum() + 3 * restored.pre.sum() + 2 * restored.latent[1].float().sum()).backward()
+    assert torch.equal(hidden.grad, torch.ones_like(hidden))
+    assert torch.equal(original.pre.grad, torch.full_like(original.pre, 3))
+    assert torch.equal(original.latent[1].grad, torch.full_like(original.latent[1], 2))
+    restored.reset()
+    assert restored.thd_layout is None
 
 
 def test_runtime_pre_high_low_retains_precision_and_gradient() -> None:

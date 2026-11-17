@@ -719,6 +719,8 @@ def get_batch(
         select_offsets = list(cu_seqlens_cpu)
         if allgather_cp:
             select_offsets[-1] += pad
+        # Packed model layouts need physical endpoints without a device read.
+        packed_seq_params.cu_seqlens_q_padded_cpu = tuple(select_offsets)
         packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
         if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
             bind_physical_layout(packed_seq_params, tuple(select_offsets))

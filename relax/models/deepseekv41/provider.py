@@ -36,6 +36,31 @@ class DeepSeekV41ModelProvider(MLAModelProvider):
     v41_qkv_format: str = "bshd"
     v41_allgather_cp: bool = False
 
+    def finalize(self) -> None:
+        relax_thd_cp = (
+            self.v41_qkv_format == "thd"
+            and self.v41_allgather_cp
+            and self.context_parallel_size > 1
+            and self.cp_partition_mode == "contiguous"
+            and not self.dynamic_context_parallel
+            and self.sequence_packing_scheduler is None
+            and self.experimental_attention_variant is None
+            and not self.mtp_num_layers
+        )
+        if not relax_thd_cp:
+            super().finalize()
+            return
+        # Core's contiguous-CP checks assume its own packing scheduler and
+        # native attention variants. V4.1 instead consumes Relax's packed
+        # metadata through its custom allgather attention. Run the remaining
+        # Core/MLA finalization with the legacy validation mode, then restore
+        # the actual layout before any model or batch consumer can use it.
+        self.cp_partition_mode = "zigzag"
+        try:
+            super().finalize()
+        finally:
+            self.cp_partition_mode = "contiguous"
+
     def provide(
         self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
     ) -> GPTModel:

@@ -3,7 +3,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # Full-model text RL on DAPO-Math-17K for 80 updates.
-# Use TP2/PP2/CP2/EP64 with decode CUDA graphs disabled.
+# THD counterpart of the historical PP+CP BSHD run: TP2/PP2/CP2/EP64,
+# temperature 1 and per-token loss, with decode CUDA graphs disabled.
 # Four 32-GPU DP-attention rollout engines, CPU Adam and full recompute:
 # selective moe/mlp ran out of memory during the 15th colocated update.
 # Per-node host RAM must cover CPU optimizer state, offload backups and Engram.
@@ -26,8 +27,8 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 HF_CKPT="${HF_CKPT:-${MODEL_DIR}/DeepSeek-V4.1-bf16}"
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl}"
-PROJECT_NAME="${PROJECT_NAME:-Relax/dev/deepseek-v41-dapo-math}"
-EXP_NAME="${EXP_NAME:-deepseek-v41-flash-dapo-math-gpu128-bshd}"
+PROJECT_NAME="${PROJECT_NAME:-Relax/rl/deepseek-v41-dapo-math}"
+EXP_NAME="${EXP_NAME:-deepseek-v41-flash-dapo-math-gpu128-thd-ppcp}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-80}"
 LOG_DIR="${LOG_DIR:-log}"
 source "${RELAX_ROOT}/scripts/models/deepseek-v4.1-flash.sh"
@@ -36,9 +37,9 @@ CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --ref-load "${HF_CKPT}"
     --megatron-to-hf-mode bridge
-    # --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
+    --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
     --save "${SAVE_DIR}/${EXP_NAME}/checkpoints"
-    --save-interval 100
+    --save-interval 1000
     --max-actor-ckpt-to-keep 2
 )
 ROLLOUT_ARGS=(
@@ -65,16 +66,17 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-    --qkv-format bshd
+    --qkv-format thd
+    --use-dynamic-batch-size
     --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 2
     --context-parallel-size 2
     --allgather-cp
+    --cp-partition-mode contiguous
     --calculate-per-token-loss
     --expert-model-parallel-size 64
     --expert-tensor-parallel-size 1
     --sequence-parallel
-    --micro-batch-size 1
     --max-tokens-per-gpu 2048
     --data-pad-size-multiplier 128
     --recompute-granularity full
@@ -161,8 +163,15 @@ TRAIN_ARGS=(
     --num-data-storage-units 16
     --max-staleness 0
     --colocate
-    "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${ROLLOUT_ARGS[@]}" "${PERF_ARGS[@]}"
-    "${GRPO_ARGS[@]}" "${OPTIMIZER_ARGS[@]}" "${SGLANG_ARGS[@]}" "${METRICS_ARGS[@]}" "${MISC_ARGS[@]}"
+    "${MODEL_ARGS[@]}"
+    "${CKPT_ARGS[@]}"
+    "${ROLLOUT_ARGS[@]}"
+    "${PERF_ARGS[@]}"
+    "${GRPO_ARGS[@]}"
+    "${OPTIMIZER_ARGS[@]}"
+    "${SGLANG_ARGS[@]}"
+    "${METRICS_ARGS[@]}"
+    "${MISC_ARGS[@]}"
     "$@"
 )
 
@@ -194,6 +203,8 @@ runtime.setdefault("env_vars", {}).update({
     "NCCL_ALGO": "Ring",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": "1",
+    "MEGATRON_SYNC_SAVE_STAGE_BYTES": "0",
 })
 for name in ("CUDA_HOME", "CLEARML_CONFIG_FILE", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "NO_VCS_VERSION"):
     if os.environ.get(name):

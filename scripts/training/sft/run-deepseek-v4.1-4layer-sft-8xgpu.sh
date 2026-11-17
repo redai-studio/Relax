@@ -7,8 +7,9 @@
 # Uses the prepared BF16 four-layer checkpoint, with its frozen Engram table.
 # TP2 / PP2 / CP2 / DP1, EP4 / ETP1 / expert-DP1, SP and DeepEP.
 # No inference engines or prediction task.
-# BSHD uses fixed micro-batches; overlong samples are skipped after rendering.
-# The 4096-token starting budget is not an 80-GB GPU memory guarantee.
+# BSHD uses fixed micro-batches; QKV_FORMAT=thd enables packed dynamic batching.
+# Overlong samples are skipped after rendering in either layout.
+# The 4096-token per-GPU starting budget is not an 80-GB GPU memory guarantee.
 #
 # Usage on a dedicated training host:
 #   MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/checkpoints \
@@ -28,11 +29,16 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 HF_CKPT="${HF_CKPT:-${MODEL_DIR}/DeepSeek-V4.1-4layer}"
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/sft/data/OpenMathReasoning-mini/data/cot-00000-of-00001.parquet}"
+QKV_FORMAT="${QKV_FORMAT:-bshd}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/deepseek-v41-openmath}"
-EXP_NAME="${EXP_NAME:-deepseek-v41-4layer-sft-openmath-tp2-pp2-cp2-ep4-deepep-gpu8}"
+EXP_NAME="${EXP_NAME:-deepseek-v41-4layer-sft-openmath-${QKV_FORMAT}-tp2-pp2-cp2-ep4-deepep-gpu8}"
 NUM_STEPS="${NUM_STEPS:-100}"
+case "${QKV_FORMAT}" in
+    bshd|thd) ;;
+    *) echo "QKV_FORMAT must be bshd or thd" >&2; exit 1 ;;
+esac
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
-# CP2 keeps the full-sequence filtering budget at 2 * 2048 = 4096 tokens.
+# At CP2, the default full-sequence filtering budget is 2 * 4096 = 8192 tokens.
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-4096}"
 SEED="${SEED:-1234}"
 LOG_DIR="${LOG_DIR:-${RELAX_ROOT}/deepseek_v41_log}"
@@ -43,9 +49,9 @@ CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --ref-load "${HF_CKPT}"
     --megatron-to-hf-mode bridge
-    # --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}-${now}"
-    --save-interval 100
+    --load "${SAVE_DIR}/${EXP_NAME}"
+    --save "${SAVE_DIR}/${EXP_NAME}"
+    --save-interval "${SAVE_INTERVAL:-100}"
     --max-actor-ckpt-to-keep 1
 )
 
@@ -65,12 +71,12 @@ SFT_ARGS=(
     --sft-tq-timeout-minutes 60
     --sft-oversize-strategy skip
     --balance-data
-    # Padding alignment: 2 * CP2 * TP2 * 512 = 4096.
+    # BSHD padding alignment: 2 * CP2 * TP2 * 1024 = 8192.
     --data-pad-size-multiplier 1024
 )
 
 PERF_ARGS=(
-    --qkv-format bshd
+    --qkv-format "${QKV_FORMAT}"
     # --seq-length "$((MAX_TOKENS_PER_GPU * 2))"
     --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 2
@@ -92,6 +98,13 @@ PERF_ARGS=(
     --moe-flex-dispatcher-backend deepep
     --moe-router-dtype fp32
 )
+
+if [ "${QKV_FORMAT}" = thd ]; then
+    PERF_ARGS+=(
+        --use-dynamic-batch-size
+        --cp-partition-mode contiguous
+    )
+fi
 
 OPTIMIZER_ARGS=(
     --optimizer adam
@@ -156,6 +169,9 @@ runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
 runtime.setdefault("env_vars", {}).update({
     "NCCL_NVLS_ENABLE": "0",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    # Bound host staging for full CPU-optimizer synchronous checkpoints.
+    "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": os.environ.get("MEGATRON_SYNC_SAVE_BOUNDED_STAGING", "1"),
+    "MEGATRON_SYNC_SAVE_STAGE_BYTES": os.environ.get("MEGATRON_SYNC_SAVE_STAGE_BYTES", "0"),
 })
 for name in ("CLEARML_CONFIG_FILE", "CUDA_HOME", "NO_VCS_VERSION"):
     if os.environ.get(name):

@@ -252,26 +252,51 @@ def test_model_engram_receives_restored_ids_before_layer(model_config, monkeypat
     assert restored.input_ids is None
 
 
-def test_model_layer_recompute_restores_state_after_another_microbatch(model_config, monkeypatch) -> None:
+@pytest.mark.parametrize("qkv_format", ["bshd", "thd"])
+def test_model_layer_recompute_restores_state_after_another_microbatch(model_config, monkeypatch, qkv_format) -> None:
     import torch.utils.checkpoint
 
     monkeypatch.setattr(HyperConnectionTransformerLayer, "__init__", _fake_layer_init)
     monkeypatch.setattr(HyperConnectionTransformerLayer, "forward", _fake_layer_forward)
     model_config.recompute_granularity = "full"
+    model_config.v41_qkv_format = qkv_format
+    metadata = (
+        SimpleNamespace(
+            qkv_format="thd",
+            cu_seqlens_q_cpu=(0, 1, 3),
+            cu_seqlens_q_padded_cpu=(0, 1, 3),
+            valid_seqlens_q_cpu=(1, 2),
+        )
+        if qkv_format == "thd"
+        else None
+    )
     runtime = V41Runtime()
     layer = V41TransformerLayer(model_config, None, runtime, layer_number=1)
     hidden = torch.randn(3, 1, 8, dtype=torch.bfloat16, requires_grad=True)
-    output = torch.utils.checkpoint.checkpoint(lambda value: layer.forward(value)[0], hidden, use_reentrant=True)
-    restored = V41Runtime()
+    output = torch.utils.checkpoint.checkpoint(
+        lambda value: layer.forward(value, packed_seq_params=metadata)[0], hidden, use_reentrant=True
+    )
+    restored = V41Runtime(thd_layout=runtime.thd_layout)
     result = v41_unpack_carry(output, restored, V41CarryPlan(model_config, 0))
     loss = result.float().sum() + restored.pre.sum()
     runtime.reset()
+    if qkv_format == "thd":
+        other_metadata = SimpleNamespace(
+            qkv_format="thd",
+            cu_seqlens_q_cpu=(0, 2, 3),
+            cu_seqlens_q_padded_cpu=(0, 2, 3),
+            valid_seqlens_q_cpu=(2, 1),
+        )
+        layer.forward(hidden.detach(), packed_seq_params=other_metadata)
+        assert runtime.thd_layout.seq_lens == (2, 1)
     runtime.pre = torch.zeros(99)
     loss.backward()
+    if qkv_format == "thd":
+        assert runtime.thd_layout.seq_lens == (1, 2)
     actual = hidden.grad.clone()
     reference = hidden.detach().clone().requires_grad_()
-    raw, _ = layer.forward(reference)
-    state = V41Runtime()
+    raw, _ = layer.forward(reference, packed_seq_params=metadata)
+    state = V41Runtime(thd_layout=runtime.thd_layout)
     unpacked = v41_unpack_carry(raw, state, V41CarryPlan(model_config, 0))
     (unpacked.float().sum() + state.pre.sum()).backward()
     assert torch.equal(actual, reference.grad)
@@ -306,9 +331,12 @@ def test_model_constructor_owns_runtime_and_freezes_only_router(model_config, mo
         assert value.grad is not None
 
 
-def test_model_forward_resets_state_and_preserves_standard_arguments(monkeypatch) -> None:
+@pytest.mark.parametrize("qkv_format", ["bshd", "thd"])
+def test_model_forward_resets_state_and_preserves_standard_arguments(monkeypatch, qkv_format) -> None:
     model = DeepSeekV41GPTModel.__new__(DeepSeekV41GPTModel)
     torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(v41_qkv_format=qkv_format)
+    model.v41_cp_group = None
     model.v41_runtime = V41Runtime(pre=torch.ones(99), latent={99: torch.ones(1)})
     captured = {}
 
@@ -320,12 +348,23 @@ def test_model_forward_resets_state_and_preserves_standard_arguments(monkeypatch
 
     monkeypatch.setattr(GPTModel, "forward", native_forward)
     ids = torch.tensor([[1, 2]])
+    metadata = (
+        SimpleNamespace(
+            qkv_format="thd",
+            cu_seqlens_q_cpu=(0, 1, 2),
+            cu_seqlens_q_padded_cpu=(0, 1, 2),
+            valid_seqlens_q_cpu=(1, 1),
+        )
+        if qkv_format == "thd"
+        else None
+    )
     decoder = torch.ones(2, 1, 2)
     processor, processor_context = object(), object()
     result = model(
         ids,
         None,
         None,
+        packed_seq_params=metadata,
         decoder_input=decoder,
         output_processor=processor,
         output_processor_context=processor_context,
@@ -333,3 +372,8 @@ def test_model_forward_resets_state_and_preserves_standard_arguments(monkeypatch
     assert result is decoder
     assert captured["output_processor"] is processor and captured["output_processor_context"] is processor_context
     assert model.v41_runtime.input_ids is None
+    assert model.v41_runtime.thd_layout is None
+    if qkv_format == "thd":
+        assert captured["packed_seq_params"] is not metadata
+        assert captured["packed_seq_params"].v41_thd_layout.seq_lens == (1, 1)
+        assert not hasattr(metadata, "v41_thd_layout")

@@ -9,17 +9,20 @@ from typing import Any
 def _validate_runtime_layout(provider: Any) -> None:
     if getattr(provider, "cuda_graph_impl", "none") not in (None, "none"):
         raise NotImplementedError("DeepSeek V4.1 training CUDA-graph capture/replay is not supported yet.")
-    if getattr(provider, "v41_qkv_format", "bshd") != "bshd":
-        raise ValueError("DeepSeek V4.1 execution requires --qkv-format bshd; packed THD sequences are unsupported.")
+    qkv_format = getattr(provider, "v41_qkv_format", "bshd")
+    if qkv_format not in ("bshd", "thd"):
+        raise ValueError("DeepSeek V4.1 execution requires --qkv-format bshd or thd.")
+    if qkv_format == "thd" and getattr(provider, "v41_indexer_replay", False):
+        raise ValueError("DeepSeek V4.1 THD does not support attention indexer replay.")
     if getattr(provider, "dynamic_context_parallel", False):
         raise ValueError("DeepSeek V4.1 currently supports fixed context-parallel groups only.")
     cp = getattr(provider, "context_parallel_size", 1)
     if cp < 1:
         raise ValueError("DeepSeek V4.1 context_parallel_size must be positive.")
-    # BSHD is sliced contiguously by Relax's allgather-CP ingestion, not by
-    # Core's native cp_partition_mode (whose contiguous path requires THD).
+    # Both layouts use Relax's contiguous allgather-CP ingestion. BSHD does
+    # not use Core's native cp_partition_mode (whose contiguous path is THD).
     if cp > 1 and not getattr(provider, "v41_allgather_cp", False):
-        raise ValueError("DeepSeek V4.1 CP>1 requires --allgather-cp for contiguous BSHD input.")
+        raise ValueError("DeepSeek V4.1 CP>1 requires --allgather-cp for contiguous input.")
 
     pp = getattr(provider, "pipeline_model_parallel_size", 1)
     if pp < 1:
@@ -53,6 +56,12 @@ def _validate_runtime_layout(provider: Any) -> None:
                 f"DeepSeek V4.1 selective recompute does not support {sorted(unsupported)}; "
                 "use full recompute or selective moe/mlp recompute."
             )
+    if qkv_format == "thd" and getattr(provider, "recompute_granularity", None) == "full":
+        if (
+            getattr(provider, "recompute_method", None) != "uniform"
+            or getattr(provider, "recompute_num_layers", 0) != 1
+        ):
+            raise ValueError("DeepSeek V4.1 THD full recompute requires uniform recompute with one layer per region.")
 
 
 def configure_execution_runtime(provider: Any, args: Namespace) -> None:
@@ -67,6 +76,7 @@ def configure_execution_runtime(provider: Any, args: Namespace) -> None:
         ("hf_checkpoint", "v41_hf_checkpoint", None),
         ("qkv_format", "v41_qkv_format", "bshd"),
         ("allgather_cp", "v41_allgather_cp", False),
+        ("use_rollout_indexer_replay", "v41_indexer_replay", False),
     ):
         setattr(provider, target, getattr(args, source, getattr(provider, target, default)))
     # Generic Bridge mode currently clears this flag before model construction;

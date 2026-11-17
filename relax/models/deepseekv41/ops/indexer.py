@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Modified for Relax integration; see NOTICE.
 
 from typing import Any
@@ -92,11 +93,32 @@ class DeepSeekV41Indexer(MegatronModule):
         lengths: torch.Tensor,
         candidates: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        q, weights = self.query_features(x, qr, freqs)
+        return self.select(q, keys, weights, lengths, candidates)
+
+    @torch.no_grad()
+    def query_features(
+        self, x: torch.Tensor, qr: torch.Tensor, freqs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project all packed queries together before segment-local selection."""
         batch, seqlen, _ = x.shape
         q = self.linear_wq_b(qr)[0].view(batch, seqlen, self.index_n_heads, self.index_head_dim).clone()
         apply_rotary_emb(q[..., -self.rope_dim :], freqs)
         q = fake_quant_fp4(q)
         weights = self.linear_weights_proj(x)[0] * (self.index_head_dim**-0.5 * self.index_n_heads**-0.5)
+        return q, weights
+
+    @torch.no_grad()
+    def select(
+        self,
+        q: torch.Tensor,
+        keys: torch.Tensor,
+        weights: torch.Tensor,
+        lengths: torch.Tensor,
+        candidates: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Retrieve keys for queries that share one sample's key coordinate system."""
+        seqlen = q.shape[1]
         n_kv = keys.shape[1]
         indices, masks = [], []
         for start in range(0, seqlen, self.query_chunk):

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Modified for Relax integration; see NOTICE.
 
 """Frozen CPU-mapped Engram tables and the trainable V4.1 retrieval gate."""
@@ -22,6 +23,8 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+from .thd.layout import ThdLayout
 
 
 def find_next_prime(start: int, seen_primes: set[int]) -> int:
@@ -368,17 +371,20 @@ class DeepSeekV41Engram(MegatronModule):
         )
         self.table, self.table_scale = table, scale
 
-    def hash_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def hash_ids(self, input_ids: torch.Tensor, seq_positions: torch.Tensor | None = None) -> torch.Tensor:
         if input_ids.ndim != 2 or input_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Engram input IDs must be an integer [batch, sequence] tensor.")
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         positions = torch.arange(seqlen, device=input_ids.device).expand(batch, seqlen)
+        if seq_positions is not None and seq_positions.shape != (seqlen,):
+            raise ValueError("Engram packed positions must have one entry per input token.")
+        in_segment = positions if seq_positions is None else seq_positions.expand(batch, seqlen)
         tokens: list[torch.Tensor] = []
         blocked = torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.max_ngram_size):
             source = compressed.gather(1, (positions - shift).clamp_min(0))
-            blocked = blocked | (positions < shift)
+            blocked = blocked | (in_segment < shift)
             tokens.append(torch.where(blocked, self.pad_id, source))
         products = torch.stack(tokens, dim=-1) * self.multipliers
         rolling, hashes = products[..., 0], []
@@ -429,7 +435,9 @@ class DeepSeekV41Engram(MegatronModule):
             torch.distributed.all_reduce(values, group=self.tp_group)
         return values
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor, *, thd_layout: ThdLayout | None = None
+    ) -> torch.Tensor:
         if self.sequence_parallel:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
@@ -438,7 +446,11 @@ class DeepSeekV41Engram(MegatronModule):
         if input_ids is None or input_ids.shape != (batch, seqlen):
             raise ValueError("Engram needs [batch, CP-local sequence] IDs matching the hidden-state sequence.")
         with torch.no_grad():
-            if self.cp_size > 1:
+            if thd_layout is not None:
+                from .thd.engram import hash_ids_thd
+
+                ids = hash_ids_thd(self, input_ids, thd_layout)
+            elif self.cp_size > 1:
                 # V4.1 uses contiguous CP chunks, not Megatron's zigzag token ordering.
                 chunks = [torch.empty_like(input_ids) for _ in range(self.cp_size)]
                 torch.distributed.all_gather(chunks, input_ids.contiguous(), group=self.cp_group)
@@ -447,6 +459,8 @@ class DeepSeekV41Engram(MegatronModule):
             else:
                 ids = self.hash_ids(input_ids).transpose(0, 1)
             rows = self.lookup(ids)
+            if thd_layout is not None:
+                rows = rows.masked_fill(~thd_layout.valid_mask(rows.device)[:, None, None, None], 0)
         kv, _ = self.linear_wkv(rows.flatten(-2))
         hidden = hidden_states.view(seqlen, batch, self.hc_mult, self.dim)
         output = engram_gate(hidden, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value)

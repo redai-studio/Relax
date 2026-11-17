@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Dependency-free execution boundary tests; no model construction or CUDA
-initialization."""
+"""Execution boundaries and CPU-only Bridge configuration finalization."""
 
 import importlib.util
 from pathlib import Path
@@ -11,7 +10,7 @@ from typing import Any
 import pytest
 
 
-_SOURCE = Path(__file__).resolve().parents[3] / "relax/models/deepseekv41/execution_config.py"
+_SOURCE = Path(__file__).resolve().parents[4] / "relax/models/deepseekv41/execution_config.py"
 _SPEC = importlib.util.spec_from_file_location("v41_execution_config_test", _SOURCE)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -67,7 +66,18 @@ def test_validate_execution_config_allows_standard_moe_recompute(recompute: str 
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        ({"v41_qkv_format": "thd"}, "packed THD"),
+        ({"v41_qkv_format": "sbhd"}, "bshd or thd"),
+        ({"v41_qkv_format": "thd", "v41_indexer_replay": True}, "indexer replay"),
+        ({"v41_qkv_format": "thd", "recompute_granularity": "full", "recompute_method": "block"}, "one layer"),
+        (
+            {
+                "v41_qkv_format": "thd",
+                "recompute_granularity": "full",
+                "recompute_method": "uniform",
+                "recompute_num_layers": 2,
+            },
+            "one layer",
+        ),
         ({"dynamic_context_parallel": True}, "fixed context"),
         ({"context_parallel_size": 0}, "positive"),
         ({"context_parallel_size": 2, "cp_partition_mode": "contiguous"}, "allgather-cp"),
@@ -100,14 +110,19 @@ def test_validate_execution_config_rejects_unsupported_paths(changes: dict[str, 
         validate_execution_config(_provider(**changes))
 
 
-@pytest.mark.parametrize("cp_partition_mode", ["zigzag", "contiguous"])
-def test_validate_execution_config_allows_allgather_cp_and_preserves_runtime_options(cp_partition_mode: str) -> None:
+@pytest.mark.parametrize(("qkv_format", "cp_partition_mode"), [("bshd", "zigzag"), ("thd", "contiguous")])
+def test_validate_execution_config_allows_allgather_cp_and_preserves_runtime_options(
+    qkv_format: str, cp_partition_mode: str
+) -> None:
     provider = _provider(
         context_parallel_size=2,
         cp_partition_mode=cp_partition_mode,
+        v41_qkv_format=qkv_format,
         v41_allgather_cp=True,
         pipeline_model_parallel_size=2,
         recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
         optimizer_cpu_offload=True,
         moe_token_dispatcher_type="flex",
         moe_flex_dispatcher_backend="deepep",
@@ -168,6 +183,14 @@ def test_configure_execution_runtime_forwards_allgather_without_changing_native_
     assert provider.cp_partition_mode == "zigzag"
 
 
+def test_configure_execution_runtime_rejects_thd_indexer_replay_but_allows_routing_replay() -> None:
+    provider = _provider()
+    configure_execution_runtime(provider, SimpleNamespace(qkv_format="thd", use_rollout_routing_replay=True))
+    assert provider.v41_qkv_format == "thd"
+    with pytest.raises(ValueError, match="indexer replay"):
+        configure_execution_runtime(provider, SimpleNamespace(qkv_format="thd", use_rollout_indexer_replay=True))
+
+
 @pytest.mark.parametrize("field", ["hidden_dropout", "attention_dropout"])
 def test_validate_execution_config_rejects_nonzero_dropout(field: str) -> None:
     with pytest.raises(ValueError, match=f"{field}=0.0"):
@@ -177,3 +200,71 @@ def test_validate_execution_config_rejects_nonzero_dropout(field: str) -> None:
 def test_validate_execution_config_rejects_unported_training_cuda_graphs() -> None:
     with pytest.raises(NotImplementedError, match="CUDA-graph"):
         validate_execution_config(_provider(cuda_graph_impl="local"))
+
+
+def _bridge_provider(**changes: Any) -> Any:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("megatron.bridge.models.mla_provider")
+    from relax.models.deepseekv41.provider import DeepSeekV41ModelProvider
+
+    values = {
+        "num_layers": 4,
+        "hidden_size": 128,
+        "num_attention_heads": 8,
+        "ffn_hidden_size": 256,
+        "q_lora_rank": 64,
+        "kv_lora_rank": 512,
+        "qk_head_dim": 448,
+        "qk_pos_emb_head_dim": 64,
+        "v_head_dim": 512,
+        "csa_window_size": 128,
+        "csa_compress_ratios": [0, 2, 1, 1],
+        "bf16": True,
+        "params_dtype": torch.bfloat16,
+        "hidden_dropout": 0.0,
+        "attention_dropout": 0.0,
+        "tensor_model_parallel_size": 2,
+        "sequence_parallel": True,
+        "pipeline_model_parallel_size": 2,
+        "context_parallel_size": 2,
+        "cp_partition_mode": "contiguous",
+        "variable_seq_lengths": True,
+        "recompute_granularity": "full",
+        "recompute_method": "uniform",
+        "recompute_num_layers": 1,
+        "v41_qkv_format": "thd",
+        "v41_allgather_cp": True,
+    }
+    values.update(changes)
+    return DeepSeekV41ModelProvider(**values)
+
+
+def test_provider_finalizes_relax_thd_cp_without_core_packing_scheduler() -> None:
+    provider = _bridge_provider()
+    for _ in range(2):
+        provider.finalize()
+        validate_execution_config(provider)
+        assert provider.cp_partition_mode == "contiguous"
+        assert provider.sequence_packing_scheduler is None
+        assert provider.context_parallel_size == 2
+        assert provider.experimental_attention_variant is None
+        assert provider.pipeline_dtype == provider.params_dtype
+        assert provider.attention_latent_norm_epsilon == provider.layernorm_epsilon
+
+
+@pytest.mark.parametrize(
+    "changes", [{"v41_qkv_format": "bshd"}, {"v41_allgather_cp": False}, {"dynamic_context_parallel": True}]
+)
+def test_provider_keeps_core_cp_validation_outside_relax_thd_path(changes: dict[str, Any]) -> None:
+    provider = _bridge_provider(**changes)
+    with pytest.raises(ValueError, match="cp_partition_mode='contiguous'"):
+        provider.finalize()
+    assert provider.cp_partition_mode == "contiguous"
+
+
+def test_provider_restores_cp_layout_when_generic_finalization_fails() -> None:
+    provider = _bridge_provider(num_attention_heads=7)
+    with pytest.raises(ValueError, match="num_attention_heads"):
+        provider.finalize()
+    assert provider.cp_partition_mode == "contiguous"
+    assert provider.sequence_packing_scheduler is None

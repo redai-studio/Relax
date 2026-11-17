@@ -158,6 +158,30 @@ def test_hash_ids_match_independent_ngram_reference_and_sample_padding() -> None
     torch.testing.assert_close(actual[1, :1], module.hash_ids(input_ids[1:2, :1])[0])
 
 
+def test_thd_hash_matches_independent_samples_and_ignores_previous_sample() -> None:
+    from relax.models.deepseekv41.thd.engram import hash_ids_thd
+    from relax.models.deepseekv41.thd.layout import ThdLayout
+
+    module = _bare_engram()
+    params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q_cpu=[0, 3, 4, 9],
+        valid_seqlens_q_cpu=[3, 1, 5],
+        cu_seqlens_q_padded_cpu=(0, 3, 4, 12),
+    )
+    layout = ThdLayout.from_packed_seq_params(params, cp_rank=0, cp_size=1)
+    samples = [torch.tensor([[1, 2, 3]]), torch.tensor([[2]]), torch.tensor([[3, 1, 2, 3, 1]])]
+    packed = torch.cat([*samples, torch.zeros(1, 3, dtype=torch.int64)], dim=1)
+    actual = hash_ids_thd(module, packed, layout).transpose(0, 1)
+    expected = torch.cat([module.hash_ids(sample) for sample in samples], dim=1)
+    torch.testing.assert_close(actual[:, :9], expected)
+    changed = packed.clone()
+    changed[:, :3] = 0
+    changed[:, 9:] = 3
+    changed_hashes = hash_ids_thd(module, changed, layout).transpose(0, 1)
+    torch.testing.assert_close(changed_hashes[:, 3:9], actual[:, 3:9])
+
+
 @pytest.mark.parametrize("ids", [torch.zeros(2), torch.zeros(2, 2), torch.zeros(1, 2, 3, dtype=torch.long)])
 def test_hash_ids_reject_non_integer_or_non_matrix_input(ids: torch.Tensor) -> None:
     with pytest.raises(ValueError):

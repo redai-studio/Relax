@@ -170,11 +170,12 @@ def _check_frozen_router(model: torch.nn.Module, source: torch.Tensor, records: 
 
 
 def _worker(rank: int, rendezvous: str, output_path: str, skew: bool, recompute: bool) -> None:
-    from deep_ep import Buffer
     from megatron.core import parallel_state
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.moe import fused_a2a
 
+    # Use Core's backend: its event handles and buffer must share the same ABI.
+    Buffer = fused_a2a.Buffer
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     torch.backends.cuda.matmul.allow_tf32 = False

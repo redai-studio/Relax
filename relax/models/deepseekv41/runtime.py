@@ -11,10 +11,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import prod
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.nn.functional as F
+
+
+if TYPE_CHECKING:
+    from .thd.layout import ThdLayout
 
 
 @dataclass(slots=True)
@@ -28,6 +32,7 @@ class V41Runtime:
     index_k: dict[int, torch.Tensor] = field(default_factory=dict)
     topk: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
+    thd_layout: ThdLayout | None = None
 
     def reset(self) -> None:
         self.pre = None
@@ -36,6 +41,7 @@ class V41Runtime:
         self.index_k.clear()
         self.topk = None
         self.candidates = None
+        self.thd_layout = None
 
 
 def v41_aggregate(hidden: torch.Tensor, pre: torch.Tensor | None, n: int) -> torch.Tensor:
@@ -151,9 +157,15 @@ class V41CarryPlan:
     def base_cols(self) -> int:
         return self.hidden_size * self.num_residual_streams
 
-    def sections(self, s: int, b: int) -> tuple[_CarrySection, ...]:
-        local_length = s * self.tp_size if self.sequence_parallel else s
-        global_length = local_length * self.cp_size
+    def sections(self, s: int, b: int, layout: ThdLayout | None = None) -> tuple[_CarrySection, ...]:
+        if layout is None:
+            from .bshd.runtime import carry_dimensions
+
+            local_length, compressed_lengths, candidate_width = carry_dimensions(self, s, b)
+        else:
+            from .thd.runtime import carry_dimensions
+
+            local_length, compressed_lengths, candidate_width = carry_dimensions(self, s, b, layout)
         sections = []
         if self.pre:
             shape = (s, b, self.num_residual_streams)
@@ -166,10 +178,7 @@ class V41CarryPlan:
             ("index_k", self.index_k_keys, self.index_head_dim),
         ):
             for key in keys:
-                ratio = self.compress_ratios[key]
-                if self.cp_size > 1 and local_length % ratio:
-                    raise ValueError("DeepSeek V4.1: CP chunk length must be divisible by its compression ratio.")
-                shape = (b, global_length // ratio, width)
+                shape = (b, compressed_lengths[key], width)
                 sections.append(_CarrySection(name, key, shape, "float", prod(shape)))
         if self.topk:
             shape = (b, local_length, self.index_topk)
@@ -177,7 +186,7 @@ class V41CarryPlan:
         if self.candidates:
             if self.candidate_ratio <= 0 or self.candidate_block_size <= 0:
                 raise ValueError("DeepSeek V4.1: candidate source ratio and block size must be positive.")
-            width = global_length // self.candidate_ratio
+            width = candidate_width
             shape = (b, local_length, width)
             blocks = (width + self.candidate_block_size - 1) // self.candidate_block_size
             elements = (b * local_length * blocks + 1) // 2
@@ -203,16 +212,16 @@ def _bits_to_bf16(value: torch.Tensor) -> torch.Tensor:
     return flat.to(torch.int32).view(torch.bfloat16)
 
 
-def _carry_sections(hidden: torch.Tensor, plan: V41CarryPlan) -> tuple[_CarrySection, ...]:
+def _carry_sections(hidden: torch.Tensor, plan: V41CarryPlan, runtime: V41Runtime) -> tuple[_CarrySection, ...]:
     if hidden.dtype != torch.bfloat16:
         raise ValueError("DeepSeek V4.1 carry requires BF16; casting its encoded integers would corrupt state.")
     if hidden.ndim != 3 or hidden.shape[0] == 0 or hidden.shape[1] == 0:
         raise ValueError("DeepSeek V4.1 carry expects a nonempty [sequence, batch, hidden] tensor.")
-    return plan.sections(hidden.shape[0], hidden.shape[1])
+    return plan.sections(hidden.shape[0], hidden.shape[1], runtime.thd_layout)
 
 
 def v41_pack_carry(hidden: torch.Tensor, runtime: V41Runtime, plan: V41CarryPlan) -> torch.Tensor:
-    sections = _carry_sections(hidden, plan)
+    sections = _carry_sections(hidden, plan, runtime)
     if hidden.shape[-1] != plan.base_cols:
         raise ValueError(f"DeepSeek V4.1 carry expected hidden width {plan.base_cols}, got {hidden.shape[-1]}.")
     parts = []
@@ -253,7 +262,7 @@ def v41_pack_carry(hidden: torch.Tensor, runtime: V41Runtime, plan: V41CarryPlan
 def v41_unpack_carry(
     hidden: torch.Tensor, runtime: V41Runtime, plan: V41CarryPlan, base_cols: int | None = None
 ) -> torch.Tensor:
-    sections = _carry_sections(hidden, plan)
+    sections = _carry_sections(hidden, plan, runtime)
     base_cols = plan.base_cols if base_cols is None else base_cols
     if base_cols != plan.base_cols:
         raise ValueError("DeepSeek V4.1 carry base width does not agree with the layer plan.")
@@ -263,7 +272,12 @@ def v41_unpack_carry(
     if hidden.shape[-1] != expected_width:
         raise ValueError(f"DeepSeek V4.1 carry expected packed width {expected_width}, got {hidden.shape[-1]}.")
     carry = hidden[..., base_cols:].contiguous().flatten()
+    # The layer binds its own microbatch's immutable layout before decoding.
+    # It also does so during backward recomputation, after a later forward may
+    # have replaced or cleared all instance-owned activation state.
+    layout = runtime.thd_layout
     runtime.reset()
+    runtime.thd_layout = layout
     offset = 0
     for section in sections:
         flat = carry[offset : offset + section.elements]

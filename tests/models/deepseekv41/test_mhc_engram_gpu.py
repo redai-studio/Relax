@@ -251,6 +251,91 @@ def _engram_config(path: Path, tp: int, cp: int) -> TransformerConfig:
 
 
 @pytest.mark.parametrize("mode", ["local", "cp", "tp_sp"])
+@pytest.mark.parametrize("segments", [(7, 1, 11), (3, 1, 5)], ids=["cross_cp_boundary", "padding_only_rank"])
+def test_engram_thd_gpu_forward_and_gradients(
+    process_group: None, tmp_path: Path, mode: str, segments: tuple[int, ...]
+) -> None:
+    from relax.models.deepseekv41.thd.layout import ThdLayout
+
+    world = torch.distributed.get_world_size()
+    if (mode == "local" and world != 1) or (mode != "local" and world != 2):
+        pytest.skip("local requires one worker; CP/TP-SP require two torchrun workers")
+    tp, cp = (2 if mode == "tp_sp" else 1), (2 if mode == "cp" else 1)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+    try:
+        model_parallel_cuda_manual_seed(41017)
+        values, scales = _checkpoint(tmp_path)
+        config = _engram_config(tmp_path, tp, cp)
+        module = DeepSeekV41Engram(
+            config, 0, parallel_state.get_tensor_model_parallel_group(), parallel_state.get_context_parallel_group()
+        ).cuda()
+        with torch.no_grad():
+            module.linear_wkv.weight.copy_(
+                torch.linspace(-0.08, 0.11, module.linear_wkv.weight.numel(), device="cuda").reshape_as(
+                    module.linear_wkv.weight
+                )
+            )
+            module.q_weight.copy_(torch.linspace(-0.9, 1.2, 128, device="cuda").view(4, 32))
+            module.k_weight.copy_(torch.linspace(0.2, 1.1, 128, device="cuda").view(4, 32))
+        total = 32
+        offsets = [0]
+        for length in segments:
+            offsets.append(offsets[-1] + length)
+        params = SimpleNamespace(
+            qkv_format="thd",
+            cu_seqlens_q_cpu=offsets,
+            valid_seqlens_q_cpu=segments,
+            cu_seqlens_q_padded_cpu=(*offsets[:-1], total),
+            cp_partition_mode="contiguous",
+        )
+        cp_rank = parallel_state.get_context_parallel_rank()
+        layout = ThdLayout.from_packed_seq_params(params, cp_rank=cp_rank, cp_size=cp)
+        token_ids = (torch.arange(total, device="cuda").remainder(6) + 2).unsqueeze(0)
+        token_ids[:, offsets[-1] :] = 1
+        generator = torch.Generator(device="cuda").manual_seed(8071)
+        full_hidden = torch.randn(total, 1, 128, generator=generator, device="cuda", dtype=torch.bfloat16)
+        cotangent = torch.randn(full_hidden.shape, generator=generator, device="cuda", dtype=torch.bfloat16)
+        rank = torch.distributed.get_rank()
+        chunk = slice(rank * (total // world), (rank + 1) * (total // world))
+        hidden = full_hidden[chunk].clone().requires_grad_()
+        input_ids = token_ids[:, chunk].contiguous() if mode == "cp" else token_ids
+        actual = module(hidden, input_ids, thd_layout=layout)
+
+        # Run each sample's hash independently: no THD helper participates in
+        # this reference. Padding retains only the residual, not a lookup value.
+        expected_hidden = full_hidden.clone().requires_grad_()
+        table = _decoded_table(values, scales).cuda()
+        pieces = []
+        for begin, end in zip(offsets, offsets[1:]):
+            hashes = module.hash_ids(token_ids[:, begin:end]).transpose(0, 1)
+            decoded = table[hashes].flatten(-2)
+            kv = torch.nn.functional.linear(decoded, module.linear_wkv.weight)
+            pieces.append(
+                _gate_reference(
+                    expected_hidden[begin:end].view(end - begin, 1, 4, 32), kv, module.q_weight, module.k_weight
+                ).flatten(-2)
+            )
+        expected = torch.cat([*pieces, expected_hidden[offsets[-1] :]], dim=0)
+        label = f"engram/thd/{mode}/{segments}"
+        _close(actual, expected[chunk], label + "/forward", atol=0.016, rtol=0.01)
+        actual_grad = torch.autograd.grad(actual, (hidden, *module.parameters()), cotangent[chunk])
+        expected_grad = torch.autograd.grad(expected, (expected_hidden, *module.parameters()), cotangent)
+        _close(actual_grad[0], expected_grad[0][chunk], label + "/hidden_grad", atol=0.016, rtol=0.015)
+        for index, (result, reference) in enumerate(zip(actual_grad[1:], expected_grad[1:])):
+            if mode == "cp":
+                torch.distributed.all_reduce(result, group=parallel_state.get_context_parallel_group())
+            _close(
+                result,
+                reference,
+                label + f"/param_grad{index}",
+                atol=0.15 if result.dtype == torch.bfloat16 else 0.02,
+                rtol=0.025,
+            )
+    finally:
+        parallel_state.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("mode", ["local", "cp", "tp_sp"])
 def test_engram_gpu_mmap_distributed_forward_and_gradients(process_group: None, tmp_path: Path, mode: str) -> None:
     world = torch.distributed.get_world_size()
     if (mode == "local" and world != 1) or (mode != "local" and world != 2):

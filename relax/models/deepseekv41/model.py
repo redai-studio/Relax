@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import Any
 
 import torch
@@ -113,10 +114,33 @@ class V41TransformerLayer(HyperConnectionTransformerLayer):
         self.v41_output_plan = V41CarryPlan(config, layer_id) if self.v41_carry and not self.v41_is_last else None
 
     def forward(self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, Any]:
+        packed_seq_params = kwargs.get("packed_seq_params")
+        if packed_seq_params is None:
+            if getattr(self.config, "v41_qkv_format", "bshd") == "thd":
+                raise ValueError("DeepSeek V4.1 THD layers require packed sequence metadata.")
+            self.v41_runtime.thd_layout = None
+        else:
+            from .thd.runtime import bind_layout
+
+            if hidden_states.shape[1] != 1:
+                raise ValueError("DeepSeek V4.1 THD layers require a singleton batch dimension.")
+            local_length = hidden_states.shape[0]
+            if self.config.sequence_parallel:
+                local_length *= self.config.tensor_model_parallel_size
+            # Core's recompute closure retains this forward's PackedSeqParams.
+            # Bind before unpacking: another microbatch may have reset runtime.
+            self.v41_runtime.thd_layout = bind_layout(
+                packed_seq_params, getattr(self.pg_collection, "cp", None), local_length
+            )
         if self.v41_input_plan is not None:
             hidden_states = v41_unpack_carry(hidden_states, self.v41_runtime, self.v41_input_plan)
         if self.v41_engram is not None:
-            hidden_states = self.v41_engram(hidden_states, self.v41_runtime.input_ids)
+            if self.v41_runtime.thd_layout is None:
+                hidden_states = self.v41_engram(hidden_states, self.v41_runtime.input_ids)
+            else:
+                hidden_states = self.v41_engram(
+                    hidden_states, self.v41_runtime.input_ids, thd_layout=self.v41_runtime.thd_layout
+                )
         output, context = super().forward(hidden_states, *args, **kwargs)
         if self.v41_is_last:
             output = v41_aggregate(output, self.v41_runtime.pre, self.config.num_residual_streams)
@@ -233,6 +257,7 @@ class DeepSeekV41GPTModel(GPTModel):
             raise ValueError("DeepSeek V4.1 requires an explicit model process-group collection.")
         runtime = V41Runtime()
         self.v41_runtime = runtime
+        self.v41_cp_group = getattr(pg_collection, "cp", None)
         pp_group = getattr(pg_collection, "pp", None)
         pp_rank = pp_group.rank() if pp_group is not None else 0
         block_spec = get_v41_spec(config, runtime, vp_stage=vp_stage, pp_rank=pp_rank)
@@ -281,8 +306,9 @@ class DeepSeekV41GPTModel(GPTModel):
         output_processor: Any = None,
         output_processor_context: Any = None,
     ) -> torch.Tensor:
-        if packed_seq_params is not None:
-            raise NotImplementedError("DeepSeek V4.1 attention does not support packed sequences.")
+        qkv_format = getattr(getattr(self, "config", None), "v41_qkv_format", "bshd")
+        if (packed_seq_params is not None) != (qkv_format == "thd"):
+            raise ValueError("DeepSeek V4.1 THD requires packed sequence metadata; BSHD must not supply it.")
         if inference_context is not None or inference_params is not None:
             raise NotImplementedError(
                 "DeepSeek V4.1 Megatron execution currently supports training, not KV-cache inference."
@@ -294,6 +320,19 @@ class DeepSeekV41GPTModel(GPTModel):
         self.v41_runtime.reset()
         self.v41_runtime.input_ids = input_ids
         try:
+            if packed_seq_params is not None:
+                from .thd.runtime import bind_layout
+
+                # Keep layout/device caches alive with this forward's Core
+                # checkpoint closure, without attaching them to a reused batch.
+                packed_seq_params = copy(packed_seq_params)
+                layout = bind_layout(
+                    packed_seq_params,
+                    self.v41_cp_group,
+                    input_ids.shape[-1] if input_ids is not None else None,
+                )
+                packed_seq_params.v41_thd_layout = layout
+                self.v41_runtime.thd_layout = layout
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
