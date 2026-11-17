@@ -249,9 +249,9 @@ def _contrast_args():
     args = _opd_args()
     vars(args).update(
         loss_type="sft",
-        task_type="seq_contrast",
+        task_type="embedding",
         use_opd=False,
-        custom_dataset_class_path="relax.engine.sft.dataset.retrieval.NLIPairDataset",
+        custom_dataset_class_path="examples.seq_contrast_sft.nli.NLIPairDataset",
         prompt_data=["/pairs.jsonl"],
         n_samples_per_prompt=1,
         rollout_batch_size=32,
@@ -267,25 +267,31 @@ def _contrast_args():
     return args
 
 
-def test_seq_contrast_parser_and_shared_offline_validation(arguments_module):
+def test_embedding_parser_and_shared_offline_validation(arguments_module):
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
-    parsed = parser.parse_args(["--task-type", "seq_contrast", "--contrastive-temperature", "0.07"])
-    assert parsed.task_type == "seq_contrast"
+    parsed = parser.parse_args(
+        ["--task-type", "embedding", "--embedding-loss-type", "infonce", "--contrastive-temperature", "0.07"]
+    )
+    assert parsed.task_type == "embedding"
+    assert parsed.embedding_loss_type == "infonce"
     assert parsed.contrastive_temperature == 0.07
     args = _contrast_args()
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
     assert args.compute_advantages_and_returns is False
     assert args.balance_data is True
     assert args.use_critic is False
 
 
-@pytest.mark.parametrize("override", ["context_parallel_size: 2", "sft_train_data_prefetch: true", "eval_size: 0"])
-def test_seq_contrast_yaml_cannot_bypass_retrieval_contract(arguments_module, tmp_path, override):
+@pytest.mark.parametrize(
+    "override",
+    ["context_parallel_size: 2", "sft_train_data_prefetch: true", "eval_size: 0", "embedding_loss_type: invalid"],
+)
+def test_embedding_yaml_cannot_bypass_pair_contract(arguments_module, tmp_path, override):
     args = _contrast_args()
     config = tmp_path / "override.yaml"
     config.write_text(override)
     args.custom_config_path = str(config)
-    with pytest.raises(ValueError, match="seq_contrast"):
-        arguments_module.slime_validate_args(args)
+    with pytest.raises(ValueError, match="embedding"):
+        arguments_module.relax_validate_args(args)

@@ -90,7 +90,9 @@ def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, model_ty
             "RELAX_LORA_A_INIT_METHOD": initializer or "kaiming",
         },
     }
-    assert args[args.index("--custom-dataset-class") + 1] == "relax.engine.sft.dataset.retrieval.NLIPairDataset"
+    assert args[args.index("--task-type") + 1] == "embedding"
+    assert args[args.index("--embedding-loss-type") + 1] == "infonce"
+    assert args[args.index("--custom-dataset-class") + 1] == "examples.seq_contrast_sft.nli.NLIPairDataset"
     assert "--data-parallel-random-init" in args
     assert "--colocate" not in args
     assert args[args.index("--sft-max-in-flight-steps") + 1] == "2"

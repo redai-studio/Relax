@@ -5,7 +5,7 @@
 from argparse import Namespace
 
 from relax.engine.sft.image_preprocessing_config import configure_image_preprocessing
-from relax.engine.sft.runtime import is_offline_mode, is_sft_mode
+from relax.engine.sft.runtime import is_embedding_task, is_offline_mode, is_sft_mode
 from relax.models.qwen3_5.recipe import enabled as qwen35_recipe_enabled
 from relax.utils.data.wholepack_policy import enabled as wholepack_enabled
 
@@ -24,9 +24,9 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
             # The optimized recipe consumes raw batches even without wholepack.
             and not qwen35_recipe_enabled(args)
             and lookahead
-            # Retrieval pairs are packed by their task-specific forward path;
+            # Embedding pairs are packed by their task-specific forward path;
             # the generic prepacker cannot concatenate anchor/positive dicts.
-            and getattr(args, "task_type", "causal_lm") != "seq_contrast"
+            and not is_embedding_task(args)
             and "image" not in (getattr(args, "multimodal_keys", None) or {})
             and args.distributed_backend == "nccl"
             and args.qkv_format == "thd"

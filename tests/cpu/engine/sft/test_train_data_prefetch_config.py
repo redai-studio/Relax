@@ -39,8 +39,8 @@ def make_args(**overrides):
     "overrides,prepack,prefetch,image",
     [
         ({}, True, False, False),
-        ({"task_type": "seq_contrast"}, False, True, False),
-        ({"task_type": "seq_contrast", "max_staleness": 0}, False, False, False),
+        ({"task_type": "embedding"}, False, True, False),
+        ({"task_type": "embedding", "max_staleness": 0}, False, False, False),
         ({"loss_type": "dpo"}, False, True, False),
         ({"loss_type": "rm"}, False, True, False),
         ({"loss_type": "dpo", "max_staleness": 0}, False, False, False),
@@ -81,7 +81,7 @@ def test_legacy_switches_do_not_override_automatic_selection(enabled):
 
 
 def test_retrieval_pairs_keep_raw_prefetch_when_legacy_prepack_is_requested():
-    args = make_args(task_type="seq_contrast", sft_async_prepack=True)
+    args = make_args(task_type="embedding", sft_async_prepack=True)
     configure_sft_data_pipeline(args)
 
     assert args.per_rank_fetch and args.sft_train_data_prefetch

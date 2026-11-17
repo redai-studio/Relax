@@ -115,7 +115,7 @@ class TestBuildLoraPeft:
     def test_sequence_contrast_uses_canonical_adapters(self, monkeypatch):
         self._install_create_peft_stub(monkeypatch)
         args = Namespace(
-            task_type="seq_contrast",
+            task_type="embedding",
             lora_rank=64,
             lora_alpha=128,
             lora_target_modules=["linear_q", "linear_k", "linear_v"],

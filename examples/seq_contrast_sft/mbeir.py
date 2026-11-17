@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from examples.lamra_rerank.data import format_text, load_rank_image, make_entity
-from relax.engine.sft.dataset.retrieval import NLIPairDataset, _encode_pair
+from examples.seq_contrast_sft.nli import NLIPairDataset, _encode_pair, position_before_emb
 
 
 def retrieval_messages(entity: dict[str, str]) -> list[dict[str, Any]]:
@@ -105,12 +105,9 @@ def _encode_mbeir_pair(
             text=[rendered], images=images or None, padding=False, truncation=False, return_tensors="pt"
         )
         ids = encoded["input_ids"][0].contiguous()
-        positions = torch.nonzero(ids == emb_token_id, as_tuple=False).flatten()
         if ids.device.type != "cpu" or ids.ndim != 1 or not 2 <= ids.numel() <= max_length:
             raise ValueError("M-BEIR branch is invalid or overlength; no visits are dropped/truncated")
-        if positions.numel() == 0 or int(positions[0]) == 0:
-            raise ValueError("M-BEIR branch requires <emb> with a preceding token")
-        branch = {"input_ids": ids}
+        branch = {"input_ids": ids, "embedding_position": position_before_emb(ids, emb_token_id)}
         # Only model tensors cross TQ. Processor control flags and the padded
         # attention mask do not belong in THD multimodal_train_inputs.
         for key in ("pixel_values", "image_grid_thw"):

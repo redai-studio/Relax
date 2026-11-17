@@ -71,7 +71,11 @@ def main() -> None:
     config = AutoConfig.from_pretrained(args.base)
     text_config = getattr(config, "text_config", config)
     num_layers = text_config.num_hidden_layers
-    if config.model_type not in {"qwen2_vl", "qwen3_5"} or saved.task_type not in {"causal_lm", "seq_contrast"}:
+    if config.model_type not in {"qwen2_vl", "qwen3_5"} or saved.task_type not in {
+        "causal_lm",
+        "seq_contrast",
+        "embedding",
+    }:
         raise ValueError("This exporter requires a LamRA retrieval or rank checkpoint")
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     if config.model_type == "qwen3_5":

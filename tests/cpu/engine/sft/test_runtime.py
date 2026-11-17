@@ -44,7 +44,7 @@ def test_resolve_sft_split_indices_matches_ms_swift_rng_order():
 
 @pytest.mark.parametrize(
     ("task_type", "mtp_only_training"),
-    [("causal_lm", False), ("seq_cls", False), ("seq_contrast", False), ("causal_lm", True)],
+    [("causal_lm", False), ("seq_cls", False), ("embedding", False), ("causal_lm", True)],
 )
 def test_pure_sft_does_not_need_snapshots_for_saving_or_local_eval(task_type, mtp_only_training):
     args = Namespace(

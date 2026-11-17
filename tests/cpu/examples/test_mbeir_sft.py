@@ -16,7 +16,7 @@ from examples.seq_contrast_sft.mbeir import MbeirPairDataset, _encode_mbeir_pair
 from examples.seq_contrast_sft.tools import prepare_mbeir
 from relax.utils.data import processor_pool
 from relax.utils.data.streaming_dataset import IndexManager
-from relax.utils.training.retrieval_utils import expand_retrieval_rollout_data
+from relax.utils.training.embedding import expand_embedding_pairs
 
 
 class _Processor:
@@ -95,13 +95,15 @@ def test_mm_pair_keeps_only_model_tensors_and_preserves_post_DP_image_order(tmp_
     Image.new("RGB", (93, 67)).save(image)
     monkeypatch.setattr(processor_pool, "get_worker_processor", lambda: _Processor())
     pairs = [_encode_mbeir_pair(_row(marker, image), 99, 16) for marker in (10, 20)]
-    assert set(pairs[0]["query"]) == {"input_ids", "pixel_values", "image_grid_thw"}
-    assert set(pairs[0]["positive"]) == {"input_ids"}
-    expanded = expand_retrieval_rollout_data({"multimodal_train_inputs": pairs[::-1]})
+    assert set(pairs[0]["query"]) == {"input_ids", "pixel_values", "image_grid_thw", "embedding_position"}
+    assert set(pairs[0]["positive"]) == {"input_ids", "embedding_position"}
+    expanded = expand_embedding_pairs({"multimodal_train_inputs": pairs[::-1]})
     assert [row[0].item() for row in expanded["tokens"]] == [20, 120, 10, 110]
     assert expanded["multimodal_train_inputs"][0]["pixel_values"][0, 0] == 20
     assert expanded["multimodal_train_inputs"][2]["pixel_values"][0, 0] == 10
     assert expanded["multimodal_train_inputs"][1] is None
+    assert expanded["embedding_positions"] == [0] * 4
+    assert "embedding_position" not in expanded["multimodal_train_inputs"][0]
 
 
 def test_missing_image_and_overlength_fail_without_skipping(tmp_path, monkeypatch):

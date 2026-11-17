@@ -473,14 +473,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
-        from relax.engine.sft.runtime import is_sequence_contrast_mode
-
-        if is_sequence_contrast_mode(args):
-            from relax.utils.training.retrieval_utils import retrieval_emb_token_id
-
-            text_config = getattr(self.hf_config, "text_config", self.hf_config)
-            args.retrieval_emb_token_id = retrieval_emb_token_id(self.tokenizer, text_config.vocab_size)
-
         from relax.utils.training.flops_counter import FlopsCounter
 
         self.flops_counter = FlopsCounter(self.hf_config)

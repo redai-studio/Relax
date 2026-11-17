@@ -14,7 +14,15 @@ from relax.utils.data.data_utils import parse_generalized_path
 from relax.utils.data.streaming_dataset import IndexManager, StreamingReader
 
 
-def _encode_pair(row: dict[str, Any], emb_token_id: int, max_length: int) -> dict[str, dict[str, torch.Tensor]]:
+def position_before_emb(ids: torch.Tensor, emb_token_id: int) -> int:
+    """Select the token immediately before the first LamRA <emb> marker."""
+    positions = torch.nonzero(ids == emb_token_id, as_tuple=False).flatten()
+    if positions.numel() == 0 or int(positions[0]) == 0:
+        raise ValueError("Each LamRA branch requires an <emb> token with a preceding token")
+    return int(positions[0]) - 1
+
+
+def _encode_pair(row: dict[str, Any], emb_token_id: int, max_length: int) -> dict[str, dict[str, torch.Tensor | int]]:
     if "query" in row and "positive" in row:
         branches = {side: row[side] for side in ("query", "positive")}
     else:
@@ -39,10 +47,7 @@ def _encode_pair(row: dict[str, Any], emb_token_id: int, max_length: int) -> dic
             ids = encoded["input_ids"][0]
         if ids.device.type != "cpu" or ids.ndim != 1 or not 2 <= ids.numel() <= max_length:
             raise ValueError("NLI branch is invalid or overlength; no pairs are filtered or truncated")
-        positions = torch.nonzero(ids == emb_token_id, as_tuple=False).flatten()
-        if positions.numel() == 0 or int(positions[0]) == 0:
-            raise ValueError("Each NLI branch requires an <emb> token with a preceding token")
-        output[side] = {"input_ids": ids.contiguous()}
+        output[side] = {"input_ids": ids.contiguous(), "embedding_position": position_before_emb(ids, emb_token_id)}
     return output
 
 
@@ -83,12 +88,17 @@ class NLIPairDataset:
 
     @classmethod
     def from_args(cls, config: Any, *, tokenizer: Any, processor_pool: Any, pad_token_ids: Any) -> "NLIPairDataset":
-        from relax.utils.training.retrieval_utils import retrieval_emb_token_id
+        from transformers import AutoConfig
 
         del pad_token_ids
+        model_config = AutoConfig.from_pretrained(config.hf_checkpoint, trust_remote_code=True)
+        text_config = getattr(model_config, "text_config", model_config)
+        emb_token_id = tokenizer.get_vocab().get("<emb>")
+        if emb_token_id is None or not 0 <= emb_token_id < min(len(tokenizer), text_config.vocab_size):
+            raise ValueError("LamRA requires <emb> in the prepared checkpoint tokenizer and model vocabulary")
         return cls(
             config.prompt_data,
-            emb_token_id=retrieval_emb_token_id(tokenizer, len(tokenizer)),
+            emb_token_id=int(emb_token_id),
             batch_size=config.global_batch_size,
             max_length=config.seq_length,
             processor_pool=processor_pool,

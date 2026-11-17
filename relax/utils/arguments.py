@@ -1383,18 +1383,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--task-type",
                 type=str,
-                choices=["causal_lm", "seq_cls", "seq_contrast"],
+                choices=["causal_lm", "seq_cls", "embedding"],
                 default="causal_lm",
                 help=(
                     "SFT task type. seq_cls installs a classification head; "
-                    "seq_contrast trains query/positive embeddings with global-batch InfoNCE."
+                    "embedding trains pooled sequence representations."
                 ),
+            )
+            parser.add_argument(
+                "--embedding-loss-type",
+                choices=["infonce"],
+                default="infonce",
+                help="Training objective for --task-type embedding.",
             )
             parser.add_argument(
                 "--contrastive-temperature",
                 type=float,
                 default=0.05,
-                help="Positive cosine-logit temperature for --task-type seq_contrast.",
+                help="Positive cosine-logit temperature for --task-type embedding.",
             )
             parser.add_argument(
                 "--num-labels",
@@ -4796,10 +4802,10 @@ def relax_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
-    if getattr(args, "task_type", "causal_lm") == "seq_contrast":
-        from relax.utils.training.retrieval_utils import validate_sequence_contrast_args
+    if getattr(args, "task_type", "causal_lm") == "embedding":
+        from relax.utils.training.embedding import validate_embedding_args
 
-        validate_sequence_contrast_args(args)
+        validate_embedding_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

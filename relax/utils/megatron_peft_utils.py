@@ -669,7 +669,7 @@ def build_lora_peft(args):
         "bias": "none",
     }
     independent_targets = {"linear_q", "linear_k", "linear_v", "linear_fc1_gate", "linear_fc1_up"}
-    if getattr(args, "task_type", None) == "seq_contrast" or any(
+    if getattr(args, "task_type", None) == "embedding" or any(
         target.rsplit(".", 1)[-1] in independent_targets for target in args.lora_target_modules
     ):
         # Explicit split projections need CanonicalLoRA for any task, including

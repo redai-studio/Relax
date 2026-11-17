@@ -51,9 +51,9 @@ CKPT_ARGS=(
 )
 SFT_ARGS=(
     --loss-type sft
-    --task-type seq_contrast
+    --task-type embedding --embedding-loss-type infonce
     --contrastive-temperature 0.05
-    --custom-dataset-class relax.engine.sft.dataset.retrieval.NLIPairDataset
+    --custom-dataset-class examples.seq_contrast_sft.nli.NLIPairDataset
     --prompt-data "${DATA_DIR}/nli/pairs.jsonl"
     --global-batch-size 512
     --n-samples-per-prompt 1
@@ -74,6 +74,7 @@ LORA_ARGS=(
     --lora-target-modules "${LAMRA_LORA_TARGETS[@]}"
     --lora-scope language
     --lora-merge-mode
+    --freeze-vision-model --freeze-vision-projection
 )
 OPTIMIZER_ARGS=(
     --optimizer adam

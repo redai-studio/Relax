@@ -9,20 +9,20 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from relax.engine.sft.runtime import should_bypass_main_output_layer
+from relax.engine.sft.runtime import is_embedding_task, should_bypass_main_output_layer
 from relax.utils.training.data_fields import build_data_fields
-from relax.utils.training.retrieval_utils import freeze_retrieval_unused_heads, validate_sequence_contrast_args
-from tests.backends.megatron.test_data_vpp import _load_data_module
-from tests.backends.megatron.test_rloo_policy_loss_dispatch import loss_module
-from tests.utils.data.test_streaming_tq_iterator import _load_stream_module
+from relax.utils.training.embedding import freeze_embedding_unused_heads, validate_embedding_args
+from tests.cpu.backends.megatron.test_data_vpp import _load_data_module
+from tests.cpu.backends.megatron.test_rloo_policy_loss_dispatch import loss_module
+from tests.cpu.utils.data.test_streaming_tq_iterator import _load_stream_module
 
 
 def _args(**overrides):
     values = dict(
         loss_type="sft",
-        task_type="seq_contrast",
+        task_type="embedding",
         train_backend="megatron",
-        custom_dataset_class_path="relax.engine.sft.dataset.retrieval.NLIPairDataset",
+        custom_dataset_class_path="examples.seq_contrast_sft.nli.NLIPairDataset",
         global_batch_size=4,
         n_samples_per_prompt=1,
         use_dynamic_batch_size=True,
@@ -30,7 +30,6 @@ def _args(**overrides):
         data_pad_size_multiplier=8,
         use_gloo_process_groups=True,
         contrastive_temperature=0.05,
-        retrieval_emb_token_id=99,
         qkv_format="thd",
         calculate_per_token_loss=False,
         allgather_cp=False,
@@ -62,12 +61,12 @@ def _args(**overrides):
 )
 def test_unsupported_contracts_fail_before_job_creation(overrides):
     with pytest.raises(ValueError):
-        validate_sequence_contrast_args(_args(**overrides))
+        validate_embedding_args(_args(**overrides))
 
 
 def test_runtime_reuses_sft_fields_and_hidden_state_bypass():
     args = _args()
-    validate_sequence_contrast_args(args)
+    validate_embedding_args(args)
     assert should_bypass_main_output_layer(args)
     assert set(build_data_fields(args)) == {
         "tokens",
@@ -77,6 +76,7 @@ def test_runtime_reuses_sft_fields_and_hidden_state_bypass():
         "multimodal_train_inputs",
     }
     assert not should_bypass_main_output_layer(_args(task_type="causal_lm"))
+    assert is_embedding_task(_args(loss_type="policy_loss"))
     assert not should_bypass_main_output_layer(_args(loss_type="policy_loss"))
 
 
@@ -91,9 +91,9 @@ def test_shared_iterator_keeps_whole_negative_set_or_rejects(monkeypatch, peer):
         output[:] = [value, value if peer is None else peer]
 
     monkeypatch.setattr(data.dist, "all_gather_object", gather)
-    rows = {"retrieval_pair_count": 2, "tokens": [torch.tensor([1, 99])] * 4, "total_lengths": [2] * 4}
+    rows = {"embedding_pair_count": 2, "tokens": [torch.tensor([1, 99])] * 4, "total_lengths": [2] * 4}
     if peer is not None:
-        with pytest.raises(ValueError, match="seq_contrast|contrastive batch"):
+        with pytest.raises(ValueError, match="embedding|contrastive batch"):
             data.get_data_iterator(_args(), None, rows)
         return
     iterators, microbatches = data.get_data_iterator(_args(), None, rows)
@@ -113,9 +113,8 @@ def test_production_loss_dispatch_preserves_mean_and_hidden_gradients(monkeypatc
         monkeypatch.setattr(mpu, "get_data_parallel_group", lambda **_kw: object(), raising=False)
     monkeypatch.setattr(loss_module.dist, "get_world_size", lambda group: 1)
     hidden = torch.randn(1, 16, 5, dtype=torch.float64, requires_grad=True)
-    tokens = [torch.tensor([index, 99]) for index in range(8)]
     batch = dict(
-        unconcat_tokens=tokens, total_lengths=[2] * 8, response_lengths=[2] * 8, loss_masks=[torch.ones(2)] * 8
+        embedding_positions=[0] * 8, total_lengths=[2] * 8, response_lengths=[2] * 8, loss_masks=[torch.ones(2)] * 8
     )
     loss, normalizer, metrics = loss_module.loss_function(_args(), batch, 1, hidden)
     features = hidden[0, ::2]
@@ -142,7 +141,7 @@ def test_retrieval_freezes_unused_vocab_but_retains_language_transformer():
     language.decoder = torch.nn.Linear(4, 4)
     wrapper = torch.nn.Module()
     wrapper.language_model = language
-    freeze_retrieval_unused_heads(wrapper)
+    freeze_embedding_unused_heads(wrapper)
     assert not any(param.requires_grad for param in language.embedding.parameters())
     assert not any(param.requires_grad for param in language.output_layer.parameters())
     assert all(param.requires_grad for param in language.decoder.parameters())
@@ -168,7 +167,10 @@ def test_pair_postprocessing_reaches_existing_packed_batch(monkeypatch):
     monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
     rows = {
         "multimodal_train_inputs": [
-            {"query": {"input_ids": [1, 2, 99]}, "positive": {"input_ids": [3, 99]}},
+            {
+                "query": {"input_ids": [1, 2, 99], "embedding_position": 1},
+                "positive": {"input_ids": [3, 99], "embedding_position": 0},
+            },
             {"query": {"input_ids": [4, 99]}, "positive": {"input_ids": [5, 6, 99]}},
         ]
     }
@@ -180,3 +182,4 @@ def test_pair_postprocessing_reaches_existing_packed_batch(monkeypatch):
     assert packed["dynamic_global_batch_size"] == 2
     assert packed["packed_seq_params"].cu_seqlens_q_cpu == [0, 3, 5, 7, 10, 16]
     assert [value.tolist() for value in packed["unconcat_tokens"]] == [[1, 2, 99], [3, 99], [4, 99], [5, 6, 99]]
+    assert packed["embedding_positions"] == [1, 0, 1, 2]

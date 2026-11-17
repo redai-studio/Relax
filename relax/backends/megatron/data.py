@@ -15,7 +15,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
-from relax.engine.sft.runtime import is_preference_mode, is_sequence_contrast_mode, is_sft_mode
+from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
@@ -443,9 +443,12 @@ def get_batch(
 
     assert "tokens" in keys
     if isinstance(data_iterator, DataIterator):
-        batch = data_iterator.get_next(
-            [*keys, "selective_loss_masks_cpu"] if Envs.RELAX_SFT_SELECTIVE_LOGITS else keys
-        )
+        extra_keys = []
+        if Envs.RELAX_SFT_SELECTIVE_LOGITS:
+            extra_keys.append("selective_loss_masks_cpu")
+        if "embedding_positions" in data_iterator.rollout_data:
+            extra_keys.append("embedding_positions")
+        batch = data_iterator.get_next([*keys, *extra_keys] if extra_keys else keys)
 
         if getattr(get_args(), "partial_rollout", False) and getattr(
             get_args(), "use_dynamic_global_batch_size", False
@@ -1209,10 +1212,10 @@ def _get_preference_data_iterator(
     return [iterator], [len(branch_bins)]
 
 
-def _get_retrieval_data_iterator(args: Namespace, rollout_data: RolloutBatch) -> tuple[list[DataIterator], list[int]]:
+def _get_embedding_data_iterator(args: Namespace, rollout_data: RolloutBatch) -> tuple[list[DataIterator], list[int]]:
     """Keep the step's complete DP negative set in one shared-loop
     microbatch."""
-    local_pairs = int(rollout_data.get("retrieval_pair_count", 0))
+    local_pairs = int(rollout_data.get("embedding_pair_count", 0))
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     alignment = int(args.data_pad_size_multiplier)
     tokens = sum(rollout_data["total_lengths"])
@@ -1226,7 +1229,7 @@ def _get_retrieval_data_iterator(args: Namespace, rollout_data: RolloutBatch) ->
     counts = {value[0] for value in observations}
     declared = {value[1] for value in observations}
     if len(counts) != 1 or len(declared) != 1 or local_pairs <= 0 or local_pairs * dp_size != args.global_batch_size:
-        raise ValueError("seq_contrast requires equal complete pair rows on all DP ranks and global_batch_size pairs")
+        raise ValueError("embedding requires equal complete pair rows on all DP ranks and global_batch_size pairs")
     if any(value[2] > value[3] for value in observations):
         raise ValueError(
             "Complete contrastive batch exceeds max_tokens_per_gpu; increase the budget or reduce global_batch_size. "
@@ -1258,8 +1261,8 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
-    if is_sequence_contrast_mode(args):
-        return _get_retrieval_data_iterator(args, rollout_data)
+    if is_embedding_sft_mode(args):
+        return _get_embedding_data_iterator(args, rollout_data)
     if is_preference_mode(args):
         return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
 

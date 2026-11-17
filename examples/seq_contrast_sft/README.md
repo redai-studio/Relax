@@ -1,10 +1,19 @@
 # Sequence contrastive SFT
 
 This example follows `examples/seq_cls_sft`: select a task with
-`--loss-type sft --task-type seq_contrast` and reuse the existing SFT producer,
+`--loss-type sft --task-type embedding --embedding-loss-type infonce` and reuse the existing SFT producer,
 TransferQueue, Actor, Megatron forward/backward, optimizer, scheduler and native
 checkpoint path. It adds a pair dataset and InfoNCE loss, without a separate
 trainer or Actor implementation.
+
+The embedding task pools one hidden state per sequence. An embedding pair
+dataset supplies one `query` and one `positive` branch per row, each with
+`input_ids` and optional `embedding_position` (a zero-based index; the
+default is the last real token). The LamRA example datasets supply the
+position before the first `<emb>`. InfoNCE consumes the pooled vectors.
+For an older LamRA launch command, use the updated task flags and example
+dataset path. The exporter accepts checkpoints saved under
+either task name.
 
 Qwen2-VL uses a dedicated Bridge in `relax/models/qwen2_vl`. Megatron Core
 runs the language model with Qwen2-VL's own vision tower and multimodal

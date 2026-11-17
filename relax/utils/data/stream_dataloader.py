@@ -1182,12 +1182,12 @@ def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> Non
 
 
 def post_process_rollout_data(args, rollout_data):
-    from relax.engine.sft.runtime import is_sequence_contrast_mode
+    from relax.engine.sft.runtime import is_embedding_sft_mode
 
-    if is_sequence_contrast_mode(args):
-        from relax.utils.training.retrieval_utils import expand_retrieval_rollout_data
+    if is_embedding_sft_mode(args):
+        from relax.utils.training.embedding import expand_embedding_pairs
 
-        expanded = expand_retrieval_rollout_data(rollout_data)
+        expanded = expand_embedding_pairs(rollout_data)
         rollout_data.clear()
         rollout_data.update(expanded)
     _add_sft_token_lengths(args, rollout_data)

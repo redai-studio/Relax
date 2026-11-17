@@ -8,8 +8,10 @@ import json
 import pytest
 import torch
 
-from relax.engine.sft.dataset.retrieval import NLIPairDataset, _encode_pair
-from relax.utils.training.retrieval_utils import expand_retrieval_rollout_data
+from examples.seq_contrast_sft.nli import NLIPairDataset, _encode_pair
+from relax.engine.sft.dataset.streaming import pack_samples_for_tq
+from relax.utils.training.embedding import expand_embedding_pairs
+from relax.utils.utils import dict_to_tensordict
 
 
 def _dataset(tmp_path, *, count=5, batch_size=4):
@@ -34,17 +36,20 @@ def test_pair_rows_remain_atomic_until_dp_assignment(tmp_path):
     assert len(set(indices)) == 4
     assert crossed is False
     # This list represents an arbitrary post-sampler DP slice, including reordering.
-    selected = [samples[3].multimodal_train_inputs, samples[0].multimodal_train_inputs]
-    expanded = expand_retrieval_rollout_data({"multimodal_train_inputs": selected})
-    assert expanded["retrieval_pair_count"] == 2
+    payload = dict_to_tensordict(pack_samples_for_tq(samples), batch_size=len(samples))
+    pairs = list(payload["multimodal_train_inputs"])
+    selected = [pairs[3], pairs[0]]
+    expanded = expand_embedding_pairs({"multimodal_train_inputs": selected})
+    assert expanded["embedding_pair_count"] == 2
     for offset, sample_index in enumerate([3, 0]):
         row_id = samples[sample_index].source_idx
         assert expanded["tokens"][2 * offset].tolist() == [row_id + 10, 99]
         assert expanded["tokens"][2 * offset + 1].tolist() == [row_id + 20, 99]
     assert expanded["total_lengths"] == [2] * 4
+    assert expanded["embedding_positions"] == [0] * 4
     assert "multimodal_train_inputs" not in expanded
     # Re-entering post-processing must not alias a dict subsequently clear()ed.
-    assert expand_retrieval_rollout_data(expanded) is not expanded
+    assert expand_embedding_pairs(expanded) is not expanded
 
 
 def test_tail_repeats_same_epoch_head_then_advances(tmp_path):
@@ -100,7 +105,7 @@ def test_raw_native_conversations_use_existing_processor_without_truncation(monk
 
         def __call__(self, *, text, padding, truncation, return_tensors):
             assert padding is False and truncation is False and return_tensors == "pt"
-            return {"input_ids": torch.tensor([[10 if text == ["query"] else 20, 99]])}
+            return {"input_ids": torch.tensor([[10, 99, 99] if text == ["query"] else [20, 21, 99]])}
 
     monkeypatch.setattr(processor_pool, "get_worker_processor", lambda: Processor())
     messages = [
@@ -108,5 +113,6 @@ def test_raw_native_conversations_use_existing_processor_without_truncation(monk
         for role, content in (("user", "query"), ("assistant", "<emb>"), ("user", "positive"), ("assistant", "<emb>"))
     ]
     pair = _encode_pair({"messages": messages}, 99, 8)
-    assert pair["query"]["input_ids"].tolist() == [10, 99]
-    assert pair["positive"]["input_ids"].tolist() == [20, 99]
+    assert pair["query"]["input_ids"].tolist() == [10, 99, 99]
+    assert pair["positive"]["input_ids"].tolist() == [20, 21, 99]
+    assert [pair[side]["embedding_position"] for side in ("query", "positive")] == [0, 1]
