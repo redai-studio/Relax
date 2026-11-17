@@ -9,6 +9,7 @@ import ast
 import copy
 import importlib.util
 import math
+import os
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,7 +48,7 @@ def update_block(guard):
     )
     code = compile(ast.Module(body=function.body[begin : end + 1], type_ignores=[]), "trainer-update-block", "exec")
 
-    def run(optimizer, scheduler, chunks):
+    def run(optimizer, scheduler, chunks, *, zero_tokens=False):
         errors = []
         context = dict(
             optimizer=optimizer,
@@ -55,7 +56,7 @@ def update_block(guard):
             model=chunks,
             args=SimpleNamespace(check_for_nan_in_loss_and_grad=False),
             losses_reduced=[],
-            _is_global_zero_token_step=lambda _: False,
+            _is_global_zero_token_step=lambda _: zero_tokens,
             record_optimizer_result=record_optimizer_result,
             step_id=128,
             rollout_id=128,
@@ -64,6 +65,7 @@ def update_block(guard):
             maybe_verify_critic_value_head_movement=lambda *a: None,
             NonFiniteGradientNormError=guard.NonFiniteGradientNormError,
             torch=torch,
+            os=os,
             math=math,
             logger=SimpleNamespace(warning=lambda *a: None, error=lambda *a, **kw: errors.append((a, kw))),
             logged_errors=errors,
@@ -193,6 +195,25 @@ def exercise_skip(distributed=False, rank=0, bad=float("nan")):
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
 def test_skip_preserves_adam_and_next_update(bad):
     exercise_skip(bad=bad)
+
+
+def test_zero_signal_step_keeps_adam_unchanged_with_capture_requested(monkeypatch, tmp_path):
+    guard = guard_module()
+    optimizer = Optimizer(guard)
+    optimizer.param.grad = torch.tensor([0.3, -0.2])
+    optimizer.step()
+    before = optimizer.param.detach().clone()
+    state = copy.deepcopy(optimizer.adam.state_dict())
+    optimizer.param.grad = torch.zeros_like(optimizer.param)
+    optimizer.error = AssertionError("A no-signal step must not call optimizer.step")
+    monkeypatch.setenv("RELAX_FLOPS_CAPTURE_DIR", str(tmp_path / "capture"))
+    scheduler = SimpleNamespace(step=lambda **_: pytest.fail("No-signal step advanced the scheduler"))
+    result = update_block(guard)(optimizer, scheduler, [Chunk()], zero_tokens=True)
+    assert not result["update_successful"] and result["step_capture"] is None
+    torch.testing.assert_close(optimizer.param, before, rtol=0, atol=0)
+    for key, value in state["state"][0].items():
+        torch.testing.assert_close(optimizer.adam.state_dict()["state"][0][key], value, rtol=0, atol=0)
+    assert not (tmp_path / "capture").exists()
 
 
 def test_skip_requires_guard_and_opt_in():

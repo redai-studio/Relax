@@ -4,6 +4,7 @@
 Megatron."""
 
 import ast
+import os
 from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
@@ -261,6 +262,7 @@ def test_resident_sft_live_initialization_reaches_train_without_snapshots(monkey
 
     actor.prof = SimpleNamespace(step=Mock(side_effect=ReachedAfterTrain))
     namespace = dict(
+        os=os,
         self=actor,
         with_ref=False,
         with_opd_teacher=False,
