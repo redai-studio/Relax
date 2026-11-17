@@ -230,7 +230,7 @@ bash scripts/entrypoint/ray-job.sh \
 
 `PROMPT_DATA` is required. `EVAL_DATA` is optional: when supplied, the resident trainer evaluates held-out loss/PPL every `EVAL_INTERVAL` steps (default 50); omitting it or setting `EVAL_INTERVAL=0` disables evaluation. `EVAL_DATASET_NAME` defaults to `heldout`. Use question-disjoint training and validation files.
 
-The command waits for training to finish. Checkpoints are saved under `$SAVE_DIR/$EXP_NAME`; keep these values unchanged to resume, and select a different experiment name for a fresh run. ClearML prints the new task URL in the logs; `PROJECT_NAME` defaults to `Relax/sft/glm5.3`. Export the saved LoRA checkpoint using the command below; independent generation evaluation uses `scripts/training/sft/eval-glm5.3-744B-A40B-aime-32xgpu.sh`.
+The command waits for training to finish. Checkpoints are saved under `$SAVE_DIR/$EXP_NAME`; keep these values unchanged to resume, and select a different experiment name for a fresh run. ClearML prints the new task URL in the logs; `PROJECT_NAME` defaults to `Relax/sft/glm5.3`. Export the saved LoRA checkpoint using the command below.
 
 ## Checkpointing and Export
 

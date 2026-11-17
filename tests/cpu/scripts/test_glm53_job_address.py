@@ -18,7 +18,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 SFT_RECIPE = "run-glm5.3-744B-A40B-lora-40k-32xgpu.sh"
-RECIPES = [SFT_RECIPE, "eval-glm5.3-744B-A40B-aime-32xgpu.sh"]
 
 
 @pytest.fixture
@@ -26,8 +25,7 @@ def run_recipe(tmp_path):
     scripts = tmp_path / "scripts"
     for directory in ("training/sft", "entrypoint", "models", "bin"):
         (scripts / directory).mkdir(parents=True)
-    for recipe in RECIPES:
-        shutil.copyfile(ROOT / "scripts/training/sft" / recipe, scripts / "training/sft" / recipe)
+    shutil.copyfile(ROOT / "scripts/training/sft" / SFT_RECIPE, scripts / "training/sft" / SFT_RECIPE)
     shutil.copyfile(ROOT / "scripts/models/glm5.3-744B-A40B.sh", scripts / "models/glm5.3-744B-A40B.sh")
     marker = tmp_path / "bootstrapped"
     (scripts / "entrypoint/local.sh").write_text(
@@ -45,7 +43,6 @@ def run_recipe(tmp_path):
         PATH=f"{scripts / 'bin'}:{env['PATH']}",
         MODEL_DIR=str(tmp_path / "models"),
         MODEL_NAME="glm",
-        DATA_DIR=str(tmp_path / "data"),
         PROMPT_DATA=str(tmp_path / "training messages.jsonl"),
         SAVE_DIR=str(tmp_path / "save"),
         RUNTIME_ENV_JSON="{}",
@@ -53,12 +50,12 @@ def run_recipe(tmp_path):
         CAPTURE=str(capture),
     )
 
-    def run(recipe, **overrides):
+    def run(**overrides):
         capture.unlink(missing_ok=True)
         marker.unlink(missing_ok=True)
         launch_env = dict(env, **overrides)
         result = subprocess.run(
-            ["bash", str(scripts / "training/sft" / recipe)],
+            ["bash", str(scripts / "training/sft" / SFT_RECIPE)],
             env=launch_env,
             capture_output=True,
             text=True,
@@ -70,16 +67,15 @@ def run_recipe(tmp_path):
     return run
 
 
-@pytest.mark.parametrize("recipe", RECIPES)
 @pytest.mark.parametrize("mode", ["local", "local_override", "remote", "remote_missing"])
-def test_recipe_resolves_jobs_address_after_entrypoint(run_recipe, recipe, mode):
+def test_recipe_resolves_jobs_address_after_entrypoint(run_recipe, mode):
     overrides = {}
     if mode.startswith("remote"):
         overrides["RELAX_ENTRYPOINT_MODE"] = "ray-job"
     explicit = "http://ray-head.example:9123"
     if mode in ("local_override", "remote"):
         overrides["RAY_JOB_ADDRESS"] = explicit
-    result, argv, bootstrapped = run_recipe(recipe, **overrides)
+    result, argv, bootstrapped = run_recipe(**overrides)
     if mode == "remote_missing":
         assert result.returncode != 0
         assert "Set RAY_JOB_ADDRESS" in result.stderr
@@ -98,7 +94,6 @@ def test_recipe_resolves_jobs_address_after_entrypoint(run_recipe, recipe, mode)
 )
 def test_sft_uses_external_datasets_and_optional_evaluation(run_recipe, eval_data, interval):
     result, argv, _ = run_recipe(
-        SFT_RECIPE,
         DATA_DIR="",
         PROMPT_DATA="/data/custom training.jsonl",
         EVAL_DATA=eval_data,
@@ -128,7 +123,7 @@ def test_sft_uses_external_datasets_and_optional_evaluation(run_recipe, eval_dat
 
 
 def test_sft_requires_explicit_training_data_before_bootstrap(run_recipe):
-    result, argv, bootstrapped = run_recipe(SFT_RECIPE, PROMPT_DATA="")
+    result, argv, bootstrapped = run_recipe(PROMPT_DATA="")
     assert result.returncode != 0
     assert "Set PROMPT_DATA" in result.stderr
     assert argv is None

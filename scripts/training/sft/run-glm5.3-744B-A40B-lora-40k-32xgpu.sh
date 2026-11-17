@@ -7,7 +7,7 @@
 # MODEL_DIR and SAVE_DIR must be shared persistent roots.
 # PROMPT_DATA is the required training JSONL with complete OpenAI messages.
 # EVAL_DATA optionally selects held-out messages for resident loss/PPL evaluation.
-# Supply full dataset paths externally; generation evaluation uses the separate eval script.
+# Supply full dataset paths externally.
 # Default: 1000 optimizer steps at 40k context; save resumable adapters every 50 steps.
 # Covers MLA projections, dense MLPs, shared experts and all routed experts.
 # KV absorption requires LoRA dropout=0; the discrete indexer remains frozen.
