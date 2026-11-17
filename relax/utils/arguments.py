@@ -1933,6 +1933,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Save a lightweight, resumable actor checkpoint containing LoRA tensors plus optimizer, "
                     "scheduler, RNG, and iteration state. Frozen base weights are restored from --hf-checkpoint. "
                     "The initial implementation supports synchronous BF16 torch_dist checkpoints only. "
+                    "May be combined with --save-hf to also export the full merged HF model. "
                     "When unset, save the regular full distributed checkpoint."
                 ),
             )
@@ -3487,8 +3488,6 @@ def validate_save_lora_only_args(args) -> None:
         incompatible.append("--fp8")
     if args.fp16:
         incompatible.append("--fp16")
-    if args.save_hf is not None:
-        incompatible.append("--save-hf")
     if incompatible:
         raise ValueError("--save-lora-only is incompatible with: " + ", ".join(incompatible))
 

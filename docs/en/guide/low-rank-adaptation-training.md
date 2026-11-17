@@ -209,10 +209,27 @@ Both set `--expert-tensor-parallel-size 1`.
 
 By default, `--save` writes the regular full Megatron distributed checkpoint. Add `--save-lora-only` to write a smaller, resumable actor checkpoint instead. This mode stores the LoRA tensors together with optimizer, scheduler, RNG, iteration, and common state, while restoring frozen base weights from `--hf-checkpoint` on resume.
 
-`--save-lora-only` is mutually exclusive with full checkpoint export: it requires synchronous BF16 `torch_dist` checkpointing and cannot be combined with `--async-save`, `--rotate-ckpt`, `--no-save-optim`, `--no-save-rng`, `--fp16`, `--fp8`, or `--save-hf`. It also fails if any trainable model parameter is not a LoRA adapter, preventing an incomplete resume artifact.
+`--save-lora-only` requires synchronous BF16 `torch_dist` checkpointing and cannot be combined with `--async-save`, `--rotate-ckpt`, `--no-save-optim`, `--no-save-rng`, `--fp16`, or `--fp8`. It also fails if any trainable model parameter is not a LoRA adapter, preventing an incomplete resume artifact.
+
+Combine `--save-lora-only` with `--save-hf` to keep a lightweight training checkpoint and also export a full merged HF model at each save. Add these arguments to an existing LoRA training command, using separate output directories:
+
+```bash
+--hf-checkpoint /path/to/base-hf \
+--save /path/to/run/native \
+--save-interval 200 \
+--ckpt-format torch_dist \
+--bf16 \
+--save-lora-only \
+--save-hf /path/to/run/hf \
+--save-hf-dtype bf16
+```
+
+The HF export reads the complete in-memory model after the native checkpoint is saved. `--save-lora-only` reduces the native checkpoint size; it does not reduce the full HF export's memory or disk requirements.
+
+To resume, keep `--hf-checkpoint` pointing to the original base and set `--load /path/to/run/native`. Relax loads the base, then restores the LoRA parameters and training state; no offline merge is needed. Keep the base, LoRA settings, and parallel topology consistent with the saved run. Use this lightweight checkpoint for full training resumption, without `--finetune`, `--no-load-optim`, or `--no-load-rng`.
 
 ::: tip
-The lightweight checkpoint is a sharded Megatron resume artifact, not a portable HF-PEFT adapter. Explicit `--save-hf` export can still write `lora_adapter/` with `adapter_config.json`, `adapter_model.safetensors`, and `relax_lora_meta.json`; that directory is for external or inference use and is not a resume source.
+The lightweight checkpoint is a sharded Megatron resume artifact, not a portable HF-PEFT adapter. With LoRA enabled, `--save-hf` also writes `lora_adapter/` inside the HF export directory, containing `adapter_config.json`, `adapter_model.safetensors`, and `relax_lora_meta.json`. The Megatron training loader does not load this portable adapter directory through `--load`; use the native checkpoint for resumption. If only the portable adapter remains, merge it into the original base as described below and use the merged HF model to initialize a new training run. This does not recover the previous training state.
 :::
 
 ### Offline merge into a standalone HF checkpoint
