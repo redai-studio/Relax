@@ -292,7 +292,7 @@ def _validate_sde_schedule(sampling: dict, errors: List[str]) -> None:
 
 def _validate_art_config(args: Namespace, sampling: dict, errors: List[str]) -> None:
     """Only the synchronous raw scalar SenseNova image profile is enabled."""
-    from relax.engine.rollout.art_cache import art_cache_limits
+    from relax.engine.rollout.art_replay import art_cache_limits
 
     config = sampling.get("art", {})
     if not isinstance(config, dict):
@@ -327,7 +327,6 @@ def _validate_art_config(args: Namespace, sampling: dict, errors: List[str]) -> 
         "fsdp_trainable_mode": "full",
         "micro_batch_size": 1,
         "num_updates_per_batch": 2,
-        "generative_reference_policy": "fixed",
         "artifact_retention_rollouts": 1,
         "fsdp_param_dtype": "bf16",
         "fsdp_reduce_dtype": "fp32",

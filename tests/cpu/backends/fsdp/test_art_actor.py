@@ -57,7 +57,6 @@ def _profile():
         fsdp_param_dtype="bf16",
         fsdp_reduce_dtype="fp32",
         fsdp_master_dtype="fp32",
-        generative_reference_policy="fixed",
         artifact_retention_rollouts=1,
         n_samples_per_prompt=8,
         global_batch_size=16,

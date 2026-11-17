@@ -274,7 +274,7 @@ def check_resume(args: Any) -> int | None:
 def check_inputs(args: Any) -> dict[str, Any]:
     from PIL import Image
 
-    from relax.engine.rollout.art_cache import art_cache_limits
+    from relax.engine.rollout.art_replay import art_cache_limits
     from relax.engine.rollout.data_source import RolloutDataSource
     from relax.models.sensenova.adapter import SenseNovaU1ImageEditAdapter
 

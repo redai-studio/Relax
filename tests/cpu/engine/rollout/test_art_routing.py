@@ -11,7 +11,7 @@ from relax.backends.fsdp.art import art_replay_update
 from relax.engine.rewards import generative
 from relax.engine.rewards.art import scalarize_art_rewards
 from relax.engine.rollout import native_generation as ng
-from relax.engine.rollout.art_cache import tensor_payload_bytes
+from relax.engine.rollout.art_replay import tensor_payload_bytes
 from relax.utils.types import Sample
 
 

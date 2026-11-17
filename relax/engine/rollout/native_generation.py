@@ -508,7 +508,7 @@ def _prepare_generated_group(
     common.update(pack_trajectory_provenance(responses, fp))
     art_bytes_metadata = {}
     if sampling.get("algorithm") == "art":
-        from relax.engine.rollout.art_cache import check_art_cache_budget, tensor_payload_bytes
+        from relax.engine.rollout.art_replay import check_art_cache_budget, tensor_payload_bytes
 
         if art_budget is None:
             raise ValueError("ART acquisition requires a rollout-owned cache budget.")
@@ -613,7 +613,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
         raise ValueError("ART prefetch requires one candidate per engine")
     art_budget = {"sizes": [], "guidance": []} if sampling.get("algorithm") == "art" else None
     if art_budget is not None:
-        from relax.engine.rollout.art_cache import art_cache_limits
+        from relax.engine.rollout.art_replay import art_cache_limits
 
         cache_limit, _ = art_cache_limits(sampling)
         # Dense trajectory lower bound before ANY engine request. Prefix and
