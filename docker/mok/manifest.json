@@ -2,7 +2,8 @@
   "schema_version": 1,
   "scope": "Incremental MoK image over a compatible CUDA13 training image; verify patch targets without dependency upgrades.",
   "megatron": {
-    "baseline": "Existing image /root/Megatron-LM snapshot (no git history)",
+    "baseline": "CUDA 13 Blackwell image built by docker/Dockerfile.cu13",
+    "core_commit": "f78809f6d9c88f8638ea7822966f35057a63fd5c",
     "upstream_port_pr": 8497,
     "upstream_port_commit": "c42e8216d2031ab3ca191e56c9d370b347c2cf02",
     "changed_files": [
@@ -10,7 +11,6 @@
       "megatron/core/transformer/moe/megakernel/factory.py",
       "megatron/core/transformer/moe/megakernel/mok/backend.py",
       "megatron/core/transformer/moe/megakernel/mok/runtime.py",
-      "megatron/core/transformer/moe/megakernel/mok/weights.py",
       "megatron/core/transformer/moe/moe_layer.py",
       "megatron/core/transformer/transformer_config.py",
       "megatron/training/arguments.py"
@@ -18,22 +18,20 @@
     "before_sha256": {
       "megatron/core/transformer/moe/megakernel/__init__.py": "58e10992bbd9be26e7f3405062edcb000a2d36f482777cb36be947e60a32ca32",
       "megatron/core/transformer/moe/megakernel/factory.py": "b57ba0c2d1ef7a57a6e9972d3b19ce5401093f16d4e5647ba7197eb2fac4e3ee",
-      "megatron/core/transformer/moe/megakernel/mok/backend.py": "dbc1a31cf9b8f5f908d837ea51038ce925ec911a94d067dd7139cfe0bb950088",
-      "megatron/core/transformer/moe/megakernel/mok/runtime.py": "4b023e432d033c2195307a8e3aae17de3a588f2c67ddd526226bd07e5cff3571",
-      "megatron/core/transformer/moe/megakernel/mok/weights.py": "6ce1077843b27adda17352876cbb4ea0da89ac1af9c8004264e8032232be22a3",
-      "megatron/core/transformer/moe/moe_layer.py": "7905b52b1e8aa39d402cb65fb34d492ca5959466b506ac9a4b47b4fd47557acf",
-      "megatron/core/transformer/transformer_config.py": "769a7dee2ab9d7ea74ec348a5eb251d2036c5bb2def37b6699fe62e773b54c57",
-      "megatron/training/arguments.py": "163660a1b4becb7bec59f2e2ea6bef6c53d4d32ee5c3dbef9a3705120416f8fa"
+      "megatron/core/transformer/moe/megakernel/mok/backend.py": "63326a8898483e2b31a00b190004d7b8a470da350e4658e71282fadea3c541fd",
+      "megatron/core/transformer/moe/megakernel/mok/runtime.py": "1e6b1b65f1203ddf40e5ea6f5135091903adb4385416fd217d5a5b244468607a",
+      "megatron/core/transformer/moe/moe_layer.py": "77afff5402f6c04b8df9d87adc502ac5f7a828c37edf9128367b522ff3cf5d25",
+      "megatron/core/transformer/transformer_config.py": "ccd71928fd7f1d9ead74fc71210561e757767b3695c724353c01096fd77195d4",
+      "megatron/training/arguments.py": "7341e4b326336de6dfbc166b5efc415fae6179402b8c252112b5e4b36a968deb"
     },
     "after_sha256": {
       "megatron/core/transformer/moe/megakernel/__init__.py": "46975e755a50423dde60ed4e2ea4dcaf5f4810095b773a05e67b79d010e83bca",
-      "megatron/core/transformer/moe/megakernel/factory.py": "9f9e00df3f8498bbb3bd368506b674ae28153adb19aeeb9e020cea06b021eff2",
-      "megatron/core/transformer/moe/megakernel/mok/backend.py": "cac7fae895389450d0ffce3a7ecbcf09ca141d0f28e4c135c844b2a932f5fbb7",
+      "megatron/core/transformer/moe/megakernel/factory.py": "030ae1e173b4b3e173451f48aab482d8a533aee01e492ebc8795d8540b487195",
+      "megatron/core/transformer/moe/megakernel/mok/backend.py": "d9744439411eab4f9ce06088d75e31ca6ffb3109a4a4acadfcaa37aad10a9785",
       "megatron/core/transformer/moe/megakernel/mok/runtime.py": "bfe82a05e6666fee644ce55e0ec98f7874ce296d33340a1de263671cd47eb98c",
-      "megatron/core/transformer/moe/megakernel/mok/weights.py": "802488aaf060e57793d33c4296ded6a7e33208a81da4c82260dcc64026f284cf",
-      "megatron/core/transformer/moe/moe_layer.py": "c110fc199a901d0d869afa07b3f03b2024395646d40299b6005e72f2a6e1a7ff",
-      "megatron/core/transformer/transformer_config.py": "e2b7dd8f27cd0228c5a46615cfd0bc1db2cacf5e1db5491cff76c0ec397871f1",
-      "megatron/training/arguments.py": "b8cce01fd0c3f0256ec2743ed41514a6294df1ade09719c044177a94da14d94d"
+      "megatron/core/transformer/moe/moe_layer.py": "4fcb30175e4f6ad14b1c311bb0b2f02590228f277566786e29da6f0e474f05a0",
+      "megatron/core/transformer/transformer_config.py": "62573db93bd4d600b83862f7375d3a654e813f1396d608d6f2afa5f5b9ed1e65",
+      "megatron/training/arguments.py": "e97b8fe93d26fb4f39a3007c20e226576144c295abac5bc9068718383d9e854c"
     }
   },
   "mok": {
@@ -95,18 +93,15 @@
     "thunderkittens": ["thunderkittens-mn-major.patch"]
   },
   "patch_sha256": {
-    "megatron-mok.patch": "2240ee8af68b5ade259914f6c52a50302b6ce29d751ed1ab6b40d700f334058d",
+    "megatron-mok.patch": "db1fdcc261a2c9084c4cbce62941475cb78be5fff98c099d1765830e3db9cb55",
     "mok-640-tail.patch": "dcf2516f6ee1552b305c3206e4d5a1b8ce900aae8566beb200feb7dea7718a97",
     "mok-pr10-scheduler.patch": "7c8b649f5f4d7584387c63637a54b9a6c5bd1b4f3a56c52de3d6d972ce1a5c5b",
-    "thunderkittens-mn-major.patch": "e001b2d0b6e4088bcedb5cef49bf6811d1757b9e9e9835ae50744ee54b8f633d",
-    "transformer-engine-fused-adam-bounded.patch": "30f8865d4ae17ef13c17f88ac03fe93b59475bef3dba74dbd89eb97a575041c7"
+    "thunderkittens-mn-major.patch": "e001b2d0b6e4088bcedb5cef49bf6811d1757b9e9e9835ae50744ee54b8f633d"
   },
   "transformer_engine": {
     "distribution": "transformer-engine",
     "version": "2.18.0",
     "path": "transformer_engine/pytorch/optimizers/fused_adam.py",
-    "before_sha256": "e7d493f0bc05f4c64dd7dd192b3f5c9bc951588c7a3358017ee2fe8a6a04f3ce",
-    "after_sha256": "b4621f62840a9ce0d7c1360d2c63f45e90104729125841a3b8f7e8c94dca3fff",
-    "patch": "transformer-engine-fused-adam-bounded.patch"
+    "after_sha256": "b4621f62840a9ce0d7c1360d2c63f45e90104729125841a3b8f7e8c94dca3fff"
   }
 }

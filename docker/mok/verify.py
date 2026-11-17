@@ -11,7 +11,7 @@ import subprocess
 from importlib import metadata
 from pathlib import Path
 
-from build import PACKAGE, check_files, check_megatron, digest
+from build import PACKAGE, check_files, check_megatron, check_transformer_engine, digest
 
 
 def main() -> None:
@@ -29,10 +29,7 @@ def main() -> None:
     check_megatron(megatron, manifest["megatron"], "after")
     check_files(mok_source, manifest["mok"]["after_sha256"])
     check_files(mok_source / "third_party/ThunderKittens", manifest["thunderkittens"]["after_sha256"])
-    te = manifest["transformer_engine"]
-    if metadata.version(te["distribution"]) != te["version"]:
-        raise RuntimeError("Transformer Engine changed after the image was built")
-    check_files(Path(metadata.distribution(te["distribution"]).locate_file("")), {te["path"]: te["after_sha256"]})
+    check_transformer_engine(manifest)
     distribution = metadata.distribution("mixture-of-kittens")
     installed = Path(distribution.locate_file("mok")).resolve()
     python_files = {
@@ -72,6 +69,7 @@ def main() -> None:
             num_attention_heads=20,
             num_moe_experts=512,
             moe_ffn_hidden_size=640,
+            moe_shared_expert_intermediate_size=640,
             moe_router_topk=10,
             moe_grouped_gemm=True,
             moe_router_dtype="fp32",

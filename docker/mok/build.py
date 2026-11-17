@@ -59,12 +59,12 @@ def checkout(root: Path, spec: dict) -> None:
         raise RuntimeError(f"Unexpected checkout: {head}")
 
 
-def patch_transformer_engine(root: Path, manifest: dict) -> None:
+def check_transformer_engine(manifest: dict) -> None:
     spec = manifest["transformer_engine"]
-    path = root / spec["path"]
-    if digest(path) != spec["after_sha256"]:
-        check_files(root, {spec["path"]: spec["before_sha256"]})
-        apply_patches(root, [spec["patch"]], manifest)
+    distribution = metadata.distribution(spec["distribution"])
+    if distribution.version != spec["version"]:
+        raise RuntimeError(f"Expected Transformer Engine {spec['version']}")
+    root = Path(distribution.locate_file(""))
     check_files(root, {spec["path"]: spec["after_sha256"]})
 
 
@@ -98,6 +98,7 @@ def main() -> None:
     nvcc = subprocess.check_output([compiler, "--version"], text=True)
     if re.search(r"release\s+13\.0\b", nvcc) is None:
         raise RuntimeError("The compiler must match Torch's CUDA 13.0; do not rebuild or replace the CUDA stack")
+    check_transformer_engine(manifest)
 
     # Fetch/verify all sources before modifying the image's Megatron tree.
     checkout(args.mok_root, manifest["mok"])
@@ -112,10 +113,6 @@ def main() -> None:
     check_files(thunderkittens, manifest["thunderkittens"]["after_sha256"])
     apply_patches(args.megatron_root, manifest["patch_order"]["megatron"], manifest)
     check_megatron(args.megatron_root, manifest["megatron"], "after")
-    te = manifest["transformer_engine"]
-    if metadata.version(te["distribution"]) != te["version"]:
-        raise RuntimeError(f"Expected Transformer Engine {te['version']}")
-    patch_transformer_engine(Path(metadata.distribution(te["distribution"]).locate_file("")), manifest)
 
     env = dict(
         os.environ,

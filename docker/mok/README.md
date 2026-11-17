@@ -1,32 +1,33 @@
 # Megatron + MoK 增量镜像
 
-将 Megatron 适配、MoK 640 维尾块支持和调度器优化封装到现有 CUDA 13 训练镜像。MoK wheel 在新镜像内编译，运行时无需挂载实验目录或复用旧 `.so`。
+在 CUDA 13 Blackwell 训练镜像上增加 Megatron MoK 适配、640 维尾块支持和调度器优化。MoK wheel 在增量镜像内编译。
 
 ## 构建
 
-从 Relax 仓库根目录执行，`BASE_IMAGE` 填写当前完整训练镜像的引用，建议使用不可变 digest：
+从 Relax 仓库根目录构建 `docker/Dockerfile.cu13` 的 Blackwell 镜像，再用它作为 `BASE_IMAGE`。已有相同源码构建的镜像时，可以直接使用对应的 digest。
 
 ```bash
-export BASE_IMAGE='填写完整 CUDA 13 训练镜像的引用'
-docker build --build-arg BASE_IMAGE="$BASE_IMAGE" \
+docker build --platform linux/amd64 -f docker/Dockerfile.cu13 --target relax \
+  --build-arg GPU_ARCH=blackwell -t relax-cu13-blackwell:f78809f6 .
+docker build --platform linux/amd64 --build-arg BASE_IMAGE=relax-cu13-blackwell:f78809f6 \
   -t relax-mok:pr10-sm103 docker/mok
 ```
 
-构建上下文仅为 `docker/mok`。基底需提供 Python 3.12、Torch `2.13.0+cu130`、CUDA 13.0 NVCC、TE 2.18、Bridge、HybridEP、Git、Make 和 patch；构建不升级这些依赖。默认解释器为 `/opt/sglang/bin/python`、Megatron 路径为 `/root/Megatron-LM`，可分别通过 `PYTHON_BIN` 和 `MEGATRON_ROOT` 构建参数调整。目标架构为 Blackwell `SM103`。
+增量构建上下文为 `docker/mok`。基底提供 Python 3.12、Torch `2.13.0+cu130`、CUDA 13.0 NVCC、TE 2.18、Bridge、HybridEP、Git、Make 和 patch。`PYTHON_BIN` 默认指向解释器目录 `/opt/sglang/bin`，`MEGATRON_ROOT` 默认指向 `/root/Megatron-LM`。MoK 目标架构为 Blackwell `SM103`。
 
-构建仅检查 Megatron 补丁涉及的 8 个文件的前后 SHA256，再以 `--fuzz=0` 应用补丁；不要求其他文件与实验镜像完全一致。补丁目标不匹配时需要先适配基底源码，不能假定当前 `Dockerfile.cu13` 产物与原始训练镜像一致。
+构建先校验 CUDA 13 基底中 Megatron 补丁涉及的 7 个文件的 SHA256，用 `--fuzz=0` 应用补丁，再校验结果。基底为 `f78809f6` 应用 `Dockerfile.cu13` 的 Megatron 补丁后的源码。
 
 ## 来源与补丁
 
-| 组件               | 固定来源                                                                                            | 增量                                                                         |
-| ------------------ | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Megatron           | 镜像源码快照；移植基于 NVIDIA/Megatron-LM PR8497，commit `c42e8216d2031ab3ca191e56c9d370b347c2cf02` | TP2/SP/ETP1、固定输入补齐与容量检查、native shared、参数属性及进程组缓存管理 |
-| MoK                | `QiZhangNV/mixture-of-kittens@ee7bdaba515fd3d557105d71809ec74cd523d5a1`                             | 640 维尾块支持                                                               |
-| 调度器             | `cursor/mixture-of-kittens` PR10，commit `79b320ab5236dd0d031ea580063571271924bdae`                 | 优化重复扫描；保留 `schedule_entrypoint` 绑定名称                            |
-| ThunderKittens     | `HazyResearch/ThunderKittens@1c3920d993404dd49a6d4c7267ea11d583bd5c68`                              | `tcgen05.cuh` MN-major 修复                                                  |
-| Transformer Engine | 基底 TE 2.18                                                                                        | bounded Adam 修复，限制临时 tensor 句柄数量                                  |
+| 组件               | 固定来源                                                                            | 增量                                                                          |
+| ------------------ | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Megatron           | Core `f78809f6` 上移植 NVIDIA/Megatron-LM PR8497（`c42e8216`）                      | TP2/SP/ETP1、native shared、固定 token 补齐、offload 缓存清理及 EP 进程组恢复 |
+| MoK                | `QiZhangNV/mixture-of-kittens@ee7bdaba515fd3d557105d71809ec74cd523d5a1`             | 640 维尾块支持                                                                |
+| 调度器             | `cursor/mixture-of-kittens` PR10，commit `79b320ab5236dd0d031ea580063571271924bdae` | 优化重复扫描；保留 `schedule_entrypoint` 绑定名称                             |
+| ThunderKittens     | `HazyResearch/ThunderKittens@1c3920d993404dd49a6d4c7267ea11d583bd5c68`              | `tcgen05.cuh` MN-major 修复                                                   |
+| Transformer Engine | 基底 TE 2.18                                                                        | bounded Adam 修复，限制临时 tensor 句柄数量                                   |
 
-补丁顺序及目标文件 SHA256 见 `manifest.json`。TE 补丁统一保存在 `patches/transformer-engine-fused-adam-bounded.patch`，主 `docker/Dockerfile.cu13` 也引用此文件；已经修复的 TE 源码会跳过应用，未知版本会拒绝。
+补丁顺序及目标文件 SHA256 见 `manifest.json`。`docker/Dockerfile.cu13` 已应用 TE 的 bounded Adam 补丁，MoK 构建直接校验补丁后的 TE 源码。
 
 `build.py` 使用 `pip wheel --no-deps --no-build-isolation` 编译并安装 MoK。CUDA driver stub 仅用于链接，不写入运行时 `LD_LIBRARY_PATH`。普通 `docker build` 不需要 GPU，只检查源码、安装路径及 SM103 cubin。
 
@@ -41,7 +42,7 @@ docker run --rm --gpus all --entrypoint python relax-mok:pr10-sm103 \
 
 所有 Ray worker 和 driver 应使用同一镜像。将 `MEGATRON` 指向镜像内的适配源码，并移除旧实验源码覆盖路径，避免 `PYTHONPATH` 遮住已安装的 MoK wheel。
 
-此封装已验证补丁重放；当前环境无 Docker CLI，尚未实际构建新镜像。导入检查不替代新镜像的训练及数值验证。
+在 SM103 GPU 上验证训练时，检查 TP2/SP、EP8、ETP1 下的前向、反向和参数更新，并覆盖实际 token 数小于 `fixed_num_local_tokens` 的 microbatch。
 
 ## OpenR1MM SFT 示例
 
