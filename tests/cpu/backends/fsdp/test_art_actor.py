@@ -127,6 +127,9 @@ def test_art_shell_launch_uses_registered_defaults_and_preserves_resume_and_extr
     args.generative_reference_policy = "ema"
     with pytest.raises(ValueError, match="fixed"):
         validate_generative_config(args)
+    capture.unlink()
+    legacy = subprocess.run(["bash", str(script), "--mode", "preflight"], env=env, capture_output=True)
+    assert legacy.returncode != 0 and not capture.exists()
 
 
 @pytest.mark.parametrize("invalid", [None, "budget", "odd_k", "ema", "steps", "options", "precision"])

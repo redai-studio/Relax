@@ -4,6 +4,12 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 cd "${SCRIPT_DIR}/../../.."
+for arg in "$@"; do
+    if [[ "$arg" == --mode || "$arg" == --mode=* ]]; then
+        echo "--mode has been removed; this script submits training directly." >&2
+        exit 2
+    fi
+done
 : "${MODEL_PATH:?Set MODEL_PATH to the worker-visible SenseNova model directory}"
 : "${PROMPT_SET:?Set PROMPT_SET to the prompt JSONL}"
 : "${SAVE_DIR:?Set SAVE_DIR to the checkpoint output directory}"
