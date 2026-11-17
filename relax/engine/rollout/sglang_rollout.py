@@ -27,6 +27,7 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -155,6 +156,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_counts = [0] * (args.sglang_dp_size or 1)
         self.dp_rank = 0
 
+        self.partial_genrm = PartialGenRM.from_args(args, self)
         self.reset()
 
     @contextmanager
@@ -198,6 +200,8 @@ class GenerateState(metaclass=SingletonMeta):
         )  # tasks that should not be aborted (abort_count >= partial_rollout_max_aborted_count)
         self.aborted = False
         self.abort_event = asyncio.Event()
+        if self.partial_genrm is not None:
+            self.partial_genrm.reset_step()
         self.evaluating = getattr(self, "evaluating", 0)  # preserve eval state across resets
         # Pre-fetched data ObjectRef for cross-step overlap.
         # Persisted across reset() calls so the ref submitted at the end of
@@ -710,18 +714,24 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
-    if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
+    state = GenerateState(args)
+    partial_genrm = getattr(state, "partial_genrm", None)
+    resume_judge_only = partial_genrm is not None and not evaluation and partial_genrm.restore(sample)
+    if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) and not resume_judge_only:
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
         return sample
 
-    state = GenerateState(args)
     teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
     if teacher_routing_enabled and not args.group_rm:
         state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
 
-    generated = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    generated = (
+        sample
+        if resume_judge_only
+        else await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    )
     # Group reward and Teacher scoring run in generate_and_rm_group.
     if args.group_rm:
         return generated
@@ -739,7 +749,18 @@ async def generate_and_rm(
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
     elif generated.reward is None:
-        generated.reward = await async_rm(args, generated, evaluation=evaluation)
+        reward_kwargs = {"evaluation": evaluation}
+        if partial_genrm is not None and not evaluation:
+            reward_kwargs["genrm_generate"] = partial_genrm.bind(generated)
+        try:
+            generated.reward = await async_rm(args, generated, **reward_kwargs)
+        except PartialGenRMAborted:
+            generated.status = Sample.Status.ABORTED
+            if teacher_routing_enabled:
+                state.opd_manager.response_stats.finish(sample.response_key)
+            return generated
+        if partial_genrm is not None:
+            partial_genrm.clear(generated)
 
     if opd.is_opd_enabled(args, evaluation=evaluation):
         await state.opd_manager.prefill(generated, _encode_multimodal_inputs)
@@ -892,10 +913,15 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     urls = router_worker_base_urls(urls)
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    partial_genrm = getattr(state, "partial_genrm", None)
+    if partial_genrm is not None:
+        abort_tasks.append(asyncio.wait_for(partial_genrm.abort_engines(), timeout=60))
     abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
     for url, result in zip(urls, abort_results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(f"Failed to abort worker at {url}: {result}")
+    if partial_genrm is not None and isinstance(abort_results[-1], BaseException):
+        raise abort_results[-1]
 
     # make sure all the pending tasks are finished
     count = 0
