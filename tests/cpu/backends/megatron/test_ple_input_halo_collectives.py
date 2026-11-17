@@ -66,7 +66,7 @@ def _worker(rank, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=45))
     try:
         # Short chunks, multiple documents, long chunks, and zero halo are distinct risks.
-        for lengths, halo in [((4, 12), 4), ((32, 16), 4), ((128,), 4), ((16,), 0)]:
+        for lengths, halo in [((4, 12), 4), ((4, 32), 4), ((16,), 4), ((32, 16), 4), ((128,), 4), ((16,), 0)]:
             owned, needed = [], []
             for peer in range(2):
                 rows, required, base = [], set(), 0
@@ -112,6 +112,14 @@ def _worker(rank, rendezvous):
             ):
                 model._cp_packed_seq_params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
                 prepare_input_halo_cp(model, packed)
+                # Compare against the original implementation at the SAME CP size,
+                # in addition to the independent complete-sequence CP1 reference.
+                os.environ["QWEN38_PLE_INPUT_HALO_CP"] = "0"
+                native_input = hidden[owned[rank]].clone().requires_grad_()
+                native_output = model(native_input)
+                (native_output * derivative[owned[rank]]).sum().backward()
+                torch.testing.assert_close(native_output, reference[owned[rank]], rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(native_input.grad, reference_input.grad[owned[rank]], rtol=1e-5, atol=1e-6)
                 os.environ["QWEN38_PLE_INPUT_HALO_CP"] = "1"
                 for mode in ("full", "halo", "adaptive"):
                     os.environ["QWEN38_PLE_INPUT_HALO_TRANSPORT"] = mode
@@ -121,8 +129,101 @@ def _worker(rank, rendezvous):
                         (output * derivative[owned[rank]]).sum().backward()
                         torch.testing.assert_close(output, reference[owned[rank]], rtol=1e-5, atol=1e-6)
                         torch.testing.assert_close(local.grad, reference_input.grad[owned[rank]], rtol=1e-5, atol=1e-6)
+                        torch.testing.assert_close(output, native_output, rtol=1e-5, atol=1e-6)
+                        torch.testing.assert_close(local.grad, native_input.grad, rtol=1e-5, atol=1e-6)
+                    zero_input = hidden[owned[rank]].clone().requires_grad_()
+                    (model(zero_input) * 0).sum().backward()
+                    assert torch.equal(zero_input.grad, torch.zeros_like(zero_input))
+        _check_bridge_interleaving(rank)
     finally:
         dist.destroy_process_group()
+
+
+class PLELayer(nn.Module):
+    def __init__(self, ple):
+        super().__init__()
+        self.per_layer_embedding = ple
+        self.layer_number = 1
+
+    def forward(self, hidden_states, context=None, **kwargs):
+        return self.per_layer_embedding(hidden_states), context
+
+
+def _check_bridge_interleaving(rank):
+    """Execute Bridge's real closure capture/restore with CPU checkpointing.
+
+    Replaces only the CUDA RNG checkpoint wrapper with PyTorch reentrant
+    checkpoint. Three microbatches share one PLE instance and backpropagate in
+    reverse order, switching adaptive transport between full and halo.
+    """
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import Qwen3VLTransformerBlock
+    from megatron.core import parallel_state
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.ple_input_halo_cp import prepare_input_halo_cp
+
+    from relax.backends.megatron.qsa_layout_metadata import bind_physical_layout
+
+    torch.manual_seed(71)
+    model = _model((16,))
+    layer = PLELayer(model)
+    block = SimpleNamespace(
+        config=SimpleNamespace(
+            fp8=False, recompute_method="uniform", recompute_num_layers=1, distribute_saved_activations=False
+        ),
+        pre_process=False,
+        num_layers_per_pipeline_rank=1,
+        _get_layer=lambda index: layer,
+    )
+    pending = []
+    with (
+        patch.object(parallel_state, "get_context_parallel_world_size", return_value=2),
+        patch.object(parallel_state, "get_context_parallel_rank", return_value=rank),
+        patch.object(parallel_state, "get_context_parallel_group", return_value=dist.group.WORLD),
+        patch("torch.cuda.current_device", return_value="cpu"),
+        patch("megatron.core.ssm.mamba_context_parallel._THD_TE_DEFAULT_SHARED_BYTES", 0),
+        patch(
+            "megatron.core.tensor_parallel.checkpoint",
+            side_effect=lambda function, distribute, *args: checkpoint(function, *args, use_reentrant=True),
+        ),
+    ):
+        for batch, lengths in enumerate(((4, 12), (32, 16), (128,))):
+            model._ngram_ids = ((torch.arange(sum(lengths)) + batch * 17) % 128).reshape(1, -1, 1)
+            model._position_in_sequence = torch.cat([torch.arange(n) for n in lengths]).unsqueeze(0)
+            model._cp_packed_seq_params = None
+            hidden = torch.randn(sum(lengths), 1, 8)
+            derivative = torch.randn_like(hidden)
+            reference_input = hidden.clone().requires_grad_()
+            os.environ["QWEN38_PLE_INPUT_HALO_CP"] = "0"
+            with patch.object(parallel_state, "get_context_parallel_world_size", return_value=1):
+                reference = model(reference_input)
+                (reference * derivative).sum().backward()
+            cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+            packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+            bind_physical_layout(packed, tuple(cu.tolist()))
+            model._cp_packed_seq_params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+            prepare_input_halo_cp(model, packed)
+            indices, base = [], 0
+            for length in lengths:
+                indices.extend(torch.arange(base, base + length).reshape(4, -1)[[rank, 3 - rank]].flatten().tolist())
+                base += length
+            local = hidden[indices].clone().requires_grad_()
+            os.environ["QWEN38_PLE_INPUT_HALO_CP"] = "1"
+            os.environ["QWEN38_PLE_INPUT_HALO_TRANSPORT"] = "adaptive"
+            output = Qwen3VLTransformerBlock._relax_native_checkpointed_forward(
+                block, local, None, None, None, None, None, packed, None, False
+            )
+            torch.testing.assert_close(output, reference[indices], rtol=1e-5, atol=1e-6)
+            pending.append((local, output, derivative[indices], reference_input.grad[indices]))
+        latest = (model._ngram_ids, model._position_in_sequence, model._cp_packed_seq_params)
+        for local, output, derivative, expected_gradient in reversed(pending):
+            (output * derivative).sum().backward()
+            torch.testing.assert_close(local.grad, expected_gradient, rtol=1e-5, atol=1e-6)
+            assert all(
+                current is saved
+                for current, saved in zip(
+                    (model._ngram_ids, model._position_in_sequence, model._cp_packed_seq_params), latest, strict=True
+                )
+            )
 
 
 def test_two_rank_ple_outputs_gradients_and_checkpoint(tmp_path):

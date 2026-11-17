@@ -46,6 +46,7 @@ def test_unknown_transport_rejected():
 class InputHaloMetadata(unittest.TestCase):
     def layer(self, rows=416, tp=1):
         return SimpleNamespace(
+            halo=16,
             tp_group=SimpleNamespace(size=lambda: tp),
             _ngram_ids=torch.zeros(1, rows, 1, dtype=torch.long),
             parameters=lambda: [],
@@ -123,10 +124,6 @@ class InputHaloMetadata(unittest.TestCase):
     def test_nondivisible_partition_rejected(self):
         with self.assertRaises(ValueError):
             self.prepare(self.layer(rows=415), self.packed((0, 271, 415)))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 @pytest.mark.parametrize("vl", [False, True])
@@ -214,3 +211,40 @@ def test_allgather_cp_rejected_before_layout_is_used(monkeypatch, vl):
             is_vl_model=vl,
             pack_device=torch.device("cpu"),
         )
+
+
+@pytest.mark.parametrize("change", ["replacement", "rebind", "ids", "hidden_rows"])
+def test_changed_prepared_inputs_rejected_before_communication(change):
+    fixture = InputHaloMetadata()
+    layer, packed = fixture.layer(), fixture.packed()
+    fixture.prepare(layer, packed)
+    hidden = torch.zeros(52, 1, 8)
+    if change == "replacement":
+        packed.cu_seqlens_q_padded = packed.cu_seqlens_q_padded.clone()
+    elif change == "rebind":
+        packed.cu_seqlens_q_padded = torch.tensor([0, 256, 416], dtype=torch.int32)
+        bind_physical_layout(packed, (0, 256, 416))
+    elif change == "ids":
+        layer._ngram_ids = torch.zeros(1, 400, 1, dtype=torch.long)
+    else:
+        hidden = torch.zeros(51, 1, 8)
+    with patch(
+        "megatron.core.parallel_state.get_context_parallel_group",
+        return_value=SimpleNamespace(rank=lambda: 0, size=lambda: 8),
+    ):
+        with pytest.raises(RuntimeError, match="metadata|physical layout"):
+            forward_input_halo(layer, hidden)
+
+
+@pytest.mark.parametrize("case", ["sbhd", "empty_document", "native_prepare_missing"])
+def test_invalid_prepare_contract_rejected(case):
+    fixture = InputHaloMetadata()
+    layer, packed = fixture.layer(), fixture.packed()
+    if case == "sbhd":
+        packed.qkv_format = "sbhd"
+    elif case == "empty_document":
+        packed = fixture.packed((0, 0, 416))
+    else:
+        layer._cp_packed_seq_params = None
+    with pytest.raises(ValueError):
+        fixture.prepare(layer, packed)
