@@ -74,7 +74,7 @@ docker build -f docker/Dockerfile.cu13 --target relax \
   -t relax:blackwell-runtime-candidate .
 ```
 
-The CUDA 12 and CUDA 13 training images include NVIDIA Emerging Optimizers for
+The CUDA 13 training images include NVIDIA Emerging Optimizers for
 Megatron. Adam remains the default in existing recipes. A compatible Megatron
 recipe can select `--optimizer muon`; MCore handles parameter grouping and
 the Adam fallback for embeddings/output parameters and non-matrix parameters.

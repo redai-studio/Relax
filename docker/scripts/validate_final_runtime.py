@@ -23,6 +23,8 @@ def main() -> None:
     if args.profile == "cu12":
         expected.pop("numpy")
         expected.pop("nvidia-nccl-cu13")
+    else:
+        expected["emerging-optimizers"] = "0.3.0"
     for package, version in expected.items():
         if md.version(package) != version:
             raise ValueError(f"{package}: expected {version}, got {md.version(package)}")
@@ -34,7 +36,6 @@ def main() -> None:
 
     if not torch.version.cuda or not torch.version.cuda.startswith("12." if args.profile == "cu12" else "13."):
         raise ValueError(f"CUDA runtime does not match {args.profile}: {torch.version.cuda}")
-    expected["emerging-optimizers"] = md.version("emerging-optimizers")
     expected["torch"] = md.version("torch")
     expected["transformer-engine"] = md.version("transformer-engine")
     hybrid = md.version("relax-hybrid-ep")
