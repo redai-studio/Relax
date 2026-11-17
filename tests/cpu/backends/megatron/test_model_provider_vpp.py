@@ -153,6 +153,7 @@ def _load_model_provider(monkeypatch, provider=None):
 def _bridge_args(**overrides):
     values = {
         "megatron_to_hf_mode": "bridge",
+        "task_type": "causal_lm",
         "hf_checkpoint": "fake-hf",
         "attention_backend": "flash",
         "tensor_model_parallel_size": 2,

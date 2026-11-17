@@ -167,6 +167,7 @@ def test_unit_loss_and_gradients_match_unchunked_native_slicing(native_loss, mod
     parent = _parent(mode)
     args = SimpleNamespace(
         loss_type="policy_loss" if mode == "rl" else "sft",
+        task_type="causal_lm",
         qkv_format="thd",
         rollout_temperature=1.0,
         log_probs_chunk_size=-1,

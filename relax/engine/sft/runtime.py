@@ -66,7 +66,7 @@ def is_sft_mode(args: Namespace) -> bool:
 
 def is_embedding_task(args: Namespace) -> bool:
     """Return whether the model produces a pooled sequence representation."""
-    return getattr(args, "task_type", "causal_lm") == "embedding"
+    return args.task_type == "embedding"
 
 
 def is_embedding_sft_mode(args: Namespace) -> bool:

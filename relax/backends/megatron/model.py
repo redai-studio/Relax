@@ -2156,7 +2156,7 @@ def save(
         args.head_type = "critic_value_terminal_v1"
     elif getattr(args, "task_type", "causal_lm") == "seq_cls":
         args.head_type = "sequence_classification_v1"
-    elif getattr(args, "task_type", "causal_lm") == "embedding":
+    elif args.task_type == "embedding":
         # Keep the native checkpoint identity of the original embedding recipe.
         args.head_type = "sequence_contrast_v1"
     else:

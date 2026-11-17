@@ -4811,7 +4811,7 @@ def relax_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
-    if getattr(args, "task_type", "causal_lm") == "embedding":
+    if args.task_type == "embedding":
         from relax.utils.training.embedding import validate_embedding_args
 
         validate_embedding_args(args)
