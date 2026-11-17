@@ -64,6 +64,16 @@ def is_sft_mode(args: Namespace) -> bool:
     return getattr(args, "loss_type", None) == "sft"
 
 
+def is_embedding_task(args: Namespace) -> bool:
+    """Return whether the model produces a pooled sequence representation."""
+    return getattr(args, "task_type", "causal_lm") == "embedding"
+
+
+def is_embedding_sft_mode(args: Namespace) -> bool:
+    """Return whether the offline trainer should consume embedding pairs."""
+    return is_sft_mode(args) and is_embedding_task(args)
+
+
 def is_i2i_sft(args: Namespace) -> bool:
     """Image-edit supervision uses its own data contract within SFT."""
     return is_sft_mode(args) and getattr(args, "generation_task", None) == "i2i"
@@ -192,7 +202,7 @@ def should_skip_sft_weight_management(
 def should_bypass_main_output_layer(args: Namespace) -> bool:
     """Return whether training needs hidden states instead of main language-
     model logits."""
-    return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args)
+    return getattr(args, "mtp_only_training", False) or should_use_sft_chunked(args) or is_embedding_sft_mode(args)
 
 
 def should_use_sft_chunked(args: Namespace) -> bool:
