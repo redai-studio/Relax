@@ -289,3 +289,12 @@ cuDNN 路线需要兼容的 CUDA 13 Blackwell 环境，以及额外的 NVIDIA cu
 - 公共模型脚本默认开启 fused attention，Mixed 不能与它同时使用，所以公共配置中的 `FUSED_ATTENTION=0` 必须显式设置。
 
 实现入口：[Mixed 分发](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/mixed.py)、[几何检查](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/geometry.py)、[cuDNN 适配](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/cudnn.py)、[Triton 选择](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/qsa_fused.py)。
+
+
+## 长上下文 CP 的运行前提
+
+32 卡 HybridEP 预检支持 TP1/PP2/EP8/ETP1 配合 CP8 或 CP16。需要显式启用 QSA CP、mixed community backend 和 CuTe long backend；预检仍检查实际 EP 成员是否位于同一主机与可访问的 NVLink 域，不因逻辑拓扑匹配而跳过物理通信检查。
+
+CP16 下 GDN 的本地 V head 数可能为 3。CUDA13 镜像包含 FlashQLA chunk64 cumsum 的小 head 对齐补丁，避免该形状编译失败；这项修复不改变训练配置或启用新的优化策略。
+
+仅需要记录数据位置、不希望同时保存模型时，可在 SFT 服务环境中设置 `RELAX_SFT_DATA_STATE_ROOT=/path/to/data-state`。写入优先使用该目录，否则沿用 `--save`；恢复始终从 `--load` 读取。该变量必须传递到实际 SFT 服务进程，例如加入 `RELAX_PROPAGATE_ENV_VARS` 并设置对应环境变量。数据位置文件不包含模型或 optimizer 状态，不能单独用于完整训练恢复。

@@ -11,6 +11,11 @@ from relax.engine.sft.dataset.streaming import SFTStreamingDataset
 from relax.utils.data.streaming_dataset import IndexManager
 
 
+@pytest.fixture(autouse=True)
+def clear_data_output_override(monkeypatch):
+    monkeypatch.delenv("RELAX_SFT_DATA_STATE_ROOT", raising=False)
+
+
 def dataset():
     # Exercise the production index manager and accepted-sample refill loop.
     result = object.__new__(SFTStreamingDataset)
@@ -29,6 +34,37 @@ def config(tmp_path):
 
 def ids(batch):
     return [sample.source_idx for sample in batch[0]]
+
+
+@pytest.mark.parametrize("override", [None, ""])
+def test_unset_or_empty_data_output_uses_model_save(tmp_path, monkeypatch, override):
+    if override is not None:
+        monkeypatch.setenv("RELAX_SFT_DATA_STATE_ROOT", override)
+    args, original = config(tmp_path), dataset()
+    samples, _ = original.get_batch(4)
+    save_data_state(args, original, 1, 13, samples)
+    assert (tmp_path / "sft_data_state/0000001.json").is_file()
+
+
+@pytest.mark.parametrize("model_save", [False, True])
+def test_data_output_override_does_not_change_restore_source(tmp_path, monkeypatch, model_save):
+    args, original = config(tmp_path / "original"), dataset()
+    samples, _ = original.get_batch(4)
+    save_data_state(args, original, 1, 13, samples)
+    source = tmp_path / "original/sft_data_state/0000001.json"
+    preserved = source.read_bytes()
+    expected = ids(original.get_batch(4))
+    samples, _ = original.get_batch(4)
+    output = tmp_path / "diagnostic"
+    monkeypatch.setenv("RELAX_SFT_DATA_STATE_ROOT", str(output))
+    if not model_save:
+        args.save = None
+    save_data_state(args, original, 1, 13, samples)
+    assert (output / "sft_data_state/0000001.json").is_file()
+    assert source.read_bytes() == preserved
+    restored = dataset()
+    restore_data_state(args, restored, 1, 13)
+    assert ids(restored.get_batch(4)) == expected
 
 
 @pytest.mark.parametrize("step", [1, 3, 7])
