@@ -23,8 +23,6 @@ def main() -> None:
     if args.profile == "cu12":
         expected.pop("numpy")
         expected.pop("nvidia-nccl-cu13")
-    else:
-        expected["emerging-optimizers"] = "0.3.0"
     for package, version in expected.items():
         if md.version(package) != version:
             raise ValueError(f"{package}: expected {version}, got {md.version(package)}")
