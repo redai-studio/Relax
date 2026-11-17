@@ -89,7 +89,6 @@ def _tool_group(name):
         result_cells=cells,
         sessions=[],
         ownership=GroupOwnership.RUNTIME,
-        eager_session_generation=True,
         first_ir_seen_session_ids=set(cells),
     )
     group.sessions.extend(
@@ -186,14 +185,6 @@ class _Runtime:
 
     async def trim_memory(self):
         pass
-
-    def session_capacity_snapshot(self):
-        return None
-
-    def _assert_epoch_drained(self, *, allow_prepared=False):
-        assert not allow_prepared
-        assert not self.tools
-        assert all(task.done() for task in self.h.group_tasks)
 
 
 class _Sink:
@@ -303,7 +294,6 @@ class _Harness:
             save=None,
             save_interval=None,
             agentic_prelaunch=False,
-            agentic_session_capacity_per_node=2 * N,
         )
         self.sink = _Sink(self)
         self.manager = SimpleNamespace(training_weight_updating=False)

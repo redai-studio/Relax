@@ -8,17 +8,14 @@ Contents: [process](#agent-process-contract), [client timeout](#relax-facing-age
 
 Relax injects `RELAX_INPUT_JSON`, `RELAX_OUTPUT_JSON`, `RELAX_SESSION_IO_DIR`, `RELAX_BASE_URL`, `RELAX_SESSION_ID`, `RELAX_ROLLOUT_MODE`, and `RELAX_GROUP_ID`. The `RELAX_` prefix is reserved from `--agent-env` overrides.
 
-`--agent-timeout` is an active-time safety budget for the agent process. It starts after the Group is leased to Runtime,
-pauses for gated normal Sessions, and continues for protected Sessions. Exhausting it terminates the process regardless
-of whether the agent is defective or merely slow. It does not cover a Session still owned by Prepare. Ordinary
-scheduling waits for all first requests before lease; member scheduling can lease earlier, so started members may
-consume their active-time budget before the first request. This budget does not bound backend abort or finalization
-cleanup RPCs.
+`--agent-timeout` starts after each member reaches its first request and its leased generation gate opens. Ordinary
+gated Sessions pause it, while protected Sessions keep running. It contains agent-side defects independently of the
+model client's wall-clock request deadline. Ready members generate independently of siblings, for both train and Eval.
 
-Resource ownership is configured by `--agent-resource-owner-path`, separately from timeouts. Read
-[integration-contract.md](integration-contract.md#resource-ownership) for external receipts. When capacity is enabled,
-unknown cleanup leaves physical slots occupied; retry the same owner rather than reset the counter at the next step.
-This confirmation behavior is distinct from optional KV optimizations that can fall back on failure.
+The launched `--agent-command` cleans up its resources on natural exit and when Relax sends SIGTERM because of a timeout
+or another reason. Relax's process and backend cleanup run as best-effort fallback after logical retirement.
+Cleanup failure warns and cannot invalidate a successful export or hold the logical Group slot. Read
+[integration-contract.md](integration-contract.md#resource-ownership) for the command's cleanup responsibilities.
 
 ## Relax-facing agent client timeout
 
@@ -112,17 +109,16 @@ generation permit; one Session may also make concurrent model requests.
 | Explicit export misses committed state | Non-finalizable Session; its Runtime Group is dropped |
 | Context length exceeded | HTTP 400 in the endpoint's JSON error envelope, or terminal SSE error after streaming starts |
 | Unknown/discarded Session | HTTP 404 in the endpoint's error envelope |
-| Process active-time exhausted | Process-group termination; external release still requires the selected owner's confirmation |
-| Cleanup timeout or lost start response | Ownership remains uncertain; retain the physical debit and retry cleanup |
+| Process active-time exhausted | Relax sends SIGTERM; `agent-command` cleans up its resources, with Relax process cleanup as fallback |
+| Cleanup timeout or lost start response | Log a warning and attempt fallback cleanup; logical Group capacity is released |
 | Relax-facing client deadline expires | Agent-side request failure or disconnect before Relax completes the Session request |
 
 ## Observable evidence
 
 Check `accounting_start`, `accounting_end`, `idle_heartbeat`, progress `scored/prepared`, `resident_group_count`,
 `interrupted_runtime_group_count`, Shard health/debug state, and the agent log tail. When KV features are enabled, use
-the exact `agentic_kv/*` metric names. With physical capacity enabled, inspect `session_capacity/outstanding`,
-`session_capacity/peak`, and `session_capacity/confirmed_releases` separately from logical Group counts. Peak and
-confirmed-return counts are cumulative within the Runtime; final shutdown should leave no outstanding debit.
+the exact `agentic_kv/*` metric names. Inspect the executor's own process/container/task state for physical occupancy;
+logical Group counts can decrease before background cleanup finishes.
 
 Use `--save-debug-rollout-data <path-with-{rollout_id}>` when finalized Sample evidence is needed. It stores exported
 Samples and their state hashes, turns, abort counts, timings, and weight versions; it does not capture the complete live

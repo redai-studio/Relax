@@ -72,7 +72,10 @@ class Fixture:
         self.module = types.ModuleType("client_retry_test")
         exec(compile(CLIENT.read_text(), str(CLIENT), "exec"), self.module.__dict__)
         self.clock, self.signals = Clock(), Signals()
-        self.receipt, self.output = self.root / "receipt.json", self.root / "output.json"
+        self.stack.enter_context(
+            mock.patch.object(self.module.uuid, "uuid4", return_value=types.SimpleNamespace(hex="nonce"))
+        )
+        self.output = self.root / "output.json"
         self.expected = {"schema": 1, "session_id": "client", "nonce": "nonce", "status": "released"}
         env = {
             "AGENT_SERVER_URL": "http://example.invalid",
@@ -80,9 +83,6 @@ class Fixture:
             "RELAX_GROUP_ID": "group",
             "RELAX_ROLLOUT_MODE": "train",
             "RELAX_BASE_URL": "http://router.invalid",
-            "RELAX_REQUIRE_RESOURCE_RELEASE": "1",
-            "RELAX_RESOURCE_RELEASE_NONCE": "nonce",
-            "RELAX_RESOURCE_RELEASE_PATH": str(self.receipt),
             "RELAX_OUTPUT_JSON": str(self.output),
         }
         self.stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
@@ -158,7 +158,6 @@ class ClientRetryTests(unittest.TestCase):
         for actual, expected in zip(delays, [0.5, 1, 2, 4, 5, 0.5, 0.5, 1]):
             self.assertAlmostEqual(actual, expected, places=6)
         self.assertFalse(f.cancel_calls())
-        self.assertEqual(json.loads(f.receipt.read_text()), f.expected)
         self.assertEqual(
             json.loads(f.output.read_text()),
             {
@@ -190,7 +189,6 @@ class ClientRetryTests(unittest.TestCase):
         self.assertAlmostEqual(f.clock.now, 162.5, places=6)
         self.assertTrue(repeated_signal)
         self.assertEqual(len(f.cancel_calls()), 1)
-        self.assertEqual(json.loads(f.receipt.read_text())["status"], "unknown")
         after = [call for call in f.poll_calls() if call["start"] >= 123]
         for first, second in zip(after, after[1:]):
             self.assertAlmostEqual(second["start"] - first["end"], 0.5, places=6)
@@ -221,7 +219,6 @@ class ClientRetryTests(unittest.TestCase):
         f.clock.hook = interrupt
         self.assertEqual(f.run(server), 143)
         self.assertLessEqual(f.cancel_calls()[0]["start"] - signal_at, 0.1000001)
-        self.assertEqual(json.loads(f.receipt.read_text()), f.expected)
 
     def test_retryable_http_errors_close_the_response_and_recover(self):
         for status in [408, 429, 500, 502, 503, 504]:
@@ -281,11 +278,10 @@ class ClientRetryTests(unittest.TestCase):
 
                 self.assertEqual(f.run(server), 1)
                 f.jitter.assert_not_called()
-                self.assertEqual(json.loads(f.receipt.read_text()), f.expected)
                 self.assertFalse(f.output.exists())
                 f.stack.close()
 
-    def test_wrong_release_identity_cannot_refund_even_after_cancellation(self):
+    def test_wrong_release_identity_keeps_client_failed_after_cancellation(self):
         f = Fixture(self)
 
         def server(call):
@@ -299,29 +295,8 @@ class ClientRetryTests(unittest.TestCase):
 
         self.assertEqual(f.run(server), 1)
         self.assertEqual(len(f.cancel_calls()), 1)
-        self.assertEqual(json.loads(f.receipt.read_text())["status"], "unknown")
         self.assertFalse(f.output.exists())
         self.assertAlmostEqual(f.clock.now, 40.0, places=6)
-
-    def test_local_receipt_failure_never_uses_network_backoff_or_claims_release(self):
-        f = Fixture(self)
-
-        def persist(path, value):
-            if value.get("status") == "released":
-                raise OSError("receipt storage unavailable")
-            return f.atomic(path, value)
-
-        f.stack.enter_context(mock.patch.object(f.module, "atomic_json", side_effect=persist))
-
-        def server(call):
-            if call["path"] == "/sessions":
-                return {"session_id": "server"}
-            return {} if call["path"].endswith("/cancel") else f.terminal()
-
-        self.assertEqual(f.run(server), 1)
-        self.assertAlmostEqual(f.clock.now, 40.0, places=6)
-        self.assertEqual(json.loads(f.receipt.read_text())["status"], "unknown")
-        f.jitter.assert_not_called()
 
     def test_local_output_failure_preserves_failure_and_does_not_relabel_network(self):
         f = Fixture(self)
@@ -339,7 +314,6 @@ class ClientRetryTests(unittest.TestCase):
             return {} if call["path"].endswith("/cancel") else f.terminal()
 
         self.assertEqual(f.run(server), 1)
-        self.assertEqual(json.loads(f.receipt.read_text()), f.expected)
         self.assertFalse(f.output.exists())
         f.jitter.assert_not_called()
 
@@ -361,27 +335,6 @@ class ClientRetryTests(unittest.TestCase):
         self.assertEqual(f.run(server), 0)
         self.assertEqual(attempts, 5)
         self.assertEqual(created, {("client", "nonce")})
-        self.assertEqual(json.loads(f.receipt.read_text()), f.expected)
-
-    def test_cancel_during_initial_unknown_write_releases_without_any_http(self):
-        for boundary in ["before", "after"]:
-            with self.subTest(boundary=boundary):
-                f = Fixture(self)
-
-                def persist(path, value):
-                    initial = value.get("status") == "unknown"
-                    if initial and boundary == "before":
-                        f.signals.cancel()
-                    result = f.atomic(path, value)
-                    if initial and boundary == "after":
-                        f.signals.cancel()
-                    return result
-
-                f.stack.enter_context(mock.patch.object(f.module, "atomic_json", side_effect=persist))
-                self.assertEqual(f.run(lambda _: self.fail("HTTP must not start")), 143)
-                self.assertFalse(f.calls)
-                self.assertEqual(json.loads(f.receipt.read_text()), f.expected)
-                f.stack.close()
 
     def test_cancel_after_create_may_have_sent_must_recover_remote_identity(self):
         f = Fixture(self)
@@ -394,16 +347,14 @@ class ClientRetryTests(unittest.TestCase):
                 if attempts == 1:
                     f.signals.cancel()
                     f.timeout(call)
-                self.assertEqual(json.loads(f.receipt.read_text())["status"], "unknown")
                 return {"session_id": "server"}
             return {} if call["path"].endswith("/cancel") else f.terminal(status="cancelled")
 
         self.assertEqual(f.run(server), 143)
         self.assertEqual(attempts, 2)
         self.assertEqual(len(f.cancel_calls()), 1)
-        self.assertEqual(json.loads(f.receipt.read_text()), f.expected)
 
-    def test_cancel_after_unknown_create_never_forges_release(self):
+    def test_cancel_after_unknown_create_remains_bounded(self):
         f = Fixture(self)
 
         def server(call):
@@ -414,7 +365,6 @@ class ClientRetryTests(unittest.TestCase):
 
         self.assertEqual(f.run(server), 143)
         self.assertAlmostEqual(f.clock.now, 40.0, places=6)
-        self.assertEqual(json.loads(f.receipt.read_text())["status"], "unknown")
         self.assertFalse(f.output.exists())
         f.jitter.assert_not_called()
 

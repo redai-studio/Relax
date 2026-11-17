@@ -1658,20 +1658,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--agent-command",
                 type=str,
                 default=None,
-                help=(
-                    "Managed-command agent entry command for agentic rollout. "
-                    "Required when --use-agentic-rollout is set."
-                ),
-            )
-            parser.add_argument(
-                "--agent-resource-owner-path",
-                type=str,
-                default="relax.agentic.runner.resources.ProcessGroupResourceOwner",
-                help=(
-                    "Session resource-owner factory used to confirm physical release. The default owns only "
-                    "the managed process group; agents using containers, detached processes or remote resources "
-                    "must select ReceiptResourceOwner or a custom owner covering those resources."
-                ),
+                help="Command to start the agent.",
             )
             parser.add_argument(
                 "--agent-cwd",
@@ -1740,17 +1727,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Prelaunch agent processes for the next rollout step.",
-            )
-            parser.add_argument(
-                "--agentic-session-capacity-per-node",
-                type=int,
-                default=None,
-                help=(
-                    "Physical train Session limit per host. Starts members incrementally and generates ready members "
-                    "before the full Group reaches its first request; requires confirmed agent resource release. "
-                    "Supports partial rollout, prelaunch, dynamic global batching and fully-async steps under their "
-                    "existing mode constraints; eval keeps its ordinary Group lifecycle."
-                ),
             )
             parser.add_argument(
                 "--agentic-session-lifecycle",
@@ -3556,9 +3532,6 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-concurrency must be > 0.")
     if args.agentic_eval_concurrency is not None and args.agentic_eval_concurrency <= 0:
         raise ValueError("--agentic-eval-concurrency must be > 0.")
-    capacity = getattr(args, "agentic_session_capacity_per_node", None)
-    if capacity is not None and capacity < args.n_samples_per_prompt:
-        raise ValueError("--agentic-session-capacity-per-node must fit one complete Group.")
     if args.agentic_program_admission:
         if args.agentic_admission_expected_decode_cap is None:
             args.agentic_admission_expected_decode_cap = args.rollout_max_response_len

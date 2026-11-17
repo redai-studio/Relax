@@ -36,9 +36,7 @@ class SessionGroupProgress:
     takeable_session_ids: Tuple[str, ...]
     interrupted: bool
     protected: bool
-    resource_released_session_ids: Tuple[str, ...] = ()
     all_first_ir_arrived: bool = False
-    error: RuntimeGroupError | None = None
 
 
 @dataclass(frozen=True)
@@ -75,7 +73,6 @@ class SessionSpec:
     sampling_params: dict[str, Any] | None = None
     observation_stage_id: str | None = None
     observation_started_at: str | None = None
-    require_resource_release: bool = False
 
 
 @dataclass
@@ -90,8 +87,8 @@ class SampleExport:
 class SessionExport:
     """All Samples exported by one terminal Session.
 
-    Runtime releases the Session's volatile resources before publishing this
-    value.
+    Runtime retires the Session before publishing this value. Physical cleanup
+    continues independently as a best-effort fallback for the agent command.
     """
 
     exports: Tuple[SampleExport, ...]
