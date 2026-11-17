@@ -7,13 +7,48 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import yaml
+
+
+def _run_sandbox(command: list[str], *, input: str, log_file: Any, timeout: float) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        process.communicate(input=input, timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode)
+    except BaseException:
+        # Let Apptainer perform its own teardown before escalating locally.
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        raise
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
 
 
 def _score_swebench(row: dict, log: Path) -> float:
@@ -64,6 +99,7 @@ def _reward(expected_output_json: str, test_output: str) -> float:
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     input_path = Path(os.environ["RELAX_INPUT_JSON"])
     output_path = Path(os.environ["RELAX_OUTPUT_JSON"])
     session_dir = Path(os.environ["RELAX_SESSION_IO_DIR"]).resolve()
@@ -137,14 +173,10 @@ def main() -> None:
             "set -e\n" + apptainer_config["setup"][mode] + "\n" + apptainer_config["command"],
         ]
         with tempfile.TemporaryFile() as log_file:
-            result = subprocess.run(
+            result = _run_sandbox(
                 command,
                 input=prompt,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                log_file=log_file,
                 timeout=timeout_s + reward_timeout_s + 300,
             )
             if result.returncode:
@@ -166,6 +198,10 @@ def main() -> None:
         "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8"
     )
     temporary.replace(output_path)
+
+
+def _handle_sigterm(signum: int, _frame: Any) -> None:
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":

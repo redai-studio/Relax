@@ -3,6 +3,7 @@
 # pyright: reportMissingTypeArgument=false, reportCallIssue=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportUninitializedInstanceVariable=false, reportOptionalIterable=false, reportFunctionMemberAccess=false, reportPossiblyUnboundVariable=false, reportOperatorIssue=false, reportIndexIssue=false, reportReturnType=false
 
 import asyncio
+import copy
 import dataclasses
 import enum
 import logging
@@ -31,6 +32,7 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -67,6 +69,7 @@ from relax.utils.training.train_dump_utils import (
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
 )
+from relax.utils.types import Sample
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -380,12 +383,12 @@ class EngineGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
-    def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
+    def start_engines(self, port_cursors: dict[str, int] | None = None) -> tuple[list, dict[str, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()``
         without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
-        of Ray ObjectRefs and *port_cursors* maps node index → next free port.
+        of Ray ObjectRefs and *port_cursors* maps node IP → next free port.
         The caller should ``ray.get()`` on the handles to block until the
         engines are healthy, and pass *port_cursors* to the next engine group
         so that different groups on the same node don't race for ports.
@@ -440,6 +443,10 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                    # Mooncake's default 15000-17000 overlaps allocated HTTP ports
+                    # before they bind. Use the upper range reserved by ray-job.sh.
+                    "MC_MIN_RPC_PORT": "65001",
+                    "MC_MAX_RPC_PORT": "65500",
                     # OPD per-position token_ids logprob patch: default off, enabled
                     # via env (affects the student engine too, like the teacher).
                     "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
@@ -776,7 +783,7 @@ class RolloutServer:
                 )
 
         all_handles = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
         groups_to_remove = []
 
         for g_idx, g in enumerate(groups):
@@ -884,6 +891,7 @@ def get_local_rollout_manager() -> "RolloutManager":
 @ray.remote(
     concurrency_groups={
         "health_monitoring": 1,
+        "reload": 1,
         "scale_out": 8,
         "scale_in": 8,
         "scale_coordination": 1,
@@ -912,6 +920,10 @@ class RolloutManager(ReloadableMixin):
         self.args = args
         self._engine_actor_states = _get_engine_actor_states()
         self._dynamic_global_batch_size = None
+        self._eval_judge = None
+        self._eval_judge_init_lock = asyncio.Lock()
+        self._eval_judge_tasks: set[asyncio.Task] = set()
+        self._eval_judge_errors: list[str] = []
         self._lora_runtime = None
         self._lora_configuring = False
         self._lora_training_config = None
@@ -987,7 +999,7 @@ class RolloutManager(ReloadableMixin):
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
-        self._port_cursors: dict[int, int] = {}
+        self._port_cursors: dict[str, int] = {}
 
         # Elastic scale-in tracking
         self._scale_in_requests: dict[str, ScaleInRequest] = {}
@@ -1010,6 +1022,25 @@ class RolloutManager(ReloadableMixin):
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
+
+    # A slow judge may finish before reload can proceed. Keep these synchronous
+    # RPCs serialized without blocking the generation/health event loop.
+    @ray.method(concurrency_group="reload")
+    def reload_function_by_name(self, module_name: str) -> dict[str, Any]:
+        return super().reload_function_by_name(module_name)
+
+    @ray.method(concurrency_group="reload")
+    def reload_module(self, module_name: str, module_path: str | None = None) -> dict[str, Any]:
+        return super().reload_module(module_name, module_path)
+
+    @ray.method(concurrency_group="reload")
+    def reload_all_functions(self) -> dict[str, Any]:
+        return super().reload_all_functions()
+
+    def _on_custom_reward_reloaded(self, module_path: str) -> None:
+        """Wait for this manager's background judge to refresh as well."""
+        if self._eval_judge is not None:
+            ray.get(self._eval_judge.reload_custom_reward.remote(module_path))
 
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
@@ -1249,6 +1280,19 @@ class RolloutManager(ReloadableMixin):
             self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
             for monitor in self._health_monitors:
                 monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
+            # Normal completion drains before shutdown; this also cleans up on
+            # failure without waiting indefinitely for a remote judge.
+            if self._eval_judge is not None:
+                try:
+                    ray.get(self._eval_judge.close.remote(), timeout=10)
+                except Exception:
+                    logger.exception("Failed to close the eval judge pool")
+                finally:
+                    try:
+                        ray.kill(self._eval_judge)
+                    except Exception:
+                        logger.exception("Failed to terminate the eval judge owner")
+                    self._eval_judge = None
             host = getattr(self, "_lora_runtime", None)
             if host is not None:
                 ray.get(host.close.remote())
@@ -1392,23 +1436,71 @@ class RolloutManager(ReloadableMixin):
         self.health_monitoring_resume()
 
         # TODO: add fault tolerance to eval
-        result = await asyncio.to_thread(
-            call_rollout_fn,
+        result, pending = await asyncio.to_thread(
+            call_eval_with_deferred_rewards,
             self.eval_generate_rollout,
             self.args,
             rollout_id,
             self.data_source,
             self.data_system_client,
-            evaluation=True,
         )
+        await self.submit_eval_result(rollout_id, result, pending)
+
+    async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
+        """Record inline scores or enqueue captured judges from RL or SFT."""
+        if pending:
+            async with self._eval_judge_init_lock:
+                if self._eval_judge is None:
+                    self._eval_judge = await asyncio.to_thread(
+                        lambda: EvalJudgeWorker.options(**with_control_plane_affinity(self.args)).remote(self.args)
+                    )
+            # Ray serializes the snapshot before returning the ObjectRef. Keep
+            # result + pending together to preserve their shared Sample refs.
+            ref = await asyncio.to_thread(self._eval_judge.score.remote, self.args, (result, pending))
+            task = asyncio.create_task(self._finish_eval_judge(rollout_id, ref))
+            self._eval_judge_tasks.add(task)
+            task.add_done_callback(self._eval_judge_tasks.discard)
+            logger.info(
+                "Queued eval judge for rollout %s (%d pending evaluations)", rollout_id, len(self._eval_judge_tasks)
+            )
+            return
+        self._record_eval_result(rollout_id, result)
+
+    def _record_eval_result(self, rollout_id: int, result: Any) -> None:
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        args = self.args
+        if getattr(args, "loss_type", None) == "sft":
+            # SFT already supplies completed training steps, not RL batch IDs.
+            args = copy.copy(args)
+            args.wandb_always_use_train_step = False
+            args.reward_key = args.eval_reward_key or args.reward_key
+            args.n_samples_per_prompt = 1
+        _log_eval_rollout_data(rollout_id, args, data, result.metrics)
+
+    async def _finish_eval_judge(self, rollout_id: int, ref: Any) -> None:
+        start = time.monotonic()
+        try:
+            result = await ref
+            result.metrics = dict(result.metrics or {})
+            result.metrics.update({"eval/async_judge": 1, "eval/async_judge_seconds": time.monotonic() - start})
+            await asyncio.to_thread(self._record_eval_result, rollout_id, result)
+        except Exception as exc:
+            self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
+            logger.exception("Background eval judge failed for rollout %s", rollout_id)
+
+    async def drain_eval_judges(self) -> None:
+        """Finish scoring and reporting before the normal job shutdown."""
+        while self._eval_judge_tasks:
+            logger.info("Waiting for %d pending eval judges at training completion", len(self._eval_judge_tasks))
+            await asyncio.gather(*tuple(self._eval_judge_tasks))
+        if self._eval_judge_errors:
+            raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
 
     async def run_predict(self, train_step: int) -> None:
         """Periodic SFT predict pass entry point.
 
-        Ensures KV/cuda-graph is onloaded (no-op if already on), then delegates
+        Restores KV/cuda-graph when rollout offloading is enabled, then delegates
         to ``run_predict_loop`` which renders the eval set, batches calls to
         ``self.generate_predict``, and writes
         ``<args.save>/predict/predictions_step_<train_step>.jsonl``.
@@ -1419,13 +1511,16 @@ class RolloutManager(ReloadableMixin):
         """
         from relax.engine.sft.predict.loop import run_predict_loop
 
-        await self.onload_kv()
+        if self.args.offload_rollout:
+            await self.onload_kv()
         await run_predict_loop(self, self.args, train_step)
 
     async def generate_predict(
         self,
         prompts: list[str],
         multimodal_inputs_list: list[dict | None] | None = None,
+        *,
+        samples: list[Sample] | None = None,
     ) -> list[str]:
         """Generate completions for ``prompts`` concurrently.
 
@@ -1470,23 +1565,56 @@ class RolloutManager(ReloadableMixin):
         }
         if multimodal_inputs_list is None:
             multimodal_inputs_list = [None] * len(prompts)
+        if samples is not None and len(samples) != len(prompts):
+            raise ValueError("SFT predict samples must align with prompts")
 
         async def _one(idx: int, prompt: str, mm: dict | None) -> str:
             url = f"{worker_urls[idx % len(worker_urls)]}/generate"
             payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
+            if getattr(self.args, "lora_rank", 0) > 0 and getattr(self.args, "lora_adapter_mode", False):
+                from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
+
+                payload["lora_path"] = LORA_ADAPTER_NAME
+            if samples is not None:
+                # Preserve actual generated token IDs for custom eval rewards.
+                payload["return_logprob"] = True
+                payload["logprob_start_len"] = -1
             if mm:
                 encoded_mm, _ = await _encode_multimodal_inputs(mm)
                 payload.update(encoded_mm)
             output = await post(url, payload)
+            if samples is not None:
+                sample = samples[idx]
+                sample.response = output["text"]
+                meta_info = output["meta_info"]
+                token_logprobs = meta_info.get("output_token_logprobs")
+                if token_logprobs is not None:
+                    response_tokens = [item[1] for item in token_logprobs]
+                    sample.rollout_log_probs = [item[0] for item in token_logprobs]
+                else:
+                    response_tokens = output["output_ids"]
+                sample.tokens.extend(response_tokens)
+                sample.rollout_tokens = list(sample.tokens)
+                sample.response_length = len(response_tokens)
+                sample.update_from_meta_info(self.args, meta_info)
+                if sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
+                    raise RuntimeError(f"SFT predict sample {sample.index} did not complete: {sample.status}")
             if isinstance(output, dict) and "text" in output:
                 return output["text"]
             if isinstance(output, str):
                 return output
             return str(output)
 
-        return await asyncio.gather(
-            *[_one(i, p, m) for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))]
-        )
+        tasks = [
+            asyncio.create_task(_one(i, p, m))
+            for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def save(self, rollout_id):
         await self.data_source.save.remote(rollout_id)
@@ -4728,82 +4856,51 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     rank_offset=0,
     base_port=15000,
 ):
-    # get ports
-    # there are 4 ports we need to allocate
-    # 1. server port
-    # 2. nccl port
-    # 3. dist_init_addr port
-    # 4. other ports for dp_attention, which is of size 4 + dp_size
-    _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
+    gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
+    nodes_per_engine = max(1, gpus_per_engine // args.num_gpus_per_node)
     addr_and_ports: dict[int, dict] = {}
 
-    # Track per-node port cursors so that different engine groups (called
-    # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
+    genrm_instances = getattr(args, "_genrm_instances_resolved", None)
+    if genrm_instances is None:
+        genrm_instances = getattr(args, "genrm_instances", None)
+    genrm_count = (
+        len(genrm_instances) if genrm_instances is not None else int(bool(getattr(args, "genrm_model_path", None)))
+    )
+    genrm_ports = None
+    if genrm_count:
+        from .genrm import _GENRM_PORT_BASE, _GENRM_PORT_WINDOW_SIZE
 
-    visited_nodes = set()
-    for rank, engine in rollout_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_engines_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
+        genrm_ports = (_GENRM_PORT_BASE, _GENRM_PORT_BASE + genrm_count * _GENRM_PORT_WINDOW_SIZE)
 
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+    node_port_cursor: dict[str, int] = {}
 
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
-                )
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
+    def allocate_port(engine, host: str, consecutive: int = 1) -> int:
+        start = node_port_cursor.get(host, base_port)
+        while True:
+            _, port = ray.get(
+                engine._get_current_node_ip_and_free_port.remote(start_port=start, consecutive=consecutive)
+            )
+            # GenRM can reserve a window before it binds any of its ports.
+            if genrm_ports and port < genrm_ports[1] and port + consecutive > genrm_ports[0]:
+                start = genrm_ports[1]
+                continue
+            node_port_cursor[host] = port + consecutive
+            return port
 
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
+    for rank, engine in sorted(rollout_engines, key=lambda item: item[0]):
+        host, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
+        ports = dict(host=host, port=allocate_port(engine, host), nccl_port=allocate_port(engine, host))
+        if worker_type == "prefill":
+            ports["disaggregation_bootstrap_port"] = allocate_port(engine, host)
 
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-            if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
-
-        if _gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
-                # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
+        # Only the distributed rendezvous belongs to the TP group's head.
+        head_rank = rank - (rank - rank_offset) % nodes_per_engine
+        if rank == head_rank:
+            ports["dist_init_addr"] = f"{host}:{allocate_port(engine, host, 30 + args.sglang_dp_size)}"
         else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
-    for i, _ in rollout_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
-        logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
+            ports["dist_init_addr"] = addr_and_ports[head_rank]["dist_init_addr"]
+        addr_and_ports[rank] = ports
+        logger.info(f"Ports for engine {rank}: {ports}")
 
     return addr_and_ports, node_port_cursor
 
@@ -5217,7 +5314,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
 
         engine_groups: list[EngineGroup] = []
         all_init_handles: list = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
 
         for group_cfg in model_cfg.engine_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine

@@ -111,25 +111,26 @@ def _runtime_args(**overrides):
     return SimpleNamespace(**base)
 
 
-async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) -> None:
-    calls: list[Sample] = []
+@pytest.mark.parametrize("rollout_mode", ["train", "eval"])
+async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch, rollout_mode) -> None:
+    calls: list[tuple[Sample, bool]] = []
 
-    async def fake_async_rm(args, sample):
+    async def fake_async_rm(args, sample, *, evaluation):
         del args
-        calls.append(sample)
+        calls.append((sample, evaluation))
         return 1.0
 
     monkeypatch.setattr("relax.agentic.pipeline.reward.async_rm", fake_async_rm)
     reward_domain = RewardDomain(
         args=_runtime_args(reward_max_concurrency=1),
-        rollout_mode="train",
+        rollout_mode=rollout_mode,
         group_filter=None,
     )
     sample = Sample(index=0, group_index=0, session_id="sample-0", metadata={})
 
     await reward_domain._score_sample(sample)
 
-    assert calls == [sample]
+    assert calls == [(sample, rollout_mode == "eval")]
     assert sample.reward == 1.0
 
 
@@ -256,18 +257,19 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
     assert second.samples[0][0].teacher_log_probs == [-0.5]
 
 
-async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> None:
-    calls: list[list[Sample]] = []
+@pytest.mark.parametrize("rollout_mode", ["train", "eval"])
+async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch, rollout_mode) -> None:
+    calls: list[tuple[list[Sample], bool]] = []
 
-    async def fake_batched_async_rm(args, samples):
+    async def fake_batched_async_rm(args, samples, *, evaluation):
         del args
-        calls.append(samples)
+        calls.append((samples, evaluation))
         return [float(sample.index) for sample in samples]
 
     monkeypatch.setattr("relax.agentic.pipeline.reward.batched_async_rm", fake_batched_async_rm)
     reward_domain = RewardDomain(
         args=_runtime_args(group_rm=True, reward_max_concurrency=1),
-        rollout_mode="train",
+        rollout_mode=rollout_mode,
         group_filter=None,
     )
     samples = [Sample(index=index, group_index=0, session_id=f"sample-{index}", metadata={}) for index in range(3)]
@@ -278,7 +280,7 @@ async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> 
 
     await reward_domain.score_group(group)
 
-    assert calls == [samples]
+    assert calls == [(samples, rollout_mode == "eval")]
     assert [sample.reward for sample in samples] == [0.0, 1.0, 2.0]
 
 
@@ -571,7 +573,10 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
     runtime = RuntimeDomain(Namespace(rollout_global_dataset=False), "train", [shard], concurrency=2)
 
     async def exit_before_first_ir(_mode: str, group_id: str, _requests: Any) -> None:
-        shard.group_streams[group_id].first_request_barrier.set_result(False)
+        stream = shard.group_streams[group_id]
+        stream.first_request_barrier.set_result(False)
+        for result in stream.session_results:
+            result.completion.set_result(None)
 
     handle.start_group.remote.side_effect = exit_before_first_ir
     first = GroupInput("first", [Sample(group_index=0, index=0)])
@@ -594,11 +599,16 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
         await asyncio.gather(*tuple(prepare._warming_prepare_tasks))
         await asyncio.sleep(0)
 
+    streams = prepare.take_ready(2)
+    assert len(streams) == 2
+    for stream, _teacher, _keys in streams:
+        assert await runtime.collect_group(stream) is None
+    await asyncio.gather(*tuple(runtime._cleanup_tasks))
     assert handle.start_group.remote.await_count == 2
     handle.drop_group.remote.assert_any_await("first", reason=None)
     handle.drop_group.remote.assert_any_await("second", reason=None)
     assert runtime.resident_group_count == 0
-    assert warning.call_count == 2
+    assert warning.call_count == 0
     assert not prepare._warming_prepare_tasks
     assert not prepare._ready_prepare_tasks
 
@@ -688,6 +698,20 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
         get_manager.assert_not_called()
     else:
         get_manager.assert_called_once_with()
+
+
+def test_zero_staleness_keeps_generation_open_until_partition_is_complete() -> None:
+    pipeline = object.__new__(AgenticResidentPipeline)
+    pipeline.args = SimpleNamespace(fully_async=True, max_staleness=0)
+    pipeline.transfer_domain = SimpleNamespace(total_debt=1, previous_debt=0)
+    pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=("tool-idle-group",))
+    context = _StepContext(rollout_id=0, final_backfill=False)
+    manager = SimpleNamespace(training_weight_updating=True)
+    with patch("relax.agentic.rollout.get_local_rollout_manager", return_value=manager) as get_manager:
+        assert not pipeline._step_can_close(context)
+        pipeline.transfer_domain.total_debt = 0
+        assert pipeline._step_can_close(context)
+    get_manager.assert_not_called()
 
 
 def test_runtime_gap_counts_current_debt_oversampling_and_resident_tail() -> None:
@@ -1028,6 +1052,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
     )
+    shard._agent_cleanup_tasks = set()
     shard._lifecycle_close_count = 0
     shard._lifecycle_close_failure_count = 0
     shard._notify_state_change = lambda group=None: None
@@ -1050,6 +1075,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
 
     assert await shard_cls._finish_session(shard, session, None) is None
     assert await shard_cls._finish_session(shard, session, None) is None
+    await asyncio.gather(*tuple(shard._agent_cleanup_tasks))
     shard._generation_backend.close_session.assert_awaited_once()
     assert shard._lifecycle_close_count == 1
     assert shard._lifecycle_close_failure_count == 0
@@ -1087,7 +1113,7 @@ async def test_lease_group_publishes_runtime_ownership_without_waiting_for_sessi
 
     assert group.ownership is GroupOwnership.RUNTIME
     assert [session.rollout_id for session in group.sessions] == [7, 7]
-    shard._set_group_timeout_active.assert_awaited_once()
+    shard._set_group_timeout_active.assert_not_awaited()
     shard._open_group.assert_awaited_once_with(group)
 
 
@@ -1548,6 +1574,7 @@ def _router_recovery_shard():
         router_cb_timeout_duration_secs=0,
     )
     shard._train_generation_open = True
+    shard._generation_gate_lock = asyncio.Lock()
     shard._state_revision = 0
     shard._state_changed = asyncio.Event()
     group = ResidentGroup(rollout_mode="train", group_id="g1", result_cells={}, sessions=[])
@@ -1559,6 +1586,8 @@ def _router_recovery_shard():
     group.sessions.append(session)
     group.result_cells[session.session_id] = session.result_cell
     shard._groups = {group.group_id: group}
+    shard._session_records = {session.session_id: session}
+    group.first_ir_seen_session_ids.add(session.session_id)
     shard._set_runtime_timeouts_active = AsyncMock()
     shard._dispatch_queued_irs_locked = lambda _session: None
     shard._notify_state_change = lambda _group=None: None
@@ -1922,6 +1951,8 @@ def _managed_shard_session():
     shard._lora_sequence = 1
     shard._lora_live_sequences = {0}
     shard._lora_pending_releases = set()
+    shard._agent_cleanup_tasks = set()
+    shard._permit_cleanup_tasks = set()
     shard._session_records = {session.session_id: session}
     shard.args.agentic_session_lifecycle = False
     session.lora_key = SessionKey("s", "boot", 0)
@@ -1946,7 +1977,7 @@ async def test_managed_session_bind_lost_reply_retries_original_key():
     assert manager.publication(1).session_count == 0
 
 
-async def test_managed_session_finish_joins_pending_bind_before_release():
+async def test_managed_session_finish_publishes_before_pending_bind_cleanup():
     shard, group, session, ir, host, manager = _managed_shard_session()
     entered, resume = asyncio.Event(), asyncio.Event()
 
@@ -1963,16 +1994,59 @@ async def test_managed_session_finish_joins_pending_bind_before_release():
     ir.runner_task = task
     await entered.wait()
     closing = asyncio.create_task(shard._finish_session(session, None))
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert not closing.done()
+    assert await asyncio.wait_for(closing, 2) is None
+    assert session.result_cell.terminal and session not in group.sessions
     assert manager.publication(0).session_count == 1
     resume.set()
-    assert await asyncio.wait_for(closing, 2) is None
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     backend.generate.assert_not_awaited()
     assert manager.publication(0).session_count == 0
     assert session not in group.sessions
     assert not shard._lora_live_sequences
+
+
+@pytest.mark.parametrize("failure_stage", ["close", "release"])
+async def test_managed_cleanup_failure_keeps_result_and_retries_release(failure_stage):
+    shard, group, session, _ir, host, manager = _managed_shard_session()
+    await shard._bind_lora_session(session)
+    shard._generation_backend = SimpleNamespace(
+        close_session=AsyncMock(side_effect=TimeoutError("close unavailable") if failure_stage == "close" else None),
+        abort_request=AsyncMock(),
+    )
+    if failure_stage == "release":
+        shard._lora_runtime.release = remote(AsyncMock(side_effect=TimeoutError("release unavailable")))
+    await shard._finish_session(session, None)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+    assert session.result_cell.dropped and not group.sessions
+    assert shard._lora_pending_releases == ({session.lora_key} if failure_stage == "release" else set())
+    shard._lora_runtime.release = remote(host.release)
+    await shard.lora_heartbeat()
+    assert not shard._lora_pending_releases and not shard._lora_live_sequences
+    assert manager.publication(0).session_count == 0
+
+
+async def test_managed_release_retries_after_cleanup_cancels_pending_bind():
+    shard, _group, session, _ir, _host, manager = _managed_shard_session()
+    await shard._bind_lora_session(session)
+    session.lora_bind_task = asyncio.create_task(asyncio.Event().wait())
+    releasing = asyncio.create_task(shard._release_lora_session(session))
+    try:
+        await asyncio.sleep(0)
+        assert shard._lora_pending_releases == {session.lora_key}
+        releasing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await releasing
+        assert manager.publication(0).session_count == 1
+        assert shard._lora_live_sequences == {session.lora_key.sequence}
+        await shard.lora_heartbeat()
+        assert not shard._lora_pending_releases and not shard._lora_live_sequences
+        assert manager.publication(0).session_count == 0
+    finally:
+        releasing.cancel()
+        session.lora_bind_task.cancel()
+        await asyncio.gather(releasing, session.lora_bind_task, return_exceptions=True)
 
 
 async def test_managed_release_retry_watermark_preserves_unbound_prelaunch_session():
@@ -2044,6 +2118,8 @@ async def test_managed_generation_transport_error_aborts_and_ends_session():
     assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
     assert isinstance(session.result_cell.payload, RuntimeGroupError)
     assert session.session_id not in shard._session_records
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     assert manager.publication(0).session_count == 0
     observation = session.observation
     assert not observation.token_count_complete
@@ -2110,6 +2186,8 @@ async def test_managed_transport_failure_and_concurrent_finish_do_not_wait_on_ea
     await asyncio.sleep(0)
     resume.set()
     await asyncio.wait_for(asyncio.gather(runner, finishing), 2)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     assert manager.publication(0).session_count == 0
 
 

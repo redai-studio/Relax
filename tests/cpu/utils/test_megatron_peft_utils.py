@@ -241,7 +241,8 @@ class TestWriteHfPeftAdapter:
             hf_key = key.removeprefix("base_model.model.").replace(".default.weight", ".weight")
             torch.testing.assert_close(value, expected[hf_key], rtol=0, atol=0)
 
-    def test_write_hf_peft_adapter_round_trip(self, tmp_path):
+    @pytest.mark.parametrize("mtp_projection", ["fc", "eh_proj"])
+    def test_write_hf_peft_adapter_round_trip(self, tmp_path, mtp_projection):
         """Writes a loadable HF-PEFT dir: config JSON + safetensors with same
         tensors."""
         from safetensors.torch import load_file
@@ -249,13 +250,15 @@ class TestWriteHfPeftAdapter:
         merged = {
             "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 16),
             "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(16, 8),
+            f"base_model.model.mtp.{mtp_projection}.lora_A.weight": torch.randn(8, 32),
+            f"base_model.model.mtp.{mtp_projection}.lora_B.weight": torch.randn(16, 8),
         }
         out = write_hf_peft_adapter(
             merged,
             tmp_path / "lora_adapter",
             lora_rank=8,
             lora_alpha=16,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=convert_megatron_to_hf_target_modules(["linear_q", "linear_v", "eh_proj"]),
             lora_dropout=0.05,
         )
 
@@ -267,7 +270,7 @@ class TestWriteHfPeftAdapter:
         config = json.loads((adapter_dir / "adapter_config.json").read_text())
         assert config["r"] == 8
         assert config["lora_alpha"] == 16
-        assert config["target_modules"] == ["q_proj", "v_proj"]
+        assert {"q_proj", "v_proj"}.issubset(config["target_modules"])
         assert config["lora_dropout"] == 0.05
         assert config["peft_type"] == "LORA"
         assert config["bias"] == "none"
@@ -276,6 +279,10 @@ class TestWriteHfPeftAdapter:
         assert set(loaded) == set(merged)
         for k, v in merged.items():
             assert torch.allclose(loaded[k], v)
+            # Every exported module, including MTP's HF `fc`, must be selected
+            # when PEFT reloads the adapter using its saved configuration.
+            module_name = k.rsplit(".lora_", 1)[0]
+            assert any(module_name.endswith(f".{target}") for target in config["target_modules"])
 
     def test_write_hf_peft_adapter_makes_missing_dirs(self, tmp_path):
         """Nested, non-existent target dirs are created."""

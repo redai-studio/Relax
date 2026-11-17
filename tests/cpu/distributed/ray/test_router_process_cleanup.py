@@ -29,6 +29,7 @@ def test_rollout_manager_dispose_stops_owned_router_even_if_engine_shutdown_fail
     manager = SimpleNamespace(
         _stop_eviction_monitor=Mock(),
         _health_monitors=[],
+        _eval_judge=None,
         _shutdown_all_engines=Mock(side_effect=shutdown_engines),
     )
     try:

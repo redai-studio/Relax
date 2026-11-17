@@ -24,6 +24,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
+    is_managed_opd_teacher_colocate,
     is_managed_opd_teacher_enabled,
     teacher_sglang_parse_args,
     validate_managed_opd_teacher_colocate_args,
@@ -863,9 +864,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "When set under --loss-type sft, every N rollout steps run a predict pass "
-                    "over the eval dataset (--eval-prompt-data/--eval-config or --eval-size) and write "
-                    "completions to <save>/predict/predictions_step_<rollout_id>.jsonl. "
+                    "When set under --loss-type sft, every N completed training steps run a predict pass "
+                    "over the eval dataset (--eval-prompt-data or --eval-size) and write "
+                    "completions to <save>/predict/predictions_step_<train_step>.jsonl. "
+                    "With --custom-rm-path or --rm-type, also score predictions with evaluation=True; "
+                    "eligible judges run asynchronously unless --disable-eval-async-judge is set. "
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
@@ -1664,10 +1667,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--agent-command",
                 type=str,
                 default=None,
-                help=(
-                    "Managed-command agent entry command for agentic rollout. "
-                    "Required when --use-agentic-rollout is set."
-                ),
+                help="Command to start the agent.",
             )
             parser.add_argument(
                 "--agent-cwd",
@@ -1789,6 +1789,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_eval_arguments(parser):
+            parser.add_argument(
+                "--disable-eval-async-judge",
+                action="store_true",
+                help=(
+                    "Disable background eval judging and wait for scoring after trajectory generation. "
+                    "Background judging is enabled by default. "
+                    "Supports remote_rm and custom rewards declaring reward_func.supports_async_eval = True. "
+                    "Uses a separate CPU reward pool; training and other rewards keep their existing behavior. "
+                    "Normal shutdown waits for pending scores."
+                ),
+            )
             parser.add_argument(
                 "--eval-function-path",
                 type=str,
@@ -1942,6 +1953,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Save a lightweight, resumable actor checkpoint containing LoRA tensors plus optimizer, "
                     "scheduler, RNG, and iteration state. Frozen base weights are restored from --hf-checkpoint. "
                     "The initial implementation supports synchronous BF16 torch_dist checkpoints only. "
+                    "May be combined with --save-hf to also export the full merged HF model. "
                     "When unset, save the regular full distributed checkpoint."
                 ),
             )
@@ -3497,8 +3509,6 @@ def validate_save_lora_only_args(args) -> None:
         incompatible.append("--fp8")
     if args.fp16:
         incompatible.append("--fp16")
-    if args.save_hf is not None:
-        incompatible.append("--save-hf")
     if incompatible:
         raise ValueError("--save-lora-only is incompatible with: " + ", ".join(incompatible))
 
@@ -4069,6 +4079,10 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
 
 
 def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
+    if is_managed_opd_teacher_colocate(args):
+        # The configured rollout/teacher split also applies without a training actor.
+        return
+
     if args.colocate and not args.rollout_num_gpus:
         args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
     else:
