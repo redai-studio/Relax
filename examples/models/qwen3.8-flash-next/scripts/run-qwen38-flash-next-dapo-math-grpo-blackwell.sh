@@ -99,6 +99,23 @@ case "${WORLD_SIZE}" in
         ;;
 esac
 
+REPLA_QSA="${REPLA_QSA:-0}"
+case "${REPLA_QSA}" in
+    0|1) ;;
+    *)
+        echo "Invalid REPLA_QSA=${REPLA_QSA}: expected 0 or 1." >&2
+        exit 1
+        ;;
+esac
+if [ "${REPLA_QSA}" = 1 ] && [ "${TOTAL_GPUS}" != 32 ]; then
+    echo "REPLA_QSA=1 requires the 32-GPU CP1 mixed preset (WORLD_SIZE=4)." >&2
+    exit 1
+fi
+
+if [ "${REPLA_QSA}" = 1 ]; then
+    CP_SIZE=1
+fi
+
 CPU_OFFLOAD="${CPU_OFFLOAD:-$((TOTAL_GPUS == 16))}"
 case "${CPU_OFFLOAD}" in
     0|1) ;;
@@ -127,6 +144,23 @@ if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
 fi
 # Reuse the example's full 48-layer architecture and Bridge defaults.
 source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
+
+# QSA reference replay requires the CP1 mixed backend.
+if [ "${REPLA_QSA}" = 1 ]; then
+    export RELAX_QWEN38_QSA_COMMUNITY_BACKEND=mixed
+    export MCORE_QSA_SPARSE_BACKEND=id_sparse
+    export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
+    export RELAX_QWEN38_QSA_FUSED_SELECTOR=0
+    export RELAX_QWEN38_QSA_TP_SELECTOR=1
+    export RELAX_QWEN38_QSA_SELECTOR_COMPILE=1
+fi
+
+QSA_REPLAY_ARGS=()
+if [ "${REPLA_QSA}" = 1 ]; then
+    QSA_REPLAY_ARGS+=(
+        --use-rollout-indexer-replay
+    )
+fi
 
 # Keep streamed PLE disabled. Host-only training PLE is not supported by the
 # colocated GPU weight iterator; keep the frozen table on its owning GPU ranks.
@@ -299,7 +333,7 @@ import os
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
 for name, value in os.environ.items():
-    if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_")) or name in (
+    if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_", "RELAX_REPLAY_")) or name in (
         "PYTHONPATH", "MEGATRON", "RELAX", "PYTHONNOUSERSITE",
         "QWEN38_PLE_CPU_OFFLOAD", "MCORE_QSA_SPARSE_BACKEND",
         "SGLANG_VLM_CACHE_SIZE_MB", "CUDA_HOME", "TRITON_F32_DEFAULT",
@@ -322,6 +356,7 @@ TRAIN_ARGS=(
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"
     "${ROLLOUT_ARGS[@]}"
+    "${QSA_REPLAY_ARGS[@]}"
     "${EVAL_ARGS[@]}"
     "${PERF_ARGS[@]}"
     "${GRPO_ARGS[@]}"

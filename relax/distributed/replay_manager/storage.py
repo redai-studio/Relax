@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import RLock
@@ -205,6 +206,45 @@ async def _clear_simple_storage_samples(client: Any, metadata: Any) -> None:
     await client._clear_meta_in_controller(metadata)
 
 
+async def _read_simple_storage_bodies(manager: Any, metadata: Any) -> list[Any]:
+    """Receive encoded CPU bodies without repacking them into a nested
+    batch."""
+    import torch
+
+    routing = manager._group_by_hash(metadata.global_indexes)
+    results = await asyncio.gather(
+        *(
+            manager._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=unit)
+            for unit, group in routing.items()
+        ),
+        return_exceptions=True,
+    )
+    # Drain every storage-unit request before a failure returns the shared
+    # client to another caller. Do not reimplement TQ's wire protocol.
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    bodies = [None] * metadata.size
+    for group, (fields, data) in zip(routing.values(), results, strict=True):
+        if tuple(fields) != ("replay_body",) or "replay_body" not in data:
+            raise RuntimeError("Unexpected SimpleStorage replay fields")
+        values = data["replay_body"]
+        if len(values) != len(group.batch_positions):
+            raise RuntimeError("SimpleStorage is missing a sealed replay body")
+        for position, value in zip(group.batch_positions, values, strict=True):
+            if (
+                not 0 <= position < len(bodies)
+                or bodies[position] is not None
+                or not isinstance(value, torch.Tensor)
+                or value.device.type != "cpu"
+            ):
+                raise RuntimeError("Invalid SimpleStorage replay body response")
+            bodies[position] = value.numpy()
+    if any(value is None for value in bodies):
+        raise RuntimeError("SimpleStorage is missing a sealed replay body")
+    return bodies
+
+
 class TQBodyBackend:
     """Process-local client with explicit keys and a dedicated synchronous
     loop."""
@@ -216,6 +256,7 @@ class TQBodyBackend:
         self._gdr_reader = None
         self._pid = os.getpid()
         self._lock = RLock()
+        self._encoded_metadata: OrderedDict[str, Any] = OrderedDict()
 
     def client(self) -> Any:
         if os.getpid() != self._pid:
@@ -243,27 +284,78 @@ class TQBodyBackend:
         client.put(TensorDict({"replay_body": body}, batch_size=[len(keys)]), metadata=meta)
 
     def read(self, keys: list[str]) -> list[Any]:
+        return self._read(keys, cache_metadata=False)
+
+    def read_encoded(self, keys: list[str]) -> list[Any]:
+        return self._read(keys, cache_metadata=True)
+
+    def _read(self, keys: list[str], *, cache_metadata: bool) -> list[Any]:
+        if not keys:
+            return []
         # Serialize foreground and speculative reads on the same sync client.
         # Client creation alone does not establish caller-thread safety.
         with self._lock:
             client = self.client()
-            meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=False)
-            if meta.size != len(keys):
-                raise RuntimeError("TQ is missing a sealed replay block")
-            meta = meta.select_fields(["replay_body"])
+            if not cache_metadata:
+                meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=False)
+                if meta.size != len(keys):
+                    raise RuntimeError("TQ is missing a sealed replay block")
+                meta = meta.select_fields(["replay_body"])
+            else:
+                # Sealed bodies are immutable while the caller holds its lease.
+                # Keep only routing metadata, never body payloads or ownership.
+                missing = list(dict.fromkeys(key for key in keys if key not in self._encoded_metadata))
+                resolved = {}
+                if missing:
+                    fetched = client.kv_retrieve_meta(keys=missing, partition_id=self.partition, create=False)
+                    if fetched.size != len(missing):
+                        raise RuntimeError("TQ is missing a sealed replay block")
+                    fetched = fetched.select_fields(["replay_body"])
+                    resolved = {key: fetched.select_samples([i]) for i, key in enumerate(missing)}
+                ordered = []
+                for key in keys:
+                    item = resolved[key] if key in resolved else self._encoded_metadata[key]
+                    ordered.append(item)
+                    self._encoded_metadata[key] = item
+                    self._encoded_metadata.move_to_end(key)
+                while len(self._encoded_metadata) > 8192:
+                    self._encoded_metadata.popitem(last=False)
+                meta = type(ordered[0]).concat(ordered) if len(ordered) > 1 else ordered[0]
+            if cache_metadata:
+                manager = getattr(client, "storage_manager", None)
+                loop = getattr(client, "_loop", None)
+                if (
+                    isinstance(loop, asyncio.AbstractEventLoop)
+                    and loop.is_running()
+                    and callable(getattr(manager, "_group_by_hash", None))
+                    and callable(getattr(manager, "_get_from_single_storage_unit", None))
+                ):
+                    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+
+                    if isinstance(manager, AsyncSimpleStorageManager):
+                        # Use this client's socket-owning loop, but bypass generic
+                        # get_data's process-global torch thread-count changes and
+                        # SimpleStorage's full nested-tensor repacking copy.
+                        return asyncio.run_coroutine_threadsafe(
+                            _read_simple_storage_bodies(manager, meta), loop
+                        ).result()
             values = client.get_data(meta)["replay_body"]
             return [value.cpu().numpy() for value in values.unbind()]
 
     def delete(self, keys: list[str]) -> None:
         if not keys:
             return
-        client = self.client()
-        meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=False)
-        if meta.size:
-            client.clear_samples(meta)
+        with self._lock:
+            for key in keys:
+                self._encoded_metadata.pop(key, None)
+            client = self.client()
+            meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=False)
+            if meta.size:
+                client.clear_samples(meta)
 
     def close(self) -> None:
         with self._lock:
+            self._encoded_metadata.clear()
             if self._gdr_reader is not None:
                 self._gdr_reader.close()
                 self._gdr_reader = None
@@ -438,15 +530,16 @@ class TQReplayStorage:
         return bool(self._device_reads)
 
     def encoded_batch_limit(self, *, device: Any) -> int:
-        """Bound heterogeneous GPU reads; CPU TensorDict bodies stay
-        singleton."""
-        return 32 << 20 if self._prepare_device_reads(device) else 0
+        """Bound heterogeneous body reads on both supported transports."""
+        return 32 << 20
 
     def read_encoded(self, keys: list[str], *, device: Any) -> list[Any]:
-        """Keep CPU backends unchanged; RDMA bodies arrive directly on GPU."""
+        """Batch CPU bodies with cached routing; RDMA arrives directly on
+        GPU."""
         if self._prepare_device_reads(device):
             return self._backend._gdr_reader.read(keys)
-        return self._backend.read(keys)
+        read = getattr(self._backend, "read_encoded", self._backend.read)
+        return read(keys)
 
     def remap_tokens(self, ref: ReplayRef, captured: list[int], training: list[int]) -> ReplayRef:
         return self.invoke("remap_tokens", ref, captured, training)

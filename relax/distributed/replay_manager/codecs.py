@@ -7,6 +7,30 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class _QSABitmapReplay:
+    bits: Any
+    mask: Any
+    missing_rows: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        import torch
+
+        if (
+            self.bits.dtype != torch.int32
+            or self.bits.ndim != 2
+            or self.bits.shape[1] < 1
+            or not self.bits.is_contiguous()
+            or self.mask.dtype != torch.bool
+            or self.mask.shape != (self.bits.shape[0],)
+            or self.mask.device != self.bits.device
+            or not isinstance(self.missing_rows, tuple)
+            or any(type(row) is not int or not 0 <= row < self.bits.shape[0] for row in self.missing_rows)
+            or tuple(sorted(set(self.missing_rows))) != self.missing_rows
+        ):
+            raise ValueError("Invalid direct QSA bitmap payload")
+
+
+@dataclass(frozen=True)
 class ReplayCodec:
     name: str
     kind: str | None = None
@@ -33,10 +57,20 @@ class ReplayCodec:
 
         decode_into(data, rows, destinations, output)
 
+    def decode_contiguous_into(
+        self, data: Any, source_start: int, destination_start: int, count: int, output: Any
+    ) -> None:
+        if not self.encoded:
+            raise ValueError("Raw replay does not use a set decoder")
+        from ._bitmap import decode_contiguous_into
+
+        decode_contiguous_into(data, source_start, destination_start, count, output)
+
 
 RAW = ReplayCodec("int32")
 KEYE_BITMAP = ReplayCodec("keye-bitmap-v1", kind="indexer", topk=2048, max_encoded_width=1025)
-_CODECS = {codec.name: codec for codec in (RAW, KEYE_BITMAP)}
+QSA_BITMAP = ReplayCodec("qsa-r4-bitmap-v1", kind="indexer", topk=512, max_encoded_width=2049)
+_CODECS = {codec.name: codec for codec in (RAW, KEYE_BITMAP, QSA_BITMAP)}
 
 
 def replay_codec(name: str) -> ReplayCodec:

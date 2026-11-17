@@ -504,7 +504,10 @@ def post_process_env(args, env):
     from relax.distributed.replay_manager import reference_environment
 
     for name, value in reference_environment().items():
-        env["env_vars"].setdefault(name, value)
+        if getattr(args, "use_rollout_indexer_replay", False):
+            env["env_vars"][name] = value
+        else:
+            env["env_vars"].setdefault(name, value)
 
     # Generic env-var passthrough for overlay packages. Comma-separated list
     # of env-var names the driver wants forwarded to every Ray actor. Each

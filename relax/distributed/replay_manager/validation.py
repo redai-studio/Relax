@@ -18,9 +18,22 @@ class IndexerReplayCapabilities:
     topk_path: tuple[str, ...] = ("dsa_indexer_topk",)
     capture_ratio: int | None = 4
     hf_topk_path: tuple[str, ...] = ("index_topk",)
+    qsa: bool = False
 
     def capture_layout(self, config: Any) -> tuple[int, tuple[int, ...]]:
         """Validate the actual training model, beyond the launch arguments."""
+        if self.qsa:
+            ratio = getattr(config, "qsa_indexer_compress_ratio", None)
+            budget = getattr(config, "qsa_indexer_budget", None)
+            pattern = getattr(config, "linear_attention_freq", None)
+            if ratio != 4 or not budget or budget % ratio or getattr(config, "qsa_indexer_loss_coeff", 0):
+                raise ValueError("QSA replay requires an R4 token budget and zero indexer loss")
+            if not isinstance(pattern, (list, tuple)) or len(pattern) < config.num_layers:
+                raise ValueError("QSA replay requires the explicit GDN/QSA layer map")
+            layers = tuple(i for i, linear in enumerate(pattern[: config.num_layers]) if not linear)
+            if not layers:
+                raise ValueError("QSA capture layer map is empty")
+            return budget // ratio, layers
         topk = config
         for field in self.topk_path:
             topk = topk.get(field) if isinstance(topk, dict) else getattr(topk, field, None)
@@ -54,6 +67,12 @@ _CAPABILITIES = {
         capture_ratio=None,
         hf_topk_path=("sa_config", "topk"),
     ),
+    "qwen4_exp": IndexerReplayCapabilities(
+        cp_partition_mode="zigzag", allgather_cp=False, rollout_dp_attention=False, qsa=True
+    ),
+    "qwen4_exp_text": IndexerReplayCapabilities(
+        cp_partition_mode="zigzag", allgather_cp=False, rollout_dp_attention=False, qsa=True
+    ),
 }
 
 
@@ -68,6 +87,12 @@ def indexer_topk(hf_config: Any) -> int:
     """Read the capture payload width using the same model capability table."""
     config = getattr(hf_config, "text_config", hf_config)
     capabilities = indexer_capabilities(getattr(config, "model_type", None))
+    if capabilities.qsa:
+        budget = getattr(config, "indexer_budget", 0)
+        ratio = getattr(config, "indexer_compress_ratio", None)
+        if ratio != 4 or budget <= 0 or budget % ratio:
+            raise ValueError("QSA replay requires a positive R4 token budget")
+        return budget // ratio
     value = config
     for field in capabilities.hf_topk_path:
         value = value.get(field) if isinstance(value, dict) else getattr(value, field, None)
@@ -79,6 +104,8 @@ def indexer_topk(hf_config: Any) -> int:
 def indexer_capture_layout(config: Any) -> tuple[int, tuple[int, ...]]:
     hf_config = getattr(config, "hf_config", None)
     model_type = getattr(hf_config, "model_type", None)
+    if model_type is None and getattr(config, "qsa_indexer_n_heads", None):
+        model_type = "qwen4_exp_text"
     # Older DSV4 Megatron configs do not retain the HF config. Require their
     # explicit sparse-layout fields, never treat an unknown HF model as DSV4.
     if model_type is None and hasattr(config, "csa_compress_ratios") and hasattr(config, "dsa_indexer_topk"):
@@ -114,10 +141,25 @@ def validate_indexer_replay_args(args: Any, *, is_offline: bool) -> None:
         unsupported.append(f"custom generate_function_path={args.custom_generate_function_path}")
     if args.qkv_format != "thd":
         unsupported.append(f"qkv_format={args.qkv_format}")
-    if args.context_parallel_size <= 1:
+    if capabilities.qsa and args.context_parallel_size != 1:
+        unsupported.append("QSA replay requires context_parallel_size=1")
+    if not capabilities.qsa and args.context_parallel_size <= 1:
         unsupported.append(f"context_parallel_size={args.context_parallel_size}")
-    if args.tensor_model_parallel_size != 1 or args.sequence_parallel:
+    if not capabilities.qsa and (args.tensor_model_parallel_size != 1 or args.sequence_parallel):
         unsupported.append("TP>1/sequence parallel")
+    if capabilities.qsa:
+        from relax.utils.env import Envs
+
+        from .config import references_enabled
+
+        if not references_enabled():
+            unsupported.append("QSA replay requires reference delivery (RELAX_REPLAY_REFERENCES=1)")
+        if Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND != "mixed" or Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
+            unsupported.append("QSA replay requires mixed attention with fused attention disabled")
+        if not Envs.RELAX_QWEN38_QSA_TP_SELECTOR or Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:
+            unsupported.append("QSA replay requires TP selector with fused selector disabled")
+        if getattr(args, "qsa_indexer_loss_coeff", 0) not in (None, 0, 0.0):
+            unsupported.append("trainable QSA indexer")
     if args.dynamic_context_parallel:
         unsupported.append("dynamic CP")
     if args.enable_mtp_training or args.sglang_speculative_algorithm:

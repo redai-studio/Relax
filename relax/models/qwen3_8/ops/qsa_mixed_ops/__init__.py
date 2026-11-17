@@ -27,15 +27,30 @@ def attention_for_selection(
     batch, length, heads, width = query.shape
     long_backend = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND
     validate_geometry(long_backend, heads, key.shape[2], width, key.shape[-1])
-    if selection.compress_ratio != 4 or selection.selected_ids is None:
-        raise ValueError("Mixed QSA requires native selected four-token block IDs")
+    if selection.compress_ratio != 4 or (selection.selected_ids is None and selection.selected_bits is None):
+        raise ValueError("Mixed QSA requires selected four-token block IDs or a replay bitmap")
     bounds = getattr(selection, "_relax_qsa_mixed_bounds", None) if is_thd else (0, length)
     if bounds is None or bounds[0] != 0 or bounds[-1] != length:
         raise ValueError("Mixed packed QSA requires producer CPU document boundaries")
     if long_backend == "cudnn_pr1765":
         from relax.models.qwen3_8.ops.qsa_mixed_ops.cudnn import attention_for_selection as cudnn_mixed
 
+        if selection.selected_ids is None:
+            from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import _block_ids_from_bits
+
+            bits = selection.selected_bits.view(torch.int32).reshape(-1, selection.bits_per_row // 4)
+            selection = replace(selection, selected_ids=_block_ids_from_bits(bits))
         return cudnn_mixed(query, key, value, selection, scale, bounds)
+    if selection.selected_ids is None:
+        from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import attention_from_bits
+
+        if selection.bits_per_row % 4 or selection.selected_bits.dtype != torch.uint8:
+            raise ValueError("Mixed QSA replay requires int32-aligned bitmap bytes")
+        bits = selection.selected_bits.view(torch.int32).reshape(batch, length, selection.bits_per_row // 4)
+        outputs = [
+            attention_from_bits(query[row], key[row], value[row], bits[row], bounds, scale) for row in range(batch)
+        ]
+        return outputs[0].unsqueeze(0) if batch == 1 else torch.stack(outputs)
     from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import attention
     from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
 

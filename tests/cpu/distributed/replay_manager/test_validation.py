@@ -111,6 +111,11 @@ def test_codec_contract_rejects_wrong_kind_topk_and_width():
             codec.validate(kind, topk)
     with pytest.raises(ValueError, match="row width"):
         codec.validate_width(1026)
+    qsa = replay_codec("qsa-r4-bitmap-v1")
+    qsa.validate("indexer", 512)
+    qsa.validate_width(2049)
+    with pytest.raises(ValueError, match="shape/kind"):
+        qsa.validate("indexer", 2048)
 
 
 def test_dsv4_does_not_inherit_keye_only_restrictions(monkeypatch):
@@ -125,3 +130,49 @@ def test_capture_topk_uses_registered_hf_layout():
     assert indexer_topk(SimpleNamespace(model_type="deepseek_v4", index_topk=512)) == 512
     text = SimpleNamespace(model_type="KeyeVL2", sa_config={"topk": 2048})
     assert indexer_topk(SimpleNamespace(text_config=text)) == 2048
+
+
+def test_qsa_reference_layout_uses_blocks_and_sparse_layers():
+    text = SimpleNamespace(model_type="qwen4_exp_text", indexer_budget=2048, indexer_compress_ratio=4)
+    assert indexer_topk(SimpleNamespace(text_config=text)) == 512
+    config = SimpleNamespace(
+        num_layers=8,
+        qsa_indexer_n_heads=4,
+        qsa_indexer_budget=2048,
+        qsa_indexer_compress_ratio=4,
+        qsa_indexer_loss_coeff=0,
+        linear_attention_freq=[1, 1, 1, 0, 1, 1, 1, 0],
+    )
+    assert indexer_capture_layout(config) == (512, (3, 7))
+    config.qsa_indexer_loss_coeff = 1
+    with pytest.raises(ValueError, match="zero indexer loss"):
+        indexer_capture_layout(config)
+
+
+def test_qsa_reference_accepts_tp4_cp1_and_rejects_full_delivery(monkeypatch):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", "mixed")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_FUSED_ATTENTION", "0")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_TP_SELECTOR", "1")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_FUSED_SELECTOR", "0")
+    args = valid_args("qwen4_exp", monkeypatch)
+    args.context_parallel_size = 1
+    args.tensor_model_parallel_size = 4
+    args.sequence_parallel = True
+    args.cp_partition_mode = "zigzag"
+    args.allgather_cp = False
+    args.sglang_enable_dp_attention = False
+    args.pipeline_model_parallel_size = 4
+    validate_indexer_replay_args(args, is_offline=False)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    with pytest.raises(ValueError, match="reference delivery"):
+        validate_indexer_replay_args(args, is_offline=False)
+
+
+def test_qsa_reference_rejects_cp2_and_conflicting_attention(monkeypatch):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", "mixed")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_FUSED_ATTENTION", "1")
+    args = valid_args("qwen4_exp", monkeypatch)
+    with pytest.raises(ValueError, match="requires context_parallel_size=1.*fused attention disabled"):
+        validate_indexer_replay_args(args, is_offline=False)

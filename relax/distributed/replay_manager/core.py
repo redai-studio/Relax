@@ -473,6 +473,7 @@ class ReplayManager:
         *,
         microbatch_id: int | None = None,
         advance_before_lookup: bool = False,
+        materialize: bool = True,
     ) -> Any:
         channel = self._channel(key)
         if phase is None:
@@ -488,9 +489,13 @@ class ReplayManager:
         # Legacy Indexer advances even on overrun; MoE advances only on success.
         if advance_before_lookup:
             setattr(channel, cursor, index + 1)
-        payload = ConsumerExecutor.execute(
-            ConsumerRequest(kind=key.kind, layer=key.layer, microbatch_id=index, payload=channel.entries[index])
-        )
+        payload = channel.entries[index]
+        if payload is None:
+            raise ValueError("Bind a reference request before executing it")
+        if materialize:
+            payload = ConsumerExecutor.execute(
+                ConsumerRequest(kind=key.kind, layer=key.layer, microbatch_id=index, payload=payload)
+            )
         if not advance_before_lookup:
             setattr(channel, cursor, index + 1)
         return payload
@@ -663,7 +668,11 @@ class ReplayInventory:
             raise ValueError("Replay blocks are write-once")
         size = count * item["topk"] * 4 * len(keys)
         if item.get("codec", "int32") != "int32":
-            if encoded_bytes is None or not 0 < encoded_bytes <= size:
+            from .codecs import replay_codec
+
+            codec = replay_codec(item["codec"])
+            maximum = count * codec.max_encoded_width * codec.element_bytes * len(keys)
+            if encoded_bytes is None or not 0 < encoded_bytes <= maximum:
                 raise ValueError("Invalid encoded replay reservation")
             size = encoded_bytes
         used = sum(obj["bytes"] for obj in self.state["objects"].values())
@@ -883,6 +892,29 @@ class ReplayInventory:
 
 
 replay_data_manager = ReplayManager(config=ReplayConfig.from_env())
+
+
+def enable_reference_replay() -> None:
+    """Resolve CLI-selected delivery before clients or workers are created."""
+    import os
+
+    manager = replay_data_manager
+    manager._ensure_open()
+    if not manager.uses_references or not manager.config.run_id:
+        if (
+            manager._enabled_kinds is not None
+            or manager._installed_engines
+            or manager._channels
+            or manager._store_instance is not None
+            or manager._owns_run
+        ):
+            raise RuntimeError("Cannot enable reference replay after replay manager initialization")
+        # Entry points may already hold this singleton; preserve its identity.
+        manager.config = replace(manager.config, delivery="reference", run_id=manager.config.run_id or new_data_id())
+    os.environ["RELAX_REPLAY_REFERENCES"] = "1"
+    os.environ["RELAX_REPLAY_RUN_ID"] = manager.config.run_id
+    # The package may have been imported while reference mode was still off.
+    install_tq_cleanup_hook()
 
 
 def install_tq_cleanup_hook() -> None:

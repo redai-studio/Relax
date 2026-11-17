@@ -93,7 +93,8 @@ def test_bitmap_replay_roundtrip_and_row_selection(length: int) -> None:
     assert (output[[0, 2, 3, 5]] == -1).all()
 
 
-def test_bitmap_consumer_cpu_and_gpu_bodies_share_cache_and_row_semantics():
+@pytest.mark.parametrize("codec_name,topk", [("keye-bitmap-v1", 2048), ("qsa-r4-bitmap-v1", 512)])
+def test_bitmap_consumer_cpu_and_gpu_bodies_share_cache_and_row_semantics(codec_name, topk):
     import numpy as np
 
     from relax.distributed.replay_manager.config import ReplayConfig
@@ -121,36 +122,49 @@ def test_bitmap_consumer_cpu_and_gpu_bodies_share_cache_and_row_semantics():
         def close(self):
             pass
 
-    ids = torch.arange(2048, device="cuda", dtype=torch.int32).expand(2050, -1).clone()
-    ids.masked_fill_(ids > torch.arange(2050, device="cuda")[:, None], -1)
+    ids = torch.arange(topk, device="cuda", dtype=torch.int32).expand(2056, -1).clone()
+    ids.masked_fill_(ids > torch.arange(2056, device="cuda")[:, None], -1)
     ids[-2:] += torch.tensor([[1], [2]], device="cuda", dtype=torch.int32)
-    encoded = torch.empty((2050, 1025), device="cuda", dtype=torch.int32)
-    encode_into(ids, encoded)
+    encoded = torch.empty((2056, 1025), device="cuda", dtype=torch.int32)
+    if topk == 2048:
+        encode_into(ids, encoded)
+    else:
+        from relax.distributed.replay_manager._bitmap import encode_qsa_tokens_into
+
+        tokens = torch.where(ids[:, :, None] >= 0, ids[:, :, None] * 4 + torch.arange(4, device="cuda"), -1).flatten(1)
+        tokens = torch.cat((tokens, torch.full((len(ids), 3), -1, dtype=torch.int32, device="cuda")), dim=1).int()
+        encode_qsa_tokens_into(tokens, torch.full((len(ids),), 4 * 2056, dtype=torch.int32, device="cuda"), encoded)
     host = encoded.cpu().numpy()
-    coordinates = np.array([[0, 16], [0, 0], [0, 2048], [0, 2049], [1, 17], [-1, 0]])
+    coordinates = np.array([[0, 16], [0, 0], [0, 2054], [0, 2055], [1, 17], [-1, 0]])
     layout = ConsumerBatchLayout.from_coordinates(coordinates)
-    for gpu_body, cache_bytes in ((False, 16 << 20), (True, 16 << 20), (True, 4096)):
+    first_body_bytes = 1024 * 4
+    for gpu_body, cache_bytes in ((False, 16 << 20), (True, 16 << 20), (True, first_body_bytes)):
         body = Bodies()
         config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=1024, publication_bytes=64 << 20)
         inventory = ReplayInventory(config, body.delete)
         store = TQReplayStorage(config, inventory=inventory)
         store._backend = body
-        publication = store.begin_publication(kind="indexer", layers=1, topk=2048, codec="keye-bitmap-v1")
-        for start, stop in [(0, 1024), (1024, 2048), (2048, 2050)]:
-            width = 1 if stop <= 2048 else 1 + (stop + 31) // 32
+        publication = store.begin_publication(kind="indexer", layers=1, topk=topk, codec=codec_name)
+        for start, stop in [(0, 1024), (1024, 2048), (2048, 2056)]:
+            if topk == 512:
+                from relax.distributed.replay_manager.backend.qwen38 import QSABitmapCapturer
+
+                width = QSABitmapCapturer.encoded_width(stop)
+            else:
+                width = 1 if stop <= topk else 1 + (stop + 31) // 32
             publication.append(stop - start, lambda layer: host[start:stop, :width].copy(), encoded_width=width)
-        ref = publication.finish(list(range(2051)))
+        ref = publication.finish(list(range(2057)))
         # Preload actual GPU bodies to exercise device reception semantics;
         # this test does not claim to test an RDMA transport.
         if gpu_body:
             body.values = {key: torch.from_numpy(value).cuda() for key, value in body.values.items()}
-            store.encoded_batch_limit = lambda **kwargs: 8 << 20
+            store.encoded_batch_limit = lambda **kwargs: 16 << 20
         cache = ConsumerTensorCache(cache_bytes)
         with store.reader([ref, ref]) as reader:
             source = ConsumerLayerReader(reader, layout, layer=0, kind="indexer", device=ids.device, cache=cache)
         try:
             first, mask = source.read()
-            assert torch.equal(first[:5].sort().values, ids[[16, 0, 2048, 2049, 17]].sort().values)
+            assert torch.equal(first[:5].sort().values, ids[[16, 0, 2054, 2055, 17]].sort().values)
             assert (first[5] == -1).all() and torch.equal(mask.cpu(), torch.tensor([True] * 5 + [False]))
             reads = body.reads
             second, _ = source.read()
@@ -164,7 +178,7 @@ def test_bitmap_consumer_cpu_and_gpu_bodies_share_cache_and_row_semantics():
             assert cache.gpu_peak_bytes > 0
             if gpu_body:
                 assert cache.encoded_read_bodies > cache.encoded_read_batches
-                assert cache.encoded_batch_peak_bytes <= 8 << 20
+                assert cache.encoded_batch_peak_bytes <= 16 << 20
             if gpu_body and cache_bytes == 16 << 20:
                 for key in list(cache.entries):
                     cache.discard(key)

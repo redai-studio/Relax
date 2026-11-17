@@ -12,8 +12,9 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Sequence
 
+from ._encoded_prefetch import _EncodedReadAhead
 from ._prefetch import _ConsumerReadAhead
-from .codecs import replay_codec
+from .codecs import QSA_BITMAP, _QSABitmapReplay, replay_codec
 from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, validate_sample
 
 
@@ -287,8 +288,13 @@ class ConsumerTensorCache:
         self.encoded_read_batches = self.encoded_read_bodies = self.encoded_batch_peak_bytes = 0
         self.encoded_fetch_seconds = 0.0
         self.gpu_bytes = self.gpu_peak_bytes = 0
-        self.gpu_capacity_bytes = min(capacity_bytes, 64 << 20)
+        self.gpu_capacity_bytes = capacity_bytes
         self._read_ahead = _ConsumerReadAhead(self)
+        self._encoded_read_ahead: _EncodedReadAhead | None = None
+        self._encoded_groups: dict[Any, dict[Any, ConsumerLayerReader]] = {}
+        self.encoded_prefetch_scheduled = self.encoded_prefetch_hits = self.encoded_prefetch_ready_hits = 0
+        self.encoded_prefetch_wait_seconds = 0.0
+        self.encoded_prefetch_peak_bytes = 0
 
     @property
     def prefetch_bytes(self) -> int:
@@ -303,10 +309,29 @@ class ConsumerTensorCache:
         self._working_set_bytes += size
         if source.reader.refs[0].codec == "int32":
             self._read_ahead.register(source)
+        elif source.reader.refs[0].codec == QSA_BITMAP.name:
+            if self._encoded_read_ahead is None:
+                self._encoded_read_ahead = _EncodedReadAhead(min(self.capacity_bytes, 32 << 20))
+            self._encoded_groups.setdefault(source._cache_group, {})[source._cache_key] = source
 
     def _unregister(self, key: Any) -> None:
         self._working_set_bytes -= self._source_bytes.pop(key, 0)
         self._read_ahead.unregister(key)
+        for group_key, group in tuple(self._encoded_groups.items()):
+            if key in group:
+                del group[key]
+                if not group:
+                    del self._encoded_groups[group_key]
+                break
+        if not self._encoded_groups and self._encoded_read_ahead is not None:
+            self._encoded_read_ahead.close()
+            self._encoded_read_ahead = None
+        if not self._source_bytes:
+            # Encoded entries use immutable body keys, not source keys. Drop
+            # their tensors explicitly rather than retaining them through the
+            # cache/read-ahead reference cycle until a later cyclic GC pass.
+            for remaining in tuple(self.entries):
+                self.discard(remaining)
 
     def get(self, key: Any) -> Any:
         value = self.entries.get(key)
@@ -347,6 +372,7 @@ class _BitmapSelection:
     count: int
     source_rows: np.ndarray
     output_rows: np.ndarray
+    width_bound: int
 
 
 class ConsumerLayerReader(ConsumerSource):
@@ -363,6 +389,7 @@ class ConsumerLayerReader(ConsumerSource):
         device: Any,
         num_experts: int = 0,
         cache: ConsumerTensorCache | None = None,
+        _qsa_bitmap_mode: bool = False,
     ) -> None:
         refs = reader.refs
         if not refs or any(m.kind != kind or m.topk != refs[0].topk or not 0 <= layer < m.layers for m in refs):
@@ -379,6 +406,9 @@ class ConsumerLayerReader(ConsumerSource):
         self.num_experts = num_experts
         self.released = False
         self.cache = cache
+        self._qsa_bitmap_mode = _qsa_bitmap_mode
+        if _qsa_bitmap_mode and refs[0].codec != QSA_BITMAP.name:
+            raise ValueError("Direct QSA bits require the QSA bitmap codec")
         self._cache_key = object()
         self._cache_group = (id(reader), id(batch_layout))
         reader.retain()
@@ -388,11 +418,11 @@ class ConsumerLayerReader(ConsumerSource):
             row_bytes = refs[0].topk * (8 if kind == "moe" else 4) + (kind != "moe")
             cache._register_source(self, len(batch_layout) * row_bytes)
 
-    def read(self) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def read(self) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | _QSABitmapReplay:
         with self.cache._read_ahead.consumer_lock if self.cache is not None else nullcontext():
             return self._read()
 
-    def _read(self) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def _read(self) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | _QSABitmapReplay:
         import torch
 
         if self.released:
@@ -413,32 +443,56 @@ class ConsumerLayerReader(ConsumerSource):
             return values
         return values, mask.clone() if device.type == "cpu" else mask.to(device, non_blocking=True)
 
-    def _read_bitmap(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _read_bitmap(self) -> tuple[torch.Tensor, torch.Tensor] | _QSABitmapReplay:
         with self.reader._lock:
             if self.reader._closing:
                 raise RuntimeError("Replay reader is closing or released")
             return self._materialize_bitmap()
 
-    def _materialize_bitmap(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _materialize_bitmap(self) -> tuple[torch.Tensor, torch.Tensor] | _QSABitmapReplay:
         import numpy as np
         import torch
 
         codec = replay_codec(self.reader.refs[0].codec)
         topk = self.reader.refs[0].topk
-        output = torch.full((len(self.batch_layout), topk), -1, dtype=torch.int32, device=self.device)
+        words = ((max(ref.rows + 1 for ref in self.reader.refs) // 4 + 1) + 31) // 32
+        output = torch.full(
+            (len(self.batch_layout), words if self._qsa_bitmap_mode else topk),
+            0 if self._qsa_bitmap_mode else -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
         selections = []
+        pending_authorizations = {}
         for sample in self.batch_layout.samples:
+            if not 0 <= sample.sample_index < len(self.reader.refs):
+                raise ValueError("Replay row plan refers to a missing sample")
             ref = self.reader.refs[sample.sample_index]
             if ref.codec != codec.name or ref.topk != topk:
                 raise ValueError("Cannot mix indexer codecs within a microbatch")
+            if (
+                sample.source_rows.ndim != 1
+                or sample.output_rows.shape != sample.source_rows.shape
+                or np.any(sample.source_rows < 0)
+                or np.any(sample.source_rows >= ref.rows)
+                or np.any(sample.output_rows < 0)
+                or np.any(sample.output_rows >= len(self.batch_layout))
+            ):
+                raise ValueError("Invalid encoded replay row layout")
             lease = self.reader._leases[sample.sample_index]
             # A reader owns immutable refs/leases until its locked release.
             # Authorize once per sample rather than per model layer/recompute.
             if sample.sample_index not in self.reader._bitmap_authorized:
-                self.reader.store.invoke("authorize_read", ref, lease)
-                self.reader._bitmap_authorized.add(sample.sample_index)
+                pending_authorizations[sample.sample_index] = (ref, lease)
             chunks = sample.source_rows // ref.chunk_rows
+            width_bound = codec.max_encoded_width
             for chunk in np.unique(chunks):
+                if codec.name == QSA_BITMAP.name:
+                    # Each immutable body is snapshotted at its own append
+                    # stop, not the eventual document length. Remaps keep rows.
+                    stop = min((int(chunk) + 1) * ref.chunk_rows, ref.rows)
+                    blocks = stop // 4
+                    width_bound = min(codec.max_encoded_width, 1 if blocks <= 512 else 1 + (blocks + 31) // 32)
                 key = f"{ref.record}:{chunk}:{self.layer}"
                 select = chunks == chunk
                 selections.append(
@@ -447,8 +501,20 @@ class ConsumerLayerReader(ConsumerSource):
                         min(ref.chunk_rows, ref.rows - int(chunk) * ref.chunk_rows),
                         sample.source_rows[select] % ref.chunk_rows,
                         sample.output_rows[select],
+                        width_bound,
                     )
                 )
+        if pending_authorizations:
+            identities = list(pending_authorizations.values())
+            if len(identities) == 1:
+                self.reader.store.invoke("authorize_read", *identities[0])
+            else:
+                self.reader.store.invoke(
+                    "authorize_reads", [ref for ref, _ in identities], [lease for _, lease in identities]
+                )
+            # A failed authorization must not leave even its successful prefix
+            # marked. Duplicate references retain their distinct reader leases.
+            self.reader._bitmap_authorized.update(pending_authorizations)
         capability = getattr(self.reader.store, "encoded_batch_limit", None)
         limit = capability(device=self.device) if capability is not None and selections else 0
         cursor = 0
@@ -461,14 +527,14 @@ class ConsumerLayerReader(ConsumerSource):
                 selection = selections[cursor]
                 if selection.key not in bodies:
                     cached = self.cache.get(("encoded", selection.key)) if self.cache is not None else None
-                    # Missing widths come from TQ metadata. Reserve the codec's
-                    # maximum, not an estimate based on this recipe's lengths.
+                    # Reserve a proven document bound for QSA snapshots; other
+                    # codecs retain their conservative maximum domain.
                     size = (
                         cached[0].nbytes
                         if cached is not None
-                        else selection.count * codec.max_encoded_width * codec.element_bytes
+                        else selection.count * selection.width_bound * codec.element_bytes
                     )
-                    if group and (not limit or reserved + size > limit or len(bodies) >= 32):
+                    if group and (not limit or reserved + size > limit or len(bodies) >= 128):
                         cached = None
                         break
                     bodies[selection.key] = cached[0] if cached is not None else None
@@ -478,8 +544,8 @@ class ConsumerLayerReader(ConsumerSource):
                     reserved += size
                 group.append(selection)
                 cursor += 1
-                # Preserve singleton CPU reads, and the previous behavior for
-                # an unavoidable single body larger than the batch budget.
+                # Preserve unbatched custom transports, and allow an
+                # unavoidable single body larger than the batch budget.
                 if not limit or reserved >= limit:
                     break
             if misses:
@@ -493,18 +559,45 @@ class ConsumerLayerReader(ConsumerSource):
                 # Hits can be evicted while later misses are inserted. Record
                 # every consuming stream before dropping the group's hold.
                 data.record_stream(torch.cuda.current_stream())
-                # Pageable as_tensor(..., device="cuda") synchronizes the model
-                # stream. Keep these small coordinate copies asynchronous too.
-                host_coordinates = torch.empty((2, len(selection.source_rows)), dtype=torch.long, pin_memory=True)
-                host_coordinates[0].numpy()[:] = selection.source_rows
-                host_coordinates[1].numpy()[:] = selection.output_rows
-                rows, destinations = host_coordinates.to(self.device, non_blocking=True).unbind()
                 # Both transports share the same bounded GPU encoded cache.
                 # Decode into the final microbatch, without another payload copy.
                 if self.cache is not None:
                     self.cache.decoded_rows += len(selection.source_rows)
                     self.cache.logical_decoded_bytes += len(selection.source_rows) * topk * codec.element_bytes
-                codec.decode_into(data, rows, destinations, output)
+                if np.all(np.diff(selection.source_rows) == 1) and np.all(np.diff(selection.output_rows) == 1):
+                    if self._qsa_bitmap_mode:
+                        from ._bitmap import copy_dense_bits_into
+
+                        copy_dense_bits_into(
+                            data,
+                            None,
+                            None,
+                            output,
+                            source_start=int(selection.source_rows[0]),
+                            destination_start=int(selection.output_rows[0]),
+                            count=len(selection.source_rows),
+                        )
+                    else:
+                        codec.decode_contiguous_into(
+                            data,
+                            int(selection.source_rows[0]),
+                            int(selection.output_rows[0]),
+                            len(selection.source_rows),
+                            output,
+                        )
+                else:
+                    # Pageable CUDA coordinate copies synchronize the model
+                    # stream. Keep arbitrary row maps asynchronous too.
+                    host_coordinates = torch.empty((2, len(selection.source_rows)), dtype=torch.long, pin_memory=True)
+                    host_coordinates[0].numpy()[:] = selection.source_rows
+                    host_coordinates[1].numpy()[:] = selection.output_rows
+                    rows, destinations = host_coordinates.to(self.device, non_blocking=True).unbind()
+                    if self._qsa_bitmap_mode:
+                        from ._bitmap import copy_dense_bits_into
+
+                        copy_dense_bits_into(data, rows, destinations, output)
+                    else:
+                        codec.decode_into(data, rows, destinations, output)
                 del data
             bodies.clear()
         # CPU layout is authoritative. The model can compute exact fallback
@@ -512,7 +605,64 @@ class ConsumerLayerReader(ConsumerSource):
         output._relax_indexer_missing_rows = tuple(int(row) for row in np.flatnonzero(~self.batch_layout.valid))
         host_mask = torch.empty(self.batch_layout.valid.shape, dtype=torch.bool, pin_memory=True)
         host_mask.numpy()[:] = self.batch_layout.valid
-        return output, host_mask.to(self.device, non_blocking=True)
+        self._schedule_bitmap_prefetch(selections)
+        mask = host_mask.to(self.device, non_blocking=True)
+        if self._qsa_bitmap_mode:
+            return _QSABitmapReplay(output, mask, output._relax_indexer_missing_rows)
+        return output, mask
+
+    def _schedule_bitmap_prefetch(self, selections: list[_BitmapSelection]) -> None:
+        # Only a foreground read may select the transport or initialize CUDA.
+        # A CPU worker reads immutable bodies and never takes this reader lock.
+        if (
+            self.cache is None
+            or self.reader.refs[0].codec != QSA_BITMAP.name
+            or getattr(self.reader.store, "_device_reads", None) is not False
+        ):
+            return
+        ahead = self.cache._encoded_read_ahead
+        if ahead is None or ahead.pending is not None or not ahead.capacity_bytes:
+            return
+        limit = min(ahead.capacity_bytes, self.reader.store.encoded_batch_limit(device=self.device))
+        if not limit:
+            return
+        following = False
+        for candidate in self.cache._encoded_groups[self._cache_group].values():
+            if candidate is self:
+                following = True
+                continue
+            if not following or candidate.released:
+                continue
+            # This group shares the exact reader, row layout and authorization;
+            # only the captured layer in each immutable key changes.
+            keys = []
+            seen = set()
+            reserved = 0
+            for selection in selections:
+                key = selection.key.rsplit(":", 1)[0] + f":{candidate.layer}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                cached = self.cache.entries.get(("encoded", key))
+                size = cached[1] if cached is not None else selection.count * selection.width_bound * 4
+                if reserved + size > limit or len(seen) > 128:
+                    break
+                reserved += size
+                if cached is None:
+                    keys.append(key)
+            if not keys:
+                continue
+            frozen_keys = tuple(keys)
+            store = candidate.reader.store
+            if ahead.schedule(
+                candidate._cache_key,
+                frozen_keys,
+                reserved,
+                lambda: store.read_encoded(list(frozen_keys), device="cpu"),
+            ):
+                self.cache.encoded_prefetch_scheduled += 1
+                self.cache.encoded_prefetch_peak_bytes = max(self.cache.encoded_prefetch_peak_bytes, reserved)
+            break
 
     def _fetch_bitmap_bodies(self, selections: list[_BitmapSelection], device: Any) -> dict[str, torch.Tensor]:
         from time import perf_counter
@@ -520,9 +670,20 @@ class ConsumerLayerReader(ConsumerSource):
         import numpy as np
         import torch
 
-        codec = replay_codec(self.reader.refs[0].codec)
         started = perf_counter()
-        blocks = self.reader.store.read_encoded([selection.key for selection in selections], device=self.device)
+        keys = tuple(selection.key for selection in selections)
+        blocks = None
+        ahead = self.cache._encoded_read_ahead if self.cache is not None else None
+        if ahead is not None:
+            window = ahead.pending
+            ready = window is not None and window.future.done()
+            blocks = ahead.take(self._cache_key, keys)
+            if blocks is not None:
+                self.cache.encoded_prefetch_hits += 1
+                self.cache.encoded_prefetch_ready_hits += ready
+                self.cache.encoded_prefetch_wait_seconds += perf_counter() - started
+        if blocks is None:
+            blocks = self.reader.store.read_encoded(list(keys), device=self.device)
         if self.cache is not None:
             self.cache.encoded_fetch_seconds += perf_counter() - started
         if len(blocks) != len(selections):
@@ -533,21 +694,26 @@ class ConsumerLayerReader(ConsumerSource):
                 block.dtype not in (np.int32, torch.int32)
                 or block.ndim != 2
                 or block.shape[0] != selection.count
-                or not 1 <= block.shape[1] <= codec.max_encoded_width
+                or not 1 <= block.shape[1] <= selection.width_bound
             ):
                 raise ValueError("Invalid encoded replay body shape")
             if isinstance(block, torch.Tensor) and (not block.is_cuda or block.device != device):
                 raise ValueError("GDR body arrived on an unexpected device")
-            if len(blocks) > 1 and not isinstance(block, torch.Tensor):
-                raise ValueError("Batched bitmap reads require GPU bodies")
         result = {}
+        host_elements = sum(block.size for block in blocks if isinstance(block, np.ndarray))
+        # One pinned allocation per bounded transport batch avoids per-body
+        # cudaHostAlloc. CUDA bodies remain independent allocations so cache
+        # eviction cannot retain an unaccounted shared GPU slab.
+        host_batch = torch.empty(host_elements, dtype=torch.int32, pin_memory=True) if host_elements else None
+        host_offset = 0
         for selection, block in zip(selections, blocks, strict=True):
             if isinstance(block, torch.Tensor):
                 staging = block
                 if self.cache is not None:
                     self.cache.encoded_rdma_bytes += block.nbytes
             else:
-                host_staging = torch.empty(block.shape, dtype=torch.int32, pin_memory=True)
+                host_staging = host_batch[host_offset : host_offset + block.size].view(block.shape)
+                host_offset += block.size
                 host_staging.numpy()[:] = block
                 staging = host_staging.to(self.device, non_blocking=True)
                 if self.cache is not None:
@@ -632,6 +798,8 @@ class ConsumerLayerReader(ConsumerSource):
         if not self.released:
             if self.cache is not None:
                 self.cache._read_ahead.drain()
+                if self.reader.refs[0].codec == QSA_BITMAP.name and self.cache._encoded_read_ahead is not None:
+                    self.cache._encoded_read_ahead.drain()
                 self.cache.discard(self._cache_key)
             self.reader.release()
             if self.cache is not None:
@@ -686,6 +854,7 @@ class ConsumerExecutor:
             device=request.device,
             num_experts=request.num_experts,
             cache=cache,
+            _qsa_bitmap_mode=request.refs[0].codec == QSA_BITMAP.name,
         )
 
     @staticmethod

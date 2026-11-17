@@ -2230,7 +2230,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--use-rollout-indexer-replay",
                 action="store_true",
                 default=False,
-                help="Replay SGLang's DeepSeek-V4 C4 indexer top-k choices in Megatron training.",
+                help="Replay SGLang's indexer choices in Megatron training using reference delivery.",
             )
             parser.add_argument(
                 "--optimize-routing-replay",
@@ -4177,8 +4177,10 @@ def slime_validate_args(args):
         )
 
     if getattr(args, "use_rollout_indexer_replay", False):
+        from relax.distributed.replay_manager.core import enable_reference_replay
         from relax.distributed.replay_manager.validation import validate_indexer_replay_args
 
+        enable_reference_replay()
         validate_indexer_replay_args(args, is_offline=is_offline)
 
     validate_reward_side_kl(args, is_offline)

@@ -42,11 +42,33 @@ def selector_forward(self, *args, **kwargs):
 
 
 def indexer_forward(self, *args, **kwargs):
+    if getattr(self.config, "relax_use_indexer_replay", False):
+        from relax.distributed.replay_manager.backend.megatron import IndexerReplay
+
+        if (
+            IndexerReplay.is_enabled()
+            and IndexerReplay.get_stage() != "fallthrough"
+            and Envs.RELAX_QWEN38_QSA_RECOMPUTE_REPLAY
+        ):
+            from .qsa_cp import _reference_indexer_forward
+
+            return _reference_indexer_forward(self, *args, **kwargs)
+        replay_data = IndexerReplay.read(self.layer_number)
+        if replay_data is not None:
+            from .ops.qsa_mixed_ops.selector import forward
+
+            return forward(self, *args, **kwargs, replay_data=replay_data)
     if Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND == "mixed":
         from .ops.qsa_mixed_ops import forward
 
-        return forward(self, *args, **kwargs)
-    return selector_forward(self, *args, **kwargs)
+        selection = forward(self, *args, **kwargs)
+    else:
+        selection = selector_forward(self, *args, **kwargs)
+    if getattr(self.config, "relax_use_indexer_replay", False):
+        from relax.distributed.replay_manager.backend.qwen38 import replay_selection
+
+        return replay_selection(self, selection)
+    return selection
 
 
 def pool_keys(self, *args, **kwargs):

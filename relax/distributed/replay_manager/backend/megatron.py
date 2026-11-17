@@ -15,6 +15,7 @@ from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
+from ..codecs import _QSABitmapReplay
 from ..config import references_enabled
 from ..consumer import (
     Consumer,
@@ -24,10 +25,11 @@ from ..consumer import (
     ConsumerModelLayout,
     ConsumerReadSession,
     ConsumerRecord,
+    ConsumerSource,
     ConsumerTensorCache,
 )
 from ..core import ConsumerConsumptionError, ConsumerPhase, ReplayManager, ReplayRegion, replay_data_manager
-from ..ref_data import REFERENCE_FIELD, ReplayRef, TokenHandle
+from ..ref_data import REFERENCE_FIELD, ReplayRef
 from ..validation import indexer_capture_layout
 
 
@@ -100,6 +102,11 @@ def log_reference_replay_metrics(cache: ConsumerTensorCache, args: Any, rollout_
         "replay/gdr_staging_d2d_bytes": cache.encoded_rdma_bytes,
         "replay/gdr_read_calls": cache.gdr_read_calls,
         "replay/encoded_fetch_seconds": cache.encoded_fetch_seconds,
+        "replay/encoded_prefetch_scheduled": cache.encoded_prefetch_scheduled,
+        "replay/encoded_prefetch_hits": cache.encoded_prefetch_hits,
+        "replay/encoded_prefetch_ready_hits": cache.encoded_prefetch_ready_hits,
+        "replay/encoded_prefetch_wait_seconds": cache.encoded_prefetch_wait_seconds,
+        "replay/encoded_prefetch_peak_bytes": cache.encoded_prefetch_peak_bytes,
         "replay/encoded_read_batches": cache.encoded_read_batches,
         "replay/encoded_read_bodies": cache.encoded_read_bodies,
         "replay/encoded_batch_peak_bytes": cache.encoded_batch_peak_bytes,
@@ -187,18 +194,40 @@ def consumer_batch_layout(
     *,
     sequence_parallel: bool,
 ) -> ConsumerBatchLayout:
+    import numpy as np
+
     if any(m.rows != length - 1 for m, length in zip(refs, lengths, strict=True)):
         raise ValueError("Replay reference row count differs from training tokens")
-    rows = [torch.from_numpy(TokenHandle.expand(ref)) for ref in refs]
+    canonical = {}
+    indices = []
+    for index, ref in enumerate(refs):
+        if len(ref.record) != 32 or ref.rows >= 2**31 or len(bytes.fromhex(ref.record)) != 16:
+            raise ValueError("Replay record cannot be represented by token handles")
+        if ref.record in canonical:
+            previous, first = canonical[ref.record]
+            if previous != ref:
+                raise ValueError("Conflicting manifests for one replay record")
+        else:
+            canonical[ref.record] = (ref, index)
+            first = index
+        indices.append(first)
+    rows = []
+    for index, ref in zip(indices, refs, strict=True):
+        coordinates = np.empty((ref.rows, 2), dtype=np.int64)
+        coordinates[:, 0] = index
+        coordinates[:, 1] = np.arange(ref.rows, dtype=np.int64)
+        rows.append(torch.from_numpy(coordinates))
 
     def pad(value: torch.Tensor, count: int) -> torch.Tensor:
         # Each padding operation restarts its offset, exactly as the original
         # MoE padding formula does. Do not replace this with a global offset.
-        padding = torch.from_numpy(TokenHandle.padding(count))
-        return torch.cat((value, padding), dim=0)
+        padding = np.empty((count, 2), dtype=np.int64)
+        padding[:, 0] = -1
+        padding[:, 1] = np.arange(count, dtype=np.int64)
+        return torch.cat((value, torch.from_numpy(padding)), dim=0)
 
     coordinates = pack_token_rows(args, rows, lengths, pad, sequence_parallel=sequence_parallel).numpy()
-    return ConsumerBatchLayout.from_coordinates(TokenHandle.coordinates(coordinates, refs))
+    return ConsumerBatchLayout.from_coordinates(coordinates)
 
 
 def _local_layer_ranges(actor: Any) -> Iterator[tuple[Any, range]]:
@@ -535,12 +564,16 @@ class _LayerIndexerReplay:
             )
         self.manager.bind(self.key, ConsumerRecord("indexer", len(self.entries), (topk, row_valid)))
 
-    def pop(self, stage: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def pop(
+        self, stage: str, *, materialize: bool = True, microbatch_id: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor] | _QSABitmapReplay | ConsumerSource:
         if stage not in ("replay_forward", "replay_backward"):
             raise ValueError(f"Cannot pop indexer replay in stage {stage!r}")
         index = self.forward_index if stage == "replay_forward" else self.backward_index
         try:
-            return self.manager.consume(self.key, stage, advance_before_lookup=True)
+            return self.manager.consume(
+                self.key, stage, advance_before_lookup=True, materialize=materialize, microbatch_id=microbatch_id
+            )
         except IndexError:
             if index < len(self.entries):
                 raise
@@ -607,7 +640,7 @@ class IndexerReplay:
         replay.record(topk, row_valid)
 
     @classmethod
-    def read(cls, layer_number: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    def read(cls, layer_number: int) -> tuple[torch.Tensor, torch.Tensor] | _QSABitmapReplay | None:
         """Consume one local microbatch; chunked models slice the returned
         rows."""
         if not cls._enabled or cls._phase.get() == "fallthrough":
@@ -617,6 +650,26 @@ class IndexerReplay:
         except KeyError as exc:
             raise RuntimeError(f"Missing rollout indexer replay for layer {layer_number}") from exc
         return replay.pop(cls._phase.get())
+
+    @classmethod
+    def _checkpoint_token(cls, layer_number: int) -> tuple[_LayerIndexerReplay, int]:
+        if not cls._enabled or cls._phase.get() != "replay_forward":
+            raise RuntimeError("QSA checkpoint capture requires forward indexer replay")
+        try:
+            replay = cls._layers[layer_number]
+        except KeyError as exc:
+            raise RuntimeError(f"Missing rollout indexer replay for layer {layer_number}") from exc
+        return replay, replay.forward_index
+
+    @classmethod
+    def _consume_cached(cls, layer_number: int, token: tuple[_LayerIndexerReplay, int]) -> None:
+        """Validate and advance a checkpoint's backward record without I/O."""
+        if not cls._enabled or cls._phase.get() != "replay_backward":
+            raise RuntimeError("Cached QSA selection requires backward indexer replay")
+        replay = cls._layers.get(layer_number)
+        if replay is None or replay is not token[0]:
+            raise RuntimeError("Cached QSA selection belongs to a different replay step or layer")
+        replay.pop("replay_backward", materialize=False, microbatch_id=token[1])
 
     @classmethod
     def replay(cls, layer_number: int, computed_topk: torch.Tensor | None) -> torch.Tensor | None:

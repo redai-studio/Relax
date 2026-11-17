@@ -35,7 +35,7 @@ def _community_id_sparse_forward(
     selection: qsa.QSASelection,
     is_thd: bool,
 ) -> Tensor:
-    if selection.selected_ids is None or not query.is_cuda:
+    if (selection.selected_ids is None and selection.selected_bits is None) or not query.is_cuda:
         return qsa.QSACoreAttention._relax_native_id_sparse_forward(self, query, key, value, selection, is_thd)
     if (
         selection.compress_ratio != 4

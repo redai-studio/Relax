@@ -758,6 +758,10 @@ def run_reference_scheduler(*args, **kwargs):
     registration = os.environ.get("RELAX_REPLAY_REGISTRATION")
     if registration is None:
         raise RuntimeError("Scheduler requires its parent's replay registration")
+    if any(kind["name"] == "indexer" for kind in json.loads(registration)["kinds"]):
+        from .qwen38 import install_capture_patch
+
+        install_capture_patch()
     _install_tq_topology_cache()
     replay_data_manager.initialize_worker(json.loads(registration), engine="sglang")
     from sglang.srt.managers.scheduler import run_scheduler_process
