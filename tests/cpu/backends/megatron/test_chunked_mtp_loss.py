@@ -492,7 +492,7 @@ def test_chunked_mtp_acceptance_survives_inplace_ce(monkeypatch, implementation,
             (gradient,) = ctx.saved_tensors
             return gradient * grad_loss.unsqueeze(-1), None
 
-    def counts(logits, labels, mask, *, tp_group=None, preds=None):
+    def counts(logits, labels, mask, *_args, tp_group=None, preds=None):
         predictions = (logits.detach().argmax(dim=-1) if preds is None else preds).T
         return ((predictions == labels) & mask.bool()).sum(), mask.bool().sum()
 

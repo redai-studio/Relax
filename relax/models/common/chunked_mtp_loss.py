@@ -26,6 +26,9 @@ _COMPUTE_MTP_ACCEPTANCE_COUNTS = getattr(_mtp_mod, "_compute_mtp_acceptance_coun
 
 
 def _count_chunk_acceptance(logits, labels, mask, output_layer, runtime_gather_output, tp_group):
+    if Envs.RELAX_MOK_BUILD_MANIFEST:
+        # The MoK image has its own pinned Megatron source snapshot.
+        return _COMPUTE_MTP_ACCEPTANCE_COUNTS(logits, labels, mask, output_layer, runtime_gather_output, tp_group)
     gathered = (
         getattr(output_layer, "gather_output", False) if runtime_gather_output is None else runtime_gather_output
     )
