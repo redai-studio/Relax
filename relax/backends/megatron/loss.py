@@ -1647,12 +1647,8 @@ def embedding_loss_function(
     hidden_states: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute InfoNCE while preserving the shared sample-sum loss contract."""
-    from relax.utils.training.embedding import (
-        infonce_loss,
-        pool_packed_embeddings,
-        scale_for_megatron_sample_mean,
-    )
+    """Apply the embedding callback and adapt its mean to Megatron."""
+    from relax.utils.training.embedding import pool_packed_embeddings, scale_for_megatron_sample_mean
 
     features = pool_packed_embeddings(
         hidden_states,
@@ -1661,7 +1657,8 @@ def embedding_loss_function(
         padded_lengths=batch.get("padded_total_lengths"),
     )
     group = mpu.get_data_parallel_group(with_context_parallel=False)
-    mean_loss = infonce_loss(
+    compute_loss = load_function(args.custom_loss_function_path)
+    mean_loss = compute_loss(
         features[::2], features[1::2], temperature=args.contrastive_temperature, process_group=group
     )
     global_pairs = int(batch.get("dynamic_global_batch_size", args.global_batch_size))

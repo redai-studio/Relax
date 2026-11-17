@@ -59,7 +59,9 @@ CKPT_ARGS=(
     --max-actor-ckpt-to-keep 2
 )
 SFT_ARGS=(
-    --loss-type sft --task-type embedding --embedding-loss-type infonce --contrastive-temperature 0.05
+    --loss-type sft --task-type embedding
+    --custom-loss-function-path relax.utils.training.embedding.infonce_loss
+    --contrastive-temperature 0.05
     --custom-dataset-class examples.seq_contrast_sft.mbeir.MbeirPairDataset
     --prompt-data "${DATA_DIR}/mbeir/pairs.jsonl"
     --global-batch-size "${GLOBAL_BATCH_SIZE}" --n-samples-per-prompt 1

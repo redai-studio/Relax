@@ -1391,16 +1391,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--embedding-loss-type",
-                choices=["infonce"],
-                default="infonce",
-                help="Training objective for --task-type embedding.",
-            )
-            parser.add_argument(
                 "--contrastive-temperature",
                 type=float,
                 default=0.05,
-                help="Positive cosine-logit temperature for --task-type embedding.",
+                help="Positive temperature passed to the embedding loss callback.",
             )
             parser.add_argument(
                 "--num-labels",
@@ -2055,8 +2049,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Path to the custom loss function, if the loss_type is `custom_loss`, "
-                    "we will use this function to calculate the loss. "
+                    "Dotted loss callback path. Embedding SFT passes pooled query and positive tensors, with "
+                    "temperature and process_group as keyword arguments, and expects a scalar mean loss. "
+                    "Top-level custom_loss uses the standard training loss arguments."
                 ),
             )
             parser.add_argument(

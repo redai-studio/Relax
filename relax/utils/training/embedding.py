@@ -26,8 +26,8 @@ def validate_embedding_args(args: Namespace) -> None:
         raise ValueError("embedding requires --megatron-to-hf-mode bridge")
     if not getattr(args, "custom_dataset_class_path", None):
         raise ValueError("embedding requires a pair-atomic --custom-dataset-class")
-    if getattr(args, "embedding_loss_type", "infonce") != "infonce":
-        raise ValueError("embedding supports --embedding-loss-type infonce")
+    if not getattr(args, "custom_loss_function_path", None):
+        raise ValueError("embedding requires --custom-loss-function-path")
     temperature = float(getattr(args, "contrastive_temperature", 0.05))
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("--contrastive-temperature must be finite and positive")

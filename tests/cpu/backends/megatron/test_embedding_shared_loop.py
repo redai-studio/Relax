@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from relax.engine.sft.runtime import is_embedding_task, should_bypass_main_output_layer
 from relax.utils.training.data_fields import build_data_fields
-from relax.utils.training.embedding import freeze_embedding_unused_heads, validate_embedding_args
+from relax.utils.training.embedding import freeze_embedding_unused_heads, infonce_loss, validate_embedding_args
 from tests.cpu.backends.megatron.test_data_vpp import _load_data_module
 from tests.cpu.backends.megatron.test_rloo_policy_loss_dispatch import loss_module
 from tests.cpu.utils.data.test_streaming_tq_iterator import _load_stream_module
@@ -23,6 +23,7 @@ def _args(**overrides):
         task_type="embedding",
         train_backend="megatron",
         custom_dataset_class_path="examples.seq_contrast_sft.nli.NLIPairDataset",
+        custom_loss_function_path="relax.utils.training.embedding.infonce_loss",
         global_batch_size=4,
         n_samples_per_prompt=1,
         use_dynamic_batch_size=True,
@@ -55,6 +56,7 @@ def _args(**overrides):
         {"num_steps_per_rollout": 2},
         {"n_samples_per_prompt": 2},
         {"sft_training_mode": "cpt"},
+        {"custom_loss_function_path": None},
         {"use_dynamic_batch_size": False},
         {"contrastive_temperature": float("nan")},
     ],
@@ -103,7 +105,15 @@ def test_shared_iterator_keeps_whole_negative_set_or_rejects(monkeypatch, peer):
     assert rows["dynamic_global_batch_size"] == 4  # pairs, not 8 expanded sequences
 
 
-def test_production_loss_dispatch_preserves_mean_and_hidden_gradients(monkeypatch):
+def _scaled_infonce(query, positive, *, temperature, process_group):
+    return 2 * infonce_loss(query, positive, temperature=temperature, process_group=process_group)
+
+
+@pytest.mark.parametrize(
+    ("callback", "multiplier"),
+    [("relax.utils.training.embedding.infonce_loss", 1), (f"{__name__}._scaled_infonce", 2)],
+)
+def test_production_loss_dispatch_preserves_mean_and_hidden_gradients(monkeypatch, callback, multiplier):
     # Exercise the actual outer Megatron loss wrapper and CP=1 reducers. These
     # stubs supply CPU process-group metadata; no MCore model is simulated.
     cp_mpu = loss_module.get_sum_of_sample_mean.__globals__["mpu"]
@@ -116,11 +126,12 @@ def test_production_loss_dispatch_preserves_mean_and_hidden_gradients(monkeypatc
     batch = dict(
         embedding_positions=[0] * 8, total_lengths=[2] * 8, response_lengths=[2] * 8, loss_masks=[torch.ones(2)] * 8
     )
-    loss, normalizer, metrics = loss_module.loss_function(_args(), batch, 1, hidden)
+    args = _args(custom_loss_function_path=callback, contrastive_temperature=0.07)
+    loss, normalizer, metrics = loss_module.loss_function(args, batch, 1, hidden)
     features = hidden[0, ::2]
     query, positive = features[::2], features[1::2]
-    reference = F.cross_entropy(
-        F.cosine_similarity(F.normalize(query, dim=-1)[:, None], F.normalize(positive, dim=-1)[None], dim=-1) / 0.05,
+    reference = multiplier * F.cross_entropy(
+        F.cosine_similarity(F.normalize(query, dim=-1)[:, None], F.normalize(positive, dim=-1)[None], dim=-1) / 0.07,
         torch.arange(4),
     )
     torch.testing.assert_close(loss, reference, rtol=0, atol=0)

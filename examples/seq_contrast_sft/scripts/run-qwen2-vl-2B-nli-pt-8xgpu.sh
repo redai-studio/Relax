@@ -51,7 +51,8 @@ CKPT_ARGS=(
 )
 SFT_ARGS=(
     --loss-type sft
-    --task-type embedding --embedding-loss-type infonce
+    --task-type embedding
+    --custom-loss-function-path relax.utils.training.embedding.infonce_loss
     --contrastive-temperature 0.05
     --custom-dataset-class examples.seq_contrast_sft.nli.NLIPairDataset
     --prompt-data "${DATA_DIR}/nli/pairs.jsonl"
