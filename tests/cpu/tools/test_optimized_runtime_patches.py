@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[3]
         "megatron/20260915-4a4de8657.patch",
         "megatron/20261016-qwen38-models.patch",
         "megatron/20261020-qwen35-optimized.patch",
+        "megatron/20261117-qwen38-ple-input-halo.patch",
         "megatron/20261020-model-operators.patch",
         "megatron/20261028-dp-reshardable-checkpoint.patch",
         "transformer_engine/2.18.0-cp-padding-no-host-sync.patch",
@@ -42,6 +43,7 @@ def test_dependency_patch_hunk_counts_are_valid(patch):
     "variable,patch",
     [
         ("OPTIMIZED_MCORE_SOURCE", "megatron/20261020-qwen35-optimized.patch"),
+        ("PLE_INPUT_HALO_SOURCE", "megatron/20261117-qwen38-ple-input-halo.patch"),
         ("MODEL_OPERATORS_SOURCE", "megatron/20261020-model-operators.patch"),
         ("OPTIMIZED_DEEPEP_SOURCE", "deepep/2.1.0-relax-namespace.patch"),
         ("OPTIMIZED_FA4_SOURCE", "flash-attention/56e48e3-fa4-isolated.patch"),

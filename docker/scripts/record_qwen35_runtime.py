@@ -137,6 +137,9 @@ def main() -> None:
         set(protected_sources)
         | {line[6:] for line in operator_patch.read_text().splitlines() if line.startswith("+++ b/")}
     )
+    protected_sources.extend(
+        ["megatron/core/transformer/ple_input_halo_cp.py", "megatron/core/models/gpt/gpt_model.py"]
+    )
     report = {
         "deepep_commit": os.environ["DEEP_EP_V2_COMMIT"],
         "fa4_commit": os.environ["FA4_COMMIT"],
@@ -166,6 +169,7 @@ def main() -> None:
                 "flashqla": "/tmp/qwen35-build/0.1.3-kkt-no-tma.patch",
                 "flashqla_cumsum": "/tmp/qwen35-build/0.1.3-cumsum-heads.patch",
                 "megatron": "/root/Megatron-LM/20261020-qwen35-optimized.patch",
+                "ple_input_halo": "/root/Megatron-LM/20261117-qwen38-ple-input-halo.patch",
                 "model_operators": "/root/Megatron-LM/20261020-model-operators.patch",
                 "checkpoint": "/root/Megatron-LM/20261028-dp-reshardable-checkpoint.patch",
             }.items()

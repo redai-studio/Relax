@@ -230,6 +230,7 @@ COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20261117-qwen38-ple-input-halo.patch /root/Megatron-LM/
 COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
 COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
@@ -242,6 +243,8 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
+    patch --batch --forward --fuzz=0 -p1 < 20261117-qwen38-ple-input-halo.patch && \
+    sha256sum 20261117-qwen38-ple-input-halo.patch > /etc/relax-ple-input-halo-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
     patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \

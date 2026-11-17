@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
@@ -478,6 +479,8 @@ def get_batch(
                 batch[key] = [torch.as_tensor(value, dtype=dtype, device=pack_device) for value in values]
 
     use_dynamic_context_parallel = getattr(get_args(), "dynamic_context_parallel", False)
+    if use_dynamic_context_parallel and os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
+        raise ValueError("Input-halo PLE does not support dynamic context parallelism")
     if use_dynamic_context_parallel and pack_device is not None and pack_device.type == "cpu":
         raise ValueError("CPU prepacking does not support dynamic context parallelism.")
     if use_dynamic_context_parallel:
@@ -498,6 +501,9 @@ def get_batch(
     else:
         cp_size = mpu.get_context_parallel_world_size()
         cp_rank = mpu.get_context_parallel_rank()
+
+    if allgather_cp and cp_size > 1 and os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
+        raise ValueError("Input-halo PLE requires per-document zigzag packing, not allgather CP")
 
     tokens = batch["tokens"]
     batch_device = pack_device or tokens[0].device
@@ -590,7 +596,7 @@ def get_batch(
             vlm_packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
             if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not use_dynamic_context_parallel and not allgather_cp:
                 _prebuild_cp_route(vlm_packed_seq_params, select_offsets, cp_size, cp_rank, device)
-            if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+            if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
                 bind_physical_layout(vlm_packed_seq_params, tuple(select_offsets))
             if qsa_stage2_enabled:
                 # Keep the attention/CP boundaries physical. Stage-2 QSA uses
@@ -702,7 +708,7 @@ def get_batch(
         packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
         if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not use_dynamic_context_parallel and not allgather_cp:
             _prebuild_cp_route(packed_seq_params, select_offsets, cp_size, cp_rank, batch_device)
-        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
             bind_physical_layout(packed_seq_params, tuple(select_offsets))
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
