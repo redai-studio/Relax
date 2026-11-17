@@ -11,6 +11,7 @@ that it notices.
 
 import ast
 import importlib.util
+import re
 import shutil
 from dataclasses import dataclass
 from functools import cache
@@ -289,8 +290,10 @@ def _copy(tmp_path, relative=None, old=None, new=None):
     if relative is not None:
         path = tmp_path / relative
         text = path.read_text()
-        assert old in text, f"{relative} no longer contains {old!r}: update this test case"
-        path.write_text(text.replace(old, new))
+        pattern = re.escape(old) if isinstance(old, str) else old
+        updated, replacements = re.subn(pattern, new, text)
+        assert replacements, f"{relative} no longer contains {old!r}: update this test case"
+        path.write_text(updated)
     return tmp_path
 
 
@@ -348,8 +351,8 @@ def test_an_unchanged_copy_of_the_source_passes(tmp_path):
         ),
         (
             "parallel_state.py",
-            "def get_data_parallel_rank(with_context_parallel=False",
-            "def get_data_parallel_rank(with_cp=False",
+            re.compile(r"(def get_data_parallel_rank\(\s*)with_context_parallel="),
+            r"\g<1>with_cp=",
             "get_data_parallel_rank(",
         ),
         (
