@@ -147,6 +147,8 @@ class MbeirPairDataset(NLIPairDataset):
     shared permutation or per-occurrence choice is replayed.
     """
 
+    _preload_jsonl = False
+
     def __init__(self, *args: Any, processor_pool: Any = None, **kwargs: Any) -> None:
         if processor_pool is None:
             raise ValueError("M-BEIR retrieval requires the existing SFT processor pool")

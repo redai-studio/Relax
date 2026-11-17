@@ -18,7 +18,7 @@ def _dataset(tmp_path, *, count=5, batch_size=4):
         {"query": {"input_ids": [index + 10, 99]}, "positive": {"input_ids": [index + 20, 99]}}
         for index in range(count)
     ]
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.write_text("\n\n".join(json.dumps(row) for row in rows) + "\n")
     return NLIPairDataset(str(path), emb_token_id=99, batch_size=batch_size, max_length=8, processor_pool=None)
 
 
@@ -29,6 +29,7 @@ def _batch(dataset):
 
 def test_pair_rows_remain_atomic_until_dp_assignment(tmp_path):
     dataset = _dataset(tmp_path)
+    (tmp_path / "pairs.jsonl").unlink()
     indices, samples, crossed = _batch(dataset)
     assert len(set(indices)) == 4
     assert crossed is False

@@ -3,11 +3,14 @@
 """Pair-atomic NLI input for the existing SFT producer and processor pool."""
 
 import asyncio
+import json
+from collections.abc import Iterable
 from typing import Any
 
 import torch
 
 from relax.engine.sft.dataset.streaming import ProcessedSample
+from relax.utils.data.data_utils import parse_generalized_path
 from relax.utils.data.streaming_dataset import IndexManager, StreamingReader
 
 
@@ -51,11 +54,13 @@ class NLIPairDataset:
     Sampling uses Relax's IndexManager, rather than promising HF RNG parity.
     """
 
+    _preload_jsonl = True
+
     def __init__(
         self, path: str, *, emb_token_id: int, batch_size: int, max_length: int, processor_pool: Any, seed: int = 42
     ) -> None:
         self.path = path
-        self.reader = StreamingReader(path)
+        self.reader = self._create_reader(path)
         self.index_manager = IndexManager(len(self.reader), seed=seed)
         self.emb_token_id = emb_token_id
         self.batch_size = batch_size
@@ -63,6 +68,18 @@ class NLIPairDataset:
         self.processor_pool = processor_pool
         if not len(self.reader) or batch_size <= 0:
             raise ValueError("NLI needs a nonempty dataset and positive pair batch size")
+
+    def _create_reader(self, path: str) -> list[dict[str, Any]] | StreamingReader:
+        file_path, row_slice = parse_generalized_path(path)
+        if not self._preload_jsonl or not file_path.endswith(".jsonl"):
+            return StreamingReader(path)
+
+        with open(file_path, "rb", buffering=1024 * 1024) as stream:
+            lines: Iterable[bytes] = (line for line in stream if not line.isspace())
+            if row_slice is not None:
+                # Preserve StreamingReader's slice over nonblank rows, including negative bounds.
+                lines = list(lines)[row_slice.start or 0 : row_slice.stop or None]
+            return [json.loads(line.decode("utf-8").strip()) for line in lines]
 
     @classmethod
     def from_args(cls, config: Any, *, tokenizer: Any, processor_pool: Any, pad_token_ids: Any) -> "NLIPairDataset":
