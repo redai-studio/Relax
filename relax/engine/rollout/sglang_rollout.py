@@ -962,7 +962,7 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
-    strict_fill_current = args.fully_async and getattr(args, "max_staleness", 1) == 0
+    strict_fill_current = args.fully_async and args.max_staleness == 0
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill

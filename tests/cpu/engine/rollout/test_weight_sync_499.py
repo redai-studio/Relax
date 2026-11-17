@@ -249,6 +249,7 @@ def _rollout_args(**overrides):
     values = {
         "rollout_global_dataset": True,
         "fully_async": True,
+        "max_staleness": 0,
         "num_rollout": 1,
         "rollout_batch_size": 1,
         "over_sampling_batch_size": 1,
