@@ -60,11 +60,25 @@ def _tile_flags(Bits, Starts, Partial, Full, tokens, blocks, WORDS: tl.constexpr
 
 
 @triton.jit
-def _pack_tiles(Partial, Full, PartialCount, PartialIndices, FullCount, FullIndices, blocks, WIDTH: tl.constexpr):
+def _pack_tiles(
+    Partial,
+    Full,
+    PartialCount,
+    PartialIndices,
+    FullCount,
+    FullIndices,
+    blocks,
+    WIDTH: tl.constexpr,
+    TRANSPOSE: tl.constexpr,
+):
     row = tl.program_id(0)
     columns = tl.arange(0, WIDTH)
-    partial = tl.load(Partial + row * blocks + columns, columns < blocks, other=0).to(tl.int32)
-    full = tl.load(Full + row * blocks + columns, columns < blocks, other=0).to(tl.int32)
+    source = columns * blocks + row if TRANSPOSE else row * blocks + columns
+    partial = tl.load(Partial + source, columns < blocks, other=0).to(tl.int32)
+    full = tl.load(Full + source, columns < blocks, other=0).to(tl.int32)
+    tl.store(PartialIndices + row * blocks + columns, 0, columns < blocks)
+    tl.store(FullIndices + row * blocks + columns, 0, columns < blocks)
+    tl.debug_barrier()
     partial_position = tl.cumsum(partial) - 1
     full_position = tl.cumsum(full) - 1
     tl.store(PartialIndices + row * blocks + partial_position, columns, partial != 0)
@@ -74,7 +88,6 @@ def _pack_tiles(Partial, Full, PartialCount, PartialIndices, FullCount, FullIndi
 
 
 def create(bits: torch.Tensor, starts: torch.Tensor, mask_mod) -> BlockMask:
-    pass
     tokens, words = bits.shape
     blocks = triton.cdiv(tokens, 128)
     partial = torch.empty((blocks, blocks), device=bits.device, dtype=torch.bool)
@@ -82,11 +95,44 @@ def create(bits: torch.Tensor, starts: torch.Tensor, mask_mod) -> BlockMask:
     _tile_flags[(blocks, triton.cdiv(blocks, 16))](bits, starts, partial, full, tokens, blocks, words, 16, num_warps=4)
     counts = torch.empty((1, 1, blocks), device=bits.device, dtype=torch.int32)
     full_counts = torch.empty_like(counts)
-    indices = torch.zeros((1, 1, blocks, blocks), device=bits.device, dtype=torch.int32)
-    full_indices = torch.zeros_like(indices)
+    indices = torch.empty((1, 1, blocks, blocks), device=bits.device, dtype=torch.int32)
+    full_indices = torch.empty_like(indices)
+    q_counts, full_q_counts = torch.empty_like(counts), torch.empty_like(counts)
+    q_indices, full_q_indices = torch.empty_like(indices), torch.empty_like(indices)
     _pack_tiles[(blocks,)](
-        partial, full, counts, indices, full_counts, full_indices, blocks, triton.next_power_of_2(blocks), num_warps=4
+        partial,
+        full,
+        counts,
+        indices,
+        full_counts,
+        full_indices,
+        blocks,
+        triton.next_power_of_2(blocks),
+        False,
+        num_warps=4,
     )
-    return BlockMask.from_kv_blocks(
-        counts, indices, full_counts, full_indices, BLOCK_SIZE=128, mask_mod=mask_mod, seq_lengths=(tokens, tokens)
+    _pack_tiles[(blocks,)](
+        partial,
+        full,
+        q_counts,
+        q_indices,
+        full_q_counts,
+        full_q_indices,
+        blocks,
+        triton.next_power_of_2(blocks),
+        True,
+        num_warps=4,
+    )
+    return BlockMask(
+        seq_lengths=(tokens, tokens),
+        kv_num_blocks=counts,
+        kv_indices=indices,
+        full_kv_num_blocks=full_counts,
+        full_kv_indices=full_indices,
+        q_num_blocks=q_counts,
+        q_indices=q_indices,
+        full_q_num_blocks=full_q_counts,
+        full_q_indices=full_q_indices,
+        BLOCK_SIZE=(128, 128),
+        mask_mod=mask_mod,
     )
