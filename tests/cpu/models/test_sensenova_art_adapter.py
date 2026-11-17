@@ -10,32 +10,7 @@ import torch
 
 from relax.models.sensenova.adapter import SenseNovaU1ImageEditAdapter
 from relax.models.sensenova.model import SenseNovaU1DiT, SenseNovaU1VisionEncoder
-
-
-def _response():
-    return {
-        "trajectory_latents": torch.randn(5, 3, 32, 48),
-        "timesteps": torch.tensor([1000.0, 750.0, 500.0, 250.0]),
-        "sigmas": torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
-        "state_indices": [0, 1, 2, 3, 4],
-        "transition_indices": [0, 1, 2, 3],
-        "sde_indices": torch.tensor([1, 2]),
-        "height": 32,
-        "width": 48,
-        "policy_version": 7,
-        "seed": 11,
-        "weight_manifest_sha256": "a" * 64,
-        "condition_fingerprint": "b" * 64,
-        "scheduler_fingerprint": "c" * 64,
-        "rollout_log_probs": torch.randn(4),
-        "denoising_env": {
-            "prefix_inputs_embeds": torch.randn(1, 9, 16),
-            "prefix_indexes": torch.zeros(1, 3, 9, dtype=torch.long),
-            "prefix_attention_mask": torch.zeros(1, 1, 1, 9, 9),
-            "indexes_image": torch.zeros(1, 3, 6, dtype=torch.long),
-            "noise_scale": torch.tensor([2.0]),
-        },
-    }
+from tests.cpu.models.test_sensenova_rollout import _pack, _pair
 
 
 def test_sensenova_full_boundary_freezes_understanding_and_unlisted_generation_modules():
@@ -71,7 +46,7 @@ class _FakeDiT(torch.nn.Module):
 
 
 def _batch():
-    packed = SenseNovaU1ImageEditAdapter().pack_trajectory(_response())
+    _, packed = _pack(*_pair())
     return {key: value.unsqueeze(0) if key.startswith("cond_") else value for key, value in packed.items()}
 
 
@@ -86,20 +61,6 @@ def test_sensenova_prepare_replay_computes_prefix_once():
     other = _FakeDiT()
     rebuilt = SenseNovaU1ImageEditAdapter().prepare_replay_batch(other, prepared)
     assert rebuilt is not prepared and other.prefix_calls == 1
-
-
-def test_sensenova_replay_enters_root_forward_with_raw_latents():
-    batch = _batch()
-    batch["image_x_t"] = batch["image_x_t"].unsqueeze(0)
-    batch["_sensenova_prefix_cache"] = "prefix-cache"
-    model = _FakeDiT()
-
-    result = SenseNovaU1ImageEditAdapter().replay_transition(model, batch, step_index=1)
-
-    assert torch.all(result == 3.0)
-    assert model.replay_kwargs["replay_latents"].shape == (1, 3, 32, 48)
-    assert model.replay_kwargs["replay_timestep"].item() == 750.0
-    assert model.replay_kwargs["past_key_values"] == "prefix-cache"
 
 
 class _ScalarEmbedder(torch.nn.Module):

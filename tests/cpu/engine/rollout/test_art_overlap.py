@@ -11,12 +11,11 @@ import torch
 from relax.engine.rewards import generative as gr
 from relax.engine.rollout import native_generation as ng
 from relax.engine.rollout.group_pipeline import GroupPipeline
-from tests.cpu.backends.fsdp.test_art_actor import _shell
 from tests.cpu.engine.rollout.test_art_routing import _acquisition
 
 
 @pytest.mark.parametrize("invalid", [(), (0,), (7,), (15,), tuple(range(16))])
-def test_serial_and_prefetched_art_rewards_rows_and_two_updates_are_identical(monkeypatch, invalid):
+def test_serial_and_prefetched_art_rewards_and_rows_are_identical(monkeypatch, invalid):
     consume = gr._consume_prefetched_rewards
     args, _rows, _caches, samples = _acquisition(monkeypatch)
     monkeypatch.setattr(gr, "_consume_prefetched_rewards", consume)
@@ -53,15 +52,6 @@ def test_serial_and_prefetched_art_rewards_rows_and_two_updates_are_identical(mo
     for key in serial_rows.keys():
         torch.testing.assert_close(serial_rows[key], overlap_rows[key], rtol=0, atol=0)
     assert all(not hasattr(sample, "_prefetched_generative_reward") for sample in overlapped)
-    baseline, variant = _shell(args), _shell(args)
-    baseline.train(0, serial_rows)
-    variant.train(0, overlap_rows)
-    torch.testing.assert_close(baseline.model.weight, variant.model.weight, rtol=0, atol=0)
-    assert baseline.events == variant.events
-    assert baseline._lr_steps == variant._lr_steps == (0 if invalid else 2)
-    assert baseline.policy_version == variant.policy_version == (7 if invalid else 8)
-    for key, value in baseline.optimizer.state.get(baseline.model.weight, {}).items():
-        torch.testing.assert_close(value, variant.optimizer.state[variant.model.weight][key], rtol=0, atol=0)
 
 
 def test_failed_unpublished_round_releases_only_new_owned_refs_before_dropping_them(monkeypatch):

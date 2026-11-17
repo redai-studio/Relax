@@ -1,14 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Bounded ART lookahead ordering, ownership and failure cleanup."""
 
-from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from threading import enumerate as threads
 
 import pytest
 
 from relax.engine.rollout.art_http_lookahead import HeaderLookahead
-from relax.engine.rollout.group_pipeline import GroupPipeline
 
 
 class Response:
@@ -115,35 +113,6 @@ def test_failure_drains_inflight_response_and_joins_thread(failure):
             cache.close()
     assert all(r.closed for r in responses)
     assert not any(t.name.startswith("art-http-lookahead") for t in threads())
-
-
-def test_reserve_counts_current_and_prefetched_groups_against_limit():
-    started = Event()
-    release = Event()
-
-    def score(value):
-        if value == 0:
-            started.set()
-            assert release.wait(3)
-
-    pipeline = GroupPipeline(lambda x: x, score, 3)
-    try:
-        pipeline.reserve(slots=2)
-        pipeline.submit(0)
-        assert started.wait(3)
-        pipeline.reserve(slots=2)
-        pipeline.submit(1)
-        with ThreadPoolExecutor(max_workers=1) as worker:
-            waiting = worker.submit(pipeline.reserve, 2)
-            assert not waiting.done()
-            release.set()
-            waiting.result(timeout=3)
-        assert len(pipeline._pending) + 2 <= 3
-        pipeline.submit(2)
-        pipeline.finish()
-    finally:
-        release.set()
-        pipeline.close()
 
 
 def test_engine_lookahead_uses_real_rpc_adapter_and_exact_candidate_order(monkeypatch):

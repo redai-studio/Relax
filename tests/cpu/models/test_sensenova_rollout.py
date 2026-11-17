@@ -226,7 +226,7 @@ def test_art_adapter_request_uses_explicit_ode_steps_and_requires_exact_replay_t
 
     class Model(torch.nn.Module):
         def forward(self, **kwargs):
-            received.append(kwargs["replay_timestep"])
+            received.append(kwargs)
             return kwargs["replay_latents"]
 
     exact_time = torch.tensor([723.412841796875])
@@ -236,8 +236,12 @@ def test_art_adapter_request_uses_explicit_ode_steps_and_requires_exact_replay_t
         cond_indexes_image=torch.zeros(3, 4),
         cond_noise_scale=torch.tensor([2.0]),
     )
-    adapter.predict_training_velocity(Model(), batch, torch.ones(1, 3, 8, 8), torch.tensor([0.5]))
-    assert received[0] is exact_time
+    latents = torch.ones(1, 3, 8, 8)
+    result = adapter.predict_training_velocity(Model(), batch, latents, torch.tensor([0.5]))
+    assert received[0]["replay_timestep"] is exact_time
+    assert received[0]["replay_latents"] is latents
+    assert received[0]["past_key_values"] is batch["_sensenova_prefix_cache"]
+    assert result is latents
 
 
 def test_art_tail_grid_is_not_replaced_by_t_eps():

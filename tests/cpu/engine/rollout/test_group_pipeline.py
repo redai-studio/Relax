@@ -8,7 +8,8 @@ import pytest
 from relax.engine.rollout.group_pipeline import GroupPipeline
 
 
-def test_group_pipeline_overlaps_and_bounds_both_writer_and_reward():
+@pytest.mark.parametrize(("limit", "slots"), [(2, 1), (3, 2)])
+def test_group_pipeline_overlaps_and_bounds_both_writer_and_reward(limit, slots):
     writer_started, release_writer, score_started, release_score = (Event() for _ in range(4))
     seen = []
 
@@ -24,20 +25,28 @@ def test_group_pipeline_overlaps_and_bounds_both_writer_and_reward():
             assert release_score.wait(3)
         seen.append(value)
 
-    pipeline = GroupPipeline(prepare, score, 2)
+    pipeline = GroupPipeline(prepare, score, limit)
     try:
-        pipeline.reserve()
+        pipeline.reserve(slots)
         pipeline.submit(0)
         assert writer_started.wait(3)
         # A second generation can start despite a blocked sidecar writer.
-        pipeline.reserve()
+        pipeline.reserve(slots)
         pipeline.submit(1)
         release_writer.set()
         assert score_started.wait(3)
         with ThreadPoolExecutor(max_workers=1) as caller:
-            credit = caller.submit(pipeline.reserve)
+            entered, reserved = Event(), Event()
+
+            def reserve():
+                entered.set()
+                pipeline.reserve(slots)
+                reserved.set()
+
+            credit = caller.submit(reserve)
             try:
-                assert not credit.done()  # Completed writer != free reward credit.
+                assert entered.wait(3)
+                assert not reserved.wait(0.1)  # Completed writer != free reward credit.
             finally:
                 release_score.set()
             credit.result(timeout=3)
