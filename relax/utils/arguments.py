@@ -2061,9 +2061,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Dotted loss callback path. Embedding SFT passes pooled query and positive tensors, with "
-                    "temperature and process_group as keyword arguments, and expects a scalar mean loss. "
-                    "Top-level custom_loss uses the standard training loss arguments."
+                    "Dotted loss callback path. For embedding SFT this overrides the default InfoNCE loss. The callback receives "
+                    "pooled query and positive tensors, with temperature and process_group as keyword arguments, and returns "
+                    "a scalar mean loss. Top-level custom_loss uses the standard training loss arguments."
                 ),
             )
             parser.add_argument(

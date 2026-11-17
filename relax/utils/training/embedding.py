@@ -1,12 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Packed embedding pooling and InfoNCE primitives.
-
-These functions neither construct an optimizer nor perform a training step. The
-caller supplies the data-parallel group explicitly. A contrastive batch must
-remain complete across the loss call; accumulating independent smaller InfoNCE
-batches changes the negative set.
-"""
+"""Paired embedding batch preparation, pooling and loss scaling."""
 
 import math
 from argparse import Namespace
@@ -14,8 +8,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-import torch.distributed as dist
-import torch.nn.functional as F
 
 
 def validate_embedding_args(args: Namespace) -> None:
@@ -26,8 +18,6 @@ def validate_embedding_args(args: Namespace) -> None:
         raise ValueError("embedding requires --megatron-to-hf-mode bridge")
     if not getattr(args, "custom_dataset_class_path", None):
         raise ValueError("embedding requires a pair-atomic --custom-dataset-class")
-    if not getattr(args, "custom_loss_function_path", None):
-        raise ValueError("embedding requires --custom-loss-function-path")
     temperature = float(getattr(args, "contrastive_temperature", 0.05))
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("--contrastive-temperature must be finite and positive")
@@ -165,51 +155,6 @@ def pool_packed_embeddings(
         raise ValueError("Packed hidden states do not cover the complete embedding sequences")
     indices = torch.tensor(offsets, dtype=torch.long, device=hidden_states.device)
     return hidden_states[0].index_select(0, indices)
-
-
-def gather_with_local_grad(features: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
-    """Gather detached remote features, preserving only this rank's graph."""
-    world_size = dist.get_world_size(process_group)
-    if world_size == 1:
-        return features
-    # Shape agreement is checked collectively before all_gather, so one rank's
-    # partial batch cannot leave its peers hanging in a tensor collective.
-    shape = torch.tensor(features.shape, device=features.device, dtype=torch.long)
-    shapes = [torch.empty_like(shape) for _ in range(world_size)]
-    dist.all_gather(shapes, shape, group=process_group)
-    torch._assert_async(torch.stack(shapes).eq(shape).all(), "InfoNCE ranks must have equal complete feature batches")
-    gathered = [torch.empty_like(features) for _ in range(world_size)]
-    dist.all_gather(gathered, features.contiguous(), group=process_group)
-    gathered[dist.get_rank(process_group)] = features
-    return torch.cat(gathered, dim=0)
-
-
-def infonce_loss(
-    query: torch.Tensor,
-    positive: torch.Tensor,
-    *,
-    temperature: float = 0.05,
-    process_group: dist.ProcessGroup | None = None,
-) -> torch.Tensor:
-    """Native mean one-way InfoNCE, before the backend's gradient reduction.
-
-    Every DP rank evaluates the global objective with only its own feature
-    graph attached. The caller must preserve the reference 1/world_size
-    gradient scale when adapting this mean to Megatron's loss normalization.
-    """
-    if query.ndim != 2 or query.shape != positive.shape or query.shape[0] == 0:
-        raise ValueError("InfoNCE features must have matching nonempty [pairs, hidden] shapes")
-    if not math.isfinite(temperature) or temperature <= 0:
-        raise ValueError("InfoNCE temperature must be finite and positive")
-    if process_group is None and dist.is_initialized():
-        raise ValueError("Distributed InfoNCE requires an explicit data-parallel process group")
-    if process_group is not None:
-        query = gather_with_local_grad(query, process_group)
-        positive = gather_with_local_grad(positive, process_group)
-    query = F.normalize(query, dim=-1)
-    positive = F.normalize(positive, dim=-1)
-    scores = F.cosine_similarity(query.unsqueeze(1), positive.unsqueeze(0), dim=-1) / temperature
-    return F.cross_entropy(scores, torch.arange(scores.shape[0], device=scores.device))
 
 
 def scale_for_megatron_sample_mean(

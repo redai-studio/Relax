@@ -75,7 +75,7 @@ def test_mbeir_launch_uses_the_prepared_dataset_horizon(tmp_path):
     assert args[args.index("--lr-warmup-iters") + 1] == "1"
     assert args[args.index("--global-batch-size") + 1] == "8"
     assert args[args.index("--task-type") + 1] == "embedding"
-    assert args[args.index("--custom-loss-function-path") + 1] == "relax.utils.training.embedding.infonce_loss"
+    assert "--custom-loss-function-path" not in args
     assert args[args.index("--custom-dataset-class") + 1] == "examples.seq_contrast_sft.mbeir.MbeirPairDataset"
     assert "--freeze-vision-model" in args and "--freeze-vision-projection" in args
     assert args[args.index("--image-max-token-num") + 1] == "300"

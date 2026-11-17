@@ -12,13 +12,14 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from relax.utils.training import embedding
+from tests.cpu.backends.megatron.test_rloo_policy_loss_dispatch import loss_module
 
 
 def test_single_rank_loss_and_gradients_match_reference():
     generator = torch.Generator().manual_seed(42)
     query = torch.randn(4, 7, generator=generator, dtype=torch.float64, requires_grad=True)
     positive = torch.randn(4, 7, generator=generator, dtype=torch.float64, requires_grad=True)
-    loss = embedding.infonce_loss(query, positive)
+    loss = loss_module.infonce_loss(query, positive)
     actual_gradients = torch.autograd.grad(loss, (query, positive))
     reference = F.cross_entropy(
         F.cosine_similarity(F.normalize(query, dim=-1)[:, None], F.normalize(positive, dim=-1)[None], dim=-1) / 0.05,
@@ -47,7 +48,7 @@ def test_pooling_rejects_indices_outside_real_tokens(positions):
 @pytest.mark.parametrize("temperature", [0.0, -0.1, float("nan"), float("inf")])
 def test_rejects_invalid_temperature(temperature):
     with pytest.raises(ValueError, match="temperature"):
-        embedding.infonce_loss(torch.randn(2, 3), torch.randn(2, 3), temperature=temperature)
+        loss_module.infonce_loss(torch.randn(2, 3), torch.randn(2, 3), temperature=temperature)
 
 
 def _distributed_worker(rank, rendezvous, output):
@@ -58,7 +59,7 @@ def _distributed_worker(rank, rendezvous, output):
         all_positive = torch.randn(4, 3, generator=generator, dtype=torch.float64)
         query = all_query[rank * 2 : (rank + 1) * 2].clone().requires_grad_()
         positive = all_positive[rank * 2 : (rank + 1) * 2].clone().requires_grad_()
-        loss = embedding.infonce_loss(query, positive, process_group=dist.group.WORLD)
+        loss = loss_module.infonce_loss(query, positive, process_group=dist.group.WORLD)
         adapted = embedding.scale_for_megatron_sample_mean(loss, global_pairs=4, dp_size=2)
         # The existing shared loss wrapper's DP/global_batch multiplier.
         (adapted * 2 / 4).backward()
@@ -80,7 +81,7 @@ def test_two_rank_real_gather_matches_native_averaged_gradient(tmp_path):
     bias = torch.zeros(3, dtype=torch.float64, requires_grad=True)
     query = torch.randn(4, 3, generator=generator, dtype=torch.float64) + bias
     positive = torch.randn(4, 3, generator=generator, dtype=torch.float64) + bias
-    reference = embedding.infonce_loss(query, positive)
+    reference = loss_module.infonce_loss(query, positive)
     (reference / 2).backward()
     for rank in range(2):
         actual = torch.load(tmp_path / f"rank{rank}.pt", weights_only=True)

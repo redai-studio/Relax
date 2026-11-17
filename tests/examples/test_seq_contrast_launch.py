@@ -91,7 +91,7 @@ def test_example_passes_initializer_and_preserves_ray_runtime(tmp_path, model_ty
         },
     }
     assert args[args.index("--task-type") + 1] == "embedding"
-    assert args[args.index("--custom-loss-function-path") + 1] == "relax.utils.training.embedding.infonce_loss"
+    assert "--custom-loss-function-path" not in args
     assert args[args.index("--custom-dataset-class") + 1] == "examples.seq_contrast_sft.nli.NLIPairDataset"
     assert "--data-parallel-random-init" in args
     assert "--colocate" not in args

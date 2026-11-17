@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from relax.engine.sft.runtime import is_embedding_task, should_bypass_main_output_layer
 from relax.utils.training.data_fields import build_data_fields
-from relax.utils.training.embedding import freeze_embedding_unused_heads, infonce_loss, validate_embedding_args
+from relax.utils.training.embedding import freeze_embedding_unused_heads, validate_embedding_args
 from tests.cpu.backends.megatron.test_data_vpp import _load_data_module
 from tests.cpu.backends.megatron.test_rloo_policy_loss_dispatch import loss_module
 from tests.cpu.utils.data.test_streaming_tq_iterator import _load_stream_module
@@ -23,7 +23,7 @@ def _args(**overrides):
         task_type="embedding",
         train_backend="megatron",
         custom_dataset_class_path="examples.seq_contrast_sft.nli.NLIPairDataset",
-        custom_loss_function_path="relax.utils.training.embedding.infonce_loss",
+        custom_loss_function_path=None,
         global_batch_size=4,
         n_samples_per_prompt=1,
         use_dynamic_batch_size=True,
@@ -56,7 +56,6 @@ def _args(**overrides):
         {"num_steps_per_rollout": 2},
         {"n_samples_per_prompt": 2},
         {"sft_training_mode": "cpt"},
-        {"custom_loss_function_path": None},
         {"use_dynamic_batch_size": False},
         {"contrastive_temperature": float("nan")},
     ],
@@ -106,12 +105,12 @@ def test_shared_iterator_keeps_whole_negative_set_or_rejects(monkeypatch, peer):
 
 
 def _scaled_infonce(query, positive, *, temperature, process_group):
-    return 2 * infonce_loss(query, positive, temperature=temperature, process_group=process_group)
+    return 2 * loss_module.infonce_loss(query, positive, temperature=temperature, process_group=process_group)
 
 
 @pytest.mark.parametrize(
     ("callback", "multiplier"),
-    [("relax.utils.training.embedding.infonce_loss", 1), (f"{__name__}._scaled_infonce", 2)],
+    [(None, 1), (f"{__name__}._scaled_infonce", 2)],
 )
 def test_production_loss_dispatch_preserves_mean_and_hidden_gradients(monkeypatch, callback, multiplier):
     # Exercise the actual outer Megatron loss wrapper and CP=1 reducers. These

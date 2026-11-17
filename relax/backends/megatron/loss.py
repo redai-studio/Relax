@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -1641,13 +1642,58 @@ def get_sequence_classification_outputs(
     return torch.stack(local_logits, dim=0), local_indices
 
 
+def gather_with_local_grad(features: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
+    """Gather detached remote features, preserving only this rank's graph."""
+    world_size = dist.get_world_size(process_group)
+    if world_size == 1:
+        return features
+    # Shape agreement is checked collectively before all_gather, so one rank's
+    # partial batch cannot leave its peers hanging in a tensor collective.
+    shape = torch.tensor(features.shape, device=features.device, dtype=torch.long)
+    shapes = [torch.empty_like(shape) for _ in range(world_size)]
+    dist.all_gather(shapes, shape, group=process_group)
+    torch._assert_async(torch.stack(shapes).eq(shape).all(), "InfoNCE ranks must have equal complete feature batches")
+    gathered = [torch.empty_like(features) for _ in range(world_size)]
+    dist.all_gather(gathered, features.contiguous(), group=process_group)
+    gathered[dist.get_rank(process_group)] = features
+    return torch.cat(gathered, dim=0)
+
+
+def infonce_loss(
+    query: torch.Tensor,
+    positive: torch.Tensor,
+    *,
+    temperature: float = 0.05,
+    process_group: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Native mean one-way InfoNCE, before the backend's gradient reduction.
+
+    Every DP rank evaluates the global objective with only its own feature
+    graph attached. The caller must preserve the reference 1/world_size
+    gradient scale when adapting this mean to Megatron's loss normalization.
+    """
+    if query.ndim != 2 or query.shape != positive.shape or query.shape[0] == 0:
+        raise ValueError("InfoNCE features must have matching nonempty [pairs, hidden] shapes")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("InfoNCE temperature must be finite and positive")
+    if process_group is None and dist.is_initialized():
+        raise ValueError("Distributed InfoNCE requires an explicit data-parallel process group")
+    if process_group is not None:
+        query = gather_with_local_grad(query, process_group)
+        positive = gather_with_local_grad(positive, process_group)
+    query = F.normalize(query, dim=-1)
+    positive = F.normalize(positive, dim=-1)
+    scores = F.cosine_similarity(query.unsqueeze(1), positive.unsqueeze(0), dim=-1) / temperature
+    return F.cross_entropy(scores, torch.arange(scores.shape[0], device=scores.device))
+
+
 def embedding_loss_function(
     args: Namespace,
     batch: RolloutBatch,
     hidden_states: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Apply the embedding callback and adapt its mean to Megatron."""
+    """Apply InfoNCE or a custom embedding loss, then scale it."""
     from relax.utils.training.embedding import pool_packed_embeddings, scale_for_megatron_sample_mean
 
     features = pool_packed_embeddings(
@@ -1657,7 +1703,8 @@ def embedding_loss_function(
         padded_lengths=batch.get("padded_total_lengths"),
     )
     group = mpu.get_data_parallel_group(with_context_parallel=False)
-    compute_loss = load_function(args.custom_loss_function_path)
+    loss_path = getattr(args, "custom_loss_function_path", None)
+    compute_loss = load_function(loss_path) if loss_path else infonce_loss
     mean_loss = compute_loss(
         features[::2], features[1::2], temperature=args.contrastive_temperature, process_group=group
     )

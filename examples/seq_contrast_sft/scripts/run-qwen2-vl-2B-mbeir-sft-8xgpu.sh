@@ -60,7 +60,6 @@ CKPT_ARGS=(
 )
 SFT_ARGS=(
     --loss-type sft --task-type embedding
-    --custom-loss-function-path relax.utils.training.embedding.infonce_loss
     --contrastive-temperature 0.05
     --custom-dataset-class examples.seq_contrast_sft.mbeir.MbeirPairDataset
     --prompt-data "${DATA_DIR}/mbeir/pairs.jsonl"

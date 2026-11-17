@@ -282,7 +282,7 @@ def _contrast_args():
         task_type="embedding",
         use_opd=False,
         custom_dataset_class_path="examples.seq_contrast_sft.nli.NLIPairDataset",
-        custom_loss_function_path="relax.utils.training.embedding.infonce_loss",
+        custom_loss_function_path=None,
         prompt_data=["/pairs.jsonl"],
         n_samples_per_prompt=1,
         rollout_batch_size=32,
@@ -309,14 +309,14 @@ def test_embedding_parser_and_shared_offline_validation(arguments_module):
             "--task-type",
             "embedding",
             "--custom-loss-function-path",
-            "relax.utils.training.embedding.infonce_loss",
+            "relax.backends.megatron.loss.infonce_loss",
             "--contrastive-temperature",
             "0.07",
         ]
     )
     assert parsed.task_type == "embedding"
     assert parsed.loss_type == "sft"
-    assert parsed.custom_loss_function_path == "relax.utils.training.embedding.infonce_loss"
+    assert parsed.custom_loss_function_path == "relax.backends.megatron.loss.infonce_loss"
     assert parsed.contrastive_temperature == 0.07
     args = _contrast_args()
     arguments_module.relax_validate_args(args)
@@ -327,7 +327,7 @@ def test_embedding_parser_and_shared_offline_validation(arguments_module):
 
 @pytest.mark.parametrize(
     "override",
-    ["context_parallel_size: 2", "sft_train_data_prefetch: true", "eval_size: 0", "custom_loss_function_path: null"],
+    ["context_parallel_size: 2", "sft_train_data_prefetch: true", "eval_size: 0"],
 )
 def test_embedding_yaml_cannot_bypass_pair_contract(arguments_module, tmp_path, override):
     args = _contrast_args()
