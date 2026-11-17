@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.core.inference_recovery import RecoveryGate
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
@@ -334,6 +335,8 @@ class Rollout(Base):
     ) -> None:
         super().__init__()
         self.config = config
+        self._recovery_gate = RecoveryGate(config, "rollout")
+        self._resume_data_source = False
         self.healthy = healthy
 
         self.data_system_client = attach_tq_client(
@@ -378,7 +381,7 @@ class Rollout(Base):
         if self._run_task is not None and not self._run_task.done():
             await self._run_task
             return
-        if self.config.rollout_global_dataset:
+        if self.config.rollout_global_dataset and not self._resume_data_source:
             try:
                 await self.rollout_manager.load.remote(self.step - 1)
             except Exception as e:
@@ -386,6 +389,16 @@ class Rollout(Base):
 
         self._run_task = asyncio.ensure_future(self._async_run())
         await self._run_task
+
+    def resume_data_source(self) -> None:
+        self._resume_data_source = True
+
+    async def stop_for_recovery(self) -> list:
+        if self._run_task is not None and not self._run_task.done():
+            raise RuntimeError("Rollout run has not ended")
+        await self.rollout_manager.dispose_for_recovery.remote()
+        children = await self.rollout_manager.get_recovery_children.remote()
+        return [*children, self.rollout_manager]
 
     def get_rollout_manager(self) -> Any:
         return self.rollout_manager
@@ -443,6 +456,9 @@ class Rollout(Base):
                         self._logger.info("All rollouts finished")
                         break
 
+                local_step = await asyncio.to_thread(self._recovery_gate.admit, local_step)
+                self.step = local_step
+                generation = self._recovery_gate.generation
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
                     await self.rollout_manager.generate.remote(rollout_id=local_step)
@@ -451,10 +467,15 @@ class Rollout(Base):
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)
+                    self._recovery_gate.fail(e)
                     self.healthy.report_error.remote("rollout", error_msg)
-                    if not getattr(self.config, "use_health_check", False):
+                    if getattr(self.config, "inference_recovery", False) or not getattr(
+                        self.config, "use_health_check", False
+                    ):
                         raise
                     break
+                finally:
+                    self._recovery_gate.leave()
                 self._logger.info(f"Finish rollout {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -463,7 +484,13 @@ class Rollout(Base):
                     pass
 
                 wait_count = 0
+                restart_window = False
                 while True:
+                    if self._recovery_gate.state is not None:
+                        status = await self._recovery_gate.state.snapshot.remote()
+                        if status["paused"] or status["generation"] != generation:
+                            restart_window = True
+                            break
                     if self._stop_event.is_set():
                         self._logger.info("Rollout loop stopping during staleness wait")
                         return
@@ -509,6 +536,8 @@ class Rollout(Base):
                             self._logger.info(f"Rollout {local_step}: data system caught up after {wait_count}s")
                         break
 
+                if restart_window:
+                    continue
                 await self._maybe_save_data(local_step)
                 self.step += 1
                 if is_final_backfill_step:
@@ -520,8 +549,11 @@ class Rollout(Base):
         except Exception as e:
             error_msg = f"Rollout failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
+            self._recovery_gate.fail(e)
             self.healthy.report_error.remote("rollout", error_msg)
-            if not getattr(self.config, "use_health_check", False):
+            if getattr(self.config, "inference_recovery", False) or not getattr(
+                self.config, "use_health_check", False
+            ):
                 raise
 
     async def _maybe_save_data(self, local_step) -> None:

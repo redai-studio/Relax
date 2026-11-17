@@ -18,6 +18,17 @@ from relax.utils.fault_events.recovery import GlobalStartup
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def restart_required_type():
+    tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "GlobalRestartRequired")
+    namespace = {"Any": object}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "controller.py", "exec"), namespace)
+    return namespace["GlobalRestartRequired"]
+
+
+GlobalRestartRequired = restart_required_type()
+
+
 def extract_method(relative_path, class_name, name, namespace):
     tree = ast.parse((ROOT / relative_path).read_text())
     owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
@@ -100,6 +111,7 @@ class InitialWeightSyncTests(unittest.TestCase):
         namespace = {
             "asyncio": asyncio,
             "GlobalStartup": GlobalStartup,
+            "GlobalRestartRequired": GlobalRestartRequired,
             "ROLES": roles,
             "GENRM_ROLE": "genrm",
             "logger": MagicMock(),
@@ -115,6 +127,9 @@ class InitialWeightSyncTests(unittest.TestCase):
             _fault_events=None,
             _fault_recovery=None,
             _restarting=False,
+            _inference_recovery=None,
+            _restart_lock=threading.RLock(),
+            _training_wait_done=threading.Event(),
             _cleanup_s3_model_weights_after_init=MagicMock(),
             _report_error_to_metrics_service=MagicMock(),
             _pending_task_refs_lock=threading.Lock(),

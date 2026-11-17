@@ -336,6 +336,7 @@ def test_advantages_advances_after_actor_retires_final_batch(tq_factory, streami
 
             from relax.components.advantages import Advantages
             from relax.components.base import Base
+            from relax.core.inference_recovery import RecoveryGate
             from relax.utils.async_utils import shutdown_async_loop
 
             class RetireAfterPublish(TransferQueueClient):
@@ -375,6 +376,7 @@ def test_advantages_advances_after_actor_retires_final_batch(tq_factory, streami
                 advantage_estimator="grpo",
             )
             service.data_system_client = real_client
+            service._recovery = RecoveryGate(service.config, "advantages")
             try:
                 service._run_blocking()
                 return real_client.get_partition_list()

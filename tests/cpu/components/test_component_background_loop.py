@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from relax.core.inference_recovery import RecoveryGate
 
 
 @pytest.fixture(params=[("actor", "Actor"), ("actor_fwd", "ActorFwd"), ("critic", "Critic")])
@@ -27,6 +28,7 @@ def component(request, monkeypatch):
     obj.role = module_name
     obj.step = 0
     obj.config = Namespace(num_rollout=1, fully_async=True, loss_type="policy_loss", use_health_check=False)
+    obj._recovery = RecoveryGate(obj.config, obj.role)
     obj.healthy = Mock()
     obj.data_system_client = Mock()
     yield obj

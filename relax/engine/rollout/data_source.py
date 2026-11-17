@@ -348,6 +348,13 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         samples = self.buffer_filter(self.args, None, self.buffer, num_samples)
         return samples
 
+    def discard_pending(self) -> int:
+        """Drop buffered groups without changing the dataset cursor or sample
+        IDs."""
+        count = len(self.buffer)
+        self.buffer.clear()
+        return count
+
     def add_samples(self, samples: list[list[Sample]]):
         """Add a sample group to buffer."""
         if not samples:
