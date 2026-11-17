@@ -63,8 +63,6 @@ def session_sampling_config(args: Namespace, overrides: dict[str, Any] | None, p
         "no_stop_trim": True,
         "spaces_between_special_tokens": False,
     }
-    # --sglang-* attrs only exist when sglang args were parsed (not skip_sglang).
-    # This function is rollout-path only, so they are always present here.
     if args.sglang_enable_deterministic_inference:
         params["sampling_seed"] = args.rollout_seed + position
     if overrides is not None:

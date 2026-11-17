@@ -187,7 +187,6 @@ def args(tmp_path):
         agentic_obs_run_id="run",
         agentic_obs_train_generation_id="generation",
         reward_key=None,
-        # rollout sampling params read directly by session_sampling_config.
         rollout_temperature=1.0,
         rollout_top_p=1.0,
         rollout_top_k=-1,

@@ -86,8 +86,6 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "dump_agentic_obs_media": False,
         "reward_key": None,
         "use_rollout_routing_replay": False,
-        # rollout sampling params read directly by session_sampling_config;
-        # declare them here so tests only override what differs.
         "rollout_temperature": 1.0,
         "rollout_top_p": 1.0,
         "rollout_top_k": -1,
@@ -472,7 +470,6 @@ def _train_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "advantage_estimator": "grpo",
         "agentic_custom_advantage_path": None,
         "reward_key": None,
-        # rollout sampling params read directly by session_sampling_config.
         "rollout_temperature": 1.0,
         "rollout_top_p": 1.0,
         "rollout_top_k": -1,
