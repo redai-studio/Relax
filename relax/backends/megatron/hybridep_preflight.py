@@ -40,9 +40,10 @@ def validate_hybridep_worker_group() -> None:
         Envs.RELAX_QWEN38_QSA_CP
         and Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND == "mixed"
         and Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND == "cute"
-        and actual["tp"] == 2
-        and actual["pp"] == 4
-        and actual["cp"] in (2, 4)
+        and (
+            (actual["tp"] == 2 and actual["pp"] == 4 and actual["cp"] in (2, 4))
+            or (actual["tp"] == 1 and actual["pp"] == 2 and actual["cp"] in (8, 16))
+        )
         and actual["ep"] == 8
         and actual["world"] == 32
     )

@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[3]
         "megatron/20261020-model-operators.patch",
         "megatron/20261028-dp-reshardable-checkpoint.patch",
         "transformer_engine/2.18.0-cp-padding-no-host-sync.patch",
+        "flash-qla/0.1.3-cumsum-heads.patch",
     ],
 )
 def test_dependency_patch_hunk_counts_are_valid(patch):
@@ -45,6 +46,7 @@ def test_dependency_patch_hunk_counts_are_valid(patch):
         ("OPTIMIZED_DEEPEP_SOURCE", "deepep/2.1.0-relax-namespace.patch"),
         ("OPTIMIZED_FA4_SOURCE", "flash-attention/56e48e3-fa4-isolated.patch"),
         ("OPTIMIZED_FLASHQLA_SOURCE", "flash-qla/0.1.3-kkt-no-tma.patch"),
+        ("OPTIMIZED_FLASHQLA_SOURCE", "flash-qla/0.1.3-cumsum-heads.patch"),
     ],
 )
 def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
@@ -106,7 +108,7 @@ def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
                     assert not (node.module or "").startswith("deep_ep.")
                 elif isinstance(node, ast.Import):
                     assert all(not a.name.startswith("deep_ep.") for a in node.names)
-    if variable == "OPTIMIZED_FLASHQLA_SOURCE":
+    if patch == "flash-qla/0.1.3-kkt-no-tma.patch":
         source = tmp_path / "flash_qla/ops/gated_delta_rule/chunk/blackwell/kkt_solve.py"
         tree = ast.parse(source.read_text())
         guard = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_relax_verify_kkt_store")

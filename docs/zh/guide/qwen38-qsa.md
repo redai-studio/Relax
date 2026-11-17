@@ -289,3 +289,9 @@ cuDNN 路线需要兼容的 CUDA 13 Blackwell 环境，以及额外的 NVIDIA cu
 - 公共模型脚本默认开启 fused attention，Mixed 不能与它同时使用，所以公共配置中的 `FUSED_ATTENTION=0` 必须显式设置。
 
 实现入口：[Mixed 分发](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/mixed.py)、[几何检查](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/geometry.py)、[cuDNN 适配](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/cudnn.py)、[Triton 选择](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/qsa_fused.py)。
+
+## 长上下文 CP 的运行前提
+
+新增两种已验证的 32 卡配置：TP1/PP2/CP8/EP8/ETP1 和 TP1/PP2/CP16/EP8/ETP1。两者都要求开启 QSA CP，并选择 mixed 后端及其 CuTe 长序列实现。仍检查每个 EP8 专家组的 8 张卡是否位于同一主机，以及组内 GPU 能否通过 HybridEP 相互通信。
+
+CP16 将 GDN 的 48 个 V heads 分到 16 张卡，每卡只有 3 个 heads。FlashQLA 的 chunk64 累加计算要求 head 数为偶数，因此临时补零至偶数个 heads，计算后裁回原始数量。各 head 独立计算，不改变原有 head 的结果。修复以补丁形式纳入 `docker/Dockerfile.cu13`，随镜像构建安装。

@@ -351,3 +351,9 @@ The recipes configure load and save at the stable SAVE_DIR/EXP_NAME path, save e
 Both recipes disable custom record-function tags and autotune logging and do not enable the PyTorch profiler. They use a 120-minute producer queue timeout and zero automatic global restarts. See [Performance Tuning](./performance-tuning.md) for explicit diagnostic profiling.
 
 Compare Actor throughput using **sum of logical training tokens / sum of Actor training seconds / GPU count** over the same step window. End-to-end throughput uses total step seconds instead. Preserve slow steps, list cold compilation and checkpoint saves separately, and compare equal data/topology/packing/recomputation settings. A faster QSA kernel does not imply the same speedup for the full training pipeline.
+
+## Runtime prerequisites for long-context CP
+
+The 32-GPU HybridEP preflight supports TP1/PP2/EP8/ETP1 with CP8 or CP16. This requires QSA CP, the mixed community backend, and the CuTe long backend to be explicitly enabled. Physical EP membership, hostname, and accessible NVLink-domain checks still apply.
+
+With CP16, GDN can have three local V heads. The CUDA13 image applies a FlashQLA chunk64 cumsum head-alignment patch to avoid compilation failure for this shape. It does not change the training configuration or enable an optimization policy.
