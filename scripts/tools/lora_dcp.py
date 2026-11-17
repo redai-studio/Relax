@@ -180,8 +180,6 @@ class DcpAdapter:
                 for key in (prefix + _A, prefix + _B)
             }
             dcp.load(state_dict=state, storage_reader=reader, no_dist=True)
-            if not all(bool(torch.isfinite(value).all()) for value in state.values()):
-                raise ValueError(f"Nonfinite adapter: {prefix}")
             return state[prefix + _A], state[prefix + _B]
 
         self._load_pair = load_pair

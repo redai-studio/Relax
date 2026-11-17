@@ -230,7 +230,7 @@ bash scripts/entrypoint/ray-job.sh \
 
 `PROMPT_DATA` 必填。`EVAL_DATA` 可选：提供后，驻留训练模型每隔 `EVAL_INTERVAL` 步计算 heldout loss/PPL（默认 50）；不提供或设置 `EVAL_INTERVAL=0` 则关闭评测。`EVAL_DATASET_NAME` 默认为 `heldout`。训练与验证文件应按题目去重。
 
-命令等待训练结束。Checkpoint 保存在 `$SAVE_DIR/$EXP_NAME`；恢复训练时保持这两个值不变，启动新实验时更换实验名。ClearML 新任务链接会输出在日志中，`PROJECT_NAME` 默认为 `Relax/sft/glm5.3`。保存后使用下文命令合并 LoRA checkpoint；独立生成评测使用 `scripts/training/sft/eval-glm5.3-744B-A40B-aime-32xgpu.sh`。
+命令等待训练结束。Checkpoint 保存在 `$SAVE_DIR/$EXP_NAME`；恢复训练时保持这两个值不变，启动新实验时更换实验名。ClearML 新任务链接会输出在日志中，`PROJECT_NAME` 默认为 `Relax/sft/glm5.3`。保存后使用下文命令合并 LoRA checkpoint。
 
 ## Checkpoint 与导出
 
