@@ -183,10 +183,7 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     spec = get_algorithm(args.advantage_estimator)
     if spec.reward_normalizer != "group_leave_one_out":
         return {}
-    if (
-        args.custom_reward_post_process_path is not None
-        or args.agentic_custom_advantage_path is not None
-    ):
+    if args.custom_reward_post_process_path is not None or args.agentic_custom_advantage_path is not None:
         # These hooks can replace the advantages consumed by training. Raw
         # rewards are insufficient to reconstruct that custom signal here, so
         # suppress the standard RLOO diagnostics instead of publishing values
