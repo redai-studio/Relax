@@ -9330,6 +9330,353 @@ index 82f5640ec..c8eac8ade 100644
 +            assert not getattr(args, "use_torch_fsdp2", False)
 +            ddp_config.delay_wgrad_compute = True
          if not getattr(args, "use_torch_fsdp2", False):
+diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge/models/conversion/model_bridge.py
+--- a/megatron/bridge/models/conversion/model_bridge.py
++++ b/megatron/bridge/models/conversion/model_bridge.py
+@@ -1482,7 +1482,7 @@
+                 if capture_unquantized_state_dict:
+                     vp_stage = task.vp_stage if task.vp_stage is not None else 0
+                     chunk_key = f"model{vp_stage}"
+-                    captured_state_dicts[chunk_key][task.param_name] = converted_weights.detach()
++                    captured_state_dicts[chunk_key][task.param_name] = converted_weights.detach().cpu()
+                 # NOTE:
+                 # For fp8_param (blockwise), `task.param_weight` can be a TransformerEngine
+                 # Float8BlockwiseQTensor) that is a leaf with requires_grad=True.
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -3011,16 +3011,17 @@
+         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
+
+     @torch.no_grad()
+-    def prepare_model_params_for_param_sync(self) -> None:
++    def prepare_model_params_for_param_sync(self) -> bool:
+         """Stage FP32 master shards into DDP param buffers before explicit param sync."""
+         if self.is_stub_optimizer:
+-            return
+-        if not (self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather):
+-            return
++            return False
++        if not self.config.reuse_grad_buf_for_mxfp8_param_ag:
++            return False
+
+         for model_chunk in self.model_chunks:
+             model_chunk.zero_grad_buffer()
+         self._copy_main_params_to_param_buffer()
++        return True
+
+     def _copy_main_params_to_param_buffer(self):
+         """
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -1754,15 +1754,13 @@
+
+     @override
+     @torch.no_grad()
+-    def prepare_model_params_for_param_sync(self) -> None:
++    def prepare_model_params_for_param_sync(self) -> bool:
+         """Stage params once per DDP model chunk before explicit param sync."""
+-        use_reused_grad_buffer = (
+-            self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather
+-        )
++        use_reused_grad_buffer = self.config.reuse_grad_buf_for_mxfp8_param_ag
+         if not use_reused_grad_buffer:
+             for optimizer in self.chained_optimizers:
+                 optimizer.prepare_model_params_for_param_sync()
+-            return
++            return False
+
+         from .distrib_optimizer import DistributedOptimizer
+
+@@ -1788,6 +1786,7 @@
+         for optimizer in dist_optimizers:
+             if not getattr(optimizer, 'is_stub_optimizer', False):
+                 optimizer._copy_main_params_to_param_buffer()
++        return True
+
+     @torch.no_grad()
+     def prepare_grads(self) -> bool:
+diff --git a/megatron/bridge/models/conversion/param_mapping.py b/megatron/bridge/models/conversion/param_mapping.py
+--- a/megatron/bridge/models/conversion/param_mapping.py
++++ b/megatron/bridge/models/conversion/param_mapping.py
+@@ -16,7 +16,9 @@
+ import re
+ from abc import ABC, abstractmethod
++from contextlib import contextmanager
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ from types import SimpleNamespace
+-from typing import Any, Callable, Dict, Generic, List, Literal, Optional, Tuple, TypeVar, Union, cast
++from typing import Any, Callable, Dict, Generic, Iterator, List, Literal, Optional, Tuple, TypeVar, Union, cast
+
+ import torch
+@@ -44,4 +46,20 @@
+ MXFP8ShardGroup = Literal["tp", "etp", "replicated"]
+ LocalHFShardGroup = Literal["tp", "etp", "replicated"]
++
++_HF_IMPORT_DTYPE: ContextVar[torch.dtype | None] = ContextVar("hf_import_dtype", default=None)
++
++
++@contextmanager
++def hf_import_dtype(dtype: torch.dtype | None) -> Iterator[None]:
++    """Keep dequantized HF values at this precision through nested TP mappings.
++
++    The importer must select the same dtype on every participating TP rank.
++    Model parameters retain their own dtype; casting happens at the final copy.
++    """
++    token = _HF_IMPORT_DTYPE.set(dtype)
++    try:
++        yield
++    finally:
++        _HF_IMPORT_DTYPE.reset(token)
+
+ import logging
+@@ -857,4 +875,5 @@
+             torch.Tensor: The scattered tensor shard on the current rank.
+         """
++        dtype = _HF_IMPORT_DTYPE.get() or dtype
+         if self.tp_size == 1:
+             return splits[0].to(device=device, dtype=dtype) if splits else None
+@@ -1285,13 +1304,14 @@
+             # in HF checkpoints). Cast to match the Megatron parameter so the
+             # scatter doesn't fail on dtype mismatch.
+-            if hf_weights.dtype != target_param.dtype:
++            import_dtype = _HF_IMPORT_DTYPE.get() or target_param.dtype
++            if hf_weights.dtype != import_dtype:
+                 if not getattr(ColumnParallelMapping, "_dtype_warned", False):
+                     ColumnParallelMapping._dtype_warned = True
+                     logger.warning(
+                         f"Dtype mismatch: HF weights are {hf_weights.dtype} but Megatron "
+-                        f"module uses {target_param.dtype}. Casting all mismatched weights "
+-                        f"to {target_param.dtype} (further warnings suppressed)."
++                        f"import uses {import_dtype}. Casting all mismatched weights "
++                        f"to {import_dtype} (further warnings suppressed)."
+                     )
+-                hf_weights = hf_weights.to(target_param.dtype)
++                hf_weights = hf_weights.to(import_dtype)
+
+             actual_dim0_size = hf_weights.shape[0]
+diff --git a/megatron/bridge/models/qwen/qwen4_exp_bridge.py b/megatron/bridge/models/qwen/qwen4_exp_bridge.py
+--- a/megatron/bridge/models/qwen/qwen4_exp_bridge.py
++++ b/megatron/bridge/models/qwen/qwen4_exp_bridge.py
+@@ -44,5 +44,5 @@
+
+ from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
+ from megatron.bridge.models.conversion.param_mapping import (
+     AutoMapping,
+@@ -54,5 +54,7 @@
+     ReplicatedMapping,
+     RMSNorm2ZeroCenteredRMSNormMapping,
++    hf_import_dtype,
+ )
++from megatron.bridge.models.conversion.quantization_utils import dequantize_fp8_blockwise, is_fp8_tensor
+ from megatron.bridge.models.conversion.utils import moe_experts_stored_packed
+ from megatron.bridge.models.gpt_provider import GPTModelProvider
+@@ -114,5 +116,6 @@
+     rows_per_rank = num_rows_total // tp_size
+     start, end = tp_rank * rows_per_rank, (tp_rank + 1) * rows_per_rank
+-    pieces = []
++    rows = None
++    copied = 0
+     for shard_index in range(start // shard_rows, min(num_shards, (end - 1) // shard_rows + 1)):
+         shard = load_shard(shard_index)
+@@ -120,8 +123,16 @@
+         lo = max(start, shard_start) - shard_start
+         hi = min(end, shard_start + shard.shape[0]) - shard_start
+-        pieces.append(shard[lo:hi])
+-    rows = torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+-    if rows.shape[0] != rows_per_rank:
+-        raise ValueError(f"PLE shards cover {rows.shape[0]} rows for TP rank {tp_rank}, expected {rows_per_rank}")
++        if rows is None:
++            rows = shard.new_empty((rows_per_rank, *shard.shape[1:]))
++        if shard.dtype != rows.dtype or shard.shape[1:] != rows.shape[1:]:
++            raise ValueError("PLE shards must have the same dtype and trailing dimensions")
++        count = hi - lo
++        if count <= 0 or copied + count > rows_per_rank:
++            raise ValueError(f"Invalid PLE shard coverage at shard {shard_index}")
++        rows[copied : copied + count].copy_(shard[lo:hi])
++        copied += count
++        del shard
++    if copied != rows_per_rank:
++        raise ValueError(f"PLE shards cover {copied} rows for TP rank {tp_rank}, expected {rows_per_rank}")
+     return rows
+
+@@ -173,8 +184,9 @@
+                 lambda i: shards[i], self.num_shards, total, shards[0].shape[0], self.tp_rank, self.tp_size
+             )
+-        target = megatron_module.weight
+         if hasattr(megatron_module, "_table_loaded"):
+             megatron_module._table_loaded = True
+-        return rows.to(device=target.device, dtype=target.dtype)
++        # The Bridge copies into the target after capturing optimizer initial values.
++        # Keep the large local table on CPU and preserve its dequantized FP32 values.
++        return rows
+
+     def megatron_to_hf(
+@@ -576,9 +588,55 @@
+         )
+
+-    # ------------------------------------------------------------------ rank-local PLE import
++    # ------------------------------------------------------------------ FP8 and rank-local PLE import
++    supports_fp8_hf_import: bool = True
++
++    @staticmethod
++    def get_hf_import_param_names(
++        hf_param: str | dict[str, str], available_hf_param_names: set[str] | None = None
++    ) -> tuple[str, ...]:
++        names = list(MegatronModelBridge.get_hf_import_param_names(hf_param, available_hf_param_names))
++        if isinstance(hf_param, dict) and "shard_0" in hf_param:
++            scale_name = hf_param["shard_0"].replace(".shard_0.weight", ".weight_scale")
++            if available_hf_param_names is not None and scale_name in available_hf_param_names:
++                names.append(scale_name)
++        return tuple(dict.fromkeys(names))
++
++    @staticmethod
++    def _convert_loaded_hf_weight(
++        task: WeightConversionTask, hf_weights: torch.Tensor | dict[str, torch.Tensor]
++    ) -> Optional[torch.Tensor]:
++        # All participating ranks load the source tensors. Preserve FP32 products
++        # across Auto/Gated/Row/Column mappings until the final model parameter copy.
++        weights = hf_weights.values() if isinstance(hf_weights, dict) else (hf_weights,)
++        dtype = torch.float32 if any(w is not None and w.dtype == torch.float32 for w in weights) else None
++        with hf_import_dtype(dtype):
++            return MegatronModelBridge._convert_loaded_hf_weight(task, hf_weights)
++
++    def _load_fp8_hf_weight(self, name: str, state: Mapping[str, torch.Tensor]) -> torch.Tensor:
++        weight = state[name]
++        if not is_fp8_tensor(weight):
++            return weight
++        config = getattr(self.hf_pretrained, "config", self.hf_pretrained)
++        quantization = getattr(config, "quantization_config", None) or {}
++        block_size = quantization.get("weight_block_size", [128, 128])
++        if block_size not in ([128, 128], (128, 128)):
++            raise ValueError(f"Qwen4-Exp FP8 import requires weight_block_size=[128, 128], got {block_size}")
++        scale_name = f"{name}_scale_inv"
++        if scale_name not in state:
++            raise ValueError(f"FP8 weight {name} requires {scale_name}")
++        scale = state[scale_name]
++        expected = tuple((dim + 127) // 128 for dim in weight.shape)
++        if weight.ndim != 2 or tuple(scale.shape) != expected:
++            raise ValueError(
++                f"{scale_name}: expected a 2D block scale of shape {expected}, got {tuple(scale.shape)}"
++            )
++        if not scale.is_floating_point() or not torch.isfinite(scale).all() or not (scale > 0).all():
++            raise ValueError(f"{scale_name}: scales must be finite positive floating-point values")
++        return dequantize_fp8_blockwise(weight, scale.float(), dtype=torch.float32)
++
+     def maybe_modify_loaded_hf_weight(
+         self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
+     ) -> torch.Tensor | dict[str, torch.Tensor]:
+-        """Load only the PLE table shards overlapping this tensor-parallel rank's row range."""
++        """Dequantize original FP8 values, loading only this rank's PLE table rows."""
+         if isinstance(hf_param, dict) and hf_param and all(k.startswith("shard_") for k in hf_param):
+             num_shards = len(hf_param)
+@@ -586,4 +644,11 @@
+             scale_name = shard_names[0].replace(".shard_0.weight", ".weight_scale")
+             scale = hf_state_dict[scale_name] if scale_name in hf_state_dict else None
++            if scale is not None and (
++                scale.numel() != 1
++                or not scale.is_floating_point()
++                or not torch.isfinite(scale).all()
++                or not (scale > 0).all()
++            ):
++                raise ValueError(f"{scale_name}: PLE requires a finite positive scalar scale")
+             if parallel_state.is_initialized():
+                 tp_rank = parallel_state.get_tensor_model_parallel_rank()
+@@ -604,10 +669,12 @@
+                     if scale is None:
+                         raise ValueError(f"FP8 PLE shard requires {scale_name}")
+-                    return shard.float() * scale.float()
++                    return shard.float().mul_(scale.float())
+                 return shard
+
+             rows = ple_local_rows_from_shards(load_shard, num_shards, total, shard_rows, tp_rank, tp_size)
+             return {"local_rows": rows}
+-        return super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
++        if isinstance(hf_param, str):
++            return self._load_fp8_hf_weight(hf_param, hf_state_dict)
++        return {key: self._load_fp8_hf_weight(name, hf_state_dict) for key, name in hf_param.items()}
+
+
+diff --git a/megatron/bridge/models/qwen/qwen4_exp_vl_bridge.py b/megatron/bridge/models/qwen/qwen4_exp_vl_bridge.py
+--- a/megatron/bridge/models/qwen/qwen4_exp_vl_bridge.py
++++ b/megatron/bridge/models/qwen/qwen4_exp_vl_bridge.py
+@@ -275,9 +275,10 @@
+         mapping_list.extend(_get_vision_mappings())
+         if getattr(text_config, "mtp_num_hidden_layers", 0):
+-            mapping_list.extend(self._get_mtp_mappings())
++            mtp_experts_packed = moe_experts_stored_packed(self.hf_pretrained, "mtp.layers.", default=True)
++            mapping_list.extend(self._get_mtp_mappings(mtp_experts_packed))
+         return MegatronMappingRegistry(*mapping_list)
+
+     @staticmethod
+-    def _get_mtp_mappings() -> list:
++    def _get_mtp_mappings(experts_packed: bool = True) -> list:
+         """Map the published QSA/MoE/HC MTP head to the MCore hybrid MTP path."""
+         mp = "language_model.mtp.layers.0."
+@@ -336,16 +337,31 @@
+             ("experts.local_experts.*.linear_fc1.weight", "experts.local_experts.*.linear_fc2.weight"),
+         ):
+-            mappings.extend(
+-                [
+-                    FusedGatedExpertMapping(
+-                        megatron_param=f"{inner}mlp.{megatron_fc1}",
+-                        hf_param=f"{hf_inner}mlp.experts.gate_up_proj",
+-                    ),
+-                    FusedExpertMapping(
+-                        megatron_param=f"{inner}mlp.{megatron_fc2}",
+-                        hf_param=f"{hf_inner}mlp.experts.down_proj",
+-                    ),
+-                ]
+-            )
++            if experts_packed:
++                mappings.extend(
++                    [
++                        FusedGatedExpertMapping(
++                            megatron_param=f"{inner}mlp.{megatron_fc1}",
++                            hf_param=f"{hf_inner}mlp.experts.gate_up_proj",
++                        ),
++                        FusedExpertMapping(
++                            megatron_param=f"{inner}mlp.{megatron_fc2}",
++                            hf_param=f"{hf_inner}mlp.experts.down_proj",
++                        ),
++                    ]
++                )
++            else:
++                mappings.extend(
++                    [
++                        GatedMLPMapping(
++                            megatron_param=f"{inner}mlp.{megatron_fc1}",
++                            gate=f"{hf_inner}mlp.experts.*.gate_proj.weight",
++                            up=f"{hf_inner}mlp.experts.*.up_proj.weight",
++                        ),
++                        AutoMapping(
++                            megatron_param=f"{inner}mlp.{megatron_fc2}",
++                            hf_param=f"{hf_inner}mlp.experts.*.down_proj.weight",
++                        ),
++                    ]
++                )
+         return mappings
+
+diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -2505,7 +2505,11 @@
+             if not fp8_checkpoint:
+                 return [state] * self.num_gemms
+
+-            state = self._decode_extra_state(state)
++            decoded_state = self._decode_extra_state(state)
++            # Stateless recipes (e.g. MXFP8) store an empty extra-state tensor.
++            if decoded_state is None:
++                return [state] * self.num_gemms
++            state = decoded_state
+             extra_states = []
+             extra_fp8_variables = state["extra_fp8_variables"]
+             extra_fp8_variables["num_gemms"] = 1
 # END common
 # BEGIN cu13
 diff --git a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py

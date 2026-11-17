@@ -75,6 +75,7 @@ class StreamingHFWriter:
         if max_shard_size <= 0:
             raise ValueError("max_shard_size must be positive")
         self.expected_names = set(key_to_filename_map)
+        self.source_scale_names: set[str] = set()
         self.max_shard_size = max_shard_size
         self.result = ConversionResult()
 
@@ -138,6 +139,8 @@ class StreamingHFWriter:
 
         try:
             for name, tensor in generator:
+                if name in self.source_scale_names:
+                    raise ValueError(f"Bridge yielded a source scale instead of dequantized model values: {name}")
                 if name in yielded_names:
                     raise ValueError(f"Bridge yielded duplicate tensor: {name}")
                 yielded_names.add(name)
@@ -242,12 +245,35 @@ class StreamingFP8Writer(StreamingHFWriter):
         block_size: list[int] | None,
         device: str | torch.device,
         max_shard_size: int = 4 * 1024**3,
+        source_config: dict | None = None,
     ) -> None:
         super().__init__(key_to_filename_map, max_shard_size)
         validate_fp8_options(strategy, block_size)
+        config = source_config or {}
+        self.expert_only = config.get("model_type") in ("qwen4_exp", "qwen4_exp_text")
+        quantization = (
+            config.get("quantization_config") or config.get("text_config", {}).get("quantization_config") or {}
+        )
+        if quantization.get("quant_method") == "fp8":
+            # Bridge yields dequantized model values. Source scales belong to
+            # the old quantization and must neither be required nor reused.
+            sharded_tables = {name.rsplit(".shard_", 1)[0] for name in self.expected_names if ".shard_" in name}
+            for name in self.expected_names:
+                for suffix in ("_scale_inv", "_scale"):
+                    if name.endswith(".weight" + suffix):
+                        weight_name = name[: -len(suffix)]
+                        if weight_name in self.expected_names or (
+                            suffix == "_scale" and weight_name.removesuffix(".weight") in sharded_tables
+                        ):
+                            self.source_scale_names.add(name)
+            self.expected_names -= self.source_scale_names
         self.strategy = strategy
         self.block_size = block_size
         self.device = device
 
     def _convert_tensor(self, name: str, tensor: torch.Tensor) -> tuple[dict[str, torch.Tensor], list[str]]:
-        return quantize_hf_tensor(name, tensor, self.strategy, self.block_size, self.device)
+        if str(tensor.dtype).startswith("torch.float8_"):
+            raise ValueError(f"FP8 export requires dequantized model values: {name}")
+        return quantize_hf_tensor(
+            name, tensor, self.strategy, self.block_size, self.device, expert_only=self.expert_only
+        )

@@ -23,6 +23,72 @@ SFT 通过 `--loss-type sft` 启用。该模式下，Relax 会启动一个 SFT p
 | [`run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh) | `OpenMathReasoning-mini` | `Qwen3.5-35B-A3B` | 16 GPU Actor，加 SFT producer | 进阶 MTP SFT。多个参数已暴露为环境变量。 |
 | [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2、AG News 或 GoEmotions | `Qwen3.5-9B` | 8 GPU Actor，加 SFT producer | 全参数二分类、多分类或多标签序列分类 SFT。 |
 | [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2、AG News 或 GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU Actor，加 SFT producer | LoRA 序列分类 SFT，默认使用 GoEmotions。 |
+| [`run-qwen38-flash-next-fp8-32xgpu.sh`](../../../examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh) | 用户提供的消息、工具与图像数据 | `Qwen3.8-Flash-Next` | 四节点 32 GPU Actor，加 SFT producer | 主干 MoE 使用 MXFP8，PLE、视觉和 MTP 保持可训练；使用已有 Ray 集群。 |
+
+## Qwen3.8 Flash Next：MoE FP8 与 PLE、视觉、MTP 训练
+
+该配方在 Blackwell 上对主干 routed/shared expert GEMM 使用 MXFP8。`PARAM_STORAGE=bf16`（默认）保留 BF16 模型参数；`PARAM_STORAGE=fp8` 将选中的专家参数保存为 TE MXFP8 tensor。两种模式的主权重和梯度累积均使用 FP32。GDN、QSA、PLE、视觉和 MTP 保留原有计算精度和参数存储。这个边界有实际形状约束：TP4 下 GDN 投影的本地宽度为 4120，不满足 MXFP8 的 32 元素对齐要求。
+
+完整 PLE n-gram 表及其投影均可训练。脚本关闭将表存为 buffer 的 PLE CPU offload，也关闭要求冻结参数的 streamed PLE 路径。视觉 encoder/projector 保持可训练；一层 MTP 使用 0.1 的 loss scaling 和 `--mtp-detach-paths none`。只有 QSA indexer 按 Mixed Stage-1 attention 的要求冻结。
+
+视觉可训练时保持 `RELAX_DISABLE_VISION_BRANCH_SYNC=0`。即使整个批次都是纯文本，也需要最小 dummy vision 前向及零 loss 依赖，让重叠梯度同步收到所有可训练参数的就绪记录。
+
+脚本通过 `--train-env-vars` 在训练 actor 导入 CUDA 模块前设置 `CUDA_MODULE_LOADING=EAGER`，用于规避原生 checkpoint 恢复后首次 SwiGLU 反向出现的内核加载阻塞。该设置仅作用于训练 actor，可能延长其初始化时间；相关机制见 [CUDA 延迟加载说明](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#lazy-loading)。
+
+环境需要包含 Qwen4Exp 模型、HybridEP 以及 MCore 的 TE 模块精度配置接口。脚本使用 TP2/PP4/CP1/EP8/ETP1、sequence parallelism 和 `Et*12|t*14|t*14|t*8mL` 布局。可通过 `QWEN38_PP_LAYOUT` 调整各阶段层数，为 PLE 表与视觉模型预留显存。QSA 长文档分支使用 grouped 后端，attention 细节见 [Qwen3.8 QSA](./qwen38-qsa.md)。
+
+[Relax 镜像的 Megatron 补丁](../../../docker/patch/megatron/20260915-4a4de8657.patch) 支持保存 MXFP8 分组层时 TE 2.18 返回的空 extra state。GPU 保存与加载回归见 `tests/backends/megatron/test_qwen38_fp8_precision.py`。
+
+在目标 Ray 集群的 head 或 worker 节点上，从仓库根目录启动，并确保本地 Ray 自动发现指向该集群。`ray-job.sh` 会调用 `ray list nodes`，仅设置远端 dashboard 地址不足以从任意机器提交。设置路径及已核实的跨节点通信网卡：
+
+```bash
+export MODEL_DIR=/models/Qwen3.8-Flash-Next
+export DATA_DIR=/datasets/train.jsonl
+export SAVE_DIR=/checkpoints/qwen38-sft
+export RAY_JOBS_ADDRESS='http://<ray-head>:8265'
+export RELAX_HYBRID_EP_COMMIT='<installed-hybridep-commit>'
+export GLOO_SOCKET_IFNAME='<verified-cross-node-interface>'
+
+bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh
+```
+
+`NCCL_SOCKET_IFNAME` 默认沿用指定的 Gloo 网卡，也可单独设置。启动器通过 `ray-job.sh` 提交，跳过集群级清理，默认等待本次作业结束。请使用空闲且没有冲突 Relax Serve 应用的集群；需要另行监控作业时再设 `RAY_NO_WAIT=1`。`DRY_RUN=1` 只输出有效参数和运行环境，不提交作业。
+
+JSONL 使用 `messages`、`tools` 和可选的 `images` 字段；producer 按 checkpoint 的 chat template 渲染并保留 thinking 内容。producer 与训练 rank 都必须能读取图像路径。无效图像样本会报错，超过上下文限制的样本会跳过，因此选择长度时应检查实际接受的样本数。
+
+配方默认值为 `SEQ_LEN=131072`、`GLOBAL_BATCH_SIZE=128`、`IMAGE_MAX_TOKENS=128`、`NUM_STEPS=50` 和 `SAVE_INTERVAL=50`。先用少量有效样本测量首阶段训练峰值，再增加上下文或 batch。FP8 GEMM 不会消除 PLE 表的 BF16 参数、FP32 梯度和 Adam 状态。该模型包含 FP32 主权重及 Adam moments 的完整 native checkpoint 约为 2.6 TB，应为保留的两个 checkpoint 及新一次写入预留空间。加载完整优化器状态时的临时显存可能高于训练峰值，容量验证也应包含恢复过程。
+
+load/save 使用稳定的 `SAVE_DIR/EXP_NAME`。默认实验名包含精度，因此 `PRECISION=bf16` 会使用独立的对照实验目录；显式命名的独立对照也应使用不同实验名。恢复时保持实验、数据快照、batch/上下文、模板和原计划 `NUM_STEPS` 不变：native checkpoint 恢复 optimizer/scheduler/RNG 状态，SFT data boundary 恢复输入游标。每次启动会创建新的 ClearML task 名称。
+
+各节点使用[基于此版本构建的 CUDA 13 Blackwell 镜像](../../../docker/README.md)。镜像的 Megatron 补丁支持 FP32 主权重初始化、参数同步，以及按原始 scale 导入 Qwen3.8 FP8 checkpoint。在任一集群节点提交以下命令，即可启用 FP8 参数存储：
+
+```bash
+PARAM_STORAGE=fp8 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh
+```
+
+该模式要求 `PRECISION=mxfp8`。脚本自动启用 `--fp8-param-gather` 和 `--reuse-grad-buf-for-mxfp8-param-ag`，并关闭参数聚合与前向计算的重叠。各优化器组更新后完成参数聚合，再清理复用的梯度缓冲区。默认实验名增加 `-fp8params`；显式设置实验名时，也应为不同存储模式使用不同名称。
+
+`MODEL_DIR` 可以指向 BF16 checkpoint，也可以指向专家权重为 E4M3、使用 128×128 `weight_scale_inv` 分块、PLE 分片表使用标量 `weight_scale` 的 Qwen3.8 FP8 checkpoint。对于 FP8 源权重，Bridge 按原始 scale 计算 `float32(weight) * float32(scale)`，在 TP 映射过程中保留 FP32 结果，并在复制到模型所选存储格式之前，将本地分片保存在 CPU，供优化器主权重初始化。scale 缺失、形状错误、非有限值或非正值都会报错。FP8 源权重配合 `PARAM_STORAGE=bf16` 时也使用这条主权重初始化路径，可用于从同一份源权重开始的 BF16 对照实验。
+
+导入器独立识别主干与 MTP 专家的存储布局，兼容 BF16 合并专家与 FP8 逐专家权重；同一 MTP checkpoint 命名空间内混用两种布局时会报错。
+
+例如，设置好上面的数据、checkpoint 输出和集群变量后：
+
+```bash
+export MODEL_DIR=/models/Qwen3.8-Flash-Next-FP8
+export PARAM_STORAGE=fp8
+DRY_RUN=1 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-flash-next-fp8-32xgpu.sh
+```
+
+准备提交时去掉 `DRY_RUN=1`。训练配方仍为 `PRECISION=mxfp8`：TE 为选中的主干专家生成自己的 MXFP8 行向和列向表示，不直接复用源 checkpoint 的 128×128 格式。PLE 和 MTP 的 FP8 源权重会先反量化，再以既有计算精度参与训练；视觉分支保留原精度。反量化得到的是这份 FP8 checkpoint 所表示的数值，无法恢复它在最初量化时丢失的 BF16 信息。
+
+FP8 源权重训练要求使用 Megatron 分布式优化器和 FP32 主权重，暂不支持 optimizer CPU offload 或 Megatron FSDP。纯 BF16 对照（`PRECISION=bf16 PARAM_STORAGE=bf16`）会由脚本关闭 precision-aware optimizer，使 MCore 实际读取捕获的初始值。不支持的优化器配置会在导入权重前被拒绝。
+
+PLE 加载器预分配本 rank 的 CPU 表，逐片填充。该模型约 512 亿元素的表，仅 FP32 捕获结果在 TP2 下每 rank 约需 102.4 GB 主机内存（TP4 下约为 51.2 GB），此外还有其他权重和加载缓冲区。Native 恢复会加载优化器状态，并从主权重重新生成两种 MXFP8 布局，无需重复 HF 导入。该导入器针对上述源权重布局；保存的 native 训练 checkpoint 不是物理 FP8 推理导出文件。
+
+MXFP8 同时保留行向和列向 FP8 缓冲区及 scale。当前 MCore 参数聚合路径还会使用与梯度存储复用的临时 BF16 缓冲区，因此不能按“每参数总共 1 字节”估算显存，也不能将其理解为全程 FP8 通信。FP32 主权重和 Adam 状态仍需保留。
+
+不要将该精度策略与 TE operation fusion 或另一份 TE precision configuration file 同时使用。FP8 参数存储目前要求各专家分别保存权重，并使用同步参数聚合；模型适配层会检查这些约束。
 
 ## YAML 数据配比与分数据集 loss
 

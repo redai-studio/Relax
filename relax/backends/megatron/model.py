@@ -2207,6 +2207,7 @@ def _install_streaming_fp8_writer(bridge, strategy, block_size):
         strategy,
         block_size,
         device="cuda",
+        source_config=bridge.hf_pretrained.config.to_dict() if hasattr(bridge.hf_pretrained, "config") else None,
     )
     original_save_generator = source.save_generator
     source.save_generator = writer.save_generator
@@ -2289,6 +2290,9 @@ def _apply_fp8_quantization_config(config_path, strategy, block_size, modules_to
     with open(config_path) as f:
         cfg = json.load(f)
     cfg["quantization_config"] = build_quantization_config(strategy, block_size, modules_to_not_convert)
+    if cfg.get("model_type") in ("qwen4_exp", "qwen4_exp_text"):
+        # The Qwen export policy retains the trainable PLE table in BF16.
+        cfg.get("text_config", cfg)["ple_embedding_dtype"] = "bfloat16"
     with open(config_path, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -2521,6 +2525,16 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    if (
+        optimizer is not None
+        and getattr(args, "fp8_param_gather", False)
+        and getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
+    ):
+        # Native checkpoints serialize dequantized model tensors. Recreate both
+        # MXFP8 layouts from restored FP32 masters before the first forward.
+        if optimizer.prepare_model_params_for_param_sync() is not True:
+            raise RuntimeError("MXFP8 resume requires the Relax image's patched Megatron parameter synchronization")
+        force_param_sync(model)
     if role == "critic":
         release_critic_lm_heads(model)
         loaded_value_head_param_ids = validate_critic_value_head_registration(model, optimizer)

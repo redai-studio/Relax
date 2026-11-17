@@ -545,6 +545,7 @@ if __name__ == "__main__":
                 fp8_block_size,
                 args.fp8_device,
                 args.fp8_max_shard_size_mb * 1024**2,
+                source_config=bridge.hf_pretrained.config.to_dict(),
             )
             source.save_generator = fp8_writer.save_generator
             logger.info("Enabled streaming FP8: max_shard_size_mb=%d", args.fp8_max_shard_size_mb)
@@ -655,6 +656,8 @@ if __name__ == "__main__":
                     fp8_block_size,
                     fp8_writer.result.modules_to_not_convert,
                 )
+                if cfg.get("model_type") in ("qwen4_exp", "qwen4_exp_text"):
+                    cfg.get("text_config", cfg)["ple_embedding_dtype"] = "bfloat16"
             elif "quantization_config" not in cfg:
                 index_path = os.path.join(args.output_dir, "model.safetensors.index.json")
                 output_is_quantized = False

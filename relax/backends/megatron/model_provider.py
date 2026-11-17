@@ -613,6 +613,10 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
+            if getattr(provider, "qsa_indexer_n_heads", None) and getattr(provider, "ple_layer_ids", None):
+                from relax.models.qwen3_8.precision import configure_fp8
+
+                configure_fp8(model, args)
             configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)

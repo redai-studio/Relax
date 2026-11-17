@@ -53,13 +53,10 @@ def _should_enable(args: argparse.Namespace) -> bool:
 
 
 def _vision_branch_sync_disabled() -> bool:
-    # Opt-out for jobs guaranteed to have no image/video input (e.g. text-only SFT of a
-    # VL checkpoint). The sync issues a 1-element DP all-reduce + .item() before every
-    # microbatch forward purely to detect whether ANY data-parallel rank fed a vision
-    # input, so idle ranks can run a dummy vision pass and keep the vision-tower
-    # collectives aligned. With no multimodal input it never fires the dummy pass, yet
-    # the all-reduce + GPU->CPU sync still runs each microbatch and stalls the compute
-    # stream. The gate MUST be set identically on every rank (launch-script env passed
+    # Opt-out for text-only jobs whose vision branch is frozen or does not use
+    # overlapped gradient reduction. Trainable vision with gradient overlap needs
+    # its autograd hooks even when every DP rank has no image/video input.
+    # The gate MUST be set identically on every rank (launch-script env passed
     # through RELAX_PASSTHROUGH_ENV) — a split decision would deadlock the all-reduce.
     return os.environ.get("RELAX_DISABLE_VISION_BRANCH_SYNC", "0") == "1"
 
@@ -221,7 +218,10 @@ def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Mo
         device = _first_tensor_device(forward_args, forward_kwargs)
         local_active = _has_local_vision_input(forward_args, forward_kwargs)
         global_active = _dp_any(local_active, self.pg_collection.dp, device)
-        dependency = _run_dummy_vision(self, device) if global_active and not local_active else None
+        # Overlapped gradient reduction learns per-parameter hook counts in the
+        # first batch. Trainable vision must participate even in all-text batches.
+        needs_dummy = not local_active and (global_active or bool(getattr(args, "overlap_grad_reduce", False)))
+        dependency = _run_dummy_vision(self, device) if needs_dummy else None
 
         output = original_forward(*forward_args, **forward_kwargs)
         if dependency is not None:

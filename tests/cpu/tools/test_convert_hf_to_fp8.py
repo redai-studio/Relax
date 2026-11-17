@@ -7,9 +7,9 @@ Qwen3.6 stores routed experts as a single fused 3-D tensor
 into per-expert 2-D projections, split ``gate_up`` into ``gate`` + ``up``, and
 quantize each. It must also skip the vision tower and the shared-expert gate.
 
-The production path normally quantizes on CUDA, so these tests stub ``quant_fp8``
-with a shape-recording no-op and fake the safetensors I/O. That isolates the
-naming, slicing, streaming, and indexing logic.
+Most cases stub ``quant_fp8`` and safetensors I/O to isolate naming, slicing,
+streaming, and indexing. Qwen mixed precision regressions use real CPU FP8
+arithmetic and safetensors files to check values, scales, and preserved dtypes.
 """
 
 from __future__ import annotations
@@ -136,6 +136,96 @@ class TestFp8Options:
 
 
 class TestStreamingFp8Writer:
+    @pytest.mark.parametrize("packed_mtp", [False, True])
+    def test_qwen38_export_requantizes_experts_and_preserves_other_modules(
+        self, tmp_path: pathlib.Path, packed_mtp: bool
+    ) -> None:
+        """Use real FP8 arithmetic and safetensors; the generic mocked tests do
+        not cover an FP8 source schema or Qwen's mixed precision boundary."""
+        expert = "model.language_model.layers.0.mlp.experts.0.down_proj.weight"
+        ple = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+        weight = torch.empty(129, 130, dtype=torch.bfloat16)
+        weight[:128, :128] = 224
+        weight[:128, 128:] = 112
+        weight[128:, :128] = 56
+        weight[128:, 128:] = 28
+        weight[0, 0] = 13.3125
+        mtp = "mtp.layers.0.mlp.experts."
+        mtp += "gate_up_proj" if packed_mtp else "0.gate_proj.weight"
+        state = {
+            expert: weight,
+            ple + ".shard_0.weight": torch.full((9, 4), 0.703125, dtype=torch.bfloat16),
+            "model.visual.blocks.0.mlp.linear_fc1.weight": torch.ones(4, 4, dtype=torch.bfloat16),
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.arange(16, dtype=torch.bfloat16)
+            .reshape(4, 4)
+            .t(),
+            "model.language_model.layers.0.linear_attn.A_log": torch.tensor([1.0001], dtype=torch.float32),
+            mtp: torch.ones((2, 8, 4) if packed_mtp else (4, 4), dtype=torch.bfloat16),
+        }
+        source_keys = [*state, expert + "_scale_inv", ple + ".weight_scale"]
+        writer = checkpoint_mod.StreamingFP8Writer(
+            dict.fromkeys(source_keys, "model.safetensors"),
+            strategy="block",
+            block_size=[128, 128],
+            device="cpu",
+            max_shard_size=32768,
+            source_config={"model_type": "qwen4_exp", "quantization_config": {"quant_method": "fp8"}},
+        )
+        writer.save_generator(
+            iter(state.items()),
+            tmp_path,
+            ignored_source_key_prefixes=(ple + ".weight_scale",),
+            ignored_source_key_suffixes=None,
+        )
+        index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+        actual = {}
+        for shard in set(index["weight_map"].values()):
+            actual.update(safetensors.torch.load_file(tmp_path / shard))
+        assert set(actual) == set(state) | {expert + "_scale_inv"}
+        assert actual[expert].dtype == torch.float8_e4m3fn
+        scale = actual[expert + "_scale_inv"]
+        torch.testing.assert_close(scale, torch.tensor([[0.5, 0.25], [0.125, 0.0625]]), rtol=0, atol=0)
+        restored = actual[expert].float() * scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:129, :130]
+        torch.testing.assert_close(restored, weight.float(), rtol=0.07, atol=0.01)
+        for name, value in state.items():
+            if name != expert:
+                assert actual[name].dtype == value.dtype
+                torch.testing.assert_close(actual[name], value, rtol=0, atol=0)
+        assert ple in writer.result.modules_to_not_convert
+        assert "mtp" in writer.result.modules_to_not_convert
+        assert index["metadata"]["total_size"] == sum(t.numel() * t.element_size() for t in actual.values())
+
+    def test_bridge_ignored_keys_do_not_hide_missing_model_weights(self, tmp_path: pathlib.Path) -> None:
+        writer = checkpoint_mod.StreamingFP8Writer(
+            dict.fromkeys(["a.weight", "b.weight", "mtp.weight", "unused_scale_inv"], "model.safetensors"),
+            strategy="tensor",
+            block_size=None,
+            device="cpu",
+        )
+        with pytest.raises(KeyError, match="did not yield 1 tensors"):
+            writer.save_generator(
+                iter([("a.weight", torch.ones(2, 2))]),
+                tmp_path,
+                ignored_source_key_prefixes=("mtp.",),
+                ignored_source_key_suffixes=("_scale_inv",),
+            )
+        assert not (tmp_path / "model.safetensors.index.json").exists()
+
+    @pytest.mark.parametrize("stale", ["scale", "payload"])
+    def test_fp8_source_payloads_and_old_scales_are_not_reused(self, tmp_path: pathlib.Path, stale: str) -> None:
+        writer = checkpoint_mod.StreamingFP8Writer(
+            dict.fromkeys(["a.weight", "a.weight_scale_inv"], "model.safetensors"),
+            strategy="block",
+            block_size=[2, 2],
+            device="cpu",
+            source_config={"quantization_config": {"quant_method": "fp8"}},
+        )
+        name = "a.weight_scale_inv" if stale == "scale" else "a.weight"
+        value = torch.ones(1) if stale == "scale" else torch.ones(2, 2).to(torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="dequantized|source scale"):
+            writer.save_generator(iter([(name, value)]), tmp_path)
+        assert not (tmp_path / "model.safetensors.index.json").exists()
+
     def test_quantizes_per_tensor_flushes_bounded_shards_and_rebuilds_index(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             fp8_mod,

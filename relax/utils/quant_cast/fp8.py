@@ -160,10 +160,29 @@ def quantize_hf_tensor(
     strategy: str,
     block_size: list[int] | None = None,
     device: str | torch.device | None = None,
+    *,
+    expert_only: bool = False,
 ) -> tuple[dict[str, torch.Tensor], list[str]]:
     """Quantize one HF tensor and return its output tensors plus ignored
     modules."""
     q_weights: dict[str, torch.Tensor] = {}
+
+    # Qwen3.8 exports follow the training precision boundary, including when
+    # MTP experts use the packed representation handled below.
+    backbone_expert = name.startswith(("model.layers.", "model.language_model.layers.")) and any(
+        part in name for part in (".mlp.experts.", ".mlp.shared_expert.")
+    )
+    if expert_only and not backbone_expert:
+        if name.startswith("mtp."):
+            ignored = ["mtp"]
+        elif name.startswith("model.visual."):
+            ignored = ["model.visual"]
+        elif ".ple.ple_embedding.ngram_embedding.shard_" in name:
+            # The inference loader selects precision on the parent table.
+            ignored = [name.rsplit(".shard_", 1)[0]]
+        else:
+            ignored = [name[: -len(".weight")]] if name.endswith(".weight") else []
+        return {name: weight}, ignored
 
     is_fused_experts = name.endswith(".experts.gate_up_proj") or name.endswith(".experts.down_proj")
     if weight.dim() == 3 and is_fused_experts:

@@ -19,8 +19,8 @@ _spec.loader.exec_module(sync)
 
 
 @pytest.mark.parametrize("paired", [False, True])
-@pytest.mark.parametrize("local_images", [False, True])
-def test_mixed_vision_forward_preserves_output_and_backward(monkeypatch, paired, local_images):
+@pytest.mark.parametrize("local_images,global_images", [(False, False), (False, True), (True, True)])
+def test_mixed_vision_forward_preserves_output_and_backward(monkeypatch, paired, local_images, global_images):
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -34,7 +34,7 @@ def test_mixed_vision_forward_preserves_output_and_backward(monkeypatch, paired,
 
     model = Model()
     monkeypatch.setattr(sync, "_is_qwen3vl_with_conditional_vision", lambda _: True)
-    monkeypatch.setattr(sync, "_dp_any", lambda *args: True)
+    monkeypatch.setattr(sync, "_dp_any", lambda *args: global_images)
     dummy_calls = []
 
     def dummy(model, device):
