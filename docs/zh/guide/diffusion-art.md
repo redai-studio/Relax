@@ -16,6 +16,10 @@ TextPecker 示例需要独立 OpenAI 兼容 OCR 服务、CPU LPIPS 及离线 Ale
 模型、图片、奖励地址和输出路径均由使用者显式提供。
 推理部署默认读取启动脚本旁的 `scripts/training/diffusion/configs/sglang-sensenova-art-8xgpu.yaml`，
 可通过 `SGLANG_CONFIG_PATH` 指定其他配置。
+启动脚本直接提交 Ray Job，不再包含独立 Python recipe 或 `--mode` 预检入口。
+提交前检查图片、离线 LPIPS 权重、奖励服务和磁盘余量；算法、轨迹及恢复校验仍在运行时执行。
+使用独立 Ray 集群，训练退出会关闭其 Serve 应用；`RAY_NO_WAIT=1` 为非阻塞提交。
+看板参数可直接追加 `--use-clearml --use-metrics-service --tb-project-name ... --tb-experiment-name ...`。
 
 每轮使用完整条件组的原始标量奖励计算终态协方差，将每组候选均分成两个不重叠
 窗口，执行两次 AdamW 更新后只发布一次 live 权重，不使用 EMA、重新加噪或旧策略前向。

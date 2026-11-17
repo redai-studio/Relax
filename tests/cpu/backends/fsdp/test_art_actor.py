@@ -76,6 +76,59 @@ def _profile():
     )
 
 
+def test_art_shell_launch_uses_registered_defaults_and_preserves_resume_and_extra_args(tmp_path):
+    import argparse
+    import os
+    import subprocess
+    from pathlib import Path
+
+    from relax.backends.fsdp.arguments import add_generative_arguments
+
+    capture = tmp_path / "argv.json"
+    ray = tmp_path / "ray"
+    ray.write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\n"
+        "from pathlib import Path\nPath(os.environ['ART_TEST_ARGV']).write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    ray.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "ART_TEST_ARGV": str(capture),
+        "MODEL_PATH": str(tmp_path / "model with spaces"),
+        "PROMPT_SET": str(tmp_path / "prompts.jsonl"),
+        "SAVE_DIR": str(tmp_path / "checkpoints"),
+        "ARTIFACT_ROOT": str(tmp_path / "artifacts"),
+        "REWARD_ENDPOINT": "http://reward.invalid/v1",
+        "LOAD_DIR": str(tmp_path / "prior checkpoint"),
+        "ART_TRAIN_STEP_INDICES": "[0,10,19]",
+        "ART_MAX_CACHE_BYTES": str(1 << 35),
+        "ART_MAX_REPLAY_BYTES": str(1 << 36),
+        "ART_GROUP_OVERLAP": "0",
+        "ART_GENERATION_PREFETCH": "0",
+        "N_PROMPTS": "8",
+        "N_SAMPLES": "8",
+        "STEPS": "20",
+        "RAY_NO_WAIT": "1",
+    }
+    script = Path(__file__).resolve().parents[4] / "scripts/training/diffusion/run-sensenova-i2i-art-full-8xgpu.sh"
+    subprocess.run(["bash", str(script), "--use-clearml"], env=env, check=True, capture_output=True)
+    submitted = json.loads(capture.read_text())
+    assert submitted[:2] == ["job", "submit"] and "--no-wait" in submitted
+    command = submitted[submitted.index("--") + 1 :]
+    assert command[:3] == ["python3", "-m", "relax.entrypoints.train"]
+    argv = command[3:]
+    assert argv[argv.index("--model-path") + 1] == env["MODEL_PATH"]
+    assert argv[argv.index("--load") + 1] == env["LOAD_DIR"] and argv[-1] == "--use-clearml"
+    registered, _ = add_generative_arguments(argparse.ArgumentParser()).parse_known_args(argv)
+    assert not hasattr(registered, "generative_reference_policy")
+    args = argparse.Namespace(**{**vars(_profile()), **vars(registered)})
+    validate_generative_config(args)
+    args.generative_reference_policy = "ema"
+    with pytest.raises(ValueError, match="fixed"):
+        validate_generative_config(args)
+
+
 @pytest.mark.parametrize("invalid", [None, "budget", "odd_k", "ema", "steps", "options", "precision"])
 def test_art_profile_is_explicit_and_rejects_unsupported_semantics(invalid):
     args = _profile()
@@ -227,6 +280,11 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
     source.sample_index, source.epoch_id = 2 * args.n_samples_per_prompt, 0
     source.metadata, source._use_streaming = {}, False
     source.save(0)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(args, "_start_rollout_id_explicit", True, raising=False)
+        patch.setattr(args, "start_rollout_id", 7, raising=False)
+        with pytest.raises(RuntimeError, match="Explicit start_rollout_id"):
+            _shell(args)._maybe_resume()
     restored = _shell(args)
     assert restored._maybe_resume() == 1
     assert restored._resume_initial_sync_pending

@@ -2690,6 +2690,11 @@ class FSDPTrainRayActor(TrainRayActor):
                 latest = ckpt.find_latest_committed(self.args.load, self.args.generation_task)
                 if latest is None:
                     raise ValueError("ART resume requires a committed checkpoint.")
+                if (
+                    getattr(self.args, "_start_rollout_id_explicit", False)
+                    and self.args.start_rollout_id != latest + 1
+                ):
+                    raise ValueError("Explicit start_rollout_id disagrees with the completed ART acquisition.")
                 checkpoint_dir = os.path.join(self.args.load, self.args.generation_task, ckpt.iter_dir_name(latest))
                 self._assert_resumable(checkpoint_dir)
                 ckpt.load_art_dataset_state(self.args.load, latest, self.args.n_samples_per_prompt)

@@ -40,7 +40,7 @@ paths. Ground truth must not be one of the condition images.
 ## Launch
 
 Set your model, prompt, service and output paths explicitly. Output directories
-must be empty and outside the code, input and resume directories. Cache budgets
+should be new and separate from the code, input and resume directories. Cache budgets
 are limits, not preallocations; size them for the actual resolution and host RAM.
 The following is a 1024-pixel-budget example with 64 candidates per acquisition:
 
@@ -55,23 +55,27 @@ export N_PROMPTS=8 N_SAMPLES=8 RESOLUTION=1024 STEPS=20
 export NUM_ROLLOUT=100 SAVE_INTERVAL=50
 export ART_TRAIN_STEP_INDICES='[0,10,19]'
 export ART_MAX_CACHE_BYTES=34359738368 ART_MAX_REPLAY_BYTES=68719476736
-export ART_MIN_FREE_BYTES=751619276800
-export ART_GROUP_OVERLAP=1 ART_OVERLAP_PENDING_GROUPS=2
-
-# Read-only validation: does not initialize Ray or CUDA or submit a job.
-bash scripts/training/diffusion/run-sensenova-i2i-art-full-8xgpu.sh --mode preflight
-
 # Use an otherwise idle, isolated Ray cluster; configure its addresses/runtime.
-export ART_EXCLUSIVE_RAY=1 RELAX_ISOLATED_JOB=1
 export RAY_ADDRESS=ray-head:6379
 export RAY_DASHBOARD_ADDRESS=http://ray-head:8265
 RAY_NO_WAIT=1 bash scripts/entrypoint/ray-job.sh \
-  scripts/training/diffusion/run-sensenova-i2i-art-full-8xgpu.sh --mode submit
+  scripts/training/diffusion/run-sensenova-i2i-art-full-8xgpu.sh
 ```
 
-`--mode config` prints the generated training arguments without loading models.
-The recipe uses `scripts/training/diffusion/configs/sglang-sensenova-art-8xgpu.yaml`
+The shell submits directly through Ray Jobs, like the SFT scripts; there are no
+separate config/preflight/submit modes. Inspect input images, offline LPIPS assets,
+reward service availability and output-disk headroom before submitting; these
+checks are no longer performed by a custom launcher. Algorithm, trajectory and
+resume validation remains in the runtime. Use an isolated cluster: training exit
+shuts down its Serve applications. To preserve existing workers when entering an
+already prepared cluster, the common entrypoint supports `RELAX_SKIP_CLUSTER_CLEANUP=1`;
+this does not make shared Serve applications safe.
+
+The script uses `scripts/training/diffusion/configs/sglang-sensenova-art-8xgpu.yaml`
 for eight single-GPU engines; set `SGLANG_CONFIG_PATH` to use another config.
+Set `RAY_NO_WAIT=1` for nonblocking submission; otherwise the script follows the job.
+Extra training flags are forwarded, for example `--use-clearml --use-metrics-service`
+with `--tb-project-name` and `--tb-experiment-name`.
 For resume, set `LOAD_DIR` to the previous checkpoint root, choose fresh output
 directories and set `NUM_ROLLOUT` above the restored cursor. Only completed
 two-window acquisitions are resumable. Per-rank RNG, optimizer/LR counters,
