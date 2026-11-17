@@ -27,16 +27,12 @@ process timer continues; timeout still terminates the agent process. Step close 
 finalize both before and after the Shard pause transition. Process timeout does not bound every backend or finalization
 RPC.
 
-## Physical Session capacity across steps
+## Session ownership across steps
 
-When `--agentic-session-capacity-per-node` is set, a step transition keeps the same reservation, Session IDs, release
-nonce, pending starts, and unconfirmed debits. Pausing generation or collecting enough training samples is not physical
-release. Ready leased members can run while siblings await startup credit; completing one member can admit work from
-another Group without changing complete-Group reward/filter/export rules.
-
-Prelaunch shares the same budgets and does not open the generation gate. At a synchronous boundary, drain Runtime
-owners; only authorized prelaunch preparation may remain. A final step has no next lease for surplus prepared work,
-so cleanup must also drop completed Prepare tasks that were never leased. Cleanup timeout retains ownership for retry.
+Prelaunch shares the Group budget and keeps generation gated until lease. Partial rollout and fully async retain
+Session/request identity under their original partition rules. A Group with members still awaiting first IRs cannot
+count as interrupted credit. A synchronous boundary drops Runtime owners; a final step also drops surplus prepared
+Groups, including completed Prepare tasks that never leased. Physical cleanup runs independently after logical drop.
 
 ## Timeout boundary
 
@@ -47,7 +43,7 @@ wall-clock time throughout that wait. Buffered SSE connection frames and heartbe
 
 `--agent-timeout` is a separate active process budget for containing defects in the agent itself, such as a stuck loop
 or tool execution. Gated normal Sessions pause it and resumed Sessions restore it. Raising it does not extend the
-Relax-facing client request timeout, bound the Prepare first-request barrier, or guarantee that a backend abort RPC
+Relax-facing client request timeout, bound an agent's wait for its first request, or guarantee that a backend abort RPC
 returns.
 
 When repeated cross-step waits have no known finite wall-clock bound, use a client configuration that intentionally has
@@ -63,7 +59,7 @@ it remains incompatible with fully async. Its close is a separate partial-rollou
 
 ## Check before launch
 
-- Confirm which Sessions, pending starts, and physical debits may survive a step boundary.
+- Confirm which Sessions and requests may survive a step boundary.
 - Confirm Eval overlap and external slots using the retained-Session capacity rule.
 - Confirm protection threshold semantics and timeout behavior.
 - Confirm the Relax-facing client timeout spans every applicable prelaunch, abort, park, resume, and fully-async hold.

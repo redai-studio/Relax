@@ -280,7 +280,9 @@ def test_client_fails_closed_on_unconfirmed_cleanup(tmp_path):
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
-            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            if "release_nonce" in payload:
+                self.server.release_nonce = payload["release_nonce"]
             self.respond({"session_id": "server"})
 
         def do_GET(self):
@@ -293,7 +295,7 @@ def test_client_fails_closed_on_unconfirmed_cleanup(tmp_path):
                     "resource_release": {
                         "schema": 1,
                         "session_id": "client",
-                        "nonce": "nonce",
+                        "nonce": self.server.release_nonce,
                         "status": "unknown",
                     },
                 }
@@ -310,7 +312,6 @@ def test_client_fails_closed_on_unconfirmed_cleanup(tmp_path):
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    receipt = tmp_path / "release.json"
     try:
         result = subprocess.run(
             [sys.executable, str(EXAMPLE / "agent_client.py")],
@@ -322,20 +323,11 @@ def test_client_fails_closed_on_unconfirmed_cleanup(tmp_path):
                 "RELAX_GROUP_ID": "g",
                 "RELAX_ROLLOUT_MODE": "train",
                 "RELAX_BASE_URL": "http://unused",
-                "RELAX_REQUIRE_RESOURCE_RELEASE": "1",
-                "RELAX_RESOURCE_RELEASE_NONCE": "nonce",
-                "RELAX_RESOURCE_RELEASE_PATH": str(receipt),
             },
             capture_output=True,
             text=True,
         )
         assert result.returncode == 1
-        assert json.loads(receipt.read_text()) == {
-            "schema": 1,
-            "session_id": "client",
-            "nonce": "nonce",
-            "status": "unknown",
-        }
     finally:
         httpd.shutdown()
         httpd.server_close()

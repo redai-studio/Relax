@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import sys
 import time
@@ -139,11 +138,6 @@ async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch, ro
 async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> None:
     from relax.utils.opd.opd_main_worker import LogprobResponse
 
-    # Load OPD's optional backend before the five-second async progress deadline.
-    # A cold import can exceed that deadline when this test runs in isolation.
-    if not cancel:
-        importlib.import_module("relax.engine.rollout.sglang_rollout")
-
     args = _runtime_args(
         rollout_global_dataset=True,
         use_opd=True,
@@ -163,7 +157,7 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
         debug_rollout_only=False,
         save_debug_rollout_data=None,
     )
-    shard = runtime_mod._SessionShardBinding("shard", MagicMock(), node_id="node")
+    shard = runtime_mod._SessionShardBinding("shard", MagicMock())
     runtime = RuntimeDomain(args, "train", [shard], 2)
     monkeypatch.setattr(runtime, "_start_shard_observers", lambda: None)
     shard.handle.pause_generation.remote = AsyncMock(return_value=0)
@@ -575,11 +569,14 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
         start_group=SimpleNamespace(remote=AsyncMock()),
         drop_group=SimpleNamespace(remote=AsyncMock()),
     )
-    shard = SimpleNamespace(actor_name="shard", node_id="node", handle=handle, group_streams={}, next_session_number=0)
+    shard = SimpleNamespace(actor_name="shard", handle=handle, group_streams={}, next_session_number=0)
     runtime = RuntimeDomain(Namespace(rollout_global_dataset=False), "train", [shard], concurrency=2)
 
     async def exit_before_first_ir(_mode: str, group_id: str, _requests: Any) -> None:
-        shard.group_streams[group_id].first_request_barrier.set_result(False)
+        stream = shard.group_streams[group_id]
+        stream.first_request_barrier.set_result(False)
+        for result in stream.session_results:
+            result.completion.set_result(None)
 
     handle.start_group.remote.side_effect = exit_before_first_ir
     first = GroupInput("first", [Sample(group_index=0, index=0)])
@@ -602,36 +599,18 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
         await asyncio.gather(*tuple(prepare._warming_prepare_tasks))
         await asyncio.sleep(0)
 
+    streams = prepare.take_ready(2)
+    assert len(streams) == 2
+    for stream, _teacher, _keys in streams:
+        assert await runtime.collect_group(stream) is None
+    await asyncio.gather(*tuple(runtime._cleanup_tasks))
     assert handle.start_group.remote.await_count == 2
-    handle.drop_group.remote.assert_any_await(
-        "first", reason=None, expected_session_ids=tuple(sample.session_id for sample in first.samples)
-    )
-    handle.drop_group.remote.assert_any_await(
-        "second", reason=None, expected_session_ids=tuple(sample.session_id for sample in second.samples)
-    )
+    handle.drop_group.remote.assert_any_await("first", reason=None)
+    handle.drop_group.remote.assert_any_await("second", reason=None)
     assert runtime.resident_group_count == 0
-    assert warning.call_count == 2
+    assert warning.call_count == 0
     assert not prepare._warming_prepare_tasks
     assert not prepare._ready_prepare_tasks
-
-
-async def test_group_placement_balances_pending_reservations_before_launch() -> None:
-    shards = [
-        SimpleNamespace(actor_name=f"{node}-{index}", node_id=node, group_streams={})
-        for node in ("node-a", "node-b")
-        for index in range(2)
-    ]
-    runtime = RuntimeDomain(Namespace(), "train", shards, concurrency=4)
-    reservations = [await runtime._reserve_group_shard(f"group-{index}", None, 8) for index in range(4)]
-    assert [reservation.shard.actor_name for reservation in reservations] == [
-        "node-a-0",
-        "node-b-0",
-        "node-a-1",
-        "node-b-1",
-    ]
-    runtime._release_group_reservation("group-0", reservations[0])
-    replacement = await runtime._reserve_group_shard("replacement", None, 8)
-    assert replacement.shard is shards[0]
 
 
 def test_chat_request_validation_and_logprob_payload() -> None:
@@ -1073,6 +1052,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
     )
+    shard._agent_cleanup_tasks = set()
     shard._lifecycle_close_count = 0
     shard._lifecycle_close_failure_count = 0
     shard._notify_state_change = lambda group=None: None
@@ -1095,6 +1075,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
 
     assert await shard_cls._finish_session(shard, session, None) is None
     assert await shard_cls._finish_session(shard, session, None) is None
+    await asyncio.gather(*tuple(shard._agent_cleanup_tasks))
     shard._generation_backend.close_session.assert_awaited_once()
     assert shard._lifecycle_close_count == 1
     assert shard._lifecycle_close_failure_count == 0
@@ -1132,7 +1113,7 @@ async def test_lease_group_publishes_runtime_ownership_without_waiting_for_sessi
 
     assert group.ownership is GroupOwnership.RUNTIME
     assert [session.rollout_id for session in group.sessions] == [7, 7]
-    shard._set_group_timeout_active.assert_awaited_once()
+    shard._set_group_timeout_active.assert_not_awaited()
     shard._open_group.assert_awaited_once_with(group)
 
 
@@ -1166,69 +1147,6 @@ async def test_lease_group_preserves_prepare_error_priority_over_drop() -> None:
     assert group.ownership is GroupOwnership.PREPARE
     shard._set_group_timeout_active.assert_not_awaited()
     shard._open_group.assert_not_awaited()
-
-
-@pytest.mark.parametrize("resists_cancellation", [False, True])
-async def test_terminal_backend_join_retries_owned_abort_and_bounds_stuck_runner(monkeypatch, resists_cancellation):
-    from relax.agentic.session import service as service_mod
-
-    for name in ("_FINALIZATION_ABORT_TIMEOUT_S", "_FINALIZATION_BACKEND_GRACE_S", "_FINALIZATION_CANCEL_GRACE_S"):
-        monkeypatch.setattr(service_mod, name, 0.01)
-    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
-    shard = object.__new__(shard_cls)
-    abort = AsyncMock()
-    shard._generation_backend = SimpleNamespace(abort_request=abort)
-    result = _SessionResultCell()
-    group = ResidentGroup("train", "owned-group", {"owned-session": result}, [])
-    session = _SessionRecord(group, "owned-session", {}, result)
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def runner():
-        started.set()
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            if resists_cancellation:
-                await release.wait()
-            else:
-                raise
-
-    task = asyncio.create_task(runner())
-    unrelated = asyncio.create_task(release.wait())
-    await started.wait()
-    try:
-        operation = shard._join_finalizing_requests(session, [], {task: "owned-rid"})
-        if resists_cancellation:
-            with pytest.raises(RuntimeGroupError, match="backend_join did not settle"):
-                await asyncio.wait_for(operation, timeout=1)
-            assert not task.done()
-            assert not result.terminal
-        else:
-            assert await asyncio.wait_for(operation, timeout=1) == []
-            assert task.cancelled()
-            assert not session.backend_cleanup_tasks
-        assert [call.args for call in abort.await_args_list] == [("owned-rid",), ("owned-rid",)]
-        assert not unrelated.done()
-    finally:
-        release.set()
-        await asyncio.gather(task, unrelated, return_exceptions=True)
-
-
-async def test_drop_group_retains_owner_when_session_cleanup_has_not_settled():
-    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
-    shard = object.__new__(shard_cls)
-    result = _SessionResultCell()
-    group = ResidentGroup("train", "owned-group", {"owned-session": result}, [])
-    session = _SessionRecord(group, "owned-session", {}, result)
-    group.sessions.append(session)
-    shard._groups = {group.group_id: group}
-    shard._finish_session = AsyncMock(side_effect=RuntimeGroupError("backend_join did not settle"))
-    with pytest.raises(RuntimeGroupError, match="backend_join did not settle"):
-        await shard._drop_group(group)
-    assert shard._groups[group.group_id] is group
-    assert group.sessions == [session]
-    assert not result.terminal
 
 
 def test_compute_reservation_tokens_uses_expanded_prompt_and_remaining_decode() -> None:
@@ -1656,7 +1574,7 @@ def _router_recovery_shard():
         router_cb_timeout_duration_secs=0,
     )
     shard._train_generation_open = True
-    shard._eager_gate_lock = asyncio.Lock()
+    shard._generation_gate_lock = asyncio.Lock()
     shard._state_revision = 0
     shard._state_changed = asyncio.Event()
     group = ResidentGroup(rollout_mode="train", group_id="g1", result_cells={}, sessions=[])
@@ -1668,6 +1586,8 @@ def _router_recovery_shard():
     group.sessions.append(session)
     group.result_cells[session.session_id] = session.result_cell
     shard._groups = {group.group_id: group}
+    shard._session_records = {session.session_id: session}
+    group.first_ir_seen_session_ids.add(session.session_id)
     shard._set_runtime_timeouts_active = AsyncMock()
     shard._dispatch_queued_irs_locked = lambda _session: None
     shard._notify_state_change = lambda _group=None: None
@@ -2031,6 +1951,8 @@ def _managed_shard_session():
     shard._lora_sequence = 1
     shard._lora_live_sequences = {0}
     shard._lora_pending_releases = set()
+    shard._agent_cleanup_tasks = set()
+    shard._permit_cleanup_tasks = set()
     shard._session_records = {session.session_id: session}
     shard.args.agentic_session_lifecycle = False
     session.lora_key = SessionKey("s", "boot", 0)
@@ -2055,7 +1977,7 @@ async def test_managed_session_bind_lost_reply_retries_original_key():
     assert manager.publication(1).session_count == 0
 
 
-async def test_managed_session_finish_joins_pending_bind_before_release():
+async def test_managed_session_finish_publishes_before_pending_bind_cleanup():
     shard, group, session, ir, host, manager = _managed_shard_session()
     entered, resume = asyncio.Event(), asyncio.Event()
 
@@ -2072,16 +1994,59 @@ async def test_managed_session_finish_joins_pending_bind_before_release():
     ir.runner_task = task
     await entered.wait()
     closing = asyncio.create_task(shard._finish_session(session, None))
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert not closing.done()
+    assert await asyncio.wait_for(closing, 2) is None
+    assert session.result_cell.terminal and session not in group.sessions
     assert manager.publication(0).session_count == 1
     resume.set()
-    assert await asyncio.wait_for(closing, 2) is None
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     backend.generate.assert_not_awaited()
     assert manager.publication(0).session_count == 0
     assert session not in group.sessions
     assert not shard._lora_live_sequences
+
+
+@pytest.mark.parametrize("failure_stage", ["close", "release"])
+async def test_managed_cleanup_failure_keeps_result_and_retries_release(failure_stage):
+    shard, group, session, _ir, host, manager = _managed_shard_session()
+    await shard._bind_lora_session(session)
+    shard._generation_backend = SimpleNamespace(
+        close_session=AsyncMock(side_effect=TimeoutError("close unavailable") if failure_stage == "close" else None),
+        abort_request=AsyncMock(),
+    )
+    if failure_stage == "release":
+        shard._lora_runtime.release = remote(AsyncMock(side_effect=TimeoutError("release unavailable")))
+    await shard._finish_session(session, None)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+    assert session.result_cell.dropped and not group.sessions
+    assert shard._lora_pending_releases == ({session.lora_key} if failure_stage == "release" else set())
+    shard._lora_runtime.release = remote(host.release)
+    await shard.lora_heartbeat()
+    assert not shard._lora_pending_releases and not shard._lora_live_sequences
+    assert manager.publication(0).session_count == 0
+
+
+async def test_managed_release_retries_after_cleanup_cancels_pending_bind():
+    shard, _group, session, _ir, _host, manager = _managed_shard_session()
+    await shard._bind_lora_session(session)
+    session.lora_bind_task = asyncio.create_task(asyncio.Event().wait())
+    releasing = asyncio.create_task(shard._release_lora_session(session))
+    try:
+        await asyncio.sleep(0)
+        assert shard._lora_pending_releases == {session.lora_key}
+        releasing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await releasing
+        assert manager.publication(0).session_count == 1
+        assert shard._lora_live_sequences == {session.lora_key.sequence}
+        await shard.lora_heartbeat()
+        assert not shard._lora_pending_releases and not shard._lora_live_sequences
+        assert manager.publication(0).session_count == 0
+    finally:
+        releasing.cancel()
+        session.lora_bind_task.cancel()
+        await asyncio.gather(releasing, session.lora_bind_task, return_exceptions=True)
 
 
 async def test_managed_release_retry_watermark_preserves_unbound_prelaunch_session():
@@ -2153,6 +2118,8 @@ async def test_managed_generation_transport_error_aborts_and_ends_session():
     assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
     assert isinstance(session.result_cell.payload, RuntimeGroupError)
     assert session.session_id not in shard._session_records
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     assert manager.publication(0).session_count == 0
     observation = session.observation
     assert not observation.token_count_complete
@@ -2219,6 +2186,8 @@ async def test_managed_transport_failure_and_concurrent_finish_do_not_wait_on_ea
     await asyncio.sleep(0)
     resume.set()
     await asyncio.wait_for(asyncio.gather(runner, finishing), 2)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     assert manager.publication(0).session_count == 0
 
 

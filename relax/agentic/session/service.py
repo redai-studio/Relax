@@ -106,12 +106,9 @@ _AGENTIC_SHARD_ALLOCATOR_ENV = {
 # value permits more live Python coroutines and memory pressure.
 _AGENTIC_SHARD_MAX_CONCURRENCY = 4096
 _SESSION_CLOSE_TIMEOUT_S = 2.0
+_AGENT_CLEANUP_TIMEOUT_S = 150.0
+_SHUTDOWN_CLEANUP_GRACE_S = 5.0
 _ADMISSION_SHUTDOWN_TIMEOUT_S = 5.0
-# Only terminal Session cleanup uses these bounds. Pause/resume must still
-# receive and preserve the backend's partial response before parking an IR.
-_FINALIZATION_ABORT_TIMEOUT_S = 10.0
-_FINALIZATION_BACKEND_GRACE_S = 5.0
-_FINALIZATION_CANCEL_GRACE_S = 5.0
 
 # Identity sentinels encode the complete result-cell state machine without a
 # parallel status field. They must remain unique objects and must never cross a
@@ -1416,44 +1413,34 @@ class ResidentGroup:
     group_id: str
     result_cells: Dict[str, _SessionResultCell]
     sessions: list["_SessionRecord"]
-    resource_released_session_ids: set[str] = field(default_factory=set)
-    requires_resource_release: bool = False
     ownership: GroupOwnership = GroupOwnership.PREPARE
     change_revision: int = 0
     drop_task: Optional[asyncio.Task[None]] = None
     stop_reason: tuple[str, str, str] | None = None
-    timing_events: Dict[str, float] = field(default_factory=dict)
-    pending_session_specs: Dict[str, SessionSpec] = field(default_factory=dict)
-    eager_session_generation: bool = False
-    leased_rollout_id: int | None = None
+    drop_committed: bool = False
     first_ir_seen_session_ids: set[str] = field(default_factory=set)
-    closing: bool = False
-    eager_failure: RuntimeGroupError | None = None
-    eager_controlled_drop: bool = False
-    finalization_error: RuntimeGroupError | None = None
 
     @property
     def all_first_ir_arrived(self) -> bool:
-        return bool(self.result_cells) and self.first_ir_seen_session_ids == self.result_cells.keys()
+        return len(self.first_ir_seen_session_ids) == len(self.result_cells)
 
     @property
     def first_request_barrier_crossed(self) -> bool:
-        if self.eager_session_generation:
-            return self.ownership is GroupOwnership.PREPARE and not self.closing and self.all_first_ir_arrived
         return (
             self.ownership is GroupOwnership.PREPARE
             and self.first_error() is None
             and not self.dropped
-            and all(session.phase is SessionPhase.ACTIVE and session.live_irs for session in self.sessions)
+            and self.all_first_ir_arrived
         )
 
     @property
     def interrupted(self) -> bool:
-        if self.eager_session_generation and (not self.all_first_ir_arrived or self.closing):
-            # Unstarted members have no live IRs; they cannot promise async
-            # completion merely because the Session interrupted predicate is true.
-            return False
-        if self.ownership is GroupOwnership.PREPARE or self.first_error() is not None or self.dropped:
+        if (
+            self.ownership is GroupOwnership.PREPARE
+            or not self.all_first_ir_arrived
+            or self.first_error() is not None
+            or self.dropped
+        ):
             return False
         unfinished = sum(not cell.terminal for cell in self.result_cells.values())
         return unfinished > 0 and unfinished == sum(session.interrupted for session in self.sessions)
@@ -1467,10 +1454,6 @@ class ResidentGroup:
         return all(cell.terminal for cell in self.result_cells.values())
 
     def first_error(self) -> Optional[RuntimeGroupError]:
-        if self.finalization_error is not None:
-            return self.finalization_error
-        if self.eager_failure is not None:
-            return self.eager_failure
         for cell in self.result_cells.values():
             if isinstance(cell.payload, RuntimeGroupError):
                 return cell.payload
@@ -1478,7 +1461,7 @@ class ResidentGroup:
 
     @property
     def dropped(self) -> bool:
-        return any(cell.dropped for cell in self.result_cells.values())
+        return self.drop_committed or any(cell.dropped for cell in self.result_cells.values())
 
 
 @dataclass(eq=False)
@@ -1498,11 +1481,7 @@ class _SessionRecord:
     queued_irs: deque[InflightRequest] = field(default_factory=deque)
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
-    process_launch_attempted: bool = False
-    eager_timeout_active: bool = False
-    finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
-    finalization_retryable: bool = False
-    backend_cleanup_tasks: set["asyncio.Task[None]"] = field(default_factory=set)
+    finish_task: Optional["asyncio.Task[None]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
     lora_key: Optional[SessionKey] = None
@@ -1539,7 +1518,6 @@ class AgenticSessionShard:
     ) -> None:
         self.args = args
         self._groups: Dict[str, ResidentGroup] = {}
-        self._resource_release_receipts: Dict[str, Tuple[str, ...]] = {}
         # OpenAI ingress index. ResidentGroup.sessions owns each Session's
         # lifecycle; this table resolves a route token to that direct ref.
         self._session_records: Dict[str, _SessionRecord] = {}
@@ -1553,9 +1531,8 @@ class AgenticSessionShard:
         self._lora_pending_releases: set[SessionKey] = set()
         self._lora_release_lock = asyncio.Lock()
         self._train_generation_open = False
-        self._rollout_epoch: int | None = None
-        self._eager_shutdown = False
-        self._eager_gate_lock = asyncio.Lock()
+        self._generation_gate_lock = asyncio.Lock()
+        self._agent_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._state_revision = 0
         self._state_changed = asyncio.Event()
         self._sglang_request_limiter = admission_coordinator
@@ -1569,11 +1546,6 @@ class AgenticSessionShard:
             load_agent_app_spec_from_args(args),
             resolve_chat_api_base_url(),
         )
-
-    async def runtime_node_id(self) -> str:
-        """Expose this owner's node once when Runtime borrows its handle."""
-
-        return ray.get_runtime_context().get_node_id()
 
     async def set_router_address(self, router_ip: str, router_port: int) -> None:
         """Bind the ready managed router before any Session is launched."""
@@ -1640,9 +1612,10 @@ class AgenticSessionShard:
     async def _release_lora_session(self, session: _SessionRecord) -> Optional[BaseException]:
         if session.lora_key is None:
             return None
+        # Keep the heartbeat retry owner even if cleanup times out while binding.
+        self._lora_pending_releases.add(session.lora_key)
         if session.lora_bind_task is not None:
             await asyncio.gather(session.lora_bind_task, return_exceptions=True)
-        self._lora_pending_releases.add(session.lora_key)
         try:
             await self.lora_heartbeat()
         except Exception as error:
@@ -1655,7 +1628,7 @@ class AgenticSessionShard:
         self._state_revision += 1
         if group is not None:
             group.change_revision = self._state_revision
-            if group.all_first_ir_arrived if group.eager_session_generation else group.first_request_barrier_crossed:
+            if group.all_first_ir_arrived:
                 self._mark_group_timing(group, "group_first_requests_ready_at")
         self._state_changed.set()
 
@@ -1664,7 +1637,7 @@ class AgenticSessionShard:
         """First-start milestones only; never participate in scheduling."""
         if not self._trajectory_recorder.enabled:
             return
-        timestamp = group.timing_events.setdefault(event, time.time())
+        timestamp = time.time()
         for session in group.sessions:
             if session.forest is not None:
                 events = agentic_trace_events(session.forest.static_metadata)
@@ -1679,15 +1652,15 @@ class AgenticSessionShard:
             groups=tuple(
                 SessionGroupProgress(
                     group_id=group.group_id,
-                    ready_for_lease=group.first_request_barrier_crossed,
+                    ready_for_lease=(
+                        group.ownership is GroupOwnership.PREPARE and not group.dropped and group.first_error() is None
+                    ),
                     takeable_session_ids=tuple(
                         session_id for session_id, cell in group.result_cells.items() if cell.available
                     ),
                     interrupted=group.interrupted,
                     protected=group.protected,
-                    resource_released_session_ids=tuple(sorted(group.resource_released_session_ids)),
-                    all_first_ir_arrived=group.eager_session_generation and group.all_first_ir_arrived,
-                    error=group.finalization_error,
+                    all_first_ir_arrived=group.all_first_ir_arrived,
                 )
                 for group in groups
             ),
@@ -1719,37 +1692,13 @@ class AgenticSessionShard:
         rollout_mode: str,
         group_id: str,
         session_specs: Tuple[SessionSpec, ...],
-        *,
-        start_session_ids: Optional[Tuple[str, ...]] = None,
     ) -> None:
-        """Register every logical member; start only identities with granted
-        credits."""
+        """Register one group and start every Session agent."""
 
         if getattr(self, "_closed", False) or getattr(self, "_lora_configuring", False):
             raise RuntimeGroupError("SessionShard is not accepting new groups")
-        eager_session_generation = (
-            rollout_mode == "train" and getattr(self.args, "agentic_session_capacity_per_node", None) is not None
-        )
         if group_id in self._groups:
             raise RuntimeGroupError(f"group token is already resident: {group_id}")
-        all_ids = tuple(spec.session_id for spec in session_specs)
-        if eager_session_generation and (
-            self._eager_shutdown
-            or start_session_ids is None
-            or not all(spec.require_resource_release for spec in session_specs)
-        ):
-            # This owner rejected registration before any process could start.
-            # Preserve an older receipt rather than acknowledging another owner.
-            self._resource_release_receipts.setdefault(group_id, all_ids)
-            raise RuntimeGroupError("Eager startup requires its resource-accounted train scope")
-        if start_session_ids is not None:
-            if (
-                not all(spec.require_resource_release for spec in session_specs)
-                or len(set(start_session_ids)) != len(start_session_ids)
-                or not set(start_session_ids) <= set(all_ids)
-            ):
-                self._resource_release_receipts.setdefault(group_id, all_ids)
-                raise RuntimeGroupError("Deferred startup requires exact budgeted Session identities")
 
         result_cells = {session_spec.session_id: _SessionResultCell() for session_spec in session_specs}
         group = ResidentGroup(
@@ -1757,9 +1706,6 @@ class AgenticSessionShard:
             group_id=group_id,
             result_cells=result_cells,
             sessions=[],
-            requires_resource_release=any(spec.require_resource_release for spec in session_specs),
-            pending_session_specs={spec.session_id: spec for spec in session_specs},
-            eager_session_generation=eager_session_generation,
         )
         for sample_position, session_spec in enumerate(session_specs):
             session_id = session_spec.session_id
@@ -1787,43 +1733,8 @@ class AgenticSessionShard:
                 self._lora_sequence += 1
         self._session_records.update((session.session_id, session) for session in group.sessions)
 
-        await self.start_group_sessions(group_id, all_ids if start_session_ids is None else start_session_ids)
-
-    async def start_group_sessions(self, group_id: str, session_ids: Tuple[str, ...]) -> bool | None:
-        """Idempotently start granted members of an already registered
-        Group."""
-        group = self._groups.get(group_id)
-        if (
-            group is None
-            or len(set(session_ids)) != len(session_ids)
-            or not set(session_ids) <= group.result_cells.keys()
-        ):
-            raise RuntimeGroupError("Session grant does not belong to this resident Group")
-        if (
-            group.eager_session_generation
-            and (group.dropped or group.eager_controlled_drop)
-            and group.first_error() is None
-        ):
-            return False  # Controlled closure: no new process; caller still owes exact resource receipts.
-        if not any(sid in group.pending_session_specs for sid in session_ids):
-            return
-        eager_runtime = group.eager_session_generation and group.ownership is GroupOwnership.RUNTIME
-        if (
-            (group.ownership is not GroupOwnership.PREPARE and not eager_runtime)
-            or group.closing
-            or group.drop_task is not None
-            or group.first_error() is not None
-            or group.dropped
-            or group.terminal
-        ):
-            raise RuntimeGroupError("Cannot start a member after Group preparation closed")
         try:
-            for session_id in session_ids:
-                session_spec = group.pending_session_specs.pop(session_id, None)
-                if session_spec is None:
-                    continue
-                session = self._session_records[session_id]
-                sample_position = tuple(group.result_cells).index(session_id)
+            for sample_position, (session, session_spec) in enumerate(zip(group.sessions, session_specs, strict=True)):
                 session.session_sampling_params = self._session_sampling_params(session_spec, sample_position)
                 session.forest = SessionForest.create_empty(
                     session_id=session.session_id,
@@ -1833,17 +1744,14 @@ class AgenticSessionShard:
                     train_metadata=session_spec.train_metadata,
                     metadata=session_spec.metadata,
                 )
-                for event, timestamp in group.timing_events.items():
-                    mark_agentic_event_once(agentic_trace_events(session.forest.static_metadata), event, timestamp)
                 self._start_session(
                     session,
                     SessionInput(
                         session_id=session.session_id,
                         group_id=group_id,
-                        rollout_mode=group.rollout_mode,
+                        rollout_mode=rollout_mode,
                         input_payload=session_spec.input_payload,
                     ),
-                    require_resource_release=session_spec.require_resource_release,
                 )
         except BaseException as error:
             for session in tuple(group.sessions):
@@ -1901,87 +1809,20 @@ class AgenticSessionShard:
         """Move one prepared group ref into Runtime and release its IR gate."""
 
         group = self._groups[group_id]
-        if group.eager_session_generation:
-            async with self._eager_gate_lock:
-                self._raise_group_error(group)
-                if group.dropped or group.eager_controlled_drop:
-                    return
-                if (
-                    rollout_id != self._rollout_epoch
-                    or group.closing
-                    or self._eager_shutdown
-                    or not self._train_generation_open
-                    or group.dropped
-                    or group.terminal
-                ):
-                    raise RuntimeGroupError("Eager lease requires its live rollout epoch")
-                if group.leased_rollout_id is not None:
-                    if group.leased_rollout_id != rollout_id:
-                        raise RuntimeGroupError("Eager Group cannot change rollout identity")
-                    return
-                for session in tuple(group.sessions):
-                    async with session.lock:
-                        session.rollout_id = rollout_id
-                group.leased_rollout_id = rollout_id
-                group.ownership = GroupOwnership.RUNTIME
-            self._mark_group_timing(group, "group_runtime_leased_at")
-            await self._open_group(group)
-            return
         self._raise_group_error(group)
         if group.drop_task is not None or group.dropped:
             return
-        if not group.first_request_barrier_crossed:
-            raise RuntimeGroupError(f"cannot lease group before every first IR exists: {group.group_id}")
         # Commit every Session ID and Runtime ownership before a drop can interleave at an await.
         for session in group.sessions:
             session.rollout_id = rollout_id
         group.ownership = GroupOwnership.RUNTIME
         self._mark_group_timing(group, "group_runtime_leased_at")
-        await self._set_group_timeout_active(group, self._group_generation_open(group))
         await self._open_group(group)
 
     def _group_generation_open(self, group: ResidentGroup) -> bool:
         """Derive gate state from the Runtime-owned rollout mode."""
 
-        if group.eager_session_generation and (group.closing or self._eager_shutdown):
-            return False
         return group.rollout_mode != "train" or self._train_generation_open
-
-    async def _close_eager_group(
-        self, group: ResidentGroup, error: RuntimeGroupError | None = None, *, controlled: bool = False
-    ) -> None:
-        """Order permanent closing after any in-flight first timer
-        activation."""
-        async with self._eager_gate_lock:
-            if error is not None and group.eager_failure is None:
-                group.eager_failure = error
-            group.eager_controlled_drop |= controlled
-            group.closing = True
-        self._notify_state_change(group)
-
-    async def _activate_eager_session(self, session: "_SessionRecord") -> None:
-        """Only a leased member with a real first IR can start active time."""
-        group = session.group
-        async with self._eager_gate_lock:
-            async with session.lock:
-                if (
-                    self._groups.get(group.group_id) is not group
-                    or group.ownership is not GroupOwnership.RUNTIME
-                    or group.leased_rollout_id != session.rollout_id
-                    or not self._group_generation_open(group)
-                    or session.session_id not in group.first_ir_seen_session_ids
-                    or session.phase is not SessionPhase.ACTIVE
-                    or session.result_cell.terminal
-                ):
-                    return
-                if session.resources is None:
-                    raise RuntimeGroupError("Eager member has an IR without its process owner")
-                if not session.eager_timeout_active:
-                    await session.resources.process.set_timeout_active(True)
-                    session.eager_timeout_active = True
-                if self._group_generation_open(group) and session.phase is SessionPhase.ACTIVE:
-                    self._mark_group_timing(group, "group_generation_open_at")
-                    self._dispatch_queued_irs_locked(session)
 
     def _max_context_len(self, group: ResidentGroup) -> Optional[int]:
         return self.args.eval_max_context_len if group.rollout_mode == "eval" else self.args.rollout_max_context_len
@@ -1992,35 +1833,42 @@ class AgenticSessionShard:
         self._raise_group_error(group)
         if group.ownership is not GroupOwnership.RUNTIME or group.dropped or group.terminal:
             return
-        if group.eager_session_generation:
-            for session in tuple(group.sessions):
-                await self._activate_eager_session(session)
-            self._notify_state_change(group)
-            return
         if self._group_generation_open(group):
             self._mark_group_timing(group, "group_generation_open_at")
             for session in tuple(group.sessions):
                 if session.result_cell.terminal:
                     continue
-                async with session.lock:
-                    if not self._group_generation_open(group) or session.phase is not SessionPhase.ACTIVE:
-                        continue
-                    self._dispatch_queued_irs_locked(session)
+                await self._activate_session(session)
         # Scheduling or gating changes the Group's fully-async close credit.
         self._notify_state_change(group)
+
+    async def _activate_session(self, session: _SessionRecord) -> None:
+        """Activate one leased member after its first IR, under the step
+        gate."""
+
+        async with self._generation_gate_lock:
+            async with session.lock:
+                group = session.group
+                if (
+                    session.phase is not SessionPhase.ACTIVE
+                    or group.ownership is not GroupOwnership.RUNTIME
+                    or group.dropped
+                    or group.first_error() is not None
+                    or session.session_id not in group.first_ir_seen_session_ids
+                    or (not self._group_generation_open(group) and not session.protected_until_finalize)
+                ):
+                    return
+                if session.resources is not None:
+                    await session.resources.process.set_timeout_active(True)
+                self._dispatch_queued_irs_locked(session)
 
     async def pause_generation(self) -> int:
         """Gate train generation and park requests actually aborted."""
 
-        # Serialize closing with first-IR activation so an in-flight timer=True
-        # cannot arrive after pause has committed timer=False.
-        async with self._eager_gate_lock:
+        async with self._generation_gate_lock:
             self._train_generation_open = False
-        try:
-            await self._interrupt_running_requests()
-        finally:
-            async with self._eager_gate_lock:
-                await self._set_runtime_timeouts_active(False)
+            await self._set_runtime_timeouts_active(False)
+        await self._interrupt_running_requests()
         self._notify_state_change()
         return self._state_revision
 
@@ -2084,37 +1932,14 @@ class AgenticSessionShard:
     async def resume_generation(self, rollout_id: int) -> int:
         """Open the step and release prepared or interrupted Runtime groups."""
 
-        # Keep the gate closed until every resident Session, including members
-        # still waiting for physical credits, carries this step's rollout ID.
-        async with self._eager_gate_lock:
-            if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
-                if (
-                    self._eager_shutdown
-                    or self._train_generation_open
-                    or (self._rollout_epoch is not None and rollout_id <= self._rollout_epoch)
-                ):
-                    raise RuntimeGroupError("Eager generation requires a new paused rollout")
-                if not (getattr(self.args, "partial_rollout", False) or getattr(self.args, "fully_async", False)):
-                    allow_prepared = getattr(self.args, "agentic_prelaunch", False)
-                    if any(
-                        group.rollout_mode == "train"
-                        and (
-                            not allow_prepared
-                            or group.ownership is not GroupOwnership.PREPARE
-                            # A controlled prelaunch failure is still collected
-                            # as a dropped Group; it has never generated. Fatal
-                            # cleanup errors must continue to stop the epoch.
-                            or (group.closing and not group.eager_controlled_drop)
-                            or group.first_error() is not None
-                        )
-                        for group in self._groups.values()
-                    ):
-                        raise RuntimeGroupError("Synchronous eager resume requires Runtime groups to be released")
-                self._rollout_epoch = rollout_id
+        async with self._generation_gate_lock:
+            if getattr(self, "_closed", False):
+                raise RuntimeGroupError("Cannot open a new paused rollout after shutdown")
+            # Keep the gate closed until every resident Session carries this step's
+            # rollout ID. A concurrent OpenAI request therefore cannot start with
+            # the preceding step's ID.
             for group in tuple(self._groups.values()):
                 if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME:
-                    if group.eager_session_generation:
-                        group.leased_rollout_id = rollout_id
                     for session in tuple(group.sessions):
                         async with session.lock:
                             if session.phase is SessionPhase.ACTIVE:
@@ -2130,7 +1955,6 @@ class AgenticSessionShard:
                 for group in self._groups.values()
                 if group.rollout_mode == "train" and group.ownership is GroupOwnership.RUNTIME
             )
-            await asyncio.gather(*(self._set_group_timeout_active(group, True) for group in runtime_groups))
             self._train_generation_open = True
         for group in runtime_groups:
             await self._open_group(group)
@@ -2159,12 +1983,8 @@ class AgenticSessionShard:
                 if session.phase is SessionPhase.ACTIVE
                 and session.resources is not None
                 and not session.result_cell.terminal
+                and session.session_id in group.first_ir_seen_session_ids
                 and (active or not session.protected_until_finalize)
-                and (
-                    not active
-                    or not group.eager_session_generation
-                    or session.session_id in group.first_ir_seen_session_ids
-                )
             )
         )
 
@@ -2194,31 +2014,15 @@ class AgenticSessionShard:
         self._groups.pop(group_id)
         self._notify_state_change()
 
-    async def drop_group(
-        self,
-        group_id: str,
-        *,
-        reason: tuple[str, str, str] | None = None,
-        expected_session_ids: Tuple[str, ...] | None = None,
-    ) -> Tuple[str, ...]:
+    async def drop_group(self, group_id: str, *, reason: tuple[str, str, str] | None = None) -> None:
         """Discard one group through an idempotent cleanup path."""
 
         group = self._groups.get(group_id)
         if group is None:
-            # Replay a committed cleanup receipt after a lost RPC response.
-            return self._resource_release_receipts.get(group_id, ())
-        if expected_session_ids is not None and (
-            len(set(expected_session_ids)) != len(expected_session_ids)
-            or set(expected_session_ids) != set(group.result_cells)
-        ):
-            raise RuntimeGroupError(f"Session cleanup identities do not match the resident Group: {group_id}")
-        if group.eager_session_generation:
-            await self._close_eager_group(group)
-        if group.drop_task is None or (
-            group.drop_task.done() and (group.drop_task.cancelled() or group.drop_task.exception() is not None)
-        ):
-            if group.stop_reason is None:
-                group.stop_reason = reason
+            # Driver cancellation may retry after the remote release committed.
+            return
+        if group.drop_task is None:
+            group.stop_reason = reason
             group.drop_task = asyncio.create_task(
                 self._drop_group(group),
                 name=f"drop-group:{group.group_id}",
@@ -2227,17 +2031,6 @@ class AgenticSessionShard:
             group.drop_task,
             f"drop-group:{group.group_id}",
         )
-        return tuple(sorted(group.resource_released_session_ids))
-
-    async def get_resource_release_receipt(self, group_id: str) -> Tuple[str, ...]:
-        """Read an exact committed receipt without dropping an unknown
-        owner."""
-        return self._resource_release_receipts.get(group_id, ())
-
-    async def forget_resource_receipt(self, group_id: str) -> None:
-        """Runtime acknowledges the drop receipt after retiring its physical
-        debit."""
-        self._resource_release_receipts.pop(group_id, None)
 
     async def chat(
         self,
@@ -2421,7 +2214,9 @@ class AgenticSessionShard:
             "backend_request_count": sum(ir.backend_started for session in sessions for ir in session.live_irs),
             "live_process_count": sum(session.resources is not None for session in sessions),
             "interrupted_session_count": sum(session.interrupted for session in sessions),
-            "ready_for_lease": group.ownership is GroupOwnership.PREPARE and group.first_request_barrier_crossed,
+            "ready_for_lease": (
+                group.ownership is GroupOwnership.PREPARE and not group.dropped and group.first_error() is None
+            ),
             "interrupted": group.interrupted,
             "terminal": group.terminal,
         }
@@ -2430,57 +2225,52 @@ class AgenticSessionShard:
         """Drop resident groups, then release the Shard-owned backend."""
 
         task = getattr(self, "_shutdown_task", None)
-        if task is None or (task.done() and task.exception() is not None):
+        if task is None:
             task = asyncio.create_task(self._shutdown_once())
             self._shutdown_task = task
         await asyncio.shield(task)
 
     async def _shutdown_once(self) -> None:
         self._closed = True
-        if getattr(self.args, "agentic_session_capacity_per_node", None) is not None:
-            async with self._eager_gate_lock:
-                self._eager_shutdown = True
-                self._train_generation_open = False
-                for group in self._groups.values():
-                    group.closing = True
-        else:
-            self._train_generation_open = False
-        first_error: Optional[BaseException] = None
+        self._train_generation_open = False
         for group in tuple(self._groups.values()):
             try:
                 await self.drop_group(group.group_id, reason=("shutdown", "selection", "shard shut down"))
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-        permit_cleanup_outcomes = await asyncio.gather(
-            *tuple(self._permit_cleanup_tasks),
-            return_exceptions=True,
-        )
-        self._permit_cleanup_tasks.clear()
-        for outcome in permit_cleanup_outcomes:
-            if first_error is None and isinstance(outcome, BaseException):
-                first_error = outcome
-        # Drain queued trajectories before the backend goes away: shards run with
-        # max_restarts=0, so anything still in the writer queue is lost for good.
-        try:
-            await self._trajectory_recorder.aclose()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        try:
-            if not getattr(self, "_backend_shutdown_done", False):
-                await self._generation_backend.shutdown()
-                self._backend_shutdown_done = True
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        if first_error is not None:
-            raise first_error
-        if getattr(self, "_lora_runtime", None) is not None:
-            await self._lora_runtime.close_shard.remote(self._lora_shard_id, self._lora_instance_id)
-            self._lora_pending_releases.clear()
-            self._lora_live_sequences.clear()
-            self._lora_runtime = None
+            except Exception as error:
+                logger.warning("Group cleanup failed during shutdown group_id=%s: %s", group.group_id, error)
+        tasks = self._agent_cleanup_tasks | self._permit_cleanup_tasks
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=_SHUTDOWN_CLEANUP_GRACE_S)
+            for task in done:
+                if not task.cancelled() and (error := task.exception()) is not None:
+                    logger.warning("Shard cleanup failed during shutdown: %s", error)
+            for task in pending:
+                task.cancel()
+            if pending:
+                logger.warning("Shard shutdown leaving %s unfinished cleanup tasks", len(pending))
+                # Session cleanup finally publishes its terminal observation.
+                await asyncio.sleep(0)
+
+        async def close_lora_shard() -> None:
+            if getattr(self, "_lora_runtime", None) is not None:
+                await self._lora_runtime.close_shard.remote(self._lora_shard_id, self._lora_instance_id)
+                self._lora_pending_releases.clear()
+                self._lora_live_sequences.clear()
+                self._lora_runtime = None
+
+        operations = {
+            asyncio.create_task(self._trajectory_recorder.aclose(), name="trajectory-recorder-close"),
+            asyncio.create_task(self._generation_backend.shutdown(), name="agent-backend-shutdown"),
+            asyncio.create_task(close_lora_shard(), name="lora-shard-close"),
+        }
+        for task in operations:
+            self._agent_cleanup_tasks.add(task)
+            task.add_done_callback(self._agent_cleanup_done)
+        _, pending = await asyncio.wait(operations, timeout=_SHUTDOWN_CLEANUP_GRACE_S)
+        for task in pending:
+            task.cancel()
+        if pending:
+            logger.warning("Shard final cleanup did not finish within its shutdown grace")
 
     async def _chat(
         self,
@@ -2585,6 +2375,7 @@ class AgenticSessionShard:
             mark_agentic_event(profile, "ir_created_at")
             session.live_irs.add(ir)
             session.queued_irs.append(ir)
+            group.first_ir_seen_session_ids.add(session.session_id)
             if session.observation is not None:
                 self._observe_session(
                     session,
@@ -2593,15 +2384,8 @@ class AgenticSessionShard:
                     request_id=request_id,
                     sampling_config=copy.deepcopy(sampling_params),
                 )
-            if group.eager_session_generation:
-                group.first_ir_seen_session_ids.add(session.session_id)
-            else:
-                self._dispatch_queued_irs_locked(session)
+        await self._activate_session(session)
         self._notify_state_change(group)
-        if group.eager_session_generation:
-            await finish_before_cancellation(
-                self._activate_eager_session(session), f"eager-activate:{session.session_id}"
-            )
         try:
             return await asyncio.shield(ir.waiter)
         except AgenticChatRequestError as error:
@@ -2708,17 +2492,10 @@ class AgenticSessionShard:
                 prompt_tokens=prompt_tokens,
             )
 
-    def _start_session(
-        self, session: _SessionRecord, session_input: SessionInput, *, require_resource_release: bool = False
-    ) -> None:
+    def _start_session(self, session: _SessionRecord, session_input: SessionInput) -> None:
         """Attach a record-owned process to one Session."""
 
-        session.process_launch_attempted = True
-        process = (
-            self._agent_launcher.start_agent(session_input, require_resource_release=True)
-            if require_resource_release
-            else self._agent_launcher.start_agent(session_input)
-        )
+        process = self._agent_launcher.start_agent(session_input)
         if session.observation is not None:
             log_path = self._trajectory_recorder.session_log_path(session.session_id)
             if log_path is not None:
@@ -2756,9 +2533,7 @@ class AgenticSessionShard:
         if session.phase is not SessionPhase.ACTIVE:
             return
         group = session.group
-        if group.ownership is not GroupOwnership.RUNTIME:
-            return
-        if group.eager_session_generation and not session.eager_timeout_active:
+        if group.ownership is not GroupOwnership.RUNTIME or group.dropped or group.first_error() is not None:
             return
         if not self._group_generation_open(group) and not session.protected_until_finalize:
             return
@@ -3125,6 +2900,14 @@ class AgenticSessionShard:
             self._notify_state_change(group)
             return
         except RuntimeGroupError as error:
+            async with session.lock:
+                # A managed transport failure freezes the Session before aborting.
+                # An already published result still fences every late callback.
+                if session.result_cell.terminal or ir not in session.live_irs or ir.runner_task is not runner_task:
+                    return
+                ir.runner_task = None
+                ir.backend_started = False
+                finalizing = session.finish_task is not None
             self._observe_session(
                 session,
                 "request",
@@ -3134,12 +2917,6 @@ class AgenticSessionShard:
                 category="infra",
                 reason=str(error),
             )
-            async with session.lock:
-                if ir in session.live_irs and ir.runner_task is runner_task:
-                    ir.runner_task = None
-                    ir.backend_started = False
-                finalizing = session.finish_task is not None
-            # An existing finalizer may already be joining this runner.
             if not finalizing:
                 await self._handle_infra_failure(session, error)
             return
@@ -3373,6 +3150,8 @@ class AgenticSessionShard:
         """Watch one process and finalize its Session result."""
 
         process_error = await asyncio.shield(process_wait)
+        if session.phase is not SessionPhase.ACTIVE or self._session_records.get(session.session_id) is not session:
+            return
 
         group = session.group
         if isinstance(process_error, AgentExecutionError):
@@ -3385,11 +3164,7 @@ class AgenticSessionShard:
             )
             await self._handle_controlled_agent_failure(session, process_error)
             return
-        if (
-            group.rollout_mode == "eval"
-            and group.ownership is GroupOwnership.PREPARE
-            and not group.first_request_barrier_crossed
-        ):
+        if group.rollout_mode == "eval" and session.session_id not in group.first_ir_seen_session_ids:
             if process_error is None:
                 logger.error(
                     "Dropping agentic eval session that exited before its first request "
@@ -3457,8 +3232,7 @@ class AgenticSessionShard:
         )
 
     async def _finalize_terminal_session(self, session: _SessionRecord) -> None:
-        """Build the compact export, release Session resources, then
-        publish."""
+        """Build the compact export and publish before physical cleanup."""
 
         finalize_arrive_at = time.time()
         outcome: _SessionResultPayload
@@ -3633,271 +3407,159 @@ class AgenticSessionShard:
         outcome: _SessionResultPayload,
         *,
         failure: tuple[str, str, str] | None = None,
-    ) -> Optional[BaseException]:
-        """Give cleanup, publication, and Group removal one task owner."""
+    ) -> None:
+        """Publish once and detach before best-effort physical cleanup."""
 
-        if session.group.eager_session_generation and (outcome is None or isinstance(outcome, BaseException)):
-            await self._close_eager_group(
-                session.group, outcome if isinstance(outcome, RuntimeGroupError) else None, controlled=outcome is None
-            )
         async with session.lock:
-            finish_task = session.finish_task
-            retry = (
-                session.finalization_retryable
-                and finish_task is not None
-                and finish_task.done()
-                and (finish_task.cancelled() or finish_task.exception() is not None)
-            )
-            if finish_task is None or retry:
+            if session.finish_task is None and session in session.group.sessions:
                 session.phase = SessionPhase.FINALIZING
                 if session.observation is not None and session.observation.failure is None and failure is not None:
                     session.observation.failure = failure
-                if retry:
-                    # Unsettled backend or resource cleanup retains its fatal
-                    # outcome across a later controlled drop or late success.
-                    outcome = session.group.finalization_error
-                session.finalization_retryable = False
-                finish_task = asyncio.create_task(
-                    self._finish_session_once(session, outcome),
-                    name=f"session-finish:{session.session_id}",
+                session.finish_task = asyncio.create_task(
+                    self._finish_session_once(session, outcome), name=f"session-finish:{session.session_id}"
                 )
-                session.finish_task = finish_task
-        return await asyncio.shield(finish_task)
+            finish_task = session.finish_task
+        if finish_task is not None:
+            await asyncio.shield(finish_task)
 
-    async def _abort_finalizing_requests(self, session: _SessionRecord, request_ids: list[str]) -> list[BaseException]:
-        """Bound terminal abort RPCs and retain any unsettled task
-        ownership."""
-
-        if not request_ids:
-            return []
-        tasks = {
-            asyncio.create_task(
-                self._generation_backend.abort_request(request_id), name=f"finalize-abort:{request_id}"
-            )
-            for request_id in request_ids
-        }
-        session.backend_cleanup_tasks.update(tasks)
-        done, pending = await asyncio.wait(tasks, timeout=_FINALIZATION_ABORT_TIMEOUT_S)
-        errors: list[BaseException] = []
-        for task in pending:
-            task.cancel()
-        if pending:
-            errors.append(RuntimeGroupError(f"Session finalization abort_rpc timed out for {session.session_id}"))
-        for task in done:
-            if task.cancelled():
-                errors.append(RuntimeGroupError(f"Session finalization abort_rpc cancelled for {session.session_id}"))
-            elif (error := task.exception()) is not None:
-                errors.append(error)
-        return errors
-
-    async def _join_finalizing_requests(
-        self,
-        session: _SessionRecord,
-        pre_backend_tasks: list[asyncio.Task[None]],
-        backend_tasks: dict[asyncio.Task[None], str],
-    ) -> list[BaseException]:
-        """Close only this terminal Session's attempts, including a late
-        backend registration."""
-
-        active = {task: request_id for task, request_id in backend_tasks.items() if not task.done()}
-        errors = await self._abort_finalizing_requests(session, list(active.values()))
-        pending: set[asyncio.Task[None]] = set()
-        if active:
-            _, pending = await asyncio.wait(active, timeout=_FINALIZATION_BACKEND_GRACE_S)
-        if pending:
-            logger.warning(
-                "Session finalization backend_join grace expired; cancelling %d owned runners session_id=%s",
-                len(pending),
-                session.session_id,
-            )
-            for task in pending:
-                task.cancel()
-            # An initial abort can reach D before its RID is registered. Closing
-            # our local POST and repeating that exact RID covers the late arrival
-            # without aborting other Sessions or changing pause/resume behavior.
-            errors.extend(await self._abort_finalizing_requests(session, [active[task] for task in pending]))
-
-        owned_tasks = set(pre_backend_tasks) | set(backend_tasks) | session.backend_cleanup_tasks
-        if owned_tasks:
-            _, unsettled = await asyncio.wait(owned_tasks, timeout=_FINALIZATION_CANCEL_GRACE_S)
-            if unsettled:
-                # wait_for can itself wait forever for cancellation-resistant
-                # cleanup. Keep the Session/Group refs instead of publishing a
-                # result or claiming that these owners have been released.
-                phase = "abort_rpc" if unsettled & session.backend_cleanup_tasks else "backend_join"
-                raise RuntimeGroupError(
-                    f"Session finalization {phase} did not settle for {session.session_id}: "
-                    f"{len(unsettled)} owned task(s) remain"
-                )
-            await asyncio.gather(*owned_tasks, return_exceptions=True)
-        session.backend_cleanup_tasks.clear()
-        return errors
-
-    def _retain_failed_finalization(
-        self, session: _SessionRecord, outcome: _SessionResultPayload, error: RuntimeGroupError
-    ) -> None:
-        """Keep the original cleanup owner and wake Runtime without refunding
-        it."""
-
+    async def _finish_session_once(self, session: _SessionRecord, outcome: _SessionResultPayload) -> None:
         group = session.group
-        session.finalization_retryable = True
-        if group.finalization_error is None:
-            group.finalization_error = error
-        if session.observation is not None:
-            failure = session.observation.failure
-            if failure is None or failure[0] != "session_cleanup_failed":
-                failure = ("session_cleanup_failed", "infra", str(error))
-                session.observation.failure = failure
-            self._observe_session(
-                session, "cleanup", "failed", reason_code=failure[0], category=failure[1], reason=failure[2]
-            )
-        if isinstance(outcome, SessionExportTransport):
-            # A retry keeps the fatal outcome, not the successful export.
-            self._trajectory_recorder.record_export_failure(
-                outcome.exports, group_id=group.group_id, rollout_mode=group.rollout_mode, reason=str(error)
-            )
+        group.sessions.remove(session)
+        self._session_records.pop(session.session_id, None)
+        if outcome is None or isinstance(outcome, RuntimeGroupError):
+            group.drop_committed = True
+        session.protected_until_finalize = False
+        for ir in session.live_irs:
+            if not ir.waiter.done():
+                ir.waiter.set_result(_error_from_exception(_session_discarded_error(session.session_id)))
+            # Cancellation runs the runner's exact permit/lease compensation.
+            # Backend abort is independent of joining that runner.
+            if ir.runner_task is not None:
+                ir.runner_task.cancel()
+        session.result_cell.publish(outcome)
+        self._schedule_agent_cleanup(session, outcome)
         self._notify_state_change(group)
 
-    async def _finish_session_once(
-        self,
-        session: _SessionRecord,
-        outcome: _SessionResultPayload,
-    ) -> Optional[BaseException]:
-        """Release Session refs, publish once, then retire the lightweight
-        record."""
+    def _schedule_agent_cleanup(self, session: _SessionRecord, outcome: _SessionResultPayload) -> None:
+        task = asyncio.create_task(
+            self._cleanup_session_once(session, outcome), name=f"agent-cleanup:{session.session_id}"
+        )
+        self._agent_cleanup_tasks.add(task)
 
-        group = session.group
-        pre_backend_tasks: list[asyncio.Task[None]] = []
-        backend_tasks: dict[asyncio.Task[None], str] = {}
-        process_wait: Optional["asyncio.Task[Optional[BaseException]]"] = None
-        resources: Optional[SessionResources] = None
-        async with session.lock:
-            irs = tuple(session.live_irs)
-            for ir in irs:
-                runner_task = ir.runner_task
-                if runner_task is not None:
-                    if ir.backend_started:
-                        backend_tasks[runner_task] = _backend_request_id(ir)
-                    else:
-                        pre_backend_tasks.append(runner_task)
-            resources = session.resources
-            if resources is not None:
-                process_wait = resources.process_wait
+        def expire() -> None:
+            logger.warning("Agent cleanup timed out for session_id=%s", session.session_id)
+            task.cancel()
 
-        for runner_task in pre_backend_tasks:
-            runner_task.cancel()
-        try:
-            abort_outcomes = await self._join_finalizing_requests(session, pre_backend_tasks, backend_tasks)
-        except RuntimeGroupError as error:
-            self._retain_failed_finalization(session, outcome, error)
-            raise
-        lifecycle_closed = True
-        if self.args.agentic_session_lifecycle:
-            lifecycle_closed = await self._generation_backend.close_session(
-                session.session_id,
-                timeout_s=_SESSION_CLOSE_TIMEOUT_S,
+        deadline = asyncio.get_running_loop().call_later(_AGENT_CLEANUP_TIMEOUT_S, expire)
+        task.add_done_callback(lambda _: deadline.cancel())
+        task.add_done_callback(self._agent_cleanup_done)
+
+    def _agent_cleanup_done(self, task: asyncio.Task[None]) -> None:
+        self._agent_cleanup_tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.warning("Agent cleanup failed task=%s: %s", task.get_name(), error)
+
+    async def _cleanup_session_once(self, session: _SessionRecord, outcome: _SessionResultPayload) -> None:
+        """Clean retired resources without changing their published result."""
+
+        irs = tuple(session.live_irs)
+        resources = session.resources
+        runner_tasks = tuple(ir.runner_task for ir in irs if ir.runner_task is not None)
+        request_ids = tuple(_backend_request_id(ir) for ir in irs if ir.backend_started)
+        if resources is not None:
+            resources.watcher_task.cancel()
+
+        async def cleanup_backend() -> None:
+            abort_outcomes = await asyncio.gather(
+                *(self._generation_backend.abort_request(request_id) for request_id in request_ids),
+                return_exceptions=True,
             )
-        elif session.lora_key is not None:
-            await self._generation_backend.close_session(session.session_id, timeout_s=_SESSION_CLOSE_TIMEOUT_S)
-        lora_release_error = await self._release_lora_session(session)
-        async with session.lock:
+            for error in abort_outcomes:
+                if isinstance(error, BaseException):
+                    logger.warning("Agent backend abort failed for session_id=%s: %s", session.session_id, error)
+            await asyncio.gather(*runner_tasks, return_exceptions=True)
+            if self.args.agentic_session_lifecycle:
+                self._lifecycle_close_count += 1
+                closed = False
+                try:
+                    closed = await self._generation_backend.close_session(
+                        session.session_id, timeout_s=_SESSION_CLOSE_TIMEOUT_S
+                    )
+                except Exception as error:
+                    logger.warning("Backend session close failed for session_id=%s: %s", session.session_id, error)
+                finally:
+                    self._lifecycle_close_failure_count += int(not closed)
+                if not closed:
+                    logger.warning("Backend session close unconfirmed for session_id=%s", session.session_id)
+                    self._observe_session(
+                        session,
+                        "cleanup",
+                        "failed",
+                        reason_code="session_close_failed",
+                        category="infra",
+                        reason="backend session close was not confirmed",
+                    )
+            elif session.lora_key is not None:
+                try:
+                    await self._generation_backend.close_session(
+                        session.session_id, timeout_s=_SESSION_CLOSE_TIMEOUT_S
+                    )
+                except Exception as error:
+                    logger.warning("LoRA backend close failed for session_id=%s: %s", session.session_id, error)
+            release_error = await self._release_lora_session(session)
+            if release_error is not None:
+                logger.warning("LoRA session release failed for session_id=%s: %s", session.session_id, release_error)
+
+        operations = [asyncio.create_task(cleanup_backend(), name=f"backend-cleanup:{session.session_id}")]
+        if resources is not None:
+            operations.append(
+                asyncio.create_task(
+                    resources.process.terminate_and_join(), name=f"process-cleanup:{session.session_id}"
+                )
+            )
+        for operation in operations:
+            self._agent_cleanup_tasks.add(operation)
+            operation.add_done_callback(self._agent_cleanup_done)
+        try:
+            await asyncio.wait(operations)
+        finally:
+            # A cancellation-resistant process join stays owned in the task set,
+            # and cannot hold up logical retirement or Shard shutdown.
+            for operation in operations:
+                if not operation.done():
+                    operation.cancel()
+            if resources is not None:
+                resources.process_wait.cancel()
             for ir in irs:
                 ir.runner_task = None
                 ir.backend_started = False
-                ir.waiter.set_result(_error_from_exception(_session_discarded_error(session.session_id)))
             session.live_irs.clear()
             session.queued_irs.clear()
-        if resources is not None:
-            await asyncio.gather(resources.process.terminate_and_join(), return_exceptions=True)
-            if group.requires_resource_release and getattr(resources.process, "resource_released", False) is not True:
-                error = RuntimeGroupError(f"Session resource release unconfirmed for {session.session_id}")
-                self._retain_failed_finalization(session, outcome, error)
-                raise error
-        if process_wait is not None:
-            process_wait.cancel()
-            await asyncio.gather(process_wait, return_exceptions=True)
-        if resources is not None and session.observation is not None:
-            session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
-            session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
-        async with session.lock:
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
             session.resources = None
-        del self._session_records[session.session_id]
-
-        cleanup_error = next(
-            (abort_outcome for abort_outcome in abort_outcomes if isinstance(abort_outcome, BaseException)),
-            None,
-        )
-        if cleanup_error is None:
-            cleanup_error = lora_release_error
-        if self.args.agentic_session_lifecycle:
-            self._lifecycle_close_count += 1
-            self._lifecycle_close_failure_count += int(not lifecycle_closed)
-            if not lifecycle_closed:
+            if resources is not None and session.observation is not None:
+                session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
+                session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
+            failure = session.observation.failure if session.observation is not None else None
+            if isinstance(outcome, SessionExportTransport):
+                self._observe_session(session, "rollout", "completed", is_terminal=True)
+            else:
+                if failure is None:
+                    failure = (
+                        ("session_infra_failed", "infra", str(outcome))
+                        if isinstance(outcome, RuntimeGroupError)
+                        else ("group_discarded", "selection", "group discarded before session completion")
+                    )
                 self._observe_session(
                     session,
-                    "cleanup",
-                    "failed",
-                    reason_code="session_close_failed",
-                    category="infra",
-                    reason="backend session close was not confirmed",
+                    "rollout",
+                    "cancelled" if failure[1] == "selection" else "failed",
+                    is_terminal=True,
+                    reason_code=failure[0],
+                    category=failure[1],
+                    reason=failure[2],
                 )
-        if cleanup_error is not None:
-            if session.observation is not None:
-                session.observation.failure = (
-                    "session_cleanup_failed",
-                    "infra",
-                    f"{type(cleanup_error).__name__}: {cleanup_error}",
-                )
-            if isinstance(outcome, SessionExportTransport):
-                self._trajectory_recorder.record_export_failure(
-                    outcome.exports,
-                    group_id=group.group_id,
-                    rollout_mode=group.rollout_mode,
-                    reason=f"{type(cleanup_error).__name__}: {cleanup_error}",
-                )
-            if group.eager_session_generation:
-                await self._close_eager_group(
-                    group, RuntimeGroupError(f"Eager member cleanup failed: {cleanup_error}")
-                )
-            if isinstance(outcome, RuntimeGroupError):
-                outcome = RuntimeGroupError(
-                    f"{outcome}; cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
-                )
-            else:
-                outcome = RuntimeGroupError(
-                    f"agent cleanup failed for {session.session_id}: {type(cleanup_error).__name__}: {cleanup_error}"
-                )
-
-        failure = session.observation.failure if session.observation is not None else None
-        if not isinstance(outcome, SessionExportTransport):
-            if failure is None:
-                failure = (
-                    ("session_infra_failed", "infra", str(outcome))
-                    if isinstance(outcome, RuntimeGroupError)
-                    else ("group_discarded", "selection", "group discarded before session completion")
-                )
-            self._observe_session(
-                session,
-                "rollout",
-                "cancelled" if failure[1] == "selection" else "failed",
-                is_terminal=True,
-                reason_code=failure[0],
-                category=failure[1],
-                reason=failure[2],
-            )
-        else:
-            self._observe_session(session, "rollout", "completed", is_terminal=True)
-        if (resources is None and not session.process_launch_attempted) or (
-            resources is not None and getattr(resources.process, "resource_released", False) is True
-        ):
-            group.resource_released_session_ids.add(session.session_id)
-        group.pending_session_specs.pop(session.session_id, None)
-        session.result_cell.publish(outcome)
-        group.sessions.remove(session)
-        self._notify_state_change(group)
-        return cleanup_error
 
     async def _drop_group(self, group: ResidentGroup) -> None:
         """Discard a group and release every Session owner."""
@@ -3906,11 +3568,6 @@ class AgenticSessionShard:
         if self._groups.get(group_id) is not group:
             return
         sessions = tuple(group.sessions)
-        resources = tuple(session.resources for session in sessions if session.resources is not None)
-        watcher_tasks = tuple(resource.watcher_task for resource in resources)
-        for watcher in watcher_tasks:
-            watcher.cancel()
-
         failure = (
             ("group_member_failed", "selection", "another session in the group failed")
             if group.dropped or group.first_error() is not None
@@ -3920,41 +3577,24 @@ class AgenticSessionShard:
             *(self._finish_session(session, None, failure=failure) for session in sessions),
             return_exceptions=True,
         )
-        await asyncio.gather(*watcher_tasks, return_exceptions=True)
-        # A failed bounded join still owns its Session and must not disappear
-        # from shutdown's group inventory. Fully retired groups keep the normal
-        # release behavior even when cleanup reports a completed RPC failure.
-        if not group.sessions:
-            # Driver-side drop accounting can only see delivered results. Retire
-            # successful exports still owned by this shard before deleting them.
-            # A result already taken by an RPC is the driver's responsibility.
-            for cell in group.result_cells.values():
-                if isinstance(cell.payload, SessionExportTransport):
-                    self._trajectory_recorder.record_export_failure(
-                        cell.payload.exports,
-                        group_id=group_id,
-                        rollout_mode=group.rollout_mode,
-                        reason="group discarded before export delivery",
-                        reason_code="group_discarded_before_delivery",
-                        category="selection",
-                    )
-            if group.requires_resource_release:
-                self._resource_release_receipts[group_id] = tuple(sorted(group.resource_released_session_ids))
-            self._groups.pop(group_id, None)
-            self._notify_state_change()
+        # Driver-side drop accounting can only see delivered results. Retire
+        # successful exports still owned by this shard before deleting them.
+        # A result already taken by an RPC is the driver's responsibility.
+        for cell in group.result_cells.values():
+            if isinstance(cell.payload, SessionExportTransport):
+                self._trajectory_recorder.record_export_failure(
+                    cell.payload.exports,
+                    group_id=group_id,
+                    rollout_mode=group.rollout_mode,
+                    reason="group discarded before export delivery",
+                    reason_code="group_discarded_before_delivery",
+                    category="selection",
+                )
+        self._groups.pop(group_id, None)
+        self._notify_state_change()
         for outcome in cleanup_outcomes:
             if isinstance(outcome, BaseException):
                 raise outcome
-        if group.finalization_error is not None:
-            # Cleanup may have committed while a sibling's controlled drop
-            # raced the error notification. Preserve the fatal error; the
-            # committed resource receipt is replayable on the next RPC.
-            raise group.finalization_error
-        if group.eager_session_generation and group.eager_failure is not None:
-            # A member may already have retired before a sibling's controlled
-            # drop reaches us. Its fatal result must survive that drop; the
-            # committed physical receipt remains replayable on the next RPC.
-            raise group.eager_failure
 
 
 def create_agentic_session_shards(

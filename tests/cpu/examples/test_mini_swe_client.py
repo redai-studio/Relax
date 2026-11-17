@@ -67,7 +67,7 @@ def client_server(tmp_path):
     thread.start()
     processes = []
 
-    def start(*, receipt=False):
+    def start():
         env = {
             **os.environ,
             "AGENT_SERVER_URL": f"http://127.0.0.1:{server.server_port}",
@@ -76,9 +76,6 @@ def client_server(tmp_path):
             "RELAX_ROLLOUT_MODE": "train",
             "RELAX_BASE_URL": "http://unused",
             "RELAX_OUTPUT_JSON": str(tmp_path / "output.json"),
-            "RELAX_REQUIRE_RESOURCE_RELEASE": "1" if receipt else "0",
-            "RELAX_RESOURCE_RELEASE_NONCE": "nonce",
-            "RELAX_RESOURCE_RELEASE_PATH": str(tmp_path / "release.json"),
             "POLL_INTERVAL_SECONDS": "0.01",
             "INITIAL_POLL_DELAY_SECONDS": "0",
             "AGENT_CLIENT_TRACE_DIR": str(tmp_path / "traces"),
@@ -106,10 +103,9 @@ def client_server(tmp_path):
         thread.join(timeout=2)
 
 
-@pytest.mark.parametrize("receipt", [False, True])
-def test_shell_entrypoint_waits_for_external_release_before_output(client_server, tmp_path, receipt):
+def test_shell_entrypoint_waits_for_external_release_before_output(client_server, tmp_path):
     start, state, polled, _cancelled, released = client_server
-    process = start(receipt=receipt)
+    process = start()
     assert polled.wait(timeout=3)
     time.sleep(0.05)
     assert process.poll() is None
@@ -122,23 +118,15 @@ def test_shell_entrypoint_waits_for_external_release_before_output(client_server
         "reward": 0.5,
     }
     assert state["create"]["group_id"] == "group"
-    if receipt:
-        assert json.loads((tmp_path / "release.json").read_text()) == {
-            "schema": 1,
-            "session_id": "client",
-            "nonce": "nonce",
-            "status": "released",
-        }
 
 
 def test_client_cancellation_waits_for_release_and_does_not_write_failure_trace(client_server, tmp_path):
     start, _state, polled, cancelled, released = client_server
-    process = start(receipt=True)
+    process = start()
     assert polled.wait(timeout=3)
     process.send_signal(signal.SIGTERM)
     assert cancelled.wait(timeout=3)
     assert process.poll() is None
-    assert json.loads((tmp_path / "release.json").read_text())["status"] == "unknown"
     released.set()
     process.communicate(timeout=5)
     assert process.returncode == 143

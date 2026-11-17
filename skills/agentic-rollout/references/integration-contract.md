@@ -51,31 +51,13 @@ The command runs through `/bin/bash -lc`; inspect login-profile behavior if it m
 
 ## Resource ownership
 
-`--agent-resource-owner-path` defaults to `relax.agentic.runner.resources.ProcessGroupResourceOwner`, which covers the
-launcher's process group without an application receipt. It does not cover remote jobs, containers managed elsewhere,
-or descendants that escape the process group. Use `ReceiptResourceOwner` from the same module, or a custom
-`SessionResourceOwner`, for that scope. Do not infer ownership from a recipe name.
+The command launched through `--agent-command` cleans up its tools, descendants, containers, and remote jobs. This
+applies both to natural exit and to termination by SIGTERM from Relax because of a timeout or another reason. Preserve
+cancellation identities and write terminal output atomically. Verify cleanup with actual executor state; a cancellation
+ACK alone does not prove the remote work has exited.
 
-External adapters receive `RELAX_REQUIRE_RESOURCE_RELEASE=1`, `RELAX_RESOURCE_RELEASE_PATH`, and
-`RELAX_RESOURCE_RELEASE_NONCE`. On normal completion, failure, and cancellation, stop/join the actual external work
-before atomically writing exactly this terminal payload, then exit:
-
-```text
-{"schema": 1, "session_id": <RELAX_SESSION_ID>, "nonce": <RELAX_RESOURCE_RELEASE_NONCE>, "status": "released"}
-```
-
-The nonce binds one launch, not a reusable task slot. No response, a cancel ACK without physical cleanup, or a missing,
-invalid, or old receipt must not become a successful release. Task success/reward is independent of physical release.
-See the runnable receipt helper in `docs/en/guide/agentic-rollout.md#resource-ownership-and-release`.
-
-Custom owners receive a `ResourceLease` before command launch. Their `launch_environment()`, `confirm_release()`, and
-`diagnostics()` hooks are bounded synchronous local operations; confirmation is idempotent and returns a matching
-`ResourceReleaseReceipt` or `None`. Do not start resources in a constructor or perform remote cleanup in verification.
-The agent's cancellation path owns remote cleanup; the launcher joins the local process group before confirmation.
-
-Enable `--agentic-session-capacity-per-node` only after this scope is correct. The framework returns individual slots
-on confirmed release and retains uncertain owners for retry. The adapter remains necessary even when logical Groups
-fail, are filtered, or survive a step boundary.
+Relax retires logical Sessions before running best-effort process/backend cleanup in the background. Cleanup failures
+warn and do not invalidate published exports or hold Group permits. The external service manages its own quotas.
 
 ## Dataset mapping
 
@@ -195,8 +177,8 @@ Before experiment preflight, verify:
    protocol-specific finish reasons;
 7. implicit or explicit export resolves to committed state;
 8. export count and advantage match `agentic-training-contract.md`;
-9. agent, tool, sandbox, and external resources clean up on completion and cancellation; release proof matches the
-   current launch and an uncertain outcome does not refund capacity.
+9. the launched `--agent-command` cleans up tool, sandbox, and external resources on natural exit and on SIGTERM from
+   Relax; Relax fallback cleanup does not block logical completion.
 
 Source anchors: `docs/en/guide/agentic-rollout.md`, `relax/agentic/runner/ipc.py`,
 `relax/agentic/session/service.py`, `relax/agentic/session/state.py`, `relax/agentic/pipeline/reward.py`, and

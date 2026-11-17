@@ -46,7 +46,7 @@ target-load validation.
 ## Validate the change
 
 1. Record the exact revision, relevant current values, target Session counts, and maximum observed per-Shard load.
-2. Prove complete-Group results under the chosen ordinary barrier or capacity-managed incremental-start lifecycle.
+2. Prove complete-Group results while leased members generate independently when ready.
 3. Reach the target Prepare/prelaunch fanout without stalled first-request progress.
 4. Complete a target-size train rollout and optimizer step.
 5. Exercise train/Eval overlap when configured.

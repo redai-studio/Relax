@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Mini-swe HTTP client with identity-bound physical resource receipts."""
+"""Mini-swe HTTP client owning remote task completion and cancellation."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def atomic_json(path: Path, value: dict) -> None:
 
 
 class _TransientRequestError(Exception):
-    """An HTTP transport failure, distinct from local output/receipt I/O."""
+    """An HTTP transport failure, distinct from local output I/O."""
 
     def __init__(self, cause: BaseException):
         super().__init__(type(cause).__name__)
@@ -56,9 +56,7 @@ def trace_failure(session_id: str, result: dict) -> None:
 def run() -> int:
     base = os.environ["AGENT_SERVER_URL"].rstrip("/")
     sid = os.environ["RELAX_SESSION_ID"]
-    required = os.environ.get("RELAX_REQUIRE_RESOURCE_RELEASE") == "1"
-    nonce = os.environ["RELAX_RESOURCE_RELEASE_NONCE"] if required else uuid.uuid4().hex
-    release_path = Path(os.environ["RELAX_RESOURCE_RELEASE_PATH"]) if required else None
+    nonce = uuid.uuid4().hex
     expected = {"schema": 1, "session_id": sid, "nonce": nonce, "status": "released"}
     cancel_deadline: float | None = None
     cancel_reason = ""
@@ -79,8 +77,6 @@ def run() -> int:
 
     signal.signal(signal.SIGTERM, cancel)
     signal.signal(signal.SIGINT, cancel)
-    if release_path is not None:
-        atomic_json(release_path, {**expected, "status": "unknown"})
 
     def request(path: str, payload: dict | None = None, *, timeout: float = 2.0) -> dict:
         if cancel_deadline is not None:
@@ -131,11 +127,7 @@ def run() -> int:
         retry_delay = poll_interval
         try:
             if cancel_deadline is not None and not create_attempted:
-                # No request could have allocated remote resources. Publish the
-                # exact lease proof in normal control flow, never in the handler.
-                phase = "release_receipt"
-                if release_path is not None:
-                    atomic_json(release_path, expected)
+                # No request could have allocated remote resources.
                 _diagnostic(f"cancelled before create reason={cancel_reason}")
                 return 1 if protocol_error else 143
             if server_sid is None:
@@ -172,15 +164,11 @@ def run() -> int:
             ):
                 raise RuntimeError("Agent server resource-release identity mismatch")
             released = release == expected
-            if released and release_path is not None:
-                phase = "release_receipt"
-                atomic_json(release_path, expected)
             if result.get("resource_release_failed"):
                 trace_failure(sid, result)
                 sys.stderr.write("Agent Session cleanup failed; physical release remains unconfirmed\n")
                 return 1
-            # Mini SWE always owns external resources. Even without a Runtime
-            # capacity limit, returning a result must wait for their release.
+            # The root owns remote cleanup on completion and cancellation.
             if result.get("status") in {"completed", "failed", "cancelled"} and released:
                 if protocol_error:
                     _diagnostic("failed after invalid server response; resources released")
