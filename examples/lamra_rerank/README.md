@@ -55,10 +55,8 @@ collator's supervision boundary: the assistant header, answer, end token and
 following newline contribute to loss. With the Qwen2-VL reference tokenizer, the two
 pointwise answers have 6 supervised tokens each and the listwise answer has 10.
 The recipe converts images to RGB and applies the factor-28 reference resize
-before passing them to the model's processor. The script pins the PIL processor
-through `RELAX_HF_PROCESSOR_USE_FAST=0`,
-including spawned processor workers. Full sequences are kept; the reference's `model_max_length=2048` did not
-actually truncate its processor output.
+before passing them to the model's processor. Full sequences are kept. The
+reference's `model_max_length=2048` did not truncate its processor output.
 
 Image paths cross the processor-pool boundary; decoding, RGB conversion and
 reference resizing run inside its workers. The recipe uses 32 prefetch threads

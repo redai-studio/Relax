@@ -17,7 +17,6 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_LORA_A_INIT_METHOD="${RELAX_LORA_A_INIT_METHOD:-kaiming}"
-export RELAX_HF_PROCESSOR_USE_FAST=0
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 RUNTIME_ENV_JSON=$(python3 - <<'PY'
 import json
@@ -25,7 +24,6 @@ import os
 
 runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
 runtime.setdefault("env_vars", {})["RELAX_LORA_A_INIT_METHOD"] = os.environ["RELAX_LORA_A_INIT_METHOD"]
-runtime["env_vars"]["RELAX_HF_PROCESSOR_USE_FAST"] = os.environ["RELAX_HF_PROCESSOR_USE_FAST"]
 runtime["env_vars"]["TOKENIZERS_PARALLELISM"] = os.environ["TOKENIZERS_PARALLELISM"]
 print(json.dumps(runtime))
 PY
