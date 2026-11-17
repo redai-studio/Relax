@@ -1037,7 +1037,15 @@ class AgentServer:
         error = ""
         info: dict[str, Any] = {}
         proc = None
+        cancel_read = cancel_write = None
         launch_attempted = False
+
+        def close_cancel_write() -> None:
+            nonlocal cancel_write
+            descriptor, cancel_write = cancel_write, None
+            if descriptor is not None:
+                os.close(descriptor)
+
         try:
             control = self.tmp_base / f"{server_session_id}-control"
             control.mkdir(mode=0o700)
@@ -1064,6 +1072,9 @@ class AgentServer:
             spec_path.write_text(json.dumps(spec))
             env = dict(os.environ, AGENT_SERVER_REWARD_LOCK_DIR=str(self.tmp_base / "reward_slots"))
             with (control / "worker.log").open("w") as log:
+                cancel_read, cancel_write = os.pipe()
+                if record.cancel_event.is_set():
+                    close_cancel_write()
                 with _owned_lock:
                     # Once Popen is called, an exception is not proof that no
                     # external worker was launched. Only earlier failures own
@@ -1075,18 +1086,23 @@ class AgentServer:
                             str(Path(__file__).with_name("session_process.py")),
                             str(spec_path),
                             str(report_path),
+                            "--cancel-fd",
+                            str(cancel_read),
                         ],
+                        pass_fds=(cancel_read,),
                         env=env,
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
                     )
                     _owned_child_pids.add(proc.pid)
-                signalled = False
+                descriptor, cancel_read = cancel_read, None
+                os.close(descriptor)
                 while proc.poll() is None:
-                    if record.cancel_event.is_set() and not signalled:
-                        proc.terminate()
-                        signalled = True
+                    if record.cancel_event.is_set() and cancel_write is not None:
+                        # EOF remains visible even before the supervisor installs
+                        # signal handlers, and parent exit closes it automatically.
+                        close_cancel_write()
                     time.sleep(0.05)
                 proc.wait()
             if not report_path.exists():
@@ -1123,6 +1139,12 @@ class AgentServer:
                 record.resources_released = True
             error = f"{type(exc).__name__}: {exc}"
         finally:
+            try:
+                if cancel_read is not None:
+                    descriptor, cancel_read = cancel_read, None
+                    os.close(descriptor)
+            finally:
+                close_cancel_write()
             if proc is not None and proc.poll() is not None:
                 _unregister_child(proc.pid)
         with self.lock:

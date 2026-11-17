@@ -91,7 +91,20 @@ def instance_absent(spec: dict, deadline: float, *, stop: bool) -> bool:
     return not any(line.split() and line.split()[0] == name for line in result.stdout.splitlines()[1:])
 
 
-def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] | None = None) -> None:
+def supervise(
+    spec_path: Path, report_path: Path, *, worker_command: list[str] | None = None, cancel_fd: int | None = None
+) -> None:
+    """Own the cancellation pipe until supervision and cleanup have settled."""
+    try:
+        if cancel_fd is not None:
+            os.set_blocking(cancel_fd, False)
+        _supervise(spec_path, report_path, worker_command=worker_command, cancel_fd=cancel_fd)
+    finally:
+        if cancel_fd is not None:
+            os.close(cancel_fd)
+
+
+def _supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] | None, cancel_fd: int | None) -> None:
     cancelled_at: float | None = None
     parent_pid = os.getppid()
 
@@ -105,8 +118,18 @@ def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] |
     enable_subreaper()
     spec = json.loads(spec_path.read_text())
     parent_pid = spec.get("server_pid", parent_pid)
-    if os.getppid() != parent_pid:
-        cancel(0, None)
+
+    def check_cancel() -> None:
+        if os.getppid() != parent_pid:
+            cancel(0, None)
+        if cancel_fd is not None:
+            try:
+                if not os.read(cancel_fd, 1):
+                    cancel(0, None)
+            except BlockingIOError:
+                pass
+
+    check_cancel()
     result_path = report_path.with_suffix(".worker.json")
     command = worker_command or [
         sys.executable,
@@ -115,14 +138,13 @@ def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] |
         str(spec_path),
         str(result_path),
     ]
-    worker = subprocess.Popen(command, start_new_session=True)
+    worker = None if cancelled_at is not None else subprocess.Popen(command, start_new_session=True)
     sent_term = False
     supervisor_error = ""
     try:
-        while worker.poll() is None:
+        while worker is not None and worker.poll() is None:
             reap_exited_children(worker.pid)
-            if os.getppid() != parent_pid:
-                cancel(0, None)
+            check_cancel()
             if cancelled_at is not None:
                 try:
                     if not sent_term:
@@ -136,17 +158,18 @@ def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] |
     except BaseException as exc:
         supervisor_error = f"{type(exc).__name__}: {exc}"
     finally:
-        if worker.poll() is None:
-            try:
-                os.killpg(worker.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        worker.wait()
+        if worker is not None:
+            if worker.poll() is None:
+                try:
+                    os.killpg(worker.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            worker.wait()
     deadline = (cancelled_at + 35.0) if cancelled_at is not None else time.monotonic() + 25.0
     error = supervisor_error
     absent = False
     try:
-        absent = instance_absent(spec, deadline, stop=True)
+        absent = instance_absent(spec, deadline, stop=worker is not None)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     children_reaped = reap_children(deadline)
@@ -158,23 +181,25 @@ def supervise(spec_path: Path, report_path: Path, *, worker_command: list[str] |
             error = f"{type(exc).__name__}: {exc}"
         # The verification subprocess was also wait()ed, but verify the invariant again.
         children_reaped = reap_children(deadline)
-    result = {"info": {}, "error": f"Session worker exited with code {worker.returncode} without a valid result"}
-    try:
-        candidate = json.loads(result_path.read_text())
-        if not isinstance(candidate, dict) or not isinstance(candidate.get("info"), dict):
-            raise ValueError("Worker result has invalid info")
-        if not isinstance(candidate.get("error"), str):
-            raise ValueError("Worker result has invalid error")
-        result = candidate
-    except (OSError, ValueError) as exc:
-        result["error"] += f": {type(exc).__name__}: {exc}"
-    if not result["error"]:
-        if worker.returncode != 0:
-            result["error"] = f"Session worker exited with code {worker.returncode}"
-        elif cancelled_at is not None:
-            result["error"] = "Session supervisor cancelled the worker"
-        elif supervisor_error:
-            result["error"] = supervisor_error
+    result = {"info": {}, "error": "Session cancelled before worker launch"}
+    if worker is not None:
+        result["error"] = f"Session worker exited with code {worker.returncode} without a valid result"
+        try:
+            candidate = json.loads(result_path.read_text())
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("info"), dict):
+                raise ValueError("Worker result has invalid info")
+            if not isinstance(candidate.get("error"), str):
+                raise ValueError("Worker result has invalid error")
+            result = candidate
+        except (OSError, ValueError) as exc:
+            result["error"] += f": {type(exc).__name__}: {exc}"
+        if not result["error"]:
+            if worker.returncode != 0:
+                result["error"] = f"Session worker exited with code {worker.returncode}"
+            elif cancelled_at is not None:
+                result["error"] = "Session supervisor cancelled the worker"
+            elif supervisor_error:
+                result["error"] = supervisor_error
     report = {
         **result,
         "nonce": spec["release_nonce"],
@@ -198,5 +223,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("spec", type=Path)
     parser.add_argument("report", type=Path)
+    parser.add_argument("--cancel-fd", type=int)
     arguments = parser.parse_args()
-    supervise(arguments.spec, arguments.report)
+    supervise(arguments.spec, arguments.report, cancel_fd=arguments.cancel_fd)

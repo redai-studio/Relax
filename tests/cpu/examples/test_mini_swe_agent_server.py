@@ -467,6 +467,13 @@ def test_start_failure_releases_only_proven_empty_allocation(supervised_server, 
     opened = Path.open
     mkdir = Path.mkdir
     launches = []
+    pipe = os.pipe
+    pipe_descriptors = []
+
+    def track_pipe():
+        descriptors = pipe()
+        pipe_descriptors.extend(descriptors)
+        return descriptors
 
     def fail_mkdir(path, *args, **kwargs):
         if failure == "mkdir" and path.name == "finishing-control":
@@ -484,6 +491,7 @@ def test_start_failure_releases_only_proven_empty_allocation(supervised_server, 
 
     monkeypatch.setattr(Path, "mkdir", fail_mkdir)
     monkeypatch.setattr(Path, "open", fail_open)
+    monkeypatch.setattr(agent_server.os, "pipe", track_pipe)
     monkeypatch.setattr(agent_server.subprocess, "Popen", fail_launch)
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(server._run_supervised_session, "finishing", 0)
@@ -495,3 +503,105 @@ def test_start_failure_releases_only_proven_empty_allocation(supervised_server, 
     assert bool(launches) is (failure == "launch")
     assert result["resource_release"]["status"] == ("unknown" if failure == "launch" else "released")
     assert result["resource_release_failed"] is (failure == "launch")
+    for descriptor in pipe_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper and /proc contract")
+@pytest.mark.parametrize("cancel_at", ["spec_write", "supervisor_start"])
+def test_cancel_survives_supervisor_startup(supervised_server, real_popen, monkeypatch, tmp_path, cancel_at):
+    server = supervised_server
+    cli = tmp_path / "apptainer"
+    cli.write_text("#!/bin/sh\necho 'INSTANCE PID'\n")
+    cli.chmod(0o755)
+    server.apptainer_args = (str(cli), [])
+    launched = tmp_path / "worker-launched"
+    spec = tmp_path / "finishing-control/spec.json"
+    read_fd, write_fd = os.pipe()
+    spare_fd = os.open(os.devnull, os.O_RDONLY)
+    processes = []
+    write_text = Path.write_text
+    pipe, close = os.pipe, os.close
+    cancel_descriptors = []
+    writer_closed, reader_closed = threading.Event(), threading.Event()
+
+    def track_pipe():
+        descriptors = pipe()
+        if not cancel_descriptors:
+            cancel_descriptors.extend(descriptors)
+        return descriptors
+
+    def track_close(descriptor):
+        close(descriptor)
+        if cancel_descriptors and descriptor == cancel_descriptors[1] and not writer_closed.is_set():
+            # Reuse the exact integer immediately. A stale second close in the
+            # server's finally block would close another Session's descriptor.
+            os.dup2(spare_fd, descriptor)
+            writer_closed.set()
+        elif cancel_descriptors and descriptor == cancel_descriptors[0]:
+            reader_closed.set()
+
+    def cancel_after_spec_write(path, *args, **kwargs):
+        result = write_text(path, *args, **kwargs)
+        if path == spec and cancel_at == "spec_write":
+            server.cancel_session("finishing")
+        return result
+
+    worker = f"from pathlib import Path;Path({str(launched)!r}).write_text('started')"
+
+    def launch(command, **kwargs):
+        # Hold the actual supervisor before it imports the implementation or
+        # installs signal handlers. The old immediate SIGTERM kills it here.
+        runner = (
+            "import os,sys;from pathlib import Path;"
+            f"os.read({read_fd},1);os.close({read_fd});"
+            f"sys.path.insert(0,{str(_EXAMPLE_DIR)!r});from session_process import supervise;"
+            f"supervise(Path(sys.argv[1]),Path(sys.argv[2]),worker_command=[sys.executable,'-c',{worker!r}],"
+            f"cancel_fd={int(command[command.index('--cancel-fd') + 1])})"
+        )
+        kwargs["pass_fds"] = (*kwargs["pass_fds"], read_fd)
+        process = real_popen([sys.executable, "-c", runner, command[2], command[3]], **kwargs)
+        processes.append(process)
+        if cancel_at == "supervisor_start":
+            server.cancel_session("finishing")
+        return process
+
+    monkeypatch.setattr(Path, "write_text", cancel_after_spec_write)
+    monkeypatch.setattr(agent_server.os, "pipe", track_pipe)
+    monkeypatch.setattr(agent_server.os, "close", track_close)
+    monkeypatch.setattr(agent_server.subprocess, "Popen", launch)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(server._run_supervised_session, "finishing", 0)
+            server.records["finishing"].future = future
+            try:
+                deadline = time.monotonic() + 5
+                while not (writer_closed.is_set() and reader_closed.is_set()) and not future.done():
+                    assert time.monotonic() < deadline, "Cancellation request was not delivered"
+                    time.sleep(0.01)
+                assert writer_closed.is_set() and reader_closed.is_set()
+                assert not future.done()
+                with pytest.raises(OSError):
+                    os.fstat(cancel_descriptors[0])
+                assert server.get_session("finishing")["resource_release"]["status"] == "unknown"
+            finally:
+                os.write(write_fd, b"1")
+            future.result(timeout=8)
+        result = server.get_session("finishing")
+        assert len(processes) == 1 and processes[0].returncode == 0
+        assert not launched.exists()
+        assert result["status"] == "cancelled"
+        assert result["resource_release"]["status"] == "released"
+        assert result["resource_release_failed"] is False
+        os.fstat(cancel_descriptors[1])  # The reused descriptor still belongs to its new owner.
+    finally:
+        close(read_fd)
+        close(write_fd)
+        close(spare_fd)
+        if writer_closed.is_set():
+            close(cancel_descriptors[1])
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=15)

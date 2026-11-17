@@ -25,7 +25,7 @@ def wait_for(predicate, timeout=8):
     raise AssertionError("Timed out waiting for owned process state")
 
 
-@pytest.mark.parametrize("outcome", ["success", "nonzero", "truncated", "cancel"])
+@pytest.mark.parametrize("outcome", ["success", "nonzero", "truncated", "cancel", "cancel_pipe"])
 def test_release_joins_detached_descendants_and_preserves_graceful_stop(tmp_path, outcome):
     cli = tmp_path / "apptainer"
     cli.write_text(
@@ -52,23 +52,28 @@ def test_release_joins_detached_descendants_and_preserves_graceful_stop(tmp_path
         f"Path({str(report.with_suffix('.worker.json'))!r}).write_text({worker_result!r});"
         + (
             "time.sleep(60)"
-            if outcome == "cancel"
+            if outcome in {"cancel", "cancel_pipe"}
             else f"time.sleep(0.05);sys.exit({7 if outcome == 'nonzero' else 0})"
         )
     )
+    read_fd, write_fd = os.pipe()
     runner = (
         "import sys;from pathlib import Path;"
         f"sys.path.insert(0,{str(EXAMPLE)!r});from session_process import supervise;"
         f"supervise(Path({str(spec)!r}),Path({str(report)!r}),"
-        f"worker_command=[sys.executable,'-c',{worker_code!r}])"
+        f"worker_command=[sys.executable,'-c',{worker_code!r}],cancel_fd={read_fd})"
     )
-    proc = subprocess.Popen([sys.executable, "-c", runner])
+    proc = subprocess.Popen([sys.executable, "-c", runner], pass_fds=(read_fd,))
+    os.close(read_fd)
     try:
         wait_for(child_pid.exists)
         pid = int(child_pid.read_text())
         assert not report.exists()
         if outcome == "cancel":
             proc.send_signal(signal.SIGTERM)
+        elif outcome == "cancel_pipe":
+            descriptor, write_fd = write_fd, None
+            os.close(descriptor)
         time.sleep(0.1)
         assert not report.exists()  # Even an empty instance list is not a child-release proof.
         assert proc.wait(timeout=8) == 0
@@ -83,14 +88,190 @@ def test_release_joins_detached_descendants_and_preserves_graceful_stop(tmp_path
             assert "code 7" in result["error"]  # The Popen worker owns its exit status.
         elif outcome == "truncated":
             assert "valid result" in result["error"]
-        elif outcome == "cancel":
+        elif outcome in {"cancel", "cancel_pipe"}:
             assert result["error"]
         else:
             assert result["error"] == ""
     finally:
+        if write_fd is not None:
+            os.close(write_fd)
         if proc.poll() is None:
             proc.terminate()
             proc.wait(timeout=15)
+
+
+@pytest.mark.parametrize("instance_state", ["absent", "present", "unknown"])
+def test_cancel_before_supervisor_start_skips_worker_but_still_requires_release_proof(tmp_path, instance_state):
+    cli = tmp_path / "apptainer"
+    cli.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        "print('INSTANCE PID')\n"
+        + ("print('mswe-owned 123')\n" if instance_state == "present" else "")
+        + ("sys.exit(1)\n" if instance_state == "unknown" else "")
+    )
+    cli.chmod(0o755)
+    spec, report, launched = tmp_path / "spec.json", tmp_path / "report.json", tmp_path / "worker-launched"
+    spec.write_text(
+        json.dumps(
+            {
+                "apptainer_args": [str(cli), []],
+                "instance_name": "mswe-owned",
+                "record": {"session_id": "client"},
+                "release_nonce": "nonce",
+            }
+        )
+    )
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    worker = f"from pathlib import Path;Path({str(launched)!r}).write_text('started')"
+    runner = (
+        "import sys;from pathlib import Path;"
+        f"sys.path.insert(0,{str(EXAMPLE)!r});from session_process import supervise;"
+        f"supervise(Path({str(spec)!r}),Path({str(report)!r}),"
+        f"worker_command=[sys.executable,'-c',{worker!r}],cancel_fd={read_fd});"
+        f"\ntry:os.fstat({read_fd})\nexcept OSError:pass\nelse:raise AssertionError('cancel fd leaked')"
+    )
+    runner = "import os;" + runner
+    try:
+        subprocess.run([sys.executable, "-c", runner], pass_fds=(read_fd,), check=True, timeout=8)
+    finally:
+        os.close(read_fd)
+    result = json.loads(report.read_text())
+    assert not launched.exists()
+    assert result["error"] == "Session cancelled before worker launch"
+    assert result["client_session_id"] == "client" and result["nonce"] == "nonce"
+    assert result["children_reaped"] is True
+    assert result["instance_absent"] is (instance_state == "absent")
+    assert result["resources_released"] is (instance_state == "absent")
+
+
+def test_supervisor_closes_cancel_pipe_when_setup_fails(tmp_path):
+    spec = tmp_path / "spec.json"
+    spec.write_text("{")
+    read_fd, write_fd = os.pipe()
+    runner = (
+        "import os,sys;from pathlib import Path;"
+        f"sys.path.insert(0,{str(EXAMPLE)!r});from session_process import supervise;"
+        f"\ntry:supervise(Path({str(spec)!r}),Path({str(tmp_path / 'report.json')!r}),cancel_fd={read_fd})"
+        "\nexcept ValueError:pass\nelse:raise AssertionError('invalid spec accepted')"
+        f"\ntry:os.fstat({read_fd})\nexcept OSError:pass\nelse:raise AssertionError('cancel fd leaked')"
+    )
+    try:
+        subprocess.run([sys.executable, "-c", runner], pass_fds=(read_fd,), check=True, timeout=8)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_cancel_between_initial_check_and_worker_spawn_still_joins_worker(tmp_path):
+    cli = tmp_path / "apptainer"
+    cli.write_text("#!/bin/sh\necho 'INSTANCE PID'\n")
+    cli.chmod(0o755)
+    spec, report = tmp_path / "spec.json", tmp_path / "report.json"
+    ready, child_pid = tmp_path / "spawn-ready", tmp_path / "worker.pid"
+    spec.write_text(
+        json.dumps(
+            {
+                "apptainer_args": [str(cli), []],
+                "instance_name": "mswe-owned",
+                "record": {"session_id": "client"},
+                "release_nonce": "nonce",
+            }
+        )
+    )
+    cancel_read, cancel_write = os.pipe()
+    gate_read, gate_write = os.pipe()
+    runner = f"""
+import os,sys
+from pathlib import Path
+sys.path.insert(0,{str(EXAMPLE)!r})
+import session_process
+real_popen = session_process.subprocess.Popen
+worker_command = [sys.executable, '-c', 'import time;time.sleep(60)']
+def launch(command, *args, **kwargs):
+    if command == worker_command:
+        Path({str(ready)!r}).touch()
+        os.read({gate_read}, 1)
+    process = real_popen(command, *args, **kwargs)
+    if command == worker_command:
+        Path({str(child_pid)!r}).write_text(str(process.pid))
+    return process
+session_process.subprocess.Popen = launch
+session_process.supervise(Path({str(spec)!r}), Path({str(report)!r}),
+                          worker_command=worker_command, cancel_fd={cancel_read})
+os.close({gate_read})
+"""
+    proc = subprocess.Popen([sys.executable, "-c", runner], pass_fds=(cancel_read, gate_read))
+    os.close(cancel_read)
+    os.close(gate_read)
+    try:
+        wait_for(ready.exists)
+        descriptor, cancel_write = cancel_write, None
+        os.close(descriptor)
+        os.write(gate_write, b"1")
+        assert proc.wait(timeout=8) == 0
+        result = json.loads(report.read_text())
+        assert result["resources_released"] is True
+        assert result["children_reaped"] is True and result["instance_absent"] is True
+        assert result["error"]
+        assert not Path(f"/proc/{int(child_pid.read_text())}").exists()
+    finally:
+        if cancel_write is not None:
+            os.close(cancel_write)
+        os.close(gate_write)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=15)
+
+
+def test_repeated_cancel_pipe_eof_keeps_first_cleanup_deadline(tmp_path):
+    spec, report = tmp_path / "spec.json", tmp_path / "report.json"
+    spec.write_text(json.dumps({"record": {"session_id": "client"}, "release_nonce": "nonce"}))
+    runner = f"""
+import os,signal,sys
+from pathlib import Path
+sys.path.insert(0,{str(EXAMPLE)!r})
+import session_process
+read_fd, write_fd = os.pipe()
+clock = -6.0
+def monotonic():
+    global clock
+    clock += 6.0
+    return clock
+class Worker:
+    pid = 999999999
+    returncode = None
+    polls = 0
+    def poll(self):
+        self.polls += 1
+        if self.polls > 4 and self.returncode is None:
+            self.returncode = 7
+        return self.returncode
+    def wait(self):
+        return self.returncode
+worker = Worker()
+kills, deadlines = [], []
+def killpg(_pid, signum):
+    kills.append(signum)
+    if signum == signal.SIGKILL:
+        worker.returncode = -signum
+def instance_absent(_spec, deadline, *, stop):
+    deadlines.append(deadline)
+    return True
+# Keep the pipe live for the initial check; close its writer only at spawn.
+session_process.time.monotonic = monotonic
+session_process.os.killpg = killpg
+def spawn(*args, **kwargs):
+    os.close(write_fd)
+    return worker
+session_process.subprocess.Popen = spawn
+session_process.instance_absent = instance_absent
+session_process.supervise(Path({str(spec)!r}), Path({str(report)!r}),
+                          worker_command=['unused'], cancel_fd=read_fd)
+assert kills == [signal.SIGTERM, signal.SIGKILL], kills
+assert deadlines == [35.0, 35.0], deadlines
+"""
+    subprocess.run([sys.executable, "-c", runner], check=True, timeout=8)
 
 
 def test_client_fails_closed_on_unconfirmed_cleanup(tmp_path):
