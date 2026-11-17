@@ -102,12 +102,24 @@ in the head container, with `RAY_JOBS_ADDRESS` set to the cluster Jobs endpoint:
 MODEL_DIR=/path/to/Qwen3.8-Flash-Next-F0 DATA_DIR=/path/to/multimodal-data \
 SAVE_DIR=/path/to/checkpoints MEGATRON=/root/Megatron-LM \
 NUM_STEPS=200 SAVE_INTERVAL=100 \
-bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-muon.sh
+bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-sft-32xgpu-muon.sh
 ```
 
 This recipe uses 32 GPUs and a global batch size of 512. Set `DRY_RUN=1` to
 inspect the arguments without submitting a job. If Gloo needs an explicit
 interface, set `GLOO_SOCKET_IFNAME` to the interface verified on all nodes.
+
+For Qwen3.6-35B-A3B multimodal SFT on 64 Blackwell GPUs, use the TP4 recipe:
+
+```bash
+MODEL_DIR=/path/to/Qwen3.6-35B-A3B DATA_DIR=/path/to/multimodal-data \
+SAVE_DIR=/path/to/checkpoints \
+bash scripts/training/sft/run-qwen36-35B-A3B-64xgpu-muon.sh
+```
+
+It defaults to 200 steps, a global batch size of 1600, and a checkpoint every
+50 steps. As in the 64-GPU baseline, `GLOBAL_BATCH_SIZE` overrides the batch size
+and `QWEN35_WHOLEPACK=0` selects binpack.
 
 Both Dockerfiles install all three convolution entries in one image. There is
 no `FLA_CONV_NB_MODE` build argument. Set `RELAX_FLA_CONV_NB_MODE` to `original`,
