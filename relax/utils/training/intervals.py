@@ -6,6 +6,12 @@ from argparse import Namespace
 
 
 def interval_is_due(args: Namespace, interval: int | str | None, completed_steps: int) -> bool:
+    """Trigger on steps or nominal epochs of accepted samples.
+
+    Epochs use the unfiltered training split size, matching training progress
+    metrics. Refilling skipped samples does not advance this counter, so an
+    epoch can span multiple dataset cursor passes when filtering is enabled.
+    """
     if interval is None or completed_steps <= 0:
         return False
     if interval == "epoch":

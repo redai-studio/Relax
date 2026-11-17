@@ -95,7 +95,12 @@ def _add_step_or_epoch_interval(parser, name: str) -> None:
     # reset_arg preserves the native Megatron action's type; update it here too.
     action = parser._option_string_actions[name]
     action.type = _step_or_epoch_interval
-    action.help = "Positive step interval, or 'epoch' for native Megatron SFT epoch boundaries."
+    action.help = (
+        "Positive step interval, or 'epoch' for native Megatron SFT nominal epochs: "
+        "completed steps * global batch size / unfiltered training split size. "
+        "Skipped samples are replaced and do not advance this counter; with filtering, "
+        "it does not track dataset cursor passes. This interval does not change training length."
+    )
 
 
 def _fault_events_port(value: str) -> int:
@@ -1364,7 +1369,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Number of epochs over the dataset. When set, "
                     "`actual_num_rollout = num_epoch * dataset_size // rollout_batch_size`. "
-                    "Native SFT with an epoch save/eval interval rounds the total up to a full batch. "
                     "If both --num-rollout and --num-epoch are set, the smaller of the two wins "
                     "(epoch acts as a cap). At least one of --num-rollout / --num-epoch must be set. "
                     "Applies to both RL and SFT."

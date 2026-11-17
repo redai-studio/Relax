@@ -99,7 +99,7 @@ def test_epoch_progress_preserves_rl_multiple_updates_per_rollout():
     assert _reported_metrics(args, 7, steps_per_rollout=4)["train/cur_epoch"] == pytest.approx(0.2)
 
 
-@pytest.mark.parametrize("interval,steps,boundaries", [("epoch", 32, [11, 21, 32]), (10, 31, [10, 20, 30])])
+@pytest.mark.parametrize("interval,steps,boundaries", [("epoch", 31, [11, 21]), (10, 31, [10, 20, 30])])
 def test_epoch_intervals_cover_nondivisible_training_without_changing_step_intervals(
     sized_dataset, interval, steps, boundaries
 ):
