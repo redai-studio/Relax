@@ -1,4 +1,4 @@
-# LamRA Rank SFT and evaluation / LamRA 重排训练与评测
+# LamRA Rank SFT and evaluation
 
 Train a generative ranker through Relax's existing multimodal SFT and Megatron
 Bridge path. For the [three-stage workflow](../seq_contrast_sft/README.md),
@@ -15,18 +15,12 @@ disabled in training and scoring. Both use `r=128`, `alpha=256`, dropout `0.05`,
 BF16, seed 42, LR `4e-5`, cosine decay, 3% warmup and one padded epoch. The
 launcher defaults to eight DP GPUs with TP=PP=CP=1.
 
-三段流程以合并后的 Ret SFT 模型初始化 Rank，重新创建 LoRA、优化器和调度器。支持
-Qwen2-VL-2B-Instruct 和 Qwen3.5 稠密版 0.8B、2B、4B、9B。Qwen3.5 的 Rank 训练和打分均关闭思考模式。
-
 ## Prepare training data
 
 Use the variables from the Ret README. `RANK_BASE` points directly to the HF
 directory with `config.json` and the tokenizer. Use this directory for data
 preparation, training and export. All workers must be able to resolve the M-BEIR
 images beneath `IMAGE_ROOT`.
-
-下列命令沿用 Ret 阶段的变量。`RANK_BASE` 直接指向含 `config.json` 和 tokenizer 的 HF 模型目录。
-数据准备、训练和导出使用同一底座，各 worker 都需能从 `IMAGE_ROOT` 读取图片。
 
 ```bash
 RANK_BASE="${RET_MODEL}"
@@ -106,8 +100,6 @@ Export the final native checkpoint on CPU. Set `FINAL_CHECKPOINT` to the final
 completed update count. Pass `RANK_BASE`, the same HF directory loaded during
 training, as `--base`.
 
-在 CPU 导出 Rank 最终的 `iter_*`，`EXPECTED_UPDATES` 填已完成的优化器步数，底座沿用训练时的 `RANK_BASE`。
-
 ```bash
 CUDA_VISIBLE_DEVICES="" python examples/lamra_rerank/tools/export_checkpoint.py \
   --checkpoint "${FINAL_CHECKPOINT}" \
@@ -128,9 +120,6 @@ Use the four files produced by the Ret top50 command in `TEST_RETRIEVAL`, along
 with the same test queries, candidate pool and qrels. Set `EVAL_GPUS` to the number
 of local GPUs available for scoring. Each worker loads its own Rank model replica.
 Use a fresh `RANK_PAIRS` path and `RANK_EVAL` directory for each evaluation.
-
-直接用 `TEST_RETRIEVAL` 下的四个文件衔接 Rank 评测，query、候选池和 qrels 沿用同一批测试数据。
-`EVAL_GPUS` 填打分使用的卡数，每张卡加载一份 Rank 模型。
 
 ```bash
 EVAL_GPUS=8
