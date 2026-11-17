@@ -8,8 +8,8 @@ Read the final parsed arguments after Relax applies defaults and validation. Rep
 | Parameters | Required check | Detection |
 | --- | --- | --- |
 | `--use-agentic-rollout` | Selects Agentic train/Eval functions; custom generate is ignored | Startup normalization, without a conflict error |
-| `--agent-command`, `--agent-cwd` | Command runs through `/bin/bash -lc`; cwd and dependencies must exist on every possible SessionShard node | Basic values at startup; node availability at process launch |
-| `--agent-env` | `KEY=VALUE`; `RELAX_*` is reserved; duplicate keys resolve to the last value | Startup validation; effective login-shell environment needs runtime evidence |
+| `--agent-command`, `--agent-cwd` | Command is launched directly; cwd and dependencies must exist on every possible SessionShard node | Basic values at startup; node availability at process launch |
+| `--agent-env` | `KEY=VALUE`; `RELAX_*` is reserved; duplicate keys resolve to the last value | Startup validation; effective agent environment needs runtime evidence |
 | `--agent-timeout` | Positive Runtime active-process safety budget for agent-side hangs; separate from each Chat request's wall-clock timeout | Positivity at startup; adequacy only during execution |
 | reasoning/tool parsers | Match the exact model/template and installed SGLang | First matching model response, not argument parsing |
 

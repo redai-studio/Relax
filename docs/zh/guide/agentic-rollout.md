@@ -319,8 +319,8 @@ python -m my_agent \
     --output-json "${RELAX_OUTPUT_JSON}"
 ```
 
-Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `exec` 简化 process tree，但 `exec` 不是
-必须条件。Application 配置通过 `--agent-env` 传入：
+Relax 会管理 launcher 创建的 process group。需要保留运行以管理资源的 wrapper 应自行处理并转发 SIGTERM。
+Application 配置通过 `--agent-env` 传入：
 
 ```bash
 --agent-env FOO=bar BAZ=qux
@@ -328,13 +328,15 @@ Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `e
 
 ### 清理责任
 
-由 Relax 启动的 `--agent-command` 自行清理其工具、子进程、容器和远程任务。
-无论命令自然退出，还是因超时等原因被 Relax 发送 SIGTERM 终止，都应执行资源清理。
-终态输出应原子写入，并保留取消远程任务需要的身份信息。
+`--agent-command` 表示可执行程序及参数，支持引号分组。Relax 直接启动程序，不隐式启动登录 Shell。
+环境激活、变量展开、管道和重定向应写入显式脚本，以 `bash run_agent_app.sh` 启动。
 
-Relax 的进程清理是尽力而为的兜底。`agent-command` 退出后，Relax 发布 Session 的逻辑结果，随后在后台清理本地残留进程和
-backend 状态。清理失败记录 warning，已经发布的结果和逻辑 Group 容量按正常路径流转。外部 executor 配额由 adapter
-或服务管理。
+agent 超时或所属 Group 被丢弃时，Relax 向 `--agent-command` 启动且仍在运行的 root 进程发送 SIGTERM；等待宽限期后仍未退出，则向该进程发送 SIGKILL。
+正常的 partial rollout 暂停不会终止 agent 进程。
+
+无论自然退出还是被 Relax 终止，`agent-command` 都负责清理自己使用的工具、子进程、容器和远程任务等资源。
+
+root 退出后，Relax 尽力清理本地残留进程。清理失败仅记录警告，不阻塞训练。
 
 ### 启动训练
 

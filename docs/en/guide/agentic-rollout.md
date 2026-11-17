@@ -331,8 +331,11 @@ python -m my_agent \
     --output-json "${RELAX_OUTPUT_JSON}"
 ```
 
-Relax manages the process group created for the launcher. A shell wrapper may use `exec` to simplify its process tree,
-but `exec` is not required. Pass application settings with `--agent-env`:
+`--agent-command` names an executable and its arguments, with shell-style quoting. Relax starts it directly without a
+login shell. Put environment activation, variable expansion, pipelines and redirection in an explicit script, launched
+as `bash run_agent_app.sh`.
+
+Pass application settings with `--agent-env`:
 
 ```bash
 --agent-env FOO=bar BAZ=qux
@@ -340,13 +343,15 @@ but `exec` is not required. Pass application settings with `--agent-env`:
 
 ### Cleanup ownership
 
-The command launched through `--agent-command` is responsible for cleaning up its tools, descendants, containers, and
-remote jobs. It must clean up both when it exits naturally and when Relax sends SIGTERM to terminate it because of a
-timeout or another reason. Write terminal output atomically and retain enough identity to cancel remote work.
+When an agent times out or its Group is dropped, Relax sends SIGTERM to the still-running root process started by
+`--agent-command`. If it has not exited after the grace period, Relax sends SIGKILL to that root process.
+A normal partial-rollout pause leaves the agent process running.
 
-Relax treats process cleanup as a best-effort fallback. After `agent-command` exits, Relax publishes the logical Session
-result and cleans up remaining local processes and backend state in the background. Cleanup failures produce warnings and
-leave the published result and logical Group capacity intact. External executor quotas belong to the adapter or service.
+Whether it exits naturally or is terminated by Relax, `agent-command` is responsible for cleaning up its tools,
+subprocesses, containers, and remote jobs.
+
+After the root exits, Relax makes a best-effort attempt to clean up remaining local processes. Cleanup failures produce
+warnings and do not block training.
 
 ### Launch Training
 

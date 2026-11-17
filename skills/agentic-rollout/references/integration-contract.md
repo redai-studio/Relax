@@ -47,7 +47,9 @@ Relax provides:
 | `RELAX_GROUP_ID` | Logical Runtime Group identifier |
 
 The adapter must preserve the agent's normal task lifecycle, write terminal output atomically, and exit after cleanup.
-The command runs through `/bin/bash -lc`; inspect login-profile behavior if it may replace injected environment values.
+Relax parses executable arguments with shell-style quoting and launches them directly. Shell expansions, `source`,
+pipelines and redirects belong in an explicit example script (`bash run_agent_app.sh`). End setup-only wrappers with
+`exec` so the agent retains the managed root PID.
 
 ## Resource ownership
 

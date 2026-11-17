@@ -14,6 +14,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -308,7 +309,8 @@ class ManagedCommandAppSpec:
     timeout_s: float = 1800.0
 
     def __post_init__(self) -> None:
-        if not self.command.strip():
+        argv = shlex.split(self.command)
+        if not argv or not argv[0]:
             raise ValueError("managed agent command must be non-empty")
         if not Path(self.cwd).is_dir():
             raise ValueError(f"managed agent cwd must be an existing directory: {self.cwd}")
@@ -524,8 +526,14 @@ class ManagedAgentProcess:
                                 raise
                 finally:
                     if self._process is not None:
-                        await self._process.close()
-                        self._process = None
+                        try:
+                            await self._process.close()
+                        except Exception as error:
+                            logger.warning(
+                                "Agent connection cleanup failed for session_id=%s: %s", self._session_id, error
+                            )
+                        finally:
+                            self._process = None
 
         finally:
             if not launch_attempted:
@@ -968,7 +976,7 @@ def _supervise_attempt_process(process: subprocess.Popen, control: Any, report_e
             (signal.SIGKILL, _TERMINATION_GRACE_SECONDS),
         ):
             try:
-                os.killpg(process.pid, signal_value)
+                os.kill(process.pid, signal_value)
             except ProcessLookupError:
                 pass
             deadline = time.monotonic() + grace
@@ -1033,9 +1041,12 @@ def _session_supervisor_main() -> None:
         return
     request = json.loads(line)
     try:
+        argv = shlex.split(request["command"])
+        if not argv or not argv[0]:
+            raise ValueError("managed agent command must name an executable")
         with Path(request["log_path"]).open("ab") as log_file:
             process = subprocess.Popen(
-                ["/bin/bash", "-lc", request["command"]],
+                argv,
                 cwd=request["cwd"],
                 env={str(key): str(value) for key, value in request["env"].items()},
                 stdin=subprocess.DEVNULL,
@@ -1043,7 +1054,7 @@ def _session_supervisor_main() -> None:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-    except OSError as error:
+    except (OSError, ValueError) as error:
         send({"op": "error", "error": str(error)})
         return
     send({"op": "started"})

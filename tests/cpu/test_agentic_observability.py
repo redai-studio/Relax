@@ -1932,7 +1932,7 @@ def test_session_attempt_tokens_include_abort_and_cleanup_result(
 
 
 @pytest.mark.parametrize("mode", ["success", "nonzero", "invalid", "timeout"])
-@pytest.mark.parametrize("log_failure", [None, "exception", "cancelled"])
+@pytest.mark.parametrize("log_failure", [None, "exception", "cancelled", "close"])
 def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path, monkeypatch, mode, log_failure):
     from relax.agentic.runner import ipc
     from relax.agentic.runner.ipc import AgentExecutionError, ManagedAgentProcess, ManagedCommandAppSpec, SessionInput
@@ -1967,7 +1967,11 @@ def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path
             Path(kw["log_path"]).write_text("agent diagnostics\n")
             if mode == "invalid":
                 (workdirs[-1] / "session_output.json").write_text("{bad json")
-            return SimpleNamespace(wait=wait, close=AsyncMock(), terminate=AsyncMock(side_effect=terminated.set))
+            return SimpleNamespace(
+                wait=wait,
+                close=AsyncMock(side_effect=OSError("connection close failed") if log_failure == "close" else None),
+                terminate=AsyncMock(side_effect=terminated.set),
+            )
 
         process = ManagedAgentProcess(
             SimpleNamespace(launch=launch),
