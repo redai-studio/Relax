@@ -7,8 +7,9 @@ SFT 和 GRPO 保持原有入口。
 
 环境、数据格式和可复制启动命令见[英文指南](../../en/guide/diffusion-art.md)。
 #495 已提供 SGLang v0.5.21 升级和通用补丁，本 PR 不重复升级。
-使用本分支 `docker/Dockerfile.cu13` 构建镜像，它会在通用补丁之后应用独立的
-`v0.5.21-sensenova-art.patch`；已有服务需重建镜像并重启以载入 ART 接口。
+使用本分支 `docker/Dockerfile.cu13` 构建镜像，统一的
+`docker/patch/sglang/v0.5.21.patch` 已包含 ART 支持，构建时一次应用到固定的干净源码。
+已有服务需重建镜像并重启以载入 ART 接口。
 ART 补丁保留默认 RoPE 缓存与原生注意力路径，不包含 SenseNova 专属 LoRA、
 TP/SP/分布式 CFG 或可选 FA3 适配。通用补丁中的已有能力保持不变。
 TextPecker 示例需要独立 OpenAI 兼容 OCR 服务、CPU LPIPS 及离线 AlexNet 权重。

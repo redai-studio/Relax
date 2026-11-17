@@ -12,7 +12,7 @@ from relax.backends.sglang.diffusion_engine import _deserialize
 
 def _overlay_module(name):
     path = "python/" + name.replace(".", "/") + ".py"
-    patch = (Path(__file__).resolve().parents[4] / "docker/patch/sglang/v0.5.21-sensenova-art.patch").read_text()
+    patch = (Path(__file__).resolve().parents[4] / "docker/patch/sglang/v0.5.21.patch").read_text()
     section = patch.split(f"diff --git a/{path} b/{path}\n", 1)[1].split("diff --git ", 1)[0]
     source = "\n".join(
         line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++")
@@ -24,7 +24,7 @@ def _overlay_module(name):
 
 @pytest.fixture(autouse=True)
 def install_codec(monkeypatch):
-    # Execute the actual new-file implementation shipped in the image overlay.
+    # Execute the actual new-file implementation shipped in the image patch.
     global codec
     name = "sglang.multimodal_gen.runtime.entrypoints.post_training.mask_codec"
     codec = _overlay_module(name)

@@ -297,14 +297,12 @@ RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
 
 # Patch and install SGLang, then replace its tree core with the ABI-checked build.
 RUN --mount=type=bind,source=docker/patch/sglang/v0.5.21.patch,target=/tmp/sglang.patch \
-    --mount=type=bind,source=docker/patch/sglang/v0.5.21-sensenova-art.patch,target=/tmp/sglang-art.patch \
     --mount=type=bind,from=tree_core_builder,source=/opt/relax-tree-core,target=/tmp/relax-tree-core \
     --mount=type=bind,source=docker/scripts/build_sglang_tree_core.py,target=/tmp/build_sglang_tree_core.py \
     cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
     git apply --check /tmp/sglang.patch && git apply /tmp/sglang.patch && \
-    git apply --check /tmp/sglang-art.patch && git apply /tmp/sglang-art.patch && \
-    sha256sum /tmp/sglang.patch /tmp/sglang-art.patch > /etc/relax-sglang-patch.sha256 && \
+    sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     pip install --no-cache-dir setuptools-scm==9.2.2 && \
     SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
         pip install --no-cache-dir --no-deps --no-build-isolation -e ./python && \

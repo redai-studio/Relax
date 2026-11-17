@@ -41,7 +41,6 @@ __all__ = ["SGLangNativeGenerationEngine"]
 _HEALTH_TIMEOUT_S = 1800.0
 _REQUEST_TIMEOUT_S = 3600.0
 _SGLANG_DIFFUSION_PATCH_PATH = "docker/patch/sglang/v0.5.21.patch"
-_SGLANG_ART_PATCH_PATH = "docker/patch/sglang/v0.5.21-sensenova-art.patch"
 _REQUIRED_DIFFUSION_SAMPLING_FIELDS = frozenset(
     {
         "initial_noise_group_ids",
@@ -66,9 +65,7 @@ def _verify_diffusion_patch_contract(pipeline_config=None) -> None:
             from sglang.multimodal_gen.runtime.models.sensenova_u1.weights import validate_dense_bucket
             from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import RolloutDitTrajectory
         except ImportError as exc:
-            raise RuntimeError(
-                f"SenseNova ART requires {_SGLANG_ART_PATCH_PATH} after the base SGLang patch."
-            ) from exc
+            raise RuntimeError(f"SenseNova ART requires {_SGLANG_DIFFUSION_PATCH_PATH}.") from exc
 
         required_methods = (
             "prepare_it2i_conditioning",
@@ -83,7 +80,7 @@ def _verify_diffusion_patch_contract(pipeline_config=None) -> None:
             or not all(callable(getattr(NEOChatModel, method, None)) for method in required_methods)
             or not callable(validate_dense_bucket)
         ):
-            raise RuntimeError(f"Incomplete SenseNova ART protocol; apply {_SGLANG_ART_PATCH_PATH}.")
+            raise RuntimeError(f"Incomplete SenseNova ART protocol; apply {_SGLANG_DIFFUSION_PATCH_PATH}.")
         return
 
     try:

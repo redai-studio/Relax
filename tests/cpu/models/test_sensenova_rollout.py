@@ -307,7 +307,7 @@ def test_art_preflight_requires_velocity_protocol_without_lora(monkeypatch, lega
         monkeypatch.setitem(sys.modules, name, module)
     config = type("SenseNovaU1PipelineConfig", (), {})()
     if legacy_runtime:
-        with pytest.raises(RuntimeError, match="v0.5.21-sensenova-art.patch"):
+        with pytest.raises(RuntimeError, match="v0.5.21.patch"):
             _verify_diffusion_patch_contract(config)
     else:
         _verify_diffusion_patch_contract(config)
