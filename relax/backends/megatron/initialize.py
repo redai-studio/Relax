@@ -9,7 +9,6 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
 from megatron.training import global_vars
 
-from relax.utils.device import AcceleratorType, get_accelerator_type
 from relax.utils.logging_utils import get_logger
 
 
@@ -77,9 +76,8 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 def init(args):
     global_vars.set_args(args)
-    # Ascend uses Core 0.16.1 and still initializes directly from args.
-    is_ascend = get_accelerator_type() == AcceleratorType.NPU
-    if not is_ascend:
+    run_config = None
+    if hasattr(global_vars, "set_run_config"):
         from megatron.training.argument_utils import pretrain_cfg_container_from_args
 
         run_config = pretrain_cfg_container_from_args(args)
@@ -131,7 +129,7 @@ def init(args):
         args.te_rng_tracker,
         args.inference_rng_tracker,
     )
-    if is_ascend:
+    if run_config is None:
         global_vars._build_tokenizer(args)
     else:
         global_vars._build_tokenizer(run_config, args)
@@ -155,7 +153,7 @@ def init(args):
     if args.tp_comm_overlap:
         from megatron.training.initialize import _initialize_tp_communicators
 
-        if is_ascend:
+        if run_config is None:
             _initialize_tp_communicators()
         else:
             from megatron.training.argument_utils import core_transformer_config_from_args
