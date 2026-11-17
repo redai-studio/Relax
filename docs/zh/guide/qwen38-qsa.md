@@ -320,3 +320,5 @@ ENV_ARGS+=(
 `full` 可用于同输入对照，并非原始的全序列 PLE 计算。边界输入的梯度会归约回持有该输入的卡；BF16 下通信归约次序变化可能产生浮点差异，需按实际数据验证。开启该路径后，原有 PLE streamed/fused-conv 开关不参与执行。
 
 构建 `docker/Dockerfile` 或 `docker/Dockerfile.cu13` 会安装所需 Megatron 补丁。使用外部 Megatron checkout 时也须安装该补丁。512K/1M 训练 recipe 单独提供。
+
+512K/1M 的 32 卡入口、数据构造和保存恢复方式见 [长序列训练 recipe](./qwen38-long-context.md)。
