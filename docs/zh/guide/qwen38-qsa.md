@@ -290,11 +290,8 @@ cuDNN 路线需要兼容的 CUDA 13 Blackwell 环境，以及额外的 NVIDIA cu
 
 实现入口：[Mixed 分发](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/mixed.py)、[几何检查](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/geometry.py)、[cuDNN 适配](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/cudnn.py)、[Triton 选择](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/qsa_fused.py)。
 
-
 ## 长上下文 CP 的运行前提
 
-32 卡 HybridEP 预检支持 TP1/PP2/EP8/ETP1 配合 CP8 或 CP16。需要显式启用 QSA CP、mixed community backend 和 CuTe long backend；预检仍检查实际 EP 成员是否位于同一主机与可访问的 NVLink 域，不因逻辑拓扑匹配而跳过物理通信检查。
+新增两种已验证的 32 卡配置：TP1/PP2/CP8/EP8/ETP1 和 TP1/PP2/CP16/EP8/ETP1。两者都要求开启 QSA CP，并选择 mixed 后端及其 CuTe 长序列实现。仍检查每个 EP8 专家组的 8 张卡是否位于同一主机，以及组内 GPU 能否通过 HybridEP 相互通信。
 
-CP16 下 GDN 的本地 V head 数可能为 3。CUDA13 镜像包含 FlashQLA chunk64 cumsum 的小 head 对齐补丁，避免该形状编译失败；这项修复不改变训练配置或启用新的优化策略。
-
-仅需要记录数据位置、不希望同时保存模型时，可在 SFT 服务环境中设置 `RELAX_SFT_DATA_STATE_ROOT=/path/to/data-state`。写入优先使用该目录，否则沿用 `--save`；恢复始终从 `--load` 读取。该变量必须传递到实际 SFT 服务进程，例如加入 `RELAX_PROPAGATE_ENV_VARS` 并设置对应环境变量。数据位置文件不包含模型或 optimizer 状态，不能单独用于完整训练恢复。
+CP16 将 GDN 的 48 个 V heads 分到 16 张卡，每卡只有 3 个 heads。FlashQLA 的 chunk64 累加计算要求 head 数为偶数，因此临时补零至偶数个 heads，计算后裁回原始数量。各 head 独立计算，不改变原有 head 的结果。修复以补丁形式纳入 `docker/Dockerfile.cu13`，随镜像构建安装。

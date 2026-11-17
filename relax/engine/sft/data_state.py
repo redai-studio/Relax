@@ -94,9 +94,7 @@ def restore_data_state(config: Any, dataset: Any, step: int, size: int) -> None:
 def save_data_state(config: Any, dataset: Any, next_step: int, size: int, samples: list[Any]) -> None:
     """Write before publishing a batch, so a model save always has its
     boundary."""
-    # Permit data-order diagnostics without enabling model checkpoint writes.
-    # Restoring remains tied to config.load, never this output-only override.
-    root = os.environ.get("RELAX_SFT_DATA_STATE_ROOT") or getattr(config, "save", None)
+    root = getattr(config, "save", None)
     if not root:
         return
     ids_hash = hashlib.sha256(json.dumps([sample.source_idx for sample in samples]).encode()).hexdigest()

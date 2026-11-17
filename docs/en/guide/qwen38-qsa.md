@@ -352,11 +352,8 @@ Both recipes disable custom record-function tags and autotune logging and do not
 
 Compare Actor throughput using **sum of logical training tokens / sum of Actor training seconds / GPU count** over the same step window. End-to-end throughput uses total step seconds instead. Preserve slow steps, list cold compilation and checkpoint saves separately, and compare equal data/topology/packing/recomputation settings. A faster QSA kernel does not imply the same speedup for the full training pipeline.
 
-
 ## Runtime prerequisites for long-context CP
 
 The 32-GPU HybridEP preflight supports TP1/PP2/EP8/ETP1 with CP8 or CP16. This requires QSA CP, the mixed community backend, and the CuTe long backend to be explicitly enabled. Physical EP membership, hostname, and accessible NVLink-domain checks still apply.
 
 With CP16, GDN can have three local V heads. The CUDA13 image applies a FlashQLA chunk64 cumsum head-alignment patch to avoid compilation failure for this shape. It does not change the training configuration or enable an optimization policy.
-
-To record data boundaries without saving model checkpoints, set `RELAX_SFT_DATA_STATE_ROOT=/path/to/data-state` in the SFT service environment. Writes use this directory when nonempty, otherwise `--save`; restores always read from `--load`. Propagate the variable to the actual SFT service process, for example through `RELAX_PROPAGATE_ENV_VARS` together with the environment value. Data-boundary files do not contain model or optimizer state and cannot restore training by themselves.
