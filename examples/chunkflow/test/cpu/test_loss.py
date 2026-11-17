@@ -22,6 +22,7 @@ from examples.chunkflow.arguments import validate_args
 from examples.chunkflow.scheduler import build_chunks
 from examples.chunkflow.unit_batch import _rows_for_unit, slice_parent_batch
 from examples.chunkflow.units import build_micro_batches
+from relax.engine.sft.runtime import is_embedding_sft_mode
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -106,6 +107,7 @@ def native_loss(monkeypatch):
             get_context_parallel_world_size=lambda: 1, get_tensor_model_parallel_group=lambda: None
         ),
         "is_sft_mode": lambda args: args.loss_type == "sft",
+        "is_embedding_sft_mode": is_embedding_sft_mode,
         "calculate_log_probs_and_entropy": _cpu_log_probs,
         "validate_opd_topk_gather": lambda *args: None,
         "ALGORITHM_SPECS": {},

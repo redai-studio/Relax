@@ -1669,8 +1669,8 @@ def infonce_loss(
     """Native mean one-way InfoNCE, before the backend's gradient reduction.
 
     Every DP rank evaluates the global objective with only its own feature
-    graph attached. The caller must preserve the reference 1/world_size
-    gradient scale when adapting this mean to Megatron's loss normalization.
+    graph attached. Summing those rank-local gradients gives the gradient of
+    the full objective.
     """
     if query.ndim != 2 or query.shape != positive.shape or query.shape[0] == 0:
         raise ValueError("InfoNCE features must have matching nonempty [pairs, hidden] shapes")
@@ -1681,9 +1681,13 @@ def infonce_loss(
     if process_group is not None:
         query = gather_with_local_grad(query, process_group)
         positive = gather_with_local_grad(positive, process_group)
-    query = F.normalize(query, dim=-1)
-    positive = F.normalize(positive, dim=-1)
-    scores = F.cosine_similarity(query.unsqueeze(1), positive.unsqueeze(0), dim=-1) / temperature
+    if query.dtype in (torch.float16, torch.bfloat16):
+        query, positive = query.float(), positive.float()
+    # Apply the cosine epsilon per row after feature normalization, without
+    # constructing a [pairs, pairs, hidden] tensor.
+    query = F.normalize(F.normalize(query, dim=-1), dim=-1, eps=1e-8)
+    positive = F.normalize(F.normalize(positive, dim=-1), dim=-1, eps=1e-8)
+    scores = (query @ positive.transpose(0, 1)) / temperature
     return F.cross_entropy(scores, torch.arange(scores.shape[0], device=scores.device))
 
 
@@ -1709,8 +1713,14 @@ def embedding_loss_function(
         features[::2], features[1::2], temperature=args.contrastive_temperature, process_group=group
     )
     global_pairs = int(batch.get("dynamic_global_batch_size", args.global_batch_size))
-    loss = scale_for_megatron_sample_mean(mean_loss, global_pairs=global_pairs, dp_size=dist.get_world_size(group))
-    return loss, {"loss": loss.detach()}
+    dp_size = dist.get_world_size(group)
+    loss = scale_for_megatron_sample_mean(mean_loss, global_pairs=global_pairs, dp_size=dp_size)
+    metric_loss = loss.detach()
+    if not loss_path:
+        # Each rank owns a disjoint part of the global gradient; compensate
+        # for DDP averaging while keeping the forward value and metric intact.
+        loss = metric_loss + (loss - metric_loss) * dp_size
+    return loss, {"loss": metric_loss}
 
 
 def sequence_classification_loss_function(
@@ -1904,26 +1914,29 @@ def loss_function(
           "values" (1D tensor: [denominator, metric1, metric2, ...]). The
           denominator is the token count for per-token loss and a zero
           placeholder for sample-mean loss. "num_tokens" separately carries
-          the effective token count used to detect no-signal steps.
+          the effective signal count used to detect no-signal steps
+          (pairs for embedding, tokens otherwise).
     """
-    # CP-local token count (tokens whose loss this rank actually contributes).
-    # Summed across the CP group in finalize_model_grads / the metric all-reduce,
-    # it counts every token exactly once regardless of CP degree, so the per-token
-    # normalizer is correct even when CP differs across micro-batches (dynamic CP).
-    # Under static CP it equals the old full-sample count distributed across ranks,
-    # so the final loss/grad/metric are unchanged after all-reduce.
-    if is_embedding_sft_mode(args) and num_microbatches != 1:
-        raise ValueError("embedding requires one complete contrastive microbatch per optimizer update")
-    num_tokens = get_cp_local_num_tokens(
-        batch["total_lengths"],
-        batch["response_lengths"],
-        batch["loss_masks"],
-        args.qkv_format,
-        batch.get("max_seq_lens", None),
-        batch.get("padded_total_lengths", None),
-        dynamic_cp_size=batch.get("dynamic_cp_size", None),
-        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
-    )
+    is_embedding = is_embedding_sft_mode(args)
+    if is_embedding:
+        if num_microbatches != 1:
+            raise ValueError("embedding requires one complete contrastive microbatch per optimizer update")
+        # A single-token sequence can yield a useful embedding even when its
+        # shifted language-model mask is empty.
+        num_tokens = logits.new_tensor(len(batch["total_lengths"]) // 2, dtype=torch.int)
+    else:
+        # Count this rank's contributing tokens so the CP reduction counts
+        # each token once, including when the CP degree changes per microbatch.
+        num_tokens = get_cp_local_num_tokens(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            args.qkv_format,
+            batch.get("max_seq_lens", None),
+            batch.get("padded_total_lengths", None),
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1952,7 +1965,7 @@ def loss_function(
             case "rm":
                 func = reward_model_loss_function
             case "sft":
-                if is_embedding_sft_mode(args):
+                if is_embedding:
                     func = embedding_loss_function
                 elif getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function

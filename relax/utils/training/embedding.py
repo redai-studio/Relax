@@ -79,15 +79,16 @@ def validate_embedding_args(args: Namespace) -> None:
 
 
 def freeze_embedding_unused_heads(model: torch.nn.Module) -> None:
-    """Keep unused vocabulary/embedding parameters out of DDP optimizer
-    buckets."""
+    """Freeze output-only parameters, preserving any tied input weights."""
     owner = getattr(model, "language_model", model)
     output = getattr(owner, "output_layer", None)
-    if output is not None:
-        output.requires_grad_(False)
+    if output is None:
+        return
     embedding = getattr(owner, "embedding", None)
-    if embedding is not None:
-        embedding.requires_grad_(False)
+    input_parameters = {id(parameter) for parameter in embedding.parameters()} if embedding is not None else set()
+    for parameter in output.parameters():
+        if id(parameter) not in input_parameters:
+            parameter.requires_grad_(False)
 
 
 def expand_embedding_pairs(rows: dict[str, Any]) -> dict[str, Any]:
@@ -162,10 +163,9 @@ def scale_for_megatron_sample_mean(
 ) -> torch.Tensor:
     """Adapt a mean to the shared sample-sum loss wrapper, with one microbatch.
 
-    The shared wrapper multiplies by DP/global_batch, then DDP averages
-    gradients. Multiplying here by global_batch/DP cancels only the wrapper's
-    scaling. It does not introduce an extra world-size multiplier into native
-    InfoNCE.
+    Multiplying by global_batch/DP converts a mean to the local sample sum. Any
+    correction for the objective's distributed gradient is applied separately
+    by the caller.
     """
     if dp_size <= 0 or global_pairs <= 0 or global_pairs % dp_size:
         raise ValueError("The complete contrastive pair batch must divide evenly across data-parallel ranks")

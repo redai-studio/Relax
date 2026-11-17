@@ -90,13 +90,13 @@ def test_production_loss_dispatch_preserves_mean_and_hidden_gradients(monkeypatc
         F.cosine_similarity(F.normalize(query, dim=-1)[:, None], F.normalize(positive, dim=-1)[None], dim=-1) / 0.07,
         torch.arange(4),
     )
-    torch.testing.assert_close(loss, reference, rtol=0, atol=0)
+    torch.testing.assert_close(loss, reference, rtol=1e-12, atol=1e-12)
     assert normalizer.item() == 1
     assert metrics["keys"] == ["loss"]
-    torch.testing.assert_close(metrics["values"][1] / 4, reference.detach(), rtol=0, atol=0)
+    torch.testing.assert_close(metrics["values"][1] / 4, reference.detach(), rtol=1e-12, atol=1e-12)
     actual_gradient = torch.autograd.grad(loss, hidden, retain_graph=True)[0]
     expected_gradient = torch.autograd.grad(reference, hidden)[0]
-    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-12, atol=1e-12)
     with pytest.raises(ValueError, match="complete contrastive microbatch"):
         loss_module.loss_function(_args(), batch, 2, hidden)
 
