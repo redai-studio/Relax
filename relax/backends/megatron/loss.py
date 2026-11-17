@@ -131,10 +131,6 @@ def get_responses(
     raw_score_centering = (
         not apply_temperature and algorithm is not None and algorithm.policy_loss_fn == "score_centering"
     )
-    # SFT chunked path (--sft-chunked-logits) feeds hidden_states (bf16) into
-    # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
-    # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
-    # produce real fp32 logits and must stay strict.
     if raw_score_centering or (is_sft_mode(args) and args.sft_chunked_logits):
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:

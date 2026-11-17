@@ -288,7 +288,7 @@ def _chunked_mtp_enabled() -> bool:
         return False
     if args is None:
         return False
-    return bool(getattr(args, "enable_mtp_training", False)) and bool(getattr(args, "sft_chunked_logits", False))
+    return bool(getattr(args, "enable_mtp_training", False)) and bool(args.sft_chunked_logits)
 
 
 def _main_update_token_normalization_enabled() -> bool:
@@ -307,7 +307,7 @@ def _main_update_token_normalization_enabled() -> bool:
     if (
         getattr(args, "loss_type", None) != "sft"
         or not getattr(args, "enable_mtp_training", False)
-        or not getattr(args, "sft_chunked_logits", False)
+        or not args.sft_chunked_logits
         or not getattr(args, "calculate_per_token_loss", False)
         or getattr(args, "mtp_num_layers", None) != 1
     ):

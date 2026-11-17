@@ -901,7 +901,7 @@ def get_batch(
         and "unsplit_tokens" not in batch
         and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"
-        and getattr(get_args(), "sft_chunked_logits", False)
+        and get_args().sft_chunked_logits
     ):
         from .selective_logits import prepare_selective_logits, prepare_selective_logits_from_cpu_masks
 
