@@ -42,7 +42,7 @@ if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
 
-# Explicit driver/actor settings override entrypoint defaults (notably connections=1).
+# Training actor settings, also used as the starting environment for the Ray job.
 ENV_ARGS=(
     "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-1}"
     MCORE_QSA_SPARSE_BACKEND=id_sparse
@@ -121,6 +121,8 @@ import sys
 print(json.dumps(dict(item.split("=", 1) for item in sys.argv[1:])))
 PYENV
 )
+# The GPU-less driver needs 1 for Megatron's TP validation. GPU actors use TRAIN_ENV_JSON.
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
 if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
 RUNTIME_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${TRAIN_ENV_JSON}" <<'PYRUNTIME'
@@ -129,6 +131,7 @@ import sys
 runtime = json.loads(sys.argv[1])
 runtime.setdefault("env_vars", {}).pop("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", None)
 runtime["env_vars"].update(json.loads(sys.argv[2]))
+runtime["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 print(json.dumps(runtime))
 PYRUNTIME
 )
