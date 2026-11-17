@@ -134,10 +134,6 @@ def build_argv(env: Mapping[str, str]) -> list[str]:
         env.get("ROLLOUT_SEED", "42"),
         "--advantage-estimator",
         "grpo",
-        "--generative-kl-coef",
-        "0",
-        "--generative-reference-policy",
-        "fixed",
         "--num-updates-per-batch",
         "2",
         "--lr",
@@ -249,7 +245,7 @@ def check_resume(args: Any) -> int | None:
         return None
     import torch
 
-    from relax.backends.fsdp.checkpoint import find_latest_committed, iter_dir_name
+    from relax.backends.fsdp.checkpoint import find_latest_committed, iter_dir_name, load_art_dataset_state
 
     iteration = find_latest_committed(args.load, "i2i")
     if iteration is None:
@@ -265,13 +261,7 @@ def check_resume(args: Any) -> int | None:
         rng = torch.load(root / f"rng_rank{rank}.pt", map_location="cpu", weights_only=False)
         if not {"torch", "cuda", "python", "numpy"} <= set(rng):
             raise ValueError(f"Incomplete RNG checkpoint for rank {rank}.")
-    cursor = Path(args.load) / "dataset" / f"global_dataset_state_dict_{iteration}.pt"
-    data = torch.load(cursor, map_location="cpu", weights_only=False)
-    required = {"sample_offset", "epoch_id", "sample_group_index", "sample_index", "metadata", "use_streaming"}
-    if not required <= set(data) or data["use_streaming"]:
-        raise ValueError("ART recipe requires a complete eager-dataset cursor.")
-    if data["sample_index"] != data["sample_group_index"] * args.n_samples_per_prompt:
-        raise ValueError("Dataset candidate/group identity does not match the ART K contract.")
+    load_art_dataset_state(args.load, iteration, args.n_samples_per_prompt)
     if args.num_rollout <= iteration + 1:
         raise ValueError(
             "NUM_ROLLOUT must exceed the restored next rollout; otherwise resume performs no new training."

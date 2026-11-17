@@ -256,6 +256,8 @@ class RolloutDataSource(DataSource):
             "metadata": self.metadata,
             "use_streaming": self._use_streaming,
         }
+        if (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art":
+            state_dict["rollout_id"] = rollout_id
 
         # Add streaming dataset state if applicable
         if self._use_streaming and self.dataset is not None:
@@ -286,7 +288,12 @@ class RolloutDataSource(DataSource):
             return
 
         path = os.path.join(self.args.load, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
-        if not os.path.exists(path):
+        is_art = (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
+        if is_art:
+            from relax.backends.fsdp.checkpoint import load_art_dataset_state
+
+            state_dict = load_art_dataset_state(self.args.load, rollout_id, self.args.n_samples_per_prompt)
+        elif not os.path.exists(path):
             # Backwards compat: older checkpoints wrote to rollout/ instead of dataset/.
             legacy_path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
             if os.path.exists(legacy_path):
@@ -297,7 +304,8 @@ class RolloutDataSource(DataSource):
                 return
 
         logger.info(f"load metadata from {path}")
-        state_dict = torch.load(path)
+        if not is_art:
+            state_dict = torch.load(path)
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)

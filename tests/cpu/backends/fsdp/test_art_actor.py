@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """ART CPU actor orchestration, real DCP resume and pre-forward agreement."""
 
+import json
 import multiprocessing as mp
 from copy import deepcopy
 from dataclasses import replace
@@ -13,6 +14,7 @@ import torch.distributed as dist
 from relax.backends.fsdp import checkpoint as ckpt
 from relax.backends.fsdp.actor import FSDPTrainRayActor
 from relax.backends.fsdp.arguments import validate_generative_config
+from relax.engine.rollout.data_source import RolloutDataSource
 from tests.cpu.backends.fsdp.test_save_and_validation import _valid_args
 from tests.cpu.backends.fsdp.test_weight_transaction import _manifest
 from tests.cpu.backends.fsdp.test_weight_transaction import _shell as _weight_shell
@@ -246,10 +248,25 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
         adapter_contract=actor._adapter_contract(),
         require_rng_state=True,
     )
+    source = object.__new__(RolloutDataSource)
+    source.args = args
+    args.rollout_global_dataset, args.save = True, str(tmp_path)
+    args.rollout_shuffle = False
+    source.sample_offset = source.sample_group_index = 2
+    source.sample_index, source.epoch_id = 2 * args.n_samples_per_prompt, 0
+    source.metadata, source._use_streaming = {}, False
+    source.save(0)
     restored = _shell(args)
     assert restored._maybe_resume() == 1
     assert restored._resume_initial_sync_pending
     assert restored._lr_steps == actor._lr_steps
+    source.sample_offset = source.sample_group_index = source.sample_index = 0
+    source.load(0)
+    assert (source.sample_offset, source.sample_group_index, source.sample_index) == (
+        2,
+        2,
+        2 * args.n_samples_per_prompt,
+    )
     with pytest.raises(RuntimeError, match="publish the restored"):
         restored.train(1, rows)
     restored._resume_initial_sync_pending = False  # CPU stand-in for successful initial publication.
@@ -268,6 +285,47 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
     restored.args.seed += 1
     with pytest.raises(ValueError, match="ART algorithm"):
         restored._assert_resumable(str(tmp_path / "i2i" / ckpt.iter_dir_name(0)))
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "schema", "k", "acquisition"])
+def test_art_resume_rejects_bad_data_cursor_before_loading_training_state(monkeypatch, tmp_path, failure):
+    from unittest.mock import Mock
+
+    args = _profile()
+    args.load, args.rollout_global_dataset = str(tmp_path), True
+    actor = _shell(args)
+    root = tmp_path / "i2i" / ckpt.iter_dir_name(0)
+    root.mkdir(parents=True)
+    (root / "COMMITTED").touch()
+    (root / "adapter_contract.json").write_text(json.dumps(actor._adapter_contract()))
+    (root / "trainer_state.json").write_text(json.dumps({"rollout_id": 0}))
+    cursor = tmp_path / "dataset" / "global_dataset_state_dict_0.pt"
+    cursor.parent.mkdir()
+    state = dict(sample_offset=2, epoch_id=0, sample_group_index=2, sample_index=16, metadata={}, use_streaming=False)
+    if failure == "corrupt":
+        cursor.write_bytes(b"incomplete snapshot")
+    elif failure != "missing":
+        if failure == "schema":
+            del state["sample_offset"]
+        elif failure == "k":
+            state["sample_index"] = 15
+        else:
+            state["rollout_id"] = 1
+        torch.save(state, cursor)
+    load = Mock(return_value={"rollout_id": 0, "policy_version": 7, "lr_scheduler_steps": 0})
+    monkeypatch.setattr(ckpt, "load_checkpoint", load)
+    before = actor.model.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="ART resume contract validation failed"):
+        actor._maybe_resume()
+    load.assert_not_called()
+    torch.testing.assert_close(actor.model.weight, before, rtol=0, atol=0)
+    assert (actor.policy_version, actor._lr_steps) == (7, 0)
+    source = object.__new__(RolloutDataSource)
+    source.args = args
+    source.sample_index = 99
+    with pytest.raises(ValueError, match="ART"):
+        source.load(0)
+    assert source.sample_index == 99
 
 
 @pytest.mark.parametrize("failure", ["missing", "incomplete", "corrupt"])

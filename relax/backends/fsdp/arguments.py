@@ -195,14 +195,6 @@ def add_generative_arguments(parser: ArgumentParser) -> ArgumentParser:
             "and 'none' is Dr.GRPO. Unset preserves the shared --disable-grpo-std-normalization behaviour."
         ),
     )
-    group.add_argument(
-        "--generative-kl-coef",
-        type=float,
-        default=0.0,
-        help="Flow-Factory-style reference penalty coefficient. Zero skips the reference forward.",
-    )
-    group.add_argument("--generative-reference-policy", default="fixed", choices=["fixed"])
-
     # Full-weight sync transaction (design doc 10).
     group.add_argument(
         "--weight-sync-mode",
@@ -682,7 +674,7 @@ def validate_generative_config(args: Namespace) -> None:
     _fail(
         errors,
         float(getattr(args, "kl_coef", 0.0) or 0.0) != 0.0 or bool(getattr(args, "use_kl_loss", False)),
-        "kl_coef/use_kl_loss are not supported for train_backend=fsdp; use --generative-kl-coef instead.",
+        "kl_coef/use_kl_loss are not supported for train_backend=fsdp.",
     )
     _fail(
         errors,

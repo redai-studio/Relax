@@ -189,11 +189,30 @@ def validate_sensenova_rollout_response(response: Mapping[str, Any], request: Ma
     """Validate an already-deserialized, per-candidate server result."""
     import torch
 
+    options = (request.get("extra_sampling_params") or {}).get("rollout_options") or {}
+    if (
+        options.get("capture") == "terminal"
+        and request.get("rollout_sde_type") == "ode"
+        and request.get("rollout_return_dit_trajectory") is False
+        and request.get("rollout_return_denoising_env") is False
+        and not request.get("rollout_return_step_indices")
+    ):
+        if response.get("seed") != request["seed"]:
+            raise ValueError("Evaluation response seed mismatch")
+        return {
+            "request_id": response.get("request_id"),
+            "group_id": request.get("group_id"),
+            "member_id": request.get("member_id"),
+            "seed": response["seed"],
+            "generated_output": _validate_reward_image(response, request),
+            "height": request["height"],
+            "width": request["width"],
+            "task": "image-editing",
+        }
     environment = response.get("denoising_env") or {}
     metadata = (environment.get("image_kwargs") or {}).get("sensenova_rollout")
     if not isinstance(metadata, dict) or metadata.get("protocol") != PROTOCOL:
         raise ValueError("Missing SenseNova rollout metadata")
-    options = (request.get("extra_sampling_params") or {}).get("rollout_options") or {}
     art_capture = options.get("capture") == "ode_states"
     if metadata.get("protocol_version") != (ART_PROTOCOL_VERSION if art_capture else PROTOCOL_VERSION):
         raise ValueError("SenseNova rollout protocol version mismatch")
@@ -359,25 +378,7 @@ def validate_sensenova_rollout_response(response: Mapping[str, Any], request: Ma
     ):
         if conditioning.get(key) != expected:
             raise ValueError(f"Actual conditioning mismatch: {key}")
-    generated = response.get("generated_output")
-    if isinstance(generated, torch.Tensor) and generated.dtype == torch.uint8:
-        # SGLang's GPUWorker returns a single uint8 THWC frame per image,
-        # whereas the reward adapter consumes normalized RGB CHW tensors.
-        height, width = request["height"], request["width"]
-        if generated.shape == (1, height, width, 3):
-            generated = generated[0]
-        if generated.shape == (height, width, 3):
-            generated = generated.permute(2, 0, 1)
-        if generated.shape == (3, height, width):
-            generated = generated.float().div(255).contiguous()
-    if (
-        not isinstance(generated, torch.Tensor)
-        or generated.shape != (3, request["height"], request["width"])
-        or not torch.isfinite(generated).all()
-    ):
-        shape = tuple(generated.shape) if isinstance(generated, torch.Tensor) else None
-        dtype = generated.dtype if isinstance(generated, torch.Tensor) else None
-        raise ValueError(f"Invalid reward image: type={type(generated).__name__}, shape={shape}, dtype={dtype}")
+    generated = _validate_reward_image(response, request)
     return {
         "request_id": response.get("request_id"),
         "group_id": request.get("group_id"),
@@ -436,6 +437,31 @@ def validate_sensenova_rollout_response(response: Mapping[str, Any], request: Ma
         "width": conditioning["width"],
         "task": "image-editing",
     }
+
+
+def _validate_reward_image(response: Mapping[str, Any], request: Mapping[str, Any]) -> Any:
+    import torch
+
+    generated = response.get("generated_output")
+    if isinstance(generated, torch.Tensor) and generated.dtype == torch.uint8:
+        # SGLang's GPUWorker returns a single uint8 THWC frame per image,
+        # whereas the reward adapter consumes normalized RGB CHW tensors.
+        height, width = request["height"], request["width"]
+        if generated.shape == (1, height, width, 3):
+            generated = generated[0]
+        if generated.shape == (height, width, 3):
+            generated = generated.permute(2, 0, 1)
+        if generated.shape == (3, height, width):
+            generated = generated.float().div(255).contiguous()
+    if (
+        not isinstance(generated, torch.Tensor)
+        or generated.shape != (3, request["height"], request["width"])
+        or not torch.isfinite(generated).all()
+    ):
+        shape = tuple(generated.shape) if isinstance(generated, torch.Tensor) else None
+        dtype = generated.dtype if isinstance(generated, torch.Tensor) else None
+        raise ValueError(f"Invalid reward image: type={type(generated).__name__}, shape={shape}, dtype={dtype}")
+    return generated
 
 
 def _validate_art_ode_cache(
@@ -574,24 +600,3 @@ def pack_sensenova_rollout_requests(requests: List[Mapping[str, Any]]) -> Dict[s
         raise ValueError("Candidate IDs must be unique within a native batch")
     packed["extra_sampling_params"]["rollout_options"]["candidates"] = candidates
     return packed
-
-
-def build_sensenova_replay_request(
-    request: Mapping[str, Any],
-    rollout_metadata: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """Regenerate under another policy with the exact sampled Think condition.
-
-    Image-transition training still replays the returned stored states in the
-    training adapter. This helper freezes the textual condition, never old KV.
-    """
-    replay = deepcopy(dict(request))
-    conditioning = rollout_metadata.get("conditioning") or {}
-    if conditioning.get("prompt") != request["prompt"] or conditioning.get("image_paths") != request["image_path"]:
-        raise ValueError("Replay condition belongs to a different request")
-    if request["extra_sampling_params"].get("think_mode", False):
-        think = conditioning.get("think") or {}
-        if not isinstance(think.get("token_ids"), list):
-            raise ValueError("Rollout is missing exact Think tokens")
-        replay["extra_sampling_params"]["think_token_ids"] = list(think["token_ids"])
-    return replay

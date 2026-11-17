@@ -1706,13 +1706,8 @@ class FSDPTrainRayActor(TrainRayActor):
         if self._rank == 0:
             total = _time.time() - _t0
             parts = " ".join(f"{k}={v:.1f}s" for k, v in _phase.items())
-            # Split bucket_loop into where it actually goes. gather = the
-            # per-parameter DTensor all-gathers, serialize = CUDA-IPC handle
-            # packing, transport = gather_object + engine RPC + barrier.
-            gather, serialize, transport = getattr(self, "_last_sync_breakdown", (0.0, 0.0, 0.0))
-            inner = f" [gather={gather:.1f}s serialize={serialize:.1f}s transport={transport:.1f}s]"
             logger.info(
-                f"[wsync time] total={total:.1f}s {parts}{inner} "
+                f"[wsync time] total={total:.1f}s {parts} "
                 f"({self._last_sync_tensors} tensors, {self._last_sync_bytes / 1e9:.1f}GB)"
             )
         return offload_engine
@@ -2693,10 +2688,16 @@ class FSDPTrainRayActor(TrainRayActor):
             read_error, latest = None, None
             try:
                 latest = ckpt.find_latest_committed(self.args.load, self.args.generation_task)
-                if latest is not None:
-                    self._assert_resumable(
-                        os.path.join(self.args.load, self.args.generation_task, ckpt.iter_dir_name(latest))
-                    )
+                if latest is None:
+                    raise ValueError("ART resume requires a committed checkpoint.")
+                checkpoint_dir = os.path.join(self.args.load, self.args.generation_task, ckpt.iter_dir_name(latest))
+                self._assert_resumable(checkpoint_dir)
+                ckpt.load_art_dataset_state(self.args.load, latest, self.args.n_samples_per_prompt)
+                import json
+
+                with open(os.path.join(checkpoint_dir, "trainer_state.json"), encoding="utf-8") as stream:
+                    if json.load(stream).get("rollout_id") != latest:
+                        raise ValueError("ART trainer state belongs to a different acquisition.")
             except Exception as exc:
                 read_error = f"{type(exc).__name__}: {exc}"
             errors = _collect_weight_sync_errors(read_error)

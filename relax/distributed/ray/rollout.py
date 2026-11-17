@@ -1496,6 +1496,8 @@ class RolloutManager(ReloadableMixin):
             await self.data_source.load.remote(rollout_id)
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
+            if (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art":
+                raise
 
     async def offload(self):
         self._offload_local()

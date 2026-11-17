@@ -254,6 +254,34 @@ def test_art_tail_grid_is_not_replaced_by_t_eps():
     torch.testing.assert_close(packed["cond_t_eps"], torch.tensor(0.02), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("fault", [None, "seed", "size", "nan"])
+def test_art_image_only_evaluation_preserves_strict_training_response_validation(fault):
+    from relax.backends.sglang.diffusion_engine import SGLangNativeGenerationEngine
+
+    training = _request()
+    request = deepcopy(training)
+    request["extra_sampling_params"]["rollout_options"]["capture"] = "terminal"
+    request["rollout_return_step_indices"] = None
+    request["rollout_return_dit_trajectory"] = request["rollout_return_denoising_env"] = False
+    response = {"seed": request["seed"], "generated_output": torch.full((1, 8, 8, 3), 255, dtype=torch.uint8)}
+    if fault == "seed":
+        response["seed"] += 1
+    elif fault == "size":
+        response["generated_output"] = torch.ones(3, 7, 8)
+    elif fault == "nan":
+        response["generated_output"] = torch.full((3, 8, 8), float("nan"))
+    engine = SGLangNativeGenerationEngine(SimpleNamespace(), rank=0)
+    with pytest.raises(ValueError, match="Missing SenseNova rollout metadata"):
+        engine._map_responses([response], training)
+    if fault:
+        with pytest.raises(ValueError, match="seed mismatch|Invalid reward image"):
+            engine._map_responses([response], request)
+    else:
+        mapped = engine._map_responses([response], request)
+        torch.testing.assert_close(mapped["generated_output"], torch.ones(3, 8, 8), rtol=0, atol=0)
+        assert "trajectory_latents" not in mapped and "denoising_env" not in mapped
+
+
 @pytest.mark.parametrize("fault", ["velocity_dtype", "t_eps", "grid_dtype"])
 def test_art_adapter_also_rejects_invalid_cached_payloads_without_wire_revalidation(fault):
     request, response = _pair()

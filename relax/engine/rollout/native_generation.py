@@ -855,6 +855,7 @@ def evaluate_rollout(args, rollout_id: int):
 
     from relax.engine.rewards.generative import score_samples
     from relax.engine.rollout.base_types import RolloutFnEvalOutput
+    from relax.models.sensenova.rollout import is_sensenova_rollout_request
 
     eval_t0 = time.time()
     eval_metrics: Dict[str, float] = {}
@@ -909,6 +910,9 @@ def evaluate_rollout(args, rollout_id: int):
                     }
                     seed = base_seed if driver_xt else base_seed + (int(group_index) * n) + slot
                     req = adapter.build_rollout_request(sample, request_sampling, seed)
+                    if is_sensenova_rollout_request(req):
+                        req["extra_sampling_params"]["rollout_options"]["capture"] = "terminal"
+                        req["rollout_return_step_indices"] = None
                     req["rollout_return_dit_trajectory"] = False
                     req["rollout_return_denoising_env"] = False
                     group_reqs.append(req)

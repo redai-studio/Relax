@@ -383,6 +383,8 @@ class Rollout(Base):
                 await self.rollout_manager.load.remote(self.step - 1)
             except Exception as e:
                 self._logger.exception(f"Failed to load global dataset: {e}")
+                if (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art":
+                    raise
 
         self._run_task = asyncio.ensure_future(self._async_run())
         await self._run_task

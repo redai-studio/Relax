@@ -50,6 +50,7 @@ __all__ = [
     "export_hf",
     "export_peft_adapter",
     "read_adapter_contract",
+    "load_art_dataset_state",
     "COMMITTED_MARKER",
 ]
 
@@ -59,6 +60,32 @@ _LATEST = "latest_checkpointed_iteration.txt"
 
 def iter_dir_name(iteration: int) -> str:
     return f"iter_{int(iteration):07d}"
+
+
+def load_art_dataset_state(load_dir: str, iteration: int, n_samples_per_prompt: int) -> Dict[str, Any]:
+    """Read the eager data cursor paired with a completed ART acquisition."""
+    path = os.path.join(load_dir, "dataset", f"global_dataset_state_dict_{iteration}.pt")
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise ValueError(f"ART resume cannot read its dataset cursor: {path}") from exc
+    counters = ("sample_offset", "epoch_id", "sample_group_index", "sample_index")
+    required = {*counters, "metadata", "use_streaming"}
+    if not isinstance(state, dict) or not required <= state.keys() or state["use_streaming"] is not False:
+        raise ValueError("ART resume requires a complete eager-dataset cursor.")
+    if any(type(state[key]) is not int or state[key] < 0 for key in counters) or not isinstance(
+        state["metadata"], dict
+    ):
+        raise ValueError("ART dataset cursor has invalid counters or metadata.")
+    if type(n_samples_per_prompt) is not int or n_samples_per_prompt < 1:
+        raise ValueError("ART dataset cursor requires a positive candidate count.")
+    if state["sample_index"] != state["sample_group_index"] * n_samples_per_prompt:
+        raise ValueError("ART dataset candidate/group identity does not match the K contract.")
+    # Earlier complete-acquisition snapshots encoded this identity in the file
+    # name only. Newly saved cursors also record it in the payload.
+    if "rollout_id" in state and (type(state["rollout_id"]) is not int or state["rollout_id"] != iteration):
+        raise ValueError("ART dataset cursor belongs to a different acquisition.")
+    return state
 
 
 def _all_ranks_ok(ok: int) -> int:

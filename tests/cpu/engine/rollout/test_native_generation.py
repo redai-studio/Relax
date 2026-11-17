@@ -297,6 +297,72 @@ def test_read_eval_prompts_uses_record_metadata_without_extra_nesting(tmp_path):
     assert ng._native_generation_sample_id(samples[0], group_index=0, slot=0) == "prompt:pickapic_000001:sample:0"
 
 
+def test_art_evaluation_requests_only_images_and_scores_saved_candidates(monkeypatch, tmp_path):
+    import json
+
+    from PIL import Image
+
+    from relax.backends.sglang.diffusion_engine import SGLangNativeGenerationEngine
+    from relax.engine.rewards import generative
+
+    prompts = tmp_path / "eval.jsonl"
+    prompts.write_text(json.dumps({"prompt": "edit", "metadata": {"images": ["a.png"]}}) + "\n")
+    sampling = dict(algorithm="art", height=8, width=8, num_inference_steps=4, art={"train_step_indices": [0, 2]})
+    args = SimpleNamespace(
+        artifact_root=str(tmp_path),
+        generation_task="i2i",
+        generation_seed=42,
+        sampling_config=sampling,
+        model_adapter_path="relax.models.sensenova.adapter.SenseNovaU1ImageEditAdapter",
+        eval_datasets=[SimpleNamespace(name="heldout", path=str(prompts))],
+        n_samples_per_eval_prompt=2,
+        reward_component_weights={"ocr": 1.0},
+    )
+    engine = SGLangNativeGenerationEngine(args, rank=0)
+    monkeypatch.setattr(ng, "_get_engines", lambda *_: [engine])
+    monkeypatch.setattr(ng, "_log_eval_perf", lambda *_: None)
+    seeds = []
+
+    def dispatch(_engines, groups):
+        mapped = []
+        for group in groups:
+            results = []
+            for request in group:
+                assert request["rollout"] and request["rollout_sde_type"] == "ode"
+                assert request["extra_sampling_params"]["rollout_options"]["capture"] == "terminal"
+                assert not request["rollout_return_step_indices"]
+                assert request["rollout_return_dit_trajectory"] is request["rollout_return_denoising_env"] is False
+                seeds.append(request["seed"])
+                results.append(
+                    engine._map_responses(
+                        [
+                            {
+                                "seed": request["seed"],
+                                "generated_output": torch.full((1, 8, 8, 3), 255, dtype=torch.uint8),
+                            }
+                        ],
+                        request,
+                    )
+                )
+            mapped.append(results)
+        return mapped
+
+    def score(_args, samples):
+        assert len(samples) == 2
+        for sample in samples:
+            output = sample.train_metadata["manifest"]["outputs"][0]
+            with Image.open(output["uri"]) as image:
+                assert image.size == (8, 8) and image.getpixel((0, 0)) == (255, 255, 255)
+        return {"ocr": [0.75, 0.5]}
+
+    monkeypatch.setattr(ng, "_dispatch_groups", dispatch)
+    monkeypatch.setattr(generative, "score_samples", score)
+    result = ng.evaluate_rollout(args, 3)
+    assert result.data == {"heldout": {"rewards": [0.75, 0.5]}}
+    assert len(set(seeds)) == 2
+    assert sampling["art"]["train_step_indices"] == [0, 2]
+
+
 # ---------------------------------------------------------------------------
 # DP work sharding (design doc 3.1)
 # ---------------------------------------------------------------------------

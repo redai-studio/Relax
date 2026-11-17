@@ -451,16 +451,6 @@ class SGLangNativeGenerationEngine(RayActor):
             "host": host,
             "port": port,
             "num_gpus": num_gpus,
-            # Keep the two frozen encoders off the card during the denoising loop.
-            # The text encoder runs once before it and the VAE once after, so both
-            # sit idle for the whole 12-step loop while still holding their weights.
-            # SGLang defaults both to False; overriding them here (and not in the
-            # launch script) keeps every diffusion rollout on the cheap path.
-            # These flags affect rollout residency, not the training peak when
-            # --offload-rollout already evicts the engine.
-            # Overridable: the sglang_overrides merge below runs after this dict.
-            "text_encoder_cpu_offload": True,
-            "vae_cpu_offload": True,
         }
         # Distinct torch-distributed master port per engine. The diffusion launcher
         # defaults master_port to a fixed value, so N single-GPU servers on one node

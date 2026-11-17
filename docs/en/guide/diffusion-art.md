@@ -76,6 +76,10 @@ For resume, set `LOAD_DIR` to the previous checkpoint root, choose fresh output
 directories and set `NUM_ROLLOUT` above the restored cursor. Only completed
 two-window acquisitions are resumable. Per-rank RNG, optimizer/LR counters,
 model and dataset cursor must belong to the same acquisition.
+The runtime checks the matching eager-dataset cursor before restoring training
+state; missing, corrupt or inconsistent cursors abort resume, including through
+the generic `train.py --load` entry point. Held-out evaluation uses image-only
+terminal ODE requests, without collecting training states or replay conditions.
 
 ## Algorithm and scheduling boundaries
 

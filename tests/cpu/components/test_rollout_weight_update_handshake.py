@@ -17,6 +17,8 @@ try/finally so the gate is always released.
 
 import asyncio
 import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -43,6 +45,29 @@ class _RemoteStub:
 
 async def _ok(*_args, **_kwargs):
     return None
+
+
+@pytest.mark.parametrize("algorithm", ["art", "grpo"])
+def test_resume_data_load_failure_reaches_service_before_production(algorithm):
+    from relax.distributed.ray.rollout import RolloutManager
+
+    manager = object.__new__(RolloutManager.__ray_metadata__.modified_class)
+    manager.args = SimpleNamespace(sampling_config={"algorithm": algorithm})
+    read = AsyncMock(side_effect=OSError("dataset unavailable"))
+    manager.data_source = SimpleNamespace(load=SimpleNamespace(remote=read))
+    service = _make_rollout(can_update=False, manager=SimpleNamespace(load=_RemoteStub(manager.load)))
+    service.config = SimpleNamespace(rollout_global_dataset=True, sampling_config={"algorithm": algorithm})
+    service.step, service._run_task = 1, None
+    service._async_run = AsyncMock()
+    if algorithm == "art":
+        with pytest.raises(OSError, match="dataset unavailable"):
+            asyncio.run(service.run())
+        assert service._run_task is None
+        service._async_run.assert_not_awaited()
+    else:
+        asyncio.run(service.run())
+        service._async_run.assert_awaited_once()
+    read.assert_awaited_once_with(0)
 
 
 async def _prepared(*_args, **_kwargs):
