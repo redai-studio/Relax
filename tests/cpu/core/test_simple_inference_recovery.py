@@ -180,18 +180,18 @@ def test_disabled_gate_has_no_state_or_tq_side_effects():
     gate.fail(ValueError("legacy behavior"))
 
 
-@pytest.mark.parametrize("flag", ["0", "false", "FALSE", " false "])
 @pytest.mark.parametrize("hybrid", [False, True])
-def test_explicit_disable_skips_eligibility_checks(monkeypatch, flag, hybrid):
+def test_disabled_fault_tolerance_skips_eligibility_checks(monkeypatch, hybrid):
     import sys
 
     module = _source()
-    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", flag)
     affinity = Mock()
     monkeypatch.setitem(
         sys.modules, "relax.core.node_group_affinity", SimpleNamespace(with_control_plane_affinity=affinity)
     )
-    config = SimpleNamespace(hybrid=hybrid, inference_recovery=True, inference_recovery_state=object())
+    config = SimpleNamespace(
+        hybrid=hybrid, use_fault_tolerance=False, inference_recovery=True, inference_recovery_state=object()
+    )
     controller = object.__new__(module["Controller"])
     controller.config = config
     assert controller._create_inference_recovery_state() is None

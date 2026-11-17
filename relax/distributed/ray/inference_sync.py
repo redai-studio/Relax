@@ -54,8 +54,9 @@ def check_services_health(args: Namespace, *, managed: bool = False) -> tuple[bo
             retry_deadline = None
             res = response.json()
             if res:
-                response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
-                response.raise_for_status()
+                if getattr(args, "use_fault_tolerance", False) and not getattr(args, "inference_recovery", False):
+                    response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
+                    response.raise_for_status()
                 break
             else:
                 time.sleep(1)

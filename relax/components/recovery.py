@@ -11,7 +11,6 @@ import ray
 
 from relax.distributed.settlement import UnsafeInferenceError, wait_all
 from relax.utils.async_utils import run
-from relax.utils.env import Envs
 
 
 class RecoveryGate:
@@ -169,15 +168,11 @@ class InferenceRecoveryState:
 
 
 def inference_recovery_enabled(config: Namespace) -> bool:
-    """Enable supported full-async/hybrid recovery by default; colocate is opt-
-    in."""
-    choice = Envs.RELAX_ENABLE_INFERENCE_RECOVERY
-    if choice is False:
+    """Select component recovery for supported fault-tolerant training."""
+    if not getattr(config, "use_fault_tolerance", False):
         return False
     hybrid = bool(getattr(config, "hybrid", False))
     fully_async = bool(getattr(config, "fully_async", False))
-    if choice is None and not (fully_async or hybrid):
-        return False
 
     conflicts = [
         f"{name}={getattr(config, name, None)!r} (requires {required!r})"
@@ -201,7 +196,6 @@ def inference_recovery_enabled(config: Namespace) -> bool:
             "debug_train_only",
             "debug_rollout_only",
             "use_dynamic_global_batch_size",
-            "use_fault_tolerance",
             "use_slime_router",
             "autoscaler_config",
             "sglang_config",
@@ -227,8 +221,4 @@ def inference_recovery_enabled(config: Namespace) -> bool:
             for name in ("offload_train", "offload_rollout", "enable_weights_backuper")
             if not getattr(config, name, False)
         )
-    if conflicts:
-        if choice is True:
-            raise ValueError("Unsupported inference recovery configuration: " + "; ".join(conflicts))
-        return False
-    return True
+    return not conflicts

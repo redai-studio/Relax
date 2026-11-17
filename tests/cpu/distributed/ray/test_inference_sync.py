@@ -48,7 +48,9 @@ def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
     _patch_health_common(monkeypatch, _record_get(calls, payload=True))
 
     shell = SimpleNamespace()
-    shell.args = Namespace(true_on_policy_mode=False, hybrid=False, rollout_http_timeout=17.0)
+    shell.args = Namespace(
+        true_on_policy_mode=False, hybrid=False, rollout_http_timeout=17.0, use_fault_tolerance=True
+    )
 
     inference_sync.check_services_health(shell.args)
 
@@ -63,6 +65,28 @@ def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
     assert recover
     for _u, k in recover:
         assert "timeout" not in k
+
+
+@pytest.mark.parametrize("fault_tolerance,component_recovery", [(False, False), (True, False), (True, True)])
+def test_health_handshake_only_requests_engine_recovery_when_selected(
+    monkeypatch, fault_tolerance, component_recovery
+):
+    calls = []
+    _patch_health_common(monkeypatch, _record_get(calls, payload=True))
+    args = SimpleNamespace(
+        true_on_policy_mode=False,
+        hybrid=False,
+        rollout_http_timeout=17.0,
+        use_fault_tolerance=fault_tolerance,
+        inference_recovery=component_recovery,
+    )
+
+    assert inference_sync.check_services_health(args) == (False, False)
+
+    paths = [url.rsplit("/", 1)[-1] for url, _ in calls]
+    assert "can_do_update_weight_for_async" in paths
+    assert "get_step" in paths
+    assert ("recover_rollout_engines" in paths) is (fault_tolerance and not component_recovery)
 
 
 def test_check_services_health_swallows_timeout(monkeypatch):

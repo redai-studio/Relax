@@ -1,13 +1,79 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import HAS_DEPS, make_engine_group, make_rollout_server
+from conftest import (
+    HAS_DEPS,
+    create_test_manager,
+    make_engine_group,
+    make_mock_args,
+    make_mock_engine,
+    make_rollout_server,
+)
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
+
+
+@pytest.mark.parametrize("component_recovery", [False, True])
+def test_component_recovery_prevents_engine_rebuild_from_legacy_callers(component_recovery):
+    manager = create_test_manager(args=make_mock_args(use_fault_tolerance=True, inference_recovery=component_recovery))
+    server = make_rollout_server()
+    server.recover = MagicMock()
+    manager.servers = {"default": server}
+    manager.rollout_id = 2
+    manager.rollout_engine_lock = object()
+    manager.health_monitoring_pause = MagicMock()
+    expected = manager.get_rollout_engines_and_lock()
+
+    assert manager.recover_rollout_engines() == expected
+
+    assert server.recover.call_count == int(not component_recovery)
+    assert manager.health_monitoring_pause.call_count == int(not component_recovery)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component_recovery", [False, True])
+async def test_generation_uses_legacy_fault_injection_only_with_engine_recovery(component_recovery):
+    manager = create_test_manager(
+        args=make_mock_args(
+            ci_test=True,
+            use_fault_tolerance=True,
+            inference_recovery=component_recovery,
+            partial_rollout=False,
+        )
+    )
+    manager._try_ci_fault_injection = MagicMock()
+    manager._generate_batch = MagicMock()
+
+    await manager.generate(2)
+
+    manager._generate_batch.assert_called_once_with(2)
+    assert manager._try_ci_fault_injection.call_count == int(not component_recovery)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component_recovery", [False, True])
+async def test_engine_registration_starts_monitor_only_with_engine_recovery(monkeypatch, component_recovery):
+    from relax.distributed.ray import rollout
+
+    manager = create_test_manager(args=make_mock_args(use_fault_tolerance=True, inference_recovery=component_recovery))
+    server = make_rollout_server()
+    engine = make_mock_engine()
+    manager._health_check_engines = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    monitor = MagicMock()
+    monkeypatch.setattr(rollout, "RolloutHealthMonitor", monitor)
+    monkeypatch.setattr(rollout.ray, "get", lambda value: value.value)
+    request = rollout.ScaleOutRequest(request_id="test", status=rollout.ScaleOutStatus.CREATING)
+
+    result = await manager._finalize_engine_group_registration(request, server, engines=[engine])
+
+    assert result.success
+    assert manager._health_monitors == ([] if component_recovery else [monitor.return_value])
+    assert monitor.return_value.start.call_count == int(not component_recovery)
 
 
 def test_recovery_removes_dead_route_before_creating_same_endpoint(monkeypatch):

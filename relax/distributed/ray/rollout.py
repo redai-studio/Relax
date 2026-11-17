@@ -975,7 +975,11 @@ class RolloutManager(ReloadableMixin):
         )
 
         self._health_monitors = []
-        if not self.args.debug_train_only and self.args.use_fault_tolerance:
+        if (
+            not self.args.debug_train_only
+            and self.args.use_fault_tolerance
+            and not getattr(self.args, "inference_recovery", False)
+        ):
             for srv in self.servers.values():
                 for group in srv.engine_groups:
                     monitor = RolloutHealthMonitor(group, args)
@@ -1490,7 +1494,12 @@ class RolloutManager(ReloadableMixin):
         self._begin_generation()
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
-        if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
+        if (
+            self.args.ci_test
+            and self.args.use_fault_tolerance
+            and not getattr(self.args, "inference_recovery", False)
+            and rollout_id >= 2
+        ):
             self._try_ci_fault_injection()
 
         self._recovery_generate_active = True
@@ -1751,6 +1760,9 @@ class RolloutManager(ReloadableMixin):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
         self._require_unmanaged_engine_pool()
+        if getattr(self.args, "inference_recovery", False):
+            # The Controller owns whole-service rebuilding in this mode.
+            return self.get_rollout_engines_and_lock(model_name)
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
         if self.rollout_id == -1 or srv is None:
@@ -2908,7 +2920,7 @@ class RolloutManager(ReloadableMixin):
         engine_group.num_new_engines = 0
 
         # Step 7: Register health monitor
-        if self.args.use_fault_tolerance:
+        if self.args.use_fault_tolerance and not getattr(self.args, "inference_recovery", False):
             monitor = RolloutHealthMonitor(engine_group, self.args)
             monitor.start()
             self._health_monitors.append(monitor)
