@@ -53,6 +53,7 @@ from relax.utils.types import Sample
 
 
 logger = get_logger(__name__)
+_CLEANUP_GRACE_S = 5.0
 
 
 # Compiler calibration messages used to measure the chat-template prefix. Their
@@ -932,6 +933,7 @@ class RuntimeDomain:
         self._progress_callback: Callable[[], None] = lambda: None
         self._state_changed = asyncio.Event()
         self._inventory = InventoryRecorder(args, rollout_mode)
+        self._cleanup_tasks: set[asyncio.Future[Any]] = set()
 
     def set_progress_callback(self, callback: Callable[[], None]) -> None:
         """Connect actor-local changes to the resident control loop."""
@@ -1005,11 +1007,9 @@ class RuntimeDomain:
         group_input: GroupInput,
         launch_decision: Optional[asyncio.Future[bool]] = None,
     ) -> Optional[RuntimeGroupStream]:
-        """Start one group on a Shard and wait for its first-IR barrier.
+        """Register every member and return a leaseable Group capability.
 
-        Session launch and progress observation share one Shard event stream. A
-        controlled drop before the barrier resolves this operation without a
-        Runtime capability.
+        Members may reach their first IR independently after registration.
         """
 
         prepare_started_at = time.monotonic()
@@ -1093,27 +1093,13 @@ class RuntimeDomain:
                     group_id, session_ids, error, uncertain=True, started_at=prepare_started_at
                 )
                 await self._release_shard_group(stream)
+                self._schedule_group_cleanup(stream, drop=True)
             else:
                 if isinstance(error, asyncio.CancelledError):
                     stream.stop_reason = ("prepare_cancelled", "selection", "session preparation cancelled")
                 await self._drop_prepared_group(stream, f"prepare-group-cleanup:{group_id}")
             raise
 
-        # Registration copied every launch field into the Shard. Drop the
-        # driver-side source and transport payloads before the first-IR wait.
-        del group_input, session_specs, registration, session_ids
-        try:
-            ready_for_lease = await asyncio.shield(stream.first_request_barrier)
-            if not ready_for_lease:
-                logger.warning("Dropping group %s because an agent exited before every first IR existed", group_id)
-                logger.info(format_agentic_status("Dropped 1 group"))
-                await self._drop_prepared_group(stream, f"prepare-group-drop:{group_id}")
-                return None
-        except BaseException as error:
-            if isinstance(error, asyncio.CancelledError):
-                stream.stop_reason = ("prepare_cancelled", "selection", "session preparation cancelled")
-            await self._drop_prepared_group(stream, f"prepare-group-cleanup:{group_id}")
-            raise
         return stream
 
     def observe_group_input(self, group_input: GroupInput) -> None:
@@ -1210,8 +1196,8 @@ class RuntimeDomain:
             stream.protected = group_progress.protected
             if stream.dropping:
                 continue
-            # RuntimeDomain.prepare_group() owns the first-IR readiness waiter.
-            if group_progress.ready_for_lease and not stream.first_request_barrier.done():
+            # Preserve the first-IR milestone independently of the lease gate.
+            if group_progress.all_first_ir_arrived and not stream.first_request_barrier.done():
                 stream.first_request_barrier.set_result(True)
             # Group execution and ordinary RM await these terminal Session refs.
             results = []
@@ -1306,9 +1292,9 @@ class RuntimeDomain:
                 outcomes = [session_export_ref.result() for session_export_ref in done]
                 if any(outcome is None for outcome in outcomes):
                     logger.info(format_agentic_status("Dropped 1 group"))
+                    await self.drop_group(stream)
                     return None
 
-            await stream.shard.handle.release_group.remote(stream.group_id)
             group = GroupExport(
                 group_id=stream.group_id,
                 sessions=tuple(
@@ -1316,6 +1302,7 @@ class RuntimeDomain:
                 ),
             )
             await self._release_shard_group(stream)
+            self._schedule_group_cleanup(stream, drop=False)
             return group
         except BaseException:
             await finish_before_cancellation(
@@ -1333,19 +1320,52 @@ class RuntimeDomain:
 
     async def _drop_group_and_release(self, stream: RuntimeGroupStream) -> None:
         stream.dropping = True
-        # An announced export may already have left its shard cell while the
-        # RPC response is still in flight. Join that transfer before dropping
-        # driver refs; otherwise neither producer can retire its trajectory.
+        # Keep announced exports attributable while their logical transfer ends.
+        # Capacity is released before joining these driver-local transfers.
+        if stream.shard.group_streams.get(stream.group_id) is stream:
+            stream.shard.group_streams.pop(stream.group_id)
+            self._resident_group_permits.release()
+            self._state_changed.set()
         take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
         if take_tasks:
-            await asyncio.gather(*take_tasks, return_exceptions=True)
-        await stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
+            await asyncio.wait(take_tasks, timeout=_CLEANUP_GRACE_S)
         if not stream.first_request_barrier.done():
             stream.first_request_barrier.set_result(False)
         for result in stream.session_results:
             if not result.completion.done():
                 result.completion.set_result(None)
         await self._release_shard_group(stream)
+        self._schedule_group_cleanup(stream, drop=True)
+
+    def _schedule_cleanup(self, work: Awaitable[Any], name: str) -> None:
+        task = asyncio.ensure_future(work)
+        if isinstance(task, asyncio.Task):
+            task.set_name(name)
+        self._cleanup_tasks.add(task)
+
+        def completed(finished: asyncio.Future[Any]) -> None:
+            self._cleanup_tasks.discard(finished)
+            if not finished.cancelled() and (error := finished.exception()) is not None:
+                logger.warning("Agentic cleanup failed task=%s: %s", name, error)
+
+        task.add_done_callback(completed)
+
+    def _schedule_group_cleanup(self, stream: RuntimeGroupStream, *, drop: bool) -> None:
+        self._schedule_cleanup(self._cleanup_group_rpc(stream, drop=drop), f"group-cleanup:{stream.group_id}")
+
+    async def _cleanup_group_rpc(self, stream: RuntimeGroupStream, *, drop: bool) -> None:
+        """Best-effort remote retirement after releasing the local Group
+        slot."""
+
+        try:
+            ref = (
+                stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
+                if drop
+                else stream.shard.handle.release_group.remote(stream.group_id)
+            )
+            await ref
+        except Exception as error:
+            logger.warning("Remote Group cleanup failed for group_id=%s: %s", stream.group_id, error)
 
     async def trim_memory(self) -> None:
         """Run allocator maintenance on every borrowed SessionShard."""
@@ -1394,7 +1414,7 @@ class RuntimeDomain:
         return {f"agentic_kv/{key}": value for key, value in metrics.items()}
 
     async def shutdown(self) -> None:
-        """Join every Ray owner and raise the first cleanup failure."""
+        """Release local ownership and give remote cleanup a bounded grace."""
 
         try:
             await self._shutdown_runtime()
@@ -1402,44 +1422,36 @@ class RuntimeDomain:
             await finish_before_cancellation(self._inventory.aclose(), "agentic-inventory-close")
 
     async def _shutdown_runtime(self) -> None:
-
-        first_error: Optional[BaseException] = None
-        try:
-            await self._stop_shard_observers()
-        except BaseException as error:
-            first_error = error
-
+        self._schedule_cleanup(self._stop_shard_observers(), "shard-observer-stop")
         streams = tuple(stream for shard in self._shards for stream in shard.group_streams.values())
         for stream in streams:
             if stream.stop_reason is None:
                 stream.stop_reason = ("shutdown", "selection", "runtime shut down")
-        drop_outcomes = await asyncio.gather(
-            *(stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason) for stream in streams),
-            return_exceptions=True,
-        )
-        for outcome in drop_outcomes:
-            if first_error is None and isinstance(outcome, BaseException):
-                first_error = outcome
         for stream in streams:
+            stream.dropping = True
             await self._release_shard_group(stream)
-
-        await self.trim_memory()
-
-        # Shards belong to the Serve deployment lifecycle. Runtime releases its
-        # borrowed handles after every owned Group has completed cleanup.
+            self._schedule_group_cleanup(stream, drop=True)
+        self._schedule_cleanup(self.trim_memory(), "shard-trim-memory")
+        if self._cleanup_tasks:
+            _, pending = await asyncio.wait(tuple(self._cleanup_tasks), timeout=_CLEANUP_GRACE_S)
+            for task in pending:
+                task.cancel()
+            if pending:
+                logger.warning("Runtime shutdown leaving %s unfinished cleanup tasks", len(pending))
         self._shards.clear()
-        if first_error is not None:
-            raise first_error
 
     async def _release_shard_group(self, stream: RuntimeGroupStream) -> None:
         """Release driver refs after Shard export/drop commits."""
 
+        if stream.shard.group_streams.get(stream.group_id) is stream:
+            stream.shard.group_streams.pop(stream.group_id)
+            self._resident_group_permits.release()
+            self._state_changed.set()
         take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
         for task in take_tasks:
             if not task.done():
                 task.cancel()
-        if take_tasks:
-            await asyncio.gather(*take_tasks, return_exceptions=True)
+            self._schedule_cleanup(task, f"session-result-take-cleanup:{stream.group_id}")
         local_refs = (
             stream.first_request_barrier,
             *(result.completion for result in stream.session_results),
@@ -1448,25 +1460,13 @@ class RuntimeDomain:
             if not local_ref.done():
                 local_ref.cancel()
         await asyncio.gather(*local_refs, return_exceptions=True)
-        # Remote cleanup can commit before cancellation reaches this driver ref.
-        group_id = stream.group_id
-        if stream.shard.group_streams.get(group_id) is stream:
-            stream.shard.group_streams.pop(group_id)
-            self._resident_group_permits.release()
-            self._state_changed.set()
 
     async def _drop_prepared_group(self, stream: RuntimeGroupStream, task_name: str) -> None:
         """Drop a registered Prepare group and release its local stream."""
 
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return
-        try:
-            await finish_before_cancellation(
-                stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason),
-                task_name,
-            )
-        finally:
-            await self._release_shard_group(stream)
+        await finish_before_cancellation(self._drop_group_and_release(stream), task_name)
 
 
 async def _take_session_results(

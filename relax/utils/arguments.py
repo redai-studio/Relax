@@ -1658,10 +1658,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--agent-command",
                 type=str,
                 default=None,
-                help=(
-                    "Managed-command agent entry command for agentic rollout. "
-                    "Required when --use-agentic-rollout is set."
-                ),
+                help="Command to start the agent.",
             )
             parser.add_argument(
                 "--agent-cwd",
