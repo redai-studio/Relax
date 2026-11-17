@@ -420,7 +420,8 @@ class _Harness:
         assert self.pipeline.transfer_domain.total_debt == 0
         assert not self.pipeline._finalized_groups
         assert not self.pipeline._active_group_tasks
-        self.runtime._assert_epoch_drained()
+        assert not self.runtime.tools
+        assert all(task.done() for task in self.group_tasks)
 
 
 async def _first_event(events):
