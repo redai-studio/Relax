@@ -381,6 +381,13 @@ def _decode_tokens(
 ) -> str:
     if not token_ids:
         return ""
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is not None and getattr(tokenizer, "clean_up_tokenization_spaces", None) is False:
+        # Same text as ``tokenizer.decode``, which adds only optional space
+        # cleanup on top of the backend. The batch entry point releases the GIL,
+        # so decoding a long trajectory on the export worker does not stall the
+        # Shard event loop.
+        return backend.decode_batch([token_ids], skip_special_tokens=False)[0]
     return tokenizer.decode(token_ids, skip_special_tokens=False)
 
 
