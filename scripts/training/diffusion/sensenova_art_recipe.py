@@ -41,23 +41,13 @@ def build_argv(env: Mapping[str, str]) -> list[str]:
         raise ValueError("Eight-rank ART requires even K>=2 and N_PROMPTS*K divisible by 16.")
     if resolution < 1 or steps < 1:
         raise ValueError("RESOLUTION and STEPS must be positive.")
-    overlap = env.get("ART_GROUP_OVERLAP", "0")
-    if overlap not in ("0", "1"):
-        raise ValueError("ART_GROUP_OVERLAP must be 0 or 1.")
-    pending = int(env.get("ART_OVERLAP_PENDING_GROUPS", "2"))
-    if not 1 <= pending <= 3:
-        raise ValueError("ART_OVERLAP_PENDING_GROUPS must be between 1 and 3.")
-    prefetch = env.get("ART_GENERATION_PREFETCH", "0")
-    if prefetch not in ("0", "1"):
-        raise ValueError("ART_GENERATION_PREFETCH must be 0 or 1.")
-    if prefetch == "1" and (overlap != "1" or pending < 2 or candidates != 8):
-        raise ValueError("ART_GENERATION_PREFETCH requires group overlap, >=2 pending groups and N_SAMPLES=8.")
+    if any(env.get(key, "0") != "0" for key in ("ART_GROUP_OVERLAP", "ART_GENERATION_PREFETCH")):
+        raise ValueError("Group overlap and generation prefetch require the separate ART performance branch.")
     sampling = {
         "algorithm": "art",
         "storage_dtype": "float16",
         "trajectory_storage": "ray",
         "wave_groups": 1,
-        "overlap_group_processing": overlap == "1",
         "height": resolution,
         "width": resolution,
         "output_size_from_condition": True,
@@ -78,10 +68,6 @@ def build_argv(env: Mapping[str, str]) -> list[str]:
             "max_replay_bytes": int(_required(env, "ART_MAX_REPLAY_BYTES")),
         },
     }
-    if prefetch == "1":
-        sampling["generation_prefetch"] = True
-    if overlap == "1":
-        sampling["overlap_pending_groups"] = pending
     argv = [
         "--resource",
         '{"actor":[1,8],"rollout":[1,8]}',

@@ -92,10 +92,6 @@ terminal ODE requests, without collecting training states or replay conditions.
 - Original FP32 timesteps, sigmas, negative Euler increments and old velocities
   are replayed alongside bit-preserved FP16/BF16 states. A failed reward skips
   the whole acquisition. A partially failed update requires checkpoint recovery.
-- `ART_GROUP_OVERLAP=1` overlaps bounded CPU reward processing with later
-  generation. `ART_GENERATION_PREFETCH=1` additionally overlaps one next
-  generation with response transfer; it requires overlap, at least two pending
-  groups and exactly eight samples/engines. It defaults off.
 - Lossless mask packing, trajectory transport and copy reductions are automatic
   on the patched runtime. Memory preparation is agreed across all training ranks
   before restoring inference weights.

@@ -69,7 +69,9 @@ def _acquisition(monkeypatch, *, size=8, constant=False, invalid=()):
         "lpips": [0.25] * len(samples),
     }
     components["__valid_mask__"] = [index not in invalid for index in range(len(samples))]
-    monkeypatch.setattr(generative, "_consume_prefetched_rewards", lambda _samples: components.copy())
+    monkeypatch.setattr(
+        generative, "_get_manager", lambda _args: SimpleNamespace(score=lambda _requests: components.copy())
+    )
     monkeypatch.setattr(generative, "_log_reward_metrics", lambda *_args: None)
     monkeypatch.setattr("relax.utils.utils.post_process_rewards", generative.post_process)
     rows = ng.convert_samples_to_train_data(args, samples)
@@ -389,3 +391,86 @@ def test_finite_validation_preserves_other_dtypes():
         torch.ones(4, dtype=torch.float64),
     ):
         assert _finite_cpu_tensor(value) == bool(torch.isfinite(value).all())
+
+
+def test_failed_unpublished_round_releases_only_new_owned_refs_before_dropping_them(monkeypatch):
+    import ray._private.internal_api as api
+
+    old, current, next_round = object(), object(), object()
+    cache = {(3, 0): old, (4, 0): current, (5, 0): next_round}
+    monkeypatch.setattr(ng, "_TRAJECTORY_REF_CACHE", cache)
+    freed = []
+
+    def free(refs, *, local_only):
+        assert cache[(4, 0)] is current  # Do not lose ownership before successful free.
+        assert local_only is False
+        freed.extend(refs)
+
+    monkeypatch.setattr(api, "free", free)
+    ng._discard_unpublished_art_refs(4, {(3, 0)})
+    assert freed == [current] and cache == {(3, 0): old, (5, 0): next_round}
+
+
+@pytest.mark.parametrize("failure", ["prepare", "reward", "put", "free"])
+def test_serial_art_failure_releases_only_unpublished_refs_and_owned_samples(monkeypatch, failure):
+    import ray._private.internal_api as api
+    from tensordict import TensorDict
+
+    from relax.utils import utils as transfer
+
+    old, refs, freed, puts = object(), {}, [], []
+    refs[(2, 0)] = old
+    groups = [[Sample(index=g * 2 + i, group_index=g, prompt="p") for i in range(2)] for g in range(2)]
+    prior = Sample(index=99, prompt="prior")
+    monkeypatch.setattr(transfer, "CURRENT_ROLLOUT_BATCH", [prior])
+    monkeypatch.setattr(ng, "_TRAJECTORY_REF_CACHE", refs)
+    monkeypatch.setattr(ng, "_CANDIDATE_IMAGE_CACHE", {})
+    monkeypatch.setattr(ng, "_CANDIDATE_IMAGE_ROLLOUT_IDS", {})
+    args = SimpleNamespace(
+        rollout_batch_size=2,
+        sampling_config={
+            "algorithm": "art",
+            "wave_groups": 1,
+            "art": {"train_step_indices": [0], "max_cache_bytes": 10000, "max_replay_bytes": 10000},
+        },
+    )
+    adapter = SimpleNamespace(build_rollout_request=lambda *_a, **_k: {"height": 1, "width": 1})
+    monkeypatch.setattr(ng, "_load_adapter", lambda *_: adapter)
+    monkeypatch.setattr(ng, "_get_engines", lambda *_: [object(), object()])
+    monkeypatch.setattr(ng, "_get_samples", lambda *_: groups)
+    monkeypatch.setattr(ng, "prune_stale_artifacts", lambda *_: None)
+    monkeypatch.setattr(ng, "_dispatch_groups", lambda *_a, **_k: [[{}, {}]])
+
+    def prepare(_args, _sampling, _adapter, rollout, _fp, group, _responses, **_kwargs):
+        refs[(rollout, group[0].group_index)] = object()
+        ng.cache_candidate_image(torch.ones(3, 1, 1), "i2i", rollout, group[0].group_index, 0)
+        if failure == "prepare":
+            raise OSError("prepare failed")
+
+    def convert(_args, _samples):
+        if failure != "put":
+            raise OSError("reward failed")
+        return TensorDict({"total_lengths": torch.ones(4), "sample_indices": torch.arange(4)}, batch_size=[4])
+
+    async def put(**kwargs):
+        puts.append(kwargs)
+        raise OSError("put failed")
+
+    def free(values, *, local_only):
+        assert old not in values and local_only is False
+        if failure == "free":
+            raise OSError("free failed")
+        freed.extend(values)
+
+    monkeypatch.setattr(ng, "_prepare_generated_group", prepare)
+    monkeypatch.setattr(transfer, "convert_samples_to_train_data", convert)
+    monkeypatch.setattr(api, "free", free)
+    with pytest.raises(OSError, match="prepare failed|reward failed|put failed"):
+        ng.generate_rollout(args, 4, object(), SimpleNamespace(async_put=put))
+    assert transfer.CURRENT_ROLLOUT_BATCH == [prior]
+    assert not ng._CANDIDATE_IMAGE_CACHE
+    assert bool(puts) == (failure == "put")
+    if failure in ("put", "free"):
+        assert not freed and any(key[0] == 4 for key in refs)
+    else:
+        assert freed and refs == {(2, 0): old}

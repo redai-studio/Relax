@@ -360,32 +360,11 @@ def _validate_art_config(args: Namespace, sampling: dict, errors: List[str]) -> 
         sampling.get("wave_groups") != 1,
         "ART requires wave_groups=1 for bounded acquisition.",
     )
-    prefetch = sampling.get("generation_prefetch", False)
-    _fail(errors, type(prefetch) is not bool, "ART generation_prefetch must be a boolean.")
-    overlap = sampling.get("overlap_group_processing", False)
-    _fail(errors, bool(prefetch) and not overlap, "ART generation_prefetch requires group overlap.")
-    _fail(errors, type(overlap) is not bool, "ART overlap_group_processing must be a boolean.")
-    if overlap:
-        _fail(
-            errors,
-            getattr(args, "reward_runtime", "cpu") != "cpu"
-            or getattr(args, "reward_scorer_path", None)
-            != "relax.engine.rewards.textpecker_reward.TextPeckerRewardScorer"
-            or getattr(args, "custom_reward_post_process_path", None)
-            != "relax.engine.rewards.generative.post_process",
-            "ART group overlap requires CPU TextPecker with the complete-acquisition reward hook.",
-        )
-        pending = sampling.get("overlap_pending_groups", 2)
-        _fail(
-            errors,
-            bool(prefetch) and (type(pending) is not int or pending < 2),
-            "ART generation_prefetch requires at least two pending groups.",
-        )
-        _fail(
-            errors,
-            type(pending) is not int or not 1 <= pending <= 3,
-            "ART overlap_pending_groups must be between 1 and 3.",
-        )
+    _fail(
+        errors,
+        bool(sampling.get("overlap_group_processing")) or bool(sampling.get("generation_prefetch")),
+        "ART group overlap and generation prefetch require the separate performance branch.",
+    )
     _fail(
         errors,
         sampling.get("guidance_scale", 1.0) != 1.0

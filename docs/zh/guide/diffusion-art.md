@@ -25,8 +25,6 @@ TextPecker 示例需要独立 OpenAI 兼容 OCR 服务、CPU LPIPS 及离线 Ale
 通用 `train.py --load` 入口也执行此校验。评估使用只返回图像的终态 ODE 请求，
 不采集训练状态或回放条件。
 
-`ART_GROUP_OVERLAP=1` 开启有界奖励与采样重叠；额外的
-`ART_GENERATION_PREFETCH=1` 默认关闭，要求至少两个待处理组、每组 8 候选。
 无损 mask 压缩、轨迹传输和减少重复复制由补丁自动启用。保存间隔建议从
 `SAVE_INTERVAL=50` 起，结合恢复成本与磁盘预算调整。
 

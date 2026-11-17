@@ -634,59 +634,6 @@ class SGLangNativeGenerationEngine(RayActor):
                 raise ValueError("ART tensor transport requires full ODE training trajectories")
         return pack(self.generate_batch(requests))
 
-    def generate_art_lookahead(
-        self, requests: List[Dict[str, Any]], *, next_requests: Optional[List[Dict[str, Any]]] = None
-    ) -> List[Dict[str, Any]]:
-        """Overlap one next ART generation with current response transfer."""
-        import requests as http
-
-        from relax.engine.rollout.art_http_lookahead import HeaderLookahead
-        from relax.models.sensenova.rollout import pack_sensenova_rollout_requests
-        from relax.utils.art_tensor_transport import pack
-
-        if len(requests) != 1 or (next_requests is not None and len(next_requests) != 1):
-            raise ValueError("ART lookahead requires exactly one candidate per engine")
-        for request in requests + (next_requests or []):
-            options = (request.get("extra_sampling_params") or {}).get("rollout_options") or {}
-            if (
-                options.get("capture") != "ode_states"
-                or not request.get("rollout_return_dit_trajectory")
-                or not request.get("rollout_return_denoising_env")
-            ):
-                raise ValueError("ART lookahead only supports ART ode_states")
-        if self._url is None:
-            raise RuntimeError("Engine URL is not initialized")
-        cache = getattr(self, "_art_header_lookahead", None)
-        if cache is None:
-            cache = HeaderLookahead(
-                lambda body: http.post(
-                    f"{self._url}/rollout/generate", json=body, timeout=_REQUEST_TIMEOUT_S, stream=True
-                )
-            )
-            self._art_header_lookahead = cache
-        body = pack_sensenova_rollout_requests(requests)
-        next_body = pack_sensenova_rollout_requests(next_requests) if next_requests is not None else None
-        policy = [self._active_version, self._active_weight_manifest_sha256]
-
-        def decode(response):
-            content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
-            if content_type == "application/msgpack":
-                import msgspec
-
-                decoded = msgspec.msgpack.decode(response.content)
-            else:
-                decoded = response.json()
-            return pack([self._map_responses(decoded, requests[0])])
-
-        return cache.consume(body, next_body, policy, decode)
-
-    def clear_art_lookahead(self) -> Dict[str, bool]:
-        cache = getattr(self, "_art_header_lookahead", None)
-        self._art_header_lookahead = None
-        if cache is not None:
-            cache.close()
-        return {"success": True}
-
     def _map_responses(self, resp: Any, request: Mapping[str, Any]) -> Dict[str, Any]:
         """Map the single RolloutResponse in a server reply to an adapter
         sidecar dict.
@@ -839,7 +786,6 @@ class SGLangNativeGenerationEngine(RayActor):
     def commit_weight_version(self, version: int, weight_manifest_sha256: str) -> Dict[str, Any]:
         """Record the active policy version after a successful weight
         update."""
-        self.clear_art_lookahead()
         digest = str(weight_manifest_sha256)
         try:
             valid = len(digest) == 64 and int(digest, 16) >= 0
@@ -958,8 +904,6 @@ class SGLangNativeGenerationEngine(RayActor):
         (the actor owns the engine while streaming), so this is bookkeeping
         only.
         """
-        if updating:
-            self.clear_art_lookahead()
         self._weight_updating = bool(updating)
         return {"success": True, "weight_updating": self._weight_updating}
 
@@ -990,10 +934,7 @@ class SGLangNativeGenerationEngine(RayActor):
         self._unsupported("check_weights")
 
     def shutdown(self) -> None:
-        try:
-            self.clear_art_lookahead()
-        finally:
-            self._kill_server()
+        self._kill_server()
 
     def __del__(self):  # best-effort reap if Serve tears the actor down abruptly
         try:
@@ -1042,13 +983,6 @@ class SGLangNativeGenerationEngine(RayActor):
     # -- http -----------------------------------------------------------------
 
     def _post(self, path: str, body: Mapping[str, Any]) -> Any:
-        if path in (
-            "/update_weights_from_tensor",
-            "/set_lora_from_tensor",
-            "/release_memory_occupation",
-            "/resume_memory_occupation",
-        ):
-            self.clear_art_lookahead()
         import requests
 
         if self._url is None:

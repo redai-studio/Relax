@@ -250,66 +250,17 @@ def score_samples(args, samples) -> Dict[str, List[float]]:
     return component_rewards
 
 
-def prefetch_group_rewards(args: Any, samples: Any) -> None:
-    """Score raw rewards early; never normalize a partial acquisition batch.
-
-    Only the CPU runtime is safe alongside generation. Keep the validity mask
-    (unlike the evaluation-only score_samples helper). The private attributes
-    are consumed once by post_process and never enter serialized train rows.
-    """
-    if getattr(args, "reward_runtime", "cpu") != "cpu":
-        raise ValueError("Overlapped rewards require reward_runtime=cpu")
-    flat = _flatten(samples)
-    if any(hasattr(sample, "_prefetched_generative_reward") for sample in flat):
-        raise RuntimeError("A candidate was submitted for reward twice")
-    requests = [_build_reward_request(args, sample) for sample in flat]
-    manager = _get_manager(args)
-    try:
-        components = manager.score(requests)
-    finally:
-        _release_memory_images(requests)
-    _validate_reward_lengths(components, len(flat))
-    valid = components.get("__valid_mask__", [True] * len(flat))
-    for index, sample in enumerate(flat):
-        sample._prefetched_generative_reward = (
-            (sample.train_metadata or {}).get("rollout_id"),
-            {name: values[index] for name, values in components.items() if name != "__valid_mask__"},
-            bool(valid[index]),
-        )
-
-
-def _consume_prefetched_rewards(flat: List[Sample]) -> Dict[str, List[float]] | None:
-    cached = [getattr(sample, "_prefetched_generative_reward", None) for sample in flat]
-    if not any(value is not None for value in cached):
-        return None
-    if any(value is None for value in cached):
-        raise RuntimeError("Partially prefetched reward batch; refusing duplicate scoring")
-    names = list(cached[0][1])  # Preserve serial scorer component-reduction order.
-    if any(set(value[1]) != set(names) for value in cached):
-        raise ValueError("Prefetched groups returned different reward components")
-    for sample, value in zip(flat, cached):
-        if value[0] != (sample.train_metadata or {}).get("rollout_id"):
-            raise ValueError("Prefetched reward belongs to a different rollout")
-    result = {name: [value[1][name] for value in cached] for name in names}
-    result["__valid_mask__"] = [value[2] for value in cached]
-    for sample in flat:
-        del sample._prefetched_generative_reward
-    return result
-
-
 def post_process(args, samples) -> List[float]:
     """``custom_reward_post_process_path`` entry point (design doc 11.2)."""
     if (getattr(args, "sampling_config", None) or {}).get("algorithm") != "art":
         return _post_process_grpo(args, samples)
     flat: List[Sample] = _flatten(samples)
-    component_rewards = _consume_prefetched_rewards(flat)
-    if component_rewards is None:
-        manager = _get_manager(args)
-        requests = [_build_reward_request(args, s) for s in flat]
-        try:
-            component_rewards = manager.score(requests)
-        finally:
-            _release_memory_images(requests)
+    manager = _get_manager(args)
+    requests = [_build_reward_request(args, s) for s in flat]
+    try:
+        component_rewards = manager.score(requests)
+    finally:
+        _release_memory_images(requests)
     _validate_reward_lengths(component_rewards, len(flat))
     valid_mask = [bool(value) for value in component_rewards.pop("__valid_mask__", [True] * len(flat))]
 
@@ -364,11 +315,6 @@ def post_process(args, samples) -> List[float]:
         # Keep the generic numeric schema, but never disguise scalar rewards
         # as GRPO advantages. ART consumes its dedicated art_rewards column.
         return [0.0] * len(flat)
-
-
-# Wrappers may declare the same capability only when they delegate the full
-# acquisition batch here, without re-scoring or normalizing groups early.
-post_process.supports_prefetched_generative_rewards = True
 
 
 def _log_reward_metrics(args, flat: List[Sample], metrics: Dict[str, float]) -> None:
