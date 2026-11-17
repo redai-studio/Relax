@@ -107,6 +107,9 @@ _AGENTIC_SHARD_ALLOCATOR_ENV = {
 _AGENTIC_SHARD_MAX_CONCURRENCY = 4096
 _SESSION_CLOSE_TIMEOUT_S = 2.0
 _AGENT_CLEANUP_TIMEOUT_S = 150.0
+# Bound startup even while the active-time budget is not running yet. This is
+# per Session execution, and ends when its first usable IR is registered.
+_FIRST_IR_TIMEOUT_S = 1800.0
 _SHUTDOWN_CLEANUP_GRACE_S = 5.0
 _ADMISSION_SHUTDOWN_TIMEOUT_S = 5.0
 
@@ -1488,6 +1491,7 @@ class _SessionRecord:
     lora_binding: Optional[VersionIdentity] = None
     lora_bind_task: Optional[asyncio.Task] = None
     observation: SessionObservation | None = None
+    first_ir_ready: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
     def interrupted(self) -> bool:
@@ -2376,6 +2380,7 @@ class AgenticSessionShard:
             session.live_irs.add(ir)
             session.queued_irs.append(ir)
             group.first_ir_seen_session_ids.add(session.session_id)
+            session.first_ir_ready.set()
             if session.observation is not None:
                 self._observe_session(
                     session,
@@ -3149,9 +3154,29 @@ class AgenticSessionShard:
     ) -> None:
         """Watch one process and finalize its Session result."""
 
-        process_error = await asyncio.shield(process_wait)
+        first_ir = asyncio.create_task(session.first_ir_ready.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (process_wait, first_ir), timeout=_FIRST_IR_TIMEOUT_S, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            first_ir.cancel()
+            await asyncio.gather(first_ir, return_exceptions=True)
         if session.phase is not SessionPhase.ACTIVE or self._session_records.get(session.session_id) is not session:
             return
+        if not done and not session.first_ir_ready.is_set() and not process_wait.done():
+            process_error = AgentExecutionError(
+                f"agent did not create its first IR within {_FIRST_IR_TIMEOUT_S:g} seconds",
+                reason_code="agent_startup_timeout",
+            )
+        else:
+            process_error = await asyncio.shield(process_wait)
+        if session.phase is not SessionPhase.ACTIVE or self._session_records.get(session.session_id) is not session:
+            return
+        if process_error is None and not session.first_ir_ready.is_set():
+            process_error = AgentExecutionError(
+                "agent exited before its first request", reason_code="agent_no_request"
+            )
 
         group = session.group
         if isinstance(process_error, AgentExecutionError):
@@ -3164,26 +3189,6 @@ class AgenticSessionShard:
             )
             await self._handle_controlled_agent_failure(session, process_error)
             return
-        if group.rollout_mode == "eval" and session.session_id not in group.first_ir_seen_session_ids:
-            if process_error is None:
-                logger.error(
-                    "Dropping agentic eval session that exited before its first request "
-                    "session_id=%s group_id=%s error_type=silent-success",
-                    session.session_id,
-                    group.group_id,
-                )
-                await self._handle_controlled_agent_failure(
-                    session,
-                    AgentExecutionError("agent exited before its first request", reason_code="agent_no_request"),
-                )
-            else:
-                if not isinstance(process_error, Exception):
-                    process_error = RuntimeGroupError(
-                        f"agent session task cancelled unexpectedly for {session.session_id}"
-                    )
-                await self._handle_infra_failure(session, process_error)
-            return
-
         if process_error is None:
             await finish_before_cancellation(
                 self._finalize_terminal_session(session),

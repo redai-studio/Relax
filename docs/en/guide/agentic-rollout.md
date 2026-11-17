@@ -636,6 +636,11 @@ requests wait. Partial rollout, fully async, and dynamic global batch size retai
 
 ### External executors and Eval
 
+Each Session has 1800 seconds from scheduling its agent process task to issue its first valid inference request,
+including time spent waiting for an external executor. Receiving that request stops the startup timer, even before the
+Group is leased; generation still waits for its gate to open. Exiting before the first request or exceeding this deadline
+drops the whole Group and triggers replenishment. This startup timer is independent of `--agent-timeout`.
+
 Logical train demand is `L = agentic_concurrency * n_samples_per_prompt`. For each Eval dataset, let
 `G_d = n_samples_per_eval_prompt`; Eval Group concurrency is the explicit `--agentic-eval-concurrency`, or
 `ceil(L / G_d)` by default. Its Session ceiling is `E_d = C_d * G_d`. Eval datasets run serially.

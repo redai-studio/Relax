@@ -18,6 +18,7 @@ from relax.agentic.pipeline import runtime as runtime_module
 from relax.agentic.pipeline.prepare import PrepareDomain
 from relax.agentic.pipeline.runtime import BackendGenerateResult, EncodedMessages, RuntimeDomain, _SessionShardBinding
 from relax.agentic.runner import AgentExecutionError
+from relax.agentic.session import service as service_module
 from relax.agentic.session.service import AgenticSessionShard, SessionPhase
 from relax.utils.types import Sample
 
@@ -333,3 +334,51 @@ async def test_drop_detaches_result_transfer_that_resists_cancellation(monkeypat
         finally:
             release.set()
             await task
+
+
+@pytest.mark.parametrize("mode", ["train", "eval"])
+async def test_first_ir_timeout_drops_group_and_releases_capacity(monkeypatch, mode):
+    from relax.agentic.observability import SessionObservation
+
+    monkeypatch.setattr(service_module, "_FIRST_IR_TIMEOUT_S", 0.02)
+    async with harness(mode=mode) as h:
+        stream = await h.prepare()
+        sessions = tuple(h.shard._groups[stream.group_id].sessions)
+        for session in sessions:
+            session.observation = SessionObservation()
+            h.processes[session.session_id].cleanup.clear()
+        await h.runtime.lease_group(stream, 0)
+        assert await asyncio.wait_for(h.runtime.collect_group(stream), 2) is None
+        assert any(s.observation.failure[0] == "agent_startup_timeout" for s in sessions if s.observation.failure)
+        assert h.runtime.resident_group_count == 0
+        assert (await asyncio.wait_for(h.prepare("replacement"), 2)).group_id == "replacement"
+
+
+async def test_first_ir_disarms_startup_deadline_before_lease(monkeypatch):
+    monkeypatch.setattr(service_module, "_FIRST_IR_TIMEOUT_S", 0.1)
+    async with harness() as h:
+        stream = await h.prepare()
+        sessions = tuple(h.shard._groups[stream.group_id].sessions)
+        chats = [asyncio.create_task(h.chat(session)) for session in sessions]
+        await eventually(lambda: all(session.first_ir_ready.is_set() for session in sessions))
+        expired = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.15, expired.set)
+        await expired.wait()
+        assert all(not session.result_cell.terminal for session in sessions)
+        assert not h.generated
+        await h.runtime.resume_generation(0)
+        await h.runtime.lease_group(stream, 0)
+        await asyncio.gather(*chats)
+
+
+async def test_drop_before_first_ir_does_not_publish_again_on_late_event():
+    async with harness() as h:
+        stream = await h.prepare()
+        sessions = tuple(h.shard._groups[stream.group_id].sessions)
+        watchers = [session.resources.watcher_task for session in sessions]
+        await h.runtime.drop_group(stream)
+        await eventually(lambda: not h.shard._session_records)
+        for session in sessions:
+            session.first_ir_ready.set()
+        await asyncio.gather(*watchers, return_exceptions=True)
+        assert all(session.result_cell.dropped for session in sessions)

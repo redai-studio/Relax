@@ -604,6 +604,10 @@ batch size 保留原有模式约束。
 
 ### 外部 Executor 与 Eval
 
+每次 Session 从进程任务开始执行算起，最多等待 1800 秒收到首个有效推理请求，包含在外部 executor 排队的时间。
+收到首个请求后停止这项计时，即使 Group 尚未分配到当前训练步；模型生成仍须等待原有生成开关放行。
+首个请求到达前退出或超时，会丢弃整组并补采样。这项启动期限与 `--agent-timeout` 分别计时。
+
 逻辑训练需求为 `L = agentic_concurrency * n_samples_per_prompt`。每个 Eval dataset 的
 `G_d = n_samples_per_eval_prompt`；Eval Group 并发取显式 `--agentic-eval-concurrency`，默认取
 `ceil(L / G_d)`，Session 上限为 `E_d = C_d * G_d`。多个 Eval dataset 串行执行。
