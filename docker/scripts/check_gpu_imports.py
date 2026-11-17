@@ -33,6 +33,15 @@ def main() -> None:
     import torch
 
     assert torch.cuda.is_available(), "GPU/driver unavailable"
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon, validate_coefficient_type
+
+    # Exercise MCore's adapter rather than just checking the package is installed.
+    validate_coefficient_type("polar_express")
+    matrix = torch.nn.Parameter(torch.zeros(8, 8, device="cuda"))
+    matrix.grad = torch.eye(8, device=matrix.device)
+    muon = TensorParallelMuon([matrix], coefficient_type="polar_express", num_ns_steps=8, extra_scale_factor=0.2)
+    muon.step()
+    assert torch.isfinite(matrix).all() and matrix.count_nonzero() > 0, "Muon did not make a finite update"
     import_module("transformer_engine.pytorch")
     import_module("sgl_kernel")
     expected_sglang = os.environ.get("RELAX_SGLANG_VERSION")

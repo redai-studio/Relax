@@ -34,6 +34,7 @@ def main() -> None:
 
     if not torch.version.cuda or not torch.version.cuda.startswith("12." if args.profile == "cu12" else "13."):
         raise ValueError(f"CUDA runtime does not match {args.profile}: {torch.version.cuda}")
+    expected["emerging-optimizers"] = md.version("emerging-optimizers")
     expected["torch"] = md.version("torch")
     expected["transformer-engine"] = md.version("transformer-engine")
     hybrid = md.version("relax-hybrid-ep")

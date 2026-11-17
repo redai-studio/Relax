@@ -14,3 +14,4 @@ cupy-cuda12x==13.6.0
 tifffile==2024.8.30
 huggingface-hub==1.10.0
 pillow==11.3.0
+emerging-optimizers==0.3.0

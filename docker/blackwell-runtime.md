@@ -74,6 +74,41 @@ docker build -f docker/Dockerfile.cu13 --target relax \
   -t relax:blackwell-runtime-candidate .
 ```
 
+The CUDA 12 and CUDA 13 training images include NVIDIA Emerging Optimizers for
+Megatron. Adam remains the default in existing recipes. A compatible Megatron
+recipe can select `--optimizer muon`; MCore handles parameter grouping and
+the Adam fallback for embeddings/output parameters and non-matrix parameters.
+This does not enable Muon in a different training backend.
+
+On a GPU host, check the built image (including a small Muon update), then
+export the tagged image with its layers and metadata:
+
+```bash
+docker run --rm --gpus all relax:blackwell-runtime-candidate python /opt/relax/check_gpu_imports.py
+docker image save -o relax-blackwell-muon.tar relax:blackwell-runtime-candidate
+sha256sum relax-blackwell-muon.tar > relax-blackwell-muon.tar.sha256
+```
+
+On the receiving host, run `sha256sum -c relax-blackwell-muon.tar.sha256` and
+`docker image load -i relax-blackwell-muon.tar`. For a multi-node job, use the
+same image on every worker. No runtime pip install or shared Python overlay is
+required for Muon.
+
+For the Qwen3.8 multimodal example, use a shared checkout and a fresh
+checkpoint directory (separate from any Adam run). From the repository root
+in the head container, with `RAY_JOBS_ADDRESS` set to the cluster Jobs endpoint:
+
+```bash
+MODEL_DIR=/path/to/Qwen3.8-Flash-Next-F0 DATA_DIR=/path/to/multimodal-data \
+SAVE_DIR=/path/to/checkpoints MEGATRON=/root/Megatron-LM \
+NUM_STEPS=200 SAVE_INTERVAL=100 \
+bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-muon.sh
+```
+
+This recipe uses 32 GPUs and a global batch size of 512. Set `DRY_RUN=1` to
+inspect the arguments without submitting a job. If Gloo needs an explicit
+interface, set `GLOO_SOCKET_IFNAME` to the interface verified on all nodes.
+
 Both Dockerfiles install all three convolution entries in one image. There is
 no `FLA_CONV_NB_MODE` build argument. Set `RELAX_FLA_CONV_NB_MODE` to `original`,
 `pow2`, or `none` before starting each training process. `auto` (the default)
