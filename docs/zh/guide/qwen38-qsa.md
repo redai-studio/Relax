@@ -300,9 +300,13 @@ CP16 将 GDN 的 48 个 V heads 分到 16 张卡，每卡只有 3 个 heads。Fl
 
 静态 CP、TP1、THD packed 输入且所有 PLE 参数冻结时，可设置：
 
+连接已有 Ray 集群时，仅在提交端 `export` 不会自动传入训练进程。对于本指南的启动脚本，在 `export "${ENV_ARGS[@]}"` 之前加入以下配置；脚本会将它们与已有环境设置合并，同时传入 Ray job 的 `runtime_env.env_vars` 和训练进程的 `--train-env-vars`：
+
 ```bash
-export QWEN38_PLE_INPUT_HALO_CP=1
-export QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+ENV_ARGS+=(
+    QWEN38_PLE_INPUT_HALO_CP=1
+    QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+)
 ```
 
 该功能默认关闭。开启后，每张卡只计算自己负责的输出，以及卷积需要的左侧输入；文档边界仍使用原来的补零规则。数据处理自动记录每篇文档补齐后的边界，无需额外开启 QSA CPU layout。支持重计算；仅支持按文档的 zigzag 分片；不支持 allgather CP、动态 CP、TP 大于 1 或训练 PLE 参数。

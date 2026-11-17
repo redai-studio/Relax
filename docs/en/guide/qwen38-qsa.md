@@ -362,9 +362,13 @@ With CP16, GDN can have three local V heads. The CUDA13 image applies a FlashQLA
 
 For static CP, TP1, packed THD input, and fully frozen PLE parameters, set:
 
+With an existing Ray cluster, submission-side `export` alone does not forward these settings to training processes. In this guide's launch scripts, add the following before `export "${ENV_ARGS[@]}"`. The scripts merge these entries with existing settings and pass them to both the Ray job's `runtime_env.env_vars` and the training processes' `--train-env-vars`:
+
 ```bash
-export QWEN38_PLE_INPUT_HALO_CP=1
-export QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+ENV_ARGS+=(
+    QWEN38_PLE_INPUT_HALO_CP=1
+    QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+)
 ```
 
 The feature is off by default. Each rank computes its own output rows and the left input context needed by convolution, preserving zero padding at document boundaries. Batch preparation records padded document boundaries automatically; the QSA CPU layout flag is not required. Recomputation is supported. Requires per-document zigzag partitioning; allgather CP, dynamic CP, TP greater than one, and trainable PLE parameters are unsupported.
