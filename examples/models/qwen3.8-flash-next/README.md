@@ -87,7 +87,7 @@ All 191 questions remained after training-set deduplication. The base model stop
 
 ![OpenSearch-VL SFT training loss and MTP loss over 67 optimizer updates](./assets/opensearch-vl-sft-curves.png)
 
-Training loss went from 0.6138 to 0.3614 over 67 updates. Evaluation on held-out training trajectories after the final update recorded a loss of 0.3479 and perplexity of 1.4160.
+Training loss went from 0.6138 to 0.3614 over 67 updates. Evaluation on held-out training trajectories after the final update recorded a loss of 0.3479 and perplexity of 1.4160. [SwanLab training curves](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/qwen38-f0-opensearch-vl-sft-67/chart)
 
 ### H800 Multimodal SFT at 64K and 128K
 

@@ -87,7 +87,7 @@ OpenR1-MM GRPO 读取转换后的 Parquet，字段为 `prompt`、`label` 和 `im
 
 ![OpenSearch-VL SFT 的 67 步训练 loss 和 MTP loss 曲线](./assets/opensearch-vl-sft-curves.png)
 
-67 次更新中，训练 loss 从 0.6138 降到 0.3614。最后一次更新后的留出轨迹验证 loss 为 0.3479，PPL 为 1.4160。
+67 次更新中，训练 loss 从 0.6138 降到 0.3614。最后一次更新后的留出轨迹验证 loss 为 0.3479，PPL 为 1.4160。 [SwanLab 训练曲线](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/qwen38-f0-opensearch-vl-sft-67/chart)
 
 ### H800 图文 SFT 的 64K 与 128K 实测
 
