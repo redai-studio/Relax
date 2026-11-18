@@ -26,21 +26,6 @@ def fla_tree(tmp_path):
     if not source:
         pytest.skip("Set BLACKWELL_FLA_SOURCE_DIR to the unpacked fla-core/flash-linear-attention 0.5.2 wheel root")
     shutil.copytree(Path(source) / "fla", tmp_path / "fla")
-    # Ensure the new convolution patches compose with main's existing KDA precision patch.
-    subprocess.run(
-        [
-            "patch",
-            "--batch",
-            "--forward",
-            "--fuzz=0",
-            "-p1",
-            "-i",
-            str(ROOT / "docker/patch/fla/0.5.2-kda-backward-precision.patch"),
-        ],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
     return tmp_path
 
 
@@ -53,11 +38,10 @@ def kernel_bodies(path):
 
 
 def install_conv_entries(fla_tree):
-    for name in ("0.5.2-qwen38-output-config.patch", "0.5.2-conv-static-entries.patch"):
-        command = ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(ROOT / "docker/patch/fla" / name)]
-        result = subprocess.run(command, cwd=fla_tree, capture_output=True, text=True, check=True)
-        assert "offset" not in result.stdout and "fuzz" not in result.stdout
-        assert subprocess.run(command + ["--dry-run"], cwd=fla_tree, capture_output=True).returncode != 0
+    command = ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(ROOT / "docker/patch/fla/0.5.2.patch")]
+    result = subprocess.run(command, cwd=fla_tree, capture_output=True, text=True, check=True)
+    assert "offset" not in result.stdout and "fuzz" not in result.stdout
+    assert subprocess.run(command + ["--dry-run"], cwd=fla_tree, capture_output=True).returncode != 0
 
 
 def test_fla_entries_preserve_kernel_arithmetic(fla_tree):

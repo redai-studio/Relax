@@ -34,7 +34,7 @@ def runtime(tmp_path, monkeypatch):
     target = tmp_path / name
     target.parent.mkdir(parents=True)
     target.write_bytes(source)
-    patch = (ROOT / "docker/patch/megatron/20261020-model-operators.patch").read_text()
+    patch = (ROOT / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
     section = next(part for part in patch.split("diff --git ") if part.startswith(f"a/{name} "))
     result = subprocess.run(
         ["patch", "--batch", "--forward", "--fuzz=0", "-p1"],

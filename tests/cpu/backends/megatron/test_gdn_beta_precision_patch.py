@@ -3,6 +3,7 @@
 modes."""
 
 import ast
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,9 +58,14 @@ def test_gdn_image_patch_preserves_configured_beta_values_and_gradients(
 ) -> None:
     root = Path(__file__).resolve().parents[4]
     relative = "megatron/core/ssm/gated_delta_net/gdn.py"
-    patch = (root / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
+    patch = (root / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
     start = patch.index(f"diff --git a/{relative} b/{relative}\n")
     section = patch[start:].split("\ndiff --git ", 1)[0] + "\n"
+    # Apply the beta hunk to this method fixture; the complete patch also
+    # contains unrelated GDN projection and preprocessing changes.
+    header = section.split("@@", 1)[0]
+    hunks = re.findall(r"@@[^\n]*\n(?:(?!@@)[\s\S])*", section)
+    section = header + next(hunk for hunk in hunks if "linear_attention_beta_in_fp32" in hunk)
     target = tmp_path / relative
     target.parent.mkdir(parents=True)
     target.write_text(_SOURCE)

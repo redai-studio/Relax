@@ -208,9 +208,9 @@ These links identify repository implementations; function names above identify t
 - [Mixed entry and geometry][mixed]; [Grouped composition][mixed-dispatch]; [NV adapter][nv]; [TP selector][tp-selector]; [selector postprocessing][select].
 - [CP/replay][cp]; [routed QKV][routed]; [attention retention][retain]; [HybridEP preflight][hybrid]; [shared model defaults][model-script].
 
-[native]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20261016-qwen38-models.patch
-[integration]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20261020-model-operators.patch
-[projection]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20261020-qwen35-optimized.patch
+[native]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20260915-4a4de8657.patch
+[integration]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20260915-4a4de8657.patch
+[projection]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20260915-4a4de8657.patch
 [docker]: https://github.com/redai-studio/Relax/blob/main/docker/Dockerfile.cu13
 [env]: https://github.com/redai-studio/Relax/blob/main/relax/utils/env.py
 [dispatch]: https://github.com/redai-studio/Relax/blob/main/relax/models/qwen3_8/qsa_dispatch.py

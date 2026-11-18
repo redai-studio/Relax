@@ -15,8 +15,8 @@ The installer is a reference delivery, not a build input: Docker builds fetch
 pinned upstream sources and apply the checked-in patches. No `install.sh`,
 `activate.sh`, archived site-packages or precompiled 280G Blackwell wheel is required.
 
-Both Dockerfiles apply `20261020-model-operators.patch` after the existing model
-patches. This replaces the former `megatron_patch` import-time installers with
+Both CUDA Dockerfiles apply the complete `patch/latest/megatron.patch`, including
+the model-operator changes. This replaces the former `megatron_patch` import-time installers with
 explicit MCore/Bridge calls. Retained code lives in `relax/models/common`,
 `relax/models/qwen3_5`, and `relax/models/qwen3_8`; model-specific kernels live
 under each model's `ops/`. The TP4 hook is now
@@ -43,7 +43,7 @@ functional or performance parity with either 280G Blackwell delivery.
 
 | Source runtime (`4d9ba79a`)                              | Main image integration                                                                                                                                                                                                                                                                                                                    |
 | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Archived merged Megatron tree                            | Keep Bridge `6862ee170a2569607e8ebc5dde91f119779093ca`, MCore `4a4de865795f123eda422ebf0a4c13d2418cf3cb`, main Megatron patch and bounded checkpoint staging patch. Both patches are applied with `--fuzz=0`.                                                                                                                             |
+| Archived merged Megatron tree                            | Keep Bridge `6862ee170a2569607e8ebc5dde91f119779093ca`, MCore `4a4de865795f123eda422ebf0a4c13d2418cf3cb`, the complete Megatron patch including bounded checkpoint staging. Selected sections are validated with `git apply --check` before application.                                                                                  |
 | HybridEP archive, including compiled extensions          | Build DeepEP's `hybrid-ep` source at `eb9cee7de5a24193bf09500668d3a619d3d3f3fb`, the revision selected by the pinned MCore CUDA 13 CI Dockerfile. Build both `deep_ep_cpp` and `hybrid_ep_cpp` against the image's Torch/CUDA. This is a candidate compatible upstream source, not an identification of the archived binary's provenance. |
 | HybridEP variable-token padding                          | Already in the pinned MCore. Restore Relax provider forwarding and the launch flag; do not overlay an older dispatcher. CPU tests cover group MAX/alignment, empty local rows, growing/shrinking batches, combine trimming and gradients.                                                                                                 |
 | GDN headwise CP, pre-rule fusion and convolution padding | Already in the pinned MCore. Keep current CP/MTP contracts and restore missing provider fields. No downgrade to old GDN monkey patches.                                                                                                                                                                                                   |
@@ -185,8 +185,8 @@ the archive after AST normalization; cosmetic formatting is not copied. The buil
 checks those AST hashes in addition to the upstream hashes and records the results.
 Neither source comparison replaces GPU validation.
 
-MCore patches apply in this order: main version patch, bounded checkpoint staging,
-Qwen3.8 model patch, then `20261020-qwen35-optimized.patch`. The last patch merges
+The complete Megatron patch includes the base changes, bounded checkpoint staging,
+Qwen3.8 models, and Qwen3.5 optimizations. The optimization changes include
 MTP selection, adaptive recomputation, KV pair gather/QKV extraction, shared gate,
 finite gradient norm, DDP delayed wgrad and DeepEP manager selection. These paths
 are default-off and selected by the optimized recipe. CuTe API compatibility is

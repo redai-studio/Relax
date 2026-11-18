@@ -252,7 +252,7 @@ Both recipes enable `OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG=1` and `FLA_TILELANG=0` t
 
 ### Bounded Synchronous Checkpoint Saving
 
-Both Dockerfiles apply `docker/patch/megatron/sync-save-bounded-staging.patch` after the main Megatron patch. The full GRPO recipe explicitly enables it; set `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` to revert that recipe to the original synchronous writer. For other launches, the patch defaults to disabled. Async saving is unchanged.
+Both Dockerfiles include bounded synchronous staging through the `common` section of `docker/patch/latest/megatron.patch`. The full GRPO recipe explicitly enables it; set `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` to revert that recipe to the original synchronous writer. For other launches, the patch defaults to disabled. Async saving is unchanged.
 
 - `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=1`: stage a bounded window and write sequentially instead of preloading the complete checkpoint onto CPU.
 - `MEGATRON_SYNC_SAVE_STAGE_BYTES`: per-rank live staging budget, default 1 GiB. A single larger tensor is allowed when the window is empty, so the bound is `max(budget, largest_tensor)`.

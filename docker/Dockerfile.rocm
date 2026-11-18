@@ -160,34 +160,15 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
     rsync -a /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
     rm -rf /root/Megatron-Bridge
 
-# Same Megatron patch sequence and checks as Dockerfile.cu13.
-COPY docker/patch/latest/megatron.patch \
-    docker/patch/megatron/sync-save-bounded-staging.patch \
-    docker/patch/megatron/kimi-packed-sequence-api.patch \
-    docker/patch/megatron/20261016-qwen38-models.patch \
-    docker/patch/megatron/20261020-qwen35-optimized.patch \
-    docker/patch/megatron/20261020-model-operators.patch \
-    docker/patch/megatron/mtp-cp-normalization.patch \
-    docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch \
-    docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
+# The common and cu13 sections retain the existing ROCm Kimi/checkpoint fixes.
+COPY docker/patch/latest/megatron.patch /root/Megatron-LM/
 RUN cd /root/Megatron-LM && \
+    for profile in common cu13; do \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply --check - && \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply - || exit 1; \
+    done && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
-    patch --batch --forward --fuzz=0 -p1 < megatron.patch && \
-    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
-    patch --batch --forward --fuzz=0 -p1 < kimi-packed-sequence-api.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
-    sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
-    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
-    echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
-    patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
-    echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
-    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
-    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
-    sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
-    python -m compileall -q megatron && \
-    rm ./*.patch
+    python -m compileall -q megatron
 
 RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/apptainer_1.4.1_amd64.deb && \
     apt-get update && \

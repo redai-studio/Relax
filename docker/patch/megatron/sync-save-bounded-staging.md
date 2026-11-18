@@ -1,8 +1,9 @@
 # Bounded synchronous checkpoint staging
 
 Adapted from `fix/wuhuan/k3_ckpt_oom` (commit `399fcb8e`), rebased onto the
-current Relax Megatron patch. Apply this patch **after** the versioned Megatron
-patch; both CUDA Dockerfiles do this automatically.
+current Relax Megatron patch. The implementation is included in the `common`
+section of `20260915-4a4de8657.patch`, selected through `../latest/megatron.patch`;
+both CUDA Dockerfiles apply it automatically.
 
 Synchronous `torch_dist` saves previously used `AsyncRequest.execute_sync` to
 copy all local checkpoint tensors to CPU before writing. The new synchronous

@@ -33,7 +33,7 @@ _SOURCE = """class GatedDeltaNet:
 
 @pytest.mark.parametrize("activation", [torch.sigmoid, F.silu])
 def test_qwen38_gdn_output_gate_matches_configured_activation(tmp_path: Path, activation) -> None:
-    patch = (_ROOT / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
+    patch = (_ROOT / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
     start = patch.index(f"diff --git a/{_TARGET} b/{_TARGET}\n")
     section = patch[start:].split("\ndiff --git ", 1)[0]
     # This fixture covers the output gate only; other GDN methods have separate tests.

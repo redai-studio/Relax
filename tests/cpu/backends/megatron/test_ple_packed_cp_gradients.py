@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 
-PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20261016-qwen38-models.patch"
+PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20260915-4a4de8657.patch"
 
 
 def _added_source(relative: str, patch: Path = PATCH) -> str:

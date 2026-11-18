@@ -184,7 +184,7 @@ def test_qsa_cp_selector_projects_pools_and_rotates_in_global_document_order(ope
     cp = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.cp")
     # Execute the image's actual selection dataclass; the rest of Megatron is
     # an external projection/rotary service for this CPU adapter contract test.
-    patch = (Path(__file__).resolve().parents[4] / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
+    patch = (Path(__file__).resolve().parents[4] / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
     section = patch.split("+++ b/megatron/core/transformer/experimental_attention_variant/qsa.py\n", 1)[1]
     source = "\n".join(line[1:] for line in section.split("\ndiff --git", 1)[0].splitlines() if line.startswith("+"))
     node = next(

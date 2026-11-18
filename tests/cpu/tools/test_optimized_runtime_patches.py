@@ -20,10 +20,6 @@ ROOT = Path(__file__).resolve().parents[3]
     "patch",
     [
         "megatron/20260915-4a4de8657.patch",
-        "megatron/20261016-qwen38-models.patch",
-        "megatron/20261020-qwen35-optimized.patch",
-        "megatron/20261020-model-operators.patch",
-        "megatron/20261028-dp-reshardable-checkpoint.patch",
         "transformer_engine/2.18.0-cp-padding-no-host-sync.patch",
         "flash-qla/0.1.3-cumsum-heads.patch",
     ],
@@ -41,9 +37,7 @@ def test_dependency_patch_hunk_counts_are_valid(patch):
 @pytest.mark.parametrize(
     "variable,patch",
     [
-        ("OPTIMIZED_MCORE_SOURCE", "megatron/20261020-qwen35-optimized.patch"),
-        ("MEGATRON_BASE_SOURCE", "latest/megatron.patch"),
-        ("MODEL_OPERATORS_SOURCE", "megatron/20261020-model-operators.patch"),
+        ("OPTIMIZED_MCORE_SOURCE", "megatron/20260915-4a4de8657.patch"),
         ("OPTIMIZED_DEEPEP_SOURCE", "deepep/2.1.0-relax-namespace.patch"),
         ("OPTIMIZED_FA4_SOURCE", "flash-attention/56e48e3-fa4-isolated.patch"),
         ("OPTIMIZED_FLASHQLA_SOURCE", "flash-qla/0.1.3-kkt-no-tma.patch"),
@@ -53,7 +47,7 @@ def test_dependency_patch_hunk_counts_are_valid(patch):
 def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
     source = os.environ.get(variable)
     if not source:
-        pytest.skip(f"Set {variable} to the pinned source (MCore includes the existing three patches)")
+        pytest.skip(f"Set {variable} to the pristine pinned source (MCore includes the unpatched Bridge sources)")
     patchfile = ROOT / "docker/patch" / patch
     # Copy only touched files, so tests do not duplicate entire native source trees.
     for line in patchfile.read_text().splitlines():
@@ -74,7 +68,7 @@ def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
     assert "offset" not in result.stdout and "fuzz" not in result.stdout
     for path in tmp_path.rglob("*.py"):
         compile(path.read_text(), str(path), "exec")
-        if variable in {"MEGATRON_BASE_SOURCE", "MODEL_OPERATORS_SOURCE"}:
+        if variable == "OPTIMIZED_MCORE_SOURCE":
             _check_model_helper_signatures(path)
     if variable == "OPTIMIZED_MCORE_SOURCE":
         mtp = (tmp_path / "megatron/core/transformer/multi_token_prediction.py").read_text()

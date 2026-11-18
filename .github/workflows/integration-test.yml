@@ -61,7 +61,7 @@ jobs:
           dockerfile: docker/Dockerfile.cu13
           build-args: GPU_ARCH=hopper
           # Include patch targets as well as the symlinks under patch/latest.
-          hash-key: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/mok/patches/transformer-engine-fused-adam-bounded.patch', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
+          hash-key: ${{ hashFiles('docker/Dockerfile.cu13', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'docker/mok/**', 'docker/scripts/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
 
       - name: Acquire test devices
         id: devices

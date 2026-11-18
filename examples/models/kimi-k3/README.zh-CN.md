@@ -252,7 +252,7 @@ bash scripts/entrypoint/ray-job.sh \
 
 ### 有界同步 Checkpoint 保存
 
-两个 Dockerfile 都在主 Megatron patch 后应用 `docker/patch/megatron/sync-save-bounded-staging.patch`。全参 GRPO 脚本显式启用；设置 `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` 可让该脚本回到原同步 writer。其他启动方式默认关闭此优化。异步保存行为不变。
+两个 Dockerfile 都通过 `docker/patch/latest/megatron.patch` 的 `common` 段安装有界同步暂存实现。全参 GRPO 脚本显式启用；设置 `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` 可让该脚本回到原同步 writer。其他启动方式默认关闭此优化。异步保存行为不变。
 
 - `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=1`：分批暂存并顺序写入，避免将整个 checkpoint 预载到 CPU。
 - `MEGATRON_SYNC_SAVE_STAGE_BYTES`：每个 rank 的活跃暂存预算，默认 1 GiB。窗口为空时允许一个超过预算的大张量，因此边界为 `max(budget, largest_tensor)`。

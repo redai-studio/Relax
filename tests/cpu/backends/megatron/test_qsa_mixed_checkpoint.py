@@ -38,7 +38,7 @@ def checkpoint_modules(monkeypatch):
     monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "grouped")
     # This patch adds the entire pinned qsa.py. Execute the unmodified production
     # dataclass and two methods, with only external backend services substituted.
-    patch = (ROOT / "docker/patch/megatron/20261016-qwen38-models.patch").read_text()
+    patch = (ROOT / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
     section = patch.split("+++ b/megatron/core/transformer/experimental_attention_variant/qsa.py\n", 1)[1]
     source = "\n".join(line[1:] for line in section.split("\ndiff --git", 1)[0].splitlines() if line.startswith("+"))
     tree = ast.parse(source)
@@ -47,8 +47,12 @@ def checkpoint_modules(monkeypatch):
         if isinstance(node, ast.ClassDef) and node.name == "QSASelection":
             nodes.append(node)
         elif isinstance(node, ast.ClassDef) and node.name in ("QwenSparseSelfAttention", "QSACoreAttention"):
-            method = "forward" if node.name == "QSACoreAttention" else "_checkpointed_attention_forward"
-            nodes.extend(item for item in node.body if isinstance(item, ast.FunctionDef) and item.name == method)
+            methods = (
+                {"forward", "_relax_native_forward"}
+                if node.name == "QSACoreAttention"
+                else {"_checkpointed_attention_forward"}
+            )
+            nodes.extend(item for item in node.body if isinstance(item, ast.FunctionDef) and item.name in methods)
     module = ModuleType(QSA_MODULE)
     module.__dict__.update(
         dataclass=dataclass, replace=replace, torch=torch, AttnMaskType=Mask, get_pg_size=lambda pg: 1
@@ -118,6 +122,7 @@ def test_mixed_bounds_survive_checkpoint_forward_and_replay(checkpoint_modules, 
         _id_sparse_forward=sparse,
         _attach_indexer_loss=lambda out, *args: out,
     )
+    core._relax_native_forward = qsa._relax_native_forward.__get__(core)
     owner = SimpleNamespace(
         core_attention=core,
         attn_mask_type=Mask.causal,

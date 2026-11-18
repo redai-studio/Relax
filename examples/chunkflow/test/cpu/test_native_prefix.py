@@ -30,7 +30,7 @@ from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as r
 from examples.chunkflow.units import Unit, build_micro_batches, completed_groups, gen_unit_ops
 
 
-PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20261016-qwen38-models.patch"
+PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20260915-4a4de8657.patch"
 QSA_MODULE = "megatron.core.transformer.experimental_attention_variant.qsa"
 PLE_MODULE = "megatron.core.transformer.per_layer_embedding"
 
@@ -121,6 +121,7 @@ def load_native():
     }
     functions = {
         "_sequence_layout",
+        "_relax_native_sequence_layout",
         "build_qsa_dense_mask",
         "ngram_segment_positions",
         "shift_tokens_in_segment",
