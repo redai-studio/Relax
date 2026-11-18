@@ -335,3 +335,60 @@ async def test_prepare_then_run_publishes_consecutive_partitions_without_replayi
     assert [call.kwargs["data"]["tokens"][0][0].item() for call in calls] == [1, 2]
     assert service.step == service._dataset.cursor == 2
     await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_prepare_shard_keeps_sibling_writer_owned_until_stop(monkeypatch):
+    from relax.components import sft as sft_module
+
+    monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
+    service = _service()
+    service.config = _make_args(global_batch_size=2)
+    service.config.sft_async_prepack = True
+    service._init_data_pipeline = MagicMock()
+    service._train_size = 2
+    release = asyncio.Event()
+    events = []
+    first_error = ValueError("first shard failed")
+    failed = asyncio.get_running_loop().create_future()
+    failed.set_exception(first_error)
+
+    async def put():
+        await release.wait()
+        events.append("sibling-put-finished")
+        return {"crossed_epoch": False, "epoch": 0}
+
+    writer = asyncio.create_task(put())
+
+    def stopped():
+        events.append("shard-stopped")
+        result = asyncio.get_running_loop().create_future()
+        result.set_result(None)
+        return result
+
+    service._batch_producers = [
+        SimpleNamespace(
+            produce_partition=SimpleNamespace(remote=lambda *_args, ref=ref: ref),
+            stop=SimpleNamespace(remote=stopped),
+        )
+        for ref in (failed, writer)
+    ]
+    # Ray get(list) reports an errored shard immediately, even while another
+    # ObjectRef remains pending. Isolate that external RPC contract here.
+    monkeypatch.setattr(sft_module.ray, "get", lambda refs: refs[0].result())
+    preparing = asyncio.create_task(service.prepare(prefetch_first_batch=True))
+    async with asyncio.timeout(5):
+        while getattr(service, "_prepare_batch_task", None) is None:
+            await asyncio.sleep(0)
+        stopping = asyncio.create_task(service.stop())
+        try:
+            await asyncio.sleep(0.02)
+            assert not preparing.done(), "One failed shard must not release a still-running sibling writer"
+            assert not stopping.done()
+            assert events == []
+        finally:
+            release.set()
+            results = await asyncio.gather(preparing, stopping, writer, return_exceptions=True)
+    assert results[0] is first_error
+    assert results[1] is None
+    assert events == ["sibling-put-finished", "shard-stopped", "shard-stopped"]

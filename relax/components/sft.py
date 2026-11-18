@@ -290,8 +290,13 @@ def _sft_batch_producer_actor_options(config: Any, runtime_env: Any | None, num_
 async def _ray_get_many_async(refs: list[Any]) -> list[Any]:
     if not refs:
         return []
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, ray.get, refs)
+    # A failed shard must not release ownership of still-running siblings.
+    # ray.get(list) raises on the first error before the other writers finish.
+    results = await asyncio.gather(*refs, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 def _set_sft_dataset_position(dataset: Any, epoch: int, position: int, prefetch_limit: int | None = None) -> None:
