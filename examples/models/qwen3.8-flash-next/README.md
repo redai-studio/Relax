@@ -76,14 +76,14 @@ The published comparisons in this table describe the recorded configurations and
 
 ### OpenSearch-VL SFT on Blackwell
 
-The OpenSearch-VL run fine-tuned Qwen3.8-Flash-Next-F0 on 32 Blackwell GPUs (280G) with cuDNN QSA and froze the vision encoder and PLE. The evaluation compared the original F0 checkpoint and the final BF16 SFT checkpoint at step 66 (67 optimizer updates). Both used TP2 on Blackwell, a 32K context and up to 10 turns per question under the same JSON `crop` protocol. [V\*Bench evaluation protocol](../../opensearch_vl/evaluation.md)
+The OpenSearch-VL run fine-tuned Qwen3.8-Flash-Next-F0 on 32 Blackwell GPUs (280G) with cuDNN QSA and froze the vision encoder and PLE. The evaluation compared the original F0 checkpoint and the final BF16 SFT checkpoint at step 66 (67 optimizer updates). Both used TP2 on Blackwell, a 32K context, up to 10 turns per question and the same JSON `crop` protocol. Both enabled thinking with `medium` reasoning effort. [V\*Bench evaluation protocol](../../opensearch_vl/evaluation.md)
 
 | Checkpoint        | Correct / total | Pass@1 | Train-deduplicated Pass@1 |
 | ----------------- | --------------- | ------ | ------------------------- |
-| F0 base           | 39 / 191        | 20.42% | 20.42%                    |
-| OpenSearch-VL SFT | 161 / 191       | 84.29% | 84.29%                    |
+| F0 base           | 142 / 191       | 74.35% | 74.35%                    |
+| OpenSearch-VL SFT | 160 / 191       | 83.77% | 83.77%                    |
 
-All 191 questions remained after training-set deduplication. The base model stopped on 146 questions due to invalid tool-call formatting. The SFT model answered 122 of those questions correctly. Both models scored 39/45 on the remaining questions. These scores measure task completion under the shared crop protocol. [OpenSearch-VL data preparation](../../opensearch_vl/data-preparation.md)
+SFT raised Pass@1 by 9.42 percentage points. On the same questions, SFT corrected 38 answers and regressed on 20, for a net gain of 18 correct answers. Tool-call format failures dropped from 24 questions to zero. Training-set deduplication retained all 191 questions. [SwanLab V\*Bench comparison](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/qwen38-f0-vstar-medium-base-vs-sft66/chart) · [OpenSearch-VL data preparation](../../opensearch_vl/data-preparation.md)
 
 ![OpenSearch-VL SFT training loss and MTP loss over 67 optimizer updates](./assets/opensearch-vl-sft-curves.png)
 

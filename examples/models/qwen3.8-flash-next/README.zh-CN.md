@@ -76,14 +76,14 @@ OpenR1-MM GRPO 读取转换后的 Parquet，字段为 `prompt`、`label` 和 `im
 
 ### Blackwell 上的 OpenSearch-VL SFT
 
-本次 OpenSearch-VL 训练使用 32 张 280G Blackwell GPU 对 Qwen3.8-Flash-Next-F0 做 SFT，启用 cuDNN QSA，并冻结视觉编码器和 PLE。评测对比原始 F0 权重和 step 66 的最终 BF16 SFT 权重（共 67 次优化器更新）。两个模型均在 Blackwell 上使用 TP2，按同一套 JSON `crop` 协议评测，上下文为 32K，每题最多 10 轮。 [V\*Bench 评测协议](../../opensearch_vl/evaluation.md)
+本次 OpenSearch-VL 训练使用 32 张 280G Blackwell GPU 对 Qwen3.8-Flash-Next-F0 做 SFT，启用 cuDNN QSA，并冻结视觉编码器和 PLE。评测对比原始 F0 权重和 step 66 的最终 BF16 SFT 权重（共 67 次优化器更新）。两个模型均在 Blackwell 上使用 TP2，按同一套 JSON `crop` 协议评测，上下文为 32K，每题最多 10 轮。两组都开启 thinking，推理强度设为 `medium`。 [V\*Bench 评测协议](../../opensearch_vl/evaluation.md)
 
 | 权重              | 正确题数 / 总题数 | Pass@1 | 训练集去重 Pass@1 |
 | ----------------- | ----------------- | ------ | ----------------- |
-| F0 基座           | 39 / 191          | 20.42% | 20.42%            |
-| OpenSearch-VL SFT | 161 / 191         | 84.29% | 84.29%            |
+| F0 基座           | 142 / 191         | 74.35% | 74.35%            |
+| OpenSearch-VL SFT | 160 / 191         | 83.77% | 83.77%            |
 
-按训练集去重后仍保留全部 191 题。基座有 146 道题因工具调用格式错误而中断，SFT 在其中答对了 122 道。 在剩余题目中，两版得分均为 39/45。这组分数反映同一 crop 协议下的任务完成率。 [OpenSearch-VL 数据准备](../../opensearch_vl/data-preparation.md)
+SFT 的 Pass@1 提高 9.42 个百分点。逐题对照，SFT 答对了 38 道基座答错的题，也答错了 20 道基座答对的题，净增 18 道正确答案。工具格式导致的中断从 24 题降为 0 题。按训练集去重后仍保留全部 191 题。 [SwanLab V\*Bench 对照](https://swanlab.cn/@redai-studio/Relax-opensearch-vl/runs/qwen38-f0-vstar-medium-base-vs-sft66/chart) · [OpenSearch-VL 数据准备](../../opensearch_vl/data-preparation.md)
 
 ![OpenSearch-VL SFT 的 67 步训练 loss 和 MTP loss 曲线](./assets/opensearch-vl-sft-curves.png)
 
