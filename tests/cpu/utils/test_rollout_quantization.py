@@ -395,3 +395,62 @@ def test_rollout_quantization_rejects_mixed_group_formats(quantization_args, tmp
     )
     with pytest.raises(ValueError, match="different quantization configs"):
         resolve_rollout_quantization_config(args, SimpleNamespace())
+
+
+@pytest.mark.parametrize("method,group_override", [("FP8", True), ("modelopt_fp4", False)])
+def test_receiver_mode_names_preserve_dense_block_fp8_layout(quantization_args, tmp_path, method, group_override):
+    from pathlib import Path
+
+    from transformers import Qwen3Config
+
+    ModelConfig = pytest.importorskip("sglang.srt.configs.model_config").ModelConfig
+    LoadConfig = pytest.importorskip("sglang.srt.configs.load_config").LoadConfig
+    get_quant_config = pytest.importorskip("sglang.srt.model_loader.weight_utils").get_quant_config
+    LinearBase = pytest.importorskip("sglang.srt.layers.linear").LinearBase
+    Fp8LinearMethod = pytest.importorskip("sglang.srt.layers.quantization.fp8").Fp8LinearMethod
+    expected = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
+    path = Path(quantization_args.hf_checkpoint)
+    config = Qwen3Config(quantization_config=expected)
+    config.architectures = ["Qwen3ForCausalLM"]
+    config.save_pretrained(path)
+    if group_override:
+        _write_groups(
+            quantization_args,
+            tmp_path,
+            [
+                {
+                    "name": "policy",
+                    "engine_groups": [
+                        {"worker_type": "regular", "num_gpus": 2, "overrides": {"quantization": method}}
+                    ],
+                }
+            ],
+        )
+    else:
+        quantization_args.sglang_quantization = method
+
+    receiver = ModelConfig(str(path), quantization=method)
+    loaded = get_quant_config(receiver, LoadConfig(load_format="dummy"), {})
+    layer = LinearBase(128, 128, quant_config=loaded, prefix="model.layers.0.self_attn.q_proj")
+    assert receiver.quantization == method.lower()
+    assert isinstance(layer.quant_method, Fp8LinearMethod)
+    assert layer.quant_method.is_checkpoint_fp8_serialized
+    assert layer.quant_method.weight_block_size == [128, 128]
+    assert resolve_rollout_quantization_config(quantization_args, SimpleNamespace()) == expected
+
+
+def test_sender_still_rejects_unsupported_serialized_layout(quantization_args):
+    from pathlib import Path
+
+    import torch
+
+    from relax.backends.megatron.weight_conversion.processors import quantize_params
+
+    unsupported = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    (Path(quantization_args.hf_checkpoint) / "config.json").write_text(
+        json.dumps({"quantization_config": unsupported})
+    )
+    quantization_args.sglang_quantization = "modelopt_fp4"
+    actual = resolve_rollout_quantization_config(quantization_args, SimpleNamespace())
+    with pytest.raises(ValueError, match="Unsupported quantization method"):
+        quantize_params(quantization_args, "unused", [("model.weight", torch.ones(1, 1))], actual)

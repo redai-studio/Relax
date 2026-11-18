@@ -53,7 +53,7 @@ def resolve_receiver_quantization_config(
         detected_config = config_values.get("quantization_config")
         if detected_config is None:
             detected_config = config_values.get("compression_config")
-        selected_method = quantization
+        selected_method = quantization.lower() if quantization is not None else None
         if selected_method is None and detected_config:
             selected_method = detected_config.get("quant_method")
         quant_config = (
@@ -63,12 +63,9 @@ def resolve_receiver_quantization_config(
         # original checkpoint and undo an explicit override.
         if quant_config:
             quant_config = dict(quant_config)
-            metadata_method = quant_config.setdefault("quant_method", selected_method)
-            if metadata_method != selected_method:
-                raise ValueError(
-                    f"Rollout receiver {name} selects {selected_method!r} but its loader metadata declares "
-                    f"{metadata_method!r}; this weight publication format is unsupported"
-                )
+            # A runtime mode may still load the checkpoint's source layout
+            # (for example modelopt_fp4 dense layers load serialized FP8).
+            quant_config.setdefault("quant_method", selected_method)
             if quant_config.get("quant_method") == "compressed-tensors":
                 local_path = os.path.realpath(model_path)
                 if local_path not in checkpoint_keys:
