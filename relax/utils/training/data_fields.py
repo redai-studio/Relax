@@ -2,7 +2,7 @@
 
 from argparse import Namespace
 
-from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
+from relax.engine.sft.runtime import is_embedding_sft_mode, is_lightning_opd_mode, is_preference_mode, is_sft_mode
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.image_refs import sft_multimodal_data_fields
@@ -49,6 +49,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
     ``consumer`` is only meaningful for PPO (``critic``, ``advantages``,
     ``actor``); other algorithms ignore it and receive the base rollout fields.
     """
+    if is_lightning_opd_mode(args):
+        return ["tokens", "total_lengths", "response_lengths", "loss_masks", "teacher_log_probs"]
     if is_preference_mode(args):
         return list(PREFERENCE_DATA_FIELDS)
     if is_sft_mode(args):

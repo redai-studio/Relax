@@ -41,6 +41,7 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from relax.components.base import Base
 from relax.engine.sft.data_state import restore_data_state, save_data_state
 from relax.engine.sft.dataset import streaming as streaming_dataset
+from relax.engine.sft.dataset.lightning_opd import LightningOPDDataset
 from relax.engine.sft.dataset.oversize import keep_within_sequence_limit
 from relax.engine.sft.dataset.preference import (
     PreferenceStreamingDataset,
@@ -50,6 +51,7 @@ from relax.engine.sft.dataset.preference import (
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
 from relax.engine.sft.debug_print import print_first_sample
 from relax.engine.sft.runtime import (
+    is_lightning_opd_mode,
     is_preference_mode,
     resolve_sft_split_indices,
     sft_logical_partition_id,
@@ -169,6 +171,15 @@ def _create_sft_train_dataset(
     classification_sentinel_token_id: int | None,
     image_preprocess_on_rank: bool = False,
 ) -> Any:
+    if is_lightning_opd_mode(config):
+        return LightningOPDDataset(
+            config.prompt_data,
+            tokenizer=tokenizer,
+            prompt_key=config.input_key,
+            metadata_key=config.metadata_key,
+            capacity=min(config.seq_length, capacity),
+            seed=config.seed,
+        )
     if is_preference_mode(config):
         return PreferenceStreamingDataset(
             path=config.prompt_data,
@@ -772,7 +783,7 @@ class SFT(Base):
             return
         prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
-        if not is_preference_mode(self.config):
+        if not is_preference_mode(self.config) and not is_lightning_opd_mode(self.config):
             try:
                 self._processor_pool = ProcessorPool(
                     self.config.hf_checkpoint,
@@ -787,7 +798,9 @@ class SFT(Base):
         self._logger.info(f"Resolved multimodal pad token ids from model config: {sorted(pad_token_ids)}")
 
         cp_size = max(1, getattr(self.config, "context_parallel_size", 1) or 1)
-        capacity = self.config.max_tokens_per_gpu * cp_size
+        capacity = (
+            self.config.max_tokens_per_gpu * cp_size if self.config.max_tokens_per_gpu else self.config.seq_length
+        )
         prefetch_buffer_size = getattr(self.config, "sft_prefetch_buffer_size", 256)
         prefetch_chunk_size = getattr(self.config, "sft_prefetch_chunk_size", 32)
         prefetch_num_workers = getattr(self.config, "sft_prefetch_num_workers", 4)
@@ -902,7 +915,7 @@ class SFT(Base):
                     image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
                 )
 
-        if isinstance(self._dataset, streaming_dataset.SFTStreamingDataset):
+        if isinstance(self._dataset, (streaming_dataset.SFTStreamingDataset, LightningOPDDataset)):
             restore_data_state(self.config, self._dataset, self.step, self._train_size)
             return
 
@@ -1008,6 +1021,8 @@ class SFT(Base):
             return
         try:
             loss_mask = s.loss_mask
+            if getattr(s, "teacher_log_probs", None) is not None:
+                loss_mask = F.pad(loss_mask, (s.total_length - loss_mask.numel(), 0))
             if s.classification_label is not None:
                 loss_mask = F.pad(loss_mask, (s.total_length - 2, 1), value=0)
                 self._logger.info(f"First classification sample label: {s.classification_label.tolist()}")
@@ -1071,7 +1086,7 @@ class SFT(Base):
                 "after bounded refill attempts. Refusing to push a partial TQ partition because the Megatron "
                 "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
             )
-        if isinstance(self._dataset, streaming_dataset.SFTStreamingDataset):
+        if isinstance(self._dataset, (streaming_dataset.SFTStreamingDataset, LightningOPDDataset)):
             save_data_state(self.config, self._dataset, self.step + 1, self._train_size, samples)
         self._maybe_print_first_sample(samples)
         put_started = time.monotonic()

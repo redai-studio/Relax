@@ -101,6 +101,7 @@ class ProcessedSample:
     image_refs_descriptor: dict[str, Any] | None = None
     pre_shifted_labels: torch.Tensor | None = None
     dataset_id: int | None = None
+    teacher_log_probs: torch.Tensor | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -1467,6 +1468,12 @@ def pack_samples_for_tq(
         # assistant/function_call token positions.
         "response_lengths": [1] * len(samples) if is_classification else total_lengths,
     }
+    teachers = [getattr(s, "teacher_log_probs", None) for s in samples]
+    if any(t is not None for t in teachers):
+        if any(t is None for t in teachers):
+            raise ValueError("teacher log probabilities must be present for every Lightning-OPD sample")
+        batch["teacher_log_probs"] = teachers
+        batch["response_lengths"] = [mask.numel() for mask in loss_masks]
     if any(s.dataset_id is not None for s in samples):
         if not all(s.dataset_id is not None for s in samples):
             raise ValueError("dataset ids must be present for every sample in a mixture batch")

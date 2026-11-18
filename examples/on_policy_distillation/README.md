@@ -9,6 +9,20 @@ Relax's OPD supports:
 - **Token-Selection Modes**: `student_sampled`, `student_topk`, `teacher_topk`, `union`, determining which tokens' log-probabilities are used for KL computation.
 - **Application Methods**: `adv` (modifying advantage) and `loss` (modifying loss), determining how the distillation signal is injected into training.
 
+## Offline Lightning-OPD
+
+Use `--loss-type lightning_opd` to train a Megatron student from a [Lightning-OPD](https://github.com/jet-ai-projects/Lightning-OPD) precomputed Parquet file. Start from the checkpoint that sampled the trajectories. For an 8-row smoke run, add these options to the matching student model configuration:
+
+```bash
+--loss-type lightning_opd \
+--resource '{"sft":[1,0],"actor":[1,1]}' \
+--prompt-data "$PRECOMPUTED_PARQUET" --input-key prompt \
+--hf-checkpoint "$STUDENT" --load "$STUDENT" --megatron-to-hf-mode bridge \
+--global-batch-size 8 --micro-batch-size 1 --num-rollout 1
+```
+
+Each row contains a rendered `prompt` and a `metadata` struct with `response_tokens`, `loss_mask`, and `teacher_log_probs` of equal length. Set `--seq-length` to cover the longest prompt plus response. The CPU producer preserves the sampled IDs and the complete response context, including masked positions. The actor recomputes student log probabilities before each update and uses their difference from the cached teacher values as the detached advantage for clipped policy gradients. Only the actor needs GPUs. The current objective supports synchronous text training, per-sample reduction and context parallel size 1.
+
 ## Token-Selection Modes
 
 | Mode              | Description                                                     |

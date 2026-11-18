@@ -693,6 +693,21 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+@torch.no_grad()
+def set_lightning_opd_advantages(rollout_data: RolloutBatch) -> None:
+    """Score the frozen trajectory against the student's pre-update forward on
+    this batch."""
+    advantages = []
+    for teacher, student in zip(rollout_data["teacher_log_probs"], rollout_data["log_probs"], strict=True):
+        if teacher.shape != student.shape:
+            raise ValueError(
+                f"Lightning-OPD token logprob shapes differ: teacher {teacher.shape}, student {student.shape}"
+            )
+        advantages.append(teacher.to(device=student.device, dtype=torch.float32) - student)
+    rollout_data["advantages"] = advantages
+    rollout_data["returns"] = advantages
+
+
 def compute_advantages_and_returns(
     args: Namespace, rollout_data: RolloutBatch, *, inline_log_probs: bool = False
 ) -> None:
@@ -1961,7 +1976,7 @@ def loss_function(
         func = mtp_only_loss_function
     else:
         match args.loss_type:
-            case "policy_loss":
+            case "policy_loss" | "lightning_opd":
                 func = policy_loss_function
             case "value_loss":
                 func = value_loss_function

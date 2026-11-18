@@ -90,17 +90,72 @@ def is_rm_mode(args: Namespace) -> bool:
     return getattr(args, "loss_type", None) == "rm"
 
 
+def is_lightning_opd_mode(args: Namespace) -> bool:
+    return getattr(args, "loss_type", None) == "lightning_opd"
+
+
 def is_offline_mode(args: Namespace) -> bool:
     """Return whether training consumes offline datasets instead of rollouts.
 
     Shared by argparse, controller wiring, components, and the Megatron
     backend.
     """
-    return getattr(args, "loss_type", None) in {"sft", "dpo", "rm"}
+    return getattr(args, "loss_type", None) in {"sft", "dpo", "rm", "lightning_opd"}
 
 
 def is_preference_mode(args: Namespace) -> bool:
     return getattr(args, "loss_type", None) in {"dpo", "rm"}
+
+
+def validate_lightning_opd_args(args: Namespace) -> None:
+    """The offline batch supplies fixed trajectories; the live actor supplies
+    the old policy."""
+    if not is_lightning_opd_mode(args):
+        return
+    if args.train_backend != "megatron" or args.task_type != "causal_lm":
+        raise ValueError("lightning_opd requires the Megatron causal LM backend")
+    if args.advantage_estimator != "grpo" or args.rollout_temperature != 1 or args.n_samples_per_prompt != 1:
+        raise ValueError("lightning_opd uses the clipped policy loss with temperature 1 and one response per row")
+    if args.rollout_batch_size is not None and args.rollout_batch_size != args.global_batch_size:
+        raise ValueError("lightning_opd requires one global batch per offline update")
+    if getattr(args, "num_steps_per_rollout", None) not in (None, 1):
+        raise ValueError("lightning_opd requires one optimizer step per offline batch")
+    if getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False):
+        raise ValueError("lightning_opd uses per-sample reduction and requires context parallel size 1")
+    conflicts = (
+        "use_opd",
+        "opd_type",
+        "opd_teacher_url",
+        "teacher_hf_checkpoint",
+        "opd_teacher_load",
+        "opd_teacher_routes",
+        "opd_loss_coef",
+        "use_rollout_logprobs",
+        "true_on_policy_mode",
+        "keep_old_actor",
+        "normalize_advantages",
+        "use_tis",
+        "use_opsm",
+        "get_mismatch_metrics",
+        "use_kl_loss",
+        "kl_coef",
+        "kl_loss_coef",
+        "entropy_coef",
+        "calculate_per_token_loss",
+        "custom_pg_loss_reducer_function_path",
+        "fully_async",
+        "hybrid",
+        "multimodal_keys",
+        "mtp_only_training",
+        "enable_mtp_training",
+        "custom_dataset_class_path",
+        "eval_prompt_data",
+        "eval_size",
+        "sft_predict_interval",
+    )
+    active = [key for key in conflicts if getattr(args, key, None)]
+    if active:
+        raise ValueError(f"lightning_opd does not support {', '.join(active)}")
 
 
 def validate_preference_args(args: Namespace) -> None:
@@ -184,14 +239,15 @@ def should_skip_sft_weight_management(
     with_ref: bool = False,
     with_opd_teacher: bool = False,
 ) -> bool:
-    """Skip snapshots and rollout sync when offline SFT has no consumer.
+    """Skip snapshots and rollout sync for offline objectives that train only
+    the live actor.
 
     Checkpoint saves and local loss evaluation read the live model. Generation
     prediction, reference/teacher forwards, and offload still retain their
     existing weight-management paths.
     """
     return bool(
-        is_sft_mode(args)
+        (is_sft_mode(args) or is_lightning_opd_mode(args))
         and getattr(args, "sft_predict_interval", None) is None
         and not getattr(args, "offload_train", False)
         and not with_ref

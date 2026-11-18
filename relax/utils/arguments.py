@@ -17,7 +17,13 @@ from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
-from relax.engine.sft.runtime import is_dpo_mode, is_offline_mode, is_sft_mode
+from relax.engine.sft.runtime import (
+    is_dpo_mode,
+    is_lightning_opd_mode,
+    is_offline_mode,
+    is_sft_mode,
+    validate_lightning_opd_args,
+)
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -2077,11 +2083,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft", "dpo", "rm", "sft_loss", "sft-loss", "custom_loss"],
+                choices=["policy_loss", "sft", "dpo", "rm", "lightning_opd", "sft_loss", "sft-loss", "custom_loss"],
                 default="policy_loss",
                 help=(
                     "Training loss: policy_loss for RL, sft for supervised fine-tuning, dpo for preference optimization, "
-                    "rm for pairwise reward modeling, or custom_loss via --custom-loss-function-path."
+                    "rm for pairwise reward modeling, lightning_opd for cached teacher logprobs on fixed responses, "
+                    "or custom_loss via --custom-loss-function-path."
                 ),
             )
             parser.add_argument(
@@ -3162,7 +3169,9 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     from relax.engine.sft.runtime import is_i2i_sft
 
     image_sft = is_i2i_sft(pre)
-    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None or image_sft
+    skip_sglang = (
+        pre.debug_train_only or pre.load_debug_rollout_data is not None or image_sft or is_lightning_opd_mode(pre)
+    )
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
     # Skipped when sglang servers are not needed.
@@ -4061,6 +4070,9 @@ def apply_custom_config_overrides(args) -> None:
     validate_kl_coefficients(args)
 
     if is_offline_mode(args):
+        validate_lightning_opd_args(args)
+        if is_lightning_opd_mode(args) and args.compute_advantages_and_returns:
+            raise ValueError("lightning_opd computes its own advantages and rejects online advantage estimation")
         return
 
     # Every *algorithm* validator, and the one derivation they read. Be precise
@@ -4173,6 +4185,7 @@ def relax_validate_args(args):
         )
         args.loss_type = "sft"
 
+    validate_lightning_opd_args(args)
     is_offline = is_offline_mode(args)
     if is_offline:
         # Disable RL-only state for offline training so users do not have to pass
@@ -4594,11 +4607,9 @@ def relax_validate_args(args):
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         # Offline training does not compute advantages.
         args.compute_advantages_and_returns = False
-        # Offline samples have highly variable length; only the dynamic-batch-size
-        # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
-        # balanced micro-batches. Static --micro-batch-size cannot do either,
-        # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size and not is_i2i_sft(args):
+        # Text SFT and preference training use length-balanced dynamic batches.
+        # Lightning-OPD also accepts fixed microbatches for upstream parity.
+        if not args.use_dynamic_batch_size and not is_i2i_sft(args) and not is_lightning_opd_mode(args):
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
                 "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "

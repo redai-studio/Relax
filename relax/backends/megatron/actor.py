@@ -36,6 +36,7 @@ from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
     evaluation_step_for_rollout,
     is_dpo_mode,
+    is_lightning_opd_mode,
     is_offline_mode,
     is_preference_mode,
     is_sft_mode,
@@ -143,7 +144,7 @@ from .data import (
     record_tensors_on_stream,
 )
 from .initialize import init, is_megatron_main_rank
-from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values, set_lightning_opd_advantages
 from .model import flush_resident_sft_param_sync, forward_only, initialize_model_and_optimizer, save, train
 from .reference_integrity import (
     DPOReferenceIdentity,
@@ -628,7 +629,7 @@ class MegatronTrainRayActor(TrainRayActor):
         elif not skip_weight_management:
             self.checkpoint_engine_client = self._create_checkpoint_engine_client(role)
         else:
-            logger.info("Offline SFT: skipping weight snapshots, rollout updater, and DCS client")
+            logger.info("Offline training: skipping weight snapshots, rollout updater, and DCS client")
         # empty cache after initialization
         clear_memory()
 
@@ -2157,7 +2158,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 algorithm_needs_critic(self.args) and self.args.fully_async and not self.args.hybrid
             )
 
-            if should_compute_old_log_probs:
+            if is_lightning_opd_mode(self.args):
+                rollout_data.update(self.compute_log_prob(data_iterator, num_microbatches))
+                if mpu.is_pipeline_last_stage():
+                    set_lightning_opd_advantages(rollout_data)
+            elif should_compute_old_log_probs:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -2350,7 +2355,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # its main loop, so nothing else awaits the eval handler. Block here
         # until eval finishes; otherwise the controller's atexit shutdown
         # races with eval and tears down the SGLang engines mid-flight.
-        if is_train_done:
+        if is_train_done and (self._per_step_rollout or has_rollout):
             self._wait_for_previous_eval()
 
     def compute_ref_log_prob(self, rollout_id: int) -> None:
