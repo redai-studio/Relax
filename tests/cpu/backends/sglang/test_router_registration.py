@@ -757,3 +757,50 @@ def test_pd_id_cleanup_rejects_url_shared_with_another_generation(monkeypatch, s
     )
     assert not sglang_engine_module.remove_dead_router_worker("http://router:3000", old["url"], cleanup)
     assert requests.deletes == []
+
+
+@pytest.mark.parametrize("registration", ["accepted", "rejected", "lost"])
+def test_colocate_registration_confirms_or_reconciles_queued_worker(monkeypatch, sglang_engine_module, registration):
+    from unittest.mock import Mock
+
+    engine = _make_engine(sglang_engine_module)
+    engine._is_scaled_out = True
+    monkeypatch.setattr(
+        sglang_engine_module.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_actor_id=lambda: "elastic-actor"),
+    )
+    worker = {
+        "id": "elastic-worker",
+        "url": engine.get_url(),
+        "is_healthy": True,
+        "metadata": {"relax_actor_id": "elastic-actor"},
+    }
+    post = {
+        "accepted": Mock(return_value=_Response(202, {"worker_id": worker["id"]})),
+        "rejected": Mock(return_value=_Response(400)),
+        "lost": Mock(side_effect=ReadTimeout("accepted but response lost")),
+    }[registration]
+    workers = {
+        "accepted": [[], [worker]],
+        "rejected": [[]],
+        "lost": [[], [worker], []],
+    }[registration]
+    get = Mock(side_effect=[_Response(200, {"workers": rows}) for rows in workers])
+    delete = Mock(return_value=_Response(202))
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module.requests, "delete", delete)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+
+    assert engine.register_to_router(confirm=True) is (registration == "accepted")
+    if registration == "accepted":
+        assert get.call_count == 2
+        assert engine._router_worker_id == worker["id"]
+    else:
+        assert engine.unregister_from_router(wait_for_removal=True, allow_already_absent=True)
+        if registration == "rejected":
+            delete.assert_not_called()
+        else:
+            assert delete.call_args.args[0].endswith("/workers/elastic-worker")
+    post.assert_called_once()

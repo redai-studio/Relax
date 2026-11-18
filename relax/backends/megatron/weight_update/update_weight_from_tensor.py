@@ -123,6 +123,7 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
+        self._uncertain_group_removal: str | None = None
         self.distributed_rollout_engines: list[ActorHandle] = []
 
     def connect_rollout_engines(
@@ -292,15 +293,21 @@ class UpdateWeightFromTensor:
                 self._ipc_engine = engine
 
     def disconnect_distributed_group(self, group_name: str | None = None) -> None:
+        if group_name is not None and getattr(self, "_uncertain_group_removal", None) == group_name:
+            raise RuntimeError(f"Removal of weight-update group {group_name} failed without all acknowledgments")
         if self._model_update_groups is None or (group_name is not None and self._group_name != group_name):
             return
-        disconnect_rollout_engines_from_distributed(
-            self.args,
-            self._group_name,
-            self._model_update_groups,
-            self.distributed_rollout_engines,
-            strict=group_name is not None,
-        )
+        try:
+            disconnect_rollout_engines_from_distributed(
+                self.args,
+                self._group_name,
+                self._model_update_groups,
+                self.distributed_rollout_engines,
+                strict=group_name is not None,
+            )
+        except Exception:
+            self._uncertain_group_removal = group_name
+            raise
         self._model_update_groups = None
 
     def _configure_sync_process_groups(self) -> None:
