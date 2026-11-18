@@ -10,6 +10,7 @@ from typing import Any
 import ray
 
 from relax.distributed.settlement import UnsafeInferenceError, wait_all
+from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.async_utils import run
 
 
@@ -169,7 +170,7 @@ class InferenceRecoveryState:
 
 def inference_recovery_enabled(config: Namespace) -> bool:
     """Select component recovery for supported fault-tolerant training."""
-    if not getattr(config, "use_fault_tolerance", False):
+    if not getattr(config, "use_fault_tolerance", False) or is_offline_mode(config):
         return False
     hybrid = bool(getattr(config, "hybrid", False))
     fully_async = bool(getattr(config, "fully_async", False))

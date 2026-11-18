@@ -83,6 +83,18 @@ def test_true_on_policy_recovery_does_not_add_forward_receiver(constructor):
     constructor.options.return_value.remote.assert_called_once_with(False, max_attempts=3)
 
 
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_offline_training_does_not_create_inference_recovery_state(constructor, loss_type):
+    config = role_config()
+    config.loss_type = loss_type
+
+    assert configure_recovery(config) is None
+    assert config.inference_recovery is False
+    assert config.inference_recovery_state is None
+    assert config.use_fault_tolerance is True
+    constructor.options.assert_not_called()
+
+
 @pytest.mark.parametrize("budget,expected", [("", 3), (" ", 3), ("0", 0), ("1", 1), ("5", 5)])
 def test_recovery_budget_env_is_passed_to_state(monkeypatch, constructor, budget, expected):
     monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", budget)
