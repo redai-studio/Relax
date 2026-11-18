@@ -164,14 +164,12 @@ RUN . /etc/relax_build.env && \
 FROM ep_builder_base as deepep_v2_builder
 ARG DEEP_EP_V2_COMMIT
 COPY docker/patch/deepep/2.1.0-relax-namespace.patch /tmp/deepep-v2.patch
-RUN --mount=type=bind,source=docker/patch/deepep/2.1.0-nccl-runtime-filter.patch,target=/tmp/deepep-nccl-filter.patch \
-    . /etc/relax_build.env && \
+RUN . /etc/relax_build.env && \
     git clone https://github.com/deepseek-ai/DeepEP.git /tmp/DeepEP-v2 && \
     cd /tmp/DeepEP-v2 && git checkout --detach "$DEEP_EP_V2_COMMIT" && \
     test "$(git rev-parse HEAD)" = "$DEEP_EP_V2_COMMIT" && \
     git submodule update --init --recursive && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/deepep-v2.patch && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/deepep-nccl-filter.patch && \
     mv deep_ep _relax_deep_ep_v2 && \
     NCCL_ROOT="$(python -c 'import importlib.metadata as m; print(m.distribution("nvidia-nccl-cu13").locate_file("nvidia/nccl"))')" && \
     CUDA_VISIBLE_DEVICES="" MAX_JOBS=16 EP_NCCL_ROOT_DIR="$NCCL_ROOT" \
@@ -215,7 +213,8 @@ COPY docker/patch/sglang/v0.5.21.patch /tmp/tree-core.patch
 COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
 RUN cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
-    git apply --check /tmp/tree-core.patch && git apply /tmp/tree-core.patch && \
+    git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt --check /tmp/tree-core.patch && \
+    git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/tree-core.patch && \
     python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
 
 FROM ${TRAIN_IMAGE} as relax_build
@@ -233,6 +232,13 @@ ENV RELAX_GPU_ARCH=${GPU_ARCH} \
 # Reused train images must match this CUDA 13 runtime generation. Protobuf 6 is
 # required by CUTLASS DSL/gRPC. Cache the kernel build independently of TE patches.
 RUN --mount=type=bind,source=docker/scripts/ensure_sgl_kernel_sm103.py,target=/tmp/ensure_sgl_kernel_sm103.py \
+    --mount=type=bind,source=docker/patch/sglang/v0.5.21.patch,target=/tmp/sglang.patch \
+    cd /sgl-workspace/sglang && \
+    if git apply --include=python/sglang/kernels/aot/CMakeLists.txt --check /tmp/sglang.patch; then \
+        git apply --include=python/sglang/kernels/aot/CMakeLists.txt /tmp/sglang.patch; \
+    else \
+        git apply --reverse --include=python/sglang/kernels/aot/CMakeLists.txt --check /tmp/sglang.patch; \
+    fi && cd /root && \
     python -c "import importlib.metadata as m; \
 assert m.version('sglang') == '0.5.21' and m.version('tilelang') == '0.1.12', \
 'Build the train target from this Dockerfile before reusing TRAIN_IMAGE'" && \
@@ -243,13 +249,9 @@ assert m.version('sglang') == '0.5.21' and m.version('tilelang') == '0.1.12', \
 
 # Preserve CP padding and head72 fallback without rebuilding the SGLang kernel.
 RUN --mount=type=bind,source=docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch,target=/tmp/te-patches/2.18.0-cp-padding-no-host-sync.patch \
-    --mount=type=bind,source=docker/patch/transformer_engine/2.18.0-blackwell-fa4-head-dim.patch,target=/tmp/te-patches/2.18.0-blackwell-fa4-head-dim.patch \
-    --mount=type=bind,source=docker/mok/patches/transformer-engine-fused-adam-bounded.patch,target=/tmp/te-patches/fused-adam-bounded.patch \
     python -c "import importlib.metadata as m; assert m.version('transformer-engine') == '2.18.0'" && \
     cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-cp-padding-no-host-sync.patch && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-blackwell-fa4-head-dim.patch && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/fused-adam-bounded.patch
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-patches/2.18.0-cp-padding-no-host-sync.patch
 
 ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
@@ -268,9 +270,7 @@ ENV RELAX_FLA_CONV_NB_MODE=auto
 
 # NVRx 0.6 supplies the pinned MCore checkpoint API. Keep the validated FLA
 # closure and Energon/MSC pins, then apply all FLA patches in the same layer.
-RUN --mount=type=bind,source=docker/patch/fla/0.5.2-kda-backward-precision.patch,target=/tmp/fla-patches/0.5.2-kda-backward-precision.patch \
-    --mount=type=bind,source=docker/patch/fla/0.5.2-qwen38-output-config.patch,target=/tmp/fla-patches/0.5.2-qwen38-output-config.patch \
-    --mount=type=bind,source=docker/patch/fla/0.5.2-conv-static-entries.patch,target=/tmp/fla-patches/0.5.2-conv-static-entries.patch \
+RUN --mount=type=bind,source=docker/patch/fla/0.5.2.patch,target=/tmp/fla.patch \
     sed -i '/^nvidia-resiliency-ext==/d' "$PIP_CONSTRAINT" && \
     printf '%s\n' 'nvidia-resiliency-ext==0.6.0' 'grpcio-tools==1.81.1' >> "$PIP_CONSTRAINT" && \
     pip install --no-cache-dir \
@@ -284,9 +284,7 @@ RUN --mount=type=bind,source=docker/patch/fla/0.5.2-kda-backward-precision.patch
         "fla-core==0.5.2" "flash-linear-attention==0.5.2" && \
     pip install --no-cache-dir megatron-energon multi-storage-client && \
     cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
-    patch --batch --forward -p1 < /tmp/fla-patches/0.5.2-kda-backward-precision.patch && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-patches/0.5.2-qwen38-output-config.patch && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-patches/0.5.2-conv-static-entries.patch && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla.patch && \
     python -m compileall -q fla/modules/conv/triton
 
 # Install runtime system packages together and discard the package lists/deb.
@@ -303,7 +301,8 @@ RUN --mount=type=bind,source=docker/patch/sglang/v0.5.21.patch,target=/tmp/sglan
     --mount=type=bind,source=docker/scripts/build_sglang_tree_core.py,target=/tmp/build_sglang_tree_core.py \
     cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
-    git apply --check /tmp/sglang.patch && git apply /tmp/sglang.patch && \
+    git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt --check /tmp/sglang.patch && \
+    git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/sglang.patch && \
     sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     pip install --no-cache-dir setuptools-scm==9.2.2 && \
     SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.21 \
@@ -346,49 +345,21 @@ RUN --mount=type=bind,source=docker/patch/transferqueue/9784ad0-assignment-trans
         assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
         assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)"
 
-# Apply source fixups after dependency installs so patch edits reuse those layers.
-# Retain the patches consumed by the runtime provenance checks.
-RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target=/tmp/relax-patches/megatron.patch \
-    --mount=type=bind,source=docker/patch/megatron/sync-save-bounded-staging.patch,target=/tmp/relax-patches/sync-save-bounded-staging.patch \
-    --mount=type=bind,source=docker/patch/megatron/kimi-packed-sequence-api.patch,target=/tmp/relax-patches/kimi-packed-sequence-api.patch \
-    --mount=type=bind,source=docker/patch/megatron/20261016-qwen38-models.patch,target=/tmp/relax-patches/20261016-qwen38-models.patch \
-    --mount=type=bind,source=docker/patch/megatron/20261020-qwen35-optimized.patch,target=/tmp/relax-patches/20261020-qwen35-optimized.patch \
-    --mount=type=bind,source=docker/patch/megatron/20261020-model-operators.patch,target=/tmp/relax-patches/20261020-model-operators.patch \
-    --mount=type=bind,source=docker/patch/megatron/mtp-cp-normalization.patch,target=/tmp/relax-patches/mtp-cp-normalization.patch \
-    --mount=type=bind,source=docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch,target=/tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
-    --mount=type=bind,source=docker/patch/megatron/fully-reshardable-checkpoint-padding.patch,target=/tmp/relax-patches/fully-reshardable-checkpoint-padding.patch \
-    --mount=type=bind,source=docker/scripts/setup_memory_saver.py,target=/tmp/setup_memory_saver.py \
-    cp /tmp/relax-patches/megatron.patch \
-    /tmp/relax-patches/sync-save-bounded-staging.patch \
-    /tmp/relax-patches/kimi-packed-sequence-api.patch \
-    /tmp/relax-patches/20261016-qwen38-models.patch \
-    /tmp/relax-patches/20261020-qwen35-optimized.patch \
-    /tmp/relax-patches/20261020-model-operators.patch \
-    /tmp/relax-patches/mtp-cp-normalization.patch \
-    /tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
-    /tmp/relax-patches/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/ && \
+# Apply the complete framework patch. Architecture-specific changes remain opt-in
+# to the same image profile; the final manifest is recorded after all changes.
+COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/megatron.patch
+RUN --mount=type=bind,source=docker/scripts/setup_memory_saver.py,target=/tmp/setup_memory_saver.py \
     cd /root/Megatron-LM && \
-    sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
-    patch --batch --forward --fuzz=0 -p1 < /root/Megatron-LM/megatron.patch && \
-    if grep -R -n '^<<<<<<< ' .; then \
-    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-    exit 1; \
+    for profile in common cu13; do \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply --check - && \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply - || exit 1; \
+    done && \
+    if [ "$GPU_ARCH" = "blackwell" ]; then \
+        sed -n '/^# BEGIN blackwell$/,/^# END blackwell$/p' megatron.patch | git apply --check - && \
+        sed -n '/^# BEGIN blackwell$/,/^# END blackwell$/p' megatron.patch | git apply - || exit 1; \
     fi && \
-    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
-    patch --batch --forward --fuzz=0 -p1 < kimi-packed-sequence-api.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
-    sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
-    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
-    echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
-    patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
-    echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
-    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
-    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
-    sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
+    sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch kimi-packed-sequence-api.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch fully-reshardable-checkpoint-padding.patch && \
     cd /root && python /tmp/setup_memory_saver.py
 
 # Hold the architecture-specific cache lock only while building sampling.so.
@@ -457,6 +428,15 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/opt/sglang/lib/python3.12/site-packa
 
 FROM relax_ep as relax_blackwell
 
+# Build MoK against this image; the complete Megatron patch already contains its adapter.
+COPY docker/mok/ /opt/relax/mok-build/
+RUN CUDA_VISIBLE_DEVICES="" python /opt/relax/mok-build/build.py \
+        --megatron-root /root/Megatron-LM --mok-root /opt/relax/mixture-of-kittens --arch SM103
+ENV RELAX_MEGATRON_ROOT=/root/Megatron-LM \
+    RELAX_MOK_SOURCE_ROOT=/opt/relax/mixture-of-kittens \
+    RELAX_MOK_BUILD_MANIFEST=/opt/relax/mok-build/manifest.json
+RUN CUDA_VISIBLE_DEVICES="" python /opt/relax/mok-build/verify.py
+
 ARG DEEP_EP_V2_COMMIT
 ARG FA4_COMMIT=56e48e3cc3557cfb9f45ec4763c5f971e17cbcbc
 ARG FLASHQLA_COMMIT=5538c35f0df33ef804eacd90c77d9d9087c1d4e4
@@ -490,6 +470,7 @@ RUN --mount=type=bind,source=docker/scripts/record_qwen35_runtime.py,target=/tmp
 RUN --mount=type=bind,source=docker/patch/deepep/2.1.0-relax-namespace.patch,target=/tmp/qwen35-build/2.1.0-relax-namespace.patch \
     --mount=type=bind,source=docker/patch/flash-attention/56e48e3-fa4-isolated.patch,target=/tmp/qwen35-build/56e48e3-fa4-isolated.patch \
     --mount=type=bind,source=docker/patch/flash-qla/0.1.3-kkt-no-tma.patch,target=/tmp/qwen35-build/0.1.3-kkt-no-tma.patch \
+    --mount=type=bind,source=docker/patch/flash-qla/0.1.3-cumsum-heads.patch,target=/tmp/qwen35-build/0.1.3-cumsum-heads.patch \
     git init /tmp/flash-attention && cd /tmp/flash-attention && \
     git fetch --depth=1 https://github.com/Dao-AILab/flash-attention.git "$FA4_COMMIT" && \
     git checkout --detach FETCH_HEAD && \
@@ -506,6 +487,8 @@ RUN --mount=type=bind,source=docker/patch/deepep/2.1.0-relax-namespace.patch,tar
     git checkout --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "$FLASHQLA_COMMIT" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/qwen35-build/0.1.3-kkt-no-tma.patch && \
+    echo "cbf6ee0195fb4e76d5cca7972641a98c3f58d9eadb7d749aa584a71e1e8b113f  flash_qla/ops/utils/cumsum.py" | sha256sum -c - && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/qwen35-build/0.1.3-cumsum-heads.patch && \
     pip install --no-cache-dir --no-deps --no-build-isolation . && cd / && rm -rf /tmp/FlashQLA && \
     python /opt/relax/record_qwen35_runtime.py && \
     python /opt/relax/validate_blackwell_runtime.py

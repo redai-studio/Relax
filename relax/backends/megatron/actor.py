@@ -99,6 +99,7 @@ from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -266,11 +267,7 @@ def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
     """Avoid retaining the next prefetched window across memory-heavy step
     boundaries."""
     next_rollout_id = rollout_id + 1
-    is_train_done = next_rollout_id == args.num_rollout
-    should_save_after_step = args.save is not None and (
-        args.rotate_ckpt
-        or (args.save_interval is not None and (next_rollout_id % args.save_interval == 0 or is_train_done))
-    )
+    should_save_after_step = should_save_checkpoint(args, next_rollout_id)
     completed_steps = evaluation_step_for_rollout(args, rollout_id)
     return (
         should_run_sft_eval(args, completed_steps)
@@ -2081,13 +2078,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # ran with tms.paused and hit `CUDA error: invalid argument` on the
         # first cudaMalloc (e.g. all_gather_object's byte tensor).
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or (
-                self.args.save_interval is not None
-                and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-            )
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         # Mirror train_actor's post-train sleep so critic frees GPU before the
         # next rollout's SGLang resume tries to alloc KV pages.
@@ -2340,11 +2331,7 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
@@ -2813,11 +2800,7 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
 
         if self.args.offload_train:
