@@ -57,3 +57,29 @@ If every rank evaluates the global loss with only its own features attached to
 autograd, set `requires_dp_gradient_sum = True` on the loss callable. Relax then
 sums the rank-local gradient contributions through DDP. Callbacks that return
 a rank-local mean keep the default gradient averaging.
+
+## AllNLI training comparison
+
+Relax and the [Sentence Transformers MNRL baseline](https://sbert.net/docs/package_reference/sentence_transformer/losses.html#multiplenegativesrankingloss)
+each ran 80 updates on two H800 GPUs from the same Qwen3.5-4B base. Both used
+2,560 AllNLI training pairs, a global batch of 32 pairs, BF16 base weights,
+LoRA rank 8 and alpha 16, a constant learning rate of `1e-4`, last-token
+pooling, and one-way InfoNCE with temperature `0.05` and cross-rank negatives.
+The baseline used Sentence Transformers 5.3.0 with Transformers and PEFT.
+Each framework used its own adapter initialization and optimizer implementation.
+
+Both runs used the AllNLI revision pinned above. The training subset takes 2,560
+pairs after streaming shuffle with seed 42 and a 10,000-row buffer, skipping
+pairs with a repeated sentence. Evaluation uses the first 1,024 records after
+shuffling the `triplet` dev split with seed 43 and the same buffer size. The
+same evaluator measures how often the positive has higher cosine similarity
+to the anchor than the negative.
+
+| Framework             | Step 0 | Step 20 | Step 40 | Step 60 | Step 80 |
+| --------------------- | -----: | ------: | ------: | ------: | ------: |
+| Relax                 | 65.43% |  81.15% |  84.18% |  86.04% |  87.30% |
+| Sentence Transformers | 65.43% |  80.57% |  84.47% |  85.55% |  87.11% |
+
+![AllNLI held-out accuracy and training loss over 80 optimizer updates](assets/allnli-training-curve.png)
+
+[Per-step losses and validation counts](assets/allnli-training-metrics.csv)
