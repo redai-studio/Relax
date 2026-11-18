@@ -642,6 +642,8 @@ class Controller:
         owner-mediated runs delegate to
         :func:`relax.utils.tq.lifecycle.close_tq_owner`.
         """
+        if getattr(self, "_startup_abort_event", None) is not None:
+            self._startup_abort_event.set()
         if getattr(self, "_sft_early_prepare_issued", False) and not getattr(
             self, "_sft_early_prepare_stopped", False
         ):

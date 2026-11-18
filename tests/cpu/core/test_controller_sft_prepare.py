@@ -210,7 +210,6 @@ def test_aborted_startup_does_not_launch_prepare_after_queue_close(controller_mo
     controller._tq_owner = object()
     controller._tq_legacy_init = False
     controller._startup_abort_event = threading.Event()
-    controller._startup_abort_event.set()
     close = Mock()
     monkeypatch.setattr(controller_module, "close_tq_owner", close)
     controller._close_data_system()
