@@ -483,7 +483,7 @@ def test_should_use_sft_chunked(loss_type, chunked_flag, expected):
     """The chunked-path gate predicate: SFT mode + explicit opt-in.
 
     Remaining incompatibilities (tied embeddings, combined-1f1b) are enforced
-    as hard AssertionErrors in arguments.py.slime_validate_args, so by the time
+    as hard AssertionErrors in arguments.py.relax_validate_args, so by the time
     we reach this gate sft_chunked_logits=True is guaranteed compatible.
     Functional check on the helper extracted from ``forward_step``.
     """

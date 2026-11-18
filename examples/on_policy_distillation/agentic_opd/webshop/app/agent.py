@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -149,11 +150,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     args = parse_args()
     session_input = read_session_input(args.input_json)
     metadata = session_input.get("metadata") or {}
     session_output = asyncio.run(run_webshop(metadata=metadata))
     write_session_output(args.output_json, session_output)
+
+
+def _handle_sigterm(signum: int, _frame: Any) -> None:
+    # Close the remote WebShop session through the existing finally block.
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":

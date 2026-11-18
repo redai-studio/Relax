@@ -16,6 +16,7 @@ def compute_score_centering_loss(
     train_topk_log_probs: torch.Tensor,
     rollout_topk_log_probs: torch.Tensor,
     loss_mask: torch.Tensor,
+    support_complete: torch.Tensor | None = None,
     mode: str = "none",
     tis_clip: float = 2.0,
     mis_low: float = 0.5,
@@ -26,7 +27,8 @@ def compute_score_centering_loss(
     Sample tensors are [N], candidate tensors are [N, K]. Candidate padding has
     rollout log-probability -inf. Masked rows contribute zero, including rows
     whose placeholders contain non-finite values. FP64 is retained for
-    numerical oracles; model probabilities otherwise use FP32.
+    numerical oracles; model probabilities otherwise use FP32. Verified
+    complete rows score the policy on the recorded sampler support.
     """
     if (
         log_probs.ndim != 1
@@ -38,6 +40,10 @@ def compute_score_centering_loss(
         or rollout_topk_log_probs.shape != train_topk_log_probs.shape
     ):
         raise ValueError("Score centering requires sample tensors [N] and candidate tensors [N, K]")
+    if support_complete is not None and (
+        support_complete.shape != log_probs.shape or support_complete.dtype != torch.bool
+    ):
+        raise ValueError("Score centering support coverage must be bool [N]")
     dtype = torch.float64 if log_probs.dtype == torch.float64 else torch.float32
     active = loss_mask != 0
     head_mask = active[:, None] & ~torch.isneginf(rollout_topk_log_probs)
@@ -47,10 +53,20 @@ def compute_score_centering_loss(
     rollout_sample = torch.where(active, rollout_log_probs.to(dtype), 0.0)
     advantage = torch.where(active, advantages.detach().to(dtype), 0.0)
 
+    aligned = torch.zeros_like(active)
+    if support_complete is not None:
+        aligned = active & support_complete
+        support_head = torch.where(aligned[:, None], train_head.masked_fill(~head_mask, -torch.inf), 0.0)
+        log_support_mass = torch.where(aligned, support_head.logsumexp(-1), 0.0)
+        train_head = torch.where(head_mask, train_head - log_support_mass[:, None], 0.0)
+        train_sample = train_sample - log_support_mass
+
     with torch.no_grad():
         p = train_head.exp().masked_fill(~head_mask, 0.0)
         q = rollout_head.exp().masked_fill(~head_mask, 0.0)
         p_mass, q_mass = p.sum(-1), q.sum(-1)
+        if support_complete is not None:
+            p_mass = torch.where(aligned, log_support_mass.exp(), p_mass)
         p_tail, q_tail = 1 - p_mass, 1 - q_mass
         rho = q_tail.clamp_min(1e-6) / p_tail.clamp_min(1e-6)
         sample_ratio_log = train_sample - rollout_sample
@@ -73,6 +89,8 @@ def compute_score_centering_loss(
             clip_fraction = (~inside).to(dtype)
         else:
             raise ValueError(f"Unknown score-centering importance weighting: {mode}")
+        if support_complete is not None:
+            alpha = torch.where(aligned, head_mass.sum(-1), alpha)
         residual = head_mass - alpha[:, None] * p
 
     # Mask before multiplication: zero weights and padding may accompany -inf.
@@ -88,5 +106,6 @@ def compute_score_centering_loss(
         "sc_importance_weight": weight,
         "sc_is_clip_fraction": clip_fraction,
         "sc_zero_weight_fraction": (weight == 0).to(dtype),
+        "sc_support_aligned": aligned.to(dtype),
     }
     return loss, {name: torch.where(active, value.detach(), 0.0) for name, value in metrics.items()}

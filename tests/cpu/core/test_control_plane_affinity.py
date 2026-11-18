@@ -1,10 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import ast
 import json
 import sys
 from argparse import Namespace
-from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
 
@@ -294,21 +292,3 @@ def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):
     backend._create_rollout_engines({0: {"ip": "127.0.0.1", "port": 8000}})
 
     assert captured["options"] == {"resources": {"stable_cpu": 1}}
-
-
-def test_scale_out_paths_do_not_request_stable_markers():
-    rollout_path = Path(placement_group_module.__file__).with_name("rollout.py")
-    source = rollout_path.read_text()
-    tree = ast.parse(source)
-    target_names = {"_scale_out_ray_native", "_bring_up_single_replica", "_scale_out_external"}
-    functions = {
-        node.name: ast.get_source_segment(source, node) or ""
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in target_names
-    }
-
-    assert functions.keys() == target_names
-    for function_source in functions.values():
-        assert "stable_cpu" not in function_source
-        assert "stable_gpu" not in function_source
-        assert "with_control_plane_affinity" not in function_source

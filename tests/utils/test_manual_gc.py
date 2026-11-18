@@ -162,13 +162,13 @@ def test_negative_interval_fails_before_touching_gc_state(
 def test_train_one_step_collects_after_clearing_gradients(args: Namespace, collect: Mock) -> None:
     # Execute the production boundary, stopping before model computation needs CUDA.
     source = Path(__file__).resolve().parents[2] / "relax/backends/megatron/model.py"
-    function = next(
+    functions = [
         node
         for node in ast.parse(source.read_text()).body
-        if isinstance(node, ast.FunctionDef) and node.name == "train_one_step"
-    )
+        if isinstance(node, ast.FunctionDef) and node.name in {"_prepare_mtp_training_window", "train_one_step"}
+    ]
     module = ast.parse("from __future__ import annotations")
-    module.body.append(function)
+    module.body.extend(functions)
     args.custom_megatron_before_train_step_hook_path = None
     namespace = {
         "get_args": lambda: args,

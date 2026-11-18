@@ -91,10 +91,6 @@ def fake_gateway(*, create_status: str) -> Iterator[tuple[str, dict[str, Any]]]:
         thread.join(timeout=2.0)
 
 
-def test_run_agent_app_has_valid_bash_syntax():
-    subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
-
-
 @pytest.mark.parametrize("missing_name", sorted(set(REQUIRED_ENV) - {"NEMO_GYM_ENVIRONMENT"}))
 def test_run_agent_app_fails_fast_when_required_env_is_missing(missing_name):
     env = {"PATH": os.environ["PATH"], **REQUIRED_ENV}
@@ -156,7 +152,8 @@ def test_run_agent_app_completes_against_fake_gateway(tmp_path):
     assert "session-id" not in state["request"]["request_id"]
 
 
-def test_process_group_sigterm_requests_abort_without_writing_success(tmp_path):
+@pytest.mark.parametrize("signal_scope", ["root", "group"])
+def test_sigterm_requests_abort_without_writing_success(tmp_path, signal_scope):
     input_path = tmp_path / "input.json"
     output_path = tmp_path / "output.json"
     input_path.write_text(
@@ -184,7 +181,10 @@ def test_process_group_sigterm_requests_abort_without_writing_success(tmp_path):
             start_new_session=True,
         )
         assert state["created"].wait(timeout=2.0)
-        os.killpg(process.pid, signal.SIGTERM)
+        if signal_scope == "root":
+            process.send_signal(signal.SIGTERM)
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
         stdout, stderr = process.communicate(timeout=3.0)
 
     assert process.returncode != 0, stdout

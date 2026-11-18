@@ -405,6 +405,46 @@ def test_qwen38_tool_call_preserves_baseline_rendered_text(reasoning):
     assert repeated.template == result.template
 
 
+_QWEN38_UNMARKED_RENDER_TEMPLATE = "\n".join(
+    (
+        f"        {_QWEN38_PRESERVE_HISTORY_GATE}",
+        f"            {_QWEN_ASSISTANT_WITH_THINK}",
+        "        {%- else %}",
+        "            {{- '<|im_start|>' + message.role + '\\n' + content }}",
+        "        {%- endif %}",
+        _QWEN_TOOL_CALL_WITH_SEPARATOR,
+        "        {{- '<|im_end|>\\n' }}",
+    )
+)
+_QWEN38_GENERATION_RENDER_TEMPLATE = "\n".join(
+    (
+        "        {{- '<|im_start|>' + message.role + '\\n' }}",
+        "        {%- generation %}",
+        f"        {_QWEN38_PRESERVE_HISTORY_GATE}",
+        "            {{- '<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}",
+        "        {%- else %}",
+        "            {{- content }}",
+        "        {%- endif %}",
+        _QWEN_TOOL_CALL_WITH_SEPARATOR,
+        "        {{- '<|im_end|>' }}",
+        "        {%- endgeneration %}",
+        "        {{- '\\n' }}",
+    )
+)
+
+
+def test_qwen38_generation_tags_restore_unmarked_template():
+    marked = try_patch_qwen_chat_template(_make_sample(), _QWEN38_GENERATION_RENDER_TEMPLATE, {})
+    unmarked = try_patch_qwen_chat_template(_make_sample(), _QWEN38_UNMARKED_RENDER_TEMPLATE, {})
+    assert marked.template == unmarked.template
+
+
+def test_qwen38_partially_matching_generation_tags_fail_fast():
+    template = _QWEN38_GENERATION_RENDER_TEMPLATE.replace("{{- '\\n' }}", "{{- '\\n\\n' }}")
+    with pytest.raises(RuntimeError, match="Cannot safely patch legacy"):
+        try_patch_qwen_chat_template(_make_sample(), template, {})
+
+
 @pytest.mark.parametrize("legacy_block", [_QWEN_ASSISTANT_TOOL_CALL, _QWEN_TOOL_CALL_SEPARATOR_PATCH])
 def test_qwen35_patch_rejects_partial_legacy_tool_patch(legacy_block):
     template = "\n".join(("reasoning_content", _QWEN_HISTORY_GATE, legacy_block))

@@ -13,6 +13,9 @@ from relax.agentic.pipeline.runtime import RuntimeDomain, RuntimeGroupStream
 from relax.utils.types import Sample
 
 
+_PreparedGroup = tuple[RuntimeGroupStream, str | None, tuple[int | str, ...]]
+
+
 class PrepareDomain:
     """Own source fetches and the FIFO of Groups crossing into Runtime."""
 
@@ -30,9 +33,9 @@ class PrepareDomain:
         self._prepare_fetch_task: Optional[asyncio.Task[None]] = None
         self._pending_group_inputs: Deque[GroupInput] = deque()
         self._warming_prepare_tasks: dict[
-            asyncio.Task[Optional[RuntimeGroupStream]], Tuple[GroupInput, asyncio.Future[bool]]
+            asyncio.Task[Optional[_PreparedGroup]], Tuple[GroupInput, asyncio.Future[bool]]
         ] = {}
-        self._ready_prepare_tasks: Deque[asyncio.Task[RuntimeGroupStream]] = deque()
+        self._ready_prepare_tasks: Deque[asyncio.Task[_PreparedGroup]] = deque()
         self._progress_callback: Callable[[], None] = lambda: None
 
     @property
@@ -75,7 +78,7 @@ class PrepareDomain:
                 self._ready_prepare_tasks.remove(task)
                 raise error
 
-    def take_ready(self, limit: int) -> Tuple[RuntimeGroupStream, ...]:
+    def take_ready(self, limit: int) -> Tuple[_PreparedGroup, ...]:
         count = min(max(limit, 0), len(self._ready_prepare_tasks))
         return tuple(self._ready_prepare_tasks.popleft().result() for _ in range(count))
 
@@ -93,18 +96,32 @@ class PrepareDomain:
         prepare_fetch_task = self._prepare_fetch_task
         self._prepare_fetch_task = None
         self._pending_group_inputs.clear()
-        tasks = list(self._warming_prepare_tasks)
+        await self._discard_prepared_tasks(() if prepare_fetch_task is None else (prepare_fetch_task,))
+
+    async def _discard_prepared_tasks(self, extra_tasks: tuple[asyncio.Task, ...] = ()) -> None:
+        tasks = list(extra_tasks)
+        tasks.extend(self._warming_prepare_tasks)
         tasks.extend(self._ready_prepare_tasks)
-        if prepare_fetch_task is not None:
-            tasks.append(prepare_fetch_task)
         for task in tasks:
             task.cancel()
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         self._warming_prepare_tasks.clear()
         self._ready_prepare_tasks.clear()
-        for outcome in outcomes:
+        # A completed Prepare task owns a registered stream even when it was
+        # never leased. Cancelling that already-done task cannot release it.
+        streams = {outcome[0].group_id: outcome[0] for outcome in outcomes if isinstance(outcome, tuple)}
+        drops = await asyncio.gather(
+            *(self.runtime_domain.drop_group(stream) for stream in streams.values()), return_exceptions=True
+        )
+        for outcome in (*outcomes, *drops):
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 raise outcome
+
+    async def discard_step(self) -> None:
+        """Release surplus preparation while retaining unfetched/deferred
+        input."""
+        self.close_step()
+        await self._discard_prepared_tasks()
 
     async def _fetch_group_inputs(self, requested_group_count: int) -> None:
         sample_groups = await self.data_source.get_samples.remote(requested_group_count)
@@ -130,14 +147,26 @@ class PrepareDomain:
     def _start_prepare(self, group_input: GroupInput) -> None:
         launch_decision = asyncio.get_running_loop().create_future()
         prepare_task = asyncio.create_task(
-            self.runtime_domain.prepare_group(group_input, launch_decision),
+            self._prepare_group(group_input, launch_decision),
             name=f"agentic-prepare:{group_input.group_id}",
         )
         self._warming_prepare_tasks[prepare_task] = (group_input, launch_decision)
         prepare_task.add_done_callback(self._on_prepare_finished)
 
-    def _on_prepare_finished(self, task: asyncio.Task[Optional[RuntimeGroupStream]]) -> None:
+    async def _prepare_group(
+        self, group_input: GroupInput, launch_decision: asyncio.Future[bool]
+    ) -> _PreparedGroup | None:
+        stream = await self.runtime_domain.prepare_group(group_input, launch_decision)
+        if stream is None:
+            return None
+        if not self.runtime_domain.teacher_routing_enabled:
+            return stream, None, ()
+        teacher_id = group_input.samples[0].metadata["teacher_id"]
+        response_keys = tuple(sample.response_key for sample in group_input.samples)
+        return stream, teacher_id, cast(tuple[int | str, ...], response_keys)
+
+    def _on_prepare_finished(self, task: asyncio.Task[Optional[_PreparedGroup]]) -> None:
         self._warming_prepare_tasks.pop(task)
         if not task.cancelled() and (task.exception() is not None or task.result() is not None):
-            self._ready_prepare_tasks.append(cast(asyncio.Task[RuntimeGroupStream], task))
+            self._ready_prepare_tasks.append(cast(asyncio.Task[_PreparedGroup], task))
         self._progress_callback()

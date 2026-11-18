@@ -84,8 +84,19 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "agentic_obs_run_id": "run_test",
         "agentic_obs_train_generation_id": "generation",
         "dump_agentic_obs_media": False,
+        "agentic_prelaunch": False,
+        "num_rollout": 10,
         "reward_key": None,
         "use_rollout_routing_replay": False,
+        "rollout_temperature": 1.0,
+        "rollout_top_p": 1.0,
+        "rollout_top_k": -1,
+        "rollout_max_response_len": None,
+        "rollout_stop": None,
+        "rollout_stop_token_ids": None,
+        "rollout_skip_special_tokens": False,
+        "eval_reward_key": None,
+        "sglang_enable_deterministic_inference": False,
     }
     args.update(overrides)
     return Namespace(**args)
@@ -192,10 +203,17 @@ def test_trajectory_media_respects_sidecar_switch(tmp_path, dump_media) -> None:
 
 
 def test_resolve_shard_ordinal_falls_back_outside_a_ray_actor() -> None:
-    # Driver-side unit tests construct the recorder with no actor context; that
-    # must degrade to shard 0 rather than raise into the export path.
-    assert resolve_shard_ordinal() == 0
-    assert resolve_shard_ordinal(default=4) == 4
+    import ray
+
+    # A metadata probe in a standalone test must not implicitly own a cluster.
+    was_initialized = ray.is_initialized()
+    try:
+        assert resolve_shard_ordinal() == 0
+        assert resolve_shard_ordinal(default=4) == 4
+        assert ray.is_initialized() == was_initialized
+    finally:
+        if not was_initialized and ray.is_initialized():
+            ray.shutdown()
 
 
 # --------------------------------------------------------------------------
@@ -304,6 +322,8 @@ def test_export_id_column_is_gated_on_the_flag(tmp_path) -> None:
         "agentic_custom_advantage_path": None,
         "advantage_estimator": "grpo",
         "rewards_normalization": False,
+        "agentic_prelaunch": False,
+        "num_rollout": 10,
         "reward_key": None,
         "multimodal_keys": None,
         "use_opd": False,
@@ -453,7 +473,18 @@ def _train_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "rollout_batch_size": 1,
         "advantage_estimator": "grpo",
         "agentic_custom_advantage_path": None,
+        "agentic_prelaunch": False,
+        "num_rollout": 10,
         "reward_key": None,
+        "rollout_temperature": 1.0,
+        "rollout_top_p": 1.0,
+        "rollout_top_k": -1,
+        "rollout_max_response_len": None,
+        "rollout_stop": None,
+        "rollout_stop_token_ids": None,
+        "rollout_skip_special_tokens": False,
+        "eval_reward_key": None,
+        "sglang_enable_deterministic_inference": False,
     }
     args.update(overrides)
     return Namespace(**args)
@@ -591,6 +622,8 @@ def rollout_module(monkeypatch):
     logging_module._log_rollout_data = lambda *args, **kwargs: None
     logging_module.get_local_rollout_manager = lambda: SimpleNamespace(training_weight_updating=False)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", logging_module)
+    # Reimporting also replaces the rollout attribute on the parent package.
+    monkeypatch.setattr(sys.modules["relax.agentic"], "rollout", None, raising=False)
     monkeypatch.delitem(sys.modules, "relax.agentic.rollout", raising=False)
     module = importlib.import_module("relax.agentic.rollout")
     yield module
@@ -607,7 +640,7 @@ def _obs_pipeline(module, args):
     pipeline._finalized_groups = deque()
     pipeline._stage_recorder = StageRecorder(args)
     pipeline._record_rollout = AsyncMock()  # These fixtures exercise trajectory ownership, not rollout membership.
-    pipeline.prepare_domain = SimpleNamespace(close_step=lambda: None, shutdown=AsyncMock())
+    pipeline.prepare_domain = SimpleNamespace(close_step=lambda: None, discard_step=AsyncMock(), shutdown=AsyncMock())
     pipeline.runtime_domain = SimpleNamespace(
         pause_generation=AsyncMock(), trim_memory=AsyncMock(), shutdown=AsyncMock()
     )
@@ -624,7 +657,7 @@ async def _lease_observed_group(pipeline, module, stream, reward_domain, collect
     pipeline._changed = asyncio.Event()
     pipeline._opd_manager = None
     pipeline.reward_domain = reward_domain
-    pipeline.prepare_domain.take_ready = lambda count: [stream]
+    pipeline.prepare_domain.take_ready = lambda count: [(stream, None, ())]
     pipeline.runtime_domain.lease_group = AsyncMock()
     pipeline.runtime_domain.drop_group = AsyncMock()
     pipeline.runtime_domain.collect_group = collect_group
@@ -652,7 +685,8 @@ def test_cancel_records_exports_while_reward_is_pending(tmp_path, rollout_module
         pipeline = _obs_pipeline(rollout_module, args)
         rm_started = asyncio.Event()
 
-        async def slow_rm(*args):
+        async def slow_rm(*args, evaluation=False):
+            assert evaluation is False
             rm_started.set()
             await asyncio.Event().wait()
 
@@ -902,6 +936,8 @@ def test_shard_export_preserves_rollout_identity(tmp_path, rollout_module, rollo
             forest=forest, rollout_mode=rollout_mode, reward=1.0, metadata={}, output_records=(), finalize_events={}
         )
         transport = shard._build_session_export_transport(session=session, prepared=prepared)
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
         return transport
 
@@ -979,15 +1015,17 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     config = resolve_agentic_obs_config(args)
     first, second = _read_jsonl(config.train_scalar_path(8, 0))
     assert first["update_id"] != second["update_id"]
-    assert first["schema_version"] == "3.0.0"
+    assert first["schema_version"] == "4.0.0"
+    assert json.loads(config.manifest_path.read_text())["train_schema_version"] == first["schema_version"]
     assert first["run_id"] == "run_test"
     assert first["capture_phase"] == "training_input"
     assert [row["sample_export_id"] for row in first["samples"]] == [str(2**60 + 1), "2"]
-    assert first["samples"][0]["loss_mask"] == [1, 0, 1, 0]
+    assert first["samples"][0]["loss_mask"] == {"ranges": [[0, 1, 1], [2, 3, 1]]}
     assert first["samples"][0]["effective_tokens"] == 2
     assert first["samples"][0]["advantage_mean"] == pytest.approx(2.0)
     assert first["samples"][0]["advantage_absmax"] == pytest.approx(3.0)
     assert first["samples"][1]["effective_tokens"] == 0
+    assert first["samples"][1]["loss_mask"] == {"ranges": []}
     assert first["samples"][1]["advantage_mean"] == pytest.approx(0.0)
     stages = [r for path in config.stages_dir.glob("actor_*.jsonl") for r in _read_jsonl(path)]
     inputs = [r for path in config.train_debug_dir.glob("*.jsonl") for r in _read_jsonl(path)]
@@ -999,6 +1037,39 @@ def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     assert not committed["groups_finalized"]  # Unassigned rows cannot establish membership.
     assert not committed["input_complete"]
     assert merged["actor:9:0"]["optimizer_step"] == 2
+
+
+def test_train_jsonl_loss_mask_ranges_roundtrip(tmp_path, fake_mpu):
+    from relax.utils.agentic_obs import train_hooks
+
+    fake_mpu()
+    args = _train_args(tmp_path)
+    mask = [0] * 6 + [1] * 16 + [0] * 3 + [2] * 9 + [0] * 8
+    data = _rollout_data(
+        [7],
+        response_lengths=[len(mask)],
+        total_lengths=[len(mask) + 2],
+        loss_masks=[torch.tensor(mask)],
+        advantages=None,
+        returns=None,
+    )
+    _emit_update(args, 1, data)
+    train_hooks.close_train_appenders()
+    config = resolve_agentic_obs_config(args)
+    (record,) = _read_jsonl(config.train_scalar_path(1, 0))
+    (sample,) = record["samples"]
+    assert sample["loss_mask"] == {"ranges": [[6, 22, 1], [25, 34, 2]]}
+    restored = [0] * sample["response_length"]
+    for start, end, value in sample["loss_mask"]["ranges"]:
+        restored[start:end] = [value] * (end - start)
+    assert restored == mask
+    assert sample["effective_tokens"] == sum(mask)
+    assert len(json.dumps(sample["loss_mask"])) < len(json.dumps(mask))
+    legacy = {**record, "schema_version": "3.0.0", "samples": [{**sample, "loss_mask": mask}]}
+    stages = [row for path in config.stages_dir.glob("actor_*.jsonl") for row in _read_jsonl(path)]
+    (summary,) = merge_train_updates(stages, [record])
+    assert summary["status"] == "committed" and summary["input_complete"]
+    assert merge_train_updates(stages, [legacy]) == [summary]
 
 
 def test_update_joins_remote_dp_members_even_when_local_input_is_empty(tmp_path, fake_mpu, monkeypatch):
@@ -1319,6 +1390,8 @@ def test_multiple_exports_publish_only_after_all_payloads_succeed(
                 output_records=tuple({"name": name, "metadata": {}, "messages": []} for name in ("one", "two")),
             )
             shard._build_session_export_transport(session=session, prepared=prepared)
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -1344,6 +1417,8 @@ def test_shard_drop_retires_only_exports_still_owned_by_shard(tmp_path, rollout_
 
     async def scenario():
         await shard._drop_group(group)
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -1371,6 +1446,7 @@ def test_runtime_drop_joins_inflight_export_delivery(tmp_path, cancelled):
         runtime = object.__new__(runtime_module.RuntimeDomain)
         runtime._resident_group_permits = asyncio.Semaphore(0)
         runtime._state_changed = asyncio.Event()
+        runtime._cleanup_tasks = set()
 
         async def take():
             take_started.set()
@@ -1391,6 +1467,7 @@ def test_runtime_drop_joins_inflight_export_delivery(tmp_path, cancelled):
                 await task
         else:
             await task
+        await asyncio.gather(*tuple(runtime._cleanup_tasks))
         shard.handle.drop_group.remote.assert_awaited_once_with("g", reason=None)
         assert completion.result() is group.sessions[0]
         assert not result.take_task.cancelled()
@@ -1463,8 +1540,8 @@ def test_eval_success_terminal_survives_cancellation(tmp_path, rollout_module, m
     )
 
 
-def test_cleanup_failure_retires_published_export(tmp_path, rollout_module, monkeypatch):
-    from relax.agentic.pipeline import RuntimeGroupError, SessionExportTransport
+def test_cleanup_failure_preserves_published_export(tmp_path, rollout_module, monkeypatch):
+    from relax.agentic.pipeline import SessionExportTransport
     from relax.agentic.session import service
 
     args = _obs_args(tmp_path, agentic_session_lifecycle=False)
@@ -1473,6 +1550,7 @@ def test_cleanup_failure_retires_published_export(tmp_path, rollout_module, monk
     shard._trajectory_recorder = ShardTrajectoryRecorder(args, shard_ordinal=3)
     shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(side_effect=RuntimeError("abort failed")))
     shard._notify_state_change = lambda group=None: None
+    shard._agent_cleanup_tasks = set()
     cell = service._SessionResultCell()
     group = service.ResidentGroup("train", "g", {"s": cell}, [])
     session = service._SessionRecord(group=group, session_id="s", session_sampling_params={}, result_cell=cell)
@@ -1484,18 +1562,19 @@ def test_cleanup_failure_retires_published_export(tmp_path, rollout_module, monk
         runner = asyncio.create_task(asyncio.sleep(0))
         session.live_irs = [
             SimpleNamespace(
-                runner_task=runner, backend_started=True, waiter=SimpleNamespace(set_result=lambda value: None)
+                runner_task=runner, backend_started=True, waiter=asyncio.get_running_loop().create_future()
             )
         ]
+        session.phase = service.SessionPhase.FINALIZING
         outcome = SessionExportTransport(exports=({"sample_payload": {"sample_export_id": 7}},))
-        error = await shard._finish_session_once(session, outcome)
-        assert str(error) == "abort failed" and isinstance(cell.payload, RuntimeGroupError)
+        await shard._finish_session_once(session, outcome)
+        assert cell.payload is outcome and not group.sessions and not shard._session_records
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
-    (event,) = _read_stage_ends(resolve_agentic_obs_config(args).stages_dir / "shard_03.jsonl")
-    assert event["sample_export_id"] == "7"
-    assert event["reason_code"] == "session_cleanup_failed" and event["is_terminal"]
+    assert not resolve_agentic_obs_config(args).stages_dir.joinpath("shard_03.jsonl").exists()
 
 
 @pytest.mark.parametrize("extension", ["jsonl", "parquet"])
@@ -1737,6 +1816,8 @@ def _session_observation_fixture(tmp_path):
     shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(), tokenizer=_FakeTokenizer())
     shard._notify_state_change = lambda group=None: None
     shard._train_generation_open = True
+    shard._generation_gate_lock = asyncio.Lock()
+    shard._agent_cleanup_tasks = set()
     cell = service._SessionResultCell()
     group = service.ResidentGroup("train", "g", {"s": cell}, [], ownership=service.GroupOwnership.RUNTIME)
     session = service._SessionRecord(group, "s", {}, cell, observation=SessionObservation())
@@ -1761,6 +1842,8 @@ def test_session_failure_has_single_terminal_without_export(tmp_path, rollout_mo
             shard._handle_controlled_agent_failure(session, error),
         )
         shard._observe_session(session, "rollout", "running")
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
         assert session.forest is None and not shard._session_records
 
@@ -1844,6 +1927,8 @@ def test_session_attempt_tokens_include_abort_and_cleanup_result(
             shard._dispatch_queued_irs_locked(session)
             await ir.runner_task
             await shard._finish_session(session, None)
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -1870,7 +1955,7 @@ def test_session_attempt_tokens_include_abort_and_cleanup_result(
 
 
 @pytest.mark.parametrize("mode", ["success", "nonzero", "invalid", "timeout"])
-@pytest.mark.parametrize("log_failure", [None, "exception", "cancelled"])
+@pytest.mark.parametrize("log_failure", [None, "exception", "cancelled", "close"])
 def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path, monkeypatch, mode, log_failure):
     from relax.agentic.runner import ipc
     from relax.agentic.runner.ipc import AgentExecutionError, ManagedAgentProcess, ManagedCommandAppSpec, SessionInput
@@ -1905,7 +1990,11 @@ def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path
             Path(kw["log_path"]).write_text("agent diagnostics\n")
             if mode == "invalid":
                 (workdirs[-1] / "session_output.json").write_text("{bad json")
-            return SimpleNamespace(wait=wait, close=AsyncMock(), terminate=AsyncMock(side_effect=terminated.set))
+            return SimpleNamespace(
+                wait=wait,
+                close=AsyncMock(side_effect=OSError("connection close failed") if log_failure == "close" else None),
+                terminate=AsyncMock(side_effect=terminated.set),
+            )
 
         process = ManagedAgentProcess(
             SimpleNamespace(launch=launch),
@@ -1931,7 +2020,11 @@ def test_managed_agent_logs_and_structured_failure_survive_temp_cleanup(tmp_path
                 ]
             )
         assert process.observation_log_ref == "logs/s.log"
-        assert process.active_ms >= 0 and all(not path.exists() for path in workdirs)
+        assert process.active_ms >= 0 and all(path.exists() for path in workdirs)
+        # The daemon owns these directories until descendant cleanup finishes.
+        for path in workdirs:
+            ipc._cleanup_session_dir(path)
+        assert all(not path.exists() for path in workdirs)
 
     asyncio.run(scenario())
     close_observation_writers()
@@ -2046,6 +2139,8 @@ def test_session_cleanup_diagnostics_do_not_change_success(tmp_path, rollout_mod
         outcome = SessionExportTransport(exports=({"sample_payload": {"sample_export_id": (3 << 56) + 1}},))
         await shard._finish_session(session, outcome)
         assert session.result_cell.payload is outcome
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -2053,6 +2148,39 @@ def test_session_cleanup_diagnostics_do_not_change_success(tmp_path, rollout_mod
     assert terminal["diagnostics"][0]["reason_code"] == "session_close_failed"
     assert terminal["status"] == "completed" and terminal["is_terminal"]
     assert terminal["export_ids"] == [str((3 << 56) + 1)]
+
+
+def test_shutdown_records_terminal_session_before_closing_writer(tmp_path, rollout_module, monkeypatch):
+    from relax.agentic.pipeline import SessionExportTransport
+    from relax.agentic.session import service
+
+    monkeypatch.setattr(service, "_SHUTDOWN_CLEANUP_GRACE_S", 0.01)
+
+    async def scenario():
+        shard, session = _session_observation_fixture(tmp_path)
+        shard.args.agentic_session_lifecycle = True
+        shard._permit_cleanup_tasks = set()
+        shard._inflight_exports = set()
+        shard._export_executor = service.ThreadPoolExecutor(max_workers=1)
+        shard._lifecycle_close_count = shard._lifecycle_close_failure_count = 0
+        entered = asyncio.Event()
+
+        async def close(*_args, **_kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        shard._generation_backend.close_session = close
+        shard._generation_backend.shutdown = AsyncMock()
+        outcome = SessionExportTransport(exports=())
+        await shard._finish_session(session, outcome)
+        await entered.wait()
+        assert session.result_cell.payload is outcome
+        await asyncio.wait_for(shard.shutdown(), 1)
+
+    asyncio.run(scenario())
+    rows = _read_jsonl(tmp_path / "run_test/stages/shard_00.jsonl")
+    terminal = [row for row in rows if row["scope"] == "session" and row["is_terminal"]]
+    assert len(terminal) == 1 and terminal[0]["status"] == "completed"
 
 
 def test_all_six_streams_join_from_prompt_to_committed_update(tmp_path, rollout_module, fake_mpu):
@@ -2104,6 +2232,8 @@ def test_all_six_streams_join_from_prompt_to_committed_update(tmp_path, rollout_
         )
         pipeline._stage_recorder.close()
         await inventory.aclose()
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
         return sample, forest
 
@@ -2180,8 +2310,7 @@ def test_inventory_drains_even_when_runtime_cleanup_fails(tmp_path):
         runtime = RuntimeDomain(_obs_args(tmp_path), "train", [], 1)
         runtime.observe_group_input(GroupInput("g", [Sample(prompt="q")]))
         runtime.trim_memory = AsyncMock(side_effect=RuntimeError("trim failed"))
-        with pytest.raises(RuntimeError, match="trim failed"):
-            await runtime.shutdown()
+        await runtime.shutdown()
 
     asyncio.run(scenario())
     assert len(_read_jsonl(next((tmp_path / "run_test/groups").glob("*.jsonl")))) == 1
@@ -2210,6 +2339,8 @@ def test_admitted_calls_rejected_before_generation_remain_in_session_timeline(tm
         assert not session.live_irs
         # An agent can recover from failed calls and finish without exporting them.
         await shard._finish_session(session, SessionExportTransport(exports=()))
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -2257,6 +2388,8 @@ def test_request_infra_failure_closes_call_as_failed(tmp_path, rollout_module, b
         session.live_irs.add(ir)
         ir.runner_task = asyncio.create_task(shard._run_ir(session, ir))
         await ir.runner_task
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -2339,6 +2472,8 @@ def test_registration_error_after_shard_execution_has_only_one_session_end(tmp_p
             await runtime.prepare_group(GroupInput("g", [Sample(prompt="q"), Sample(prompt="q")]))
         assert not shard._groups and not shard._session_records
         await runtime._inventory.aclose()
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -2360,6 +2495,8 @@ def test_group_drop_preserves_cancellation_reason_and_finishes_once(tmp_path, ro
         shard, session = _session_observation_fixture(tmp_path)
         reason = (reason_code, "selection", "group no longer needed")
         await asyncio.gather(shard.drop_group("g", reason=reason), shard.drop_group("g", reason=reason))
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
         assert session.result_cell.terminal
 
@@ -2403,6 +2540,8 @@ def test_call_cancelled_during_compilation_keeps_its_actual_end(tmp_path, rollou
         assert call_end is not None
         await shard._finish_session(session, None)
         assert call["finished_at"] == call_end
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -2487,6 +2626,7 @@ def test_first_request_group_boundaries_preserve_gating_and_cleanup(tmp_path, ro
         assert "agentic_trace" not in forest.static_metadata
         # Stand in for the first IR; scheduling/cleanup methods are real.
         session.live_irs.add(object())
+        group.first_ir_seen_session_ids.add(session.session_id)
         shard._notify_state_change(group)
         await shard.lease_group(group.group_id, 7)
         assert group.ownership is service.GroupOwnership.RUNTIME
@@ -2511,6 +2651,8 @@ def test_first_request_group_boundaries_preserve_gating_and_cleanup(tmp_path, ro
             assert not events
         session.live_irs.clear()
         await shard._finish_session(session, None)
+        if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         await shard._trajectory_recorder.aclose()
         assert session.forest is None and not shard._session_records
 

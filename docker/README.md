@@ -83,6 +83,34 @@ CU13_BLACKWELL_TRAIN_IMAGE="$REGISTRY/relax:train-YYYYMMDD-HASH8-cu13-blackwell"
 
 See the [English installation guide](../docs/en/guide/installation.md) or [中文安装指南](../docs/zh/guide/installation.md) for container setup and direct Docker build examples.
 
+### CUDA Patches and MoK
+
+CUDA and ROCm builds use `patch/latest/megatron.patch`, a symlink to
+`patch/megatron/20260915-4a4de8657.patch`. This versioned file contains the complete
+Bridge/MCore changes, with `common`, `cu13`, and `blackwell` sections selected in
+order. ROCm retains its existing Kimi/checkpoint fixes by applying `common` and
+`cu13`; the section name does not install CUDA dependencies. Keep new Megatron
+changes in this file rather than adding feature patches. Historical versioned
+Megatron and SGLang patches remain available.
+
+`PATCH_VERSION` defaults to `latest` and continues to select
+`patch/${PATCH_VERSION}/megatron.patch`. Custom patch sets must supply the
+complete merged patch with the same sections. CUDA 12 also selects
+`patch/${PATCH_VERSION}/sglang.patch`, which must include the `relax` and
+`transformers5` sections. Migrate custom legacy incremental patch sets to these
+complete files before rebuilding.
+
+SGLang keeps one complete patch per active upstream version: `v0.5.17.patch`
+for CUDA 12 and `v0.5.21.patch` for CUDA 13. The CUDA 12 patch includes
+per-position top-K queries and a separate Transformers 5 compatibility section,
+which still applies when `ENABLE_SGLANG_PATCH=0`. Third-party patches remain
+standalone files, grouped by component and version; build helpers remain under
+`scripts/`.
+
+The CUDA 13 Blackwell final image also builds and installs MoK for SM103.
+There is no separate MoK Dockerfile. See [MoK usage and limitations](mok/README.md).
+Hopper and CUDA 12 retain their existing backend selection.
+
 ## Build the ROCm Image
 
 `docker/Dockerfile.rocm` targets AMD Instinct GPUs; `GPU_ARCH` selects the variant:

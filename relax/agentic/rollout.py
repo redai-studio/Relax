@@ -285,7 +285,7 @@ class AgenticResidentPipeline:
         warming, ready = self.prepare_domain.counts
         runtime_reward = len(self._active_group_tasks)
         finalized = len(self._finalized_groups)
-        return {
+        snapshot: dict[str, object] = {
             "active_rollout_id": context.rollout_id if context is not None else None,
             "warming_prepare_group_count": warming,
             "ready_prepare_group_count": ready,
@@ -295,6 +295,9 @@ class AgenticResidentPipeline:
             "resident_group_count": self.runtime_domain.resident_group_count,
             "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
         }
+        if self.runtime_domain.teacher_routing_enabled:
+            snapshot["teacher_responses"] = self._opd_manager.response_stats.metrics()
+        return snapshot
 
     async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
         """Generate one rollout step while resident Group refs may cross
@@ -312,6 +315,8 @@ class AgenticResidentPipeline:
             final_backfill=final_backfill,
         )
         self._active_step = context
+        if self.runtime_domain.teacher_routing_enabled:
+            self._opd_manager.response_stats.new_window()
         try:
             if self._stage_recorder.enabled:
                 context.observed_group_ids.update(group.group_id for group in self._finalized_groups)
@@ -330,6 +335,8 @@ class AgenticResidentPipeline:
             metrics = dict(output.metrics or {})
             metrics.update(_aggregate_agentic_timing(samples))
             metrics.update(self.reward_domain.collect_metrics())
+            if self.runtime_domain.teacher_routing_enabled:
+                metrics.update(self._opd_manager.response_stats.metrics())
             if getattr(self.args, "agentic_program_admission", False) or getattr(
                 self.args, "agentic_session_lifecycle", False
             ):
@@ -340,6 +347,8 @@ class AgenticResidentPipeline:
             await stop_sglang_profile(self.args, rollout_id)
             profile_stopped = True
             rollout_time = time.monotonic() - started_at
+            metrics["perf/rollout_time"] = rollout_time
+            metrics["perf/rollout_accepted_samples"] = len(samples)
             if samples:
                 last_sample = samples[-1]
                 logger.info(
@@ -649,7 +658,9 @@ class AgenticResidentPipeline:
         # same number of resident Groups is confirmed interrupted. Debt from
         # the older partition must finish first: only two physical partitions
         # can be active, so carrying it again would make the next open fail.
-        if self.args.fully_async and not context.final_backfill:
+        # Zero staleness blocks the next rollout until training consumes this
+        # partition, so it cannot leave debt for that next rollout to fill.
+        if self.args.fully_async and self.args.max_staleness > 0 and not context.final_backfill:
             return (
                 get_local_rollout_manager().training_weight_updating
                 and self.transfer_domain.previous_debt == 0
@@ -679,7 +690,14 @@ class AgenticResidentPipeline:
             "agentic-generation-pause",
         )
         retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
+        retain_prepared = (
+            self.args.agentic_prelaunch
+            and not context.final_backfill
+            and context.rollout_id + 1 < self.args.num_rollout
+        )
         if not retain_resident_tail:
+            if not retain_prepared:
+                await self.prepare_domain.discard_step()
             await finish_before_cancellation(
                 self._cancel_active_group_tasks(
                     rollout_id=context.rollout_id,
@@ -693,6 +711,11 @@ class AgenticResidentPipeline:
             # append their aligned FIFO prefix, seal the partition, and wait for
             # its remaining TQ batches. Reward-inflight Groups stay resident.
             await self._seal_dynamic_partition(context)
+
+        if retain_resident_tail and not self.args.fully_async and context.rollout_id + 1 >= self.args.num_rollout:
+            # The final partial step has no next lease for prepared work. Its
+            # Runtime tail is still owned until the normal pipeline shutdown.
+            await self.prepare_domain.discard_step()
 
         await self.runtime_domain.trim_memory()
         return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
@@ -721,12 +744,13 @@ class AgenticResidentPipeline:
     async def _lease_prepared_groups(self, context: _StepContext) -> None:
         """Open generation for the ready FIFO prefix visible at this check.
 
-        Each ready task already owns a Shard-resident Group whose Sessions have
-        crossed the first-IR barrier. Leasing changes ownership to Runtime and
-        opens its generation gate.
+        Each ready task owns a fully registered Group. Leasing opens ready
+        members' generation gates; siblings may reach their first IR later.
         """
 
-        for stream in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+        for stream, teacher_id, response_keys in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+            for key in response_keys:
+                self._opd_manager.response_stats.admit(key, cast(str, teacher_id))
             await self.runtime_domain.lease_group(stream, context.rollout_id)
             observation = (
                 _GroupObservation(stream, observed_rollout_id=context.rollout_id)
@@ -745,12 +769,18 @@ class AgenticResidentPipeline:
                 ),
                 name=f"agentic-group:{stream.group_id}",
             )
-            group_task.add_done_callback(lambda _task: self._changed.set())
+            # A task cancelled before its coroutine starts still has to release its response counts.
+            group_task.add_done_callback(lambda _task, keys=response_keys: self._finish_group(keys))
             self._active_group_tasks.append(group_task)
             if observation is not None:
                 self._group_observations[group_task] = observation
                 context.observed_group_ids.add(stream.group_id)
         await self._record_rollout(context)
+
+    def _finish_group(self, response_keys: tuple[int | str, ...]) -> None:
+        for key in response_keys:
+            self._opd_manager.response_stats.finish(key)
+        self._changed.set()
 
     def _runtime_group_gap(self, context: _StepContext) -> int:
         oversample_groups = 0
@@ -1089,6 +1119,10 @@ def bind_agentic_router(router_ip: str, router_port: int) -> None:
     _run_on_resident_async_loop(get_agentic_resident_pipeline().runtime_domain.bind_router(router_ip, router_port))
 
 
+def bind_agentic_lora_runtime(handle: Any) -> None:
+    _run_on_resident_async_loop(get_agentic_resident_pipeline().runtime_domain.bind_lora_runtime(handle))
+
+
 def _aggregate_agentic_timing(samples: list[Sample]) -> dict[str, float]:
     turns_by_sample = [sample.metadata[TRACE_KEY]["turns"] for sample in samples]
     if not turns_by_sample:
@@ -1290,7 +1324,8 @@ async def _eval_rollout(
         completed_samples.sort(key=lambda sample: sample.index)
         results[dataset_cfg.name] = {
             "rewards": [
-                sample.reward if not reward_key else sample.reward[reward_key] for sample in completed_samples
+                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
+                for sample in completed_samples
             ],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in completed_samples],
             "samples": completed_samples,

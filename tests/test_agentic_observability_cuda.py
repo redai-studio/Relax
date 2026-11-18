@@ -28,5 +28,5 @@ def test_cuda_training_snapshot_owns_input_before_later_mutation(tmp_path, fake_
     train_hooks.close_train_appenders()
     close_observation_writers()
     (row,) = _read_train_samples(resolve_agentic_obs_config(args).train_scalar_path(1, 0))
-    assert row["loss_mask"] == [1, 1, 1, 1]
+    assert row["loss_mask"] == {"ranges": [[0, 4, 1]]}
     assert row["advantage_mean"] == pytest.approx(0.5)

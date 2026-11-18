@@ -139,7 +139,8 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
     async def scenario():
         entered = asyncio.Event()
 
-        async def score(rm_args, samples):
+        async def score(rm_args, samples, *, evaluation):
+            assert evaluation is False
             entered.set()
             if cancelled:
                 await asyncio.Event().wait()
@@ -154,6 +155,7 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
         exec("from __future__ import annotations\n" + ast.unparse(cls), scope)
         domain = scope["RewardDomain"]()
         domain.args = args
+        domain._evaluation = False
         group = NS(samples=[NS(sample_export_id=export_id, reward=None) for export_id in (7, 8)])
         recorder = StageRecorder(args)
         task = asyncio.create_task(
@@ -164,6 +166,8 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
                 ),
             )
         )
+        # Propagate failures before the scorer starts instead of waiting forever.
+        task.add_done_callback(lambda _: entered.set())
         await entered.wait()
         if cancelled:
             task.cancel()
@@ -174,7 +178,7 @@ def test_group_reward_observation_preserves_results_and_cancellation(args, cance
         assert [sample.reward for sample in group.samples] == ([None, None] if cancelled else [1.0, 2.0])
         await recorder.aclose()
 
-    asyncio.run(scenario())
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
     rows = [
         json.loads(line)
         for line in (Path(args.dump_agentic_obs) / "run/stages/rollout_00000001.jsonl").read_text().splitlines()
@@ -191,6 +195,15 @@ def args(tmp_path):
         agentic_obs_run_id="run",
         agentic_obs_train_generation_id="generation",
         reward_key=None,
+        rollout_temperature=1.0,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        rollout_max_response_len=None,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=False,
+        eval_reward_key=None,
+        sglang_enable_deterministic_inference=False,
     )
 
 
@@ -535,23 +548,11 @@ def test_merge_idempotent_success_skip_and_legacy():
 
 
 def test_dropping_protected_group_progress_and_release_wake_cleanup():
-    # Extract the actual methods to isolate Ray imports; no copied implementation.
-    path = Path(__file__).resolve().parents[3] / "relax/agentic/pipeline/runtime.py"
-    tree = ast.parse(path.read_text())
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RuntimeDomain")
-    names = {
-        "_apply_shard_progress",
-        "_wait_for_no_protected_groups",
-        "_drop_group_and_release",
-        "_release_shard_group",
-    }
-    cls.body = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
-    cls.bases, cls.decorator_list = [], []
-    scope = {"asyncio": asyncio, "cast": lambda typ, value: value}
-    exec("from __future__ import annotations\n" + ast.unparse(cls), scope)
+    from relax.agentic.pipeline.runtime import RuntimeDomain
 
     async def scenario():
-        runtime = scope["RuntimeDomain"]()
+        runtime = object.__new__(RuntimeDomain)
+        runtime._cleanup_tasks = set()
         runtime._state_changed = asyncio.Event()
         runtime._resident_group_permits = asyncio.Semaphore(0)
         runtime._start_shard_observers = lambda: None
@@ -571,10 +572,15 @@ def test_dropping_protected_group_progress_and_release_wake_cleanup():
 
         async def remote_drop(*args, **kw):
             progress = NS(
-                group_id="g", ready_for_lease=True, interrupted=False, protected=False, takeable_session_ids=()
+                group_id="g",
+                ready_for_lease=True,
+                all_first_ir_arrived=True,
+                interrupted=False,
+                protected=False,
+                takeable_session_ids=(),
             )
             runtime._apply_shard_progress(shard, NS(revision=1, groups=[progress]))
-            assert not stream.first_request_barrier.done()
+            assert stream.first_request_barrier.result() is False
             await asyncio.sleep(0)
             runtime._apply_shard_progress(shard, NS(revision=2, groups=[]))
             await asyncio.sleep(0)
@@ -584,6 +590,7 @@ def test_dropping_protected_group_progress_and_release_wake_cleanup():
         await asyncio.sleep(0)
         await runtime._drop_group_and_release(stream)
         await asyncio.wait_for(waiter, 0.2)
+        await asyncio.gather(*tuple(runtime._cleanup_tasks))
         assert not shard.group_streams and runtime._state_changed.is_set()
         observer.cancel()
         await asyncio.gather(observer, return_exceptions=True)
@@ -666,7 +673,7 @@ def test_six_streams_keep_prompt_session_export_and_update_links(args, mpu):
         == rows["train"][0]["samples"][0]["sample_export_id"]
         == str(export_id)
     )
-    assert rows["train"][0]["samples"][0]["loss_mask"] == [1, 0]
+    assert rows["train"][0]["samples"][0]["loss_mask"] == {"ranges": [[0, 1, 1]]}
     (update,) = merge_train_updates(rows["stages"], rows["train"])
     assert update["status"] == "committed" and update["input_complete"] and update["group_ids"] == ["g"]
     assert update["started_at"] <= update["occurred_at"]

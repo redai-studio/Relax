@@ -390,6 +390,24 @@ def test_owned_compaction_matches_the_old_snapshot(shared_rollout_tokens: bool) 
     _assert_same(artifact.to_sample().to_dict(), before, "round-trip")
 
 
+def test_custom_export_decoder_does_not_load_transformers(monkeypatch) -> None:
+    import builtins
+    import sys
+
+    from relax.agentic.session.state import _decode_tokens
+
+    import_module = builtins.__import__
+
+    def reject_transformers(name, *args, **kwargs):
+        assert not name.startswith("transformers"), name
+        return import_module(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.delitem(sys.modules, "transformers.tokenization_utils_tokenizers", raising=False)
+        patch.setattr(builtins, "__import__", reject_transformers)
+        assert _decode_tokens(tokenizer=_CharTokenizer(), token_ids=_chars("abc")) == "abc"
+
+
 @pytest.mark.parametrize("mode", ["default", "parallel", "serial", "cleanup", "custom"])
 def test_export_decoding_preserves_tokenizer_semantics(monkeypatch, mode) -> None:
     from tokenizers import Tokenizer, models
@@ -469,7 +487,7 @@ async def test_export_runs_off_the_event_loop_and_freezes_the_forest(shard, tmp_
     assert (await shard.debug_state())["pending_export_count"] == 0
 
 
-async def test_drop_discards_a_queued_export_and_waits_for_a_running_one(shard) -> None:
+async def test_drop_cancels_queued_export_without_waiting_for_running_worker(shard) -> None:
     _gate_exports(shard)
     await _run_group(shard, "g", ["s0", "s1"], turns=1)
     group = shard._groups["g"]
@@ -479,12 +497,12 @@ async def test_drop_discards_a_queued_export_and_waits_for_a_running_one(shard) 
     await _until(lambda: shard._session_records["s1"].export_task is not None)
     queued = shard._session_records["s1"].export_task
 
-    drop = asyncio.ensure_future(shard.drop_group("g"))
-    await _until(lambda: queued.cancelled() and all(cell.dropped for cell in group.result_cells.values()))
-    assert not drop.done(), "drop must wait for the export the worker is running"
+    await asyncio.wait_for(shard.drop_group("g"), timeout=2.0)
+    await _until(queued.cancelled)
+    assert not shard.test_release.is_set()
     assert (await shard.debug_state())["pending_export_count"] == 1
     shard.test_release.set()
-    await asyncio.wait_for(drop, timeout=5.0)
+    await _until(lambda: not shard._inflight_exports)
 
     assert shard.test_started == ["s0"]
     assert (await shard.debug_state())["pending_export_count"] == 0
@@ -545,6 +563,26 @@ async def test_shutdown_drains_running_exports(shard, tmp_path, retired: bool) -
         assert isinstance(payload, RuntimeGroupError) and "permit release failed" in str(payload)
         assert session.observation.export_ids == []
         assert not (tmp_path / "run_unknown/trajectories/shard_00.jsonl").exists()
+
+
+async def test_shutdown_honors_main_cleanup_grace_with_running_export(shard, monkeypatch) -> None:
+    monkeypatch.setattr(service, "_SHUTDOWN_CLEANUP_GRACE_S", 0.01)
+    _gate_exports(shard)
+    await _run_group(shard, "g", ["s0"], turns=1)
+    cell = shard._groups["g"].result_cells["s0"]
+    _finish(shard, "s0")
+    await _until_exporting(shard, ["s0"])
+
+    try:
+        await asyncio.wait_for(shard.shutdown(), timeout=1.0)
+        assert cell.dropped and not shard._session_records
+        assert (await shard.debug_state())["pending_export_count"] == 1
+        with pytest.raises(RuntimeError):
+            shard._export_executor.submit(lambda: None)
+    finally:
+        shard.test_release.set()
+        await _until(lambda: not shard._inflight_exports)
+    assert cell.dropped
 
 
 @pytest.mark.parametrize(

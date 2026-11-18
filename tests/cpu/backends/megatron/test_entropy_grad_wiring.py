@@ -114,6 +114,56 @@ def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.M
     torch.testing.assert_close(weight.grad, reference_weight.grad, atol=1e-6, rtol=1e-6)
 
 
+def test_sft_chunked_allgather_cp_padding_rank_keeps_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: 3)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: object())
+    monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(loss_module.dist.nn, "all_reduce", lambda value, group: value)
+
+    # Five real tokens padded to eight leave contiguous CP rank 3 with only padding.
+    hidden = torch.ones(1, 2, 3, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.ones(5, 3, dtype=torch.bfloat16, requires_grad=True)
+    tokens = torch.tensor([2, 4, 1, 3, 2], dtype=torch.long)
+    args = Namespace(
+        allgather_cp=True,
+        entropy_coef=0.0,
+        loss_type="sft",
+        opd_log_prob_top_k=0,
+        qkv_format="thd",
+        rollout_temperature=1.0,
+        sft_chunked_logits=True,
+        sft_logits_chunk_size=2,
+        recompute_loss_function=True,
+    )
+
+    def lm_head_forward(hidden_sub: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return torch.nn.functional.linear(hidden_sub, weight), None
+
+    def get_log_probs() -> torch.Tensor:
+        _, result = loss_module.get_log_probs_and_entropy(
+            hidden,
+            args=args,
+            unconcat_tokens=[tokens],
+            total_lengths=[5],
+            response_lengths=[5],
+            lm_head_forward=lm_head_forward,
+        )
+        return result["log_probs"][0]
+
+    log_probs = get_log_probs()
+    assert log_probs.shape == (1,)
+    assert log_probs.dtype == torch.float32
+    assert log_probs.requires_grad
+    torch.testing.assert_close(log_probs, torch.zeros_like(log_probs))
+    log_probs.sum().backward()
+    assert hidden.grad is not None
+    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
+
+    with torch.no_grad():
+        assert not get_log_probs().requires_grad
+
+
 @pytest.mark.parametrize("entropy_grad", [False, True])
 def test_empty_response_keeps_logit_graph_and_entropy_grad_policy(entropy_grad):
     from relax.utils.training.ppo_utils import calculate_log_probs_and_entropy

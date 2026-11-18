@@ -19,6 +19,7 @@ relax/                   核心框架
 └── utils/               基础设施 — 工具函数、指标监控、多模态处理
 tests/                   模块测试与集成回归测试
 ├── cpu/                 无 GPU 环境执行的测试，内部保留模块层级
+├── gpux4/               需要 2-4 张 GPU 的测试
 ├── backends/megatron/   Megatron 后端测试（权重转换等）
 ├── backends/sglang/     SGLang 后端测试
 ├── components/          RL 服务组件测试
@@ -94,11 +95,20 @@ CRITICAL: 以下规则不可违反。
 - 禁止通配导入、硬编码密钥/路径/端点
 - 禁止跳过 pre-commit hooks
 - 禁止猜测集群配置或重建 CUDA/驱动栈
-- 调试时直接修改 `scripts/training/` 下的训练脚本来调整参数，再通过 `scripts/entrypoint/ray-job.sh` 提交
+- 调试时直接修改 `scripts/training/` 下的训练脚本来调整参数，启动入口遵循下方 Configuration & Launching 规则
 - 禁止做与目标无关的代码改动，如 code format 等
 - 集成测试需要多节点 GPU 硬件——必须显式说明跳过原因
 - 修改前先读相关文件；提交前跑 `pre-commit run --all-files`
 - 遵循最小变更原则：只碰需求直接涉及的文件和行
+
+## Docker Patch Management
+
+- 尽量不新建 `.patch` 文件。修改前先检查目标依赖的版本、现有 patch 和 Dockerfile 的应用顺序；同一依赖、同一版本的修复优先合入已有 patch，避免按功能不断叠加增量 patch。
+- Megatron 和 SGLang 的相关修复统一收敛到对应版本的主 patch。沿用 `docker/patch/latest/` 的现有软链接并修改其实际目标文件，不另建 CUDA 专用目录或重复副本。升级依赖版本或确实无法共用时才新增 patch，并说明不能合并的原因。
+- 保留历史版本的 Megatron、SGLang patch。区分历史版本 patch 与已合入当前主 patch 的增量文件；仅在确认内容完整迁移、所有引用已更新后，删除被替代的增量文件。
+- 其他依赖也优先按依赖和版本合并 patch；不能为了减少文件数而混合不同依赖或不兼容版本。确有运行配置差异时，优先沿用主 patch 内的分段应用机制，保持各配置原有的生效范围和顺序。
+- patch 代码保留在 `.patch` 文件中，不搬入 Dockerfile 的内联脚本或字符串替换。Dockerfile 尽量小改，只调整必要的复制、应用和构建步骤；现有镜像能力应保留在输出镜像内，不能改为要求用户在容器启动后手动补丁。
+- 合并时列明旧文件内容的新位置，检查 Dockerfile、脚本、测试、文档和校验清单中的引用。对固定版本源码验证 patch 能按实际构建顺序干净应用，并核对各受影响配置合并前后的源码结果；不能仅凭 patch 文本拼接成功判断无冲突。未完成的镜像构建或 GPU 验证须明确说明。
 
 ## Ask First
 
@@ -129,15 +139,26 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 
 ## Test Scope & Placement
 
-新增测试前先评估必要性，不要求每个函数、类或实现改动都配套新增单测。
+验证改动不等于新增永久测试。先搜索并运行已有相关测试；已有覆盖足够时，可以不新增测试，并简述依据。
 
-- 先检查现有覆盖，并在变更说明中简述新增测试要防止的真实失败、覆盖缺口和 CI 成本；没有明确增量价值时不新增。
-- 优先覆盖用户可见行为、真实缺陷回归、数值与梯度正确性，以及分布式通信、状态恢复和资源清理等高风险路径。
-- 纯搬迁、重命名、文案或无行为变化的重构，优先复用现有回归与静态检查；避免重复实现逻辑、只断言 mock 调用或源码文本的测试。
-- 优先扩展已有用例，以最小场景集覆盖不同失败机制；避免重复覆盖和无必要的参数组合。新增慢测试或多进程测试时，说明为什么现有轻量测试不足，并限制进程数和超时。
+新增永久测试必须：
+
+- 指向一个具体的行为契约或真实故障风险；
+- 执行实际项目实现，而非在测试中重写被测逻辑；mock 用于隔离外部边界，不替换被测行为本身；
+- 说明已有测试为何不能覆盖，以及新增测试的 CI 成本；
+- 检查可观察结果，避免锁定源码文本、私有命名或无关调用顺序。
+
+修复 bug 时，优先扩展已有测试，验证修复前失败、修复后通过。探索实验、原理演示、文档措辞检查不默认进入长期测试集。
+
+无法在当前硬件验证的行为，应明确留下验证缺口，不得用源码字符串检查冒充运行验证，也不得用 AST 检查替代运行行为验证。
+
+禁止把脚本修改翻译成字符串断言，例如 `assert "NEW_ENV=value" in script.read_text()`；环境变量、参数在脚本文本中出现，不代表它们在运行时正确生效。纯搬迁、重命名、文案或无行为变化的重构，优先复用现有回归与静态检查。
+
+按不同故障模式选择用例，不机械穷举参数组合。优先覆盖用户可见行为、真实缺陷回归、数值与梯度正确性，以及分布式通信、状态恢复和资源清理等高风险路径。新增慢测试或多进程测试时，说明为什么现有轻量测试不足，并限制进程数和超时。
+
 - 测试按实际运行需求归类：纯 CPU 测试放入 `tests/cpu/<module>/`，需要真实 GPU 的测试保留在对应的 `tests/<module>/`。CPU/GPU 混合文件应拆开，不在 workflow 维护文件清单或逐用例排除。
 - CPU 分类必须检查间接调用和 fixture 的设备依赖，包括 CUDA tensor 搬运、设备探测和可见设备环境变量；不能仅凭测试名称或使用 mock 判断，也不能为迁入 CPU 而新增 skip/mock 掩盖真实 GPU 依赖。
-- CPU 套件须支持隐藏 GPU 后执行 `pytest tests/cpu`；GPU 套件由 `pytest tests/ --ignore=tests/cpu` 执行。依赖不全导致的 skip 不算回归通过，应明确验证限制。
+- CPU 套件须支持隐藏 GPU 后执行 `pytest tests/cpu`。单卡 CI 运行 `pytest tests/ --ignore=tests/cpu --ignore=tests/gpux4`，多卡 CI 运行 `pytest tests/gpux4`。依赖不全导致的 skip 不算回归通过，应明确验证限制。
 
 ## Distributed Code Rules
 
@@ -152,23 +173,32 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 
 训练入口为 `python relax/entrypoints/train.py [args]`，通过 `relax/utils/arguments.py` 的命令行参数配置（扩展 Megatron-LM 解析器）。
 
+单机启动训练时先检查本地 Ray 是否运行，未运行则直接 `bash <训练脚本路径>`（多数脚本会自动 source `scripts/entrypoint/local.sh`，缺少该逻辑时先 source 此入口），不要仅凭 `HOST_IP` / `MASTER_ADDR` 环境变量推断已有远程集群或要求用户提供 Ray 地址，只有明确使用已有集群时才走 `ray-job.sh`。
+
 ## Domain experts & skills
+
+### Codex 架构专家入口
+
+执行框架架构评审、职责划分或分层重构任务时，先完整读取当前工作区的
+`.codex/agents/arch-expert.md`，并将其作为本任务的专家工作指引。该文件不取代用户指令或本文件的约束。
+Codex 的子代理名称为 `arch_expert`；Claude/OpenCode 使用文件名对应的 `arch-expert`。
 
 Fire the appropriate **expert subagent** or **load a skill** based on what you're working on. Experts are read-only consultants with deep domain knowledge; skills are step-by-step implementation guides.
 
-| Working on...                                | Fire subagent      | Load skill              |
-| -------------------------------------------- | ------------------ | ----------------------- |
-| Megatron backend (TP/PP/CP/EP)               | `megatron-expert`  |                         |
-| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)      | `algorithm-expert` |                         |
-| Task Launch & service deployment             | `launcher-expert`  |                         |
-| Ray framework (Core, Serve, Jobs, placement) | `ray-expert`       |                         |
-| Development & code changes                   | `ray-expert`       | `dev`                   |
-| Agentic rollout integration, runtime & hangs | `agentic-expert`   | `agentic-rollout`       |
-| Distributed training hang debugging          | `ray-expert`       | `debug-hang`            |
-| Code review of git changes                   | --                 | `code-review`           |
-| Creating new skills                          | --                 | `creating-skills`       |
-| Git commits                                  | --                 | `git-commit`            |
-| GitHub contribution, PRs & review follow-up  | --                 | `relax-github-workflow` |
-| GitHub required checks & CI operations       | --                 | `relax-github-ci`       |
+| Working on...                                     | Fire subagent                          | Load skill              |
+| ------------------------------------------------- | -------------------------------------- | ----------------------- |
+| Framework architecture, responsibility & layering | `arch-expert`                          | --                      |
+| Megatron backend (TP/PP/CP/EP)                    | `megatron-expert`                      |                         |
+| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)           | `algorithm-expert`                     |                         |
+| Task Launch & service deployment                  | `launcher-expert`                      |                         |
+| Ray framework (Core, Serve, Jobs, placement)      | `ray-expert`                           |                         |
+| Development & code changes                        | `ray-expert`                           | `dev`                   |
+| Agentic rollout integration, runtime & hangs      | `agentic-expert`                       | `agentic-rollout`       |
+| Distributed training hang debugging               | `ray-expert`                           | `debug-hang`            |
+| Code review of git changes                        | `arch-expert` for architecture changes | `code-review`           |
+| Creating new skills                               | --                                     | `creating-skills`       |
+| Git commits                                       | --                                     | `git-commit`            |
+| GitHub contribution, PRs & review follow-up       | --                                     | `relax-github-workflow` |
+| GitHub required checks & CI operations            | --                                     | `relax-github-ci`       |
 
 **How to fire an expert**: task(subagent_type="megatron-expert", load_skills=\[\], run_in_background=true, prompt="...")

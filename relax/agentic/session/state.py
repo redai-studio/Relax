@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import math
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -382,6 +383,9 @@ def _decode_tokens(
     if not token_ids:
         return ""
     decode = tokenizer.decode
+    # A TokenizersBackend instance cannot exist before its module is loaded.
+    if "transformers.tokenization_utils_tokenizers" not in sys.modules:
+        return decode(token_ids, skip_special_tokens=False)
     try:
         from tokenizers import Tokenizer
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -439,6 +443,7 @@ class MsgNode:
     logprob_delta: list[float] = field(default_factory=list)
     topk_token_ids_delta: np.ndarray | None = None
     topk_logprob_delta: np.ndarray | None = None
+    topk_support_complete_delta: np.ndarray | None = None
     multimodal_train_inputs_delta: dict[str, Any] | None = None
     backend_image_data_delta: list[str] = field(default_factory=list)
     backend_audio_data_delta: list[str] = field(default_factory=list)
@@ -477,6 +482,7 @@ class InflightRequest:
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_topk_token_ids_delta: list[np.ndarray] = field(default_factory=list)
     pending_topk_logprob_delta: list[np.ndarray] = field(default_factory=list)
+    pending_topk_support_complete_delta: list[np.ndarray] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
@@ -719,6 +725,7 @@ class SessionForest:
         logprob_delta: list[float],
         topk_token_ids_delta: np.ndarray | None = None,
         topk_logprob_delta: np.ndarray | None = None,
+        topk_support_complete_delta: np.ndarray | None = None,
         weight_version_delta: list[str] | None = None,
         spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
@@ -757,6 +764,7 @@ class SessionForest:
                 logprob_delta=logprob_delta,
                 topk_token_ids_delta=topk_token_ids_delta,
                 topk_logprob_delta=topk_logprob_delta,
+                topk_support_complete_delta=topk_support_complete_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
                 spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
@@ -808,6 +816,7 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         topk_token_ids: list[np.ndarray] = []
         topk_log_probs: list[np.ndarray] = []
+        topk_support_complete: list[np.ndarray] = []
         topk_width = next(
             (node.topk_token_ids_delta.shape[1] for node in lineage if node.topk_token_ids_delta is not None), None
         )
@@ -844,6 +853,10 @@ class SessionForest:
                         raise ValueError(f"Score Centering candidates missing from response node {node.state_hash}")
                     topk_token_ids.append(node.topk_token_ids_delta)
                     topk_log_probs.append(node.topk_logprob_delta)
+                    coverage = node.topk_support_complete_delta
+                    topk_support_complete.append(
+                        coverage if coverage is not None else np.zeros(len(node.train_token_delta), dtype=bool)
+                    )
                 weight_versions.extend(node.weight_version_delta)
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
@@ -857,6 +870,7 @@ class SessionForest:
                 shape = (len(node.train_token_delta), topk_width)
                 topk_token_ids.append(np.full(shape, -1, dtype=np.int32))
                 topk_log_probs.append(np.full(shape, -np.inf, dtype=np.float32))
+                topk_support_complete.append(np.zeros(shape[0], dtype=bool))
 
         if first_response_node is None:
             raise ValueError("A sample export leaf must have at least one resp node in its lineage.")
@@ -905,6 +919,7 @@ class SessionForest:
             rollout_log_probs=rollout_log_probs,
             rollout_topk_token_ids=np.concatenate(topk_token_ids) if topk_token_ids else None,
             rollout_topk_log_probs=np.concatenate(topk_log_probs) if topk_log_probs else None,
+            rollout_topk_support_complete=np.concatenate(topk_support_complete) if topk_support_complete else None,
             rollout_routed_experts=copy.deepcopy(leaf.rollout_routed_experts),
             abort_count=leaf.abort_count,
             status=status,

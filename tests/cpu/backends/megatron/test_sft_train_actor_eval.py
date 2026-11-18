@@ -8,6 +8,7 @@ from argparse import Namespace
 import pytest
 
 from relax.engine.sft.runtime import evaluation_step_for_rollout, should_run_sft_eval, should_run_sft_predict
+from relax.utils.training.intervals import should_save_checkpoint
 
 
 def _mk_actor_args():
@@ -101,6 +102,7 @@ def test_sft_lookahead_uses_completed_step_eval_boundaries():
         "evaluation_step_for_rollout": evaluation_step_for_rollout,
         "should_run_sft_eval": should_run_sft_eval,
         "should_run_sft_predict": should_run_sft_predict,
+        "should_save_checkpoint": should_save_checkpoint,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
     for loss_type in ("sft", "dpo", "rm"):

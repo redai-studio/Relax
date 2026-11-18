@@ -48,14 +48,11 @@ def _clear_router_state():
 
 
 def _args() -> Namespace:
-    return Namespace(
-        opd_teacher_routes_map={TEXT_SOURCE: TEXT_REPLICAS, VL_SOURCE: VL_REPLICAS},
-        opd_teacher_key="data_source",
-    )
+    return Namespace(opd_teacher_routes_map={TEXT_SOURCE: TEXT_REPLICAS, VL_SOURCE: VL_REPLICAS})
 
 
 def _sample(data_source: str, group_index: int | None) -> Sample:
-    return Sample(group_index=group_index, metadata={"data_source": data_source})
+    return Sample(group_index=group_index, metadata={"teacher_id": data_source})
 
 
 def _interleaved_picks() -> dict[tuple[str, int], list[str]]:
@@ -101,8 +98,13 @@ def test_on_policy_distillation_routing_falls_back_without_group_index():
     assert urls == [TEXT_REPLICAS[0], TEXT_REPLICAS[1], TEXT_REPLICAS[0], TEXT_REPLICAS[1]]
 
 
+def test_single_teacher_keeps_existing_route():
+    args = Namespace(opd_teacher_routes_map={}, opd_teacher_url="http://single/generate")
+    assert opd._pick_teacher_url(args, Sample()) == args.opd_teacher_url
+
+
 def test_on_policy_distillation_routing_single_replica_is_unconditional():
-    args = Namespace(opd_teacher_routes_map={TEXT_SOURCE: [TEXT_REPLICAS[0]]}, opd_teacher_key="data_source")
+    args = Namespace(opd_teacher_routes_map={TEXT_SOURCE: [TEXT_REPLICAS[0]]})
     urls = {opd._pick_teacher_url(args, _sample(TEXT_SOURCE, g)) for g in range(5)}
     assert urls == {TEXT_REPLICAS[0]}
 
@@ -116,13 +118,24 @@ def test_on_policy_distillation_routing_survives_group_map_eviction():
     assert len(set(urls)) == 1
 
 
+def test_on_policy_distillation_routing_uses_bound_teacher_id():
+    args = _args()
+    sample = _sample(VL_SOURCE, 0)
+    sample.metadata["data_source"] = TEXT_SOURCE
+    assert opd._pick_teacher_url(args, sample) in VL_REPLICAS
+
+
 def test_on_policy_distillation_routing_missing_routing_key_raises():
     args = _args()
-    with pytest.raises(ValueError, match="missing key 'data_source'"):
-        opd._pick_teacher_url(args, Sample(group_index=0, metadata={}))
+    with pytest.raises(KeyError, match="teacher_id"):
+        opd._pick_teacher_url(args, Sample(group_index=0, metadata={"data_source": TEXT_SOURCE}))
 
 
-def test_on_policy_distillation_routing_unknown_data_source_raises():
-    args = _args()
-    with pytest.raises(KeyError, match="no teacher route"):
-        opd._pick_teacher_url(args, _sample("not-a-source", 0))
+@pytest.mark.parametrize("source", ["unknown", "no-replicas"])
+def test_bind_teacher_requires_an_available_route(source):
+    args = Namespace(
+        opd_teacher_key="data_source", opd_teacher_routes_map={TEXT_SOURCE: TEXT_REPLICAS, "no-replicas": []}
+    )
+    sample = Sample(metadata={"data_source": source})
+    with pytest.raises(KeyError, match=source):
+        opd.bind_teacher(args, sample)

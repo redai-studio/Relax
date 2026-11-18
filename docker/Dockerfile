@@ -200,20 +200,12 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir --force-reinstall --no-deps \
     "fla-core==0.5.2" "flash-linear-attention==0.5.2"
 
-# Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
-COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch
-RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
-    patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
-
-# Install all convolution entries; each training process selects its mode at import.
+# Keep KDA precision, Qwen output configuration and all convolution entries together.
 ENV RELAX_FLA_CONV_NB_MODE=auto
-COPY docker/patch/fla/0.5.2-qwen38-output-config.patch /tmp/fla-output-config.patch
-COPY docker/patch/fla/0.5.2-conv-static-entries.patch /tmp/fla-conv-entries.patch
+COPY docker/patch/fla/0.5.2.patch /tmp/fla.patch
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-output-config.patch && \
-    patch --batch --forward --fuzz=0 -p1 < /tmp/fla-conv-entries.patch && \
-    python -m compileall -q fla/modules/conv/triton && \
-    rm /tmp/fla-output-config.patch /tmp/fla-conv-entries.patch
+    patch --batch --forward --fuzz=0 -p1 < /tmp/fla.patch && \
+    python -m compileall -q fla/modules/conv/triton && rm /tmp/fla.patch
 
 # Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
 COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
@@ -225,43 +217,21 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
     rm -rf /tmp/router-wheels
 
 
-COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
-COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
-COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
-COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
-COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
-COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
-RUN cd Megatron-LM && \
-    patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
-    if grep -R -n '^<<<<<<< ' .; then \
-    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-    exit 1; \
-    fi && \
-    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
-    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
-    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
-    sha256sum 20261016-qwen38-models.patch 20261020-qwen35-optimized.patch > /etc/relax-qwen-model-patches.sha256 && \
+# The complete CUDA patch retains its provenance in the final image.
+COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/megatron.patch
+RUN cd /root/Megatron-LM && \
+    sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply --check - && \
+    sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply - && \
+    sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     python -m compileall -q megatron && \
-    rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch mtp-cp-normalization.patch 20261020-qwen35-optimized.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
-COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
-    cd /sgl-workspace/sglang && git add . && \
-    git update-index --refresh && \
-    git apply sglang.patch --3way && \
-    if grep -R -n '^<<<<<<< ' .; then \
-    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-    exit 1; \
-    fi && \
-    git apply --check sglang_per_pos_topk.patch && \
-    git apply sglang_per_pos_topk.patch && \
-    rm sglang.patch sglang_per_pos_topk.patch; \
+    cd /sgl-workspace/sglang && \
+    sed -n '/^# BEGIN relax$/,/^# END relax$/p' sglang.patch | git apply --check - && \
+    sed -n '/^# BEGIN relax$/,/^# END relax$/p' sglang.patch | git apply -; \
 fi
 
 # Shared MCore model sources are installed above, but this CUDA 12 image retains
@@ -287,12 +257,28 @@ COPY docker/patch/transformer_engine/2.14.1-cu12-wheel-tag.patch /opt/relax/te-w
 COPY docker/patch/cudnn/1.27.0-dsa-sm90-signature-cache.patch /tmp/cudnn-dsa-sm90-signature-cache.patch
 # Resolve late so existing compiled layers remain cached. NIXL packages both
 # backends, but dispatches to cu12 based on Torch; this does not change CUDA.
+# Pin Qwen3.8 HF support without replacing the CUDA/Torch/TE/DeepEP stack.
 RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d.metadata["Name"], d.version) for d in m.distributions() if d.metadata["Name"].lower().replace("_", "-") in ("torch", "torchvision", "torchaudio", "triton", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch") or d.metadata["Name"].lower().startswith("nvidia-")))' > /tmp/cu12-abi-constraints.txt && \
     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt -r /opt/relax/cu12-runtime-requirements.txt && \
     python /opt/relax/repair_te_wheel_metadata.py /opt/relax/te-wheel-tag.patch && \
     pip install --no-deps "nvidia-nvshmem-cu12==3.4.5" "pynvml==13.0.1" && \
     pip install --force-reinstall --no-deps /tmp/ep-wheels/*.whl && \
     rm -r /tmp/ep-wheels && \
+    cd /sgl-workspace/sglang && \
+    sed -n '/^# BEGIN transformers5$/,/^# END transformers5$/p' sglang.patch | git apply --check - && \
+    sed -n '/^# BEGIN transformers5$/,/^# END transformers5$/p' sglang.patch | git apply - && cd /root && \
+    pip install --no-cache-dir setuptools-scm==9.2.2 && \
+    SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
+        pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
+    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
+    pip uninstall -y nvidia-cuda-nvcc && \
+    sha256sum /sgl-workspace/sglang/sglang.patch > /etc/relax-sglang-patch.sha256 && \
+    python -c 'from importlib.metadata import version; \
+        assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
+        assert version("sglang") == "0.5.17"; \
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
+        assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
+        import sglang.srt.configs.qwen3_asr' && \
     python /opt/relax/validate_hybridep_install.py && \
     CUDNN_SITE="$(python -c 'import importlib.metadata as m; \
         assert m.version("nvidia-cudnn-frontend") == "1.27.0", "DSA SM90 patch requires cuDNN Frontend 1.27.0"; \

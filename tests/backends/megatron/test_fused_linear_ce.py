@@ -10,8 +10,8 @@ import torch.nn.functional as F
 
 
 gpu = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Fused linear CE requires the Blackwell CuTe runtime",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="Fused linear CE requires a Hopper or Blackwell CuTe runtime",
 )
 
 

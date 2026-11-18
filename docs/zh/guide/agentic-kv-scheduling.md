@@ -19,6 +19,9 @@ Relax 从 session 生命周期的两端分别处理这个问题：
 这两个特性优化的是*调度*开销，不是模型质量。当 rollout 是 KV-bound 时才需要开启——engine `token_usage` 高、频繁 eviction、GPU 没打满但 request 在排队。
 :::
 
+Group 并发限制驻留 agent 任务，已 lease 的 Session 在自身请求就绪后独立生成。进程和容器的物理配额由外部
+executor 约束，参见[组并发](./agentic-rollout.md#组并发与-session-独立生成)。
+
 ## Session KV Lifecycle
 
 ### 做了什么

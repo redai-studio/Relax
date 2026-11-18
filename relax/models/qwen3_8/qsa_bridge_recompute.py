@@ -53,7 +53,7 @@ def qsa_bridge_checkpointed_forward(
         for index in range(start, end):
             ple = getattr(self._get_layer(index), "per_layer_embedding", None)
             if ple is not None:
-                ple_states[index] = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
+                ple_states[index] = ple.capture_checkpoint_state()
 
         def custom_forward(
             hidden_states,
@@ -70,8 +70,8 @@ def qsa_bridge_checkpointed_forward(
                 layer = self._get_layer(index)
                 ple = getattr(layer, "per_layer_embedding", None)
                 if ple is not None:
-                    previous_ple_state = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
-                    ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = ple_states[index]
+                    previous_ple_state = ple.capture_checkpoint_state()
+                    ple.restore_checkpoint_state(ple_states[index])
                 inner_fp8_context = (
                     get_fp8_context(self.config, layer.layer_number - 1) if use_inner_fp8_context else nullcontext()
                 )
@@ -99,7 +99,7 @@ def qsa_bridge_checkpointed_forward(
                                 )
                 finally:
                     if ple is not None:
-                        ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = previous_ple_state
+                        ple.restore_checkpoint_state(previous_ple_state)
             return hidden_states, context
 
         return custom_forward
@@ -146,8 +146,10 @@ def qsa_bridge_checkpointed_forward(
         while layer_idx < self.num_layers_per_pipeline_rank:
             chunk_end = min(layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank)
             forward_func = custom(layer_idx, chunk_end)
-            if chunk_end == layer_idx + 1 and getattr(
-                self._get_layer(layer_idx), "_relax_qsa_attention_retained", False
+            layer = self._get_layer(layer_idx)
+            if chunk_end == layer_idx + 1 and (
+                getattr(layer, "_relax_qsa_attention_retained", False)
+                or getattr(layer, "_relax_qsa_full_layer_retained", False)
             ):
                 hidden_states, context = forward_func(
                     hidden_states,

@@ -62,6 +62,7 @@ def _manager(**overrides) -> OpdManager:
         opd_kl_coef=1.0,
         opd_loss_coef=0.0,
         opd_teacher_url="http://teacher/generate",
+        opd_teacher_routes_map=None,
         sglang_router_ip="student",
         sglang_router_port=80,
     )
@@ -356,6 +357,10 @@ def native_generate(monkeypatch):
         sglang_router_port=1,
         use_slime_router=False,
         use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
         sglang_router_policy="round_robin",
         sglang_speculative_algorithm=None,
     )

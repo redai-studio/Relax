@@ -17,7 +17,7 @@ from einops import repeat
 from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import DynamicCache
 
-from .processing import build_abs_positions_from_grid_hw
+from .processing import PATCH_SIZE, build_abs_positions_from_grid_hw, patchify, unpatchify
 
 
 def attention_forward(
@@ -30,9 +30,23 @@ def attention_forward(
     out_pattern: str = "b s n d",
     attn_mask: torch.Tensor | None = None,
     scale: float | None = None,
+    *,
+    reference_prefix: bool = False,
 ) -> torch.Tensor:
     if (q_pattern, k_pattern, v_pattern, out_pattern) != ("b n s d", "b n s d", "b n s d", "b s n d"):
         raise ValueError("Unsupported SenseNova attention layout")
+    if reference_prefix and attn_mask is not None:
+        # Match the business FF prefix: compute-dtype logits, FP32 mask
+        # addition/softmax, then compute-dtype probabilities and output.
+        # Generation without a mask retains the existing FlashAttention path.
+        if k.shape[1] != v.shape[1] or q.shape[1] % k.shape[1]:
+            raise ValueError("Invalid SenseNova prefix GQA head counts")
+        k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+        v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
+        weights = torch.matmul(q, k.transpose(2, 3)) * (q.shape[-1] ** -0.5 if scale is None else scale)
+        weights = weights + attn_mask[:, :, :, : k.shape[-2]].float()
+        weights = torch.softmax(weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        return torch.matmul(weights, v).transpose(1, 2).contiguous()
     if attn_mask is not None or os.environ.get("RELAX_ATTENTION_IMPLEMENTATION") == "torch":
         # Match the audited Torch2.11 reference: its signature probe cannot
         # introspect the builtin SDPA, so GQA uses explicit K/V repetition.
@@ -108,12 +122,27 @@ class SenseNovaU1RotaryEmbedding(nn.Module):
         self.original_max_seq_len = max_position_embeddings
         self.attention_scaling = 1.0
         self.inv_freq = None
+        self._rl_precision = False
 
     @staticmethod
     def _compute_inv_freq(base: Any, dim: Any, device: Any = None) -> Any:
         return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
 
+    def configure_rl_precision(self, dtype: torch.dtype) -> None:
+        """Opt into reference RL buffer rounding without changing SFT
+        defaults."""
+        if self._rl_precision:
+            return
+        # Reference constructs on CPU before model.to(compute_dtype).
+        inv_freq = self._compute_inv_freq(self.rope_theta, self.rope_head_dim * 2, "cpu")[::2].to(dtype)
+        del self.inv_freq
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._rl_precision = True
+
     def _ensure_inv_freq(self, device: Any) -> Any:
+        if self._rl_precision:
+            self.inv_freq = self.inv_freq.to(device)
+            return
         if self.inv_freq is not None and self.inv_freq.device == device:
             return
         inv_freq_full = self._compute_inv_freq(self.rope_theta, self.rope_head_dim * 2, device)
@@ -172,6 +201,7 @@ class SenseNovaU1Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = attention_dropout
         self.is_causal = True
+        self.reference_prefix = False
 
         self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
         self.q_proj_mot_gen = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
@@ -275,8 +305,11 @@ class SenseNovaU1Attention(nn.Module):
             out_pattern="b s n d",
             attn_mask=None
             if attention_mask is None
-            else attention_mask[:, :, :, : key_states.shape[-2]].to(query_states.dtype),
+            else attention_mask[:, :, :, : key_states.shape[-2]].to(
+                torch.float32 if self.reference_prefix else query_states.dtype
+            ),
             scale=self.scaling,
+            reference_prefix=self.reference_prefix,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         output = self.o_proj(attn_output)
@@ -314,8 +347,11 @@ class SenseNovaU1Attention(nn.Module):
             out_pattern="b s n d",
             attn_mask=None
             if attention_mask is None
-            else attention_mask[:, :, :, : key_states.shape[-2]].to(query_states.dtype),
+            else attention_mask[:, :, :, : key_states.shape[-2]].to(
+                torch.float32 if self.reference_prefix else query_states.dtype
+            ),
             scale=self.scaling,
+            reference_prefix=self.reference_prefix,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         output = self.o_proj_mot_gen(attn_output)
@@ -919,11 +955,44 @@ class SenseNovaU1DiT(nn.Module):
     def extract_gen_feature(self, pixel_values: Any, grid_hw: Any) -> Any:
         return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw)
 
+    def configure_rl_precision(self, dtype: torch.dtype) -> None:
+        """Select reference prefix math only for the RL replay adapter."""
+        self._rl_precision = True
+        for module in self.modules():
+            if isinstance(module, SenseNovaU1RotaryEmbedding):
+                module.configure_rl_precision(dtype)
+            elif isinstance(module, SenseNovaU1Attention):
+                module.reference_prefix = True
+
     def embed_timestep(self, timestep: Any, noise_scale: Any, num_tokens: Any, batch_size: Any = 1) -> Any:
-        t_expanded = timestep.expand(batch_size * num_tokens)
+        timestep = torch.as_tensor(timestep, device=self.fm_modules["timestep_embedder"].mlp[0].weight.device)
+        timestep = timestep.reshape(-1)
+        if timestep.numel() == 1:
+            timestep = timestep.expand(batch_size)
+        if timestep.numel() != batch_size:
+            raise ValueError(
+                f"SenseNova timestep must be scalar or shape [B={batch_size}], got {tuple(timestep.shape)}."
+            )
+        t_expanded = timestep[:, None].expand(batch_size, num_tokens).reshape(-1)
         embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(batch_size, num_tokens, -1)
         if self.add_noise_scale_embedding:
-            noise_scale_tensor = torch.full_like(t_expanded, noise_scale / self.noise_scale_max_value)
+            if not getattr(self, "_rl_precision", False):
+                # SFT divides its Python scalar before the compute-dtype cast.
+                noise_scale_tensor = torch.full_like(t_expanded, noise_scale / self.noise_scale_max_value)
+            else:
+                noise_scale_tensor = torch.as_tensor(
+                    noise_scale, device=t_expanded.device, dtype=t_expanded.dtype
+                ).reshape(-1)
+                if noise_scale_tensor.numel() == 1:
+                    noise_scale_tensor = noise_scale_tensor.expand(batch_size)
+                if noise_scale_tensor.numel() != batch_size:
+                    raise ValueError(
+                        f"SenseNova noise_scale must be scalar or shape [B={batch_size}], "
+                        f"got {tuple(noise_scale_tensor.shape)}."
+                    )
+                noise_scale_tensor = (
+                    noise_scale_tensor[:, None].expand(batch_size, num_tokens).reshape(-1) / self.noise_scale_max_value
+                )
             noise_embeddings = self.fm_modules["noise_scale_embedder"](noise_scale_tensor)
             embeddings = embeddings + noise_embeddings.view(batch_size, num_tokens, -1)
         return embeddings
@@ -1026,13 +1095,90 @@ class SenseNovaU1DiT(nn.Module):
 
     def forward(
         self,
-        image_embeds: Any,
-        indexes_image: Any,
-        past_key_values: Any,
-        image_size: Any,
+        image_embeds: Any = None,
+        indexes_image: Any = None,
+        past_key_values: Any = None,
+        image_size: Any = None,
         use_gradient_checkpointing: Any = False,
         use_gradient_checkpointing_offload: Any = False,
+        prefix_inputs_embeds: Any = None,
+        prefix_indexes: Any = None,
+        prefix_attention_mask: Any = None,
+        replay_latents: Any = None,
+        replay_timestep: Any = None,
+        replay_noise_scale: Any = None,
+        replay_t_eps: Any = 0.02,
     ) -> Any:
+        # Prefix replay must enter through ``forward`` rather than calling
+        # ``encode_prefix`` directly. FSDP2 installs its root all-gather hooks
+        # on ``__call__/forward``; bypassing them leaves root-owned parameters
+        # (notably the final RMSNorm) as DTensors while activations are local
+        # tensors. Decoder blocks have their own shard hooks, but that does not
+        # cover those root leftovers.
+        if prefix_inputs_embeds is not None:
+            if any(value is not None for value in (image_embeds, indexes_image, image_size, replay_latents)):
+                raise ValueError("SenseNova prefix and denoising inputs are mutually exclusive.")
+            return self.encode_prefix(
+                inputs_embeds=prefix_inputs_embeds,
+                indexes=prefix_indexes,
+                attention_mask=prefix_attention_mask,
+                past_key_values=past_key_values,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+            )
+
+        # Generation feature extraction and timestep embedding are root-owned
+        # modules. Keep them inside ``forward`` so FSDP2's root pre-forward hook
+        # materializes their parameters before convolution/linear operators run.
+        # Calling extract_gen_feature/embed_timestep before ``dit(...)`` mixes
+        # local activations with sharded DTensor parameters.
+        replay_sigma = None
+        if replay_latents is not None:
+            if any(value is not None for value in (image_embeds, image_size)):
+                raise ValueError("SenseNova replay latents and precomputed image embeds are mutually exclusive.")
+            if any(value is None for value in (replay_timestep, indexes_image, past_key_values)):
+                raise ValueError("SenseNova replay requires timestep, image indexes and prefix cache.")
+            # Native denoiser coordinates intentionally use FP32 division;
+            # loss/noising sigma has a separate FP64 conversion contract.
+            replay_sigma = (
+                torch.as_tensor(replay_timestep, device=replay_latents.device, dtype=torch.float32).reshape(-1)
+                / 1000.0
+            )
+            if replay_sigma.numel() == 1:
+                replay_sigma = replay_sigma.expand(replay_latents.shape[0])
+            if replay_sigma.numel() != replay_latents.shape[0]:
+                raise ValueError(
+                    f"SenseNova timestep must be scalar or shape [B={replay_latents.shape[0]}], "
+                    f"got {tuple(replay_sigma.shape)}."
+                )
+
+            grid_hw = torch.tensor(
+                [[replay_latents.shape[2] // self.patch_size, replay_latents.shape[3] // self.patch_size]]
+                * replay_latents.shape[0],
+                device=replay_latents.device,
+            )
+            replay_patches = patchify(replay_latents, PATCH_SIZE)
+            num_tokens = replay_patches.shape[1]
+            image_input = patchify(replay_latents, self.patch_size, channel_first=True)
+            # Keep sampler storage untouched; the CNN copy follows compute.
+            feature_input = image_input.flatten(0, 1).to(
+                self.fm_modules["vision_model_mot_gen"].embeddings.patch_embedding.weight.dtype
+            )
+            image_embeds = self.extract_gen_feature(feature_input, grid_hw).view(
+                replay_latents.shape[0], num_tokens, -1
+            )
+            image_embeds = image_embeds + self.embed_timestep(
+                1.0 - replay_sigma,
+                replay_noise_scale,
+                num_tokens,
+                batch_size=replay_latents.shape[0],
+            )
+            image_size = (replay_latents.shape[3], replay_latents.shape[2])
+
+        if any(value is None for value in (image_embeds, indexes_image, past_key_values, image_size)):
+            raise ValueError(
+                "SenseNova denoising forward requires image embeds, indexes, prefix cache and image size."
+            )
         batch_size, num_tokens = image_embeds.shape[0], image_embeds.shape[1]
         image_gen_indicators = torch.ones((batch_size, num_tokens), dtype=torch.bool, device=image_embeds.device)
 
@@ -1060,4 +1206,22 @@ class SenseNovaU1DiT(nn.Module):
 
         smoothed = smoothed_img_2d.view(batch_size, 3, token_h, merged_patch, token_w, merged_patch)
         smoothed = torch.einsum("b c h p w q -> b h w p q c", smoothed)
-        return smoothed.contiguous().view(batch_size, num_tokens, merged_patch * merged_patch * 3)
+        output = smoothed.contiguous().view(batch_size, num_tokens, merged_patch * merged_patch * 3)
+        if replay_latents is None:
+            return output
+        # Native CUDA autocast rounds patchify/unpatchify's einsum to the
+        # compute dtype, even for a pure permutation. Match both boundaries
+        # explicitly when FSDP disables root autocast; sampler storage stays FP16.
+        residual = output - replay_patches.to(output.dtype)
+        # The native sampler divides the compute-dtype difference by FP32 time.
+        # Casting sigma to BF16 changes behavior scores.
+        denominator = (1.0 - (1.0 - replay_sigma)).reshape(-1, 1, 1, 1)
+        t_eps = torch.as_tensor(replay_t_eps, device=denominator.device, dtype=torch.float32)
+        denominator = torch.maximum(denominator, t_eps.reshape(-1, 1, 1, 1))
+        # FF's scheduler promotes the already-rounded pixel velocity to FP32.
+        return -unpatchify(
+            (residual / denominator.reshape(-1, 1, 1)).to(output.dtype),
+            PATCH_SIZE,
+            replay_latents.shape[2],
+            replay_latents.shape[3],
+        ).float()
