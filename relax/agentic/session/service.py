@@ -54,6 +54,8 @@ from relax.agentic.runner import (
     ManagedAgentLauncher,
     ManagedAgentProcess,
     SessionInput,
+    SessionOutput,
+    SingleTurnTask,
     load_agent_app_spec_from_args,
 )
 from relax.agentic.session.admission import compute_reservation_tokens
@@ -149,7 +151,7 @@ def _resolve_fastapi_request_endpoint(func: Callable[..., Any]) -> Callable[...,
     return func
 
 
-async def _wait_process(process: ManagedAgentProcess) -> Optional[BaseException]:
+async def _wait_process(process: ManagedAgentProcess | SingleTurnTask) -> Optional[BaseException]:
     """Return process failure as data so watcher cancellation stays
     unambiguous."""
 
@@ -1403,7 +1405,7 @@ class _SessionResultCell:
 class SessionResources:
     """Agent process capabilities owned by one Session cleanup task."""
 
-    process: ManagedAgentProcess
+    process: ManagedAgentProcess | SingleTurnTask
     process_wait: asyncio.Task[Optional[BaseException]]
     watcher_task: asyncio.Task[None]
 
@@ -2498,13 +2500,21 @@ class AgenticSessionShard:
             )
 
     def _start_session(self, session: _SessionRecord, session_input: SessionInput) -> None:
-        """Attach a record-owned process to one Session."""
+        """Start the sample's single chat or its external agent."""
 
-        process = self._agent_launcher.start_agent(session_input)
-        if session.observation is not None:
-            log_path = self._trajectory_recorder.session_log_path(session.session_id)
-            if log_path is not None:
-                process.configure_observability(log_path)
+        payload = session_input.input_payload
+        template_kwargs = (payload.get("metadata") or {}).get("agentic_single_turn")
+        if template_kwargs is None:
+            process = self._agent_launcher.start_agent(session_input)
+            if session.observation is not None:
+                log_path = self._trajectory_recorder.session_log_path(session.session_id)
+                if log_path is not None:
+                    process.configure_observability(log_path)
+        else:
+            task = asyncio.create_task(
+                self._single_turn_chat(session.session_id, payload["messages"], template_kwargs)
+            )
+            process = SingleTurnTask(session.session_id, self.args.agent_timeout, task)
         process_wait = asyncio.create_task(
             _wait_process(process),
             name=f"agent-process-wait:{session.session_id}",
@@ -2518,6 +2528,18 @@ class AgenticSessionShard:
             process_wait=process_wait,
             watcher_task=watcher_task,
         )
+
+    async def _single_turn_chat(
+        self, session_id: str, messages: list[dict[str, Any]], template_kwargs: dict[str, Any]
+    ) -> SessionOutput:
+        try:
+            request = _normalized_chat_request({"messages": messages, "chat_template_kwargs": template_kwargs})
+        except AgenticChatRequestError as error:
+            raise AgentExecutionError(error.message) from error
+        result = await self.chat(session_id=session_id, **request)
+        if "error" in result:
+            raise AgentExecutionError(result["error"]["message"])
+        return SessionOutput(metadata={"num_turn": 1, "stop_reason": result["finish_reason"]})
 
     @staticmethod
     def _raise_group_error(group: ResidentGroup) -> None:

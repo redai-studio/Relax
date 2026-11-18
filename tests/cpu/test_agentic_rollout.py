@@ -516,6 +516,73 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert session_spec.input_payload["messages"] == [{"role": "user", "content": "hello"}]
 
 
+@pytest.mark.parametrize("include_input_payload, template_kwargs", [(False, {}), (True, {"enable_thinking": False})])
+async def test_single_turn_uses_session_chat_and_export(
+    monkeypatch: pytest.MonkeyPatch, include_input_payload: bool, template_kwargs: dict[str, bool]
+) -> None:
+    image = "https://example.org/photo.png"
+    prompt = [{"role": "user", "content": [{"type": "image", "image": image}]}]
+    managed, direct = _build_session_specs(
+        [Sample(prompt="managed"), Sample(prompt=prompt, metadata={"agentic_single_turn": template_kwargs})],
+        session_ids=["managed", "direct"],
+        include_input_payload=include_input_payload,
+    )
+    assert bool(managed.input_payload) == include_input_payload
+    messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image}}]}]
+
+    backend = MagicMock(tokenizer=_FakeTokenizer())
+    backend.compiler.apply_chat_template_kwargs = {}
+    backend.compiler.encode_messages = AsyncMock(return_value=runtime_mod.EncodedMessages([80], [80], [image]))
+    backend.generate = AsyncMock(return_value=BackendGenerateResult([97, 98], [-0.1, -0.2], "stop", {}, 0.1))
+    launcher = MagicMock()
+    monkeypatch.setattr(service_mod, "SGLangBackendAdapter", lambda args: backend)
+    monkeypatch.setattr(service_mod, "ManagedAgentLauncher", lambda *args: launcher)
+    monkeypatch.setattr(service_mod, "resolve_chat_api_base_url", lambda: "")
+    args = _runtime_args(
+        agent_cwd=".",
+        agent_timeout=30,
+        sglang_enable_deterministic_inference=False,
+        agentic_program_admission=False,
+        agentic_admission_scope="all",
+        agentic_session_lifecycle=False,
+        agentic_reasoning_parser=None,
+        agentic_tool_call_parser=None,
+        use_rollout_routing_replay=False,
+    )
+    limiter = SimpleNamespace(
+        acquire_request_permit=remote(AsyncMock(return_value=True)), release_request_permit=remote(AsyncMock())
+    )
+    shard = AgenticSessionShard.__ray_metadata__.modified_class(args, limiter)
+
+    async def external_agent() -> None:
+        request = _normalized_chat_request({"messages": messages, "chat_template_kwargs": template_kwargs})
+        await shard.chat(session_id="managed", **request)
+
+    process = AsyncMock(output=service_mod.SessionOutput())
+    process.wait.side_effect = external_agent
+    launcher.start_agent.return_value = process
+    await shard.start_group("train", "group", (managed, direct))
+    await _wait_until(lambda: shard._groups["group"].first_request_barrier_crossed)
+    backend.generate.assert_not_awaited()
+    await shard.lease_group("group", 130)
+    await shard.resume_generation(130)
+    await _wait_until(lambda: shard._groups["group"].terminal)
+
+    launcher.start_agent.assert_called_once()
+    assert launcher.start_agent.call_args.args[0].session_id == "managed"
+    for call in backend.compiler.encode_messages.await_args_list:
+        assert call.args[0] == messages
+        assert call.kwargs["chat_template_kwargs"] == template_kwargs
+        assert call.kwargs["multimodal_inputs"] == {"images": [image]}
+    results = await shard.take_session_results("group", ("managed", "direct"))
+    for result in results:
+        (export,) = result.exports
+        sample = export["sample_payload"]
+        np.testing.assert_array_equal(sample["tokens"], [80, 97, 98])
+        np.testing.assert_array_equal(sample["loss_mask"], [1, 1])
+        np.testing.assert_allclose(sample["rollout_log_probs"], [-0.1, -0.2])
+
+
 def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> None:
     forest, initial_obs = _forest_with_initial_obs(
         session_id="sc-branches",

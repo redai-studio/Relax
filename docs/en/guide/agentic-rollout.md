@@ -1,6 +1,6 @@
 # Agentic Rollout
 
-Agentic rollout connects an existing agent app (harness) to Relax training. For each Session, Relax starts and
+Agentic rollout connects an existing agent app (harness) to Relax training. By default, Relax starts and
 supervises an agent process that runs the existing harness. Relax records committed conversations and turns selected
 contexts into training samples.
 
@@ -90,6 +90,13 @@ OpenAI message shape.
 
 `--metadata-key` maps a dataset object to `metadata`. A harness can read the task from metadata and construct the
 messages when it runs.
+
+#### Single-turn samples
+
+Set `metadata.agentic_single_turn` to a dictionary on a sample to send its prompt through one Session chat call.
+The dictionary contains chat template options; use `{}` for the defaults or `{"enable_thinking": false}` to turn off
+thinking for that sample. Text and image prompts use the usual Session export. Samples without this key use the
+configured agent command in the same batch.
 
 #### Multimodal Input
 

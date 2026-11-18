@@ -9,6 +9,7 @@ from relax.agentic.runner.ipc import (
     ManagedCommandAppSpec,
     SessionInput,
     SessionOutput,
+    SingleTurnTask,
     load_agent_app_spec_from_args,
 )
 
@@ -21,4 +22,5 @@ __all__ = [
     "load_agent_app_spec_from_args",
     "SessionInput",
     "SessionOutput",
+    "SingleTurnTask",
 ]
