@@ -39,7 +39,7 @@ def test_freezing_output_head_preserves_input_embedding(tie_weights):
     assert not model.output_layer.bias.requires_grad
 
 
-def test_single_pair_is_rejected_only_for_default_infonce():
+def test_single_pair_is_rejected_by_builtin_infonce():
     args = Namespace(
         loss_type="sft",
         custom_dataset_class_path="example.Pairs",
@@ -53,6 +53,11 @@ def test_single_pair_is_rejected_only_for_default_infonce():
 
     args.custom_loss_function_path = "example.pair_loss"
     embedding.validate_embedding_args(args)
+
+    callback = loss_module.load_function("relax.backends.megatron.loss.infonce_loss")
+    features = torch.ones(1, 3)
+    with pytest.raises(ValueError, match="at least two pairs"):
+        callback(features, features)
 
 
 def _pair_inputs():

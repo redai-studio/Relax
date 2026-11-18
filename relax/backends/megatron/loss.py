@@ -1681,6 +1681,8 @@ def infonce_loss(
     if process_group is not None:
         query = gather_with_local_grad(query, process_group)
         positive = gather_with_local_grad(positive, process_group)
+    if query.shape[0] < 2:
+        raise ValueError("InfoNCE requires at least two pairs per global batch")
     if query.dtype in (torch.float16, torch.bfloat16):
         query, positive = query.float(), positive.float()
     # Apply the cosine epsilon per row after feature normalization, without
