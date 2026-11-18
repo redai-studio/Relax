@@ -759,7 +759,7 @@ def test_pd_id_cleanup_rejects_url_shared_with_another_generation(monkeypatch, s
     assert requests.deletes == []
 
 
-@pytest.mark.parametrize("registration", ["accepted", "rejected", "lost"])
+@pytest.mark.parametrize("registration", ["accepted", "rejected", "lost", "foreign"])
 def test_colocate_registration_confirms_or_reconciles_queued_worker(monkeypatch, sglang_engine_module, registration):
     from unittest.mock import Mock
 
@@ -780,11 +780,13 @@ def test_colocate_registration_confirms_or_reconciles_queued_worker(monkeypatch,
         "accepted": Mock(return_value=_Response(202, {"worker_id": worker["id"]})),
         "rejected": Mock(return_value=_Response(400)),
         "lost": Mock(side_effect=ReadTimeout("accepted but response lost")),
+        "foreign": Mock(return_value=_Response(409)),
     }[registration]
     workers = {
         "accepted": [[], [worker]],
         "rejected": [[]],
         "lost": [[], [worker], []],
+        "foreign": [[{**worker, "metadata": {"relax_actor_id": "other-actor"}}]],
     }[registration]
     get = Mock(side_effect=[_Response(200, {"workers": rows}) for rows in workers])
     delete = Mock(return_value=_Response(202))
@@ -799,7 +801,7 @@ def test_colocate_registration_confirms_or_reconciles_queued_worker(monkeypatch,
         assert engine._router_worker_id == worker["id"]
     else:
         assert engine.unregister_from_router(wait_for_removal=True, allow_already_absent=True)
-        if registration == "rejected":
+        if registration in ("rejected", "foreign"):
             delete.assert_not_called()
         else:
             assert delete.call_args.args[0].endswith("/workers/elastic-worker")

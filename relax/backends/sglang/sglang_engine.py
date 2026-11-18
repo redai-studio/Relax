@@ -1357,6 +1357,13 @@ class SGLangEngine(RayActor):
                 )
                 workers_response.raise_for_status()
                 all_workers = workers_response.json().get("workers", [])
+                if allow_already_absent:
+                    actor_id = ray.get_runtime_context().get_actor_id()
+                    all_workers = [
+                        worker
+                        for worker in all_workers
+                        if isinstance(worker, dict) and worker.get("metadata", {}).get("relax_actor_id") == actor_id
+                    ]
                 exact_worker = None
                 dp_worker_found = False
                 for worker in all_workers:
@@ -1364,6 +1371,8 @@ class SGLangEngine(RayActor):
                         continue
                     listed_worker_url = worker.get("url")
                     if listed_worker_url == worker_url:
+                        if allow_already_absent and exact_worker is not None:
+                            return False
                         exact_worker = worker
                     elif (
                         isinstance(listed_worker_url, str) and router_worker_base_url(listed_worker_url) == worker_url
