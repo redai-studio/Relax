@@ -326,14 +326,16 @@ class WeightSyncProxy:
         self.metrics: dict = {}
 
     def _receive_replies(self, *, deadline: float) -> list:
-        results = []
+        results, errors = [], []
         for _process, connection in self.children:
             if not connection.poll(remaining(deadline)):
                 raise TimeoutError("Proxy subprocess did not complete before its deadline")
             result = connection.recv()
             if result.get("success") is not True:
-                raise RuntimeError(f"GPU proxy subprocess failed: {result}")
+                errors.append(result)
             results.append(result)
+        if errors:
+            raise RuntimeError(f"GPU proxy subprocess batch failed: {errors}")
         return results
 
     def _commands(self, commands: list[dict], *, deadline: float) -> list:

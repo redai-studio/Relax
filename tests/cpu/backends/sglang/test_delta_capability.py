@@ -70,6 +70,30 @@ def test_actual_sg_tp_geometry_change_requires_full_before_any_sparse_write():
     assert torch.equal(before, row.weight)
 
 
+@pytest.mark.parametrize("head", [False, True])
+def test_actual_sg_vocab_shard_dataclass_is_admitted_and_geometry_is_tracked(head):
+    model, _row = model_with_row()
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+        VocabParallelEmbeddingShardIndices,
+    )
+
+    cls = ParallelLMHead if head else VocabParallelEmbedding
+    embedding = cls.__new__(cls)
+    torch.nn.Module.__init__(embedding)
+    embedding.tp_rank, embedding.tp_size, embedding.use_presharded_weights = 0, 2, False
+    embedding.org_vocab_size = 8
+    embedding.shard_indices = VocabParallelEmbeddingShardIndices(0, 4, 8, 8, 0, 4, 8, 8)
+    embedding.weight = torch.nn.Parameter(torch.zeros(4, 2), requires_grad=False)
+    embedding.weight.output_dim, embedding.weight.weight_loader = 0, embedding.weight_loader
+    model.model.embedding = embedding
+    before = sparse_loader_identity(model)
+    assert before is not None
+    embedding.shard_indices = VocabParallelEmbeddingShardIndices(4, 8, 8, 8, 4, 8, 8, 8)
+    assert sparse_loader_identity(model) != before
+
+
 @pytest.mark.parametrize(
     "attribute,value",
     [
