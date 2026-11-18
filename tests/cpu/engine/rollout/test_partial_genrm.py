@@ -29,7 +29,9 @@ async def judge(monkeypatch):
     helper.tokenizers["__default__"] = SimpleNamespace(
         apply_chat_template=lambda *args, **kwargs: [10, 11],
         eos_token_id=99,
-        decode=lambda ids, **kwargs: "".join({1: "first", 2: "pr", 3: "e", 4: "fix", 7: "done"}[i] for i in ids),
+        decode=lambda ids, **kwargs: "".join(
+            {1: "first", 2: "pr", 3: "e", 4: "fix", 7: "done", 99: "done"}[i] for i in ids
+        ),
     )
     monkeypatch.setattr(helper, "_get_engine_urls", AsyncMock(return_value=["http://judge"]))
     yield helper
@@ -192,18 +194,30 @@ async def test_partial_genrm_rejects_changed_resume_input(judge, monkeypatch):
     [
         ({"ignore_eos": False}, False),
         ({"ignore_eos": True}, True),
-        ({"ignore_eos": True, "stop_token_ids": [99], "stop": None, "stop_regex": []}, False),
+        ({"ignore_eos": True, "stop_token_ids": [99], "stop": None, "stop_regex": []}, True),
+        ({"ignore_eos": False, "stop_token_ids": [7]}, False),
+        ({"ignore_eos": True, "stop_token_ids": [7]}, True),
     ],
 )
 async def test_partial_genrm_honors_eos_on_abort(judge, monkeypatch, params, aborted):
-    post = AsyncMock(return_value=_chunk("done", [99], "abort"))
+    token_id = (params.get("stop_token_ids") or [99])[0]
+    post = AsyncMock(side_effect=[_chunk("done", [token_id], "abort"), _chunk("fix", [4], "length")])
     monkeypatch.setattr(partial_genrm, "_post", post)
-    generate = judge.bind(Sample(status=Sample.Status.COMPLETED))
+    sample = Sample(status=Sample.Status.COMPLETED)
+    generate = judge.bind(sample)
     if aborted:
         with pytest.raises(PartialGenRMAborted):
             await generate(MESSAGES, params)
+        assert await judge.bind(sample)(MESSAGES, params) == "donefix"
+        payload = post.call_args.args[2]
+        assert payload["input_ids"] == [10, 11, token_id]
+        assert payload["sampling_params"]["max_new_tokens"] == 4
+        assert await judge.bind(sample)(MESSAGES, params) == "donefix"
+        assert post.await_count == 2
     else:
         assert await generate(MESSAGES, params) == "done"
+        assert await judge.bind(sample)(MESSAGES, params) == "done"
+        assert post.await_count == 1
 
 
 @pytest.mark.asyncio

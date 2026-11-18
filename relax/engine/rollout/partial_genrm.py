@@ -233,8 +233,9 @@ class PartialGenRM:
         call["output_ids"].extend(token_ids)
         finish_reason = meta.get("finish_reason") or {}
         reason = finish_reason.get("type")
-        stop_ids = set(params.get("stop_token_ids") or [])
+        stop_ids = set()
         if not params.get("ignore_eos", False):
+            stop_ids.update(params.get("stop_token_ids") or [])
             for attribute in ("eos_token_id", "eos_token_ids", "additional_stop_token_ids"):
                 value = getattr(tokenizer, attribute, None)
                 stop_ids.update([value] if isinstance(value, int) else value or [])
