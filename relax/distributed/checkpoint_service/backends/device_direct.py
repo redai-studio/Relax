@@ -180,6 +180,11 @@ class DeviceDirectBackend(CommBackend):
         self.timeout_seconds = timeout_seconds
         self._weights_getter = weights_getter
         self.rollout_manager = None
+        # DCS can be constructed on the async loop's thread, whose CUDA
+        # current device is independent of the trainer's. Bridge constructors
+        # already contain EP/PP object collectives, so bind before exporting.
+        self.device = next(model[0].parameters()).device if model else device_module.current_device()
+        device_module.set_device(self.device)
         self.delta_exporter = None
         if model and role_info is not None and role_info.role_name == "actor":
             from relax.backends.megatron.weight_update.delta_export import create_delta_exporter
@@ -187,7 +192,6 @@ class DeviceDirectBackend(CommBackend):
             self.delta_exporter = create_delta_exporter(
                 args, model, model_name=model_name, quantization_config=quantization_config
             )
-        self.device = next(model[0].parameters()).device if model else device_module.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
         self._thread_pool = ThreadPoolExecutor(max_workers=4)
@@ -209,8 +213,6 @@ class DeviceDirectBackend(CommBackend):
         # proxy actors are reused across weight updates instead of being torn down
         # and rebuilt every step. None forces a (re)build on the next update.
         self._rollout_topology_signature: Optional[frozenset] = None
-        device_module.set_device(self.device)
-
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
         self._rollout_bucket_splitter = self._megatron.get_dcs_bucket_splitter(
