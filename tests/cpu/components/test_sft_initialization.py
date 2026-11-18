@@ -220,7 +220,8 @@ async def test_cancelled_stop_request_keeps_resource_cleanup_owned():
 
 
 @pytest.mark.asyncio
-async def test_controller_waits_for_slow_first_batch_before_closing_queue(monkeypatch):
+@pytest.mark.parametrize("finishes_within_budget", [True, False])
+async def test_controller_waits_for_slow_first_batch_before_closing_queue(monkeypatch, finishes_within_budget):
     controller_module = load_controller_with_stubbed_dependencies("_test_sft_slow_cleanup")
     entered, release, stop_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
     events = []
@@ -256,17 +257,20 @@ async def test_controller_waits_for_slow_first_batch_before_closing_queue(monkey
         _sft_prepare_response=object(), handle=SimpleNamespace(stop=SimpleNamespace(remote=remote_stop))
     )
     controller = controller_module.Controller.__new__(controller_module.Controller)
+    controller._tq_owner = object()
+    controller._tq_legacy_init = False
+    controller._sft_early_prepare_issued = True
+    monkeypatch.setattr(controller_module, "close_tq_owner", lambda _owner: events.append("queue-closed"))
     original_wait_for = asyncio.wait_for
 
     async def shortened_timeout(awaitable, timeout):
-        # Exercise the old 30-second cutoff without making this a slow test.
-        return await original_wait_for(awaitable, timeout=0.01)
+        return await original_wait_for(awaitable, timeout=0.25 if finishes_within_budget else 0.01)
 
     monkeypatch.setattr(controller_module.asyncio, "wait_for", shortened_timeout)
 
     def close_after_stop():
         controller._stop_prepared_sft(deployment)
-        events.append("queue-closed")
+        controller._close_data_system()
 
     preparing = asyncio.create_task(service.prepare(prefetch_first_batch=True))
     async with asyncio.timeout(5):
@@ -274,13 +278,24 @@ async def test_controller_waits_for_slow_first_batch_before_closing_queue(monkey
         closing = asyncio.create_task(asyncio.to_thread(close_after_stop))
         try:
             await stop_started.wait()
-            await asyncio.sleep(0.05)
-            assert not closing.done()
+            if finishes_within_budget:
+                await asyncio.sleep(0.05)
+                assert not closing.done()
+            else:
+                await asyncio.wait({closing}, timeout=0.5)
+                assert closing.done(), "A stuck producer must not block failure recovery indefinitely"
+                with pytest.raises(RuntimeError, match="unconfirmed"):
+                    await closing
+                assert not service._prepare_batch_task.done()
+                with pytest.raises(RuntimeError, match="unconfirmed"):
+                    controller._close_data_system()
             assert "queue-closed" not in events
         finally:
             release.set()
-            await asyncio.gather(preparing, closing, service.stop())
-    assert events == ["put", "dataset-stopped", "queue-closed"]
+            await asyncio.gather(preparing, closing, service.stop(), return_exceptions=True)
+    assert events == (
+        ["put", "dataset-stopped", "queue-closed"] if finishes_within_budget else ["put", "dataset-stopped"]
+    )
 
 
 @pytest.mark.asyncio

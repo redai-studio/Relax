@@ -44,13 +44,15 @@ def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
 
 
 @pytest.mark.parametrize(
-    "driver_stopped, actor_fails, manager_pending, initial_router_ip, expected_router_ip",
+    "driver_stopped, actor_fails, manager_pending, initial_router_ip, expected_router_ip, sft_cleanup",
     [
-        (1, False, False, "127.0.0.1", None),
-        (0, False, False, None, None),
-        (1, True, False, "127.0.0.1", None),
-        (1, False, True, "127.0.0.1", None),
-        (0, False, False, "external-router.example", "external-router.example"),
+        (1, False, False, "127.0.0.1", None, None),
+        (0, False, False, None, None, None),
+        (1, True, False, "127.0.0.1", None, None),
+        (1, False, True, "127.0.0.1", None, None),
+        (0, False, False, "external-router.example", "external-router.example", None),
+        (0, False, False, None, None, "untracked"),
+        (0, False, False, None, None, "failed"),
     ],
     ids=[
         "agentic-driver",
@@ -58,10 +60,12 @@ def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
         "manager-unavailable",
         "manager-query-pending",
         "external-primary-local-auxiliary",
+        "untracked-sft-producer",
+        "terminal-sft-cleanup-failure",
     ],
 )
 def test_global_restart_cleans_both_router_owners(
-    monkeypatch, driver_stopped, actor_fails, manager_pending, initial_router_ip, expected_router_ip
+    monkeypatch, driver_stopped, actor_fails, manager_pending, initial_router_ip, expected_router_ip, sft_cleanup
 ):
     events = []
     dispose_ref = object()
@@ -96,7 +100,12 @@ def test_global_restart_cleans_both_router_owners(
     controller._max_global_restart = 1
     controller._health_manager = SimpleNamespace(_checker=None, stop=Mock())
     controller._cancel_pending_tasks = Mock()
-    controller._close_data_system = Mock()
+    if sft_cleanup is None:
+        controller._close_data_system = Mock()
+    else:
+        controller._sft_early_prepare_issued = True
+        if sft_cleanup == "failed":
+            controller._sft_cleanup_error = RuntimeError("SFT cleanup unconfirmed")
     controller.serve_dict = {controller_module.ROLES.rollout: service}
     controller._metrics_service_enabled = False
     controller._autoscaler_config = None
@@ -147,6 +156,13 @@ def test_global_restart_cleans_both_router_owners(
 
     controller.restart_serve(controller_module.ROLES.rollout)
 
+    if sft_cleanup is not None:
+        assert controller._restart_error is not None
+        assert "unconfirmed" in str(controller._restart_error)
+        assert "reinit" not in events
+        assert "ray shutdown" not in events
+        assert controller._restart_done_event.is_set()
+        return
     if manager_pending:
         dispose_remote.assert_not_called()
         assert events.index("manager query cancelled") < events.index(f"delete {controller_module.ROLES.rollout}")

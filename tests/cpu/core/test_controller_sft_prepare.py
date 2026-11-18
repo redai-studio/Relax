@@ -85,15 +85,17 @@ def test_sft_prepare_uses_runtime_environment_before_driver(controller_module, m
     assert service.handle.prepare.remote.called is expected
 
 
-@pytest.mark.parametrize("failure_stage", ["services", "health"])
+@pytest.mark.parametrize("failure_stage,stop_fails", [("services", False), ("health", False), ("services", True)])
 def test_constructor_failure_stops_prepared_producer_before_closing_queue(
-    controller_module, monkeypatch, failure_stage
+    controller_module, monkeypatch, failure_stage, stop_fails
 ):
     events = []
     error = RuntimeError("later startup failed")
 
     async def stop():
         assert "queue-closed" not in events
+        if stop_fails:
+            raise RuntimeError("producer stop failed")
         events.extend(["pending-put-finished", "producer-stopped"])
 
     service = SimpleNamespace(
@@ -125,4 +127,75 @@ def test_constructor_failure_stops_prepared_producer_before_closing_queue(
         controller_module.Controller(config)
 
     assert actual.value is error
-    assert events == ["pending-put-finished", "producer-stopped", "queue-closed"]
+    assert events == ([] if stop_fails else ["pending-put-finished", "producer-stopped", "queue-closed"])
+
+
+def test_restart_failure_cancels_prepared_request_before_run_refs_exist(controller_module):
+    import asyncio
+    import threading
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    controller = controller_module.Controller.__new__(controller_module.Controller)
+    requested = threading.Event()
+
+    class PrepareResponse:
+        def __init__(self):
+            self.future = Future()
+
+        def __await__(self):
+            requested.set()
+            return asyncio.wrap_future(self.future).__await__()
+
+        def cancel(self):
+            self.future.cancel()
+
+    prepared = PrepareResponse()
+    controller.serve_dict = {"sft": SimpleNamespace(_sft_prepare_response=prepared)}
+    controller._pending_task_refs = []
+    controller._pending_task_refs_lock = threading.Lock()
+    controller._restart_lock = threading.RLock()
+    controller._restart_done_event = threading.Event()
+    controller._restart_consumed_event = threading.Event()
+    controller._restart_consumed_event.set()
+    controller._health_manager = SimpleNamespace(_checker=None)
+    error = RuntimeError("SFT cleanup unconfirmed")
+    controller._restart_serve = Mock(side_effect=error)
+    controller._report_error_to_metrics_service = Mock()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        training = executor.submit(controller.training_loop)
+        try:
+            assert requested.wait(timeout=5)
+            controller.restart_serve("actor")
+            with pytest.raises(RuntimeError, match="global restart failed: SFT cleanup unconfirmed"):
+                training.result(timeout=2)
+            assert prepared.future.cancelled()
+            controller._report_error_to_metrics_service.assert_called_once_with(error)
+        finally:
+            prepared.cancel()
+            try:
+                training.result(timeout=5)
+            except RuntimeError:
+                pass
+
+
+def test_queue_close_refuses_a_prepared_producer_missing_from_service_results(controller_module, monkeypatch):
+    monkeypatch.setenv("RELAX_SFT_EARLY_PREPARE", "1")
+    controller = controller_module.Controller.__new__(controller_module.Controller)
+    controller.config = SimpleNamespace(loss_type="sft", start_rollout_id=0, load="hf", hf_checkpoint="hf")
+    controller._tq_owner = object()
+    controller._tq_legacy_init = False
+    close = Mock()
+    monkeypatch.setattr(controller_module, "close_tq_owner", close)
+    service = SimpleNamespace(handle=Mock())
+    controller._maybe_prepare_sft_data("sft", service)
+    # The startup future has not returned this service to the caller yet.
+    controller.serve_dict = {}
+
+    with pytest.raises(RuntimeError, match="unconfirmed"):
+        controller._close_data_system()
+    close.assert_not_called()
+    # A later successful stop must not turn terminal cleanup into a restart.
+    with pytest.raises(RuntimeError, match="has not confirmed"):
+        controller._stop_prepared_sft(service)
+    service.handle.stop.remote.assert_not_called()

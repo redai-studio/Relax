@@ -186,6 +186,7 @@ class Controller:
     _fault_events: Any = None
     _fault_recovery: Any = None
     _fault_rebuild_ready: Any = None
+    _sft_cleanup_error: Optional[Exception] = None
 
     def __init__(
         self, config: Namespace, runtime_env: dict = None, fault_events: Any = None, fault_recovery: Any = None
@@ -291,9 +292,9 @@ class Controller:
             # Release this job's TQ state immediately if initialization fails,
             # before the entrypoint runs its broader shutdown cleanup.
             logger.error("Controller construction failed; closing any initialized TQ state.")
-            for service in self.serve_dict.values():
-                self._stop_prepared_sft(service)
             try:
+                for service in self.serve_dict.values():
+                    self._stop_prepared_sft(service)
                 self._close_data_system()
             except Exception as cleanup_error:  # pragma: no cover - best effort
                 logger.warning(
@@ -641,6 +642,15 @@ class Controller:
         owner-mediated runs delegate to
         :func:`relax.utils.tq.lifecycle.close_tq_owner`.
         """
+        if getattr(self, "_sft_early_prepare_issued", False) and not getattr(
+            self, "_sft_early_prepare_stopped", False
+        ):
+            if self._sft_cleanup_error is None:
+                self._sft_cleanup_error = RuntimeError("SFT producer has not confirmed it stopped")
+        if self._sft_cleanup_error is not None:
+            raise RuntimeError(
+                "SFT producer cleanup is unconfirmed; refusing to close TransferQueue"
+            ) from self._sft_cleanup_error
         if self._tq_legacy_init:
             self._tq_legacy_init = False
             tq.close()
@@ -712,6 +722,15 @@ class Controller:
         with self._pending_task_refs_lock:
             refs_to_cancel = list(self._pending_task_refs)
             self._pending_task_refs.clear()
+
+        # Early prepare is awaited before service.run() registers its task
+        # refs. Cancel that request too so a failed restart can reach the
+        # entrypoint's exit path; cancellation does not stop shielded writers.
+        refs_to_cancel.extend(
+            prepared
+            for service in getattr(self, "serve_dict", {}).values()
+            if (prepared := vars(service).get("_sft_prepare_response")) is not None
+        )
 
         if not refs_to_cancel:
             return
@@ -796,22 +815,29 @@ class Controller:
         if getattr(self.config, "load", None) not in (None, self.config.hf_checkpoint):
             return
         self._sft_early_prepare_issued = True
+        self._sft_early_prepare_stopped = False
         service._sft_prepare_response = service.handle.prepare.remote(prefetch_first_batch=True)
         logger.info("Started CPU-only SFT preparation alongside GPU service initialization")
 
     def _stop_prepared_sft(self, service: Service) -> None:
+        if self._sft_cleanup_error is not None:
+            raise self._sft_cleanup_error
         if vars(service).get("_sft_prepare_response") is None:
             return
 
         async def stop() -> None:
-            # SFT owns shielded prepare/cleanup tasks. A local timeout would
-            # leave them running while callers tear down their TransferQueue.
-            await service.handle.stop.remote()
+            await asyncio.wait_for(service.handle.stop.remote(), timeout=30)
 
         try:
             run(stop())
         except Exception as exc:
-            logger.warning("Failed to finish prepared SFT cleanup before service deletion: %s", exc)
+            # Startup phases can wrap this error and lose the failed service.
+            # Keep a terminal guard on the queue owner as well as propagating
+            # failure. The entrypoint must terminate Serve/Ray, not rebuild or
+            # close a queue whose writers have not confirmed they stopped.
+            self._sft_cleanup_error = RuntimeError("SFT producer cleanup is unconfirmed; refusing resource teardown")
+            raise self._sft_cleanup_error from exc
+        self._sft_early_prepare_stopped = True
 
     def _create_service_task(
         self,
@@ -1905,6 +1931,8 @@ class Controller:
         try:
             self._close_data_system()
         except Exception as e:
+            if self._sft_cleanup_error is not None:
+                raise
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 
         # --- 1.8 Stop the global async event loop BEFORE ray.shutdown() ---

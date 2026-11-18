@@ -3711,7 +3711,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if rollout_id + 1 >= self.args.num_rollout:
             self._shutdown_sft_train_prefetch()
             return
-        if rollout_id >= 0 and _should_pause_sft_lookahead(self.args, rollout_id):
+        if _should_pause_sft_lookahead(self.args, rollout_id):
             return
         if self._sft_train_prefetch is not None:
             raise RuntimeError("SFT train-data prefetch was not consumed before scheduling the next step.")
