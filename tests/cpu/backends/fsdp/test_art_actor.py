@@ -295,6 +295,13 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
         patch.setattr(args, "start_rollout_id", 7, raising=False)
         with pytest.raises(RuntimeError, match="Explicit start_rollout_id"):
             _shell(args)._maybe_resume()
+    from relax.utils.utils import recovery_load_path
+
+    # Health recovery replaces the initial explicit cursor with the newest
+    # committed step, without weakening validation for a fresh explicit resume.
+    args.start_rollout_id, args._start_rollout_id_explicit = 0, True
+    args.no_save_optim = args.no_save_rng = False
+    recovery_load_path(args)
     restored = _shell(args)
     assert restored._maybe_resume() == 1
     assert restored._resume_initial_sync_pending

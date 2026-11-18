@@ -777,6 +777,7 @@ def recovery_load_path(args: Namespace) -> Optional[str]:
         args.finetune = False
         # A save may finish before teardown; use the backend's actual loaded step.
         args.start_rollout_id = None
+        args._start_rollout_id_explicit = False
         args.load = args.save
 
 

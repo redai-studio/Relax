@@ -16,11 +16,19 @@ def test_recovery_configures_committed_iteration_and_load_flags(tmp_path, tracke
 
     assert checkpoint_resume_step(str(tmp_path), override) == iteration + 1
     args.start_rollout_id = iteration + 1
+    args._start_rollout_id_explicit = True
     recovery_load_path(args)
 
     assert args.start_rollout_id is None
+    assert not args._start_rollout_id_explicit
     assert args.load == str(tmp_path)
     assert not args.no_load_optim and not args.no_load_rng and not args.finetune
+
+
+def test_recovery_without_checkpoint_preserves_explicit_initial_cursor(tmp_path):
+    args = Namespace(save=str(tmp_path), start_rollout_id=7, _start_rollout_id_explicit=True)
+    recovery_load_path(args)
+    assert args.start_rollout_id == 7 and args._start_rollout_id_explicit
 
 
 def test_recovery_uses_checkpoint_committed_after_restart_configuration(tmp_path):
