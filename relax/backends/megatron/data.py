@@ -363,7 +363,17 @@ def pad_and_flatten(
         return t, [t.size(0)]
 
     if transpose is not None:
-        tensor_list = [t.transpose(*transpose) for t in tensor_list]
+        # Pad time independently of the number of media items/chunks. Using
+        # pad_sequence after transposing would require identical chunk counts
+        # across samples (or incorrectly broadcast a singleton chunk).
+        max_length = max(t.transpose(*transpose).size(0) for t in tensor_list)
+        padded_list = []
+        for tensor in tensor_list:
+            transposed = tensor.transpose(*transpose)
+            padding = [0] * (2 * transposed.ndim)
+            padding[-1] = max_length - transposed.size(0)
+            padded_list.append(F.pad(transposed, padding, value=padding_value).transpose(*transpose))
+        return torch.cat(padded_list, dim=0), [t.size(0) for t in tensor_list]
 
     padded = pad_sequence(
         tensor_list,
@@ -371,10 +381,7 @@ def pad_and_flatten(
         padding_value=padding_value,
     )
 
-    if transpose is not None:
-        padded_list = [t.transpose(*transpose) for t in padded]
-    else:
-        padded_list = [t for t in padded]  # noqa: C416
+    padded_list = [t for t in padded]  # noqa: C416
 
     num_items = [t.size(0) for t in padded_list]
     return torch.cat(padded_list, dim=0), num_items
