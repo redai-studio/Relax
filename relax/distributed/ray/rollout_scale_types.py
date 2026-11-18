@@ -16,6 +16,7 @@ class ScaleOutStatus(str, enum.Enum):
     CREATING = "CREATING"  # (ray_native) Creating Ray actors and starting SGLang
     CONNECTING = "CONNECTING"  # (external) Connecting to external engines
     HEALTH_CHECKING = "HEALTH_CHECKING"  # Engines started, running health checks
+    WAITING_FOR_WEIGHT_SYNC = "WAITING_FOR_WEIGHT_SYNC"  # Healthy, awaiting the next Actor FULL
     WEIGHT_SYNCING = "WEIGHT_SYNCING"  # Engines healthy, syncing weights
     READY = "READY"  # Weight sync complete, can accept requests
     ACTIVE = "ACTIVE"  # Registered to router, processing requests

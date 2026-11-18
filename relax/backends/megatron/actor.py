@@ -38,6 +38,7 @@ from relax.distributed.replay_manager.backend.megatron import (
     log_reference_replay_metrics,
     reference_execution,
 )
+from relax.engine.lora_versions.training import run_on_training_rank_zero
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -368,6 +369,15 @@ class _SFTPrepackedDeviceIterator:
 class MegatronTrainRayActor(TrainRayActor):
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         super().set_rollout_manager(rollout_manager)
+        self._colocate_elastic = (
+            self.args.colocate
+            and not self.args.fully_async
+            and not self.args.hybrid
+            and self._per_step_rollout
+            and isinstance(getattr(self, "weight_updater", None), UpdateWeightFromTensor)
+            and ray.get(rollout_manager.supports_colocate_scale_out.remote())
+        )
+        self._colocate_receivers = None
         config = ray.get(rollout_manager.get_lora_training_config.remote())
         self._managed_lora_publication = config is not None
         if config is not None:
@@ -2914,6 +2924,31 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
     @timer
+    def disconnect_colocate_weight_group(self, name: str) -> None:
+        self.weight_updater.disconnect_distributed_group(name)
+        ray.get(self.rollout_manager.acknowledge_colocate_group_removed.remote(name))
+
+    def _acquire_colocate_full(self) -> dict:
+        source = ray.get_runtime_context().current_actor
+        while True:
+            snapshot, obsolete = ray.get(self.rollout_manager.acquire_colocate_full.remote(source))
+            if snapshot is not None:
+                return snapshot
+            if obsolete is not None:
+                self.disconnect_colocate_weight_group(obsolete)
+            else:
+                time.sleep(0.2)
+
+    def _publish_colocate_full(self, engines: list) -> None:
+        retired = ray.get(
+            self.rollout_manager.publish_colocate_full.remote(
+                self.weight_updater.weight_version, [engine._actor_id.hex() for engine in engines]
+            )
+        )
+        if retired is not None:
+            self.disconnect_colocate_weight_group(retired)
+        ray.get(self.rollout_manager.release_colocate_full.remote())
+
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
@@ -2966,9 +3001,27 @@ class MegatronTrainRayActor(TrainRayActor):
             if recovery_error[0] is not None:
                 raise RuntimeError(f"Rollout engine recovery failed: {recovery_error[0]}")
 
-        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
-        )
+        colocate_elastic = getattr(self, "_colocate_elastic", False)
+        connect_kwargs = {}
+        if colocate_elastic:
+            snapshot = run_on_training_rank_zero(self._acquire_colocate_full, phase="Colocate FULL admission")
+            rollout_engines = [engine for engine, _, _ in snapshot["receivers"]]
+            engine_gpu_counts = [count for _, count, _ in snapshot["receivers"]]
+            engine_gpu_offsets = [offset for _, _, offset in snapshot["receivers"]]
+            rollout_engine_lock = snapshot["lock"]
+            connect_kwargs = {
+                "shared_engine_count": snapshot["shared_count"],
+                "remote_group_name": snapshot["group_name"],
+            }
+            receivers = (
+                tuple((engine._actor_id.hex(), count, offset) for engine, count, offset in snapshot["receivers"]),
+                snapshot["group_name"],
+            )
+            num_new_engines = int(receivers != self._colocate_receivers or snapshot["num_new_engines"] > 0)
+        else:
+            rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
+                self.rollout_manager.get_rollout_engines_and_lock.remote()
+            )
 
         # Disaggregate PPO tears down the actor↔rollout NCCL groups on sleep(),
         # so we must wake_up() fully (not just reload_process_groups) and force
@@ -2989,9 +3042,17 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_engine_lock,
                 engine_gpu_counts=engine_gpu_counts,
                 engine_gpu_offsets=engine_gpu_offsets,
+                **connect_kwargs,
             )
             dist.barrier(group=get_gloo_group())
-            if dist.get_rank() == 0:
+            if colocate_elastic:
+                self._colocate_receivers = receivers
+                if snapshot["num_new_engines"] > 0:
+                    run_on_training_rank_zero(
+                        lambda: ray.get(self.rollout_manager.clear_num_new_engines.remote()),
+                        phase="Colocate receiver reconciliation",
+                    )
+            elif dist.get_rank(get_gloo_group()) == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
         with self._train_state_offloader.disable_during_update():
@@ -2999,6 +3060,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
 
+            if colocate_elastic:
+                run_on_training_rank_zero(
+                    lambda: self._publish_colocate_full(rollout_engines), phase="Colocate FULL publication"
+                )
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())
