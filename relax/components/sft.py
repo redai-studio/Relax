@@ -583,6 +583,9 @@ class SFT(Base):
         self._stop_event = asyncio.Event()
         self._run_task: asyncio.Task | None = None
         self._init_task: asyncio.Task | None = None
+        self._stop_task: asyncio.Task | None = None
+        self._prepare_batch_task: asyncio.Task | None = None
+        self._prefetch_first_batch_requested = False
 
     def _should_use_remote_batch_producer(self) -> bool:
         num_shards = sft_tq_num_shards(self.config)
@@ -1235,14 +1238,33 @@ class SFT(Base):
                 await self.data_system_client.async_clear_partition(partition_id=partition_id)
                 return
 
+    async def prepare(self, *, prefetch_first_batch: bool = False) -> None:
+        """Build CPU resources; optionally prefill step zero for a verified
+        fresh run."""
+        if self._stop_event.is_set():
+            return
+        if prefetch_first_batch:
+            self._prefetch_first_batch_requested = True
+        if self._init_task is None:
+            self._init_task = asyncio.create_task(asyncio.to_thread(self._init_data_pipeline))
+        # Requests share initialization even if an individual request is cancelled.
+        await asyncio.shield(self._init_task)
+        if (
+            getattr(self, "_prefetch_first_batch_requested", False)
+            and not self._stop_event.is_set()
+            and self._run_task is None
+            and self.step == 0
+            and getattr(self, "_prepare_batch_task", None) is None
+        ):
+            self._prepare_batch_task = asyncio.create_task(self._produce_one_step())
+        prepared_batch = getattr(self, "_prepare_batch_task", None)
+        if prepared_batch is not None:
+            await asyncio.shield(prepared_batch)
+
     async def run(self) -> None:
         if self._run_task is not None or self._stop_event.is_set():
             return
-        if self._init_task is None:
-            self._init_task = asyncio.create_task(asyncio.to_thread(self._init_data_pipeline))
-        # Requests may overlap or be cancelled while the initialization thread
-        # is still running. Share its outcome and keep ownership until stop().
-        await asyncio.shield(self._init_task)
+        await self.prepare()
         if self._run_task is None and not self._stop_event.is_set():
             self._run_task = asyncio.create_task(self._async_run())
 
@@ -1263,11 +1285,23 @@ class SFT(Base):
 
     async def stop(self) -> None:
         self._stop_event.set()
+        if getattr(self, "_stop_task", None) is None:
+            self._stop_task = asyncio.create_task(self._stop_resources())
+        # A cancelled Serve request must not abandon the initialized CPU pool.
+        await asyncio.shield(self._stop_task)
+
+    async def _stop_resources(self) -> None:
         if self._init_task is not None:
             try:
                 await asyncio.shield(self._init_task)
             except Exception as exc:
                 self._logger.warning(f"SFT initialization failed before shutdown: {exc}")
+        prepared_batch = getattr(self, "_prepare_batch_task", None)
+        if prepared_batch is not None:
+            try:
+                await asyncio.shield(prepared_batch)
+            except Exception as exc:
+                self._logger.warning(f"SFT initial batch failed before shutdown: {exc}")
         for producer in getattr(self, "_batch_producers", []):
             try:
                 await _ray_get_many_async([producer.stop.remote()])
@@ -1278,5 +1312,10 @@ class SFT(Base):
             self._dataset.stop()
         if self._eval_dataset is not None:
             self._eval_dataset.stop()
-        if self._run_task:
-            await self._run_task
+        try:
+            if self._run_task:
+                await self._run_task
+        finally:
+            pool, self._processor_pool = getattr(self, "_processor_pool", None), None
+            if pool is not None:
+                await asyncio.to_thread(pool.shutdown, wait=True)

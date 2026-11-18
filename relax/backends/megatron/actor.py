@@ -498,8 +498,31 @@ class MegatronTrainRayActor(TrainRayActor):
 
             install_autotune_logging(get_gloo_group())
         resumed_from_megatron = not args.finetune and args.load is not None and is_megatron_checkpoint(args.load)
+        model_ready = None
+        if (
+            role == "actor"
+            and self._sft_image_preprocess_on_rank
+            and os.environ.get("RELAX_SFT_EARLY_PREPARE") == "1"
+            and not resumed_from_megatron
+            and (getattr(args, "start_rollout_id", 0) or 0) == 0
+            and not should_run_sft_eval(args, 1)
+            and not should_run_sft_predict(args, 1)
+        ):
+
+            def model_ready(*, model: list[torch.nn.Module]) -> None:
+                self.model = model
+                if mpu.get_data_parallel_world_size(with_context_parallel=False) == 1:
+                    # Initial consumer reset cannot reassign a different DP
+                    # shard when all model-parallel peers share one DP slot.
+                    self._start_sft_train_prefetch(
+                        -1,
+                        sft_task_name(args, component="backend"),
+                        build_data_fields(args, consumer="actor"),
+                        args.global_batch_size,
+                    )
+
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
-            args, role
+            args, role, model_ready=model_ready
         )
         if role == "actor":
             from relax.utils.record_function_tags import install_record_function_tags
@@ -653,6 +676,16 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
+        if (
+            is_sft_mode(self.args)
+            and getattr(self.args, "sft_train_data_prefetch", False)
+            and os.environ.get("RELAX_SFT_EARLY_PREPARE") == "1"
+        ):
+            # First use initializes the same NCCL groups used to agree on CPU
+            # prefetch state. Do this on the main thread during initialization,
+            # before measuring the first training data fetch.
+            _agree_sft_train_prefetch_result(None, None)
+            logger.info("Initialized SFT prefetch control communicators")
         self.prof.on_init_end()
         self.data_iterator = None
         self._sft_window_prefetcher = SFTWindowPrefetcher() if is_sft_async_prepack_enabled(self.args) else None
@@ -3698,14 +3731,14 @@ class MegatronTrainRayActor(TrainRayActor):
     def _start_sft_train_prefetch(
         self, rollout_id: int, task_name: str, data_fields: list[str], batch_size: int
     ) -> None:
-        """Start a CPU-only TQ read for the next SFT step while this one
-        trains."""
+        """Read the next SFT step on CPU; rollout -1 prefetches the initial
+        step."""
         if self._sft_train_prefetch_executor is None:
             return
         if rollout_id + 1 >= self.args.num_rollout:
             self._shutdown_sft_train_prefetch()
             return
-        if _should_pause_sft_lookahead(self.args, rollout_id):
+        if rollout_id >= 0 and _should_pause_sft_lookahead(self.args, rollout_id):
             return
         if self._sft_train_prefetch is not None:
             raise RuntimeError("SFT train-data prefetch was not consumed before scheduling the next step.")

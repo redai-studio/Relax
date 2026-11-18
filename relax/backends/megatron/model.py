@@ -541,6 +541,8 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
+    *,
+    model_ready: Callable[..., None] | None = None,
 ) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler]:
     """Build model(s), wrap with DDP, and construct optimizer and scheduler.
 
@@ -570,6 +572,8 @@ def setup_model_and_optimizer(
     )
     finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
     validate_mtp_only_trainable_params(args, model)
+    if model_ready is not None:
+        model_ready(model=model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
         disable_frozen_conditional_branch_sync(_unwrap_module(model_chunk))
@@ -2479,7 +2483,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
 
 
 def initialize_model_and_optimizer(
-    args: Namespace, role: str = "actor"
+    args: Namespace, role: str = "actor", *, model_ready: Callable[..., None] | None = None
 ) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
     """Initialize model(s), optimizer, scheduler, and load from checkpoint.
 
@@ -2500,7 +2504,10 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
+    if model_ready is None:
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
+    else:
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role, model_ready=model_ready)
     model[0].role = role
     value_head_param_ids = ()
     reward_head_param_ids = ()

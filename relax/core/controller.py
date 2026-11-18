@@ -775,6 +775,39 @@ class Controller:
         except Exception as e:
             logger.warning(f"Failed to report fatal error to metrics service: {e}")
 
+    def _maybe_prepare_sft_data(self, role: str, service: Service) -> None:
+        """Overlap fresh-run CPU data preparation with GPU service startup."""
+        if role != "sft" or os.environ.get("RELAX_SFT_EARLY_PREPARE") != "1":
+            return
+        from relax.engine.sft.runtime import is_i2i_sft, should_run_sft_eval, should_run_sft_predict
+
+        if is_i2i_sft(self.config) or should_run_sft_eval(self.config, 1) or should_run_sft_predict(self.config, 1):
+            return
+        if getattr(self, "_sft_early_prepare_issued", False):
+            return
+        if (getattr(self.config, "start_rollout_id", 0) or 0) != 0:
+            return
+        # A backend checkpoint can change the effective starting step. Keep
+        # early preparation restricted to an initial HF/fresh start, once per
+        # controller; restarts and resumed checkpoints use the normal run path.
+        if getattr(self.config, "load", None) not in (None, self.config.hf_checkpoint):
+            return
+        self._sft_early_prepare_issued = True
+        service._sft_prepare_response = service.handle.prepare.remote(prefetch_first_batch=True)
+        logger.info("Started CPU-only SFT preparation alongside GPU service initialization")
+
+    def _stop_prepared_sft(self, service: Service) -> None:
+        if vars(service).get("_sft_prepare_response") is None:
+            return
+
+        async def stop() -> None:
+            await asyncio.wait_for(service.handle.stop.remote(), timeout=30)
+
+        try:
+            run(stop())
+        except Exception as exc:
+            logger.warning("Failed to finish prepared SFT cleanup before service deletion: %s", exc)
+
     def _create_service_task(
         self,
         role,
@@ -817,6 +850,8 @@ class Controller:
             if self._startup_abort_event.is_set():
                 self._cleanup_aborted_service(role, service, deploy=not defer_deploy)
                 return (role, None, "startup phase aborted")
+            if not defer_deploy:
+                self._maybe_prepare_sft_data(role, service)
             logger.info(f"Service {role} has been created successfully")
             return (role, service, None)
         except Exception as e:
@@ -834,6 +869,7 @@ class Controller:
             if self._startup_abort_event.is_set():
                 self._cleanup_aborted_service(role, service, deploy=True)
                 return (role, None, "startup phase aborted")
+            self._maybe_prepare_sft_data(role, service)
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to deploy service {role}: {e}")
@@ -955,6 +991,7 @@ class Controller:
                 service._stop_heartbeat_thread()
             except Exception as e:
                 logger.warning(f"[{role}] Failed to stop heartbeat during phase abort: {e}")
+            self._stop_prepared_sft(service)
             if str(role) == "rollout" and getattr(service, "_deployed", False):
                 try:
                     rollout_manager = run(service.get_rollout_manager())
@@ -1307,6 +1344,11 @@ class Controller:
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
         async def run_all_services(*, resume_existing: bool = False, startup: GlobalStartup):
+            if not resume_existing:
+                for service in self.serve_dict.values():
+                    prepared = vars(service).get("_sft_prepare_response")
+                    if prepared is not None:
+                        await prepared
             if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
                 # Pass genRM manager(s) to actor for coordinated offload/onload
                 if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
@@ -1385,7 +1427,18 @@ class Controller:
                 if ROLES.actor in self.serve_dict:
                     with startup.step_restore():
                         step = await self.serve_dict[ROLES.actor].get_step()
+                        if step != 0 and any(
+                            vars(service).get("_sft_prepare_response") is not None
+                            for service in self.serve_dict.values()
+                        ):
+                            raise RuntimeError(
+                                "Early SFT preparation requires actor step zero; refusing a cursor mismatch"
+                            )
                         for service in self.serve_dict.values():
+                            if vars(service).get("_sft_prepare_response") is not None:
+                                # Its first partition was produced during model init;
+                                # resetting to zero would duplicate that sample.
+                                continue
                             await service.set_step(step)
 
             # All startup consumers have now initialized and the first policy
@@ -1511,7 +1564,10 @@ class Controller:
 
         from relax.engine.sft.runtime import is_i2i_sft
 
-        if is_i2i_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
+        sft_service = self.serve_dict.get(ROLES.sft)
+        if sft_service is not None:
+            self._stop_prepared_sft(sft_service)
+        if sft_service is not None and is_i2i_sft(getattr(self, "config", None)):
 
             async def stop_image_producer() -> None:
                 await asyncio.wait_for(self.serve_dict[ROLES.sft].handle.stop.remote(), timeout=10)
@@ -1783,6 +1839,7 @@ class Controller:
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():
+            self._stop_prepared_sft(service)
             try:
                 service._stop_heartbeat_thread()
                 logger.info(f"[Global Restart] Stopped heartbeat for '{svc_role}'")

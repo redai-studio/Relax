@@ -158,6 +158,22 @@ def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(runtime)
     assert actor._sft_train_prefetch_rollout_id is None
 
 
+def test_initial_prefetch_targets_step_zero_without_save_boundary_pause(runtime):
+    actor = runtime.actor
+    actor.args.save, actor.args.save_interval = "checkpoint", 100
+    payload = {"tokens": [7, 8]}
+    actor.data_system_client = SimpleNamespace(
+        get_meta=Mock(return_value=SimpleNamespace(size=2)), get_data=Mock(return_value=payload)
+    )
+    assert runtime.namespace["_should_pause_sft_lookahead"](actor.args, -1)
+    actor._start_sft_train_prefetch(-1, "sft_train", ["tokens"], 2)
+    assert actor._sft_train_prefetch_rollout_id == 0
+    rows, _ = actor._take_sft_train_prefetch(0)
+    assert rows[0] is payload
+    actor.data_system_client.get_data.assert_called_once()
+    assert actor.data_system_client.get_meta.call_args.kwargs["sampling_config"]["partition_id"] == "sft_0"
+
+
 def test_empty_prefetch_timeout_finishes_before_fallback(runtime):
     client = SimpleNamespace(get_meta=Mock(return_value=SimpleNamespace(size=0)), get_data=Mock())
     actor = runtime.actor
