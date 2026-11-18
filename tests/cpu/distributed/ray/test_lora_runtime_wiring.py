@@ -1,10 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
-from conftest import HAS_DEPS, create_test_manager, make_mock_engine, mock_ray_get
+from conftest import (
+    HAS_DEPS,
+    create_test_manager,
+    make_engine_group,
+    make_mock_engine,
+    make_rollout_server,
+    mock_ray_get,
+)
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -119,6 +126,32 @@ def prepare_training(manager, tmp_path):
     manager.args.lora_adapter_mode = True
     next(iter(manager.servers.values())).engines[0]._actor_id.hex.return_value = "engine-id"
     return manager.configure_lora_training(str(tmp_path), "frozen-base", [1])
+
+
+def test_eviction_probe_cannot_remove_replica_after_training_configuration(wiring, tmp_path, monkeypatch):
+    from relax.distributed.ray.rollout import EngineGroupLifecycle, ray
+
+    manager, *_ = wiring
+    initial = make_engine_group(engines=manager.servers["default"].engines)
+    replica = make_mock_engine(evicted=True)
+    replica._actor_id.hex.return_value = "replica-id"
+    scaled = make_engine_group(engines=[replica], rank_offset=1, is_scaled_out=True)
+    scaled.pg = (Mock(), [], [])
+    manager.servers["default"] = make_rollout_server(engine_groups=[initial, scaled])
+    remove = AsyncMock(return_value=([], []))
+    monkeypatch.setattr(manager, "_remove_live_engines", remove)
+
+    def finish_probe(refs, **_kwargs):
+        assert prepare_training(manager, tmp_path).engine_actor_ids == ("engine-id", "replica-id")
+        return refs, []
+
+    monkeypatch.setattr(ray, "wait", finish_probe)
+    with pytest.raises(RuntimeError, match="fixed engine pool"):
+        manager._check_and_handle_evictions()
+
+    assert scaled.lifecycle_status is EngineGroupLifecycle.ACTIVE
+    assert not scaled.eviction_requested
+    remove.assert_not_called()
 
 
 def test_training_configuration_blocks_generation_until_initial_publication(wiring, tmp_path):

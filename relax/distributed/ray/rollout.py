@@ -4756,6 +4756,7 @@ class RolloutManager(ReloadableMixin):
         """Fence a ready eviction batch before performing one live removal."""
         claimed = []
         with self._engine_lifecycle_lock:
+            self._require_unmanaged_engine_pool()
             for srv_name, group, node0_idx in eviction_infos:
                 srv = self.servers.get(srv_name)
                 if (
