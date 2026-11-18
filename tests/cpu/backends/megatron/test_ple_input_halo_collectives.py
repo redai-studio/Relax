@@ -134,7 +134,8 @@ def _worker(rank, rendezvous):
                     zero_input = hidden[owned[rank]].clone().requires_grad_()
                     (model(zero_input) * 0).sum().backward()
                     assert torch.equal(zero_input.grad, torch.zeros_like(zero_input))
-        _check_bridge_interleaving(rank)
+        _check_block_interleaving(rank, native=False)
+        _check_block_interleaving(rank, native=True)
     finally:
         dist.destroy_process_group()
 
@@ -146,20 +147,23 @@ class PLELayer(nn.Module):
         self.layer_number = 1
 
     def forward(self, hidden_states, context=None, **kwargs):
+        if getattr(self, "fail", False):
+            raise RuntimeError("injected layer failure")
         return self.per_layer_embedding(hidden_states), context
 
 
-def _check_bridge_interleaving(rank):
-    """Execute Bridge's real closure capture/restore with CPU checkpointing.
+def _check_block_interleaving(rank, *, native):
+    """Execute native GPT and Bridge closures with CPU checkpointing.
 
     Replaces only the CUDA RNG checkpoint wrapper with PyTorch reentrant
-    checkpoint. Three microbatches share one PLE instance and backpropagate in
-    reverse order, switching adaptive transport between full and halo.
+    checkpoint. Microbatches share one PLE instance and backpropagate in
+    reverse order, including equal layouts with different n-gram IDs.
     """
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import Qwen3VLTransformerBlock
     from megatron.core import parallel_state
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.ple_input_halo_cp import prepare_input_halo_cp
+    from megatron.core.transformer.transformer_block import TransformerBlock
 
     from relax.backends.megatron.qsa_layout_metadata import bind_physical_layout
 
@@ -168,7 +172,11 @@ def _check_bridge_interleaving(rank):
     layer = PLELayer(model)
     block = SimpleNamespace(
         config=SimpleNamespace(
-            fp8=False, recompute_method="uniform", recompute_num_layers=1, distribute_saved_activations=False
+            fp8=False,
+            fp4=False,
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            distribute_saved_activations=False,
         ),
         pre_process=False,
         num_layers_per_pipeline_rank=1,
@@ -186,7 +194,7 @@ def _check_bridge_interleaving(rank):
             side_effect=lambda function, distribute, *args: checkpoint(function, *args, use_reentrant=True),
         ),
     ):
-        for batch, lengths in enumerate(((4, 12), (32, 16), (128,))):
+        for batch, lengths in enumerate(((4, 12), (32, 16), (32, 16), (128,))):
             model._ngram_ids = ((torch.arange(sum(lengths)) + batch * 17) % 128).reshape(1, -1, 1)
             model._position_in_sequence = torch.cat([torch.arange(n) for n in lengths]).unsqueeze(0)
             model._cp_packed_seq_params = None
@@ -209,9 +217,14 @@ def _check_bridge_interleaving(rank):
             local = hidden[indices].clone().requires_grad_()
             os.environ["QWEN38_PLE_INPUT_HALO_CP"] = "1"
             os.environ["QWEN38_PLE_INPUT_HALO_TRANSPORT"] = "adaptive"
-            output = Qwen3VLTransformerBlock._relax_native_checkpointed_forward(
-                block, local, None, None, None, None, None, packed, None, False
-            )
+            if native:
+                output = TransformerBlock._checkpointed_forward(
+                    block, local, None, None, None, None, None, packed, False
+                )
+            else:
+                output = Qwen3VLTransformerBlock._relax_native_checkpointed_forward(
+                    block, local, None, None, None, None, None, packed, None, False
+                )
             torch.testing.assert_close(output, reference[indices], rtol=1e-5, atol=1e-6)
             pending.append((local, output, derivative[indices], reference_input.grad[indices]))
         latest = (model._ngram_ids, model._position_in_sequence, model._cp_packed_seq_params)
@@ -224,6 +237,53 @@ def _check_bridge_interleaving(rank):
                     (model._ngram_ids, model._position_in_sequence, model._cp_packed_seq_params), latest, strict=True
                 )
             )
+
+        if native:
+            # A failure during replay must still restore the newer microbatch.
+            local = hidden[indices].clone().requires_grad_()
+            output = TransformerBlock._checkpointed_forward(block, local, None, None, None, None, None, packed, False)
+            model._ngram_ids = model._ngram_ids.clone()
+            model._position_in_sequence = model._position_in_sequence.clone()
+            newer = (model._ngram_ids, model._position_in_sequence, model._cp_packed_seq_params)
+            layer.fail = True
+            with pytest.raises(RuntimeError, match="injected layer failure"):
+                output.sum().backward()
+            assert all(
+                current is saved
+                for current, saved in zip(
+                    (model._ngram_ids, model._position_in_sequence, model._cp_packed_seq_params), newer, strict=True
+                )
+            )
+
+
+def test_native_checkpoint_without_ple():
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    class Layer(nn.Module):
+        def forward(self, hidden_states, context=None, **kwargs):
+            return hidden_states.square(), context
+
+    layer = Layer()
+    block = SimpleNamespace(
+        config=SimpleNamespace(
+            fp8=False,
+            fp4=False,
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            distribute_saved_activations=False,
+        ),
+        num_layers_per_pipeline_rank=1,
+        _get_layer=lambda index: layer,
+    )
+    x = torch.tensor([2.0, 3.0], requires_grad=True)
+    with patch(
+        "megatron.core.tensor_parallel.checkpoint",
+        side_effect=lambda function, distribute, *args: checkpoint(function, *args, use_reentrant=True),
+    ):
+        output = TransformerBlock._checkpointed_forward(block, x, None, None, None, None, None, None, False)
+        output.sum().backward()
+    torch.testing.assert_close(output, x.detach().square())
+    torch.testing.assert_close(x.grad, 2 * x.detach())
 
 
 def test_two_rank_ple_outputs_gradients_and_checkpoint(tmp_path):

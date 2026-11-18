@@ -2951,3 +2951,93 @@ diff --git a/megatron/core/transformer/ple_input_halo_cp.py b/megatron/core/tran
 +    # when a later microbatch is prepared before an earlier one recomputes.
 +    layer._cp_packed_seq_params.ple_input_halo_lengths = lengths
 +    layer._cp_packed_seq_params.ple_input_halo_packed = packed
+diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+--- a/megatron/core/transformer/transformer_block.py
++++ b/megatron/core/transformer/transformer_block.py
+@@ -620,6 +620,13 @@
+         rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+ 
+         def custom(start: int, end: int):
++            # Capture this microbatch before a later prepare() replaces layer state.
++            ple_states = {}
++            for index in range(start, end):
++                ple = getattr(self._get_layer(index), "per_layer_embedding", None)
++                if ple is not None:
++                    ple_states[index] = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
++
+             def custom_forward(
+                 hidden_states,
+                 attention_mask,
+@@ -637,36 +644,44 @@
+ 
+                 for index in range(start, end):
+                     layer = self._get_layer(index)
+-
+-                    # Get appropriate inner quantization context
+-                    if use_inner_quantization_context:
+-                        if self.config.fp8:
+-                            inner_quantization_context = get_fp8_context(
+-                                self.config, layer.layer_number - 1
+-                            )
+-                        # TODO: check if fp4 is supported in this case
+-                        elif self.config.fp4:
+-                            inner_quantization_context = get_fp4_context(
+-                                self.config, layer.layer_number - 1
+-                            )
++                    ple = getattr(layer, "per_layer_embedding", None)
++                    if ple is not None:
++                        previous_ple_state = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
++                        ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = ple_states[index]
++                    try:
++
++                        # Get appropriate inner quantization context
++                        if use_inner_quantization_context:
++                            if self.config.fp8:
++                                inner_quantization_context = get_fp8_context(
++                                    self.config, layer.layer_number - 1
++                                )
++                            # TODO: check if fp4 is supported in this case
++                            elif self.config.fp4:
++                                inner_quantization_context = get_fp4_context(
++                                    self.config, layer.layer_number - 1
++                                )
++                            else:
++                                inner_quantization_context = nullcontext()
+                         else:
+                             inner_quantization_context = nullcontext()
+-                    else:
+-                        inner_quantization_context = nullcontext()
+-
+-                    with inner_quantization_context:
+-                        hidden_states, context = layer(
+-                            hidden_states=hidden_states,
+-                            attention_mask=attention_mask,
+-                            context=context,
+-                            context_mask=context_mask,
+-                            rotary_pos_emb=rotary_pos_emb,
+-                            attention_bias=attention_bias,
+-                            inference_context=None,
+-                            packed_seq_params=packed_seq_params,
+-                            padding_mask=padding_mask,
+-                            input_ids=input_ids,
+-                        )
++
++                        with inner_quantization_context:
++                            hidden_states, context = layer(
++                                hidden_states=hidden_states,
++                                attention_mask=attention_mask,
++                                context=context,
++                                context_mask=context_mask,
++                                rotary_pos_emb=rotary_pos_emb,
++                                attention_bias=attention_bias,
++                                inference_context=None,
++                                packed_seq_params=packed_seq_params,
++                                padding_mask=padding_mask,
++                                input_ids=input_ids,
++                            )
++                    finally:
++                        if ple is not None:
++                            ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = previous_ple_state
+                 return hidden_states, context
+ 
+             return custom_forward
