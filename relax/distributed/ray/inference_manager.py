@@ -45,6 +45,7 @@ POOL_METHODS = frozenset(
         "get_router_address",
         "get_engines_info",
         "get_status",
+        "get_lora_training_config",
         "check_weights",
         "health_monitoring_pause",
         "health_monitoring_resume",
@@ -307,6 +308,11 @@ class InferenceManager:
         releasing_weights = method == "set_weight_updating" and not (args[0] if args else kwargs["is_updating"])
         if self._closing and not releasing_weights and not method.startswith("cancel_"):
             raise RuntimeError("Inference manager is closing")
+        if method == "get_lora_training_config":
+            # The managed pool has no legacy LoRA publication state. Returning
+            # None preserves the trainer handshake used by ordinary Megatron
+            # jobs without exposing a runtime-only handle.
+            return None
         completed = asyncio.get_running_loop().create_future()
         self._active_calls.add(completed)
         try:
@@ -454,7 +460,12 @@ class InferenceManager:
                 except Exception:
                     logger.exception("Could not abort residual requests during shutdown")
                 if worker is not None:
-                    await asyncio.wait_for(worker.close.remote(), timeout=30)
+                    try:
+                        await asyncio.wait_for(worker.close.remote(), timeout=30)
+                    except ray.exceptions.ActorDiedError:
+                        # A previous cleanup attempt may already have stopped
+                        # the CPU worker. GPU release is still checked below.
+                        pass
                 await self.ledger.drain("shutdown", timeout=10)
             finally:
                 try:

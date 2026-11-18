@@ -940,6 +940,9 @@ class RolloutManager(ReloadableMixin):
         self._health_monitors = []
         self._eviction_monitor_stop = threading.Event()
         self._eviction_monitor_thread = None
+        # Kept for the legacy colocated Megatron LoRA handshake. Managed
+        # independent pools expose this query through InferenceManager.
+        self._lora_training_config = None
 
         init_tracking(args, primary=False)
 
@@ -1194,6 +1197,9 @@ class RolloutManager(ReloadableMixin):
             "get_dynamic_global_batch_size called before first generate()"
         )
         return self._dynamic_global_batch_size
+
+    def get_lora_training_config(self) -> Any:
+        return self._lora_training_config
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset

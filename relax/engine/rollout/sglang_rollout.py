@@ -352,7 +352,12 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
 async def _post_generation(
     args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
 ) -> Any:
-    router_recovery_enabled = not evaluation and args.fully_async and not args.use_slime_router
+    router_recovery_enabled = (
+        not evaluation
+        and args.fully_async
+        and not args.use_slime_router
+        and not bool(getattr(args, "use_distributed_post", False))
+    )
     for attempt in range(2):
         if attempt and state.abort_event.is_set():
             raise GenerationAborted

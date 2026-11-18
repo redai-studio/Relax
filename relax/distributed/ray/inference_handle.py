@@ -10,6 +10,7 @@ WORKLOAD_METHODS = frozenset(
     {
         "generate",
         "eval",
+        "drain_eval_judges",
         "save",
         "load",
         "get_num_rollout_per_epoch",
@@ -61,6 +62,7 @@ def use_managed_rollout(args: Any) -> bool:
     standard = "relax.engine.rollout.sglang_rollout.generate_rollout"
     return not (
         is_offline_mode(args)
+        or bool(getattr(args, "use_distributed_post", False))
         or (bool(getattr(args, "_genrm_instances_resolved", None)) and bool(getattr(args, "colocate", False)))
         or (bool(getattr(args, "use_opd", False)) and bool(getattr(args, "colocate", False)))
         or bool(getattr(args, "use_agentic_rollout", False))
