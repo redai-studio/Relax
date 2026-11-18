@@ -18,7 +18,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from relax.distributed.weight_sync.config import DeltaSyncConfig
+from relax.distributed.weight_sync.config import RETAINED_DIRECTORY_BYTES, DeltaSyncConfig
 from relax.utils.logging_utils import get_logger
 
 
@@ -60,6 +60,8 @@ def create_delta_exporter(args: Any, model: Any, *, model_name: str, quantizatio
     # Leave bounded control metadata room as well; do not spend this same host
     # budget in full independently in snapshots and delivery.
     snapshots = config.host_budget_bytes - 2 * config.staging_budget_bytes - (16 << 20)
+    if config.receive_overlap:
+        snapshots -= RETAINED_DIRECTORY_BYTES
     if snapshots <= 0:
         raise ValueError("Delta host budget must cover snapshots, TCP staging copies and bounded control metadata")
     return ShardDeltaExporter.create(
@@ -176,14 +178,16 @@ class ShardDeltaExporter:
         version: str,
         group: dist.ProcessGroup,
         force_full: bool = False,
+        before_first_apply: Callable[[], None] | None = None,
     ) -> dict:
-        """Export/deliver inside the caller's existing pause and lock window.
+        """Export/deliver under the original caller's update lock.
 
         Every training rank enters conversion. Only source group rank zero
         sends the global HF stream. In particular, DCS's actor_fwd/reference
         raw path remains in its existing owner and does not pass through this
         code. The caller commits only after its remaining lifecycle gates
-        succeed.
+        succeed. An optional owner barrier defers its pause until bounded
+        immutable reception finishes; only that owner knows how to pause.
         """
         from relax.distributed.weight_sync.codec import encode
         from relax.distributed.weight_sync.transport import DeltaTransfer
@@ -209,6 +213,29 @@ class ShardDeltaExporter:
                 raise RuntimeError(f"Delta weight synchronization failed across source ranks: {errors}")
 
         try:
+            if before_first_apply is not None:
+                # Seed/reconnect may allocate a communicator or a fresh arena.
+                # Keep those allocations inside the original pause, rather
+                # than admitting them against a transient generation trough.
+                early_pause, error = [None], None
+                if rank == 0:
+                    try:
+                        early_pause[0] = bool(
+                            not self.config.receive_overlap
+                            or force_full
+                            or self._force_full
+                            or self.config.full_only
+                            or self._sequence % self.config.anchor_interval == 0
+                            or self.transfer is None
+                            or not self.transfer.can_reuse(engines, gpu_counts)
+                        )
+                    except Exception as exc:
+                        error = exc
+                agree(error)
+                dist.broadcast_object_list(early_pause, src=source_rank, group=group)
+                if early_pause[0]:
+                    before_first_apply()
+                    before_first_apply = None
             status = [None]
             error = None
             if rank == 0:
@@ -230,6 +257,28 @@ class ShardDeltaExporter:
             agree(error)
             dist.broadcast_object_list(status, src=source_rank, group=group)
             seed = status[0]
+            applying = before_first_apply is None
+            overlap = bool(self.config.receive_overlap and not seed and not force_full and not applying)
+            constraints = set()
+
+            def enter_apply() -> None:
+                nonlocal applying
+                if applying:
+                    return
+                # Every source rank enters the owner's same original pause,
+                # flush and session barrier exactly once. No converter is
+                # suspended across the separate DCS raw-weight iteration.
+                before_first_apply()
+                error = None
+                if rank == 0:
+                    try:
+                        self.transfer.activate()
+                        constraints.update(self.transfer.apply())
+                    except Exception as exc:
+                        error = exc
+                agree(error)
+                applying = True
+
             error = None
             try:
                 if seed:
@@ -241,13 +290,14 @@ class ShardDeltaExporter:
             error = None
             if rank == 0:
                 try:
-                    self.transfer.begin(version=version, base=self._version, seed=seed)
+                    self.transfer.begin(version=version, base=self._version, seed=seed, defer_apply=not applying)
                 except Exception as exc:
                     error = exc
             agree(error)
+            if not overlap:
+                enter_apply()
 
             stream = self.export(full=seed, full_names=frozenset(self.full_names), emit=rank == 0)
-            constraints = set()
             while True:
                 error, chunk = None, None
                 try:
@@ -272,11 +322,31 @@ class ShardDeltaExporter:
                         )
                         if workspace_peak() > self.config.gpu_budget_bytes:
                             raise ValueError("Measured source conversion/encoding workspace exceeds its GPU budget")
-                        constraints.update(self.transfer.send(metadata, raw))
+                    except Exception as exc:
+                        error = exc
+                agree(error)
+                if not applying:
+                    admission, error = [None], None
+                    if rank == 0:
+                        try:
+                            admission[0] = self.transfer.can_stage(metadata, raw)
+                        except Exception as exc:
+                            error = exc
+                    agree(error)
+                    dist.broadcast_object_list(admission, src=source_rank, group=group)
+                    if not admission[0]:
+                        enter_apply()
+                error = None
+                if rank == 0:
+                    try:
+                        self.transfer.stage(metadata, raw)
+                        if applying:
+                            constraints.update(self.transfer.apply())
                     except Exception as exc:
                         error = exc
                 agree(error)
                 del chunk
+            enter_apply()
             source_peaks = [None] * world
             dist.all_gather_object(source_peaks, workspace_peak(), group=group)
             status = [None]
@@ -291,6 +361,8 @@ class ShardDeltaExporter:
                         full_names=sorted(constraints),
                         force_full_seed=any(reply["force_full_seed"] for reply in result["receivers"]),
                         source_torch_workspace_peak_bytes=source_peaks,
+                        receive_overlap_requested=self.config.receive_overlap,
+                        receive_overlap_eligible=overlap,
                     )
                 except Exception as exc:
                     error = exc

@@ -16,6 +16,7 @@ import time
 from multiprocessing.connection import Connection
 from typing import Any
 
+from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT
 from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup, remaining
 
 from .delta_loader import LOADER as PROXY_MEMORY_LOADER
@@ -133,7 +134,7 @@ class _StagingArena:
         if not size:
             self.active[key] = (0, 0)
             return self.storage[:0]
-        charged = (size + 3) // 4 * 4
+        charged = (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
         for index, (offset, available) in enumerate(self.free):
             if size <= available:
                 charged = min(charged, available)
@@ -288,6 +289,16 @@ def _child(connection: Connection) -> None:
                         retained_payload_bytes=sum(v["slab"].numel() for v in buffers.values()),
                     )
                 elif op == "close":
+                    # A fenced pre-receive prefix has never exported an IPC
+                    # handle. It can be discarded without waiting for the live
+                    # generating server to exit. Ambiguous reads/exports keep
+                    # the original stronger lifetime protection below.
+                    for key in list(buffers):
+                        item = buffers[key]
+                        if item["complete"] and not item["exported"]:
+                            del buffers[key]
+                            arena.release(key)
+                        del item
                     if buffers and not _workers_exited(workers):
                         raise RuntimeError("Retaining unresolved IPC/NCCL buffers until model worker exit")
                     connection.send(dict(success=True))

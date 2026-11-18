@@ -9,6 +9,9 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 
+RETAINED_DIRECTORY_BYTES = 16 << 20
+
+
 @dataclass(frozen=True)
 class DeltaSyncConfig:
     stream: str
@@ -21,6 +24,7 @@ class DeltaSyncConfig:
     anchor_interval: int = 20
     full_only: bool = False
     transport: str = "tcp"
+    receive_overlap: bool = False
 
     @classmethod
     def load(cls, path: str | Path) -> DeltaSyncConfig:
@@ -52,6 +56,10 @@ class DeltaSyncConfig:
         ):
             if type(getattr(config, name)) is not int or getattr(config, name) <= 0:
                 raise ValueError(f"Delta setting {name} must be a positive integer")
-        if type(config.full_only) is not bool or config.transport not in ("tcp", "nccl"):
-            raise ValueError("Delta full_only must be boolean and transport must be tcp or nccl")
+        if (
+            type(config.full_only) is not bool
+            or type(config.receive_overlap) is not bool
+            or config.transport not in ("tcp", "nccl")
+        ):
+            raise ValueError("Delta full_only/receive_overlap must be boolean and transport must be tcp or nccl")
         return config

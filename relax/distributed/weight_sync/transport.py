@@ -8,12 +8,16 @@ This object owns only transport resources and waits for actual receiver fences.
 
 from __future__ import annotations
 
+import json
 import socket
+import struct
+import sys
 import uuid
 from time import monotonic
 from typing import Any
 
-from .config import DeltaSyncConfig
+from .codec import WIRE_ALIGNMENT
+from .config import RETAINED_DIRECTORY_BYTES, DeltaSyncConfig
 from .gpu_transport import GpuSyncGroup
 from .tcp_transport import TcpFrameSource
 
@@ -32,15 +36,27 @@ class DeltaTransfer:
         self.version: str | None = None
         self.metrics: dict = {}
         self._active_raw: Any = None
+        self._staged: list[tuple[int, dict]] = []
+        self._staged_bytes = 0
+        self._directory_bytes = sys.getsizeof(self._staged)
+        self._control: dict | None = None
+        self._applying = False
+
+    @staticmethod
+    def _signature(engines: list, counts: list[int]) -> tuple:
+        if not engines or len(engines) != len(counts) or any(type(n) is not int or n <= 0 for n in counts):
+            raise ValueError("Delta transport requires the original owner's nonempty GPU recipient layout")
+        return tuple((engine._actor_id.hex(), count) for engine, count in zip(engines, counts, strict=True))
+
+    def can_reuse(self, engines: list, counts: list[int]) -> bool:
+        return self.signature == self._signature(engines, counts)
 
     def connect(self, engines: list, counts: list[int], *, reconnect: bool = False) -> bool:
         """Return whether receiver identities changed and a FULL seed is
         needed."""
         import ray
 
-        if not engines or len(engines) != len(counts) or any(type(n) is not int or n <= 0 for n in counts):
-            raise ValueError("Delta transport requires the original owner's nonempty GPU recipient layout")
-        signature = tuple((engine._actor_id.hex(), count) for engine, count in zip(engines, counts, strict=True))
+        signature = self._signature(engines, counts)
         if signature == self.signature and not reconnect:
             return False
         self.close()
@@ -120,33 +136,85 @@ class DeltaTransfer:
         self.joined = joined
         return True
 
-    def begin(self, *, version: str, base: str | None, seed: bool) -> None:
-        import ray
-
+    def begin(self, *, version: str, base: str | None, seed: bool, defer_apply: bool = False) -> None:
+        if self._staged or self._active_raw is not None:
+            raise RuntimeError("Cannot begin with unresolved receiver storage")
         self.frame, self.version = 0, version
-        self.metrics = dict(payload_bytes=0, logical_delivery_bytes=0, frames=0, transfer_apply_s=0.0)
-        control = dict(
+        self._applying = False
+        self.metrics = dict(
+            payload_bytes=0,
+            logical_delivery_bytes=0,
+            frames=0,
+            transfer_apply_s=0.0,
+            receive_s=0.0,
+            apply_s=0.0,
+            prestaged_bytes=0,
+            prestaged_frames=0,
+            proxy_receive_memory=[],
+        )
+        self._control = dict(
             version=version,
             base=base,
             seed=seed,
             receiver_gpu_budget_bytes=self.config.receiver_gpu_budget_bytes,
             staging_budget_bytes=self.config.staging_budget_bytes,
         )
+        if not defer_apply:
+            self.activate()
+
+    def activate(self) -> None:
+        """Called only after the original owner establishes its apply
+        window."""
+        import ray
+
+        if self._control is None or self._applying:
+            raise RuntimeError("A publication may enter its apply window only once")
         ray.get(
             [
-                engine.delta_weight_sync.remote("begin", control=control, timeout=self.config.sync_timeout_s)
+                engine.delta_weight_sync.remote("begin", control=self._control, timeout=self.config.sync_timeout_s)
                 for engine in self.engines
             ],
             timeout=self.config.sync_timeout_s,
         )
+        self._applying = True
 
-    def send(self, metadata: dict, raw: Any) -> set[str]:
-        """Deliver one complete loader group and return receiver FULL
-        constraints."""
+    def can_stage(self, metadata: dict, raw: Any) -> bool:
+        charged = (raw.numel() + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
+        directory = len(json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode())
+        return (
+            self._staged_bytes + charged <= self.config.staging_budget_bytes
+            and directory <= RETAINED_DIRECTORY_BYTES
+            and self._directory_bytes + self._retained_directory_size(metadata) <= RETAINED_DIRECTORY_BYTES
+        )
+
+    def _retained_directory_size(self, metadata: dict) -> int:
+        """Charge actual Python representations, not their smaller JSON wire.
+
+        Count shared objects once within a frame and conservatively again
+        across frames. Four pointer slots per record cover even the first
+        append's list overallocation, in addition to the retained tuple/rank.
+        This is object allocation accounting, not an RSS/allocator guarantee.
+        """
+        pending, seen, size = [metadata], set(), 0
+        while pending:
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            size += sys.getsizeof(value)
+            if isinstance(value, dict):
+                pending.extend(value.keys())
+                pending.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                pending.extend(value)
+        return size + sys.getsizeof((self.frame, metadata)) + sys.getsizeof(self.frame) + 4 * struct.calcsize("P")
+
+    def stage(self, metadata: dict, raw: Any) -> None:
+        """Receive immutable bytes without invoking the live model loader."""
         import ray
 
-        if raw.numel() > self.config.staging_budget_bytes:
-            raise ValueError("Complete delta loader group exceeds proxy staging capacity")
+        if self._control is None or not self.can_stage(metadata, raw):
+            raise ValueError("Retained delta groups exceed the bounded proxy staging capacity")
         started = monotonic()
         self._active_raw = raw
         descriptor = None
@@ -177,32 +245,66 @@ class DeltaTransfer:
         # Source bytes are no longer needed after every transport read fence;
         # SG consumers still hold independently allocated proxy-owned storage.
         self._active_raw = None
-        ray.get(
+        memory = ray.get(
             [
                 engine.delta_weight_sync.remote("ready", round_id=self.frame, timeout=self.config.sync_timeout_s)
                 for engine in self.engines
             ],
             timeout=self.config.sync_timeout_s,
         )
-        replies = ray.get(
-            [
-                engine.delta_weight_sync.remote(
-                    "consume", round_id=self.frame, metadata=metadata, timeout=self.config.sync_timeout_s
-                )
-                for engine in self.engines
-            ],
-            timeout=self.config.sync_timeout_s,
-        )
+        elapsed = monotonic() - started
+        self.metrics["receive_s"] += elapsed
+        self.metrics["transfer_apply_s"] += elapsed
+        self.metrics["proxy_receive_memory"] = memory
+        self._staged.append((self.frame, metadata))
+        self._staged_bytes += (raw.numel() + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
+        self._directory_bytes += self._retained_directory_size(metadata)
         self.metrics["payload_bytes"] += raw.numel()
         self.metrics["logical_delivery_bytes"] += raw.numel() * sum(map(len, self.ranks))
         self.metrics["frames"] += 1
-        self.metrics["transfer_apply_s"] += monotonic() - started
+        if not self._applying:
+            self.metrics["prestaged_bytes"] += raw.numel()
+            self.metrics["prestaged_frames"] += 1
         self.frame += 1
-        return {name for reply in replies for name in reply["full_required"]}
+
+    def apply(self) -> set[str]:
+        """Consume staged groups in directory order inside the original
+        pause."""
+        import ray
+
+        if not self._applying:
+            raise RuntimeError("Staged payload cannot mutate a generating model")
+        started = monotonic()
+        required = set()
+        for round_id, metadata in self._staged:
+            replies = ray.get(
+                [
+                    engine.delta_weight_sync.remote(
+                        "consume", round_id=round_id, metadata=metadata, timeout=self.config.sync_timeout_s
+                    )
+                    for engine in self.engines
+                ],
+                timeout=self.config.sync_timeout_s,
+            )
+            required.update(name for reply in replies for name in reply["full_required"])
+        self._staged.clear()
+        self._staged_bytes = 0
+        self._directory_bytes = sys.getsizeof(self._staged)
+        elapsed = monotonic() - started
+        self.metrics["apply_s"] += elapsed
+        self.metrics["transfer_apply_s"] += elapsed
+        return required
+
+    def send(self, metadata: dict, raw: Any) -> set[str]:
+        """Serial delivery retains the same receive and consumption fences."""
+        self.stage(metadata, raw)
+        return self.apply()
 
     def finalize(self) -> dict:
         import ray
 
+        if not self._applying or self._staged:
+            raise RuntimeError("Cannot finalize before staged payload consumption")
         replies = ray.get(
             [
                 engine.delta_weight_sync.remote("finalize", update=self.version, timeout=self.config.sync_timeout_s)
