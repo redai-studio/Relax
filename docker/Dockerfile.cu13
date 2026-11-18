@@ -213,7 +213,8 @@ COPY docker/patch/sglang/v0.5.21.patch /tmp/tree-core.patch
 COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
 RUN cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
-    git apply --check /tmp/tree-core.patch && git apply /tmp/tree-core.patch && \
+    git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt --check /tmp/tree-core.patch && \
+    git apply --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/tree-core.patch && \
     python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
 
 FROM ${TRAIN_IMAGE} as relax_build

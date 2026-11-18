@@ -20,8 +20,8 @@ COPY docker/patch/sglang/v0.5.21.patch /tmp/tree-core.patch
 COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
 RUN cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
-    git apply --check --exclude=python/pyproject.toml /tmp/tree-core.patch && \
-    git apply --exclude=python/pyproject.toml /tmp/tree-core.patch && \
+    git apply --check --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/tree-core.patch && \
+    git apply --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/tree-core.patch && \
     python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
 
 # Build the patched R3 + PD DP-aware router, as Dockerfile.cu13 does.
@@ -122,8 +122,8 @@ COPY docker/patch/sglang/v0.5.21.patch /tmp/sglang.patch
 COPY docker/patch/rocm/sglang-v0.5.21-rocm.patch /tmp/sglang-rocm.patch
 RUN cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
-    git apply --check --exclude=python/pyproject.toml /tmp/sglang.patch && \
-    git apply --exclude=python/pyproject.toml /tmp/sglang.patch && \
+    git apply --check --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/sglang.patch && \
+    git apply --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/sglang.patch && \
     sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     git apply --check /tmp/sglang-rocm.patch && \
     git apply /tmp/sglang-rocm.patch && \
