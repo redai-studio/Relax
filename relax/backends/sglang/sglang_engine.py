@@ -614,6 +614,7 @@ class SGLangEngine(RayActor):
                         "num_gpus_per_engine": effective_num_gpus,
                         "actor_id": ray.get_runtime_context().get_actor_id(),
                         "sync_nextn_draft": self._sync_nextn_draft,
+                        "delta_gpu_local": self._delta_layout_supported(effective_num_gpus),
                     },
                 )
             )
@@ -696,6 +697,10 @@ class SGLangEngine(RayActor):
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
         server_args = ServerArgs(**server_args_dict)
+        self._weight_sync_server_args = {
+            key: getattr(server_args, key)
+            for key in ("nnodes", "tp_size", "pp_size", "dp_size", "base_gpu_id", "gpu_id_step")
+        }
         self._router_bootstrap_port = (
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
@@ -1058,6 +1063,11 @@ class SGLangEngine(RayActor):
             process = getattr(self, "process", None)
             if process is not None:
                 kill_process_tree(process.pid)
+            proxy = getattr(self, "_weight_sync_proxy", None)
+            if proxy is not None:
+                # Unresolved IPC producers may retire only after their model
+                # consumers exited; killing the server above establishes that.
+                proxy.close(timeout=10)
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -1393,7 +1403,12 @@ class SGLangEngine(RayActor):
 
     def release_memory_occupation(self):
         self.flush_cache()
-        return self._make_request("release_memory_occupation")
+        response = self._make_request("release_memory_occupation")
+        if getattr(self, "_weight_sync_proxy", None) is not None:
+            # All update consumers finished before this original offload
+            # boundary. Retire extra contexts as well as the staging arena.
+            self.delta_weight_sync("close", timeout=30)
+        return response
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """Available tags for multi-stage resume: weights, kv_cache."""
@@ -1750,6 +1765,38 @@ class SGLangEngine(RayActor):
         if not _sglang_has_weight_update_session():
             return
         return self._make_request("begin_weight_update", {})
+
+    def delta_weight_sync(self, action: str, **kwargs):
+        """Operate only this engine's per-GPU data owners; no pause/resume."""
+        from .weight_sync_proxy import WeightSyncProxy
+
+        if action not in ("prepare", "join", "receive", "ready", "begin", "consume", "finalize", "close"):
+            raise ValueError("Unknown delta data operation")
+        proxy = getattr(self, "_weight_sync_proxy", None)
+        if proxy is None:
+            if action == "close":
+                return
+            if action != "prepare":
+                raise ValueError("Delta GPU receivers must be prepared before data delivery")
+            proxy = self._weight_sync_proxy = WeightSyncProxy(self)
+        result = getattr(proxy, action)(**kwargs)
+        if action == "close":
+            self._weight_sync_proxy = None
+        return result
+
+    def get_delta_weight_sync_layout(self) -> dict:
+        """Resolved CPU topology only; GPU identities come from their
+        owners."""
+        return dict(self._weight_sync_server_args)
+
+    def _delta_layout_supported(self, gpu_count: int) -> bool:
+        layout = getattr(self, "_weight_sync_server_args", {})
+        return (
+            layout.get("nnodes") == 1
+            and layout.get("pp_size") == 1
+            and layout.get("dp_size") == 1
+            and layout.get("tp_size") == gpu_count
+        )
 
     def end_weight_update(self):
         """Close the session opened by ``begin_weight_update``.
@@ -2248,6 +2295,11 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
+        if getattr(args, "memory_weight_sync_config", None):
+            from relax.backends.sglang.delta_loader import LOADER
+
+            if LOADER not in loaders:
+                loaders.append(LOADER)
         kwargs["custom_weight_loader"] = loaders
 
     if (

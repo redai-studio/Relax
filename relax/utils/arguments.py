@@ -1119,6 +1119,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # update weight
             parser.add_argument(
+                "--memory-weight-sync-config",
+                type=str,
+                default=None,
+                help="Opt-in lossless delta settings; retains the original weight-sync lifecycle.",
+            )
+            parser.add_argument(
                 "--update-weight-buffer-size",
                 type=int,
                 default=512 * 1024**2,

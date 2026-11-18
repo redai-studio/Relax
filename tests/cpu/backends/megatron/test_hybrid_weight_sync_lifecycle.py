@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
+import threading
 from contextlib import contextmanager, nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -119,7 +121,8 @@ def test_hybrid_dcs_restores_explicit_rollout_offload(hybrid_actor, monkeypatch,
 
 @pytest.mark.parametrize("offload_train", [False, True])
 @pytest.mark.parametrize("fail_sync", [False, True])
-def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_actor, offload_train, fail_sync):
+@pytest.mark.asyncio
+async def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_actor, offload_train, fail_sync):
     actor, state = hybrid_actor
     actor.args.offload_train = offload_train
     if offload_train:
@@ -137,11 +140,12 @@ def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_ac
     actor.update_weights_fully_async = push
     config = SimpleNamespace(hybrid=True, fully_async=True, autoscaler_config="elastic.yaml", loss_type="policy_loss")
     service = SimpleNamespace(config=config, actor_model=actor)
+    service._set_rollout_manager_blocking = MethodType(Actor.func_or_class._set_rollout_manager_blocking, service)
     if fail_sync:
         with pytest.raises(RuntimeError, match="sync failed"):
-            Actor.func_or_class.set_rollout_manager(service, object())
+            await Actor.func_or_class.set_rollout_manager(service, object())
     else:
-        Actor.func_or_class.set_rollout_manager(service, object())
+        await Actor.func_or_class.set_rollout_manager(service, object())
     assert state.awake is not offload_train
     assert (state.tp_group is None) is offload_train
     assert not state.updating
@@ -149,6 +153,39 @@ def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_ac
         ["reload", "reload_groups", "push", "destroy_groups", "offload"] if offload_train else ["push"]
     )
     assert actor._advance_keep_old_actor_queue.call_count == (0 if fail_sync else 1)
+
+
+@pytest.mark.asyncio
+async def test_initial_delta_sync_leaves_serve_loop_available_and_propagates_failure():
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_backend_update():
+        entered.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("receiver installation failed")
+
+    model = SimpleNamespace(set_rollout_manager=Mock(), update_weights=slow_backend_update)
+    service = SimpleNamespace(
+        config=SimpleNamespace(
+            memory_weight_sync_config="delta.json", fully_async=False, hybrid=False, loss_type="policy_loss"
+        ),
+        actor_model=model,
+    )
+    service._set_rollout_manager_blocking = MethodType(Actor.func_or_class._set_rollout_manager_blocking, service)
+    manager = object()
+    pending = asyncio.create_task(Actor.func_or_class.set_rollout_manager(service, manager))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 4), timeout=5)
+        # This continuation must run while the backend is still blocked.
+        assert not pending.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="receiver installation failed"):
+            await pending
+        model.set_rollout_manager.assert_called_once_with(manager)
+    finally:
+        release.set()
+        if not pending.done():
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 def test_hybrid_training_restores_offload_before_first_parallel_query(hybrid_actor, monkeypatch):
