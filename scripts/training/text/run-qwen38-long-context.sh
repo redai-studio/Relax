@@ -17,17 +17,17 @@ for arg in "$@"; do
             exit 2 ;;
     esac
 done
-export SCENARIO="${SCENARIO:-real512}"
+export SCENARIO="${SCENARIO:-mixed512}"
 case "${SCENARIO}" in
-    real512) SEQ_LENGTH=524288; CP_SIZE=8; budget=65536; transport=full
+    mixed512) SEQ_LENGTH=524288; CP_SIZE=8; budget=65536; transport=full
         dataset=examples.long_context_repeat.RepeatedSFTDataset ;;
     filled512) SEQ_LENGTH=524288; CP_SIZE=8; budget=65536; transport=full
         dataset=examples.long_context_repeat.FilledSFTDataset ;;
-    real1m) SEQ_LENGTH=1048576; CP_SIZE=16; budget=32768; transport=adaptive
+    mixed1m) SEQ_LENGTH=1048576; CP_SIZE=16; budget=32768; transport=adaptive
         dataset=examples.long_context_repeat.DoubledSFTDataset ;;
     filled1m) SEQ_LENGTH=1048576; CP_SIZE=16; budget=32768; transport=adaptive
         dataset=examples.long_context_repeat.FilledSFTDataset ;;
-    *) echo 'SCENARIO must be real512, filled512, real1m, or filled1m' >&2; exit 2 ;;
+    *) echo 'SCENARIO must be mixed512, filled512, mixed1m, or filled1m' >&2; exit 2 ;;
 esac
 export SEQ_LENGTH CP_SIZE
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${budget}}"
@@ -72,18 +72,14 @@ if [[ ! "${SEQ_LENGTH}" =~ ^[1-9][0-9]*$ || ! "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][
     echo "Require positive MAX_TOKENS_PER_GPU <= SEQ_LENGTH for the custom SFT sample limit" >&2
     exit 2
 fi
-export RAY_NO_WAIT="${RAY_NO_WAIT:-1}"
+export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 export EXP_NAME="${EXP_NAME:-qwen38-${SCENARIO}-32gpu}"
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-long-context}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
-# Without an explicit Jobs endpoint, Ray resolves the existing cluster's dashboard.
-RAY_JOB_ADDRESS_ARGS=()
-if [[ -n "${RAY_JOBS_ADDRESS:-}" ]]; then
-    RAY_JOB_ADDRESS_ARGS=(--address "${RAY_JOBS_ADDRESS}")
-fi
+# RAY_API_SERVER_ADDRESS is shared by Ray node discovery and job submission.
 
 # Use an exclusive Ray cluster; the operator must prevent concurrent training.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
@@ -225,7 +221,6 @@ CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}"
     --ref-load "${MODEL_DIR}"
     --megatron-to-hf-mode bridge
-    --num-epoch "${NUM_EPOCH:-2}"
     --num-rollout "${NUM_STEPS:-200}"
     --load "${SAVE_DIR}/${EXP_NAME}"
     "${SAVE_ARGS[@]}"
@@ -404,7 +399,7 @@ fi
 
 cd "${RELAX}"
 mkdir -p "${SAVE_DIR}/${EXP_NAME}/logs"
-ray job submit ${RAY_NO_WAIT:+--no-wait} "${RAY_JOB_ADDRESS_ARGS[@]}" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} \
     --submission-id "${SUBMISSION_ID}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \

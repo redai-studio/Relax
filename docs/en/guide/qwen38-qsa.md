@@ -371,7 +371,7 @@ ENV_ARGS+=(
 )
 ```
 
-The feature is off by default. Each rank computes its own output rows and the left input context needed by convolution, preserving zero padding at document boundaries. Batch preparation records padded document boundaries automatically; the QSA CPU layout flag is not required. Recomputation is supported. Requires per-document zigzag partitioning; allgather CP, dynamic CP, TP greater than one, and trainable PLE parameters are unsupported.
+The feature is off by default. Each rank computes its own output rows and the left input context needed by convolution, preserving zero padding at document boundaries. Batch preparation records padded document boundaries automatically; the QSA CPU layout flag is not required. Native GPT and VL Bridge preserve PLE state per microbatch during recomputation. Requires per-document zigzag partitioning; allgather CP, dynamic CP, TP greater than one, and trainable PLE parameters are unsupported.
 
 | Transport | Input communication | PLE computation |
 | --- | --- | --- |
