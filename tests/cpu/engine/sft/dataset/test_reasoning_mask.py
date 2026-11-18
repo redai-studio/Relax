@@ -80,7 +80,9 @@ def qwen38_tokenizer():
         + "{{- '<think>\\n' + reasoning_content + '\\n</think>\\n\\n' -}}"
         "{%- endif -%}"
         "{%- endif -%}"
-        "{{- message.content + '<|im_end|>\\n' -}}"
+        "{%- if message.content is string -%}{{- message.content -}}"
+        "{%- else -%}{{- message.content | map(attribute='text') | join -}}{%- endif -%}"
+        "{{- '<|im_end|>\\n' -}}"
         "{%- endfor -%}"
     )
     return tokenizer
@@ -121,6 +123,35 @@ def test_qwen38_mask_keeps_literal_close_tag_in_structured_reasoning(qwen38_toke
     )
     assert f"<think>\n{reasoning}\n</think>" in qwen38_tokenizer.decode(ids)
     assert qwen38_tokenizer.decode(ids[mask.bool()]).strip() == "ANSWER<|im_end|>"
+
+
+def test_qwen38_mask_rejects_embedded_thinking_across_text_blocks(qwen38_tokenizer, tmp_path):
+    path = tmp_path / "data.jsonl"
+    content = [{"type": "text", "text": " \n<thi"}, {"type": "text", "text": "nk>SECRET</think>\n\nANSWER"}]
+    messages = [{"role": "user", "content": "Question"}, {"role": "assistant", "content": content}]
+    path.write_text(json.dumps({"messages": messages}) + "\n")
+    kwargs = {
+        "tokenizer": qwen38_tokenizer,
+        "prompt_key": "messages",
+        "prefetch_max_cached": 0,
+        "apply_chat_template_kwargs": {"reasoning_effort": "low"},
+    }
+
+    masked = SFTStreamingDataset(str(path), loss_mask_reasoning=True, **kwargs)
+    try:
+        with pytest.raises(ValueError, match="provide separate reasoning_content and content fields"):
+            masked.get_batch(1)
+    finally:
+        masked.stop()
+
+    unmasked = SFTStreamingDataset(str(path), loss_mask_reasoning=False, **kwargs)
+    try:
+        (sample,), _ = unmasked.get_batch(1)
+        assert qwen38_tokenizer.decode(sample.tokens) == qwen38_tokenizer.apply_chat_template(
+            messages, tokenize=False, reasoning_effort="low"
+        )
+    finally:
+        unmasked.stop()
 
 
 @pytest.mark.parametrize(

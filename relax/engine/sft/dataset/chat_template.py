@@ -78,6 +78,21 @@ def _to_chat_messages(
         if normalize_deepseek_reasoning and m.role == "assistant" and reasoning_content is None:
             reasoning_content, content = split_embedded_thinking(content)
         if normalize_qwen38_reasoning and m.role == "assistant":
+            # Qwen renders consecutive text blocks together, so the opener can span blocks.
+            if (
+                mask_reasoning
+                and isinstance(content, list)
+                and len(content) > 1
+                and all(
+                    isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                    for part in content
+                )
+                and "".join(part["text"] for part in content).lstrip().startswith(_THINK_OPEN_TAG)
+            ):
+                raise ValueError(
+                    "Qwen3.8 cannot mask a leading <think> block in multi-part text; "
+                    "provide separate reasoning_content and content fields"
+                )
             text_item = (
                 content[0]
                 if isinstance(content, list)
