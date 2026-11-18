@@ -39,6 +39,22 @@ def test_freezing_output_head_preserves_input_embedding(tie_weights):
     assert not model.output_layer.bias.requires_grad
 
 
+def test_single_pair_is_rejected_only_for_default_infonce():
+    args = Namespace(
+        loss_type="sft",
+        custom_dataset_class_path="example.Pairs",
+        global_batch_size=1,
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=128,
+        use_gloo_process_groups=True,
+    )
+    with pytest.raises(ValueError, match="at least two pairs"):
+        embedding.validate_embedding_args(args)
+
+    args.custom_loss_function_path = "example.pair_loss"
+    embedding.validate_embedding_args(args)
+
+
 def _pair_inputs():
     return torch.randn(4, 2, 3, generator=torch.Generator().manual_seed(123), dtype=torch.float64)
 
@@ -56,7 +72,6 @@ def _distributed_worker(rank, rendezvous, output):
         with torch.no_grad():
             encoder.weight.copy_(torch.eye(3, dtype=torch.float64))
         ddp = torch.nn.parallel.DistributedDataParallel(encoder, process_group=group)
-        hidden = ddp(_pair_inputs()[rank * 2 : (rank + 1) * 2]).reshape(1, 4, 3)
         args = Namespace(
             loss_type="sft",
             task_type="embedding",
@@ -72,17 +87,21 @@ def _distributed_worker(rank, rendezvous, output):
             response_lengths=[1] * 4,
             loss_masks=[align_loss_mask_for_sft(torch.ones(1, dtype=torch.int))] * 4,
         )
-        loss, _, metrics = loss_module.loss_function(args, batch, 1, hidden)
-        loss.backward()
-        torch.save(
-            {
-                "gradient": encoder.weight.grad,
-                "loss": loss.detach(),
-                "logged_loss": metrics["values"][1] / 2,
-                "signal": metrics["num_tokens"],
-            },
-            Path(output) / f"rank{rank}.pt",
-        )
+        for label, path in (("default", None), ("callback", "relax.backends.megatron.loss.infonce_loss")):
+            args.custom_loss_function_path = path
+            ddp.zero_grad(set_to_none=True)
+            hidden = ddp(_pair_inputs()[rank * 2 : (rank + 1) * 2]).reshape(1, 4, 3)
+            loss, _, metrics = loss_module.loss_function(args, batch, 1, hidden)
+            loss.backward()
+            torch.save(
+                {
+                    "gradient": encoder.weight.grad,
+                    "loss": loss.detach(),
+                    "logged_loss": metrics["values"][1] / 2,
+                    "signal": metrics["num_tokens"],
+                },
+                Path(output) / f"{label}-rank{rank}.pt",
+            )
     finally:
         dist.destroy_process_group()
 
@@ -97,9 +116,10 @@ def test_two_rank_ddp_matches_full_batch_gradient_with_single_token_pairs(tmp_pa
     query, positive = (_pair_inputs() @ weight.T).unbind(dim=1)
     reference = F.cross_entropy(F.cosine_similarity(query[:, None], positive[None], dim=-1) / 0.05, torch.arange(4))
     reference.backward()
-    for rank in range(2):
-        actual = torch.load(tmp_path / f"rank{rank}.pt", weights_only=True)
-        torch.testing.assert_close(actual["loss"], reference.detach(), rtol=1e-12, atol=1e-12)
-        torch.testing.assert_close(actual["logged_loss"], reference.detach(), rtol=1e-12, atol=1e-12)
-        torch.testing.assert_close(actual["gradient"], weight.grad, rtol=1e-12, atol=1e-12)
-        assert actual["signal"].item() == 2
+    for label in ("default", "callback"):
+        for rank in range(2):
+            actual = torch.load(tmp_path / f"{label}-rank{rank}.pt", weights_only=True)
+            torch.testing.assert_close(actual["loss"], reference.detach(), rtol=1e-12, atol=1e-12)
+            torch.testing.assert_close(actual["logged_loss"], reference.detach(), rtol=1e-12, atol=1e-12)
+            torch.testing.assert_close(actual["gradient"], weight.grad, rtol=1e-12, atol=1e-12)
+            assert actual["signal"].item() == 2

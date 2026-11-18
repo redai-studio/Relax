@@ -21,8 +21,11 @@ def validate_embedding_args(args: Namespace) -> None:
     temperature = float(getattr(args, "contrastive_temperature", 0.05))
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("--contrastive-temperature must be finite and positive")
-    if int(getattr(args, "global_batch_size", 0) or 0) <= 0:
+    global_pairs = int(getattr(args, "global_batch_size", 0) or 0)
+    if global_pairs <= 0:
         raise ValueError("embedding global_batch_size counts positive query/positive pairs")
+    if global_pairs == 1 and not getattr(args, "custom_loss_function_path", None):
+        raise ValueError("embedding InfoNCE requires at least two pairs per global batch")
     if int(getattr(args, "n_samples_per_prompt", 1)) != 1:
         raise ValueError("embedding requires n_samples_per_prompt=1: each TQ row is already a complete pair")
     if not getattr(args, "use_dynamic_batch_size", False) or int(getattr(args, "max_tokens_per_gpu", 0) or 0) <= 0:

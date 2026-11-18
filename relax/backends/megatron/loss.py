@@ -1691,6 +1691,9 @@ def infonce_loss(
     return F.cross_entropy(scores, torch.arange(scores.shape[0], device=scores.device))
 
 
+infonce_loss.requires_dp_gradient_sum = True
+
+
 def embedding_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1716,7 +1719,7 @@ def embedding_loss_function(
     dp_size = dist.get_world_size(group)
     loss = scale_for_megatron_sample_mean(mean_loss, global_pairs=global_pairs, dp_size=dp_size)
     metric_loss = loss.detach()
-    if not loss_path:
+    if getattr(compute_loss, "requires_dp_gradient_sum", False):
         # Each rank owns a disjoint part of the global gradient; compensate
         # for DDP averaging while keeping the forward value and metric intact.
         loss = metric_loss + (loss - metric_loss) * dp_size

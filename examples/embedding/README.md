@@ -50,4 +50,10 @@ Custom datasets can supply `input_ids` and an optional zero-based
 `embedding_position` per branch. A custom loss can be passed through
 `--custom-loss-function-path`. It receives the local query and positive
 tensors along with the keyword arguments `temperature` and `process_group`,
-and returns a scalar mean loss.
+and returns a scalar mean loss. The built-in InfoNCE needs at least two pairs
+in the global batch. Custom losses can use a single pair.
+
+If every rank evaluates the global loss with only its own features attached to
+autograd, set `requires_dp_gradient_sum = True` on the loss callable. Relax then
+sums the rank-local gradient contributions through DDP. Callbacks that return
+a rank-local mean keep the default gradient averaging.
