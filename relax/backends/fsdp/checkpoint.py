@@ -239,7 +239,11 @@ def save_checkpoint(
 
     ``require_rng_state`` rejects RNG failures collectively and requires every
     rank's RNG file before publication or an idempotent return.
+    An ART adapter contract also requires strict RNG and the matching durable
+    dataset cursor before either publication or an idempotent return.
     """
+    art_contract = adapter_contract.get("art")
+    require_rng_state = require_rng_state or art_contract is not None
     task_root = _task_root(save_dir, task)
     ckpt_dir = os.path.join(task_root, iter_dir_name(iteration))
     staging_dir = os.path.join(task_root, f".{iter_dir_name(iteration)}.inprogress")
@@ -258,6 +262,8 @@ def save_checkpoint(
                     existing[name] = json.load(f)
             if require_rng_state and any(not os.path.isfile(path) for path in _rng_paths(ckpt_dir)):
                 raise RuntimeError("Committed checkpoint is missing required per-rank RNG state")
+            if art_contract is not None:
+                load_art_dataset_state(save_dir, iteration, art_contract["training"]["n_samples_per_prompt"])
             if existing == expected:
                 decision = {"action": "return"}
             else:
@@ -377,6 +383,8 @@ def save_checkpoint(
             missing = [path for path in required_paths if not os.path.isfile(path)]
             if missing:
                 raise RuntimeError(f"Checkpoint publication is missing required files: {missing}.")
+            if art_contract is not None:
+                load_art_dataset_state(save_dir, iteration, art_contract["training"]["n_samples_per_prompt"])
             # COMMITTED is the last write inside staging. The directory is still
             # hidden from discovery; promotion below makes the complete snapshot
             # visible in one rename instead of authenticating a partial overwrite.

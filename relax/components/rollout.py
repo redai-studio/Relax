@@ -530,6 +530,13 @@ class Rollout(Base):
         if self.config.save is None or self.config.save_interval is None:
             return
 
+        if (
+            getattr(self.config, "train_backend", None) == "fsdp"
+            and (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art"
+        ):
+            # The ART actor saves this cursor before committing its checkpoint.
+            return
+
         is_save_step = (local_step + 1) % self.config.save_interval == 0
         is_final_step = (local_step + 1) == self.config.num_rollout
         if self.config.rotate_ckpt or is_save_step or is_final_step:

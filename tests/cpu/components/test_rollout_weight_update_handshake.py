@@ -70,6 +70,26 @@ def test_resume_data_load_failure_reaches_service_before_production(algorithm):
     read.assert_awaited_once_with(0)
 
 
+@pytest.mark.parametrize("algorithm", ["art", "grpo"])
+def test_rollout_does_not_rewrite_actor_owned_art_checkpoint_cursor(algorithm):
+    service = _make_rollout(can_update=False, manager=_ManagerStub())
+    service.config = SimpleNamespace(
+        save="checkpoints",
+        save_interval=1,
+        num_rollout=3,
+        rotate_ckpt=False,
+        train_backend="fsdp",
+        sampling_config={"algorithm": algorithm},
+    )
+    save = AsyncMock()
+    service.data_source = SimpleNamespace(save=SimpleNamespace(remote=save))
+    asyncio.run(service._maybe_save_data(0))
+    if algorithm == "art":
+        save.assert_not_awaited()
+    else:
+        save.assert_awaited_once_with(rollout_id=0)
+
+
 async def _prepared(*_args, **_kwargs):
     return True
 

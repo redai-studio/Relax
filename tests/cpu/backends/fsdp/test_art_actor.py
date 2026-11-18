@@ -6,6 +6,7 @@ import multiprocessing as mp
 from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -264,6 +265,14 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
     args.generation_task, args.load = "i2i", str(tmp_path)
     actor = _shell(args)
     actor.train(0, rows)
+    source = object.__new__(RolloutDataSource)
+    source.args = args
+    args.rollout_global_dataset, args.save = True, str(tmp_path)
+    args.rollout_shuffle = False
+    source.sample_offset = source.sample_group_index = 2
+    source.sample_index, source.epoch_id = 2 * args.n_samples_per_prompt, 0
+    source.metadata, source._use_streaming = {}, False
+    source.save(0)
     ckpt.save_checkpoint(
         str(tmp_path),
         "i2i",
@@ -275,14 +284,6 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
         adapter_contract=actor._adapter_contract(),
         require_rng_state=True,
     )
-    source = object.__new__(RolloutDataSource)
-    source.args = args
-    args.rollout_global_dataset, args.save = True, str(tmp_path)
-    args.rollout_shuffle = False
-    source.sample_offset = source.sample_group_index = 2
-    source.sample_index, source.epoch_id = 2 * args.n_samples_per_prompt, 0
-    source.metadata, source._use_streaming = {}, False
-    source.save(0)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(args, "_start_rollout_id_explicit", True, raising=False)
         patch.setattr(args, "start_rollout_id", 7, raising=False)
@@ -317,6 +318,56 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
     restored.args.seed += 1
     with pytest.raises(ValueError, match="ART algorithm"):
         restored._assert_resumable(str(tmp_path / "i2i" / ckpt.iter_dir_name(0)))
+
+
+@pytest.mark.parametrize("failure", ["write", "missing"])
+def test_art_save_keeps_previous_recovery_point_until_cursor_and_dcp_are_committed(monkeypatch, tmp_path, failure):
+    import ray
+
+    args = _profile()
+    args.save = args.load = str(tmp_path)
+    args.rollout_global_dataset, args.rollout_shuffle = True, False
+    args.max_actor_ckpt_to_keep, args.rotate_ckpt, args.save_interval = 1, False, 1
+    actor = _shell(args)
+    actor._build_manifest = lambda: SimpleNamespace(to_dict=lambda: {})
+    source = object.__new__(RolloutDataSource)
+    source.args, source.metadata, source._use_streaming = args, {}, False
+    source.sample_offset = source.sample_group_index = 2
+    source.sample_index, source.epoch_id = 2 * args.n_samples_per_prompt, 0
+    fail = False
+
+    def save_cursor(rollout_id):
+        if fail:
+            if failure == "write":
+                raise OSError("cursor disk full")
+            return  # Simulate a lost cursor before DCP's final publication check.
+        source.save(rollout_id)
+
+    # Only the Ray RPC boundary is replaced; real cursor IO, DCP, rotation and
+    # actor resume execute, including a failed publication after shard writes.
+    actor.rollout_manager = SimpleNamespace(save=SimpleNamespace(remote=save_cursor))
+    monkeypatch.setattr(ray, "get", lambda result: result)
+    actor.save_model(0)
+    first = tmp_path / "i2i" / ckpt.iter_dir_name(0)
+    first_weights = actor.model.weight.detach().clone()
+    with torch.no_grad():
+        actor.model.weight.add_(1)
+    source.sample_offset = source.sample_group_index = 4
+    source.sample_index = 4 * args.n_samples_per_prompt
+    fail = True
+    with pytest.raises((RuntimeError, ValueError), match="cursor"):
+        actor.save_model(1)
+    assert first.is_dir() and ckpt.find_latest_committed(str(tmp_path), "i2i") == 0
+    assert not (tmp_path / "i2i" / ckpt.iter_dir_name(1) / "COMMITTED").exists()
+    for root in (tmp_path, tmp_path / "i2i"):
+        assert (root / "latest_checkpointed_iteration.txt").read_text() == "0"
+    restored = _shell(args)
+    assert restored._maybe_resume() == 1
+    torch.testing.assert_close(restored.model.weight, first_weights, rtol=0, atol=0)
+    fail = False
+    actor.save_model(1)
+    assert not first.exists() and ckpt.find_latest_committed(str(tmp_path), "i2i") == 1
+    assert _shell(args)._maybe_resume() == 2
 
 
 @pytest.mark.parametrize("failure", ["missing", "corrupt", "schema", "k", "acquisition"])

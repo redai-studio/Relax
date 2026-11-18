@@ -1775,6 +1775,17 @@ class FSDPTrainRayActor(TrainRayActor):
 
         from relax.backends.fsdp import checkpoint as ckpt
 
+        if self._sampling_cfg().get("algorithm") == "art":
+            import ray
+
+            # Colocate cannot advance the data source until this train call
+            # returns. Persist its same-acquisition cursor before DCP commits
+            # or rotation can remove the previous recovery point.
+            self._rank0_then_agree(
+                lambda: ray.get(self.rollout_manager.save.remote(rollout_id)),
+                what=f"ART dataset cursor save at rollout {rollout_id}",
+            )
+
         trainer_state = {
             "rollout_id": int(rollout_id),
             "policy_version": int(self.policy_version),
