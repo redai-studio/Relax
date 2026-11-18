@@ -32,6 +32,10 @@ def _args(**overrides):
         rollout_top_logprobs_num=2,
         sglang_speculative_algorithm=None,
         score_centering_vocab_size=8,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
