@@ -8,18 +8,31 @@ Start a Ray cluster with two available GPUs and set `RAY_ADDRESS` to its Jobs
 HTTP address. Set `MODEL_DIR` to the parent directory of `Qwen3.5-4B`, `DATA_DIR`
 to the input directory, and `SAVE_DIR` to a persistent checkpoint root.
 
+Prepare eight sentence pairs from the `pair` training split of
+[AllNLI](https://huggingface.co/datasets/sentence-transformers/all-nli).
+Run the download with Hugging Face Datasets installed and make `DATA_DIR`
+accessible to the Ray workers.
+
 ```bash
 mkdir -p "$DATA_DIR"
-cat > "$DATA_DIR/pairs.jsonl" <<'EOF'
-{"query":"How do I make espresso?","positive":"Brew espresso by pushing hot water through finely ground coffee."}
-{"query":"Where do emperor penguins live?","positive":"Emperor penguins live in Antarctica."}
-{"query":"Why does ice float?","positive":"Solid water is less dense than liquid water."}
-{"query":"What is a prime number?","positive":"A prime has exactly two positive divisors."}
-{"query":"How do solar panels work?","positive":"Photovoltaic cells turn light into electricity."}
-{"query":"What is the capital of France?","positive":"Paris is the capital of France."}
-{"query":"When does a lunar eclipse occur?","positive":"A lunar eclipse occurs when Earth casts its shadow on the Moon."}
-{"query":"How can I keep basil fresh?","positive":"Store basil stems upright in a glass of water."}
-EOF
+python3 - "$DATA_DIR/pairs.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from datasets import load_dataset
+
+pairs = load_dataset(
+    "sentence-transformers/all-nli",
+    "pair",
+    revision="d482672c8e74ce18da116f430137434ba2e52fab",
+    split="train",
+    streaming=True,
+).take(8)
+lines = [json.dumps({"query": row["anchor"], "positive": row["positive"]}) for row in pairs]
+Path(sys.argv[1]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
 bash examples/embedding/scripts/run-qwen35-4B-2xgpu.sh
 ```
 
