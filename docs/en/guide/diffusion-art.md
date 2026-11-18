@@ -85,7 +85,12 @@ the commit gate validates it alongside the training state and per-rank RNG.
 Only then are `COMMITTED`, latest markers and checkpoint retention advanced.
 The runtime checks the matching eager-dataset cursor before restoring training
 state; missing, corrupt or inconsistent cursors abort resume, including through
-the generic `train.py --load` entry point. Held-out evaluation uses image-only
+the generic `train.py --load` entry point. New data cursors also bind the ordered
+manifest contents, slices, parsing and shuffle/seed configuration. Fingerprints
+are computed once at data-source startup and reused for saves; legacy cursors
+without a fingerprint warn that identity is unverified. Referenced media and
+tokenizer assets must remain immutable.
+Held-out evaluation uses image-only
 terminal ODE requests, without collecting training states or replay conditions.
 
 ## Algorithm and scheduling boundaries

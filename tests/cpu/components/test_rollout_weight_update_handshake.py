@@ -22,9 +22,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
-from ray.exceptions import RayActorError
+from ray.exceptions import RayActorError, RayTaskError
 
 from relax.components.rollout import Rollout as RolloutDeployment
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 
 
 # ``Rollout`` is wrapped by ``@serve.deployment`` / ``@serve.ingress`` -- reach
@@ -48,19 +49,23 @@ async def _ok(*_args, **_kwargs):
 
 
 @pytest.mark.parametrize("algorithm", ["art", "grpo"])
-def test_resume_data_load_failure_reaches_service_before_production(algorithm):
+@pytest.mark.parametrize("error", [OSError, DatasetStateMismatchError])
+def test_resume_data_load_failure_reaches_service_before_production(algorithm, error):
     from relax.distributed.ray.rollout import RolloutManager
 
     manager = object.__new__(RolloutManager.__ray_metadata__.modified_class)
     manager.args = SimpleNamespace(sampling_config={"algorithm": algorithm})
-    read = AsyncMock(side_effect=OSError("dataset unavailable"))
+    failure = error("dataset unavailable")
+    if error is DatasetStateMismatchError:
+        failure = RayTaskError("load", "dataset unavailable", failure).as_instanceof_cause()
+    read = AsyncMock(side_effect=failure)
     manager.data_source = SimpleNamespace(load=SimpleNamespace(remote=read))
     service = _make_rollout(can_update=False, manager=SimpleNamespace(load=_RemoteStub(manager.load)))
     service.config = SimpleNamespace(rollout_global_dataset=True, sampling_config={"algorithm": algorithm})
     service.step, service._run_task = 1, None
     service._async_run = AsyncMock()
-    if algorithm == "art":
-        with pytest.raises(OSError, match="dataset unavailable"):
+    if algorithm == "art" or error is DatasetStateMismatchError:
+        with pytest.raises(error, match="dataset unavailable"):
             asyncio.run(service.run())
         assert service._run_task is None
         service._async_run.assert_not_awaited()

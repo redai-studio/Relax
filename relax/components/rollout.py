@@ -17,6 +17,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client
@@ -383,7 +384,10 @@ class Rollout(Base):
                 await self.rollout_manager.load.remote(self.step - 1)
             except Exception as e:
                 self._logger.exception(f"Failed to load global dataset: {e}")
-                if (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art":
+                if (
+                    isinstance(e, DatasetStateMismatchError)
+                    or (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art"
+                ):
                     raise
 
         self._run_task = asyncio.ensure_future(self._async_run())
