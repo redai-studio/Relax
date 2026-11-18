@@ -158,6 +158,7 @@ def build_sensenova_rollout_request(
         "guidance_scale": guidance_scale,
         "true_cfg_scale": image_guidance_scale,
         "rollout": True,
+        "rollout_debug_mode": False,
         "rollout_sde_type": dynamics,
         "rollout_noise_level": 0.0 if dynamics == "ode" else noise_level,
         "rollout_log_prob_no_const": dynamics != "sde",

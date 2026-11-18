@@ -133,7 +133,9 @@ def test_art_shell_launch_uses_registered_defaults_and_preserves_resume_and_extr
     assert legacy.returncode != 0 and not capture.exists()
 
 
-@pytest.mark.parametrize("invalid", [None, "budget", "odd_k", "ema", "steps", "options", "precision"])
+@pytest.mark.parametrize(
+    "invalid", [None, "budget", "odd_k", "ema", "steps", "options", "precision", "streaming", "staleness"]
+)
 def test_art_profile_is_explicit_and_rejects_unsupported_semantics(invalid):
     args = _profile()
     if invalid == "budget":
@@ -148,6 +150,10 @@ def test_art_profile_is_explicit_and_rejects_unsupported_semantics(invalid):
         args.sampling_config["art"]["corrective_mask_enabled"] = False
     elif invalid == "precision":
         args.fsdp_master_dtype = "bf16"
+    elif invalid == "streaming":
+        args.use_streaming_dataset = True
+    elif invalid == "staleness":
+        args.max_staleness = 1
     if invalid is None:
         validate_generative_config(args)
     else:
@@ -320,12 +326,13 @@ def test_complete_window_dcp_resume_matches_uninterrupted_next_acquisition(monke
         restored._assert_resumable(str(tmp_path / "i2i" / ckpt.iter_dir_name(0)))
 
 
-@pytest.mark.parametrize("failure", ["write", "missing"])
+@pytest.mark.parametrize("failure", ["write", "missing", "reuse", "seed"])
 def test_art_save_keeps_previous_recovery_point_until_cursor_and_dcp_are_committed(monkeypatch, tmp_path, failure):
     import ray
 
     args = _profile()
     args.save = args.load = str(tmp_path)
+    args.generation_seed = 42
     args.rollout_global_dataset, args.rollout_shuffle = True, False
     args.max_actor_ckpt_to_keep, args.rotate_ckpt, args.save_interval = 1, False, 1
     actor = _shell(args)
@@ -340,7 +347,8 @@ def test_art_save_keeps_previous_recovery_point_until_cursor_and_dcp_are_committ
         if fail:
             if failure == "write":
                 raise OSError("cursor disk full")
-            return  # Simulate a lost cursor before DCP's final publication check.
+            if failure == "missing":
+                return  # Simulate a lost cursor before DCP's final publication check.
         source.save(rollout_id)
 
     # Only the Ray RPC boundary is replaced; real cursor IO, DCP, rotation and
@@ -348,19 +356,31 @@ def test_art_save_keeps_previous_recovery_point_until_cursor_and_dcp_are_committ
     actor.rollout_manager = SimpleNamespace(save=SimpleNamespace(remote=save_cursor))
     monkeypatch.setattr(ray, "get", lambda result: result)
     actor.save_model(0)
+    cursor = tmp_path / "dataset" / "global_dataset_state_dict_0.pt"
+    original_cursor = cursor.read_bytes()
+    actor.save_model(0)  # Idempotent retries must reuse, not rewrite, the cursor.
+    assert cursor.read_bytes() == original_cursor
     first = tmp_path / "i2i" / ckpt.iter_dir_name(0)
     first_weights = actor.model.weight.detach().clone()
     with torch.no_grad():
         actor.model.weight.add_(1)
     source.sample_offset = source.sample_group_index = 4
     source.sample_index = 4 * args.n_samples_per_prompt
+    if failure == "reuse":
+        source._dataset_resume_contract = {"replacement": "different manifest"}
+    elif failure == "seed":
+        source.sample_offset = source.sample_group_index = 2
+        source.sample_index = 2 * args.n_samples_per_prompt
+        args.generation_seed += 1
     fail = True
-    with pytest.raises((RuntimeError, ValueError), match="cursor"):
-        actor.save_model(1)
+    with pytest.raises((RuntimeError, ValueError), match="cursor|metadata"):
+        actor.save_model(0 if failure in ("reuse", "seed") else 1)
+    assert cursor.read_bytes() == original_cursor
     assert first.is_dir() and ckpt.find_latest_committed(str(tmp_path), "i2i") == 0
     assert not (tmp_path / "i2i" / ckpt.iter_dir_name(1) / "COMMITTED").exists()
     for root in (tmp_path, tmp_path / "i2i"):
         assert (root / "latest_checkpointed_iteration.txt").read_text() == "0"
+    args.generation_seed = 42
     restored = _shell(args)
     assert restored._maybe_resume() == 1
     torch.testing.assert_close(restored.model.weight, first_weights, rtol=0, atol=0)

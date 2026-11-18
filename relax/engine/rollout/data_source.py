@@ -310,6 +310,16 @@ class RolloutDataSource(DataSource):
             state_dict["dataset_contract"] = self._dataset_resume_contract
         if (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art":
             state_dict["rollout_id"] = rollout_id
+            from relax.backends.fsdp.checkpoint import COMMITTED_MARKER, iter_dir_name, load_art_dataset_state
+
+            committed = Path(self.args.save) / self.args.generation_task / iter_dir_name(rollout_id) / COMMITTED_MARKER
+            if committed.is_file():
+                original = load_art_dataset_state(self.args.save, rollout_id, self.args.n_samples_per_prompt)
+                if original != state_dict:
+                    raise DatasetStateMismatchError(
+                        "Refusing to replace the dataset cursor of a committed ART checkpoint."
+                    )
+                return
 
         # Add streaming dataset state if applicable
         if self._use_streaming and self.dataset is not None:

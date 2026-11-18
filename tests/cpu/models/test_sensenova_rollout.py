@@ -113,6 +113,28 @@ def _pack(request, response):
     return mapped, adapter.pack_trajectory(mapped)
 
 
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_sensenova_http_payload_disables_debug_collection_after_batch_packing(monkeypatch, evaluation):
+    from relax.backends.sglang.diffusion_engine import SGLangNativeGenerationEngine
+
+    requests = [_request(member) for member in range(2)]
+    if evaluation:
+        for request in requests:
+            request["extra_sampling_params"]["rollout_options"]["capture"] = "terminal"
+            request["rollout_return_step_indices"] = None
+            request["rollout_return_dit_trajectory"] = request["rollout_return_denoising_env"] = False
+    engine = SGLangNativeGenerationEngine(SimpleNamespace(), rank=0)
+
+    def post(route, payload):
+        assert route == "/rollout/generate" and payload["num_outputs_per_prompt"] == 2
+        assert payload["rollout_debug_mode"] is False
+        raise OSError("captured at HTTP boundary")
+
+    monkeypatch.setattr(engine, "_post", post)
+    with pytest.raises(OSError, match="captured at HTTP boundary"):
+        engine.generate_batch(requests, max_batch_size=2)
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_art_selected_cache_preserves_actual_dtype_and_sparse_scheduler_coordinates(dtype):
     from relax.backends.fsdp.art import art_steps_from_batch

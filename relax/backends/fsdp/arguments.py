@@ -335,6 +335,8 @@ def _validate_art_config(args: Namespace, sampling: dict, errors: List[str]) -> 
     for key, value in required.items():
         _fail(errors, getattr(args, key, None) != value, f"ART requires {key}={value!r}.")
     _fail(errors, bool(getattr(args, "fsdp_cpu_offload", False)), "ART requires GPU-resident FSDP shards.")
+    _fail(errors, bool(getattr(args, "use_streaming_dataset", False)), "ART currently requires an eager dataset.")
+    _fail(errors, getattr(args, "max_staleness", 0) != 0, "ART currently requires max_staleness=0.")
     _fail(
         errors,
         float(getattr(args, "generative_kl_coef", 0.0) or 0.0) != 0,

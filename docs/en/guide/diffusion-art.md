@@ -83,6 +83,9 @@ model and dataset cursor must belong to the same acquisition.
 On save, the actor persists the same-acquisition dataset cursor before DCP;
 the commit gate validates it alongside the training state and per-rank RNG.
 Only then are `COMMITTED`, latest markers and checkpoint retention advanced.
+ART requires eager data and `max_staleness=0`; unsupported streaming or stale
+acquisitions are rejected at startup. An already committed acquisition's cursor
+is immutable: a matching retry reuses it, and a conflicting save is rejected.
 The runtime checks the matching eager-dataset cursor before restoring training
 state; missing, corrupt or inconsistent cursors abort resume, including through
 the generic `train.py --load` entry point. New data cursors also bind the ordered
