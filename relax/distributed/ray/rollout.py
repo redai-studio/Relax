@@ -1419,8 +1419,7 @@ class RolloutManager(ReloadableMixin):
                 ray.get(host.close.remote())
                 ray.kill(host)
                 self._lora_runtime = None
-            elastic_groups = []
-            if _synchronous_colocate(self.args):
+            if _synchronous_colocate(getattr(self, "args", None)):
                 with self._engine_lifecycle_lock:
                     self._colocate_disposing = True
                 deadline = time.monotonic() + 35.0
@@ -1438,9 +1437,11 @@ class RolloutManager(ReloadableMixin):
                 if current is not None:
                     ray.get(source.disconnect_colocate_weight_group.remote(current[0]), timeout=35)
                 elastic_groups.extend(candidate.group for candidate in candidates if candidate.result is None)
-            self._shutdown_all_engines(extra_groups=elastic_groups)
-            for group in elastic_groups:
-                ray.util.remove_placement_group(group.pg[0])
+                self._shutdown_all_engines(extra_groups=elastic_groups)
+                for group in elastic_groups:
+                    ray.util.remove_placement_group(group.pg[0])
+            else:
+                self._shutdown_all_engines()
         finally:
             try:
                 # Deregister the worker's Mooncake segment before a fast restart.
