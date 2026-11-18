@@ -111,7 +111,7 @@ def controller_fixture():
         run=asyncio.run,
         asyncio=asyncio,
         Optional=Optional,
-        ROLES=SimpleNamespace(rollout="rollout"),
+        ROLES=SimpleNamespace(rollout="rollout", sft="sft"),
     )
     ns["GlobalStartup"] = GlobalStartup
     cls = load_methods(
@@ -129,6 +129,7 @@ def controller_fixture():
     ctrl._health_manager = SimpleNamespace(_checker=SimpleNamespace(_stop_event=threading.Event()))
     ctrl._restart_error = None
     ctrl._restarting = False
+    ctrl._sft_finishing = False
     ctrl._pending_task_refs_lock = threading.Lock()
     ctrl._pending_task_refs = []
     ctrl.config = SimpleNamespace(debug_train_only=True)

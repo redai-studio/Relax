@@ -44,6 +44,7 @@ class Roles(StrEnum):
     critic = "critic"
     reference = "reference"
     advantages = "advantages"
+    sft = "sft"
 
 
 def load_classes(path, names, namespace):

@@ -220,3 +220,83 @@ def test_aborted_startup_does_not_launch_prepare_after_queue_close(controller_mo
 
     close.assert_called_once()
     service.handle.prepare.remote.assert_not_called()
+
+
+def test_completion_snapshot_is_atomic_with_failed_recovery(controller_module):
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    controller = controller_module.Controller.__new__(controller_module.Controller)
+    controller.config = SimpleNamespace(debug_train_only=True, debug_rollout_only=False)
+    controller._pending_task_refs = []
+    controller._pending_task_refs_lock = threading.Lock()
+    controller._restart_lock = threading.RLock()
+    controller._restart_consumed_event = threading.Event()
+    controller._restart_consumed_event.set()
+    controller._restart_done_event = threading.Event()
+    controller._restart_error = None
+    controller._restarting = False
+    controller._health_manager = SimpleNamespace(_checker=None)
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    controller._report_error_to_metrics_service = Mock()
+    decision, release = threading.Event(), threading.Event()
+    callbacks = []
+
+    class Prepared:
+        def __await__(self):
+            return asyncio.sleep(0).__await__()
+
+    service = SimpleNamespace(
+        _sft_prepare_response=Prepared(),
+        handle=SimpleNamespace(stop=SimpleNamespace(remote=AsyncMock())),
+        run=lambda: None,
+    )
+
+    def failed_rebuild(_role):
+        controller._stop_prepared_sft(service)
+        controller.serve_dict.clear()
+        raise RuntimeError("rebuild failed after producer stop")
+
+    controller._restart_serve = Mock(side_effect=failed_rebuild)
+
+    def recover_at_snapshot():
+        acquired = controller._restart_lock.acquire(blocking=False)
+        if acquired:
+            try:
+                controller.restart_serve("sft")
+            finally:
+                controller._restart_lock.release()
+                decision.set()
+        else:
+            decision.set()
+            assert release.wait(timeout=5)
+            controller.restart_serve("sft")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+
+        class Services(dict):
+            fired = False
+
+            def get(self, key, default=None):
+                if key == "sft" and not self.fired:
+                    self.fired = True
+                    callbacks.append(executor.submit(recover_at_snapshot))
+                    assert decision.wait(timeout=5)
+                return super().get(key, default)
+
+        controller.serve_dict = Services(sft=service)
+        try:
+            try:
+                controller.training_loop()
+            except RuntimeError as error:
+                assert "rebuild failed after producer stop" in str(error)
+                completed = False
+            else:
+                completed = True
+        finally:
+            release.set()
+            for callback in callbacks:
+                callback.result(timeout=5)
+    # Either decision may win, but a failed recovery cannot become success.
+    assert completed is (not controller._restart_serve.called)

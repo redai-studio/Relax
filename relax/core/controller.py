@@ -1534,13 +1534,11 @@ class Controller:
             startup = GlobalStartup(self._fault_events, pending_recovery, pending_initialized)
             try:
                 run(run_all_services(resume_existing=resume_existing, startup=startup))
-                if self._restarting:
-                    raise RuntimeError("Service completion interrupted by recovery")
-                sft_service = self.serve_dict.get(ROLES.sft)
-                if sft_service is not None and vars(sft_service).get("_sft_prepare_response") is not None:
-                    with self._restart_lock:
-                        if self._restarting:
-                            raise RuntimeError("Service completion interrupted by recovery")
+                with self._restart_lock:
+                    if self._restarting:
+                        raise RuntimeError("Service completion interrupted by recovery")
+                    sft_service = self.serve_dict.get(ROLES.sft)
+                    if sft_service is not None and vars(sft_service).get("_sft_prepare_response") is not None:
                         # Choose completion atomically with recovery. A new
                         # replica must not undo the producer stop confirmation.
                         self._sft_finishing = True
