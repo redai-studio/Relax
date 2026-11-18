@@ -354,7 +354,6 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     --mount=type=bind,source=docker/patch/megatron/20261016-qwen38-models.patch,target=/tmp/relax-patches/20261016-qwen38-models.patch \
     --mount=type=bind,source=docker/patch/megatron/20261020-qwen35-optimized.patch,target=/tmp/relax-patches/20261020-qwen35-optimized.patch \
     --mount=type=bind,source=docker/patch/megatron/20261020-model-operators.patch,target=/tmp/relax-patches/20261020-model-operators.patch \
-    --mount=type=bind,source=docker/patch/megatron/20261117-qwen38-ple-input-halo.patch,target=/tmp/relax-patches/20261117-qwen38-ple-input-halo.patch \
     --mount=type=bind,source=docker/patch/megatron/mtp-cp-normalization.patch,target=/tmp/relax-patches/mtp-cp-normalization.patch \
     --mount=type=bind,source=docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch,target=/tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
     --mount=type=bind,source=docker/patch/megatron/fully-reshardable-checkpoint-padding.patch,target=/tmp/relax-patches/fully-reshardable-checkpoint-padding.patch \
@@ -365,7 +364,6 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     /tmp/relax-patches/20261016-qwen38-models.patch \
     /tmp/relax-patches/20261020-qwen35-optimized.patch \
     /tmp/relax-patches/20261020-model-operators.patch \
-    /tmp/relax-patches/20261117-qwen38-ple-input-halo.patch \
     /tmp/relax-patches/mtp-cp-normalization.patch \
     /tmp/relax-patches/20261028-dp-reshardable-checkpoint.patch \
     /tmp/relax-patches/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/ && \
@@ -382,8 +380,6 @@ RUN --mount=type=bind,source=docker/patch/${PATCH_VERSION}/megatron.patch,target
     sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261117-qwen38-ple-input-halo.patch && \
-    sha256sum 20261117-qwen38-ple-input-halo.patch > /etc/relax-ple-input-halo-patch.sha256 && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
     echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
     patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \

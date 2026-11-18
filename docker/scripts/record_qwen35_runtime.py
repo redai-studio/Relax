@@ -169,13 +169,13 @@ def main() -> None:
                 "flashqla": "/tmp/qwen35-build/0.1.3-kkt-no-tma.patch",
                 "flashqla_cumsum": "/tmp/qwen35-build/0.1.3-cumsum-heads.patch",
                 "megatron": "/root/Megatron-LM/20261020-qwen35-optimized.patch",
-                "ple_input_halo": "/root/Megatron-LM/20261117-qwen38-ple-input-halo.patch",
                 "model_operators": "/root/Megatron-LM/20261020-model-operators.patch",
                 "checkpoint": "/root/Megatron-LM/20261028-dp-reshardable-checkpoint.patch",
             }.items()
         },
         "gpu_validated": False,
     }
+    report["patch_sha256"]["megatron_base"] = Path("/etc/relax-megatron-patch.sha256").read_text().split()[0]
     Path("/etc/relax-qwen35-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
