@@ -796,6 +796,9 @@ def test_colocate_registration_confirms_or_reconciles_queued_worker(monkeypatch,
 
     engine = _make_engine(sglang_engine_module)
     engine._is_scaled_out = True
+    engine._skip_router_registration = True
+    engine.args.colocate = True
+    engine.args.rollout_external = False
     monkeypatch.setattr(
         sglang_engine_module.ray,
         "get_runtime_context",
@@ -832,6 +835,7 @@ def test_colocate_registration_confirms_or_reconciles_queued_worker(monkeypatch,
         assert engine._router_worker_id == worker["id"]
     else:
         assert engine.unregister_from_router(wait_for_removal=True, allow_already_absent=True)
+        engine.shutdown()
         if registration in ("rejected", "foreign"):
             delete.assert_not_called()
         else:
