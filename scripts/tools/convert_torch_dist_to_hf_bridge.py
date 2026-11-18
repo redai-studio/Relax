@@ -3,7 +3,9 @@
 import argparse
 import os
 import sys
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -18,6 +20,10 @@ _pythonpath_entries = [
 ]
 os.environ["PYTHONPATH"] = os.pathsep.join([_RELAX_ROOT, *_pythonpath_entries])
 
+from relax.utils.logging_utils import get_logger  # noqa: E402
+
+
+logger = get_logger(__name__)
 
 _model_load_save_module = None
 _original_load_model_config = None
@@ -90,7 +96,7 @@ def _build_lora_checkpoint_spec(metadata):
         if len(in_shape) not in (2, 3) or len(out_shape) != len(in_shape):
             raise ValueError(f"Unsupported LoRA adapter shapes: linear_in={in_shape}, linear_out={out_shape}")
         ranks.add(in_shape[-2])
-        if out_shape[-1] != in_shape[-2]:
+        if out_shape[-1] != in_shape[-2] or out_shape[:-2] != in_shape[:-2]:
             raise ValueError(f"LoRA rank mismatch: linear_in={in_shape}, linear_out={out_shape}")
 
     if len(ranks) != 1:
@@ -106,22 +112,27 @@ def _build_lora_checkpoint_spec(metadata):
         "rank": ranks.pop(),
         "target_modules": sorted(model_targets),
         "adapter_keys": set(adapter_shapes),
-        "share_expert_adapters": not any(len(shape) == 3 for shape in adapter_shapes.values()),
+        # Vision layers also prepend a layer axis to otherwise dense adapters.
+        # Only grouped MoE paths carry an expert axis.
+        "share_expert_adapters": not any(
+            ".mlp.experts." in prefix and len(adapter_shapes[pair["in"]]) == 3 for prefix, pair in pairs.items()
+        ),
     }
 
 
 def _checkpoint_adapter_prefix_to_model_target(prefix):
     target = prefix.replace(".mlp.experts.experts.", ".mlp.experts.")
-    vision_layers_prefix = "vision_model.decoder.layers."
-    if target.startswith(vision_layers_prefix):
-        suffix = target[len(vision_layers_prefix) :]
+    for vision_prefix in ("vision_model.decoder.layers.", "vision_model.decoder.deepstack_merger_list."):
+        if not target.startswith(vision_prefix):
+            continue
+        suffix = target[len(vision_prefix) :]
         first_component = suffix.split(".", 1)[0]
         if not first_component.isdigit():
             # Qwen3-VL's vision sharded_state_dict collapses the physical layer
             # index into the ShardedTensor offsets. Recreate every concrete
             # vision layer with a wildcard; adapter coverage below still checks
             # the persistent DCP keys exactly before any weights are loaded.
-            target = f"{vision_layers_prefix}*.{suffix}"
+            target = f"{vision_prefix}*.{suffix}"
     return target
 
 
@@ -218,6 +229,49 @@ def _save_file_ensure_contiguous(tensors, filename, metadata=None):
     return _original_save_file(fixed, filename, metadata=metadata)
 
 
+class _ExportDtypeMapping(Mapping[str, torch.Tensor]):
+    """Keep Bridge's PLE mapping lazy while casting one shard at a time."""
+
+    def __init__(self, weights: Mapping[str, torch.Tensor], dtype: torch.dtype) -> None:
+        self.weights = weights
+        self.dtype = dtype
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.weights)
+
+    def __len__(self) -> int:
+        return len(self.weights)
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        weight = self.weights[name]
+        return weight.to(self.dtype) if weight.is_floating_point() else weight
+
+
+def _cast_export_weight_dtype(
+    weights: Mapping[str, torch.Tensor], weight_dtype: torch.dtype | None
+) -> Mapping[str, torch.Tensor]:
+    return weights if weight_dtype is None else _ExportDtypeMapping(weights, weight_dtype)
+
+
+def _apply_checkpoint_precision(provider: Any, checkpoint_args: Any) -> None:
+    """Recreate the saved precision, including flags consulted by Bridge's CPU
+    loader; the HF Qwen4Exp provider otherwise defaults to FP32."""
+    if getattr(checkpoint_args, "bf16", False):
+        dtype = torch.bfloat16
+    elif getattr(checkpoint_args, "fp16", False):
+        dtype = torch.float16
+    else:
+        dtype = getattr(checkpoint_args, "params_dtype", None)
+    if dtype is None:
+        return
+    if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"Unsupported checkpoint parameter dtype: {dtype}")
+    provider.params_dtype = dtype
+    provider.bf16 = dtype == torch.bfloat16
+    provider.fp16 = dtype == torch.float16
+    logger.info("Loading Megatron parameters using checkpoint precision: %s", dtype)
+
+
 # Here we need to patch Megatron Bridge's `load_model_config`, since the checkpoint is saved
 # by Megatron and lack of provider information.
 def _patched_load_model_config(checkpoint_path):
@@ -230,6 +284,7 @@ def _patched_load_model_config(checkpoint_path):
         from megatron.bridge.training.mlm_compat.arguments import _load_args_from_checkpoint
 
         mlm_args = _load_args_from_checkpoint(checkpoint_path)
+        _apply_checkpoint_precision(provider, mlm_args)
         checkpoint_moe_layer_freq = getattr(mlm_args, "moe_layer_freq", None)
         if isinstance(checkpoint_moe_layer_freq, list):
             provider.moe_layer_freq = checkpoint_moe_layer_freq
@@ -252,12 +307,15 @@ def _initialize_bridge_patches():
     import megatron.bridge.training.mlm_compat.arguments as mlm_compat_args_module
     import megatron.bridge.training.model_load_save as model_load_save_module
     import safetensors.torch as safetensors_torch
+    from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 
     _model_load_save_module = model_load_save_module
     _original_load_model_config = model_load_save_module.load_model_config
     _original_save_file = safetensors_torch.save_file
     model_load_save_module.load_model_config = _patched_load_model_config
     safetensors_torch.save_file = _save_file_ensure_contiguous
+    # A dict comprehension here would materialize every PLE shard at once.
+    MegatronModelBridge._cast_export_weight_dtype = staticmethod(_cast_export_weight_dtype)
     _original_transformer_config_from_args = mlm_compat_args_module._transformer_config_from_args
     mlm_compat_args_module._transformer_config_from_args = _patched_transformer_config_from_args
     # Some Bridge revisions import this helper by name.
@@ -317,6 +375,7 @@ def _checkpoint_has_mtp(input_dir):
     return any("mtp" in k.lower() for k in metadata.state_dict_metadata)
 
 
+@torch.no_grad()
 def _export_checkpoint(bridge, input_dir, output_dir, strict, *, weight_dtype=None):
     """Load torch-dist weights and explicitly merge any reconstructed LoRA on
     HF export."""
@@ -326,7 +385,7 @@ def _export_checkpoint(bridge, input_dir, output_dir, strict, *, weight_dtype=No
     if weight_dtype is not None:
         save_kwargs["weight_dtype"] = weight_dtype
     with temporary_distributed_context(backend="gloo"):
-        megatron_model = bridge.load_megatron_model(input_dir, wrap_with_ddp=False)
+        megatron_model = bridge.load_megatron_model(input_dir, wrap_with_ddp=False, use_cpu_initialization=True)
         bridge.save_hf_pretrained(megatron_model, output_dir, **save_kwargs)
 
 
@@ -392,6 +451,13 @@ if __name__ == "__main__":
         help="Device used for one-tensor-at-a-time FP8 quantization (default: cuda).",
     )
     parser.add_argument(
+        "--max-shard-size-mb",
+        type=int,
+        default=1024,
+        help="Target BF16 safetensors shard size in MiB (default: 1024); a single tensor may exceed it. "
+        "Bounds the output buffer only: loading still requires the full Megatron model in host memory.",
+    )
+    parser.add_argument(
         "--fp8-max-shard-size-mb",
         type=int,
         default=4096,
@@ -406,6 +472,8 @@ if __name__ == "__main__":
             "--copy-config and --fp8 are mutually exclusive: --fp8 quantizes with its own recipe, "
             "so the origin config would misdescribe the exported weights."
         )
+    if args.max_shard_size_mb <= 0:
+        raise ValueError("--max-shard-size-mb must be positive")
 
     _initialize_bridge_patches()
     from megatron.bridge import AutoBridge
@@ -420,13 +488,13 @@ if __name__ == "__main__":
             "they will be reconstructed and merged into the exported HF weights"
         )
 
-    if args.fp8:
+    if args.fp8 or args.bf16:
         try:
             output_is_origin = os.path.samefile(args.output_dir, args.origin_hf_dir)
         except FileNotFoundError:
             output_is_origin = os.path.realpath(args.output_dir) == os.path.realpath(args.origin_hf_dir)
         if output_is_origin:
-            raise ValueError("--output-dir must differ from --origin-hf-dir for online FP8 conversion")
+            raise ValueError("--output-dir must differ from --origin-hf-dir for streaming conversion")
     if os.path.exists(args.output_dir) and not args.force:
         raise ValueError(f"Output directory {args.output_dir} already exists. Use --force to overwrite it.")
 
@@ -464,25 +532,31 @@ if __name__ == "__main__":
     fp8_writer = None
     source = None
     original_save_generator = None
-    if args.fp8:
+    if args.fp8 or args.bf16:
         state = getattr(bridge.hf_pretrained, "state", None)
         source = getattr(state, "source", None)
         if source is None or not hasattr(source, "key_to_filename_map"):
-            raise ValueError("Online FP8 conversion requires --origin-hf-dir to contain safetensors weights")
-        fp8_writer = StreamingFP8Writer(
-            source.key_to_filename_map,
-            args.fp8_strategy,
-            fp8_block_size,
-            args.fp8_device,
-            args.fp8_max_shard_size_mb * 1024**2,
-        )
+            raise ValueError("Streaming conversion requires --origin-hf-dir to contain safetensors weights")
         original_save_generator = source.save_generator
-        source.save_generator = fp8_writer.save_generator
-        print(
-            f"[convert] Enabled streaming FP8: strategy={args.fp8_strategy}, "
-            f"block_size={fp8_block_size}, device={args.fp8_device}, "
-            f"max_shard_size_mb={args.fp8_max_shard_size_mb}"
-        )
+        if args.fp8:
+            fp8_writer = StreamingFP8Writer(
+                source.key_to_filename_map,
+                args.fp8_strategy,
+                fp8_block_size,
+                args.fp8_device,
+                args.fp8_max_shard_size_mb * 1024**2,
+            )
+            source.save_generator = fp8_writer.save_generator
+            logger.info("Enabled streaming FP8: max_shard_size_mb=%d", args.fp8_max_shard_size_mb)
+        else:
+            from relax.utils.quant_cast.fp8_checkpoint import StreamingHFWriter
+
+            hf_writer = StreamingHFWriter(source.key_to_filename_map, args.max_shard_size_mb * 1024**2)
+            source.save_generator = hf_writer.save_generator
+            logger.info(
+                "Enabled streaming BF16: max_shard_size_mb=%d; the full Megatron model still resides in CPU memory",
+                args.max_shard_size_mb,
+            )
 
     print(f"Exporting checkpoint from {args.input_dir} to {args.output_dir}")
     try:

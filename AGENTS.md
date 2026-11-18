@@ -168,21 +168,28 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 
 ## Domain experts & skills
 
+### Codex 架构专家入口
+
+执行框架架构评审、职责划分或分层重构任务时，先完整读取当前工作区的
+`.codex/agents/arch-expert.md`，并将其作为本任务的专家工作指引。该文件不取代用户指令或本文件的约束。
+Codex 的子代理名称为 `arch_expert`；Claude/OpenCode 使用文件名对应的 `arch-expert`。
+
 Fire the appropriate **expert subagent** or **load a skill** based on what you're working on. Experts are read-only consultants with deep domain knowledge; skills are step-by-step implementation guides.
 
-| Working on...                                | Fire subagent      | Load skill              |
-| -------------------------------------------- | ------------------ | ----------------------- |
-| Megatron backend (TP/PP/CP/EP)               | `megatron-expert`  |                         |
-| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)      | `algorithm-expert` |                         |
-| Task Launch & service deployment             | `launcher-expert`  |                         |
-| Ray framework (Core, Serve, Jobs, placement) | `ray-expert`       |                         |
-| Development & code changes                   | `ray-expert`       | `dev`                   |
-| Agentic rollout integration, runtime & hangs | `agentic-expert`   | `agentic-rollout`       |
-| Distributed training hang debugging          | `ray-expert`       | `debug-hang`            |
-| Code review of git changes                   | --                 | `code-review`           |
-| Creating new skills                          | --                 | `creating-skills`       |
-| Git commits                                  | --                 | `git-commit`            |
-| GitHub contribution, PRs & review follow-up  | --                 | `relax-github-workflow` |
-| GitHub required checks & CI operations       | --                 | `relax-github-ci`       |
+| Working on...                                     | Fire subagent                          | Load skill              |
+| ------------------------------------------------- | -------------------------------------- | ----------------------- |
+| Framework architecture, responsibility & layering | `arch-expert`                          | --                      |
+| Megatron backend (TP/PP/CP/EP)                    | `megatron-expert`                      |                         |
+| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)           | `algorithm-expert`                     |                         |
+| Task Launch & service deployment                  | `launcher-expert`                      |                         |
+| Ray framework (Core, Serve, Jobs, placement)      | `ray-expert`                           |                         |
+| Development & code changes                        | `ray-expert`                           | `dev`                   |
+| Agentic rollout integration, runtime & hangs      | `agentic-expert`                       | `agentic-rollout`       |
+| Distributed training hang debugging               | `ray-expert`                           | `debug-hang`            |
+| Code review of git changes                        | `arch-expert` for architecture changes | `code-review`           |
+| Creating new skills                               | --                                     | `creating-skills`       |
+| Git commits                                       | --                                     | `git-commit`            |
+| GitHub contribution, PRs & review follow-up       | --                                     | `relax-github-workflow` |
+| GitHub required checks & CI operations            | --                                     | `relax-github-ci`       |
 
 **How to fire an expert**: task(subagent_type="megatron-expert", load_skills=\[\], run_in_background=true, prompt="...")

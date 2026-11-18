@@ -11,6 +11,7 @@ implementation.
 
 import ast
 import math
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,14 +24,21 @@ import torch.nn.functional as F
 PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20261016-qwen38-models.patch"
 
 
-def _added_source(relative: str) -> str:
-    text = PATCH.read_text()
+def _added_source(relative: str, patch: Path = PATCH) -> str:
+    text = patch.read_text()
     section = text.split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
     return "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++"))
 
 
 def _load_ple(parallel_state):
-    namespace = {"torch": torch, "Tensor": torch.Tensor, "F": F, "math": math, "parallel_state": parallel_state}
+    namespace = {
+        "torch": torch,
+        "Tensor": torch.Tensor,
+        "F": F,
+        "math": math,
+        "os": os,
+        "parallel_state": parallel_state,
+    }
     hyper = ast.parse(_added_source("megatron/core/transformer/hyper_connection.py"))
     norm = next(
         node
@@ -38,7 +46,11 @@ def _load_ple(parallel_state):
         if isinstance(node, ast.FunctionDef) and node.name == "gated_residual_group_rmsnorm"
     )
     exec(compile(ast.Module(body=[norm], type_ignores=[]), str(PATCH), "exec"), namespace)
-    source = ast.parse(_added_source("megatron/core/transformer/per_layer_embedding.py"))
+    source = ast.parse(
+        _added_source(
+            "megatron/core/transformer/per_layer_embedding.py", PATCH.parent.parent / "latest/megatron.patch"
+        )
+    )
     cls = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "PerLayerEmbedding")
     names = {"forward", "_local_positions", "_causal_dilated_conv"}
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]

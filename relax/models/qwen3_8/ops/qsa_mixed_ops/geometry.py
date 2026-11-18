@@ -6,7 +6,7 @@
 def validate_geometry(backend: str, q_heads: int, kv_heads: int, q_dim: int, k_dim: int) -> None:
     """Check the selected backend before document routing or kernel
     execution."""
-    if backend not in ("grouped", "cudnn_pr1765"):
+    if backend not in ("grouped", "cudnn_pr1765", "cute"):
         raise ValueError(f"Unknown mixed QSA long backend: {backend}")
     actual = f"{q_heads}Q/{kv_heads}KV, Q D{q_dim}/K D{k_dim}"
     if backend == "cudnn_pr1765":
@@ -20,4 +20,9 @@ def validate_geometry(backend: str, q_heads: int, kv_heads: int, q_dim: int, k_d
         raise NotImplementedError(
             f"Mixed QSA backend={backend} received {actual}; requires positive Q/KV heads, "
             "integral local GQA groups (Q heads divisible by KV heads), and D256 for Q and K."
+        )
+
+    if backend == "cute" and not 5 <= q_heads // kv_heads <= 128:
+        raise NotImplementedError(
+            "CuTe QSA requires a local GQA group of 5–128 for its membership bitmask and MMA tile"
         )

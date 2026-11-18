@@ -13,6 +13,8 @@ import hashlib
 import json
 import os
 import re
+import select
+import shlex
 import shutil
 import signal
 import socket
@@ -23,7 +25,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from relax.agentic.profile import agentic_trace_events, mark_agentic_event
 from relax.utils.agentic_obs.writers import best_effort, submit_background
@@ -35,17 +37,18 @@ from relax.utils.logging_utils import get_logger
 # namespace. Its depth follows the package path ``relax/agentic/runner``;
 # moving this module requires updating the relationship atomically.
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-# Grace period between cooperative termination and forced process-group kill.
-# Increasing it retains Session resources longer; decreasing it risks cutting
-# off an agent while it is flushing output and cleanup.
-_TERMINATION_GRACE_SECONDS = 5.0
-_TERMINATION_RESPONSE_TIMEOUT_SECONDS = 2 * _TERMINATION_GRACE_SECONDS + 1.0
+# Give the root and its adopted descendants separate TERM windows after logical retirement.
+_COOPERATIVE_TERMINATION_GRACE_SECONDS = 120.0
+# Wait after SIGKILL for the kernel to report exit; the subreaper must survive a blocked child.
+_TERMINATION_GRACE_SECONDS = 10.0
+_TERMINATION_RESPONSE_TIMEOUT_SECONDS = _COOPERATIVE_TERMINATION_GRACE_SECONDS + _TERMINATION_GRACE_SECONDS + 1.0
+_SUPERVISOR_TERMINATION_TIMEOUT_SECONDS = 2 * _TERMINATION_RESPONSE_TIMEOUT_SECONDS
 # Deadline for the node-local launcher daemon to publish its Unix socket.
 # This covers process bootstrap rather than the agent's active timeout.
 _LAUNCHER_BOOTSTRAP_TIMEOUT_SECONDS = 30.0
 # Wire-format version shared by LauncherClient and the daemon. A mismatch is a
 # hard compatibility break and must be rolled out atomically.
-_LAUNCHER_PROTOCOL_VERSION = 1
+_LAUNCHER_PROTOCOL_VERSION = 2
 # Four-byte network-order length prefix. Changing it makes every existing
 # launcher connection undecodable.
 _LAUNCHER_MESSAGE_SIZE = struct.Struct("!I")
@@ -59,7 +62,7 @@ logger = get_logger(__name__)
 
 
 class AgentExecutionError(RuntimeError):
-    """Expected agent-level failure that drops its rollout group."""
+    """Expected failure of one external agent."""
 
     def __init__(self, message: str = "", *, reason_code: str = "agent_execution_failed") -> None:
         super().__init__(message)
@@ -142,11 +145,7 @@ class _LauncherProcess:
         """Decode the daemon exit frame."""
 
         response = await _read_launcher_message(self._reader)
-        if (
-            response.get("op") != "exit"
-            or not isinstance(response.get("return_code"), int)
-            or not isinstance(response.get("group_closed"), bool)
-        ):
+        if response.get("op") != "exit" or not isinstance(response.get("return_code"), int):
             raise LauncherProtocolError(f"launcher expected an exit message, got {response!r}")
         return response["return_code"]
 
@@ -168,7 +167,12 @@ class LauncherClient:
     ) -> _LauncherProcess:
         """Launch an agent and return its connection capability."""
 
-        reader, writer = await asyncio.open_unix_connection(self._socket_path)
+        try:
+            reader, writer = await asyncio.open_unix_connection(self._socket_path)
+        except BaseException:
+            # No launch request was sent, so the daemon cannot own this directory.
+            _cleanup_session_dir(Path(session_dir))
+            raise
         try:
             await _write_launcher_message(
                 writer,
@@ -305,7 +309,8 @@ class ManagedCommandAppSpec:
     timeout_s: float = 1800.0
 
     def __post_init__(self) -> None:
-        if not self.command.strip():
+        argv = shlex.split(self.command)
+        if not argv or not argv[0]:
             raise ValueError("managed agent command must be non-empty")
         if not Path(self.cwd).is_dir():
             raise ValueError(f"managed agent cwd must be an existing directory: {self.cwd}")
@@ -428,8 +433,6 @@ class ManagedAgentProcess:
                 terminate(),
                 timeout=_TERMINATION_RESPONSE_TIMEOUT_SECONDS + _TERMINATION_GRACE_SECONDS,
             )
-        except Exception:
-            pass
         finally:
             if not self._task.done():
                 self._task.cancel()
@@ -440,7 +443,9 @@ class ManagedAgentProcess:
 
         process_events: dict[str, Any] = {}
         mark_agentic_event(process_events, "managed_prepare_start_at")
-        with tempfile.TemporaryDirectory(prefix="relax-agentic-command-") as session_dir:
+        session_dir = tempfile.mkdtemp(prefix="relax-agentic-command-")
+        launch_attempted = False
+        try:
             session_path = Path(session_dir)
             input_path = session_path / "session_input.json"
             output_path = session_path / "session_output.json"
@@ -464,6 +469,7 @@ class ManagedAgentProcess:
             try:
                 mark_agentic_event(process_events, "managed_launch_start_at")
                 mark_agentic_event(process_events, "managed_process_start_at")
+                launch_attempted = True
                 self._process = await self._launcher.launch(
                     command=self._spec.command,
                     cwd=self._spec.cwd,
@@ -474,7 +480,15 @@ class ManagedAgentProcess:
                 mark_agentic_event(process_events, "managed_process_spawn_return_at")
                 mark_agentic_event(process_events, "managed_launch_return_at")
                 self._launch_finished.set()
-                return_code = await self._process.wait()
+                try:
+                    return_code = await self._process.wait()
+                except asyncio.CancelledError:
+                    if self._timed_out:
+                        raise AgentExecutionError(
+                            f"Managed command agent timed out after {self._spec.timeout_s} seconds.",
+                            reason_code="agent_timeout",
+                        ) from None
+                    raise
                 mark_agentic_event(process_events, "managed_process_exit_at")
                 log_tail = _read_log_tail(log_path)
                 if self._timed_out:
@@ -492,7 +506,7 @@ class ManagedAgentProcess:
                         output_text = output_path.read_text(encoding="utf-8")
                         mark_agentic_event(process_events, "managed_output_read_at")
                         self._output = _session_output_from_text(output_text)
-                    except Exception as error:
+                    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
                         raise AgentExecutionError(
                             f"Managed command agent produced invalid output.\n{log_tail}".rstrip(),
                             reason_code="agent_output_invalid",
@@ -512,8 +526,18 @@ class ManagedAgentProcess:
                                 raise
                 finally:
                     if self._process is not None:
-                        await self._process.close()
-                        self._process = None
+                        try:
+                            await self._process.close()
+                        except Exception as error:
+                            logger.warning(
+                                "Agent connection cleanup failed for session_id=%s: %s", self._session_id, error
+                            )
+                        finally:
+                            self._process = None
+
+        finally:
+            if not launch_attempted:
+                _cleanup_session_dir(Path(session_dir))
 
     @best_effort
     async def _persist_observation_log(self, source: Path) -> None:
@@ -691,126 +715,138 @@ def ensure_local_launcher_daemon() -> str:
         return socket_path
 
 
-class _ProcessGroup:
-    """Daemon-owned lifetime for one launcher command and all descendants."""
+class _SessionSupervisor:
+    """One physical attempt's private subreaper, owned by one launcher
+    connection."""
 
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self._process = process
-        # start_new_session=True makes the child a session and process-group
-        # leader, so its PID is the stable PGID even if the leader exits before
-        # the daemon can query the kernel again.
-        self.pgid = process.pid
-        self.exit_task = asyncio.create_task(process.wait(), name=f"launcher-pgid:{self.pgid}")
-        self._termination_task: Optional["asyncio.Task[tuple[int, bool]]"] = None
+        self.exit_task = asyncio.create_task(self._read_exit(), name=f"agent-root:{process.pid}")
 
-    def alive(self) -> bool:
-        try:
-            os.killpg(self.pgid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-
-    def signal(self, signal_value: signal.Signals) -> None:
-        try:
-            os.killpg(self.pgid, signal_value)
-        except ProcessLookupError:
-            pass
-
-    async def terminate_and_join(self) -> tuple[int, bool]:
-        """Close the whole group once, escalating from TERM to KILL."""
-
-        if self._termination_task is None:
-            self._termination_task = asyncio.create_task(
-                self._terminate_and_join(),
-                name=f"launcher-terminate-pgid:{self.pgid}",
+    @classmethod
+    async def start(cls, request: Mapping[str, Any]) -> "_SessionSupervisor":
+        spawn = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                f"from {__name__} import _session_supervisor_main; _session_supervisor_main()",
+                cwd=_REPOSITORY_ROOT,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
+        )
         try:
-            return await asyncio.shield(self._termination_task)
+            process = await asyncio.shield(spawn)
         except asyncio.CancelledError:
-            await self._termination_task
+            process = await spawn
+            process.stdin.close()
+            _cleanup_session_dir(Path(request["session_dir"]))
             raise
-
-    async def _terminate_and_join(self) -> tuple[int, bool]:
-        if await self._wait_closed(0):
-            return self._return_code(), True
-        self.signal(signal.SIGTERM)
-        if not await self._wait_closed(_TERMINATION_GRACE_SECONDS):
-            self.signal(signal.SIGKILL)
-            if not await self._wait_closed(_TERMINATION_GRACE_SECONDS):
-                return self._return_code(), False
-        return self._return_code(), True
-
-    def _return_code(self) -> int:
-        return_code = self._process.returncode
-        return return_code if return_code is not None else -int(signal.SIGKILL)
-
-    async def _wait_closed(self, timeout: float) -> bool:
-        deadline = time.monotonic() + max(timeout, 0.0)
-        while True:
-            if self.exit_task.done():
-                self._reap_exited_descendants()
-                if not self.alive():
-                    return True
-            if time.monotonic() >= deadline:
-                return False
-            await asyncio.sleep(min(0.05, deadline - time.monotonic()))
-
-    def _reap_exited_descendants(self) -> None:
-        while True:
+        except OSError:
+            _cleanup_session_dir(Path(request["session_dir"]))
+            raise
+        try:
+            process.stdin.write((json.dumps(request) + "\n").encode())
+            await process.stdin.drain()
+            reply = await asyncio.wait_for(process.stdout.readline(), timeout=_LAUNCHER_BOOTSTRAP_TIMEOUT_SECONDS)
+            response = json.loads(reply)
+            if response != {"op": "started"}:
+                raise LauncherProtocolError(f"supervisor expected started, got {response!r}")
+        except BaseException:
+            # Closing stdin makes the supervisor own any launch that beat its acknowledgement.
+            process.stdin.close()
             try:
-                pid, _ = os.waitpid(-self.pgid, os.WNOHANG)
-            except ChildProcessError:
-                return
-            if pid <= 0:
-                return
+                await asyncio.wait_for(process.wait(), timeout=_SUPERVISOR_TERMINATION_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning("Agent supervisor still cleaning failed launch pid=%s", process.pid)
+            else:
+                if process.returncode == 0:
+                    _cleanup_session_dir(Path(request["session_dir"]))
+            raise
+        return cls(process)
+
+    async def _read_exit(self) -> int:
+        response = json.loads(await self._process.stdout.readline())
+        if response.get("op") != "exit":
+            raise LauncherProtocolError(f"supervisor expected exit, got {response!r}")
+        return response["return_code"]
+
+    async def terminate(self) -> int:
+        if not self.exit_task.done():
+            self._process.stdin.write(b'{"op":"terminate"}\n')
+            await self._process.stdin.drain()
+        return await asyncio.wait_for(asyncio.shield(self.exit_task), timeout=_TERMINATION_RESPONSE_TIMEOUT_SECONDS)
+
+    async def close(self) -> bool:
+        self._process.stdin.close()
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=_SUPERVISOR_TERMINATION_TIMEOUT_SECONDS)
+            return self._process.returncode == 0
+        except asyncio.TimeoutError:
+            logger.warning("Agent supervisor still reaping descendants pid=%s", self._process.pid)
+            return False
+        finally:
+            if not self.exit_task.done():
+                self.exit_task.cancel()
+            await asyncio.gather(self.exit_task, return_exceptions=True)
 
 
 async def _supervise_launcher_process(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-    process_group: _ProcessGroup,
-    session_dir: Path,
-) -> None:
+    supervisor: _SessionSupervisor,
+) -> bool:
     """Bind process lifetime and orphan cleanup to its owner connection."""
 
     request_task = asyncio.create_task(_read_launcher_message(reader))
-    owner_disappeared = False
     try:
-        done, _ = await asyncio.wait(
-            (process_group.exit_task, request_task),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if process_group.exit_task not in done:
+        done, _ = await asyncio.wait((supervisor.exit_task, request_task), return_when=asyncio.FIRST_COMPLETED)
+        if supervisor.exit_task in done:
+            return_code = supervisor.exit_task.result()
+        else:
             try:
                 request = request_task.result()
             except asyncio.IncompleteReadError:
-                owner_disappeared = True
-                return
+                return True
             if request.get("op") != "terminate":
                 raise LauncherProtocolError(f"launcher expected a terminate message, got {request!r}")
-        return_code, group_closed = await process_group.terminate_and_join()
+            return_code = await supervisor.terminate()
         try:
-            await _write_launcher_message(
-                writer,
-                {"op": "exit", "return_code": return_code, "group_closed": group_closed},
-            )
+            await _write_launcher_message(writer, {"op": "exit", "return_code": return_code})
         except (BrokenPipeError, ConnectionResetError):
-            owner_disappeared = True
-            return
+            return True
         if not request_task.done():
             request_task.cancel()
             await asyncio.gather(request_task, return_exceptions=True)
         await reader.read()
+        return True
     finally:
-        await process_group.terminate_and_join()
         if not request_task.done():
             request_task.cancel()
         await asyncio.gather(request_task, return_exceptions=True)
-        if owner_disappeared:
-            try:
-                shutil.rmtree(session_dir)
-            except FileNotFoundError:
-                pass
+
+
+def _validated_session_dir(path: str) -> Path:
+    directory = Path(path)
+    if (
+        not directory.is_absolute()
+        or not directory.name.startswith("relax-agentic-command-")
+        or directory.is_symlink()
+        or directory.stat().st_uid != os.getuid()
+    ):
+        raise LauncherProtocolError(f"invalid launcher session directory: {path!r}")
+    return directory
+
+
+def _cleanup_session_dir(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logger.warning("Agent directory cleanup failed for %s: %s", path, error)
 
 
 async def _launch_for_client(
@@ -829,29 +865,20 @@ async def _launch_for_client(
         raise LauncherProtocolError("launcher command, cwd, log_path, and session_dir must be strings")
     if not isinstance(env, dict):
         raise LauncherProtocolError("launcher env must be a JSON object")
-    with Path(log_path).open("ab") as log_file:
-        process = await asyncio.create_subprocess_exec(
-            "/bin/bash",
-            "-lc",
-            command,
-            cwd=cwd,
-            env={str(key): str(value) for key, value in env.items()},
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
-    process_group = _ProcessGroup(process)
+    session_path = _validated_session_dir(session_dir)
+    supervisor = await _SessionSupervisor.start(request)
+    owner_released = False
     try:
         await _write_launcher_message(writer, {"op": "started"})
-        await _supervise_launcher_process(reader, writer, process_group, Path(session_dir))
+        owner_released = await _supervise_launcher_process(reader, writer, supervisor)
     except (BrokenPipeError, ConnectionResetError):
-        try:
-            shutil.rmtree(session_dir)
-        except FileNotFoundError:
-            pass
+        owner_released = True
     finally:
-        await process_group.terminate_and_join()
+        group_closed = await supervisor.close()
+        if group_closed and owner_released:
+            await asyncio.to_thread(_cleanup_session_dir, session_path)
+        else:
+            logger.warning("Agent tree cleanup or owner release incomplete; retaining %s", session_path)
 
 
 async def _handle_launcher_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -916,13 +943,130 @@ def _enable_child_subreaper() -> None:
         raise OSError(error_number, os.strerror(error_number))
 
 
+def _supervise_attempt_process(process: subprocess.Popen, control: Any, report_exit: Callable[[int], None]) -> None:
+    """Report root exit before reaping this attempt's adopted descendants."""
+
+    root_code: Optional[int] = None
+
+    def reap() -> bool:
+        nonlocal root_code
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return False
+            if pid == 0:
+                return True
+            if pid == process.pid:
+                root_code = os.waitstatus_to_exitcode(status)
+
+    while root_code is None:
+        reap()
+        if root_code is not None:
+            break
+        readable, _, _ = select.select((control,), (), (), 0.05)
+        if readable:
+            message = control.readline()
+            if not message or json.loads(message).get("op") == "terminate":
+                break
+
+    if root_code is None:
+        for signal_value, grace in (
+            (signal.SIGTERM, _COOPERATIVE_TERMINATION_GRACE_SECONDS),
+            (signal.SIGKILL, _TERMINATION_GRACE_SECONDS),
+        ):
+            try:
+                os.kill(process.pid, signal_value)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + grace
+            while root_code is None and time.monotonic() < deadline:
+                reap()
+                if root_code is None:
+                    time.sleep(0.05)
+            if root_code is not None:
+                break
+        # The subreaper must outlive a kernel-blocked root process.
+        while root_code is None:
+            reap()
+            time.sleep(0.1)
+    process.returncode = root_code
+    report_exit(root_code)
+
+    def children() -> tuple[int, ...]:
+        return tuple(int(pid) for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text().split())
+
+    for signal_value, grace in (
+        (signal.SIGTERM, _COOPERATIVE_TERMINATION_GRACE_SECONDS),
+        (signal.SIGKILL, _TERMINATION_GRACE_SECONDS),
+    ):
+        deadline = time.monotonic() + grace
+        signaled: set[int] = set()
+        while reap():
+            for pid in children():
+                if pid not in signaled:
+                    try:
+                        os.kill(pid, signal_value)
+                    except ProcessLookupError:
+                        pass
+                    signaled.add(pid)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        else:
+            return
+    # Retain ownership until the last descendant exits, even after callers time out.
+    while reap():
+        for pid in children():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.1)
+
+
+def _session_supervisor_main() -> None:
+    _enable_child_subreaper()
+    control = sys.stdin.buffer
+
+    def send(payload: Mapping[str, Any]) -> None:
+        try:
+            sys.stdout.buffer.write((json.dumps(payload) + "\n").encode())
+            sys.stdout.buffer.flush()
+        except BrokenPipeError:
+            pass
+
+    line = control.readline()
+    if not line:
+        return
+    request = json.loads(line)
+    try:
+        argv = shlex.split(request["command"])
+        if not argv or not argv[0]:
+            raise ValueError("managed agent command must name an executable")
+        with Path(request["log_path"]).open("ab") as log_file:
+            process = subprocess.Popen(
+                argv,
+                cwd=request["cwd"],
+                env={str(key): str(value) for key, value in request["env"].items()},
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except (OSError, ValueError) as error:
+        send({"op": "error", "error": str(error)})
+        return
+    send({"op": "started"})
+    _supervise_attempt_process(process, control, lambda code: send({"op": "exit", "return_code": code}))
+
+
 def _main() -> None:
     """Run the launcher daemon CLI entrypoint."""
 
     parser = argparse.ArgumentParser(description="Relax agentic launcher daemon")
     parser.add_argument("--launcher-socket", required=True)
     args = parser.parse_args()
-    _enable_child_subreaper()
     asyncio.run(_run_launcher_daemon(args.launcher_socket))
 
 

@@ -1363,15 +1363,25 @@ class Controller:
                     # via checkpoint engine. Hybrid mode skips this because the actor handles
                     # ref/actor_fwd internally via _switch_model.
                     token = startup.token()
-                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async(recovery_token=token)]
-                    if ROLES.actor_fwd in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async(recovery_token=token))
-                    if ROLES.reference in self.serve_dict:
-                        handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async(recovery_token=token))
+                    receivers = [role for role in (ROLES.actor_fwd, ROLES.reference) if role in self.serve_dict]
+                    handles = [
+                        self.serve_dict[ROLES.actor].update_weights_fully_async(
+                            rollout_only=not receivers, recovery_token=token
+                        ),
+                        *(self.serve_dict[role].recv_weight_fully_async(recovery_token=token) for role in receivers),
+                    ]
                     # Start senders and receivers together, and await the real
                     # Serve responses before set_step or generation can start.
                     with startup.weight_sync():
-                        await asyncio.gather(*handles)
+                        sync_tasks = [asyncio.create_task(handle) for handle in handles]
+                        try:
+                            await asyncio.gather(*sync_tasks)
+                        finally:
+                            # Do not leave receive waiters alive after a sender fails (or vice versa).
+                            for task in sync_tasks:
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(*sync_tasks, return_exceptions=True)
                 if ROLES.actor in self.serve_dict:
                     with startup.step_restore():
                         step = await self.serve_dict[ROLES.actor].get_step()

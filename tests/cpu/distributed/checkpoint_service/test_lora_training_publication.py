@@ -36,6 +36,7 @@ def backends(monkeypatch):
         backend._rollout_bucket_splitter = None
         backend._use_bridge = backend._lora_merge_mode = backend._is_pp_src_rank = False
         backend._lora_adapter_mode = True
+        backend._skip_empty_actor_fwd_ref_sync = False
         backend._lora_sync = SimpleNamespace(base_sync_done=False, adapter_loaded=False)
         backend._managed_lora_publisher = SimpleNamespace(
             publish=Mock(

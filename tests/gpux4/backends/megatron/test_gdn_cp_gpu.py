@@ -251,6 +251,54 @@ def _check_gdn_cp_mode(rank: int, init_method: str, tested_mode: str) -> None:
                 # CP owns partial token sums; DDP would sum these replicas.
                 dist.all_reduce(grad, group=cp_group)
                 _assert_grad_close(grad, ref_grads[name], f"{mode} {name}")
+            if mode == "chunkwise":
+                from unittest.mock import patch
+
+                from relax.backends.megatron.data import (
+                    _prebuild_cp_route,
+                    move_tensors_to_device,
+                    pin_tensors,
+                    record_tensors_on_stream,
+                )
+
+                # Static CP must reuse producer routes after real pinned async H2D.
+                cpu_cu = torch.tensor([0, lengths[0], total], dtype=torch.int32)
+                cpu_packed = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cpu_cu,
+                    cu_seqlens_kv=cpu_cu,
+                    cu_seqlens_q_padded=cpu_cu,
+                    cu_seqlens_kv_padded=cpu_cu,
+                    max_seqlen_q=max(lengths),
+                    max_seqlen_kv=max(lengths),
+                )
+                _prebuild_cp_route(cpu_packed, [0, lengths[0], total], 2, rank, torch.device("cpu"))
+                pinned = pin_tensors(cpu_packed)
+                transfer = torch.cuda.Stream()
+                with torch.cuda.stream(transfer):
+                    cached = move_tensors_to_device(pinned, torch.device("cuda", rank), non_blocking=True)
+                torch.cuda.current_stream().wait_stream(transfer)
+                record_tensors_on_stream(cached, torch.cuda.current_stream())
+                for index in (cached.cp_partition_route.zigzag_index, cached.cp_partition_route.contiguous_index):
+                    assert index is None or index.is_cuda
+                with (
+                    patch(
+                        "megatron.core.context_parallel_layout.routes.build_thd_cp_partition_route",
+                        side_effect=AssertionError("route rebuilt"),
+                    ),
+                    patch(
+                        "megatron.core.context_parallel_layout.conversion.build_thd_cp_partition_route",
+                        side_effect=AssertionError("route rebuilt"),
+                    ),
+                ):
+                    cached_out, cached_dx, cached_grads = _forward_backward(
+                        gdn, shard, cached, grad_shard, recompute=True
+                    )
+                torch.testing.assert_close(cached_out, out, rtol=0, atol=0)
+                torch.testing.assert_close(cached_dx, dx, rtol=0, atol=0)
+                for name, grad in cached_grads.items():
+                    dist.all_reduce(grad, group=cp_group)
+                    _assert_grad_close(grad, grads[name], f"cached {name}")
     finally:
         parallel_state.destroy_model_parallel()
         dist.destroy_process_group()

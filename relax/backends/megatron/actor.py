@@ -839,6 +839,17 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
+        if getattr(self.args, "moe_megakernel_backend", None) == "mok":
+            from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+            from mok.functional import clear_workspace_cache
+
+            # Symmetric workspaces belong to the live EP group. Release them
+            # collectively before sleep destroys that group and recreates it on wake.
+            clear_workspace_cache()
+            for model_chunk in self.model:
+                for module in model_chunk.modules():
+                    if isinstance(module, MoKMegakernel):
+                        module.invalidate_storage_cache()
         destroy_process_groups()
 
         self._train_state_offloader.offload()

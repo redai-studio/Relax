@@ -1686,10 +1686,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--agent-command",
                 type=str,
                 default=None,
-                help=(
-                    "Managed-command agent entry command for agentic rollout. "
-                    "Required when --use-agentic-rollout is set."
-                ),
+                help="Command to start the agent.",
             )
             parser.add_argument(
                 "--agent-cwd",
@@ -1975,6 +1972,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Save a lightweight, resumable actor checkpoint containing LoRA tensors plus optimizer, "
                     "scheduler, RNG, and iteration state. Frozen base weights are restored from --hf-checkpoint. "
                     "The initial implementation supports synchronous BF16 torch_dist checkpoints only. "
+                    "May be combined with --save-hf to also export the full merged HF model. "
                     "When unset, save the regular full distributed checkpoint."
                 ),
             )
@@ -3567,8 +3565,6 @@ def validate_save_lora_only_args(args) -> None:
         incompatible.append("--fp8")
     if args.fp16:
         incompatible.append("--fp16")
-    if args.save_hf is not None:
-        incompatible.append("--save-hf")
     if incompatible:
         raise ValueError("--save-lora-only is incompatible with: " + ", ".join(incompatible))
 
@@ -4327,13 +4323,20 @@ def relax_validate_args(args):
 
     validate_opd_args(args, is_offline=is_offline, log=logger)
 
+    # ART resolves the committed DCP iteration and next cursor in its backend.
+    sampling_config = getattr(args, "sampling_config", None)
+    native_art = (
+        args.train_backend == "fsdp"
+        and isinstance(sampling_config, dict)
+        and sampling_config.get("algorithm") == "art"
+    )
     if is_i2i_sft(args):
         # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
         if args.train_backend != "fsdp":
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
-    else:
+    elif not native_art:
         if args.megatron_to_hf_mode == "bridge":
             if (
                 args.load is not None
