@@ -1,12 +1,128 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import json
+import struct
 from argparse import Namespace
 from types import SimpleNamespace
 
 import pytest
 
-from relax.utils.quant_cast import resolve_rollout_quantization_config
+from relax.distributed.ray.rollout_weight_config import resolve_rollout_quantization_config
+from relax.utils.quant_cast import resolve_receiver_quantization_config
+
+
+@pytest.mark.parametrize(
+    "extra,compatible",
+    [
+        ({"fmt": "e4m3", "weight_block_size": None, "scale_fmt": None, "modules_to_not_convert": []}, True),
+        ({"weight_block_size": [128, 128]}, False),
+        ({"scale_fmt": "ue8m0"}, False),
+        ({"fmt": "e5m2"}, False),
+    ],
+)
+def test_receiver_fp8_compares_effective_defaults(quantization_args, extra, compatible):
+    first = {"quant_method": "fp8", "activation_scheme": "dynamic"}
+    recipients = [
+        ("first", quantization_args.hf_checkpoint, json.dumps({"quantization_config": first})),
+        ("second", quantization_args.hf_checkpoint, json.dumps({"quantization_config": {**first, **extra}})),
+    ]
+    if compatible:
+        assert resolve_receiver_quantization_config(quantization_args, SimpleNamespace(), recipients) == first
+    else:
+        with pytest.raises(ValueError, match="different quantization configs"):
+            resolve_receiver_quantization_config(quantization_args, SimpleNamespace(), recipients)
+
+
+@pytest.fixture
+def compressed_checkpoint(tmp_path):
+    pytest.importorskip("safetensors")
+    checkpoint = tmp_path / "packed"
+    checkpoint.mkdir()
+    config = {
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "strategy": "group",
+                    "group_size": 128,
+                    "symmetric": True,
+                },
+            }
+        },
+        "ignore": [],
+    }
+    (checkpoint / "config.json").write_text(json.dumps({"compression_config": config}))
+    # A real, tiny safetensors file exercises the production header scan.
+    header = json.dumps(
+        {
+            "vision_tower.proj.weight": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]},
+            "model.layers.0.mlp.experts.0.up_proj.weight_packed": {
+                "dtype": "U8",
+                "shape": [1],
+                "data_offsets": [2, 3],
+            },
+        }
+    ).encode()
+    header += b" " * (-len(header) % 8)
+    (checkpoint / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + b"\0\0\0")
+    return checkpoint, config
+
+
+def test_receiver_compression_metadata_drives_packing(quantization_args, compressed_checkpoint):
+    path, config = compressed_checkpoint
+    quantization_args.sglang_hf_checkpoint = str(path)
+    actual = resolve_rollout_quantization_config(
+        quantization_args, SimpleNamespace(quantization_config={"quant_method": "fp8"})
+    )
+    assert actual["quant_method"] == "compressed-tensors"
+    assert actual["format"] == "pack-quantized"
+    assert "re:.*vision_tower.*" in actual["ignore"]
+    assert config["ignore"] == []
+
+
+@pytest.mark.parametrize("alias", ["source", "original"])
+def test_receiver_s3_alias_uses_local_metadata_and_shards(quantization_args, compressed_checkpoint, alias):
+    from relax.utils.model_source import ModelSource
+
+    path, _ = compressed_checkpoint
+    args = quantization_args
+    args.hf_checkpoint = str(path)
+    args.model_source = ModelSource(uri="s3://test-bucket/model")
+    args._model_source_original_hf_checkpoint = "s3://test-bucket/original"
+    receiver = args.model_source.uri if alias == "source" else args._model_source_original_hf_checkpoint
+    actual = resolve_receiver_quantization_config(args, SimpleNamespace(), [("policy", receiver, None)])
+    assert actual["quant_method"] == "compressed-tensors"
+    assert "re:.*vision_tower.*" in actual["ignore"]
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"quantization_config": None}, "compressed-tensors"),
+        ({"quantization_config": None, "compression_config": None}, None),
+        ({"quantization_config": {}}, "empty"),
+        ({"compression_config": {"quant_method": "other"}}, "other"),
+    ],
+)
+def test_receiver_overrides_apply_before_compression_fallback(
+    quantization_args, tmp_path, monkeypatch, overrides, expected
+):
+    from relax.utils import quant_cast
+
+    path = tmp_path / "receiver_config"
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps({"compression_config": {"quant_method": "compressed-tensors"}}))
+    # This case tests metadata precedence; the separate packed-file case
+    # exercises augmentation and shard discovery.
+    monkeypatch.setattr(quant_cast, "augment_compressed_tensors_ignore", lambda config, _: config)
+    actual = resolve_receiver_quantization_config(
+        quantization_args, SimpleNamespace(), [("policy", str(path), json.dumps(overrides))]
+    )
+    assert actual == (None if expected is None else {} if expected == "empty" else {"quant_method": expected})
 
 
 @pytest.fixture

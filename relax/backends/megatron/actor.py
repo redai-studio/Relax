@@ -613,7 +613,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 # mm_projector — without augment_compressed_tensors_ignore the bridge
                 # would try to INT4-pack those BF16 tensors and SGLang would reject
                 # them with "weight_packed not found in params_dict".
-                from relax.utils.quant_cast import resolve_rollout_quantization_config
+                from relax.distributed.ray.rollout_weight_config import resolve_rollout_quantization_config
 
                 push_quant_config = resolve_rollout_quantization_config(self.args, self.hf_config)
                 self.weight_updater = update_weight_cls(
@@ -1019,7 +1019,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "master_address": master_address,
             "master_port": master_port,
         }
-        from relax.utils.quant_cast import resolve_rollout_quantization_config
+        from relax.distributed.ray.rollout_weight_config import resolve_rollout_quantization_config
 
         push_quant_config = resolve_rollout_quantization_config(self.args, self.hf_config)
         return run(

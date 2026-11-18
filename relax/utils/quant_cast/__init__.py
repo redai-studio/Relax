@@ -13,67 +13,70 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def resolve_rollout_quantization_config(args: Namespace, hf_config: Any) -> dict | None:
-    """Resolve one sender format for all engines receiving this publication."""
-    default_path = getattr(args, "sglang_hf_checkpoint", None) or args.hf_checkpoint
-    global_overrides = getattr(args, "sglang_json_model_override_args", None)
-    recipients = [("default", default_path, global_overrides)]
-    if getattr(args, "sglang_config", None) is not None:
-        from relax.distributed.ray.rollout import _resolve_sglang_config
-
-        config = _resolve_sglang_config(args)
-        # Tensor updates target the first model. DCS registers every YAML
-        # model's engines under the shared rollout role.
-        models = config.models if args.fully_async or args.hybrid else config.models[:1]
-        recipients = []
-        for model in models:
-            model.resolve(args)
-            for index, group in enumerate(model.engine_groups):
-                if group.worker_type == "placeholder":
-                    continue
-                recipients.append(
-                    (
-                        f"{model.name}/{index}:{group.worker_type}",
-                        group.overrides["model_path"],
-                        group.overrides.get("json_model_override_args", global_overrides),
-                    )
-                )
+def resolve_receiver_quantization_config(
+    args: Namespace, hf_config: Any, recipients: list[tuple[str, str, str | None]]
+) -> dict | None:
+    """Resolve a compatible sender format for already selected receivers."""
+    from relax.utils.model_source import is_model_source_alias
 
     configs = []
     for name, model_path, override_json in recipients:
-        overrides = json.loads(override_json or "{}")
-        if "quantization_config" in overrides:
-            quant_config = overrides["quantization_config"]
-            # None is an explicit opt-out here, not permission to reread the
-            # checkpoint inside augment_compressed_tensors_ignore.
-            if quant_config is None:
-                configs.append((name, None))
-                continue
+        # SGLang can load the original URI, but this process already owns the
+        # local copy needed for metadata and compressed-tensor shard scans.
+        if is_model_source_alias(args, model_path):
+            model_path = args.hf_checkpoint
+        config_path = os.path.join(model_path, "config.json")
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                config_values = json.load(f)
+        elif model_path == args.hf_checkpoint:
+            config_values = hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
         else:
-            if model_path == args.hf_checkpoint:
-                quant_config = getattr(hf_config, "quantization_config", None) or getattr(
-                    getattr(hf_config, "text_config", None), "quantization_config", None
-                )
-            else:
-                from transformers import PretrainedConfig
+            from transformers import PretrainedConfig
 
-                config_values, _ = PretrainedConfig.get_config_dict(model_path)
-                quant_config = config_values.get("quantization_config") or (
-                    config_values.get("text_config") or {}
-                ).get("quantization_config")
-        configs.append((name, augment_compressed_tensors_ignore(quant_config, model_path)))
+            config_values, _ = PretrainedConfig.get_config_dict(model_path)
+        # Overrides replace top-level fields, including explicit None. Resolve
+        # compression_config only after this merge, just as the receiver does.
+        config_values = {**config_values, **json.loads(override_json or "{}")}
+        quant_config = _get_checkpoint_quantization_config(config_values)
+        # None here is the effective format, not permission to reread the
+        # original checkpoint and undo an explicit override.
+        configs.append(
+            (name, augment_compressed_tensors_ignore(quant_config, model_path) if quant_config else quant_config)
+        )
     if not configs:
         raise ValueError("Weight publication has no rollout receiver groups")
     first_name, first_config = configs[0]
     for name, quant_config in configs[1:]:
-        if quant_config != first_config:
+        if _normalize_quantization_format(quant_config) != _normalize_quantization_format(first_config):
             raise ValueError(f"Rollout receivers require different quantization configs: {first_name} and {name}")
     return first_config
 
 
+def _get_checkpoint_quantization_config(config: dict) -> dict | None:
+    quant_config = config.get("quantization_config")
+    if quant_config is None:
+        text_config = config.get("text_config") or {}
+        quant_config = text_config.get("quantization_config")
+    if quant_config is None:
+        quant_config = config.get("compression_config")
+    return quant_config
+
+
+def _normalize_quantization_format(config: dict | None) -> dict | None:
+    if not config:
+        return None
+    normalized = dict(config)
+    if normalized.get("quant_method") == "fp8":
+        normalized.setdefault("fmt", "e4m3")
+        normalized.setdefault("weight_block_size", None)
+        normalized.setdefault("scale_fmt", None)
+        normalized["modules_to_not_convert"] = sorted(set(normalized.get("modules_to_not_convert") or []))
+    return normalized
+
+
 def read_quantization_config(hf_dir: str | os.PathLike) -> dict | None:
-    """Read ``quantization_config`` from config.json, falling back to
-    ``text_config``.
+    """Read receiver quantization metadata, including compression fallback.
 
     VLM checkpoints like Kimi K3 nest the compressed-tensors config under the
     text backbone, leaving the top-level block null — so callers that read
@@ -85,7 +88,7 @@ def read_quantization_config(hf_dir: str | os.PathLike) -> dict | None:
         return None
     with open(config_path) as f:
         cfg = json.load(f)
-    return cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or None
+    return _get_checkpoint_quantization_config(cfg)
 
 
 def derive_extra_ignore_namespaces(hf_dir: str | os.PathLike) -> list[str]:
