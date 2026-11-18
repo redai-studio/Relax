@@ -10,13 +10,13 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPTS = ROOT / "scripts/training/text"
+SCRIPTS = ROOT / "scripts/training/sft"
 
 
 def run_recipe(tmp_path, *, script="run-qwen38-long-context.sh", extra=(), **overrides):
     env = os.environ.copy()
     for name in (
-        "SCENARIO",
+        "CONTEXT_LENGTH",
         "DATA_MODE",
         "RESUME",
         "EXP_NAME",
@@ -47,25 +47,23 @@ def option(argv, name):
 
 
 @pytest.mark.parametrize(
-    "scenario,seq,cp,budget,mode,dataset",
+    "context,seq,cp,budget,mode",
     [
-        ("mixed512", 524288, 8, 65536, "full", "RepeatedSFTDataset"),
-        ("filled512", 524288, 8, 65536, "full", "FilledSFTDataset"),
-        ("mixed1m", 1048576, 16, 32768, "adaptive", "DoubledSFTDataset"),
-        ("filled1m", 1048576, 16, 32768, "adaptive", "FilledSFTDataset"),
+        ("512k", 524288, 8, 65536, "full"),
+        ("1m", 1048576, 16, 32768, "adaptive"),
     ],
 )
-def test_scenario_cli_and_real_parser(tmp_path, monkeypatch, scenario, seq, cp, budget, mode, dataset):
-    result = run_recipe(tmp_path, SCENARIO=scenario)
+def test_recipe_cli_and_real_parser(tmp_path, monkeypatch, context, seq, cp, budget, mode):
+    result = run_recipe(tmp_path, CONTEXT_LENGTH=context)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     argv, env = payload["argv"], payload["runtime_env"]["env_vars"]
     assert option(argv, "--seq-length") == str(seq)
     assert option(argv, "--context-parallel-size") == str(cp)
     assert option(argv, "--max-tokens-per-gpu") == str(budget)
-    assert option(argv, "--custom-dataset-class") == "examples.long_context_repeat." + dataset
+    assert "--custom-dataset-class" not in argv
     assert option(argv, "--num-rollout") == "200"
-    assert option(argv, "--load").endswith(f"qwen38-{scenario}-32gpu")
+    assert option(argv, "--load").endswith(f"qwen38-{context}-32gpu")
     assert "--save" not in argv and "--use-clearml" not in argv
     assert env["QWEN38_PLE_INPUT_HALO_TRANSPORT"] == mode
     assert json.loads(option(argv, "--train-env-vars"))["QWEN38_PLE_INPUT_HALO_TRANSPORT"] == mode
@@ -90,34 +88,41 @@ def test_scenario_cli_and_real_parser(tmp_path, monkeypatch, scenario, seq, cp, 
     assert args.num_layers == 48 and args.mtp_num_layers == 1
     assert args.empty_unused_memory_level == 0
     assert args.num_epoch is None
+    assert args.custom_dataset_class_path is None
+    assert args.sft_oversize_strategy == "custom"
     assert args.max_tokens_per_gpu == budget
     assert args.resource["actor"] == [1, 32]
+    # Exercise native dataset sizing with real input records, without rendering
+    # or opening any GPU context. A single epoch must not shorten NUM_STEPS.
+    from relax.engine.sft.bootstrap import resolve_sft_num_rollout
+
+    data = tmp_path / "data.jsonl"
+    data.write_text((json.dumps({"messages": [{"role": "user", "content": "hello"}]}) + "\n") * 32)
+    resolve_sft_num_rollout(args)
+    assert args.num_rollout == 200
+    assert args.num_rollout_per_epoch == 1
     assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.parametrize(
-    "script,mode,scenario",
-    [
-        ("run-qwen38-512k-cp.sh", "mixed", "mixed512"),
-        ("run-qwen38-512k-cp.sh", "filled", "filled512"),
-        ("run-qwen38-1m-cp.sh", "double", "mixed1m"),
-        ("run-qwen38-1m-cp.sh", "filled", "filled1m"),
-    ],
+    "script,context",
+    [("run-qwen38-512k-cp.sh", "512k"), ("run-qwen38-1m-cp.sh", "1m")],
 )
-def test_wrappers_and_argument_forwarding(tmp_path, script, mode, scenario):
-    result = run_recipe(tmp_path, script=script, DATA_MODE=mode, extra=("--lr", "1e-5"))
+def test_wrappers_and_argument_forwarding(tmp_path, script, context):
+    result = run_recipe(tmp_path, script=script, extra=("--lr", "1e-5"))
     assert result.returncode == 0, result.stderr
     argv = json.loads(result.stdout)["argv"]
-    assert option(argv, "--load").endswith(f"qwen38-{scenario}-32gpu")
+    assert option(argv, "--load").endswith(f"qwen38-{context}-32gpu")
     assert option(argv, "--lr") == "1e-5"
 
 
 @pytest.mark.parametrize(
     "overrides,fragment",
     [
-        ({"SCENARIO": "unknown"}, "SCENARIO must"),
+        ({"CONTEXT_LENGTH": "unknown"}, "CONTEXT_LENGTH must"),
         ({"MAX_TOKENS_PER_GPU": "0"}, "Require positive"),
-        ({"MAX_TOKENS_PER_GPU": "1048576"}, "Require positive"),
+        ({"MAX_TOKENS_PER_GPU": "65537"}, "Require positive"),
+        ({"CONTEXT_LENGTH": "1m", "MAX_TOKENS_PER_GPU": "65537"}, "Require positive"),
         ({"RESUME": "yes"}, "RESUME must"),
         ({"RESUME": "1"}, "Set EXP_NAME"),
         ({"RESUME": "1", "EXP_NAME": "saved"}, "original checkpoint tracker"),
@@ -163,7 +168,7 @@ def test_checkpoint_identity_and_resume_scheduler(tmp_path):
     assert "--use-checkpoint-opt_param-scheduler" in argv
     assert option(argv, "--ckpt-step") == "99"
     assert option(argv, "--num-rollout") == "210"
-    for changed in ({"SCENARIO": "filled512"}, {"GBS": "16"}, {"SEED": "1"}, {"MAX_TOKENS_PER_GPU": "32768"}):
+    for changed in ({"CONTEXT_LENGTH": "1m"}, {"GBS": "16"}, {"SEED": "1"}, {"MAX_TOKENS_PER_GPU": "32768"}):
         mismatch = run_recipe(tmp_path, RESUME="1", EXP_NAME="saved", **changed)
         assert mismatch.returncode != 0 and "differs from the saved" in mismatch.stderr
 

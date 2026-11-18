@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Four text-only 512k/1m scenarios on 32 GPUs: TP1/PP2/EP8, CP8 or CP16.
+# Native SFT 512k/1m recipes on 32 GPUs: TP1/PP2/EP8, CP8 or CP16.
 # Use the image built with the long-context prerequisites and PLE optimization.
 # Required paths must be accessible on every node. DRY_RUN=1 never submits a job.
 set -eo pipefail
@@ -17,17 +17,11 @@ for arg in "$@"; do
             exit 2 ;;
     esac
 done
-export SCENARIO="${SCENARIO:-mixed512}"
-case "${SCENARIO}" in
-    mixed512) SEQ_LENGTH=524288; CP_SIZE=8; budget=65536; transport=full
-        dataset=examples.long_context_repeat.RepeatedSFTDataset ;;
-    filled512) SEQ_LENGTH=524288; CP_SIZE=8; budget=65536; transport=full
-        dataset=examples.long_context_repeat.FilledSFTDataset ;;
-    mixed1m) SEQ_LENGTH=1048576; CP_SIZE=16; budget=32768; transport=adaptive
-        dataset=examples.long_context_repeat.DoubledSFTDataset ;;
-    filled1m) SEQ_LENGTH=1048576; CP_SIZE=16; budget=32768; transport=adaptive
-        dataset=examples.long_context_repeat.FilledSFTDataset ;;
-    *) echo 'SCENARIO must be mixed512, filled512, mixed1m, or filled1m' >&2; exit 2 ;;
+export CONTEXT_LENGTH="${CONTEXT_LENGTH:-512k}"
+case "${CONTEXT_LENGTH}" in
+    512k) SEQ_LENGTH=524288; CP_SIZE=8; budget=65536; transport=full ;;
+    1m) SEQ_LENGTH=1048576; CP_SIZE=16; budget=32768; transport=adaptive ;;
+    *) echo 'CONTEXT_LENGTH must be 512k or 1m' >&2; exit 2 ;;
 esac
 export SEQ_LENGTH CP_SIZE
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${budget}}"
@@ -68,13 +62,13 @@ PYLIB
 )
 export LD_LIBRARY_PATH
 if [[ ! "${SEQ_LENGTH}" =~ ^[1-9][0-9]*$ || ! "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]] ||
-    (( MAX_TOKENS_PER_GPU > SEQ_LENGTH )); then
-    echo "Require positive MAX_TOKENS_PER_GPU <= SEQ_LENGTH for the custom SFT sample limit" >&2
+    (( MAX_TOKENS_PER_GPU * CP_SIZE > SEQ_LENGTH )); then
+    echo "Require positive MAX_TOKENS_PER_GPU * CP_SIZE <= SEQ_LENGTH for the SFT sample limit" >&2
     exit 2
 fi
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
-export EXP_NAME="${EXP_NAME:-qwen38-${SCENARIO}-32gpu}"
+export EXP_NAME="${EXP_NAME:-qwen38-${CONTEXT_LENGTH}-32gpu}"
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-long-context}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
@@ -230,7 +224,6 @@ CKPT_ARGS=(
 
 SFT_ARGS=(
     --loss-type sft
-    --custom-dataset-class "${dataset}"
     --prompt-data "${DATA_DIR}"
     "${EVAL_ARGS[@]}"
     --input-key messages
@@ -338,7 +331,7 @@ TRAIN_ARGS=(
 # Keep data semantics and parallel/optimizer settings consistent on resume.
 # This is a recipe check; checkpoint loading and data-position recovery remain native.
 python3 - "${SAVE_DIR}/${EXP_NAME}" "${RESUME:-0}" "${DRY_RUN:-0}" \
-    "${SCENARIO}" "${MODEL_DIR}" "${DATA_DIR}" "${SEQ_LENGTH}" "${CP_SIZE}" \
+    "${CONTEXT_LENGTH}" "${MODEL_DIR}" "${DATA_DIR}" "${SEQ_LENGTH}" "${CP_SIZE}" \
     "${MAX_TOKENS_PER_GPU}" "${GBS:-32}" "${SEED:-9714}" \
     "${QWEN38_PLE_INPUT_HALO_TRANSPORT}" "${LR:-2e-5}" "${MIN_LR:-2e-6}" \
     "${PIPELINE_LAYOUT:-Et*24|t*24mL}" "$@" <<'PYIDENTITY'
@@ -347,7 +340,7 @@ import sys
 from pathlib import Path
 
 root, resume, dry = Path(sys.argv[1]), sys.argv[2] == "1", sys.argv[3] == "1"
-keys = ("scenario", "model", "data", "seq_length", "cp", "packing_budget", "gbs", "seed",
+keys = ("context_length", "model", "data", "seq_length", "cp", "packing_budget", "gbs", "seed",
         "ple_transport", "lr", "min_lr", "pipeline_layout")
 identity = dict(zip(keys, sys.argv[4:16], strict=True))
 extra = iter(sys.argv[16:])
@@ -363,7 +356,7 @@ if resume:
     if not tracker.is_file() or not manifest.is_file():
         raise SystemExit("Resume requires the original checkpoint tracker and recipe-config.json")
     if json.loads(manifest.read_text()) != identity:
-        raise SystemExit("Resume recipe differs from the saved configuration; keep scenario, data and training settings unchanged")
+        raise SystemExit("Resume recipe differs from the saved configuration; keep context length, data and training settings unchanged")
 elif tracker.exists():
     raise SystemExit("Checkpoint already exists: use RESUME=1 or choose a new EXP_NAME")
 if not dry and not resume:
