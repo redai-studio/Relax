@@ -160,7 +160,7 @@ def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_c
         assert metadata.relax_sft_selective_full_rows == 16
         for actual, expected in zip(metadata.relax_sft_selective_mtp_rows, expected_mtp, strict=True):
             torch.testing.assert_close(actual, expected)
-        if case != "dummy":
+        if case not in ("dummy", "repeated_dummy"):
             assert 0 < sum(rows.numel() for _, rows in planned_batch["selective_logit_rows"]) < 8
             assert 0 < metadata.relax_sft_selective_mtp_rows[0].numel() < 16
         else:
