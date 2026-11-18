@@ -88,6 +88,15 @@ def _obs_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "num_rollout": 10,
         "reward_key": None,
         "use_rollout_routing_replay": False,
+        "rollout_temperature": 1.0,
+        "rollout_top_p": 1.0,
+        "rollout_top_k": -1,
+        "rollout_max_response_len": None,
+        "rollout_stop": None,
+        "rollout_stop_token_ids": None,
+        "rollout_skip_special_tokens": False,
+        "eval_reward_key": None,
+        "sglang_enable_deterministic_inference": False,
     }
     args.update(overrides)
     return Namespace(**args)
@@ -467,6 +476,15 @@ def _train_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "agentic_prelaunch": False,
         "num_rollout": 10,
         "reward_key": None,
+        "rollout_temperature": 1.0,
+        "rollout_top_p": 1.0,
+        "rollout_top_k": -1,
+        "rollout_max_response_len": None,
+        "rollout_stop": None,
+        "rollout_stop_token_ids": None,
+        "rollout_skip_special_tokens": False,
+        "eval_reward_key": None,
+        "sglang_enable_deterministic_inference": False,
     }
     args.update(overrides)
     return Namespace(**args)
