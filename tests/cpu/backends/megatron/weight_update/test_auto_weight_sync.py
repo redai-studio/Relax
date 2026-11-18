@@ -221,6 +221,7 @@ def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, 
     updater._route_experts = False
     updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
     updater._configure_direct_experts = Mock()
+    updater._model_update_groups = None
     first, replacement = Mock(), Mock()
     monkeypatch.setattr(sync.ray, "get", lambda refs: [{"node_id": "local"} for _ in refs])
     monkeypatch.setattr(sync.ray, "get_runtime_context", lambda: SimpleNamespace(get_node_id=lambda: "local"))
@@ -238,6 +239,43 @@ def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, 
     assert updater._ipc_engine is (replacement if rank == 0 else None)
     with pytest.raises(ValueError, match="changed IPC GPU placement"):
         updater.connect_rollout_engines([replacement], None, [2], [1])
+
+
+def test_independent_engines_reuse_group_and_destroy_only_matching_generation(monkeypatch):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace()
+    updater._route_experts = False
+    updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
+    updater._model_update_groups = None
+    updater._configure_direct_experts = Mock()
+    baseline, dynamic = Mock(), Mock()
+    connect = Mock(side_effect=["old-handle", "next-handle"])
+    disconnect = Mock()
+    monkeypatch.setattr(sync, "connect_rollout_engines_from_distributed", connect)
+    monkeypatch.setattr(sync, "disconnect_rollout_engines_from_distributed", disconnect)
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(sync.dist, "new_group", Mock(return_value="ipc"))
+    monkeypatch.setattr(sync.dist, "all_reduce", Mock())
+    monkeypatch.setattr(sync.mpu, "get_data_parallel_rank", lambda **kwargs: 0)
+    monkeypatch.setattr(sync.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(sync.mpu, "get_pipeline_model_parallel_rank", lambda: 0)
+
+    for _ in range(2):
+        updater.connect_rollout_engines(
+            [baseline, dynamic], None, [2, 2], [0, 0], shared_engine_count=1, remote_group_name="old"
+        )
+    assert updater._ipc_engine is baseline
+    connect.assert_called_once_with(updater.args, "old", [dynamic], engine_gpu_counts=[2])
+    dynamic.get_pid_and_node_id.remote.assert_not_called()
+    updater.disconnect_distributed_group("old")
+    disconnect.assert_called_once_with(updater.args, "old", "old-handle", [dynamic], strict=True)
+    updater.connect_rollout_engines(
+        [baseline, dynamic], None, [2, 2], [0, 0], shared_engine_count=1, remote_group_name="next"
+    )
+    updater.disconnect_distributed_group("old")
+    assert updater._model_update_groups == "next-handle"
+    assert disconnect.call_count == 1
 
 
 @pytest.mark.parametrize("geometry", [(256, 2048, 512), (256, 7168, 2048)])
@@ -316,7 +354,7 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
         pass
 
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
+    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = updater.use_distribute = False
     updater.quantization_config = None
     updater.weight_version = 0
     updater.rollout_engines = updater.distributed_rollout_engines = []

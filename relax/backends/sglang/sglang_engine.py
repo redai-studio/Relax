@@ -1418,15 +1418,18 @@ class SGLangEngine(RayActor):
             },
         )
 
-    def destroy_weights_update_group(self, group_name):
+    def destroy_weights_update_group(self, group_name, *, strict: bool = False):
         try:
             return self._make_request(
                 "destroy_weights_update_group",
                 {
                     "group_name": group_name,
                 },
+                timeout=30 if strict else None,
             )
         except requests.exceptions.RequestException:
+            if strict:
+                raise
             # catch the case there the engine is just created and does not have the group.
             pass
 

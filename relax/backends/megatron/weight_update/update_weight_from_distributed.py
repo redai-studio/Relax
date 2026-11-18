@@ -339,11 +339,16 @@ def connect_rollout_engines_from_distributed(
     raise RuntimeError(f"Failed to connect rollout engines after {max_retries} attempts") from last_error
 
 
-def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines):
+def disconnect_rollout_engines_from_distributed(
+    args, group_name, model_update_groups, rollout_engines, *, strict: bool = False
+):
     """Destroy NCCL on training and engines."""
-    refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
+    kwargs = {"strict": True} if strict else {}
+    refs = [engine.destroy_weights_update_group.remote(group_name, **kwargs) for engine in rollout_engines]
     dist.destroy_process_group(model_update_groups)
-    ray.get(refs)
+    results = ray.get(refs, timeout=35) if strict else ray.get(refs)
+    if strict and any(not isinstance(result, dict) or result.get("success") is not True for result in results):
+        raise RuntimeError(f"Engine did not acknowledge destruction of weight-update group {group_name}")
     # Wait for NCCL socket ports to be released by the OS
     time.sleep(2.0)
 
@@ -354,18 +359,21 @@ def update_weights_from_distributed(
     weight_version: int,
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
+    *,
+    submitted_refs: list[ObjectRef] | None = None,
 ) -> list[ObjectRef]:
     """Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines)."""
-    refs = [
-        engine.update_weights_from_distributed.remote(
-            names=[name for name, _ in converted_named_tensors],
-            dtypes=[param.dtype for _, param in converted_named_tensors],
-            shapes=[param.shape for _, param in converted_named_tensors],
-            group_name=group_name,
-            weight_version=str(weight_version),
+    refs = [] if submitted_refs is None else submitted_refs
+    for engine in rollout_engines:
+        refs.append(
+            engine.update_weights_from_distributed.remote(
+                names=[name for name, _ in converted_named_tensors],
+                dtypes=[param.dtype for _, param in converted_named_tensors],
+                shapes=[param.shape for _, param in converted_named_tensors],
+                group_name=group_name,
+                weight_version=str(weight_version),
+            )
         )
-        for engine in rollout_engines
-    ]
 
     handles = []
     for _, param in converted_named_tensors:
