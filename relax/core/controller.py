@@ -816,6 +816,11 @@ class Controller:
             return
         self._sft_early_prepare_issued = True
         self._sft_early_prepare_stopped = False
+        # Publish ownership before checking abort: a late startup thread must
+        # not launch a producer after the driver has already closed its queue.
+        if getattr(self, "_startup_abort_event", None) is not None and self._startup_abort_event.is_set():
+            self._sft_early_prepare_stopped = True
+            return
         service._sft_prepare_response = service.handle.prepare.remote(prefetch_first_batch=True)
         logger.info("Started CPU-only SFT preparation alongside GPU service initialization")
 

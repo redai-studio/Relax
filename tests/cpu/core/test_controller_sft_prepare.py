@@ -199,3 +199,25 @@ def test_queue_close_refuses_a_prepared_producer_missing_from_service_results(co
     with pytest.raises(RuntimeError, match="has not confirmed"):
         controller._stop_prepared_sft(service)
     service.handle.stop.remote.assert_not_called()
+
+
+def test_aborted_startup_does_not_launch_prepare_after_queue_close(controller_module, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("RELAX_SFT_EARLY_PREPARE", "1")
+    controller = controller_module.Controller.__new__(controller_module.Controller)
+    controller.config = SimpleNamespace(loss_type="sft", start_rollout_id=0, load="hf", hf_checkpoint="hf")
+    controller._tq_owner = object()
+    controller._tq_legacy_init = False
+    controller._startup_abort_event = threading.Event()
+    controller._startup_abort_event.set()
+    close = Mock()
+    monkeypatch.setattr(controller_module, "close_tq_owner", close)
+    controller._close_data_system()
+    # A service thread can reach this point after its peer has aborted startup
+    # and the driver closed the queue, even if deleting the deployment failed.
+    service = SimpleNamespace(handle=Mock())
+    controller._maybe_prepare_sft_data("sft", service)
+
+    close.assert_called_once()
+    service.handle.prepare.remote.assert_not_called()
