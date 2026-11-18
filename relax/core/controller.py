@@ -187,6 +187,7 @@ class Controller:
     _fault_recovery: Any = None
     _fault_rebuild_ready: Any = None
     _sft_cleanup_error: Optional[Exception] = None
+    _sft_finishing: bool = False
 
     def __init__(
         self, config: Namespace, runtime_env: dict = None, fault_events: Any = None, fault_recovery: Any = None
@@ -194,6 +195,7 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
+        self._sft_finishing = False
         self.serve_dict = {}
         self._teacher_manager = None
         # Initialize health management system
@@ -844,6 +846,7 @@ class Controller:
             # close a queue whose writers have not confirmed they stopped.
             self._sft_cleanup_error = RuntimeError("SFT producer cleanup is unconfirmed; refusing resource teardown")
             raise self._sft_cleanup_error from exc
+        service._sft_prepare_response = None
         self._sft_early_prepare_stopped = True
 
     def _create_service_task(
@@ -1533,6 +1536,15 @@ class Controller:
                 run(run_all_services(resume_existing=resume_existing, startup=startup))
                 if self._restarting:
                     raise RuntimeError("Service completion interrupted by recovery")
+                sft_service = self.serve_dict.get(ROLES.sft)
+                if sft_service is not None and vars(sft_service).get("_sft_prepare_response") is not None:
+                    with self._restart_lock:
+                        if self._restarting:
+                            raise RuntimeError("Service completion interrupted by recovery")
+                        # Choose completion atomically with recovery. A new
+                        # replica must not undo the producer stop confirmation.
+                        self._sft_finishing = True
+                        self._stop_prepared_sft(sft_service)
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
@@ -1665,6 +1677,8 @@ class Controller:
         while True:
             self._restart_consumed_event.wait()
             with self._restart_lock:
+                if self._sft_finishing:
+                    return
                 if not self._restart_consumed_event.is_set():
                     continue
                 self._restart_consumed_event.clear()

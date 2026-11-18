@@ -666,3 +666,91 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
     ray_get.assert_called_once_with(dispose_ref, timeout=35.0)
     controller._close_data_system.assert_called_once_with()
     stop_routers.assert_called_once_with()
+
+
+@pytest.mark.parametrize("stop_failure", [None, "rpc", "timeout"])
+def test_prepared_sft_stop_is_confirmed_before_recording_success(tmp_path, monkeypatch, stop_failure):
+    from tests.cpu.core.controller_test_utils import load_controller_with_stubbed_dependencies
+
+    monkeypatch.delenv("RELAX_KERNEL_CACHE_DIR", raising=False)
+    module = load_controller_with_stubbed_dependencies("_test_completed_sft_cleanup")
+    ns = _train_namespace()
+    events = []
+
+    class Prepared:
+        def __await__(self):
+            return asyncio.sleep(0).__await__()
+
+    async def training():
+        events.append("training-finished")
+
+    async def stop():
+        events.append("stop-request")
+        if stop_failure == "rpc":
+            raise RuntimeError("producer stop failed")
+        if stop_failure == "timeout":
+            await asyncio.get_running_loop().create_future()
+
+    remote_stop = AsyncMock(side_effect=stop)
+    service = SimpleNamespace(
+        role="sft",
+        _sft_prepare_response=Prepared(),
+        handle=SimpleNamespace(stop=SimpleNamespace(remote=remote_stop)),
+        run=training,
+    )
+
+    def initialize(self, *_args, **_kwargs):
+        self.config = SimpleNamespace(debug_train_only=True, debug_rollout_only=False, use_agentic_rollout=False)
+        self.serve_dict = {module.ROLES.sft: service}
+        self._sft_early_prepare_issued = True
+        self._health_manager = Mock()
+        self._teacher_manager = None
+        self._metrics_service_enabled = False
+        self._pending_task_refs = []
+        self._pending_task_refs_lock = threading.Lock()
+        self._restart_lock = threading.RLock()
+        self._restart_consumed_event = threading.Event()
+        self._restart_consumed_event.set()
+        self._restart_done_event = threading.Event()
+        self._restart_error = None
+        self._restarting = False
+        self._tq_owner = object()
+        self._tq_legacy_init = False
+        self._cleanup_s3_model_weights_after_init = Mock()
+        self._report_error_to_metrics_service = Mock()
+
+    original_wait_for = asyncio.wait_for
+
+    async def short_wait_for(awaitable, *, timeout):
+        assert timeout == 30
+        return await original_wait_for(awaitable, timeout=0.01)
+
+    monkeypatch.setattr(module.Controller, "__init__", initialize)
+    monkeypatch.setattr(module.asyncio, "wait_for", short_wait_for)
+    monkeypatch.setattr(module, "close_tq_owner", lambda _owner: events.append("queue-closed"))
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=lambda: 0))
+    ns["Controller"] = module.Controller
+    ns["serve"].shutdown.side_effect = lambda: events.append("serve-stopped")
+    ns["ray"].shutdown.side_effect = lambda: events.append("ray-stopped")
+
+    def hard_exit(code):
+        raise SystemExit(code)
+
+    ns["_hard_exit"] = hard_exit
+    args = SimpleNamespace(dump_agentic_obs=str(tmp_path), agentic_obs_run_id="sft_stop")
+    with pytest.raises(SystemExit) as caught:
+        ns["main"](args)
+    assert caught.value.code == (1 if stop_failure else 0)
+    rows = [json.loads(line) for line in (tmp_path / "sft_stop/stages/run.jsonl").read_text().splitlines()]
+    assert rows[-1]["status"] == ("failed" if stop_failure else "completed")
+    assert ns["_training_completed"] is (stop_failure is None)
+    assert events[:2] == ["training-finished", "stop-request"]
+    assert events[-2:] == ["serve-stopped", "ray-stopped"]
+    assert ("queue-closed" in events) is (stop_failure is None)
+    remote_stop.assert_awaited_once()
+
+    # A delayed health callback must not revive a producer after completion
+    # was chosen, including when that final stop failed.
+    ns["_ctrl"]._restart_serve = Mock()
+    ns["_ctrl"].restart_serve(module.ROLES.sft)
+    ns["_ctrl"]._restart_serve.assert_not_called()
