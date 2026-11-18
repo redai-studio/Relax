@@ -50,6 +50,7 @@ __all__ = [
     "export_hf",
     "export_peft_adapter",
     "read_adapter_contract",
+    "load_art_dataset_state",
     "COMMITTED_MARKER",
 ]
 
@@ -59,6 +60,32 @@ _LATEST = "latest_checkpointed_iteration.txt"
 
 def iter_dir_name(iteration: int) -> str:
     return f"iter_{int(iteration):07d}"
+
+
+def load_art_dataset_state(load_dir: str, iteration: int, n_samples_per_prompt: int) -> Dict[str, Any]:
+    """Read the eager data cursor paired with a completed ART acquisition."""
+    path = os.path.join(load_dir, "dataset", f"global_dataset_state_dict_{iteration}.pt")
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise ValueError(f"ART resume cannot read its dataset cursor: {path}") from exc
+    counters = ("sample_offset", "epoch_id", "sample_group_index", "sample_index")
+    required = {*counters, "metadata", "use_streaming"}
+    if not isinstance(state, dict) or not required <= state.keys() or state["use_streaming"] is not False:
+        raise ValueError("ART resume requires a complete eager-dataset cursor.")
+    if any(type(state[key]) is not int or state[key] < 0 for key in counters) or not isinstance(
+        state["metadata"], dict
+    ):
+        raise ValueError("ART dataset cursor has invalid counters or metadata.")
+    if type(n_samples_per_prompt) is not int or n_samples_per_prompt < 1:
+        raise ValueError("ART dataset cursor requires a positive candidate count.")
+    if state["sample_index"] != state["sample_group_index"] * n_samples_per_prompt:
+        raise ValueError("ART dataset candidate/group identity does not match the K contract.")
+    # Earlier complete-acquisition snapshots encoded this identity in the file
+    # name only. Newly saved cursors also record it in the payload.
+    if "rollout_id" in state and (type(state["rollout_id"]) is not int or state["rollout_id"] != iteration):
+        raise ValueError("ART dataset cursor belongs to a different acquisition.")
+    return state
 
 
 def _all_ranks_ok(ok: int) -> int:
@@ -126,18 +153,30 @@ def _rng_paths(ckpt_dir: str) -> List[str]:
     return [os.path.join(ckpt_dir, f"rng_rank{rank}.pt") for rank in range(world)]
 
 
-def _load_rng(ckpt_dir: str) -> None:
-    """Restore this rank's RNG state if present (best-effort).
+def _load_rng(ckpt_dir: str, *, strict: bool = False) -> None:
+    """Restore this rank's RNG state; strict callers reject incomplete state.
 
     Skips silently when the file is absent (older checkpoint, or a resume with
-    a different world size than the save) so resume never hard-fails on RNG.
+    a different world size than the save) for legacy best-effort callers only.
     """
     path = os.path.join(ckpt_dir, f"rng_rank{_rank()}.pt")
     if not os.path.exists(path):
+        if strict:
+            raise FileNotFoundError(f"Required RNG state is missing: {path}")
         logger.warning(f"No RNG state for rank {_rank()} at {path}; resume RNG not restored.")
         return
     try:
-        state = torch.load(path, map_location="cpu")
+        # Locally produced RNG checkpoints include Python/NumPy state, not just
+        # tensors. Torch >=2.6's weights-only default cannot restore that state.
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if strict and not {"torch", "python", "numpy", "cuda"} <= set(state):
+            raise ValueError("Required RNG state is incomplete.")
+        if (
+            strict
+            and torch.cuda.is_available()
+            and (state["cuda"] is None or len(state["cuda"]) != torch.cuda.device_count())
+        ):
+            raise ValueError("Required CUDA RNG states disagree with the current visible device count.")
         torch.set_rng_state(state["torch"])
         if state.get("cuda") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda"])
@@ -150,6 +189,8 @@ def _load_rng(ckpt_dir: str) -> None:
 
             _np.random.set_state(state["numpy"])
     except Exception as e:
+        if strict:
+            raise
         logger.warning(f"RNG state restore skipped: {e}")
 
 
@@ -198,7 +239,11 @@ def save_checkpoint(
 
     ``require_rng_state`` rejects RNG failures collectively and requires every
     rank's RNG file before publication or an idempotent return.
+    An ART adapter contract also requires strict RNG and the matching durable
+    dataset cursor before either publication or an idempotent return.
     """
+    art_contract = adapter_contract.get("art")
+    require_rng_state = require_rng_state or art_contract is not None
     task_root = _task_root(save_dir, task)
     ckpt_dir = os.path.join(task_root, iter_dir_name(iteration))
     staging_dir = os.path.join(task_root, f".{iter_dir_name(iteration)}.inprogress")
@@ -217,6 +262,8 @@ def save_checkpoint(
                     existing[name] = json.load(f)
             if require_rng_state and any(not os.path.isfile(path) for path in _rng_paths(ckpt_dir)):
                 raise RuntimeError("Committed checkpoint is missing required per-rank RNG state")
+            if art_contract is not None:
+                load_art_dataset_state(save_dir, iteration, art_contract["training"]["n_samples_per_prompt"])
             if existing == expected:
                 decision = {"action": "return"}
             else:
@@ -336,6 +383,8 @@ def save_checkpoint(
             missing = [path for path in required_paths if not os.path.isfile(path)]
             if missing:
                 raise RuntimeError(f"Checkpoint publication is missing required files: {missing}.")
+            if art_contract is not None:
+                load_art_dataset_state(save_dir, iteration, art_contract["training"]["n_samples_per_prompt"])
             # COMMITTED is the last write inside staging. The directory is still
             # hidden from discovery; promotion below makes the complete snapshot
             # visible in one rename instead of authenticating a partial overwrite.
@@ -420,6 +469,7 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer],
     *,
     adapter_only: bool = False,
+    require_rng_state: bool = False,
 ) -> Dict[str, Any]:
     """Restore model/optimizer from a committed checkpoint; return
     trainer_state.
@@ -433,6 +483,22 @@ def load_checkpoint(
     after a run has accumulated apparently-successful checkpoints.
     """
     ckpt_dir = os.path.join(_task_root(save_dir, task), iter_dir_name(iteration))
+    trainer_state = None
+    if require_rng_state:
+        preflight_error = None
+        try:
+            if not _is_committed(ckpt_dir):
+                raise FileNotFoundError(f"Required checkpoint is not committed: {ckpt_dir}")
+            if not os.path.isfile(os.path.join(ckpt_dir, f"rng_rank{_rank()}.pt")):
+                raise FileNotFoundError("Required per-rank checkpoint RNG file is missing.")
+            with open(os.path.join(ckpt_dir, "trainer_state.json"), encoding="utf-8") as f:
+                trainer_state = json.load(f)
+        except Exception as exc:
+            preflight_error = exc
+        if not _all_ranks_ok(0 if preflight_error is not None else 1):
+            raise RuntimeError(
+                "Required checkpoint metadata/RNG preflight failed on at least one rank."
+            ) from preflight_error
     if not _is_committed(ckpt_dir):
         raise FileNotFoundError(f"Refusing to resume from uncommitted checkpoint: {ckpt_dir}")
     fsdp_dir = os.path.join(ckpt_dir, "fsdp")
@@ -471,8 +537,19 @@ def load_checkpoint(
     )
 
     # Restore this rank's RNG state (best-effort) for deterministic resume.
-    _load_rng(ckpt_dir)
+    if require_rng_state:
+        rng_error = None
+        try:
+            _load_rng(ckpt_dir, strict=True)
+        except Exception as exc:
+            rng_error = exc
+        if not _all_ranks_ok(0 if rng_error is not None else 1):
+            raise RuntimeError("Required checkpoint RNG restore failed on at least one rank.") from rng_error
+    else:
+        _load_rng(ckpt_dir)
 
+    if trainer_state is not None:
+        return trainer_state
     with open(os.path.join(ckpt_dir, "trainer_state.json"), encoding="utf-8") as f:
         return json.load(f)
 

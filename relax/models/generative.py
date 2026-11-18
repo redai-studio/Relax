@@ -291,6 +291,10 @@ class GenerativeModelAdapter(Protocol):
         neither is set, a LoRA run fails at init.
     ``lora_task_type: str``
         PEFT task type, default ``"FEATURE_EXTRACTION"`` (diffusion DiTs).
+    ``prepare_replay_batch(model, batch) -> Mapping[str, Any]``
+        Optional once-per-forward hook invoked before the replay step loop.
+        Adapters use it to compute shared conditioning (for example a frozen
+        image/text prefix) once rather than once per denoising timestep.
     """
 
     family: str

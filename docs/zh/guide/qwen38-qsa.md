@@ -298,16 +298,32 @@ CP16 将 GDN 的 48 个 V heads 分到 16 张卡，每卡只有 3 个 heads。Fl
 
 ## 冻结 PLE 的局部计算
 
-静态 CP、TP1、THD packed 输入且所有 PLE 参数冻结时，可设置：
-
-连接已有 Ray 集群时，仅在提交端 `export` 不会自动传入训练进程。对于本指南的启动脚本，在 `export "${ENV_ARGS[@]}"` 之前加入以下配置；脚本会将它们与已有环境设置合并，同时传入 Ray job 的 `runtime_env.env_vars` 和训练进程的 `--train-env-vars`：
+静态 CP、TP1、THD packed 输入且所有 PLE 参数冻结时可启用。下面的 32 卡示例使用 **TP1/PP2/CP8/EP8/ETP1**，序列上限 128K；脚本会把两个 PLE 开关同时传入 Ray job 和训练 Actor，无需修改脚本。使用上述已安装 HybridEP 的镜像，并从仓库根目录运行：
 
 ```bash
-ENV_ARGS+=(
-    QWEN38_PLE_INPUT_HALO_CP=1
-    QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
-)
+export MODEL_DIR=/path/to/model
+export DATA_DIR=/path/to/sft-data
+export SAVE_DIR=/path/to/checkpoints
+export MEGATRON=/path/to/image-patched/Megatron-LM
+export RAY_JOBS_ADDRESS=http://ray-head:8265
+export RAY_ADDRESS="$RAY_JOBS_ADDRESS"
+export QWEN38_PLE_INPUT_HALO_CP=1
+export QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+export RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
+export RELAX_QWEN38_QSA_CP=1
+export QWEN38_CP_SIZE=8
+export QWEN38_PP_LAYOUT='Et*24|t*24mL'
+export QWEN38_SFT_MODALITY=text
+export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS=1
+export EXP_NAME=qwen38-ple-halo-cp8
+NUM_STEPS=20 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh \
+  --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
+  --linear-cp-mode headwise --global-batch-size 32 --rollout-batch-size 32 \
+  --max-tokens-per-gpu 16384 \
+  --chunked-optimizer-state-offload --optimizer-state-offload-fraction 1.0
 ```
+
+命令末尾的 TP/PP 参数覆盖脚本的 TP2/PP4 默认值；Megatron 在 TP1 时关闭 sequence parallelism。脚本已有的冻结参数设置包含全部 PLE 参数。先添加 `DRY_RUN=1` 可检查最终参数；这是 PLE 启动示例，不代表 512K/1M 容量验收。
 
 该功能默认关闭。开启后，每张卡只计算自己负责的输出，以及卷积需要的左侧输入；文档边界仍使用原来的补零规则。数据处理自动记录每篇文档补齐后的边界，无需额外开启 QSA CPU layout。原生 GPT 和 VL Bridge 重计算均按微批保存、恢复 PLE 状态；仅支持按文档的 zigzag 分片；不支持 allgather CP、动态 CP、TP 大于 1 或训练 PLE 参数。
 
