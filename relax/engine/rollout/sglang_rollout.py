@@ -951,6 +951,18 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    """Generate a rollout and release Judge HTTP resources on every exit."""
+    state = GenerateState(args)
+    try:
+        return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
+    finally:
+        if (partial_genrm := getattr(state, "partial_genrm", None)) is not None:
+            await partial_genrm.aclose()
+
+
+async def _generate_rollout_async(
+    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
+) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based
     rm rollout generation.
 

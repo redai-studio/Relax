@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 from relax.engine.rollout import partial_genrm
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
@@ -20,25 +22,97 @@ MESSAGES = [{"role": "user", "content": "Score this response"}]
 
 
 @pytest.fixture
-def judge(monkeypatch):
+async def judge(monkeypatch):
     args = Namespace(genrm_model_path="judge", genrm_sampling_config={"max_response_len": 5})
     state = SimpleNamespace(abort_event=asyncio.Event())
     helper = PartialGenRM(args, state)
     helper.tokenizers["__default__"] = SimpleNamespace(
-        apply_chat_template=lambda *args, **kwargs: [10, 11], eos_token_id=99
+        apply_chat_template=lambda *args, **kwargs: [10, 11],
+        eos_token_id=99,
+        decode=lambda ids, **kwargs: "".join({1: "first", 2: "pr", 3: "e", 4: "fix", 7: "done"}[i] for i in ids),
     )
     monkeypatch.setattr(helper, "_get_engine_urls", AsyncMock(return_value=["http://judge"]))
-    return helper
+    yield helper
+    await helper.aclose()
 
 
 def _chunk(text, ids, reason):
     return {"text": text, "output_ids": ids, "meta_info": {"finish_reason": {"type": reason}}}
 
 
+@pytest.fixture
+def byte_tokenizer():
+    backend = Tokenizer(
+        models.BPE({char: index for index, char in enumerate(pre_tokenizers.ByteLevel.alphabet())}, [])
+    )
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend, eos_token="<eos>", chat_template="{{ messages[0]['content'] }}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["__default__", "quality"])
+async def test_partial_genrm_discovers_named_singleton_manager(judge, monkeypatch, key):
+    judge.args._genrm_instances_resolved = {key: {"model_path": "judge", "sampling_config": {}}}
+    name = "relax_genrm_manager" if key == "__default__" else "relax_genrm_manager_quality"
+    manager = SimpleNamespace(get_engine_hosts_ports=SimpleNamespace(remote=AsyncMock(return_value=[("judge", 8000)])))
+    registered = {name: manager}
+    monkeypatch.setattr(partial_genrm.ray, "get_actor", registered.__getitem__)
+    assert await PartialGenRM._get_engine_urls(judge, key) == ["http://judge:8000"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["stop", "length", "abort"])
+async def test_partial_genrm_normalizes_completed_replayed_and_budget_results(judge, monkeypatch, reason):
+    post = AsyncMock(return_value=_chunk("\n1 \n", [1], reason))
+    monkeypatch.setattr(partial_genrm, "_post", post)
+    sample = Sample(status=Sample.Status.COMPLETED)
+    params = {"max_new_tokens": 1}
+    if reason == "abort":
+        with pytest.raises(PartialGenRMAborted):
+            await judge.bind(sample)(MESSAGES, params)
+    else:
+        assert await judge.bind(sample)(MESSAGES, params) == "1"
+    assert await judge.bind(sample)(MESSAGES, params) == "1"
+    assert await judge.bind(sample)(MESSAGES, params) == "1"
+    assert post.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop,no_stop_trim,skip_special,expected",
+    [
+        ("END", False, True, "€1"),
+        ("END", True, True, "€1END"),
+        ("<eos>", False, False, "€1"),
+        ("<eos>", True, False, "€1<eos>"),
+        ("<eos>", True, True, "€1"),
+    ],
+)
+async def test_partial_genrm_resumes_multibyte_text_and_preserves_stop_options(
+    judge, monkeypatch, byte_tokenizer, stop, no_stop_trim, skip_special, expected
+):
+    judge.tokenizers["__default__"] = byte_tokenizer
+    ids = byte_tokenizer.encode("€1" + stop, add_special_tokens=False)
+    assert byte_tokenizer.decode(ids[:1]) == "�"
+    first = _chunk("�", ids[:1], "abort")
+    last = _chunk("1" + (stop if no_stop_trim and not skip_special else ""), ids[1:], "stop")
+    last["meta_info"]["finish_reason"]["matched"] = byte_tokenizer.eos_token_id if stop == "<eos>" else stop
+    post = AsyncMock(side_effect=[first, last])
+    monkeypatch.setattr(partial_genrm, "_post", post)
+    sample = Sample(status=Sample.Status.COMPLETED)
+    params = {"max_new_tokens": 20, "no_stop_trim": no_stop_trim, "skip_special_tokens": skip_special}
+    with pytest.raises(PartialGenRMAborted):
+        await judge.bind(sample)(MESSAGES, params)
+    assert await judge.bind(sample)(MESSAGES, params) == expected
+
+
 @pytest.mark.asyncio
 async def test_partial_genrm_replays_completed_calls_and_resumes_prefix(judge, monkeypatch):
     post = AsyncMock(side_effect=[_chunk("first", [1], "stop"), _chunk("pre", [2, 3], "abort")])
-    monkeypatch.setattr(partial_genrm, "post", post)
+    monkeypatch.setattr(partial_genrm, "_post", post)
     sample = Sample(status=Sample.Status.TRUNCATED)
     generate = judge.bind(sample)
     assert await generate(MESSAGES) == "first"
@@ -58,18 +132,19 @@ async def test_partial_genrm_replays_completed_calls_and_resumes_prefix(judge, m
     assert await generate(MESSAGES) == "first"
     assert post.await_count == 0
     assert await generate(MESSAGES, {"temperature": 0}) == "prefix"
-    payload = post.call_args.args[1]
+    payload = post.call_args.args[2]
     assert payload["input_ids"] == [10, 11, 2, 3]
     assert payload["sampling_params"]["max_new_tokens"] == 3
     assert payload["sampling_params"]["temperature"] == 0
     resumed.clear(sample)
     assert not resumed.restore(sample)
+    await resumed.aclose()
 
 
 @pytest.mark.asyncio
 async def test_partial_genrm_rejects_changed_resume_input(judge, monkeypatch):
     post = AsyncMock(return_value=_chunk("pre", [1], "abort"))
-    monkeypatch.setattr(partial_genrm, "post", post)
+    monkeypatch.setattr(partial_genrm, "_post", post)
     sample = Sample(status=Sample.Status.COMPLETED)
     with pytest.raises(PartialGenRMAborted):
         await judge.bind(sample)(MESSAGES)
@@ -82,7 +157,7 @@ async def test_partial_genrm_rejects_changed_resume_input(judge, monkeypatch):
 @pytest.mark.parametrize("ignore_eos,aborted", [(False, False), (True, True)])
 async def test_partial_genrm_honors_eos_on_abort(judge, monkeypatch, ignore_eos, aborted):
     post = AsyncMock(return_value=_chunk("done", [99], "abort"))
-    monkeypatch.setattr(partial_genrm, "post", post)
+    monkeypatch.setattr(partial_genrm, "_post", post)
     generate = judge.bind(Sample(status=Sample.Status.COMPLETED))
     if aborted:
         with pytest.raises(PartialGenRMAborted):
@@ -100,7 +175,7 @@ async def test_partial_genrm_budget_exhaustion_does_not_redispatch(judge, monkey
             "meta_info": {"finish_reason": {"type": "abort"}, "output_token_logprobs": [[0, 7, None]]},
         }
     )
-    monkeypatch.setattr(partial_genrm, "post", post)
+    monkeypatch.setattr(partial_genrm, "_post", post)
     sample = Sample(status=Sample.Status.COMPLETED)
     with pytest.raises(PartialGenRMAborted):
         await judge.bind(sample)(MESSAGES, {"max_new_tokens": 1})
@@ -122,7 +197,7 @@ async def test_partial_genrm_only_maps_strict_abort_499(judge, monkeypatch, stat
         status, request=httpx.Request("POST", "http://judge/generate"), json={"error": {"message": message}}
     )
     post = AsyncMock(side_effect=httpx.HTTPStatusError("failed", request=response.request, response=response))
-    monkeypatch.setattr(partial_genrm, "post", post)
+    monkeypatch.setattr(partial_genrm, "_post", post)
     with pytest.raises(expected):
         await judge.bind(Sample(status=Sample.Status.COMPLETED))(MESSAGES)
     assert not judge.active
@@ -136,7 +211,7 @@ async def test_partial_genrm_stops_dispatch_after_discovery_abort(judge, monkeyp
 
     monkeypatch.setattr(judge, "_get_engine_urls", discover)
     post = AsyncMock()
-    monkeypatch.setattr(partial_genrm, "post", post)
+    monkeypatch.setattr(partial_genrm, "_post", post)
     with pytest.raises(PartialGenRMAborted):
         await judge.bind(Sample(status=Sample.Status.COMPLETED))(MESSAGES)
     post.assert_not_awaited()
@@ -147,7 +222,7 @@ async def test_partial_genrm_abort_drains_late_http_dispatch(judge, monkeypatch)
     entered, released = asyncio.Event(), asyncio.Event()
     aborts = 0
 
-    async def post(url, payload, **kwargs):
+    async def post(client, url, payload, **kwargs):
         nonlocal aborts
         if url.endswith("/abort_request"):
             aborts += 1
@@ -159,7 +234,7 @@ async def test_partial_genrm_abort_drains_late_http_dispatch(judge, monkeypatch)
         await released.wait()
         return _chunk("pre", [1], "abort")
 
-    monkeypatch.setattr(partial_genrm, "post", post)
+    monkeypatch.setattr(partial_genrm, "_post", post)
     task = asyncio.create_task(judge.bind(Sample(status=Sample.Status.COMPLETED))(MESSAGES))
     await asyncio.wait_for(entered.wait(), timeout=2)
     judge.state.abort_event.set()

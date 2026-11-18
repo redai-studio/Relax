@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import ray
 
-from relax.utils.http_utils import is_expected_sglang_499, post
+from relax.utils.http_utils import _post, is_expected_sglang_499
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
@@ -36,6 +36,7 @@ class PartialGenRM:
         self.engine_urls: dict[str, list[str]] = {}
         self.next_engine: dict[str, int] = {}
         self.active: dict[str, int] = {}
+        self._client: httpx.AsyncClient | None = None
 
     @classmethod
     def from_args(cls, args: Namespace, state: Any) -> "PartialGenRM | None":
@@ -66,6 +67,14 @@ class PartialGenRM:
     def reset_step(self) -> None:
         self.engine_urls.clear()
         self.next_engine.clear()
+
+    async def aclose(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception as error:
+                logger.warning(f"Failed to close partial GenRM HTTP client: {error}")
 
     @staticmethod
     def restore(sample: Sample) -> bool:
@@ -110,7 +119,7 @@ class PartialGenRM:
                 "sampling_config": getattr(self.args, "genrm_sampling_config", None) or {},
             }
         }
-        key = next(iter(instances)) if route_key is None and len(instances) == 1 else route_key
+        key = next(iter(instances)) if route_key is None and len(instances) == 1 else route_key or "__default__"
         if key not in instances:
             raise ValueError(f"Unknown GenRM route_key={key!r}; available={list(instances)}")
         return key, instances[key]
@@ -125,7 +134,7 @@ class PartialGenRM:
     async def _get_engine_urls(self, key: str) -> list[str]:
         if key not in self.engine_urls:
             instances = getattr(self.args, "_genrm_instances_resolved", None) or {"__default__": {}}
-            name = "relax_genrm_manager" if len(instances) == 1 else f"relax_genrm_manager_{key}"
+            name = "relax_genrm_manager" if list(instances) == ["__default__"] else f"relax_genrm_manager_{key}"
             manager = ray.get_actor(name)
             hosts_ports = await manager.get_engine_hosts_ports.remote()
             urls = [f"http://{host}:{port}" for host, port in hosts_ports]
@@ -166,7 +175,7 @@ class PartialGenRM:
             call = {"fingerprint": fingerprint, "output_ids": [], "response": "", "terminal": False}
             calls.append(call)
         if call["terminal"]:
-            return call["response"]
+            return call["response"].strip()
         self._check_abort()
         tokenizer = self._get_tokenizer(key, spec)
         if "prompt_ids" not in call:
@@ -181,7 +190,7 @@ class PartialGenRM:
         params["max_new_tokens"] = max(0, params["max_new_tokens"] - len(call["output_ids"]))
         if params["max_new_tokens"] == 0:
             call["terminal"] = True
-            return call["response"]
+            return call["response"].strip()
         urls = await self._get_engine_urls(key)
         engine_index = self.next_engine.get(key, 0) % len(urls)
         self.next_engine[key] = engine_index + 1
@@ -192,10 +201,15 @@ class PartialGenRM:
             "return_logprob": True,
         }
         self._check_abort()
+        if self._client is None:
+            concurrency = getattr(self.args, "reward_max_concurrency", None) or 64
+            self._client = httpx.AsyncClient(limits=httpx.Limits(max_connections=concurrency), timeout=None)
         self.active[url] = self.active.get(url, 0) + 1
         try:
             try:
-                output = await post(f"{url}/generate", payload, max_retries=1)
+                # Judge traffic must not consume the policy HTTP pool or the
+                # distributed poster actors' execution slots.
+                output = await _post(self._client, f"{url}/generate", payload, max_retries=1)
             except httpx.HTTPStatusError as error:
                 if is_expected_sglang_499(error):
                     raise PartialGenRMAborted from error
@@ -211,17 +225,38 @@ class PartialGenRM:
         text = output.get("text", "")
         if text and not token_ids:
             raise RuntimeError("Partial GenRM requires output token IDs to checkpoint generated text")
+        resumed = bool(call["output_ids"])
         call["output_ids"].extend(token_ids)
-        call["response"] += text
-        reason = (meta.get("finish_reason") or {}).get("type")
+        finish_reason = meta.get("finish_reason") or {}
+        reason = finish_reason.get("type")
         stop_ids = set(params.get("stop_token_ids") or [])
         if not params.get("ignore_eos", False):
             for attribute in ("eos_token_id", "eos_token_ids", "additional_stop_token_ids"):
                 value = getattr(tokenizer, attribute, None)
                 stop_ids.update([value] if isinstance(value, int) else value or [])
-        if reason in {"stop", "length"} or (reason == "abort" and token_ids and token_ids[-1] in stop_ids):
+        if reason == "abort" and token_ids and token_ids[-1] in stop_ids:
+            reason = "stop"
+            finish_reason = {"type": "stop", "matched": token_ids[-1]}
+        # A request-local decoded chunk can end in a partial UTF-8 character.
+        # On resume, decode the complete prefix rather than concatenate text.
+        if resumed:
+            ids = call["output_ids"]
+            matched = finish_reason.get("matched")
+            if not params.get("no_stop_trim", False) and isinstance(matched, int) and ids and ids[-1] == matched:
+                ids = ids[:-1]
+            text = await asyncio.to_thread(
+                tokenizer.decode,
+                ids,
+                skip_special_tokens=params.get("skip_special_tokens", True),
+                spaces_between_special_tokens=params.get("spaces_between_special_tokens", True),
+                clean_up_tokenization_spaces=False,
+            )
+            if not params.get("no_stop_trim", False) and isinstance(matched, str) and matched:
+                text = text.partition(matched)[0]
+        call["response"] = text
+        if reason in {"stop", "length"}:
             call["terminal"] = True
-            return call["response"]
+            return call["response"].strip()
         if reason == "abort":
             raise PartialGenRMAborted
         raise RuntimeError(f"Unexpected GenRM finish_reason={reason!r}")
@@ -230,14 +265,18 @@ class PartialGenRM:
         # Repeat until drained: abort_all may reach a worker before an in-flight
         # HTTP generate has reached its scheduler. No new training requests can
         # enter after the rollout abort event is set.
-        while self.active:
-            urls = list(self.active)
-            results = await asyncio.gather(
-                *(post(f"{url}/abort_request", {"abort_all": True}, max_retries=1) for url in urls),
-                return_exceptions=True,
-            )
-            for url, result in zip(urls, results, strict=True):
-                if isinstance(result, BaseException):
-                    logger.warning(f"Failed to abort GenRM worker at {url}: {result}")
-            if self.active:
-                await asyncio.sleep(0.5)
+        async with httpx.AsyncClient(timeout=10) as control_client:
+            while self.active:
+                urls = list(self.active)
+                results = await asyncio.gather(
+                    *(
+                        _post(control_client, f"{url}/abort_request", {"abort_all": True}, max_retries=1)
+                        for url in urls
+                    ),
+                    return_exceptions=True,
+                )
+                for url, result in zip(urls, results, strict=True):
+                    if isinstance(result, BaseException):
+                        logger.warning(f"Failed to abort GenRM worker at {url}: {result}")
+                if self.active:
+                    await asyncio.sleep(0.5)
