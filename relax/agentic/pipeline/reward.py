@@ -40,6 +40,7 @@ class RewardDomain:
     ) -> None:
         self.args = args
         self.group_rm = args.group_rm
+        self._evaluation = rollout_mode == "eval"
 
         custom_advantage_path = args.agentic_custom_advantage_path if rollout_mode == "train" else None
         self.custom_advantage_func = None
@@ -123,7 +124,7 @@ class RewardDomain:
             for sample in samples:
                 mark_sample_agentic_event(sample, "reward_arrive_at", reward_start_at)
                 mark_sample_agentic_event(sample, "reward_start_at", reward_start_at)
-            rewards = await batched_async_rm(self.args, samples)
+            rewards = await batched_async_rm(self.args, samples, evaluation=self._evaluation)
             reward_end_at = time.time()
             for sample, reward in zip(samples, rewards, strict=True):
                 sample.reward = reward
@@ -222,7 +223,7 @@ class RewardDomain:
             if sample.reward is None:
                 mark_sample_agentic_event(sample, "reward_start_at")
                 try:
-                    sample.reward = await async_rm(self.args, sample)
+                    sample.reward = await async_rm(self.args, sample, evaluation=self._evaluation)
                 finally:
                     mark_sample_agentic_event(sample, "reward_end_at")
 
