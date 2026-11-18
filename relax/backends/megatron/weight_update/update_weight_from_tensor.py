@@ -685,7 +685,8 @@ class UpdateWeightFromTensor:
         if failed.item():
             errors = [None] * dist.get_world_size(get_gloo_group())
             dist.all_gather_object(errors, error, group=get_gloo_group())
-            raise RuntimeError(f"Weight load failed: {errors}")
+            label = "Routed weight load" if self._route_experts else "Weight load"
+            raise RuntimeError(f"{label} failed: {errors}")
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
