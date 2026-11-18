@@ -4,25 +4,20 @@ CPU."""
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import sys
-from dataclasses import dataclass, replace
-from enum import IntEnum
+from dataclasses import replace
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
+from megatron.core.transformer.enums import AttnMaskType as Mask
 
 
 ROOT = Path(__file__).resolve().parents[4]
 QSA_MODULE = "megatron.core.transformer.experimental_attention_variant.qsa"
 MIXED = "relax.models.qwen3_8.ops.qsa_mixed_ops"
-
-
-class Mask(IntEnum):
-    causal = 1
 
 
 def _load(monkeypatch, name, path):
@@ -36,29 +31,14 @@ def _load(monkeypatch, name, path):
 @pytest.fixture
 def checkpoint_modules(monkeypatch):
     monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "grouped")
-    # This patch adds the entire pinned qsa.py. Execute the unmodified production
-    # dataclass and two methods, with only external backend services substituted.
-    patch = (ROOT / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
-    section = patch.split("+++ b/megatron/core/transformer/experimental_attention_variant/qsa.py\n", 1)[1]
-    source = "\n".join(line[1:] for line in section.split("\ndiff --git", 1)[0].splitlines() if line.startswith("+"))
-    tree = ast.parse(source)
-    nodes = []
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name == "QSASelection":
-            nodes.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name in ("QwenSparseSelfAttention", "QSACoreAttention"):
-            methods = (
-                {"forward", "_relax_native_forward"}
-                if node.name == "QSACoreAttention"
-                else {"_checkpointed_attention_forward"}
-            )
-            nodes.extend(item for item in node.body if isinstance(item, ast.FunctionDef) and item.name in methods)
-    module = ModuleType(QSA_MODULE)
-    module.__dict__.update(
-        dataclass=dataclass, replace=replace, torch=torch, AttnMaskType=Mask, get_pg_size=lambda pg: 1
+    from megatron.core.transformer.experimental_attention_variant import qsa
+
+    module = SimpleNamespace(
+        QSASelection=qsa.QSASelection,
+        forward=qsa.QSACoreAttention.forward,
+        _relax_native_forward=qsa.QSACoreAttention._relax_native_forward,
+        _checkpointed_attention_forward=qsa.QwenSparseSelfAttention._checkpointed_attention_forward,
     )
-    monkeypatch.setitem(sys.modules, QSA_MODULE, module)
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<pinned-qsa-checkpoint>", "exec"), module.__dict__)
     metadata = _load(monkeypatch, MIXED + ".selection", ROOT / "relax/models/qwen3_8/ops/qsa_mixed_ops/selection.py")
     _load(monkeypatch, MIXED + ".geometry", ROOT / "relax/models/qwen3_8/ops/qsa_mixed_ops/geometry.py")
     mixed = _load(monkeypatch, MIXED, ROOT / "relax/models/qwen3_8/ops/qsa_mixed_ops/__init__.py")

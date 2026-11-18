@@ -1,12 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Validate runtime patches against real pinned sources, without CUDA
-imports."""
+"""Validate installed runtime sources and build helper behavior on CPU."""
 
 import ast
 import importlib.util
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,41 +20,13 @@ SPEC.loader.exec_module(validation)
 
 @pytest.fixture
 def fla_tree(tmp_path):
-    source = os.environ.get("BLACKWELL_FLA_SOURCE_DIR")
-    if not source:
-        pytest.skip("Set BLACKWELL_FLA_SOURCE_DIR to the unpacked fla-core/flash-linear-attention 0.5.2 wheel root")
-    shutil.copytree(Path(source) / "fla", tmp_path / "fla")
+    package = Path(importlib.util.find_spec("fla").origin).parent
+    shutil.copytree(package, tmp_path / "fla")
     return tmp_path
-
-
-def kernel_bodies(path):
-    return {
-        n.name: [ast.dump(stmt) for stmt in n.body]
-        for n in ast.parse(path.read_text()).body
-        if isinstance(n, ast.FunctionDef)
-    }
-
-
-def install_conv_entries(fla_tree):
-    command = ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(ROOT / "docker/patch/fla/0.5.2.patch")]
-    result = subprocess.run(command, cwd=fla_tree, capture_output=True, text=True, check=True)
-    assert "offset" not in result.stdout and "fuzz" not in result.stdout
-    assert subprocess.run(command + ["--dry-run"], cwd=fla_tree, capture_output=True).returncode != 0
-
-
-def test_fla_entries_preserve_kernel_arithmetic(fla_tree):
-    package = fla_tree / "fla"
-    kernels = package / "modules/conv/triton/kernels.py"
-    before = kernel_bodies(kernels)
-    install_conv_entries(fla_tree)
-    hashes = validation.check_fla_conv(package)
-    assert set(hashes) == {"kernels.py", "kernels_pow2.py", "kernels_none.py", "ops.py", "conv_policy.py"}
-    assert kernel_bodies(kernels) == before
 
 
 @pytest.mark.parametrize("filename", ["kernels.py", "kernels_pow2.py", "kernels_none.py"])
 def test_fla_validation_rejects_kernel_arithmetic_changes(fla_tree, filename):
-    install_conv_entries(fla_tree)
     package = fla_tree / "fla"
     kernels = package / "modules/conv/triton" / filename
     kernels.write_text(
@@ -69,7 +39,6 @@ def test_fla_validation_rejects_kernel_arithmetic_changes(fla_tree, filename):
 @pytest.mark.parametrize("mode", ["original", "pow2", "none", "auto"])
 @pytest.mark.parametrize("arch", ["blackwell", "hopper", ""])
 def test_fla_policy_selects_entries_once_per_process(fla_tree, monkeypatch, mode, arch):
-    install_conv_entries(fla_tree)
     monkeypatch.setenv("RELAX_FLA_CONV_NB_MODE", mode)
     monkeypatch.setenv("RELAX_GPU_ARCH", arch)
     monkeypatch.delenv("RELAX_QWEN38_FLA_CONV_CACHE_REUSE", raising=False)
@@ -93,7 +62,6 @@ def test_fla_policy_selects_entries_once_per_process(fla_tree, monkeypatch, mode
 def test_fla_forward_backward_bind_same_static_entry(fla_tree, monkeypatch, mode):
     from types import SimpleNamespace
 
-    install_conv_entries(fla_tree)
     tree = ast.parse((fla_tree / "fla/modules/conv/triton/ops.py").read_text())
     branch = next(node for node in tree.body if isinstance(node, ast.If) and "CONV_NB_MODE" in ast.unparse(node.test))
     entries = {
@@ -113,7 +81,6 @@ def test_fla_forward_backward_bind_same_static_entry(fla_tree, monkeypatch, mode
 
 
 def test_fla_original_cache_override_is_frozen(fla_tree, monkeypatch):
-    install_conv_entries(fla_tree)
     monkeypatch.setenv("RELAX_FLA_CONV_NB_MODE", "original")
     monkeypatch.setenv("RELAX_QWEN38_FLA_CONV_CACHE_REUSE", "1")
     scope = {}
@@ -128,18 +95,8 @@ def test_fla_validation_rejects_unknown_mode(tmp_path):
         validation.check_fla_conv(tmp_path, "typo")
 
 
-def test_pinned_mcore_exposes_required_runtime_contracts():
-    source = os.environ.get("BLACKWELL_MEGATRON_SOURCE_DIR")
-    if not source:
-        pytest.skip("Set BLACKWELL_MEGATRON_SOURCE_DIR to the assembled and patched Megatron source root")
-    validation.check_mcore(Path(source) / "megatron")
-
-
 def test_pinned_hybridep_retains_both_dispatch_apis(tmp_path):
-    source = os.environ.get("BLACKWELL_HYBRIDEP_SOURCE_DIR")
-    if not source:
-        pytest.skip("Set BLACKWELL_HYBRIDEP_SOURCE_DIR to the pinned HybridEP source root")
-    package = Path(source) / "deep_ep"
+    package = Path(importlib.util.find_spec("_relax_hybrid_ep").origin).parent
     validation.check_hybridep(package)
     for name in ("__init__.py", "hybrid_ep_buffer.py"):
         shutil.copy(package / name, tmp_path / name)
@@ -165,12 +122,10 @@ def load_methods(path, class_name, methods, globals_dict):
 def test_main_hybridep_padding_growth_and_combine_gradients(monkeypatch, dense):
     from types import SimpleNamespace
 
+    import megatron.core
     import torch
 
-    source = os.environ.get("BLACKWELL_MEGATRON_SOURCE_DIR")
-    if not source:
-        pytest.skip("Set BLACKWELL_MEGATRON_SOURCE_DIR to the patched source root")
-    path = Path(source) / "megatron/core/transformer/moe/token_dispatcher.py"
+    path = Path(megatron.core.__file__).parent / "transformer/moe/token_dispatcher.py"
     ns = load_methods(
         path,
         "_HybridEPManager",
@@ -231,9 +186,7 @@ def test_main_hybridep_padding_growth_and_combine_gradients(monkeypatch, dense):
 def test_pinned_hybridep_requests_buffer_growth():
     from types import SimpleNamespace
 
-    source = os.environ.get("BLACKWELL_HYBRIDEP_SOURCE_DIR")
-    if not source:
-        pytest.skip("Set BLACKWELL_HYBRIDEP_SOURCE_DIR to the pinned source root")
+    package = Path(importlib.util.find_spec("_relax_hybrid_ep").origin).parent
 
     class Config(SimpleNamespace):
         def is_valid(self):
@@ -241,7 +194,7 @@ def test_pinned_hybridep_requests_buffer_growth():
 
     updates = []
     ns = load_methods(
-        Path(source) / "deep_ep/hybrid_ep_buffer.py",
+        package / "hybrid_ep_buffer.py",
         "HybridEPBuffer",
         {"update_template_config"},
         {

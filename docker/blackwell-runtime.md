@@ -112,14 +112,15 @@ CUDA imports when running the image on a GPU host.
 
 ## Tests and acceptance
 
-CPU source tests take explicit source directories; none downloads dependencies or
-starts Ray jobs. `BLACKWELL_FLA_SOURCE_DIR` is the extraction root containing `fla/` from
-both pinned 0.5.2 wheels. `BLACKWELL_MEGATRON_SOURCE_DIR` is the assembled main source
-with both patches applied. `BLACKWELL_HYBRIDEP_SOURCE_DIR` is the pinned DeepEP checkout.
+Run CPU tests inside the built CUDA 13 image. They use the installed, patched
+FLA, Megatron and `_relax_hybrid_ep` packages; no pristine source directories or
+patch replay are required. These tests do not download dependencies or start Ray
+jobs. CPU checks cover build helper decisions and numerical behavior that can run
+without GPU kernels; they do not validate CUDA compilation or distributed transport.
 
 ```bash
 PYTHONPATH=. pytest -q tests/cpu/tools/test_blackwell_runtime_build.py \
-  tests/scripts/test_qwen_moe_runtime_preflight.py tests/scripts/test_qwen_moe_entries.py \
+  tests/cpu/tools/test_optimized_runtime_patches.py \
   tests/cpu/backends/megatron/test_model_provider_vpp.py
 ```
 

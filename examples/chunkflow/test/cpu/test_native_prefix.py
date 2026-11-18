@@ -4,7 +4,8 @@
 
 Only construction, Megatron QKV plumbing and RoPE are small CPU stand-ins.
 Selection, sparse-mask attention, n-gram hashing, PLE gating and convolution
-are loaded unchanged from the pinned patch. This is not a CUDA/TE validation.
+are loaded unchanged from the installed Megatron source. This is not a CUDA/TE
+validation.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import megatron.core
 import pytest
 import torch
 import torch.nn.functional as F
@@ -30,7 +32,7 @@ from examples.chunkflow.test.cpu.test_integration import restore_rope_patch as r
 from examples.chunkflow.units import Unit, build_micro_batches, completed_groups, gen_unit_ops
 
 
-PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20260915-4a4de8657.patch"
+MCORE = Path(megatron.core.__file__).parent
 QSA_MODULE = "megatron.core.transformer.experimental_attention_variant.qsa"
 PLE_MODULE = "megatron.core.transformer.per_layer_embedding"
 
@@ -82,13 +84,8 @@ class TinySelfAttention(torch.nn.Module):
 
 
 def native_source(relative):
-    patch = (
-        PATCH.parent.parent / "latest/megatron.patch" if relative == PLE_MODULE.replace(".", "/") + ".py" else PATCH
-    )
-    section = patch.read_text().split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
-    return ast.parse(
-        "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++"))
-    )
+    path = MCORE / relative.removeprefix("megatron/core/")
+    return ast.parse(path.read_text())
 
 
 def load_native():
@@ -143,7 +140,7 @@ def load_native():
             ):
                 nodes.append(node)
     future = ast.parse("from __future__ import annotations").body
-    exec(compile(ast.Module(body=future + nodes, type_ignores=[]), str(PATCH), "exec"), namespace)
+    exec(compile(ast.Module(body=future + nodes, type_ignores=[]), str(MCORE), "exec"), namespace)
     for name in classes:
         namespace[name].__module__ = PLE_MODULE if name in {"NGramEmbedding", "PerLayerEmbedding"} else QSA_MODULE
     return SimpleNamespace(**namespace)
