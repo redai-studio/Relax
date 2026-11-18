@@ -697,10 +697,11 @@ class SGLangEngine(RayActor):
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
         server_args = ServerArgs(**server_args_dict)
-        self._weight_sync_server_args = {
-            key: getattr(server_args, key)
-            for key in ("nnodes", "tp_size", "pp_size", "dp_size", "base_gpu_id", "gpu_id_step")
-        }
+        if getattr(self.args, "memory_weight_sync_config", None):
+            self._weight_sync_server_args = {
+                key: getattr(server_args, key)
+                for key in ("nnodes", "tp_size", "pp_size", "dp_size", "base_gpu_id", "gpu_id_step")
+            }
         self._router_bootstrap_port = (
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
@@ -1787,7 +1788,7 @@ class SGLangEngine(RayActor):
     def get_delta_weight_sync_layout(self) -> dict:
         """Resolved CPU topology only; GPU identities come from their
         owners."""
-        return dict(self._weight_sync_server_args)
+        return dict(getattr(self, "_weight_sync_server_args", {}))
 
     def _delta_layout_supported(self, gpu_count: int) -> bool:
         layout = getattr(self, "_weight_sync_server_args", {})
