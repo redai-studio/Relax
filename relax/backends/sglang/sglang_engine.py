@@ -1053,7 +1053,17 @@ class SGLangEngine(RayActor):
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         try:
-            self.unregister_from_router(timeout=5.0)
+            deferred_colocate = (
+                getattr(self, "_skip_router_registration", False)
+                and getattr(self, "_is_scaled_out", False)
+                and getattr(self.args, "colocate", False)
+                and not getattr(self.args, "hybrid", False)
+                and not getattr(self.args, "fully_async", False)
+            )
+            if not deferred_colocate:
+                self.unregister_from_router(timeout=5.0)
+            elif getattr(self, "_router_registration_pending", False) or self._router_worker_id is not None:
+                self.unregister_from_router(timeout=5.0, allow_already_absent=True)
         finally:
             process = getattr(self, "process", None)
             if process is not None:
@@ -1282,6 +1292,8 @@ class SGLangEngine(RayActor):
                 self._router_registration_pending = True
                 self._wait_for_registered_worker(timeout=confirm_timeout)
                 self._router_registration_pending = False
+            if confirm:
+                self._skip_router_registration = False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
