@@ -48,18 +48,27 @@ def resolve_receiver_quantization_config(
         if isinstance(overrides.get("text_config"), dict) and isinstance(config_values.get("text_config"), dict):
             overrides["text_config"] = {**config_values["text_config"], **overrides["text_config"]}
         config_values = {**config_values, **overrides}
-        # After promotion and overrides the receiver only consults root
-        # metadata; a null root must not re-enable the nested checkpoint copy.
-        quant_config = config_values.get("quantization_config")
-        if quant_config is None:
-            quant_config = config_values.get("compression_config")
-        quant_config = quant_config or None
+        # Mode detection reads root fields, while a selected mode's weight
+        # loader also reads nested metadata. Keep these two decisions distinct.
+        detected_config = config_values.get("quantization_config")
+        if detected_config is None:
+            detected_config = config_values.get("compression_config")
+        selected_method = quantization
+        if selected_method is None and detected_config:
+            selected_method = detected_config.get("quant_method")
+        quant_config = (
+            _get_checkpoint_quantization_config(config_values) if selected_method is not None else None
+        ) or None
         # None here is the effective format, not permission to reread the
         # original checkpoint and undo an explicit override.
         if quant_config:
             quant_config = dict(quant_config)
-            if quantization is not None:
-                quant_config.setdefault("quant_method", quantization)
+            metadata_method = quant_config.setdefault("quant_method", selected_method)
+            if metadata_method != selected_method:
+                raise ValueError(
+                    f"Rollout receiver {name} selects {selected_method!r} but its loader metadata declares "
+                    f"{metadata_method!r}; this weight publication format is unsupported"
+                )
             if quant_config.get("quant_method") == "compressed-tensors":
                 local_path = os.path.realpath(model_path)
                 if local_path not in checkpoint_keys:

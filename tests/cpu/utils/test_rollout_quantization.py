@@ -202,23 +202,29 @@ def test_rollout_quantization_uses_receiver_checkpoint(quantization_args, tmp_pa
 
 
 @pytest.mark.parametrize(
-    "overrides,root_null,keeps_fp8",
+    "overrides,root_null,requested_quantization,keeps_fp8",
     [
-        ({"text_config": {"use_cache": False}}, False, True),
-        ({"text_config": {"quantization_config": None}}, False, True),
-        ({"quantization_config": None, "text_config": {"quantization_config": None}}, False, False),
-        ({"text_config": {"quantization_config": None}}, True, False),
-        ({"quantization_config": None}, False, False),
-        ({"text_config": {"use_cache": False}}, True, False),
+        ({"text_config": {"use_cache": False}}, False, None, True),
+        ({"text_config": {"quantization_config": None}}, False, None, True),
+        ({"quantization_config": None, "text_config": {"quantization_config": None}}, False, None, False),
+        ({"text_config": {"quantization_config": None}}, True, None, False),
+        ({"quantization_config": None}, False, None, False),
+        ({"text_config": {"use_cache": False}}, True, None, False),
+        ({"text_config": {"use_cache": False}}, True, "fp8", True),
+        ({"quantization_config": None}, False, "fp8", True),
     ],
 )
-def test_rollout_quantization_matches_receiver_text_config(quantization_args, overrides, root_null, keeps_fp8):
+def test_rollout_quantization_matches_receiver_text_config(
+    quantization_args, overrides, root_null, requested_quantization, keeps_fp8
+):
     from pathlib import Path
 
     from transformers import Qwen3VLConfig
 
     ModelConfig = pytest.importorskip("sglang.srt.configs.model_config").ModelConfig
-    expected = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    LoadConfig = pytest.importorskip("sglang.srt.configs.load_config").LoadConfig
+    get_quant_config = pytest.importorskip("sglang.srt.model_loader.weight_utils").get_quant_config
+    expected = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
     path = Path(quantization_args.hf_checkpoint)
     config = Qwen3VLConfig(text_config={"quantization_config": expected})
     config.architectures = ["Qwen3VLForConditionalGeneration"]
@@ -226,7 +232,13 @@ def test_rollout_quantization_matches_receiver_text_config(quantization_args, ov
         config.quantization_config = None
     config.save_pretrained(path)
     quantization_args.sglang_json_model_override_args = json.dumps(overrides)
-    receiver = ModelConfig(str(path), model_override_args=json.dumps(overrides))
+    quantization_args.sglang_quantization = requested_quantization
+    receiver = ModelConfig(str(path), model_override_args=json.dumps(overrides), quantization=requested_quantization)
+    if receiver.quantization is not None:
+        loaded = get_quant_config(receiver, LoadConfig(load_format="dummy"), {})
+        assert loaded.get_name() == "fp8"
+        assert loaded.is_checkpoint_fp8_serialized
+        assert loaded.weight_block_size == [128, 128]
     actual = resolve_rollout_quantization_config(quantization_args, SimpleNamespace())
     assert (actual["quant_method"] if actual else None) == receiver.quantization == ("fp8" if keeps_fp8 else None)
     assert actual == (expected if keeps_fp8 else None)
