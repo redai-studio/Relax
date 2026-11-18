@@ -59,8 +59,10 @@ def test_gdn_image_patch_preserves_configured_beta_values_and_gradients(
     root = Path(__file__).resolve().parents[4]
     relative = "megatron/core/ssm/gated_delta_net/gdn.py"
     patch = (root / "docker/patch/megatron/20260915-4a4de8657.patch").read_text()
-    start = patch.index(f"diff --git a/{relative} b/{relative}\n")
-    section = patch[start:].split("\ndiff --git ", 1)[0] + "\n"
+    file_header = f"diff --git a/{relative} b/{relative}\n"
+    # The versioned base and feature delta can both modify this file.
+    sections = (file_header + part.split("\ndiff --git ", 1)[0] for part in patch.split(file_header)[1:])
+    section = next(part for part in sections if "linear_attention_beta_in_fp32" in part) + "\n"
     # Apply the beta hunk to this method fixture; the complete patch also
     # contains unrelated GDN projection and preprocessing changes.
     header = section.split("@@", 1)[0]
