@@ -232,7 +232,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
          """Forward method with activation checkpointing.
  
          Args:
-@@ -608,153 +594,69 @@
+@@ -608,16 +594,14 @@
              If extract_layer_indices is empty: hidden_states tensor
              If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
          """
@@ -253,6 +253,10 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
          rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
  
          def custom(start: int, end: int):
+@@ -628,21 +612,9 @@
+                 if ple is not None:
+                     ple_states[index] = ple.capture_checkpoint_state()
+ 
 -            def custom_forward(
 -                hidden_states,
 -                attention_mask,
@@ -273,41 +277,49 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
 +                rotary_pos_emb = (rotary_pos_emb_local, rotary_pos_emb_global) if is_dual_rope else rotary_pos_emb_global
                  for index in range(start, end):
                      layer = self._get_layer(index)
+                     ple = getattr(layer, "per_layer_embedding", None)
+@@ -650,126 +622,56 @@
+                         previous_ple_state = ple.capture_checkpoint_state()
+                         ple.restore_checkpoint_state(ple_states[index])
+                     try:
 -
--                    # Get appropriate inner quantization context
-                     if use_inner_quantization_context:
-                         if self.config.fp8:
--                            inner_quantization_context = get_fp8_context(
--                                self.config, layer.layer_number - 1
--                            )
--                        # TODO: check if fp4 is supported in this case
-+                            inner_quantization_context = get_fp8_context(self.config, layer.layer_number - 1)
-                         elif self.config.fp4:
--                            inner_quantization_context = get_fp4_context(
--                                self.config, layer.layer_number - 1
--                            )
-+                            inner_quantization_context = get_fp4_context(self.config, layer.layer_number - 1)
+-                        # Get appropriate inner quantization context
+                         if use_inner_quantization_context:
+                             if self.config.fp8:
+-                                inner_quantization_context = get_fp8_context(
+-                                    self.config, layer.layer_number - 1
+-                                )
+-                            # TODO: check if fp4 is supported in this case
++                                inner_quantization_context = get_fp8_context(self.config, layer.layer_number - 1)
+                             elif self.config.fp4:
+-                                inner_quantization_context = get_fp4_context(
+-                                    self.config, layer.layer_number - 1
+-                                )
++                                inner_quantization_context = get_fp4_context(self.config, layer.layer_number - 1)
+                             else:
+                                 inner_quantization_context = nullcontext()
                          else:
                              inner_quantization_context = nullcontext()
-                     else:
-                         inner_quantization_context = nullcontext()
 -
-                     with inner_quantization_context:
--                        hidden_states, context = layer(
--                            hidden_states=hidden_states,
--                            attention_mask=attention_mask,
--                            context=context,
--                            context_mask=context_mask,
--                            rotary_pos_emb=rotary_pos_emb,
--                            attention_bias=attention_bias,
--                            inference_context=None,
--                            packed_seq_params=packed_seq_params,
--                            padding_mask=padding_mask,
--                            input_ids=input_ids,
--                        )
+                         with inner_quantization_context:
+-                            hidden_states, context = layer(
+-                                hidden_states=hidden_states,
+-                                attention_mask=attention_mask,
+-                                context=context,
+-                                context_mask=context_mask,
+-                                rotary_pos_emb=rotary_pos_emb,
+-                                attention_bias=attention_bias,
+-                                inference_context=None,
+-                                packed_seq_params=packed_seq_params,
+-                                padding_mask=padding_mask,
+-                                input_ids=input_ids,
+-                            )
++                            hidden_states, context = layer(hidden_states=hidden_states, attention_mask=attention_mask, context=context, context_mask=context_mask, rotary_pos_emb=rotary_pos_emb, attention_bias=attention_bias, inference_context=None, packed_seq_params=packed_seq_params, padding_mask=padding_mask, input_ids=input_ids)
+                     finally:
+                         if ple is not None:
+                             ple.restore_checkpoint_state(previous_ple_state)
 -                return hidden_states, context
 -
-+                        hidden_states, context = layer(hidden_states=hidden_states, attention_mask=attention_mask, context=context, context_mask=context_mask, rotary_pos_emb=rotary_pos_emb, attention_bias=attention_bias, inference_context=None, packed_seq_params=packed_seq_params, padding_mask=padding_mask, input_ids=input_ids)
 +                return (hidden_states, context)
              return custom_forward
  

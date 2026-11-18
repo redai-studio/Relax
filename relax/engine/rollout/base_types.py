@@ -1,8 +1,14 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from dataclasses import dataclass
 from typing import Any
 
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
+
+
+class DatasetStateMismatchError(ValueError):
+    """A saved cursor does not belong to the current data sequence."""
 
 
 @dataclass

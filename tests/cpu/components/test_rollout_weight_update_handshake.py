@@ -17,12 +17,15 @@ try/finally so the gate is always released.
 
 import asyncio
 import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
-from ray.exceptions import RayActorError
+from ray.exceptions import RayActorError, RayTaskError
 
 from relax.components.rollout import Rollout as RolloutDeployment
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 
 
 # ``Rollout`` is wrapped by ``@serve.deployment`` / ``@serve.ingress`` -- reach
@@ -43,6 +46,53 @@ class _RemoteStub:
 
 async def _ok(*_args, **_kwargs):
     return None
+
+
+@pytest.mark.parametrize("algorithm", ["art", "grpo"])
+@pytest.mark.parametrize("error", [OSError, DatasetStateMismatchError])
+def test_resume_data_load_failure_reaches_service_before_production(algorithm, error):
+    from relax.distributed.ray.rollout import RolloutManager
+
+    manager = object.__new__(RolloutManager.__ray_metadata__.modified_class)
+    manager.args = SimpleNamespace(sampling_config={"algorithm": algorithm})
+    failure = error("dataset unavailable")
+    if error is DatasetStateMismatchError:
+        failure = RayTaskError("load", "dataset unavailable", failure).as_instanceof_cause()
+    read = AsyncMock(side_effect=failure)
+    manager.data_source = SimpleNamespace(load=SimpleNamespace(remote=read))
+    service = _make_rollout(can_update=False, manager=SimpleNamespace(load=_RemoteStub(manager.load)))
+    service.config = SimpleNamespace(rollout_global_dataset=True, sampling_config={"algorithm": algorithm})
+    service.step, service._run_task = 1, None
+    service._async_run = AsyncMock()
+    if algorithm == "art" or error is DatasetStateMismatchError:
+        with pytest.raises(error, match="dataset unavailable"):
+            asyncio.run(service.run())
+        assert service._run_task is None
+        service._async_run.assert_not_awaited()
+    else:
+        asyncio.run(service.run())
+        service._async_run.assert_awaited_once()
+    read.assert_awaited_once_with(0)
+
+
+@pytest.mark.parametrize("algorithm", ["art", "grpo"])
+def test_rollout_does_not_rewrite_actor_owned_art_checkpoint_cursor(algorithm):
+    service = _make_rollout(can_update=False, manager=_ManagerStub())
+    service.config = SimpleNamespace(
+        save="checkpoints",
+        save_interval=1,
+        num_rollout=3,
+        rotate_ckpt=False,
+        train_backend="fsdp",
+        sampling_config={"algorithm": algorithm},
+    )
+    save = AsyncMock()
+    service.data_source = SimpleNamespace(save=SimpleNamespace(remote=save))
+    asyncio.run(service._maybe_save_data(0))
+    if algorithm == "art":
+        save.assert_not_awaited()
+    else:
+        save.assert_awaited_once_with(rollout_id=0)
 
 
 async def _prepared(*_args, **_kwargs):

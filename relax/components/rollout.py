@@ -17,6 +17,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client
@@ -383,6 +384,11 @@ class Rollout(Base):
                 await self.rollout_manager.load.remote(self.step - 1)
             except Exception as e:
                 self._logger.exception(f"Failed to load global dataset: {e}")
+                if (
+                    isinstance(e, DatasetStateMismatchError)
+                    or (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art"
+                ):
+                    raise
 
         self._run_task = asyncio.ensure_future(self._async_run())
         await self._run_task
@@ -526,6 +532,13 @@ class Rollout(Base):
 
     async def _maybe_save_data(self, local_step) -> None:
         if self.config.save is None or self.config.save_interval is None:
+            return
+
+        if (
+            getattr(self.config, "train_backend", None) == "fsdp"
+            and (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art"
+        ):
+            # The ART actor saves this cursor before committing its checkpoint.
             return
 
         is_save_step = (local_step + 1) % self.config.save_interval == 0

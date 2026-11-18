@@ -1,7 +1,7 @@
 # Integration contract
 
 Contents: [runtime path](#choose-the-runtime-path), [environment](#agent-environment),
-[dataset](#dataset-mapping), [request/parser](#model-request-contract), [export](#export-contract),
+[recipe](#assemble-a-recipe), [resources](#resource-ownership), [dataset](#dataset-mapping), [request/parser](#model-request-contract), [export](#export-contract),
 [multimodal](#multimodal-boundary), [validation](#integration-validation).
 
 ## Choose the runtime path
@@ -16,6 +16,21 @@ Use resident Agentic rollout for an external agent application that owns its mod
 
 `--use-agentic-rollout` unconditionally selects Agentic train and Eval generation functions. A configured
 `--custom-generate-function-path` is ignored; use the legacy path instead when Relax-side custom code must own the loop.
+
+## Assemble a recipe
+
+Start from the closest working model/mode recipe. Local tools: `examples/search_r1/run_search_r1.sh`; images:
+`examples/deepeyes_agentic/run_deepeyes_agentic.sh`; remote sandbox and fully async 4+4 PD/HiCache:
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh`. Reuse applicable settings, not machine-specific paths,
+capacity, or parallelism without checking the target environment.
+
+Keep the integration in the agent entry point, dataset mapping, resource adapter, and launch recipe. Wire the existing
+model/tool loop to the injected API and complete-history contract, choose reward/export behavior, then configure
+concurrency and eligible-node dependencies. Shared environment/retrieval servers belong outside per-Session commands.
+The recipe should contain normal CLI configuration rather than experiment hooks or a separate rollout implementation.
+
+For local launch, inspect local Ray first and follow the repository's `AGENTS.md` entrypoint rule. Use `ray-job.sh`
+when submitting to an existing cluster. Integration or documentation work alone does not authorize a GPU experiment.
 
 ## Agent environment
 
@@ -32,7 +47,19 @@ Relax provides:
 | `RELAX_GROUP_ID` | Logical Runtime Group identifier |
 
 The adapter must preserve the agent's normal task lifecycle, write terminal output atomically, and exit after cleanup.
-The command runs through `/bin/bash -lc`; inspect login-profile behavior if it may replace injected environment values.
+Relax parses executable arguments with shell-style quoting and launches them directly. Shell expansions, `source`,
+pipelines and redirects belong in an explicit example script (`bash run_agent_app.sh`). End setup-only wrappers with
+`exec` so the agent retains the managed root PID.
+
+## Resource ownership
+
+The command launched through `--agent-command` cleans up its tools, descendants, containers, and remote jobs. This
+applies both to natural exit and to termination by SIGTERM from Relax because of a timeout or another reason. Preserve
+cancellation identities and write terminal output atomically. Verify cleanup with actual executor state; a cancellation
+ACK alone does not prove the remote work has exited.
+
+Relax retires logical Sessions before running best-effort process/backend cleanup in the background. Cleanup failures
+warn and do not invalidate published exports or hold Group permits. The external service manages its own quotas.
 
 ## Dataset mapping
 
@@ -152,7 +179,8 @@ Before experiment preflight, verify:
    protocol-specific finish reasons;
 7. implicit or explicit export resolves to committed state;
 8. export count and advantage match `agentic-training-contract.md`;
-9. agent, tool, sandbox, and external resources clean up.
+9. the launched `--agent-command` cleans up tool, sandbox, and external resources on natural exit and on SIGTERM from
+   Relax; Relax fallback cleanup does not block logical completion.
 
 Source anchors: `docs/en/guide/agentic-rollout.md`, `relax/agentic/runner/ipc.py`,
 `relax/agentic/session/service.py`, `relax/agentic/session/state.py`, `relax/agentic/pipeline/reward.py`, and

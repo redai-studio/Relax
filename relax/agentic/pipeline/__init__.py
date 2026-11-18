@@ -36,6 +36,7 @@ class SessionGroupProgress:
     takeable_session_ids: Tuple[str, ...]
     interrupted: bool
     protected: bool
+    all_first_ir_arrived: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,8 +88,8 @@ class SampleExport:
 class SessionExport:
     """All Samples exported by one terminal Session.
 
-    Runtime releases the Session's volatile resources before publishing this
-    value.
+    Runtime retires the Session before publishing this value. Physical cleanup
+    continues independently as a best-effort fallback for the agent command.
     """
 
     exports: Tuple[SampleExport, ...]

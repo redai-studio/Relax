@@ -302,6 +302,7 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
         pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
     pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
+    pip uninstall -y nvidia-cuda-nvcc && \
     rm /tmp/sglang-transformers5.patch && \
     python -c 'from importlib.metadata import version; \
         assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
