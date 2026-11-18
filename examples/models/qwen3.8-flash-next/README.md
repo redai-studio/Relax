@@ -85,6 +85,10 @@ The OpenSearch-VL run fine-tuned Qwen3.8-Flash-Next-F0 on 32 Blackwell GPUs (280
 
 All 191 questions remained after training-set deduplication. The base model stopped on 146 questions due to invalid tool-call formatting. The SFT model answered 122 of those questions correctly. Both models scored 39/45 on the remaining questions. These scores measure task completion under the shared crop protocol. [OpenSearch-VL data preparation](../../opensearch_vl/data-preparation.md)
 
+![OpenSearch-VL SFT training loss and MTP loss over 67 optimizer updates](./assets/opensearch-vl-sft-curves.png)
+
+Training loss went from 0.6138 to 0.3614 over 67 updates. Evaluation on held-out training trajectories after the final update recorded a loss of 0.3479 and perplexity of 1.4160.
+
 ### H800 Multimodal SFT at 64K and 128K
 
 The 128-GPU comparisons initialized from the same HF checkpoint within each pair and matched per-step token counts. The 64K run used TP4/PP8/CP1/EP8/ETP1 and GBS512. The 128K runs used TP8/PP8/CP1/EP8/ETP1 and GBS1024. TPS/GPU below is the mean of the logged end-to-end step rates.

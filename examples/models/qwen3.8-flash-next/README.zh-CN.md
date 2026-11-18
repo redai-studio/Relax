@@ -85,6 +85,10 @@ OpenR1-MM GRPO 读取转换后的 Parquet，字段为 `prompt`、`label` 和 `im
 
 按训练集去重后仍保留全部 191 题。基座有 146 道题因工具调用格式错误而中断，SFT 在其中答对了 122 道。 在剩余题目中，两版得分均为 39/45。这组分数反映同一 crop 协议下的任务完成率。 [OpenSearch-VL 数据准备](../../opensearch_vl/data-preparation.md)
 
+![OpenSearch-VL SFT 的 67 步训练 loss 和 MTP loss 曲线](./assets/opensearch-vl-sft-curves.png)
+
+67 次更新中，训练 loss 从 0.6138 降到 0.3614。最后一次更新后的留出轨迹验证 loss 为 0.3479，PPL 为 1.4160。
+
 ### H800 图文 SFT 的 64K 与 128K 实测
 
 这些 128 卡对照在每组内使用相同的 HF 权重，逐步 token 数对齐。64K 使用 TP4/PP8/CP1/EP8/ETP1、GBS512。128K 使用 TP8/PP8/CP1/EP8/ETP1、GBS1024。表中的 TPS/GPU 为日志记录的逐步端到端速率均值。
