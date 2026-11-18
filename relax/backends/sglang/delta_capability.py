@@ -70,6 +70,7 @@ def _geometry(owner: Any) -> tuple:
             "moe_tp_rank",
             "moe_tp_size",
             "moe_ep_rank",
+            "_expert_storage_rank",
             "moe_ep_size",
             "num_local_experts",
             "num_fused_shared_experts",
