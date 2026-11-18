@@ -833,40 +833,6 @@ diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core
      hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
      hidden_states = hidden_states_list[0]
      derived_labels_from_input_ids = labels is None
-diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/transformer/per_layer_embedding.py
---- a/megatron/core/transformer/per_layer_embedding.py
-+++ b/megatron/core/transformer/per_layer_embedding.py
-@@ -517,6 +517,14 @@
-     # ------------------------------------------------------------------ forward
-     def forward(self, hidden_states: Tensor) -> Tensor:
-         """[s_local, b, n*C] streams -> [s_local, b, n*C] PLE update (to be added by the layer)."""
-+        from relax.utils.env import Envs
-+        if Envs.RELAX_QWEN38_PLE_STREAMED:
-+            from relax.models.qwen3_8.ops.ple_stream import _streamed_forward
-+            return _streamed_forward(self, hidden_states)
-+        if Envs.RELAX_QWEN38_PLE_FUSED_CONV:
-+            from relax.models.qwen3_8.ops.ple_fused_conv import supported, fused_forward
-+            if supported(self, hidden_states):
-+                return fused_forward(self, hidden_states)
-         if self._ngram_ids is None:
-             raise RuntimeError("PerLayerEmbedding.prepare() must be called before forward().")
-         from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp, split_tensor_cp
-@@ -576,8 +584,13 @@
-             gated_value, self.norm_conv.weight, n, self.norm_eps
-         )
-         positions = self._local_positions(s_local)
--        conv_out = self._causal_dilated_conv(gated_value_normed, positions)
--        out = gated_value + F.silu(conv_out.float()).to(dtype)
-+        if thd_cp and Envs.RELAX_QWEN38_PLE_CP_FUSED_CONV:
-+            from relax.models.qwen3_8.ops.ple_fused_conv import cp_convolution
-+
-+            out = cp_convolution(self, gated_value_normed, gated_value, positions)
-+        else:
-+            conv_out = self._causal_dilated_conv(gated_value_normed, positions)
-+            out = gated_value + F.silu(conv_out.float()).to(dtype)
-         if thd_cp:
-             out = split_tensor_cp(out, self._cp_packed_seq_params, dim=0)
-             if sp_replicated:
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
 --- a/megatron/core/transformer/transformer_layer.py
 +++ b/megatron/core/transformer/transformer_layer.py
