@@ -3,6 +3,7 @@
 # pyright: reportMissingTypeArgument=false, reportCallIssue=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportUninitializedInstanceVariable=false, reportOptionalIterable=false, reportFunctionMemberAccess=false, reportPossiblyUnboundVariable=false, reportOperatorIssue=false, reportIndexIssue=false, reportReturnType=false
 
 import asyncio
+import copy
 import dataclasses
 import enum
 import logging
@@ -31,6 +32,7 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -67,6 +69,7 @@ from relax.utils.training.train_dump_utils import (
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
 )
+from relax.utils.types import Sample
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -908,10 +911,12 @@ def get_local_rollout_manager() -> "RolloutManager":
 @ray.remote(
     concurrency_groups={
         "health_monitoring": 1,
+        "reload": 1,
         "scale_out": 8,
         "scale_in": 8,
         "scale_coordination": 1,
         "recover_rollout_engines": 1,
+        "lora_publication": 1,
     }
 )
 class RolloutManager(ReloadableMixin):
@@ -943,6 +948,13 @@ class RolloutManager(ReloadableMixin):
         # Kept for the legacy colocated Megatron LoRA handshake. Managed
         # independent pools expose this query through InferenceManager.
         self._lora_training_config = None
+        self._eval_judge = None
+        self._eval_judge_init_lock = asyncio.Lock()
+        self._eval_judge_tasks: set[asyncio.Task] = set()
+        self._eval_judge_errors: list[str] = []
+        self._lora_runtime = None
+        self._lora_configuring = False
+        self._generation_started = False
 
         init_tracking(args, primary=False)
 
@@ -1060,6 +1072,192 @@ class RolloutManager(ReloadableMixin):
         with self._engine_lifecycle_lock:
             return self._training_weight_updating or self._scale_out_weight_updating
 
+    @ray.method(concurrency_group="lora_publication")
+    def configure_lora_training(
+        self,
+        artifact_dir: str,
+        base_fingerprint: str,
+        probe_input_ids: list[int],
+        max_versions: int = 2,
+        reconcile_interval_s: float = 1.0,
+    ) -> Any:
+        """Prepare automatic publication before assigning this manager to
+        trainers.
+
+        The directory must be shared by the publisher and every engine and
+        isolated to this training run. The fingerprint identifies the actual
+        frozen base contents. Initial publication follows the first base sync.
+        """
+        from relax.engine.lora_versions.training import LoRATrainingConfig
+        from relax.utils.megatron_peft_utils import is_lora_adapter_mode
+
+        with self._engine_lifecycle_lock:
+            engines = [engine for server in self.servers.values() for engine in server.engines]
+            if not engines or any(engine is None for engine in engines):
+                raise ValueError("training publication requires a complete engine pool")
+            config = LoRATrainingConfig(
+                artifact_dir,
+                base_fingerprint,
+                tuple(probe_input_ids),
+                max_versions,
+                reconcile_interval_s,
+                tuple(engine._actor_id.hex() for engine in engines),
+            )
+            previous = getattr(self, "_lora_training_config", None)
+            if previous is not None:
+                if previous == config:
+                    return previous
+                raise RuntimeError("Cannot replace a training publication configuration")
+            if (
+                not self.args.fully_async
+                or getattr(self.args, "train_backend", "megatron") != "megatron"
+                or getattr(self.args, "hybrid", False)
+                or self.args.colocate
+                or self.args.offload_rollout
+                or not self.args.use_agentic_rollout
+                or not is_lora_adapter_mode(self.args)
+                or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
+                or len(self.servers) != 1
+            ):
+                raise ValueError(
+                    "automatic LoRA publication requires fully-async Megatron Agentic adapter mode, "
+                    "a fixed single-model pool, and no rollout offload or automatic recovery"
+                )
+            if (
+                self._lora_runtime is not None
+                or self._lora_configuring
+                or getattr(self, "_lora_configuration_failed", False)
+                or self._generation_started
+                or self._find_active_scale_request() is not None
+            ):
+                raise RuntimeError("training publication must be configured on a fresh, idle rollout pool")
+            self._lora_training_config = config
+        self._stop_eviction_monitor()
+        return config
+
+    def get_lora_training_config(self) -> Any:
+        return self._lora_training_config
+
+    @ray.method(concurrency_group="lora_publication")
+    def publish_training_lora(self, artifact_path: str) -> dict[str, Any]:
+        """Bootstrap after base sync, then publish without pausing Sessions."""
+        # Blocking control-plane RPCs must not occupy generate's event loop.
+        config = self._lora_training_config
+        if config is None:
+            return {"status": "failed", "error": "training publication is not configured"}
+        if getattr(self, "_lora_configuration_failed", False):
+            return {"status": "failed", "error": "initial LoRA configuration failed"}
+        if self._lora_configuring:
+            return {"status": "unconfirmed", "error": "initial LoRA configuration is still running"}
+        if self._lora_runtime is None:
+            try:
+                self._configure_lora_version_runtime(
+                    artifact_path, list(config.probe_input_ids), config.max_versions, config.reconcile_interval_s
+                )
+            except Exception as error:
+                return {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+            return {"status": "published", "version_id": self._lora_initial_publication.identity.version_id}
+        return ray.get(self._lora_runtime.publish_for_training.remote(artifact_path))
+
+    @ray.method(concurrency_group="lora_publication")
+    def configure_lora_versions(
+        self,
+        initial_artifact_path: str,
+        probe_input_ids: list[int],
+        max_versions: int = 2,
+        reconcile_interval_s: float = 1.0,
+    ) -> Any:
+        """Opt into immutable versions before starting any resident groups.
+
+        Requires a fixed single-model engine pool configured with managed LoRA
+        capacity. The initial artifact is published before Session injection;
+        subsequent artifacts can be published through the returned actor.
+        """
+        if getattr(self, "_lora_training_config", None) is not None:
+            raise RuntimeError("automatic training publication owns the initial LoRA bootstrap")
+        return self._configure_lora_version_runtime(
+            initial_artifact_path, probe_input_ids, max_versions, reconcile_interval_s
+        )
+
+    def _configure_lora_version_runtime(
+        self,
+        initial_artifact_path: str,
+        probe_input_ids: list[int],
+        max_versions: int,
+        reconcile_interval_s: float,
+    ) -> Any:
+        from relax.agentic.rollout import bind_agentic_lora_runtime
+        from relax.engine.lora_versions.runtime import LoRAVersionRuntime
+
+        with self._engine_lifecycle_lock:
+            if (
+                self._lora_runtime is not None
+                or self._lora_configuring
+                or getattr(self, "_lora_configuration_failed", False)
+            ):
+                raise RuntimeError("LoRA versions are already configured or being configured")
+            if (
+                not self.args.use_agentic_rollout
+                or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
+                or len(self.servers) != 1
+            ):
+                raise ValueError("managed LoRA requires Agentic rollout, one model, and disabled automatic recovery")
+            if getattr(self, "_generation_started", False):
+                raise RuntimeError("LoRA versions must be configured before generation starts")
+            if self._find_active_scale_request() is not None:
+                raise RuntimeError("cannot configure LoRA during an engine pool transition")
+            self._lora_configuring = True
+        try:
+            # Stop automatic eviction before capturing the fixed engine pool.
+            self._stop_eviction_monitor()
+            host = LoRAVersionRuntime.options(
+                **with_control_plane_affinity(self.args, {"num_cpus": 0, "num_gpus": 0})
+            ).remote()
+            self._lora_runtime = host
+            engines = next(iter(self.servers.values())).engines
+            if not engines or any(engine is None for engine in engines):
+                raise ValueError("managed LoRA requires a complete ready engine pool")
+            urls = ray.get([engine.get_url.remote() for engine in engines])
+            if any(not url for url in urls) or len(set(urls)) != len(urls):
+                raise ValueError("managed LoRA requires unique engine endpoints")
+            ray.get(
+                host.start.remote(
+                    dict(zip(map(str, range(len(urls))), urls)), probe_input_ids, max_versions, reconcile_interval_s
+                )
+            )
+            self._lora_initial_publication = ray.get(host.publish.remote(initial_artifact_path))
+            bind_agentic_lora_runtime(host)
+            return host
+        except BaseException:
+            # A partially published/configured pool must not resume unmanaged
+            # operation. Retain its owner for reconciliation and disposal.
+            self._lora_configuration_failed = True
+            raise
+        finally:
+            self._lora_configuring = False
+
+    def get_lora_version_runtime(self) -> Any:
+        return self._lora_runtime
+
+    def _require_unmanaged_engine_pool(self) -> None:
+        if (
+            self._lora_runtime is not None
+            or self._lora_configuring
+            or getattr(self, "_lora_configuration_failed", False)
+            or self._lora_training_config is not None
+        ):
+            raise RuntimeError("managed LoRA currently requires a fixed engine pool")
+
+    def _begin_generation(self) -> None:
+        with self._engine_lifecycle_lock:
+            if getattr(self, "_lora_configuring", False) or getattr(self, "_lora_configuration_failed", False):
+                raise RuntimeError("LoRA configuration is incomplete")
+            if getattr(self, "_lora_training_config", None) is not None and self._lora_runtime is None:
+                raise RuntimeError("initial training LoRA publication has not completed")
+            self._generation_started = True
+
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is
         running)."""
@@ -1082,6 +1280,7 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
+    @ray.method(concurrency_group="lora_publication")
     def dispose(self):
         try:
             # Signal every monitor before bounded joins so a stalled health
@@ -1093,6 +1292,24 @@ class RolloutManager(ReloadableMixin):
             self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
             for monitor in self._health_monitors:
                 monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
+            # Normal completion drains before shutdown; this also cleans up on
+            # failure without waiting indefinitely for a remote judge.
+            if self._eval_judge is not None:
+                try:
+                    ray.get(self._eval_judge.close.remote(), timeout=10)
+                except Exception:
+                    logger.exception("Failed to close the eval judge pool")
+                finally:
+                    try:
+                        ray.kill(self._eval_judge)
+                    except Exception:
+                        logger.exception("Failed to terminate the eval judge owner")
+                    self._eval_judge = None
+            host = getattr(self, "_lora_runtime", None)
+            if host is not None:
+                ray.get(host.close.remote())
+                ray.kill(host)
+                self._lora_runtime = None
             self._shutdown_all_engines()
         finally:
             try:
@@ -1198,9 +1415,6 @@ class RolloutManager(ReloadableMixin):
         )
         return self._dynamic_global_batch_size
 
-    def get_lora_training_config(self) -> Any:
-        return self._lora_training_config
-
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
@@ -1225,21 +1439,70 @@ class RolloutManager(ReloadableMixin):
             )
 
     async def eval(self, rollout_id):
+        self._begin_generation()
         self.health_monitoring_resume()
 
         # TODO: add fault tolerance to eval
-        result = await asyncio.to_thread(
-            call_rollout_fn,
+        result, pending = await asyncio.to_thread(
+            call_eval_with_deferred_rewards,
             self.eval_generate_rollout,
             self.args,
             rollout_id,
             self.data_source,
             self.data_system_client,
-            evaluation=True,
         )
+        await self.submit_eval_result(rollout_id, result, pending)
+
+    async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
+        """Record inline scores or enqueue captured judges from RL or SFT."""
+        if pending:
+            async with self._eval_judge_init_lock:
+                if self._eval_judge is None:
+                    self._eval_judge = await asyncio.to_thread(
+                        lambda: EvalJudgeWorker.options(**with_control_plane_affinity(self.args)).remote(self.args)
+                    )
+            # Ray serializes the snapshot before returning the ObjectRef. Keep
+            # result + pending together to preserve their shared Sample refs.
+            ref = await asyncio.to_thread(self._eval_judge.score.remote, self.args, (result, pending))
+            task = asyncio.create_task(self._finish_eval_judge(rollout_id, ref))
+            self._eval_judge_tasks.add(task)
+            task.add_done_callback(self._eval_judge_tasks.discard)
+            logger.info(
+                "Queued eval judge for rollout %s (%d pending evaluations)", rollout_id, len(self._eval_judge_tasks)
+            )
+            return
+        self._record_eval_result(rollout_id, result)
+
+    def _record_eval_result(self, rollout_id: int, result: Any) -> None:
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        args = self.args
+        if getattr(args, "loss_type", None) == "sft":
+            # SFT already supplies completed training steps, not RL batch IDs.
+            args = copy.copy(args)
+            args.wandb_always_use_train_step = False
+            args.reward_key = args.eval_reward_key or args.reward_key
+            args.n_samples_per_prompt = 1
+        _log_eval_rollout_data(rollout_id, args, data, result.metrics)
+
+    async def _finish_eval_judge(self, rollout_id: int, ref: Any) -> None:
+        start = time.monotonic()
+        try:
+            result = await ref
+            result.metrics = dict(result.metrics or {})
+            result.metrics.update({"eval/async_judge": 1, "eval/async_judge_seconds": time.monotonic() - start})
+            await asyncio.to_thread(self._record_eval_result, rollout_id, result)
+        except Exception as exc:
+            self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
+            logger.exception("Background eval judge failed for rollout %s", rollout_id)
+
+    async def drain_eval_judges(self) -> None:
+        """Finish scoring and reporting before the normal job shutdown."""
+        while self._eval_judge_tasks:
+            logger.info("Waiting for %d pending eval judges at training completion", len(self._eval_judge_tasks))
+            await asyncio.gather(*tuple(self._eval_judge_tasks))
+        if self._eval_judge_errors:
+            raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
 
     async def run_predict(self, train_step: int) -> None:
         """Periodic SFT predict pass entry point.
@@ -1262,6 +1525,8 @@ class RolloutManager(ReloadableMixin):
         self,
         prompts: list[str],
         multimodal_inputs_list: list[dict | None] | None = None,
+        *,
+        samples: list[Sample] | None = None,
     ) -> list[str]:
         """Generate completions for ``prompts`` concurrently.
 
@@ -1306,23 +1571,56 @@ class RolloutManager(ReloadableMixin):
         }
         if multimodal_inputs_list is None:
             multimodal_inputs_list = [None] * len(prompts)
+        if samples is not None and len(samples) != len(prompts):
+            raise ValueError("SFT predict samples must align with prompts")
 
         async def _one(idx: int, prompt: str, mm: dict | None) -> str:
             url = f"{worker_urls[idx % len(worker_urls)]}/generate"
             payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
+            if getattr(self.args, "lora_rank", 0) > 0 and getattr(self.args, "lora_adapter_mode", False):
+                from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
+
+                payload["lora_path"] = LORA_ADAPTER_NAME
+            if samples is not None:
+                # Preserve actual generated token IDs for custom eval rewards.
+                payload["return_logprob"] = True
+                payload["logprob_start_len"] = -1
             if mm:
                 encoded_mm, _ = await _encode_multimodal_inputs(mm)
                 payload.update(encoded_mm)
             output = await post(url, payload)
+            if samples is not None:
+                sample = samples[idx]
+                sample.response = output["text"]
+                meta_info = output["meta_info"]
+                token_logprobs = meta_info.get("output_token_logprobs")
+                if token_logprobs is not None:
+                    response_tokens = [item[1] for item in token_logprobs]
+                    sample.rollout_log_probs = [item[0] for item in token_logprobs]
+                else:
+                    response_tokens = output["output_ids"]
+                sample.tokens.extend(response_tokens)
+                sample.rollout_tokens = list(sample.tokens)
+                sample.response_length = len(response_tokens)
+                sample.update_from_meta_info(self.args, meta_info)
+                if sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
+                    raise RuntimeError(f"SFT predict sample {sample.index} did not complete: {sample.status}")
             if isinstance(output, dict) and "text" in output:
                 return output["text"]
             if isinstance(output, str):
                 return output
             return str(output)
 
-        return await asyncio.gather(
-            *[_one(i, p, m) for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))]
-        )
+        tasks = [
+            asyncio.create_task(_one(i, p, m))
+            for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def save(self, rollout_id):
         await self.data_source.save.remote(rollout_id)
@@ -1374,6 +1672,7 @@ class RolloutManager(ReloadableMixin):
     def recover_rollout_engines(self, model_name: str | None = None):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
+        self._require_unmanaged_engine_pool()
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
         if self.rollout_id == -1 or srv is None:
@@ -1679,6 +1978,7 @@ class RolloutManager(ReloadableMixin):
         Returns:
             Dict with request_id and initial status (or NOOP if idempotent no-op)
         """
+        self._require_unmanaged_engine_pool()
         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
         if num_replicas > 0:
             scale_mode = ScaleOutMode.RAY_NATIVE
@@ -1761,6 +2061,7 @@ class RolloutManager(ReloadableMixin):
             # Idempotency: filter out URLs already in the system or in-flight
             # (_collect_existing/in_flight already return normalized addrs)
             existing_urls = self._collect_existing_engine_addrs(srv)
+            self._require_unmanaged_engine_pool()
             in_flight_urls = self._collect_in_flight_engine_addrs(model_name)
             already_known = existing_urls | in_flight_urls
 
@@ -1793,6 +2094,7 @@ class RolloutManager(ReloadableMixin):
         # eviction claims.  Validation above may be slow enough for eviction
         # to win after the initial fast-path check.
         with self._engine_lifecycle_lock:
+            self._require_unmanaged_engine_pool()
             active = self._find_active_scale_request()
             if active is not None:
                 return {
@@ -1809,6 +2111,7 @@ class RolloutManager(ReloadableMixin):
 
     @ray.method(concurrency_group="scale_out")
     async def execute_scale_out(self, request_id: str) -> None:
+        self._require_unmanaged_engine_pool()
         """Execute a previously created scale-out request. Meant to be called
         via .remote() (fire-and-forget).
 
@@ -3771,6 +4074,7 @@ class RolloutManager(ReloadableMixin):
         force: bool = False,
         dry_run: bool = False,
     ) -> dict:
+        self._require_unmanaged_engine_pool()
         # Mutual exclusion: reject if any scale operation is in progress
         active = self._find_active_scale_request()
         if active is not None:
@@ -3834,6 +4138,7 @@ class RolloutManager(ReloadableMixin):
         )
         # Recheck and insert atomically against graceful eviction claims.
         with self._engine_lifecycle_lock:
+            self._require_unmanaged_engine_pool()
             active = self._find_active_scale_request()
             if active is not None:
                 return {
@@ -3850,6 +4155,7 @@ class RolloutManager(ReloadableMixin):
 
     @ray.method(concurrency_group="scale_in")
     async def execute_scale_in(self, request_id: str) -> None:
+        self._require_unmanaged_engine_pool()
         request = self._scale_in_requests.get(request_id)
         if request is None:
             logger.error(f"Scale-in request {request_id} not found")
