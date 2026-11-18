@@ -12,7 +12,8 @@ def resolve_rollout_quantization_config(args: Namespace, hf_config: Any) -> dict
     """Resolve one sender format for all engines receiving this publication."""
     default_path = getattr(args, "sglang_hf_checkpoint", None) or args.hf_checkpoint
     global_overrides = getattr(args, "sglang_json_model_override_args", None)
-    recipients = [("default", default_path, global_overrides)]
+    global_quantization = getattr(args, "sglang_quantization", None)
+    recipients = [("default", default_path, global_overrides, global_quantization)]
     if getattr(args, "sglang_config", None) is not None:
         from relax.distributed.ray.rollout import _resolve_sglang_config
 
@@ -31,6 +32,7 @@ def resolve_rollout_quantization_config(args: Namespace, hf_config: Any) -> dict
                         f"{model.name}/{index}:{group.worker_type}",
                         group.overrides["model_path"],
                         group.overrides.get("json_model_override_args", global_overrides),
+                        group.overrides.get("quantization", global_quantization),
                     )
                 )
 

@@ -23,8 +23,8 @@ from relax.utils.quant_cast import resolve_receiver_quantization_config
 def test_receiver_fp8_compares_effective_defaults(quantization_args, extra, compatible):
     first = {"quant_method": "fp8", "activation_scheme": "dynamic"}
     recipients = [
-        ("first", quantization_args.hf_checkpoint, json.dumps({"quantization_config": first})),
-        ("second", quantization_args.hf_checkpoint, json.dumps({"quantization_config": {**first, **extra}})),
+        ("first", quantization_args.hf_checkpoint, json.dumps({"quantization_config": first}), None),
+        ("second", quantization_args.hf_checkpoint, json.dumps({"quantization_config": {**first, **extra}}), None),
     ]
     if compatible:
         assert resolve_receiver_quantization_config(quantization_args, SimpleNamespace(), recipients) == first
@@ -72,9 +72,30 @@ def compressed_checkpoint(tmp_path):
     return checkpoint, config
 
 
-def test_receiver_compression_metadata_drives_packing(quantization_args, compressed_checkpoint):
+@pytest.mark.parametrize("method_source", ["metadata", "global", "group"])
+def test_receiver_compression_metadata_drives_packing(
+    quantization_args, compressed_checkpoint, tmp_path, method_source
+):
     path, config = compressed_checkpoint
     quantization_args.sglang_hf_checkpoint = str(path)
+    if method_source != "metadata":
+        config = {key: value for key, value in config.items() if key != "quant_method"}
+        (path / "config.json").write_text(json.dumps({"compression_config": config}))
+        quantization_args.sglang_quantization = "compressed-tensors"
+    if method_source == "group":
+        quantization_args.sglang_quantization = "fp8"
+        _write_groups(
+            quantization_args,
+            tmp_path,
+            [
+                {
+                    "name": "policy",
+                    "engine_groups": [
+                        {"worker_type": "regular", "num_gpus": 2, "overrides": {"quantization": "compressed-tensors"}}
+                    ],
+                }
+            ],
+        )
     actual = resolve_rollout_quantization_config(
         quantization_args, SimpleNamespace(quantization_config={"quant_method": "fp8"})
     )
@@ -82,6 +103,14 @@ def test_receiver_compression_metadata_drives_packing(quantization_args, compres
     assert actual["format"] == "pack-quantized"
     assert "re:.*vision_tower.*" in actual["ignore"]
     assert config["ignore"] == []
+    # Execute the real sender dispatch on a plain namespace excluded by the
+    # checkpoint scan; this CPU case does not invoke the CUDA packing kernel.
+    import torch
+
+    from relax.backends.megatron.weight_conversion.processors import quantize_params
+
+    named = [("vision_tower.proj.weight", torch.ones(1, 1))]
+    assert quantize_params(quantization_args, "unused", named, actual) == named
 
 
 @pytest.mark.parametrize("alias", ["source", "original"])
@@ -94,7 +123,7 @@ def test_receiver_s3_alias_uses_local_metadata_and_shards(quantization_args, com
     args.model_source = ModelSource(uri="s3://test-bucket/model")
     args._model_source_original_hf_checkpoint = "s3://test-bucket/original"
     receiver = args.model_source.uri if alias == "source" else args._model_source_original_hf_checkpoint
-    actual = resolve_receiver_quantization_config(args, SimpleNamespace(), [("policy", receiver, None)])
+    actual = resolve_receiver_quantization_config(args, SimpleNamespace(), [("policy", receiver, None, None)])
     assert actual["quant_method"] == "compressed-tensors"
     assert "re:.*vision_tower.*" in actual["ignore"]
 
@@ -104,7 +133,7 @@ def test_receiver_s3_alias_uses_local_metadata_and_shards(quantization_args, com
     [
         ({"quantization_config": None}, "compressed-tensors"),
         ({"quantization_config": None, "compression_config": None}, None),
-        ({"quantization_config": {}}, "empty"),
+        ({"quantization_config": {}}, None),
         ({"compression_config": {"quant_method": "other"}}, "other"),
     ],
 )
@@ -118,11 +147,11 @@ def test_receiver_overrides_apply_before_compression_fallback(
     (path / "config.json").write_text(json.dumps({"compression_config": {"quant_method": "compressed-tensors"}}))
     # This case tests metadata precedence; the separate packed-file case
     # exercises augmentation and shard discovery.
-    monkeypatch.setattr(quant_cast, "augment_compressed_tensors_ignore", lambda config, _: config)
+    monkeypatch.setattr(quant_cast, "augment_compressed_tensors_ignore", lambda config, _, **kwargs: config)
     actual = resolve_receiver_quantization_config(
-        quantization_args, SimpleNamespace(), [("policy", str(path), json.dumps(overrides))]
+        quantization_args, SimpleNamespace(), [("policy", str(path), json.dumps(overrides), None)]
     )
-    assert actual == (None if expected is None else {} if expected == "empty" else {"quant_method": expected})
+    assert actual == (None if expected is None else {"quant_method": expected})
 
 
 @pytest.fixture
@@ -135,6 +164,7 @@ def quantization_args(tmp_path):
         sglang_hf_checkpoint=None,
         sglang_json_model_override_args=None,
         sglang_config=None,
+        sglang_quantization=None,
         rollout_num_gpus=2,
         rollout_num_gpus_per_engine=1,
         fully_async=False,
@@ -169,6 +199,80 @@ def test_rollout_quantization_uses_receiver_checkpoint(quantization_args, tmp_pa
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    "nested_override,keeps_fp8", [({"use_cache": False}, True), ({"quantization_config": None}, False)]
+)
+def test_rollout_quantization_preserves_partial_text_config(quantization_args, nested_override, keeps_fp8):
+    from pathlib import Path
+
+    expected = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    (Path(quantization_args.hf_checkpoint) / "config.json").write_text(
+        json.dumps({"text_config": {"quantization_config": expected, "use_cache": True}})
+    )
+    quantization_args.sglang_json_model_override_args = json.dumps({"text_config": nested_override})
+    assert resolve_rollout_quantization_config(quantization_args, SimpleNamespace()) == (
+        expected if keeps_fp8 else None
+    )
+
+
+@pytest.mark.parametrize("order", ["single", "empty-first", "plain-first"])
+def test_rollout_empty_quantization_preserves_bf16_dispatch(quantization_args, tmp_path, order):
+    from pathlib import Path
+
+    import torch
+
+    from relax.backends.megatron.weight_conversion.processors import quantize_params
+
+    (Path(quantization_args.hf_checkpoint) / "config.json").write_text(json.dumps({"quantization_config": {}}))
+    quantization_args.sglang_quantization = "compressed-tensors"
+    groups = [{"worker_type": "regular", "num_gpus": 1}]
+    if order != "single":
+        groups.append(
+            {
+                "worker_type": "regular",
+                "num_gpus": 1,
+                "overrides": {"quantization": None, "json_model_override_args": '{"quantization_config": null}'},
+            }
+        )
+    if order == "plain-first":
+        groups.reverse()
+    _write_groups(quantization_args, tmp_path, [{"name": "policy", "engine_groups": groups}])
+    actual = resolve_rollout_quantization_config(quantization_args, SimpleNamespace())
+    named = [("model.weight", torch.ones(1, 1))]
+    assert quantize_params(quantization_args, "unused", named, actual) is named
+    assert actual is None
+
+
+def test_receiver_reuses_shard_headers_without_reusing_group_overrides(
+    quantization_args, compressed_checkpoint, monkeypatch
+):
+    from unittest.mock import Mock
+
+    import safetensors
+
+    path, config = compressed_checkpoint
+    open_header = Mock(wraps=safetensors.safe_open)
+    monkeypatch.setattr(safetensors, "safe_open", open_header)
+    recipients = [
+        ("prefill", str(path), None, None),
+        ("decode", str(path), json.dumps({"compression_config": {**config, "ignore": ["decode_only"]}}), None),
+    ]
+    with pytest.raises(ValueError, match="different quantization configs"):
+        resolve_receiver_quantization_config(quantization_args, SimpleNamespace(), recipients)
+    assert open_header.call_count == 1
+    # A later resolution must read the checkpoint again, rather than retain a
+    # process-global snapshot after new shards appear.
+    import torch
+    from safetensors.torch import save_file
+
+    save_file({"new_namespace.weight": torch.ones(1)}, path / "new.safetensors")
+    actual = resolve_receiver_quantization_config(
+        quantization_args, SimpleNamespace(), [("prefill", str(path), None, None)]
+    )
+    assert "re:.*new_namespace.*" in actual["ignore"]
+    assert open_header.call_count == 3
 
 
 def _write_groups(args, tmp_path, models):

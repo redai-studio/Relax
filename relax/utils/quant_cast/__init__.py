@@ -14,13 +14,14 @@ logger = get_logger(__name__)
 
 
 def resolve_receiver_quantization_config(
-    args: Namespace, hf_config: Any, recipients: list[tuple[str, str, str | None]]
+    args: Namespace, hf_config: Any, recipients: list[tuple[str, str, str | None, str | None]]
 ) -> dict | None:
     """Resolve a compatible sender format for already selected receivers."""
     from relax.utils.model_source import is_model_source_alias
 
     configs = []
-    for name, model_path, override_json in recipients:
+    checkpoint_keys = {}
+    for name, model_path, override_json, quantization in recipients:
         # SGLang can load the original URI, but this process already owns the
         # local copy needed for metadata and compressed-tensor shard scans.
         if is_model_source_alias(args, model_path):
@@ -35,15 +36,27 @@ def resolve_receiver_quantization_config(
             from transformers import PretrainedConfig
 
             config_values, _ = PretrainedConfig.get_config_dict(model_path)
-        # Overrides replace top-level fields, including explicit None. Resolve
-        # compression_config only after this merge, just as the receiver does.
-        config_values = {**config_values, **json.loads(override_json or "{}")}
-        quant_config = _get_checkpoint_quantization_config(config_values)
+        # SGLang updates an existing text sub-config field by field, but
+        # replaces top-level quantization dictionaries and explicit None.
+        overrides = json.loads(override_json or "{}")
+        if isinstance(overrides.get("text_config"), dict) and isinstance(config_values.get("text_config"), dict):
+            overrides["text_config"] = {**config_values["text_config"], **overrides["text_config"]}
+        config_values = {**config_values, **overrides}
+        quant_config = _get_checkpoint_quantization_config(config_values) or None
         # None here is the effective format, not permission to reread the
         # original checkpoint and undo an explicit override.
-        configs.append(
-            (name, augment_compressed_tensors_ignore(quant_config, model_path) if quant_config else quant_config)
-        )
+        if quant_config:
+            quant_config = dict(quant_config)
+            if quantization is not None:
+                quant_config.setdefault("quant_method", quantization)
+            if quant_config.get("quant_method") == "compressed-tensors":
+                local_path = os.path.realpath(model_path)
+                if local_path not in checkpoint_keys:
+                    checkpoint_keys[local_path] = _list_all_keys(model_path)
+                quant_config = augment_compressed_tensors_ignore(
+                    quant_config, model_path, checkpoint_keys=checkpoint_keys[local_path]
+                )
+        configs.append((name, quant_config))
     if not configs:
         raise ValueError("Weight publication has no rollout receiver groups")
     first_name, first_config = configs[0]
@@ -91,7 +104,9 @@ def read_quantization_config(hf_dir: str | os.PathLike) -> dict | None:
     return _get_checkpoint_quantization_config(cfg)
 
 
-def derive_extra_ignore_namespaces(hf_dir: str | os.PathLike) -> list[str]:
+def derive_extra_ignore_namespaces(
+    hf_dir: str | os.PathLike, *, checkpoint_keys: list[str] | None = None
+) -> list[str]:
     """Return top-level module names whose subtree has plain ``.weight`` keys
     but zero ``.weight_packed`` triplets in the source checkpoint.
 
@@ -107,23 +122,21 @@ def derive_extra_ignore_namespaces(hf_dir: str | os.PathLike) -> list[str]:
     """
     from collections import defaultdict
 
-    from safetensors import safe_open
-
     namespaces: dict[str, dict[str, bool]] = defaultdict(lambda: {"plain": False, "packed": False})
-    for fname in os.listdir(hf_dir):
-        if not fname.endswith(".safetensors"):
-            continue
-        with safe_open(os.path.join(hf_dir, fname), framework="pt") as reader:
-            for key in reader.keys():
-                top = key.split(".", 1)[0]
-                if key.endswith(".weight_packed"):
-                    namespaces[top]["packed"] = True
-                elif key.endswith(".weight"):
-                    namespaces[top]["plain"] = True
+    if checkpoint_keys is None:
+        checkpoint_keys = _list_all_keys(hf_dir)
+    for key in checkpoint_keys:
+        top = key.split(".", 1)[0]
+        if key.endswith(".weight_packed"):
+            namespaces[top]["packed"] = True
+        elif key.endswith(".weight"):
+            namespaces[top]["plain"] = True
     return sorted(top for top, info in namespaces.items() if info["plain"] and not info["packed"])
 
 
-def augment_compressed_tensors_ignore(quantization_config: dict | None, hf_dir: str | os.PathLike) -> dict | None:
+def augment_compressed_tensors_ignore(
+    quantization_config: dict | None, hf_dir: str | os.PathLike, *, checkpoint_keys: list[str] | None = None
+) -> dict | None:
     """Return a copy of ``quantization_config`` whose ``ignore`` list is
     augmented with any source-checkpoint top-level namespaces that have no
     ``.weight_packed`` triplets (i.e. they aren't actually quantized).
@@ -140,7 +153,9 @@ def augment_compressed_tensors_ignore(quantization_config: dict | None, hf_dir: 
         quantization_config = read_quantization_config(hf_dir)
     if not quantization_config or quantization_config.get("quant_method") != "compressed-tensors":
         return quantization_config
-    extra = derive_extra_ignore_namespaces(hf_dir)
+    if checkpoint_keys is None:
+        checkpoint_keys = _list_all_keys(hf_dir)
+    extra = derive_extra_ignore_namespaces(hf_dir, checkpoint_keys=checkpoint_keys)
 
     existing = list(quantization_config.get("ignore", []))
     added = []
@@ -158,9 +173,7 @@ def augment_compressed_tensors_ignore(quantization_config: dict | None, hf_dir: 
     moe_gate_pattern = "re:.*\\.mlp\\.gate\\.weight$"
     if moe_gate_pattern not in existing:
         # Check if there are expert weights being quantized
-        has_expert_quantized = any(
-            ".mlp.experts." in k for k in _list_all_keys(hf_dir) if k.endswith(".weight_packed")
-        )
+        has_expert_quantized = any(".mlp.experts." in k for k in checkpoint_keys if k.endswith(".weight_packed"))
         if has_expert_quantized:
             existing.append(moe_gate_pattern)
             added.append(moe_gate_pattern)
@@ -168,7 +181,7 @@ def augment_compressed_tensors_ignore(quantization_config: dict | None, hf_dir: 
     # For VLM models: ignore embedding, output layers, and vision components
     # These layers are often left in original precision (embed_tokens, lm_head, vision_tower, mm_projector)
     unquantized_layers = ["embed_tokens", "lm_head", "vision_tower", "mm_projector"]
-    all_keys = _list_all_keys(hf_dir)
+    all_keys = checkpoint_keys
     for layer_name in unquantized_layers:
         pattern = f"re:.*\\.{layer_name}\\.weight$"
         if pattern not in existing:
@@ -193,9 +206,6 @@ def _list_all_keys(hf_dir: str | os.PathLike) -> list[str]:
     for fname in os.listdir(hf_dir):
         if not fname.endswith(".safetensors"):
             continue
-        try:
-            with safe_open(os.path.join(hf_dir, fname), framework="pt") as reader:
-                all_keys.extend(reader.keys())
-        except Exception:
-            pass
+        with safe_open(os.path.join(hf_dir, fname), framework="pt") as reader:
+            all_keys.extend(reader.keys())
     return all_keys
