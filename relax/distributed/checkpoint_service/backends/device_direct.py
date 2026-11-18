@@ -125,6 +125,32 @@ def bucket_tensor_counts(sizes: Sequence[int], max_bytes: int) -> list[int]:
     return counts
 
 
+def _raw_group_status(
+    group: dist.ProcessGroup, device: torch.device | int, failed: bool, *, wait: bool = True
+) -> bool:
+    """Exchange four-byte control status on an existing raw group.
+
+    Waiting reads only this completion flag, never a model payload. Ready on a
+    receiver defers its host wait to Release; the source waits before clear.
+    """
+    status = torch.tensor([int(failed)], dtype=torch.int32, device=device)
+    dist.all_reduce(status, group=group)
+    return bool(status.cpu().item()) if wait else failed
+
+
+def _complete_raw_group(group: dist.ProcessGroup, device: torch.device | int, *, wait: bool = True) -> str | None:
+    """Fence prior device work before advertising successful stop
+    consumption."""
+    error = None
+    try:
+        if torch.device(device).type != "cpu":
+            device_module.synchronize(device)
+    except Exception as exc:
+        error = str(exc)
+    failed = _raw_group_status(group, device, error is not None, wait=wait)
+    return error or ("A raw recipient rejected device completion" if failed else None)
+
+
 class DeviceDirectBackend(CommBackend):
     """PyTorch distributed communication backend using NCCL (GPU) or GLOO
     (CPU).
@@ -179,7 +205,19 @@ class DeviceDirectBackend(CommBackend):
         self.lock = lock
         self.timeout_seconds = timeout_seconds
         self._weights_getter = weights_getter
+        self.rollout_manager = None
+        # DCS can be constructed on the async loop's thread, whose CUDA
+        # current device is independent of the trainer's. Bridge constructors
+        # already contain EP/PP object collectives, so bind before exporting.
         self.device = next(model[0].parameters()).device if model else device_module.current_device()
+        device_module.set_device(self.device)
+        self.delta_exporter = None
+        if model and role_info is not None and role_info.role_name == "actor":
+            from relax.backends.megatron.weight_update.delta_export import create_delta_exporter
+
+            self.delta_exporter = create_delta_exporter(
+                args, model, model_name=model_name, quantization_config=quantization_config
+            )
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
         self._thread_pool = ThreadPoolExecutor(max_workers=4)
@@ -201,8 +239,6 @@ class DeviceDirectBackend(CommBackend):
         # proxy actors are reused across weight updates instead of being torn down
         # and rebuilt every step. None forces a (re)build on the next update.
         self._rollout_topology_signature: Optional[frozenset] = None
-        device_module.set_device(self.device)
-
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
         self._rollout_bucket_splitter = self._megatron.get_dcs_bucket_splitter(
@@ -538,6 +574,14 @@ class DeviceDirectBackend(CommBackend):
 
         if self.role_info is None:
             raise RuntimeError("Role info not set. Cannot initialize process group.")
+
+        delta = getattr(self, "delta_exporter", None)
+        if delta is not None and topology_data is not None:
+            rollout = topology_data.get("nodes", {}).get("rollout", {})
+            if any(not (info.get("metadata") or {}).get("delta_gpu_local", False) for info in rollout.values()):
+                delta.disconnect(group=get_gloo_group())
+                self.delta_exporter = None
+                logger.info("Actual SG topology retains original DCS FULL transport")
         self._is_pp_src_rank = (
             self._megatron.mpu.get_data_parallel_rank(with_context_parallel=True) == 0
             and self._megatron.mpu.get_tensor_model_parallel_rank() == 0
@@ -559,7 +603,7 @@ class DeviceDirectBackend(CommBackend):
             # the rollout side either, so both ends keep the same persistent group.
             new_sig = self._rollout_topology_signature_of(self.rollout_topology)
             if (
-                self._model_update_groups is not None
+                (self._model_update_groups is not None or getattr(self, "delta_exporter", None) is not None)
                 and new_sig == self._rollout_topology_signature
                 and self.rollout_engines
                 and not self._healthcheck_rollout_engines()
@@ -576,6 +620,12 @@ class DeviceDirectBackend(CommBackend):
 
             self._create_rollout_engines(self.rollout_topology)
             self._update_rollout_engines()
+
+            if self.delta_exporter is not None:
+                # Keep the existing DCS topology/health owners. The engine's
+                # per-GPU proxy owns the NCCL receive group for delta payloads.
+                self._rollout_topology_signature = self._rollout_topology_signature_of(self.rollout_topology)
+                return
 
             if self._model_update_groups is not None:
                 try:
@@ -745,6 +795,51 @@ class DeviceDirectBackend(CommBackend):
                     f"Actor_fwd PP{pp_rank} joined group {group_name} as rank {global_rank} (world_size={world_size})"
                 )
 
+    def _delta_rollout_recipients(self) -> tuple[bool, list | None, list[int] | None]:
+        """Resolve existing SG handles for the original DCS recipient
+        intersection."""
+        group = get_gloo_group()
+        local = None
+        if self._is_pp_src_rank:
+            local = {
+                info["metadata"]["actor_id"]
+                for info in self.rollout_topology.values()
+                if (info.get("metadata") or {}).get("actor_id")
+            }
+        choices = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(choices, local, group=group)
+        sources = [choice for choice in choices if choice is not None]
+        recipients = set.intersection(*sources) if sources else set()
+        status, engines, counts = [None], None, None
+        if dist.get_rank(group=group) == 0:
+            try:
+                if recipients:
+                    if self.rollout_manager is None:
+                        raise RuntimeError("DCS delta needs its existing rollout manager handle")
+                    available, *_ = ray.get(
+                        self.rollout_manager.get_rollout_engines_and_lock.remote(),
+                        timeout=self.args.rollout_http_timeout,
+                    )
+                    by_id = {engine._actor_id.hex(): engine for engine in available}
+                    if not recipients <= by_id.keys():
+                        raise ValueError("DCS recipients differ from the current rollout engine owners")
+                    ordered = sorted(self.rollout_topology.items(), key=lambda item: int(item[0]))
+                    entries = [
+                        info for _, info in ordered if (info.get("metadata") or {}).get("actor_id") in recipients
+                    ]
+                    engines = [by_id[info["metadata"]["actor_id"]] for info in entries]
+                    counts = [
+                        info["metadata"].get("num_gpus_per_engine", self.args.rollout_num_gpus_per_engine)
+                        for info in entries
+                    ]
+                status[0] = dict(active=bool(recipients), error=None)
+            except Exception as exc:
+                status[0] = dict(active=False, error=str(exc))
+        dist.broadcast_object_list(status, src=dist.get_process_group_ranks(group)[0], group=group)
+        if status[0]["error"] is not None:
+            raise RuntimeError(f"DCS delta recipient lookup failed: {status[0]['error']}")
+        return status[0]["active"], engines, counts
+
     @torch.no_grad()
     def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights used by rollout nodes.
@@ -753,6 +848,8 @@ class DeviceDirectBackend(CommBackend):
         model parameters (non-expert then expert), then resume generation.
         """
         self.weight_version += 1
+        delta = getattr(self, "delta_exporter", None) is not None and not actor_fwd_only
+        delta_active, delta_engines, delta_counts = self._delta_rollout_recipients() if delta else (False, None, None)
         managed = self.managed_lora_publication_enabled
         if managed:
             from relax.engine.lora_versions.training import run_on_training_rank_zero
@@ -828,81 +925,85 @@ class DeviceDirectBackend(CommBackend):
             elif dist.get_rank() == 0:
                 pause_and_flush()
             dist.barrier(group=get_gloo_group())
+            if delta_active:
+                from relax.backends.sglang.sglang_engine import _sglang_has_weight_update_session
+
+                if _sglang_has_weight_update_session():
+                    self._rollout_control_request("/begin_weight_update")
             if reload_quantized_base:
                 self._rollout_control_request(
                     "/post_process_weights",
                     {"restore_weights_before_load": True, "post_process_quantization": False},
                 )
 
-        buffer_size = 0
-        converted_named_tensors = []
-        origin_named_tensors = []
-        # non expert params
-        pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
+        if not (delta and rollout_only):
+            buffer_size = 0
+            converted_named_tensors = []
+            origin_named_tensors = []
+            # non expert params
+            pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." not in n):
-            if not self._should_sync_tensor(name, param):
-                continue
-            buffer_size = self._update_weight_from_distributed(
-                name,
-                param,
-                converted_named_tensors,
-                origin_named_tensors,
-                buffer_size,
-                rollout_only,
-                actor_fwd_only,
-                pbar=pbar,
-            )
-
-        if converted_named_tensors or origin_named_tensors:
-            if not rollout_only:
-                self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
-            if converted_named_tensors and not actor_fwd_only:
-                if self._rollout_bucket_splitter is not None:
-                    self._rollout_bucket_splitter(converted_named_tensors, require_complete=True)
-                self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
-                converted_named_tensors.clear()
-            origin_named_tensors.clear()
-        dist.barrier(group=get_gloo_group())
-
-        if self._lora_adapter_mode and getattr(self.args, "num_experts", 0):
-            # Adapter mode + MoE: the expert delta reaches the rollout as a pure adapter via the
-            # /update_lora_from_distributed push, so the expert base is converted for rollout only on
-            # the first sync (base is frozen in LoRA training). actor_fwd/reference has no adapter
-            # transport of its own, so every sync it receives the current expert adapter folded
-            # into the base weight{N} (its own expert adapters are zeroed at init). Two passes,
-            # each with the specialized rollout_only/actor_fwd_only flag, express the pure-vs-folded
-            # divergence without changing the expert-bucket arity (merge/dense stay single-pass).
-            if not actor_fwd_only and not self._lora_skip_rollout_base:
-                self._run_expert_pass(rollout_only=True, actor_fwd_only=False, pbar=pbar)
-            if not rollout_only:
-                self._run_expert_pass(rollout_only=False, actor_fwd_only=True, pbar=pbar)
-        else:
-            self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar)
-        dist.barrier(group=get_gloo_group())
-        if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
-
-            def finish_actor_fwd_sync() -> None:
-                payload = {
-                    "names": [
-                        "weight_updated_stop",
-                    ],
-                    "dtypes": [],
-                    "shapes": [],
-                    "group_name": "end",
-                }
-                logger.info("start post end send_weight_meta to actor fwd nodes...")
-                response = self.http_client.post(
-                    f"{self.coordinator_url}/send_weight_meta",
-                    json=payload,
+            for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." not in n):
+                if not self._should_sync_tensor(name, param):
+                    continue
+                buffer_size = self._update_weight_from_distributed(
+                    name,
+                    param,
+                    converted_named_tensors,
+                    origin_named_tensors,
+                    buffer_size,
+                    rollout_only,
+                    actor_fwd_only or delta,
+                    pbar=pbar,
                 )
-                response.raise_for_status()
 
-            if managed:
-                run_on_training_rank_zero(finish_actor_fwd_sync, phase="actor_fwd weight completion")
-            elif dist.get_rank() == 0:
-                finish_actor_fwd_sync()
+            if converted_named_tensors or origin_named_tensors:
+                if not rollout_only:
+                    self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
+                if converted_named_tensors and not actor_fwd_only:
+                    if self._rollout_bucket_splitter is not None:
+                        self._rollout_bucket_splitter(converted_named_tensors, require_complete=True)
+                    self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+                    converted_named_tensors.clear()
+                origin_named_tensors.clear()
             dist.barrier(group=get_gloo_group())
+
+            if self._lora_adapter_mode and getattr(self.args, "num_experts", 0):
+                # Adapter mode + MoE: the expert delta reaches the rollout as a pure adapter via the
+                # /update_lora_from_distributed push, so the expert base is converted for rollout only on
+                # the first sync (base is frozen in LoRA training). actor_fwd/reference has no adapter
+                # transport of its own, so every sync it receives the current expert adapter folded
+                # into the base weight{N} (its own expert adapters are zeroed at init). Two passes,
+                # each with the specialized rollout_only/actor_fwd_only flag, express the pure-vs-folded
+                # divergence without changing the expert-bucket arity (merge/dense stay single-pass).
+                if not actor_fwd_only and not self._lora_skip_rollout_base:
+                    self._run_expert_pass(rollout_only=True, actor_fwd_only=False, pbar=pbar)
+                if not rollout_only:
+                    self._run_expert_pass(rollout_only=False, actor_fwd_only=True, pbar=pbar)
+            else:
+                self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only or delta, pbar=pbar)
+            dist.barrier(group=get_gloo_group())
+        if delta_active:
+            getter = self._weights_getter
+            if getter is None:
+                getter = lambda: dict(
+                    self._megatron.named_params_and_buffers(
+                        self.args,
+                        self.model,
+                        convert_to_global_name=not self._use_bridge,
+                        include_persistent_buffers=self._use_bridge,
+                    )
+                )
+            self.delta_exporter.synchronize(
+                getter,
+                engines=delta_engines,
+                gpu_counts=delta_counts,
+                version=str(self.weight_version),
+                group=get_gloo_group(),
+                force_full=self.args.offload_rollout,
+            )
+        if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
+            self._finish_actor_fwd_ref_sync()
 
         # Adapter mode: (re)register the trained LoRA adapter on every rollout engine. The base
         # was already broadcast above on the first sync; the adapter itself is broadcast over the
@@ -956,6 +1057,12 @@ class DeviceDirectBackend(CommBackend):
                     "/post_process_weights",
                     {"restore_weights_before_load": False, "post_process_quantization": True},
                 )
+            if delta_active:
+                from relax.backends.sglang.sglang_engine import _sglang_has_weight_update_session
+
+                if _sglang_has_weight_update_session():
+                    self._rollout_control_request("/end_weight_update")
+                self.delta_exporter.commit()
             self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
             # NOTE: rollout proxy actors are intentionally kept alive across weight
@@ -973,6 +1080,67 @@ class DeviceDirectBackend(CommBackend):
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
+
+    def _finish_actor_fwd_ref_sync(self) -> None:
+        """Keep stop metadata until every participating role has consumed
+        it."""
+        training_group = get_gloo_group()
+        root = dist.get_process_group_ranks(training_group)[0]
+
+        def coordinator_call(request: Callable[[], httpx.Response], phase: str) -> None:
+            error = [None]
+            if dist.get_rank(group=training_group) == 0:
+                try:
+                    request().raise_for_status()
+                except Exception as exc:
+                    error[0] = str(exc)
+            dist.broadcast_object_list(error, src=root, group=training_group)
+            if error[0] is not None:
+                raise RuntimeError(f"Actor_fwd/reference metadata {phase} failed: {error[0]}")
+
+        coordinator_call(
+            lambda: self.http_client.post(
+                f"{self.coordinator_url}/send_weight_meta",
+                json=dict(names=["weight_updated_stop"], dtypes=[], shapes=[], group_name="end"),
+            ),
+            "stop",
+        )
+        error = None
+        if self._is_pp_src_rank:
+            try:
+                if self._model_update_groups_for_actor_fwd_ref is None:
+                    raise RuntimeError("Actor_fwd/reference completion group is not initialized")
+                error = _complete_raw_group(self._model_update_groups_for_actor_fwd_ref, self.device)
+            except Exception as exc:
+                error = str(exc)
+        errors = [None] * dist.get_world_size(group=training_group)
+        # This is also the original training-side completion rendezvous. Every
+        # PP source shares an ACK/fence failure before anyone clears or commits.
+        dist.all_gather_object(errors, error, group=training_group)
+        failed = any(error is not None for error in errors)
+        clear_error = None
+        if not failed:
+            try:
+                coordinator_call(
+                    lambda: self.http_client.get(f"{self.coordinator_url}/clear_weight_meta"),
+                    "clear",
+                )
+            except Exception as exc:
+                clear_error = str(exc)
+                failed = True
+        error = None
+        if self._is_pp_src_rank:
+            try:
+                if _raw_group_status(self._model_update_groups_for_actor_fwd_ref, self.device, failed):
+                    error = "A raw recipient rejected release"
+            except Exception as exc:
+                error = str(exc)
+        release_errors = [None] * dist.get_world_size(group=training_group)
+        dist.all_gather_object(release_errors, error, group=training_group)
+        if failed or any(error is not None for error in release_errors):
+            raise RuntimeError(
+                f"Actor_fwd/reference completion failed: ready={errors}, clear={clear_error}, release={release_errors}"
+            )
 
     def _rollout_control_request(self, endpoint: str, payload: Optional[Dict] = None) -> None:
         """Await receiver lifecycle operations and share failures with every
@@ -1377,9 +1545,27 @@ class DeviceDirectBackend(CommBackend):
                 # termination marker
                 if names and names[0] == "weight_updated_stop":
                     dist.barrier(get_gloo_group())
-                    if dist.get_rank() == 0:
-                        response = self.http_client.get(f"{self.coordinator_url}/clear_weight_meta")
-                        response.raise_for_status()
+                    errors = []
+                    groups = self._model_update_groups_for_actor_fwd_ref
+                    for group_name in sorted(groups):
+                        try:
+                            error = _complete_raw_group(groups[group_name], self.device, wait=False)
+                            if error is not None:
+                                errors.append(error)
+                        except Exception as exc:
+                            errors.append(str(exc))
+                    failed = bool(errors)
+                    # Do not return into the next partition while the previous
+                    # directory/stop remains visible. Failure still traverses
+                    # every PP Release so one role cannot strand other peers.
+                    for group_name in sorted(groups):
+                        try:
+                            failed = _raw_group_status(groups[group_name], self.device, failed) or failed
+                        except Exception as exc:
+                            errors.append(str(exc))
+                            failed = True
+                    if failed:
+                        raise RuntimeError(f"Actor_fwd/reference completion failed: {errors}")
 
                     logger.info("Received final weight update marker for actor_fwd nodes")
                     return

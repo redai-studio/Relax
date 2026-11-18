@@ -30,6 +30,7 @@ from relax.utils.megatron_peft_utils import (
 from relax.utils.reloadable_process_group import retain_process_groups
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from .delta_export import create_delta_exporter
 from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice_chunk
 from .expert_routing import ExpertLayout, validate_bf16_server_layout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -115,6 +116,9 @@ class UpdateWeightFromTensor:
         self._hf_weight_iterator = HfWeightIteratorBase.create(
             args=args, model=model, model_name=model_name, quantization_config=quantization_config
         )
+        self.delta_exporter = create_delta_exporter(
+            args, model, model_name=model_name, quantization_config=quantization_config
+        )
 
         self._direct_expert_layout: DirectExpertLayout | None = None
 
@@ -138,6 +142,15 @@ class UpdateWeightFromTensor:
         to colocated IPC engines.
         """
         self.rollout_engines = rollout_engines
+        if getattr(self, "delta_exporter", None) is not None:
+            self._delta_gpu_counts = list(
+                engine_gpu_counts or [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
+            )
+            self.distributed_rollout_engines = []
+            # The original updater still owns pause/session/resume. Its delta
+            # data groups terminate at the engine's GPU owners, not SG's live
+            # model workers or another per-model synchronization path.
+            return
         explicit_placement = engine_gpu_counts is not None and engine_gpu_offsets is not None
         if getattr(self, "_auto_expert_routing", False):
             self._hf_weight_iterator.configure_expert_routing(None)
@@ -443,6 +456,10 @@ class UpdateWeightFromTensor:
                 self._direct_expert_layout or reason or "source expert mapping/geometry requires HF loading",
             )
 
+    def disconnect_rollout_engines(self) -> None:
+        if getattr(self, "delta_exporter", None) is not None:
+            self.delta_exporter.disconnect(group=get_gloo_group())
+
     @torch.no_grad()
     def update_weights(self) -> None:
         """version++, flush caches, process buckets with pipelining.
@@ -470,7 +487,11 @@ class UpdateWeightFromTensor:
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
 
         rank = dist.get_rank()
-        if self._route_experts:
+        if getattr(self, "delta_exporter", None) is not None:
+            self._routed_engine_call(all_engines, "pause_generation")
+            self._routed_engine_call(all_engines, "flush_cache")
+            self._routed_engine_call(all_engines, "begin_weight_update")
+        elif self._route_experts:
             self._routed_engine_call(all_engines, "pause_generation")
             self._routed_engine_call(all_engines, "flush_cache")
             if getattr(self, "_auto_expert_routing", False):
@@ -528,31 +549,41 @@ class UpdateWeightFromTensor:
         current_refs: list[ObjectRef] = []
         long_lived_tensors = None
         try:
-            with export_ctx:
-                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-                    dispatch_errors = []
-                    current_refs, long_lived_tensors = self._send_hf_params(
-                        hf_named_tensors, dispatch_errors=dispatch_errors
-                    )
-                    # Routed export agrees on failures before advancing its
-                    # collective generator. Ordinary export keeps two chunks
-                    # overlapped, including the previous chunk's storage.
-                    if self._route_experts:
-                        self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
-                        current_refs = []
-                    else:
-                        self._wait_for_ipc(prev_refs)
-                        prev_refs = []
-                        if dispatch_errors:
-                            self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
-                    prev_long_lived_tensors = long_lived_tensors
-                    prev_refs, current_refs = current_refs, []
-                    if self._route_experts:
-                        prev_long_lived_tensors = long_lived_tensors = None
-                        del hf_named_tensors
-                    device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-                self._wait_for_ipc(prev_refs)
-                prev_refs = []
+            if getattr(self, "delta_exporter", None) is not None:
+                self.delta_exporter.synchronize(
+                    self.weights_getter,
+                    engines=all_engines,
+                    gpu_counts=self._delta_gpu_counts,
+                    version=str(self.weight_version),
+                    group=get_gloo_group(),
+                    force_full=self.args.offload_rollout,
+                )
+            else:
+                with export_ctx:
+                    for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                        dispatch_errors = []
+                        current_refs, long_lived_tensors = self._send_hf_params(
+                            hf_named_tensors, dispatch_errors=dispatch_errors
+                        )
+                        # Routed export agrees on failures before advancing its
+                        # collective generator. Ordinary export keeps two chunks
+                        # overlapped, including the previous chunk's storage.
+                        if self._route_experts:
+                            self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
+                            current_refs = []
+                        else:
+                            self._wait_for_ipc(prev_refs)
+                            prev_refs = []
+                            if dispatch_errors:
+                                self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
+                        prev_long_lived_tensors = long_lived_tensors
+                        prev_refs, current_refs = current_refs, []
+                        if self._route_experts:
+                            prev_long_lived_tensors = long_lived_tensors = None
+                            del hf_named_tensors
+                        device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
+                    self._wait_for_ipc(prev_refs)
+                    prev_refs = []
         finally:
             # Conversion or ACK failures must not release storage while an
             # already submitted receiver is still reading it. No additional
@@ -566,7 +597,11 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         # int4/fp4 post_process
-        if self._route_experts:
+        if getattr(self, "delta_exporter", None) is not None:
+            self._routed_engine_call(all_engines, "end_weight_update")
+            self.delta_exporter.commit()
+            self._routed_engine_call(all_engines, "continue_generation")
+        elif self._route_experts:
             if getattr(self, "_auto_expert_routing", False):
                 self._routed_engine_call(all_engines, "end_weight_update")
             else:
@@ -611,7 +646,7 @@ class UpdateWeightFromTensor:
             # ray.get(list) may raise before other requests finish. Keep source
             # buffers alive until every submitted reader has completed/failed.
             _drain_ipc_refs(refs)
-        if not self._route_experts:
+        if not self._route_experts and getattr(self, "delta_exporter", None) is None:
             if error is not None:
                 raise RuntimeError(f"Weight load failed: {error}")
             return

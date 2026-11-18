@@ -22,6 +22,7 @@ from relax.engine.lora_versions.training import LoRATrainingConfig
 def backends(monkeypatch):
     ranks = ThreadRanks(monkeypatch)
     monkeypatch.setattr(device_direct, "get_gloo_group", lambda: ranks)
+    monkeypatch.setattr(device_direct.dist, "get_process_group_ranks", lambda group: [0, 1])
     monkeypatch.setattr(engine_module, "get_gloo_group", lambda: ranks)
     monkeypatch.setattr(device_direct.ray, "get", lambda value, **kwargs: value)
     monkeypatch.setattr(device_direct.device_module, "empty_cache", lambda: None)
@@ -58,7 +59,8 @@ def backends(monkeypatch):
         backend._run_expert_pass = Mock(side_effect=lambda **kwargs: None)
         backend.coordinator_url = "http://coordinator"
         backend.http_client = SimpleNamespace(
-            post=Mock(side_effect=lambda *a, events=events, **kw: events.append("actor-fwd-end") or Mock())
+            post=Mock(side_effect=lambda *a, events=events, **kw: events.append("actor-fwd-end") or Mock()),
+            get=Mock(side_effect=lambda *a, events=events, **kw: events.append("actor-fwd-clear") or Mock()),
         )
         backend.events = events
         workers.append(backend)
@@ -100,7 +102,9 @@ def test_later_actor_fwd_updates_keep_completion_marker_without_pausing_rollout(
         None,
         None,
     ]
-    assert workers[0].events == (["actor-fwd-end"] if actor_fwd_only else ["actor-fwd-end", "publish"])
+    assert workers[0].events == (
+        ["actor-fwd-end", "actor-fwd-clear"] if actor_fwd_only else ["actor-fwd-end", "actor-fwd-clear", "publish"]
+    )
     assert workers[1].events == ([] if actor_fwd_only else ["publish"])
     assert all(worker._run_expert_pass.call_count == 1 for worker in workers)
 
