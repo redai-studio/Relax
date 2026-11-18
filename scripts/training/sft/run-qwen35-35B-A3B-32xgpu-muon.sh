@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.6-35B-A3B Muon TP4/CP1/PP1/EP8/ETP1 SFT on 32 Blackwell GPUs.
-# Set MODEL_DIR, DATA_DIR and a persistent shared SAVE_DIR.
+# Qwen3.5-35B-A3B Muon TP4/CP1/PP1/EP8/ETP1 SFT on 32 Blackwell GPUs.
+# Set MODEL_DIR to Qwen3.5-35B-A3B, DATA_DIR and a persistent shared SAVE_DIR.
 # DRY_RUN=1 renders the command and worker environment without submitting a job.
 # Multimodal SFT is enabled by default. Resume from SAVE_DIR/EXP_NAME when available.
 # Use the unified Blackwell training image with Emerging Optimizers on all nodes.
@@ -35,8 +35,8 @@ for arg in "$@"; do
     fi
 done
 
-PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen36}"
-EXP_NAME="${EXP_NAME:-qwen36-35B-A3B-32xB300-muon}"  # gitleaks:allow -- stable experiment/checkpoint identity
+PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen35}"
+EXP_NAME="${EXP_NAME:-qwen35-35B-A3B-32xB300-muon}"  # gitleaks:allow -- stable experiment/checkpoint identity
 now="$(date +%Y%m%d-%H%M%S)"
 TASK_NAME="${EXP_NAME}-${now}-$$"
 SUBMISSION_ID="${SUBMISSION_ID:-$TASK_NAME}"
@@ -47,8 +47,6 @@ TRAIN_STEPS="${TRAIN_STEPS:-200}"
 ENV_JSON="$(python3 - "$MULTIMODAL" <<'PYENV'
 import json
 import os
-import shlex
-import shutil
 import sys
 from pathlib import Path
 
@@ -60,20 +58,6 @@ def build_environment() -> dict[str, str]:
     site = Path(sysconfig.get_paths()["purelib"])
     nccl = site / "nvidia/nccl"
     cublas = Path("/opt/relax/cublas13.3/nvidia/cu13/lib")
-    # DeepEP 2.1 invokes NVCC via a shell. Keep training preloads, but isolate
-    # its compiler subprocess even when the image NVCC is not wrapped.
-    nvcc_wrapper = Path(os.environ["RELAX"]) / "scripts/tools/nvcc-without-preload.sh"
-    if shlex.quote(str(nvcc_wrapper)) != str(nvcc_wrapper):
-        raise ValueError("DeepEP requires a Relax checkout path without shell-special characters")
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    nvcc = os.environ.get("EP_JIT_NVCC_COMPILER") or (
-        str(Path(cuda_home) / "bin/nvcc") if cuda_home else shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
-    )
-    nvcc = str(Path(nvcc).absolute())
-    if Path(nvcc).resolve() == nvcc_wrapper.resolve():
-        raise ValueError("EP_JIT_NVCC_COMPILER must select the original compiler, not the Relax wrapper")
-    if os.environ.get("DRY_RUN") != "1" and not (Path(nvcc).is_file() and os.access(nvcc, os.X_OK)):
-        raise RuntimeError(f"NVCC compiler is missing or not executable: {nvcc}")
     kept = [
         p
         for p in os.environ.get("LD_PRELOAD", "").replace(":", " ").split()
@@ -101,9 +85,6 @@ def build_environment() -> dict[str, str]:
             "RELAX_FLA_CONV_NB_MODE": "none",
             "EP_NCCL_ROOT_DIR": str(nccl),
             "EP_JIT_CACHE_DIR": f"/tmp/relax-qwen35-{os.getuid()}/deepep",
-            "EP_JIT_NVCC_COMPILER": str(nvcc_wrapper),
-            "RELAX_NVCC_REAL": nvcc,
-            "EP_JIT_PRINT_COMPILER_COMMAND": os.environ.get("EP_JIT_PRINT_COMPILER_COMMAND", "1"),
         }
     )
     env.update(
