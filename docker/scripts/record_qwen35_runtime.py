@@ -138,7 +138,11 @@ def main() -> None:
         | {line[6:] for line in operator_patch.read_text().splitlines() if line.startswith("+++ b/")}
     )
     protected_sources.extend(
-        ["megatron/core/transformer/ple_input_halo_cp.py", "megatron/core/models/gpt/gpt_model.py"]
+        [
+            "megatron/core/transformer/per_layer_embedding.py",
+            "megatron/core/transformer/ple_input_halo_cp.py",
+            "megatron/core/models/gpt/gpt_model.py",
+        ]
     )
     report = {
         "deepep_commit": os.environ["DEEP_EP_V2_COMMIT"],
