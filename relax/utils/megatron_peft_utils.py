@@ -509,6 +509,12 @@ def write_hf_peft_adapter(
     adapter_dir = Path(adapter_dir)
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
+    # Qwen3.5 exports Megatron's MTP eh_proj as mtp.fc; DeepSeek/GLM keep
+    # eh_proj. Resolve this model-specific name from the exported tensors,
+    # rather than changing the shared mapping for every model family.
+    if "eh_proj" in target_modules and any(".mtp.fc.lora_" in f".{name}" for name in merged):
+        target_modules = list(dict.fromkeys("fc" if name == "eh_proj" else name for name in target_modules))
+
     # HF PEFT adapter config (JSON-safe: no enums).
     config_dict = build_hf_peft_config_dict(
         lora_rank=lora_rank,

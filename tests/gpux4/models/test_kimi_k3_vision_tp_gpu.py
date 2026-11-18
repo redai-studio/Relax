@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Real MoonViT/NCCL regression; opt in with KIMI_K3_TEST_CHECKPOINT."""
+"""Real K3/K3.1 MoonViT/NCCL regression; opt in with
+KIMI_K3_TEST_CHECKPOINT."""
 
 import importlib.util
 import os
@@ -21,7 +22,7 @@ def _vision_tp_worker(rank: int, world_size: int, rendezvous: str, checkpoint_pa
     group = dist.new_group(ranks=list(range(world_size)))
     try:
         spec = importlib.util.spec_from_file_location(
-            "_k3_vision_gpu_model", Path(__file__).parents[3] / "relax/models/kimi_k3/model.py"
+            "relax.models.kimi_k3._vision_gpu_model", Path(__file__).parents[3] / "relax/models/kimi_k3/model.py"
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -34,6 +35,7 @@ def _vision_tp_worker(rank: int, world_size: int, rendezvous: str, checkpoint_pa
             trust_remote_code=True,
             vision_config=hf_config.vision_config,
             params_dtype=torch.bfloat16,
+            kimi_dsa_config=getattr(hf_config.text_config, "dsa_config", None),
         )
         torch.manual_seed(42)
         model = module.KimiK3VLModel.__new__(module.KimiK3VLModel)
@@ -68,7 +70,7 @@ def _vision_tp_worker(rank: int, world_size: int, rendezvous: str, checkpoint_pa
 
 @pytest.mark.skipif(
     torch.cuda.device_count() < 4 or not os.environ.get("KIMI_K3_TEST_CHECKPOINT"),
-    reason="Requires four GPUs and KIMI_K3_TEST_CHECKPOINT with the K3 HF custom modules.",
+    reason="Requires four GPUs and KIMI_K3_TEST_CHECKPOINT pointing to a K3 or K3.1 checkpoint.",
 )
 def test_kimi_k3_real_vision_tp_matches_unsplit_features_and_projector_gradients(tmp_path: Path) -> None:
     mp.spawn(

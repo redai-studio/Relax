@@ -517,6 +517,7 @@ _ESTIMATE_FUNC = {
     "gemma4": estimate_gemma4_flops,
     "gemma4_text": estimate_gemma4_flops,
     "kimi_k3": estimate_kimi_k3_flops,
+    "kimi_k31": estimate_kimi_k3_flops,
     # Dense transformers (SwiGLU + GQA)
     "qwen2": _estimate_qwen2_flops,
     "qwen3": _estimate_qwen2_flops,
@@ -577,9 +578,9 @@ class FlopsCounter:
     def estimate(self, batch_seqlens, delta_time, **kwargs):
         """Return (estimated_tflops, peak_device_tflops).
 
-        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``. K3
-        honors independent frozen-region flags; other estimators retain their
-        existing 3x-forward training convention.
+        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``.
+        K3/K3.1 honors independent frozen-region flags; other estimators retain
+        their existing 3x-forward training convention.
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
@@ -593,7 +594,7 @@ class FlopsCounter:
             ):
                 if not self._warned_unsupported_trainability:
                     logger.warning(
-                        "K3 FLOPs/MFU omitted for LoRA or custom parameter masks: "
+                        "K3/K3.1 FLOPs/MFU omitted for LoRA or custom parameter masks: "
                         "HF config cannot determine adapter dimensions and actual trainability. "
                         "Token throughput and timing remain available."
                     )

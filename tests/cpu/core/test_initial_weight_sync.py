@@ -47,31 +47,39 @@ class InitialWeightSyncTests(unittest.TestCase):
         self.update = extract_method("relax/core/service.py", "Service", "update_weights_fully_async", {})
         self.receive = extract_method("relax/core/service.py", "Service", "recv_weight_fully_async", {})
 
-    def _startup(self, fail_role=None, include_receivers=True):
+    def _startup(self, fail_role=None, receivers=("actor_fwd", "reference"), **config):
         roles = SimpleNamespace(
             actor="actor", rollout="rollout", actor_fwd="actor_fwd", reference="reference", critic="critic"
         )
-        started, completed, responses = [], [], {}
+        started, completed, cancelled, responses = [], [], [], {}
         sender_started, receivers_started = asyncio.Event(), asyncio.Event()
-        required_receivers = {"actor_fwd", "reference"} if include_receivers else set()
+        required_receivers = set(receivers)
+
+        async def finish(role):
+            if fail_role == role:
+                raise RuntimeError(f"{role} weight synchronization failure")
+            if fail_role is not None:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    cancelled.append(role)
+                    raise
+            completed.append(role)
 
         async def sender():
             started.append("actor")
             sender_started.set()
             if required_receivers:
                 await asyncio.wait_for(receivers_started.wait(), timeout=0.5)
-            if fail_role == "actor":
-                raise RuntimeError("sender partial-weight failure")
-            completed.append("actor")
+            await finish("actor")
 
         async def receiver(role):
             started.append(role)
             if required_receivers.issubset(started):
                 receivers_started.set()
             await asyncio.wait_for(sender_started.wait(), timeout=0.5)
-            if fail_role == role:
-                raise RuntimeError(f"{role} receive failure")
-            completed.append(role)
+            await asyncio.wait_for(receivers_started.wait(), timeout=0.5)
+            await finish(role)
 
         services = {}
         for role in ["actor", "rollout", *sorted(required_receivers)]:
@@ -79,11 +87,9 @@ class InitialWeightSyncTests(unittest.TestCase):
             if role == "actor":
                 response = FakeDeploymentResponse(sender)
                 service.handle = SimpleNamespace(
-                    update_weights_fully_async=SimpleNamespace(remote=lambda response=response, **_kwargs: response)
+                    update_weights_fully_async=SimpleNamespace(remote=MagicMock(return_value=response))
                 )
-                service.update_weights_fully_async = lambda service=service, recovery_token=None: self.update(
-                    service, recovery_token=recovery_token
-                )
+                service.update_weights_fully_async = lambda service=service, **kwargs: self.update(service, **kwargs)
                 service.get_step = AsyncMock(return_value=0)
                 responses[role] = response
             elif role in required_receivers:
@@ -97,13 +103,21 @@ class InitialWeightSyncTests(unittest.TestCase):
                 responses[role] = response
             services[role] = service
 
+        async def run_bounded(coro):
+            try:
+                return await asyncio.wait_for(coro, timeout=2)
+            finally:
+                if fail_role is not None:
+                    # Check before asyncio.run's shutdown cancels leftover tasks.
+                    self.assertEqual(set(cancelled), {"actor", *required_receivers} - {fail_role})
+
         namespace = {
             "asyncio": asyncio,
             "GlobalStartup": GlobalStartup,
             "ROLES": roles,
             "GENRM_ROLE": "genrm",
             "logger": MagicMock(),
-            "run": asyncio.run,
+            "run": lambda coro: asyncio.run(run_bounded(coro)),
             "set_managed_opd_teacher_on_actor_service": AsyncMock(),
             "_needs_rollout_manager_setup": lambda _: False,
         }
@@ -120,6 +134,8 @@ class InitialWeightSyncTests(unittest.TestCase):
             _pending_task_refs_lock=threading.Lock(),
             _pending_task_refs=[],
         )
+        for key, value in config.items():
+            setattr(controller.config, key, value)
         error = None
         try:
             training_loop(controller)
@@ -151,11 +167,39 @@ class InitialWeightSyncTests(unittest.TestCase):
                 controller._report_error_to_metrics_service.assert_called_once()
 
     def test_on_policy_without_actor_fwd_or_reference_still_awaits_sender(self):
-        _, services, _, completed, responses, error = self._startup(include_receivers=False)
+        _, services, _, completed, responses, error = self._startup(receivers=())
         self.assertIsNone(error)
         self.assertEqual(completed, ["actor"])
         self.assertEqual(responses["actor"].await_count, 1)
         services["rollout"].run.assert_called_once()
+        services["actor"].handle.update_weights_fully_async.remote.assert_called_once_with(
+            rollout_only=True, actor_fwd_only=False, recovery_token=None
+        )
+
+    def test_each_receiver_configuration_uses_full_sync(self):
+        for receivers in (("actor_fwd",), ("reference",), ("actor_fwd", "reference")):
+            with self.subTest(receivers=receivers):
+                _, services, _, completed, _, error = self._startup(receivers=receivers)
+                self.assertIsNone(error)
+                self.assertEqual(set(completed), {"actor", *receivers})
+                services["actor"].handle.update_weights_fully_async.remote.assert_called_once_with(
+                    rollout_only=False, actor_fwd_only=False, recovery_token=None
+                )
+
+    def test_colocate_hybrid_and_debug_modes_skip_initial_async_sync(self):
+        for config in (
+            {"fully_async": False},
+            {"hybrid": True},
+            {"debug_train_only": True},
+            {"debug_rollout_only": True},
+        ):
+            with self.subTest(config=config):
+                _, services, started, _, responses, error = self._startup(**config)
+                self.assertIsNone(error)
+                self.assertEqual(started, [])
+                self.assertTrue(all(response.await_count == 0 for response in responses.values()))
+                for service in services.values():
+                    service.run.assert_called_once()
 
 
 if __name__ == "__main__":

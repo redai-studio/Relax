@@ -24,6 +24,7 @@ from tqdm import tqdm
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
+from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
@@ -111,13 +112,13 @@ class GenerateState(metaclass=SingletonMeta):
         # Media-encoding thread pool for this rollout worker process, sized by
         # --encode-max-workers (falls back to $RELAX_ENCODE_MAX_WORKERS, then an
         # affinity-aware default). Held on state so consumers use it explicitly.
-        self.encode_executor = configure_encode_executor(getattr(args, "encode_max_workers", None))
+        self.encode_executor = configure_encode_executor(args.encode_max_workers)
 
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
         self.processor_pool = None
         if self.processor is not None:
-            pool_size = getattr(args, "mm_processor_pool_size", 0)
+            pool_size = args.mm_processor_pool_size
             if pool_size > 0:
                 try:
                     self.processor_pool = ProcessorPool(
@@ -146,7 +147,7 @@ class GenerateState(metaclass=SingletonMeta):
             spaces_between_special_tokens=False,
         )
 
-        if getattr(args, "sglang_enable_deterministic_inference", False):
+        if args.sglang_enable_deterministic_inference:
             sampling_seed_base = args.rollout_seed
             self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
 
@@ -443,7 +444,7 @@ async def generate(
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
-    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+    if args.use_rollout_indexer_replay and not evaluation:
         payload["return_indexer_topk"] = True
 
     if opd_enabled:
@@ -452,7 +453,7 @@ async def generate(
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
     # base model only and rollouts would not reflect the trained policy.
-    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+    if args.lora_rank > 0 and args.lora_adapter_mode:
         from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
 
         payload["lora_path"] = LORA_ADAPTER_NAME
@@ -497,7 +498,7 @@ async def generate(
     headers = None
     if args.sglang_router_policy == "consistent_hashing" and sample.session_id:
         headers = {"X-SMG-Routing-Key": sample.session_id}
-    elif getattr(args, "slime_router_sticky", False) and sample.group_index is not None:
+    elif args.slime_router_sticky and sample.group_index is not None:
         # Pin all samples of one prompt group to the same engine so the shared prompt
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
@@ -514,6 +515,7 @@ async def generate(
             sampling_mode=sc_sampling_mode,
             expected_tokens=output.get("output_ids"),
             vocab_size=resolve_score_centering_vocab_size(args),
+            return_support_complete=True,
         )
     if native_image_opd:
         validate_prompt_token_ids(output, sample.tokens)
@@ -524,7 +526,7 @@ async def generate(
 
         sample = await postprocess_sample_with_radix_tree(args, sample, output)
         if sc_result is not None:
-            sc_tokens, sc_sampled, sc_ids, sc_logprobs = sc_result
+            sc_tokens, sc_sampled, sc_ids, sc_logprobs, sc_complete = sc_result
             response_tokens = sample.tokens[-sample.response_length :] if sample.response_length else []
             if response_tokens != sc_tokens:
                 raise ValueError(
@@ -533,6 +535,7 @@ async def generate(
             sample.rollout_log_probs = sc_sampled
             sample.rollout_topk_token_ids = sc_ids
             sample.rollout_topk_log_probs = sc_logprobs
+            sample.rollout_topk_support_complete = sc_complete
     else:
         if "output_token_logprobs" in output["meta_info"]:
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -547,7 +550,7 @@ async def generate(
             )
 
         if sc_result is not None:
-            new_response_tokens, new_response_log_probs, _, _ = sc_result
+            new_response_tokens, new_response_log_probs, *_ = sc_result
             # Keep an independent copy to detect in-place token sanitization.
             sc_tokens_before_sanitization = list(new_response_tokens)
 
@@ -616,7 +619,7 @@ async def generate(
             sample.rollout_log_probs = []
         sample.rollout_log_probs += new_response_log_probs
         if sc_result is not None:
-            append_score_centering_candidates(sample, sc_result[2], sc_result[3])
+            append_score_centering_candidates(sample, *sc_result[2:])
 
         if opd_enabled:
             state.opd_manager.after_rollout(sample, output)
@@ -631,7 +634,7 @@ async def generate(
             args.moe_router_topk,
         )
 
-    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+    if args.use_rollout_indexer_replay and not evaluation:
         setattr(
             sample,
             "rollout_indexer_topk",
@@ -732,11 +735,11 @@ async def generate_and_rm(
     # Custom generation may already have assigned rewards to some outputs.
     if isinstance(generated, list):
         samples_need_reward = [sample for sample in generated if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
     elif generated.reward is None:
-        generated.reward = await async_rm(args, generated)
+        generated.reward = await async_rm(args, generated, evaluation=evaluation)
 
     if opd.is_opd_enabled(args, evaluation=evaluation):
         await state.opd_manager.prefill(generated, _encode_multimodal_inputs)
@@ -812,7 +815,7 @@ async def generate_and_rm_group(
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
-        if getattr(args, "sglang_enable_deterministic_inference", False):
+        if args.sglang_enable_deterministic_inference:
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
         tasks.append(
@@ -831,7 +834,7 @@ async def generate_and_rm_group(
                 state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
-    rewards = await batched_async_rm(args, group)
+    rewards = await batched_async_rm(args, group, evaluation=evaluation)
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 
@@ -962,7 +965,7 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
-    strict_fill_current = args.fully_async and getattr(args, "max_staleness", 1) == 0
+    strict_fill_current = args.fully_async and args.max_staleness == 0
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -1424,7 +1427,7 @@ async def eval_rollout_single_dataset(
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 group.append(sample)
             sampling_params = base_sampling_params
-            if getattr(args, "sglang_enable_deterministic_inference", False):
+            if args.sglang_enable_deterministic_inference:
                 sampling_params = base_sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed
             tasks.append(
@@ -1459,7 +1462,7 @@ async def eval_rollout_single_dataset(
                 sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 sampling_params = base_sampling_params
-                if getattr(args, "sglang_enable_deterministic_inference", False):
+                if args.sglang_enable_deterministic_inference:
                     sampling_params = base_sampling_params.copy()
                     sampling_params["sampling_seed"] = args.rollout_seed + j
                 tasks.append(
@@ -1499,7 +1502,11 @@ async def eval_rollout_single_dataset(
         if (
             0 <= prompt_index < len(dataset.samples)
             and [sample.index for sample in group] == list(expected_indices)
-            and all(sample.reward is not None and sample.status != Sample.Status.ABORTED for sample in group)
+            and all(
+                (sample.reward is not None or is_eval_reward_pending(sample))
+                and sample.status != Sample.Status.ABORTED
+                for sample in group
+            )
         ):
             valid_data.extend(group)
     num_valid_prompts = len(valid_data) // group_size
@@ -1512,7 +1519,10 @@ async def eval_rollout_single_dataset(
     data = valid_data
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [
+                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
+                for sample in data
+            ],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
             "group_size": group_size,
@@ -1549,7 +1559,7 @@ def generate_rollout(
     # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
     # prefetched generation is almost always aborted by the next step's pause_generation and its
     # truncated samples would pollute the next rollout. Other modes keep the optimization.
-    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+    _lora_adapter_mode = args.lora_rank > 0 and args.lora_adapter_mode
     # Match Rollout._maybe_save_data: prefetch advances the saved data cursor, but its
     # ObjectRef is not checkpointed. Leave the next batch unread at save boundaries.
     _save_data = (

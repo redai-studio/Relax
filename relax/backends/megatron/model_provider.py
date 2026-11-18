@@ -26,6 +26,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.models.common.lora import resolve_lora_targets
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -404,6 +405,8 @@ def get_model_provider_func(
             "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
+            "moe_megakernel_backend",
+            "moe_megakernel_backend_config",
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",
@@ -478,6 +481,13 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        # Match MCore's CLI conversion: interleaved P2P overlap and batched
+        # communication are mutually exclusive. Parser validation already
+        # disables overlap for schedules without virtual pipeline stages.
+        if getattr(args, "overlap_p2p_comm", None) is not None:
+            provider.overlap_p2p_comm = args.overlap_p2p_comm
+            provider.batch_p2p_comm = not args.overlap_p2p_comm
 
         if callable(getattr(provider, "configure_runtime", None)):
             provider.configure_runtime(args)
@@ -796,12 +806,13 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
+            peft.target_modules = resolve_lora_targets(model, list(peft.target_modules), args)
             # Restrict adapter injection to the requested model region (e.g. language-only
             # for VL models). Overriding target_modules post-construction is supported:
             # PEFT.__call__ rebuilds its matcher state from the current target_modules.
             scope = getattr(args, "lora_scope", "all")
             if scope != "all":
-                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+                peft.target_modules = scope_target_modules_to_region(model, list(peft.target_modules), scope)
             if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
                 peft.target_modules = exclude_frozen_lora_target_modules(
                     model, list(peft.target_modules), args.freeze_params_name_list
