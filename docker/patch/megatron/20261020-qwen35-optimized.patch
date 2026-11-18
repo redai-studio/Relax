@@ -255,7 +255,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
          def custom(start: int, end: int):
 @@ -628,21 +612,9 @@
                  if ple is not None:
-                     ple_states[index] = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
+                     ple_states[index] = ple.capture_checkpoint_state()
  
 -            def custom_forward(
 -                hidden_states,
@@ -279,8 +279,8 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
                      layer = self._get_layer(index)
                      ple = getattr(layer, "per_layer_embedding", None)
 @@ -650,126 +622,56 @@
-                         previous_ple_state = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
-                         ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = ple_states[index]
+                         previous_ple_state = ple.capture_checkpoint_state()
+                         ple.restore_checkpoint_state(ple_states[index])
                      try:
 -
 -                        # Get appropriate inner quantization context
@@ -317,7 +317,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
 +                            hidden_states, context = layer(hidden_states=hidden_states, attention_mask=attention_mask, context=context, context_mask=context_mask, rotary_pos_emb=rotary_pos_emb, attention_bias=attention_bias, inference_context=None, packed_seq_params=packed_seq_params, padding_mask=padding_mask, input_ids=input_ids)
                      finally:
                          if ple is not None:
-                             ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = previous_ple_state
+                             ple.restore_checkpoint_state(previous_ple_state)
 -                return hidden_states, context
 -
 +                return (hidden_states, context)

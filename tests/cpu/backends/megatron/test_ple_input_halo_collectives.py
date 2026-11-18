@@ -134,8 +134,8 @@ def _worker(rank, rendezvous):
                     zero_input = hidden[owned[rank]].clone().requires_grad_()
                     (model(zero_input) * 0).sum().backward()
                     assert torch.equal(zero_input.grad, torch.zeros_like(zero_input))
-        _check_block_interleaving(rank, native=False)
-        _check_block_interleaving(rank, native=True)
+        for implementation in ("vl", "native", "qsa", "qsa_retained"):
+            _check_block_interleaving(rank, implementation=implementation)
     finally:
         dist.destroy_process_group()
 
@@ -152,7 +152,7 @@ class PLELayer(nn.Module):
         return self.per_layer_embedding(hidden_states), context
 
 
-def _check_block_interleaving(rank, *, native):
+def _check_block_interleaving(rank, *, implementation):
     """Execute native GPT and Bridge closures with CPU checkpointing.
 
     Replaces only the CUDA RNG checkpoint wrapper with PyTorch reentrant
@@ -170,6 +170,7 @@ def _check_block_interleaving(rank, *, native):
     torch.manual_seed(71)
     model = _model((16,))
     layer = PLELayer(model)
+    layer._relax_qsa_attention_retained = implementation == "qsa_retained"
     block = SimpleNamespace(
         config=SimpleNamespace(
             fp8=False,
@@ -217,9 +218,15 @@ def _check_block_interleaving(rank, *, native):
             local = hidden[indices].clone().requires_grad_()
             os.environ["QWEN38_PLE_INPUT_HALO_CP"] = "1"
             os.environ["QWEN38_PLE_INPUT_HALO_TRANSPORT"] = "adaptive"
-            if native:
+            if implementation == "native":
                 output = TransformerBlock._checkpointed_forward(
                     block, local, None, None, None, None, None, packed, False
+                )
+            elif implementation.startswith("qsa"):
+                from relax.models.qwen3_8.qsa_bridge_recompute import qsa_bridge_checkpointed_forward
+
+                output = qsa_bridge_checkpointed_forward(
+                    block, local, None, None, None, None, None, packed, None, False
                 )
             else:
                 output = Qwen3VLTransformerBlock._relax_native_checkpointed_forward(
@@ -238,7 +245,7 @@ def _check_block_interleaving(rank, *, native):
                 )
             )
 
-        if native:
+        if implementation == "native":
             # A failure during replay must still restore the newer microbatch.
             local = hidden[indices].clone().requires_grad_()
             output = TransformerBlock._checkpointed_forward(block, local, None, None, None, None, None, packed, False)
@@ -304,3 +311,14 @@ def test_two_rank_ple_outputs_gradients_and_checkpoint(tmp_path):
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+
+
+def test_checkpoint_state_preserves_references_and_none():
+    model = _model((16,))
+    metadata = object()
+    model._cp_packed_seq_params = metadata
+    state = model.capture_checkpoint_state()
+    model.restore_checkpoint_state((None, None, None))
+    assert model.capture_checkpoint_state() == (None, None, None)
+    model.restore_checkpoint_state(state)
+    assert all(current is saved for current, saved in zip(model.capture_checkpoint_state(), state, strict=True))
