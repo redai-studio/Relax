@@ -151,7 +151,7 @@ The [projection patch][projection] gathers projection shards when query groups a
 
 ### MoE topology and recomputation are separate contracts
 
-[HybridEP preflight][hybrid] checks the MoE dispatcher independently of QSA. For Qwen3.8 Mixed, use CP1, ETP1, and EP4 or EP8 with a compatible world size. The EP×ETP group must contain distinct ranks on one host, and every member must see the expected number of peers. The installed package and loaded modules must match `RELAX_HYBRID_EP_COMMIT`.
+[HybridEP preflight][hybrid] checks the MoE dispatcher independently of QSA. The Grouped and cuDNN Mixed routes require CP1. With QSA CP enabled, Mixed CuTe also allows the documented [static CP2/4 layouts](#opt-in-cute-attention-and-static-cp) and [32-GPU CP8/16 layouts](#runtime-prerequisites-for-long-context-cp). HybridEP requires ETP1, EP4 or EP8, and a compatible world size for the selected layout. The EP×ETP group must contain distinct ranks on one host, and every member must see the expected number of peers. The installed package and loaded modules must match `RELAX_HYBRID_EP_COMMIT`.
 
 `RELAX_QWEN38_QSA_RECOMPUTE_REPLAY=1` caches frozen selection/mask/plan metadata on an **invocation-local** checkpoint tape. Trainable indexers use the ordinary path; K/V remain differentiable. It is distinct from `RELAX_QWEN38_RETAIN_QSA_ATTENTION=1`, which retains attention and checkpoints the MLP. The latter's [guard][retain] is deliberately narrow: BF16, full/uniform/one-layer recomputation, TP8/PP4/CP1/EP8/ETP1; no FP8/FP4, activation offload, distributed saved activations, VPP or CUDA graphs, with validated layer owners and frozen indexers. These are optimization guards, not universal QSA limits.
 

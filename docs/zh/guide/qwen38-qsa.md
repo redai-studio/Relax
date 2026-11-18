@@ -219,7 +219,7 @@ export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
 - **原生与 Mixed 的区别**：原生 `id_sparse` 可接原生 CP 流程；设置 `COMMUNITY_BACKEND=mixed` 后，同一入口的计算由 Mixed 替换，Grouped/cuDNN 路线须遵守 CP1 限制；CuTe 的静态 CP 路径见上文。
 - **CP**：原生路径在 CP>1 时先汇集完整 Q/K/V，计算完成后切分为本地输出。Flex/Triton 可配合 `LOCAL_QUERY=1` 只保留本地 Q、汇集 K/V，但要求 THD、CUDA、R4 bitset 和冻结的 Stage-1 indexer 等条件；不满足时回退到原生路径。Grouped/cuDNN Mixed 只允许 CP1；CuTe 可显式启用上述静态 CP 路径。
 - **SP**：selector 会按 TP group 汇集序列。SP 不改变表中的本地 attention 头数要求；可选 TP selector 只用于 Mixed，并要求汇集后的序列长度能被 TP 整除。
-- **PP / EP**：分别负责层分配和 MoE 通信。Qwen3.8 Mixed 使用 HybridEP 时，需要 CP1、ETP1、EP4 或 EP8，以及可整除的总 rank 数。EP×ETP 组的 rank 必须在同一台主机上且互相可访问，加载的模块和安装包必须匹配 `RELAX_HYBRID_EP_COMMIT`。
+- **PP / EP**：分别负责层分配和 MoE 通信。Mixed 的 Grouped 和 cuDNN 路线要求 CP1。开启 QSA CP 后，Mixed CuTe 也允许本指南列出的[静态 CP2/4 拓扑](#可选-cute-attention-与静态-cp)和 [32 卡 CP8/16 拓扑](#长上下文-cp-的运行前提)。HybridEP 要求 ETP1、EP4 或 EP8，且总 rank 数须满足所选拓扑的整除条件。EP×ETP 组的 rank 必须在同一台主机上且互相可访问，加载的模块和安装包必须匹配 `RELAX_HYBRID_EP_COMMIT`。
 
 ### Mixed 几何与文档长度分流
 
