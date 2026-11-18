@@ -4,10 +4,12 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 import uuid
 import warnings
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -4068,6 +4070,16 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
         )
 
 
+def _next_rollout_id_from_cursors(load_dir: str) -> int:
+    latest = -1
+    for directory in ("dataset", "rollout"):
+        for path in (Path(load_dir) / directory).glob("*.pt"):
+            match = re.fullmatch(r"global_dataset_state_dict_(0|[1-9][0-9]*)\.pt", path.name)
+            if match and path.is_file():
+                latest = max(latest, int(match[1]))
+    return latest + 1
+
+
 def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
     if is_managed_opd_teacher_colocate(args):
         # The configured rollout/teacher split also applies without a training actor.
@@ -4257,12 +4269,19 @@ def relax_validate_args(args):
 
     validate_opd_args(args, is_offline=is_offline, log=logger)
 
+    if args.debug_rollout_only and args.rollout_global_dataset and args.load and args.start_rollout_id is None:
+        args.start_rollout_id = _next_rollout_id_from_cursors(args.load)
+
     if is_i2i_sft(args):
         # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
         if args.train_backend != "fsdp":
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
+    elif args.debug_rollout_only and args.start_rollout_id is not None and args.start_rollout_id > 0:
+        # Rollout-only runs save a data cursor without a training checkpoint.
+        if args.rollout_global_dataset and not args.load:
+            raise ValueError("Rollout-only resume requires --load for the dataset cursor")
     else:
         if args.megatron_to_hf_mode == "bridge":
             if (

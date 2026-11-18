@@ -343,7 +343,8 @@ class Rollout(Base):
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env
         )
-        self.step = 0
+        if config.debug_rollout_only and config.start_rollout_id is not None and config.start_rollout_id > 0:
+            self.step = config.start_rollout_id
         self.data_source = data_source
 
         self._stop_event = asyncio.Event()
@@ -380,8 +381,10 @@ class Rollout(Base):
             return
         if self.config.rollout_global_dataset:
             try:
-                await self.rollout_manager.load.remote(self.step - 1)
+                await self.data_source.load.remote(self.step - 1)
             except Exception as e:
+                if self.config.debug_rollout_only and (self.config.start_rollout_id or 0) > 0:
+                    raise
                 self._logger.exception(f"Failed to load global dataset: {e}")
 
         self._run_task = asyncio.ensure_future(self._async_run())

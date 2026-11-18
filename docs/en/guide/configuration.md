@@ -700,7 +700,7 @@ These environment variables are for tuning and troubleshooting; all are optional
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--debug-rollout-only` | flag | False | Run Rollout only, no training |
+| `--debug-rollout-only` | flag | False | Run rollout only. With the global dataset, `--load DIR` resumes after the highest numbered saved data cursor, or starts at 0 if none exists. Set `--start-rollout-id 0` to start over. A positive start requires the preceding cursor. |
 | `--debug-train-only` | flag | False | Run training only, no Rollout |
 | `--load-debug-rollout-data` | str | None | Load debug Rollout data. Automatically enables `--debug-train-only` when set |
 | `--load-debug-rollout-data-subsample` | float | None | Subsample debug Rollout data to accelerate debugging |
