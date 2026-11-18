@@ -1263,7 +1263,7 @@ async def generate_rollout_async(
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
     new_aborted, completed_protected = await abort(args, rollout_id)
-    for group in new_aborted + completed_protected:
+    for group in (new_aborted + completed_protected) if args.fully_async or args.partial_rollout else []:
         # Groups completed during abort have not passed the main-loop filter.
         if (
             args.partial_rollout

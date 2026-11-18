@@ -19,13 +19,14 @@ from relax.distributed.checkpoint_service.client.engine import CheckpointEngineC
 @pytest.mark.parametrize(
     "overrides", [None, {"quantization_config": {"quant_method": "fp8"}}, {"quantization_config": None}]
 )
-def test_checkpoint_sender_uses_effective_rollout_quantization(monkeypatch, overrides):
+def test_checkpoint_sender_uses_effective_rollout_quantization(monkeypatch, tmp_path, overrides):
     actor = object.__new__(actor_module.MegatronTrainRayActor)
     checkpoint_quantization = {"quant_method": "fp8", "weight_block_size": [128, 128]}
     actor.hf_config = SimpleNamespace(quantization_config=checkpoint_quantization)
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": checkpoint_quantization}))
     actor.args = SimpleNamespace(
         sglang_json_model_override_args=None if overrides is None else json.dumps(overrides),
-        hf_checkpoint="unused",
+        hf_checkpoint=str(tmp_path),
         coordinator_url="http://coordinator.test",
         model_name="test-model",
         checkpoint_engine_backend="test",

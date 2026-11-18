@@ -4,11 +4,71 @@
 
 import json
 import os
+from argparse import Namespace
+from typing import Any
 
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def resolve_rollout_quantization_config(args: Namespace, hf_config: Any) -> dict | None:
+    """Resolve one sender format for all engines receiving this publication."""
+    default_path = getattr(args, "sglang_hf_checkpoint", None) or args.hf_checkpoint
+    global_overrides = getattr(args, "sglang_json_model_override_args", None)
+    recipients = [("default", default_path, global_overrides)]
+    if getattr(args, "sglang_config", None) is not None:
+        from relax.distributed.ray.rollout import _resolve_sglang_config
+
+        config = _resolve_sglang_config(args)
+        # Tensor updates target the first model. DCS registers every YAML
+        # model's engines under the shared rollout role.
+        models = config.models if args.fully_async or args.hybrid else config.models[:1]
+        recipients = []
+        for model in models:
+            model.resolve(args)
+            for index, group in enumerate(model.engine_groups):
+                if group.worker_type == "placeholder":
+                    continue
+                recipients.append(
+                    (
+                        f"{model.name}/{index}:{group.worker_type}",
+                        group.overrides["model_path"],
+                        group.overrides.get("json_model_override_args", global_overrides),
+                    )
+                )
+
+    configs = []
+    for name, model_path, override_json in recipients:
+        overrides = json.loads(override_json or "{}")
+        if "quantization_config" in overrides:
+            quant_config = overrides["quantization_config"]
+            # None is an explicit opt-out here, not permission to reread the
+            # checkpoint inside augment_compressed_tensors_ignore.
+            if quant_config is None:
+                configs.append((name, None))
+                continue
+        else:
+            if model_path == args.hf_checkpoint:
+                quant_config = getattr(hf_config, "quantization_config", None) or getattr(
+                    getattr(hf_config, "text_config", None), "quantization_config", None
+                )
+            else:
+                from transformers import PretrainedConfig
+
+                config_values, _ = PretrainedConfig.get_config_dict(model_path)
+                quant_config = config_values.get("quantization_config") or (
+                    config_values.get("text_config") or {}
+                ).get("quantization_config")
+        configs.append((name, augment_compressed_tensors_ignore(quant_config, model_path)))
+    if not configs:
+        raise ValueError("Weight publication has no rollout receiver groups")
+    first_name, first_config = configs[0]
+    for name, quant_config in configs[1:]:
+        if quant_config != first_config:
+            raise ValueError(f"Rollout receivers require different quantization configs: {first_name} and {name}")
+    return first_config
 
 
 def read_quantization_config(hf_dir: str | os.PathLike) -> dict | None:

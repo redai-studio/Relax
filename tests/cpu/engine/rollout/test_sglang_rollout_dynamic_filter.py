@@ -262,3 +262,19 @@ async def test_sync_rollout_carries_completed_surplus_only_with_partial_rollout(
     assert result.output.samples == result.transferred
     assert _group_ids(result.transferred).isdisjoint(_group_ids(result.buffered))
     assert len(result.buffered) == int(partial_rollout)
+
+
+@pytest.mark.parametrize("partial_rollout", [False, True])
+async def test_sync_rollout_drain_carries_protected_completion_only_with_partial_rollout(
+    run_rollout: Callable, partial_rollout: bool
+) -> None:
+    accepted, protected = _group(0), _group(1)
+    result = await run_rollout(
+        [[accepted]],
+        drained=([], [protected]),
+        partial_rollout=partial_rollout,
+        dynamic_global_batch_size=False,
+        filter_fn=None,
+    )
+    assert result.transferred == result.output.samples == [accepted]
+    assert result.buffered == ([protected] if partial_rollout else [])

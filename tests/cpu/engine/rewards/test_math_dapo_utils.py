@@ -191,7 +191,7 @@ class TestComputeScore:
 @pytest.mark.parametrize("end_token", ["<|endofassistant|>", "<|im_end|>", "<|endoftext|>"])
 @pytest.mark.parametrize("answer,score", [("768", 1.0), ("767", -1.0)])
 def test_compute_score_ignores_assistant_end_token(end_token, answer, score):
-    response = f"Reasoning... Answer: \\boxed{{{answer}}}{end_token}"
+    response = f"Reasoning... Answer: {answer}{end_token}"
 
     result = math_dapo_utils.compute_score(response, "768")
 

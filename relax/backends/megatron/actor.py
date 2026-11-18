@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import json
 import logging
 import os
 import random
@@ -559,12 +558,6 @@ class MegatronTrainRayActor(TrainRayActor):
             with_opd_teacher=with_opd_teacher,
         )
         use_tensor_backuper = not skip_weight_management and (not self.args.fully_async or self.args.hybrid)
-        # The rollout may quantize a BF16 training checkpoint through its HF
-        # overrides. The sender must use that same effective quantization config.
-        rollout_overrides = json.loads(getattr(args, "sglang_json_model_override_args", None) or "{}")
-        rollout_quant_config = rollout_overrides.get(
-            "quantization_config", getattr(self.hf_config, "quantization_config", None)
-        )
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
                 source_getter=lambda: named_params_and_buffers(
@@ -620,12 +613,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 # mm_projector — without augment_compressed_tensors_ignore the bridge
                 # would try to INT4-pack those BF16 tensors and SGLang would reject
                 # them with "weight_packed not found in params_dict".
-                from relax.utils.quant_cast import augment_compressed_tensors_ignore
+                from relax.utils.quant_cast import resolve_rollout_quantization_config
 
-                push_quant_config = augment_compressed_tensors_ignore(
-                    rollout_quant_config,
-                    args.hf_checkpoint,
-                )
+                push_quant_config = resolve_rollout_quantization_config(self.args, self.hf_config)
                 self.weight_updater = update_weight_cls(
                     self.args,
                     self.model,
@@ -1029,13 +1019,9 @@ class MegatronTrainRayActor(TrainRayActor):
             "master_address": master_address,
             "master_port": master_port,
         }
-        from relax.utils.quant_cast import augment_compressed_tensors_ignore
+        from relax.utils.quant_cast import resolve_rollout_quantization_config
 
-        rollout_overrides = json.loads(getattr(self.args, "sglang_json_model_override_args", None) or "{}")
-        push_quant_config = augment_compressed_tensors_ignore(
-            rollout_overrides.get("quantization_config", getattr(self.hf_config, "quantization_config", None)),
-            self.args.hf_checkpoint,
-        )
+        push_quant_config = resolve_rollout_quantization_config(self.args, self.hf_config)
         return run(
             create_client(
                 args=self.args,
