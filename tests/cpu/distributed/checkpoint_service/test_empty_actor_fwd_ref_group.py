@@ -25,6 +25,7 @@ def load_methods(source=None):
         "update_weights_for_rollout",
         "_named_params_and_buffers",
         "recv_weight",
+        "_finish_actor_fwd_ref_sync",
     }
     methods = [node for node in backend.body if isinstance(node, ast.FunctionDef) and node.name in names]
     for method in methods:
@@ -182,6 +183,7 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
                 return response(list(metadata[params["index"] :]))
             self.assertTrue(url.endswith("/clear_weight_meta"))
             self.assertEqual(pending_tensors, [], "Receiver stopped before consuming all tensor broadcasts")
+            self.assertEqual([item["names"] for item in metadata], [["weight"], ["weight_updated_stop"]])
             metadata.clear()
             return response()
 
@@ -201,14 +203,24 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
                 empty=lambda shape, **kwargs: CpuTensor([None] * shape[0]),
                 distributed=SimpleNamespace(broadcast=broadcast),
             ),
-            dist=SimpleNamespace(broadcast=broadcast, barrier=barrier, get_rank=lambda: 0),
+            dist=SimpleNamespace(
+                broadcast=broadcast,
+                barrier=barrier,
+                get_rank=lambda **kwargs: 0,
+                get_process_group_ranks=lambda group: [0],
+                get_world_size=lambda **kwargs: 1,
+                broadcast_object_list=lambda *args, **kwargs: None,
+                all_gather_object=lambda values, value, **kwargs: values.__setitem__(0, value),
+            ),
             httpx=SimpleNamespace(Timeout=lambda **kwargs: None, ReadTimeout=TimeoutError),
             get_gloo_group=lambda: "training-gloo",
             tqdm=lambda **kwargs: SimpleNamespace(update=lambda *args: None),
             device_module=SimpleNamespace(empty_cache=lambda: None),
         )
         actor = self.state()
-        actor.http_client = SimpleNamespace(post=post)
+        actor.http_client = SimpleNamespace(post=post, get=get)
+        actor.device = "cpu"
+        actor._finish_actor_fwd_ref_sync = lambda: self.methods["_finish_actor_fwd_ref_sync"](actor)
         actor.args = SimpleNamespace(num_experts=0)
         actor.model = []
         actor.quantization_config = None
@@ -240,8 +252,19 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
             [(name, list(value.values)) for name, value in weights]
         )
 
+        def completion(group, device, **kwargs):
+            if group is actor._model_update_groups_for_actor_fwd_ref:
+                self.methods["recv_weight"](reference)
+            else:
+                self.assertEqual(pending_tensors, [])
+                self.assertTrue(metadata, "The receiver must not clear shared stop metadata")
+
+        self.methods["_complete_raw_group"] = completion
+        self.methods["_raw_group_status"] = lambda *args, **kwargs: False
         for size in (1, 2, 1, 2):
             self.initialize(actor, self.topology(size))
+            if size == 2:
+                self.initialize(reference, self.topology(size, global_rank=1))
             barrier.reset_mock()
             # Exercise the complete sender method and real bucket/stop emission;
             # omit unrelated SGLang rollout transport from this protocol test.
@@ -251,11 +274,7 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
                 self.assertEqual(pending_tensors, [])
                 self.assertEqual(barrier.call_count, 2)  # No actor_fwd/reference completion barrier.
             else:
-                self.assertEqual([item["names"] for item in metadata], [["weight"], ["weight_updated_stop"]])
-                self.assertEqual(barrier.call_count, 3)
-                self.initialize(reference, self.topology(size, global_rank=1))
-                self.methods["recv_weight"](reference)
-                self.assertEqual(metadata, [])
+                self.assertEqual(metadata, [], "Source completion must await raw loads before clearing")
                 self.assertEqual(pending_tensors, [])
         self.assertEqual(loaded, [[("weight", [1.25, -3.5])], [("weight", [1.25, -3.5])]])
         self.assertEqual(self.new_group.call_count, 2)  # One source and one receiver group, both reused.

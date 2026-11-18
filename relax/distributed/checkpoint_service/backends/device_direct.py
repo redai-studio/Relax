@@ -125,6 +125,32 @@ def bucket_tensor_counts(sizes: Sequence[int], max_bytes: int) -> list[int]:
     return counts
 
 
+def _raw_group_status(
+    group: dist.ProcessGroup, device: torch.device | int, failed: bool, *, wait: bool = True
+) -> bool:
+    """Exchange four-byte control status on an existing raw group.
+
+    Waiting reads only this completion flag, never a model payload. Ready on a
+    receiver defers its host wait to Release; the source waits before clear.
+    """
+    status = torch.tensor([int(failed)], dtype=torch.int32, device=device)
+    dist.all_reduce(status, group=group)
+    return bool(status.cpu().item()) if wait else failed
+
+
+def _complete_raw_group(group: dist.ProcessGroup, device: torch.device | int, *, wait: bool = True) -> str | None:
+    """Fence prior device work before advertising successful stop
+    consumption."""
+    error = None
+    try:
+        if torch.device(device).type != "cpu":
+            device_module.synchronize(device)
+    except Exception as exc:
+        error = str(exc)
+    failed = _raw_group_status(group, device, error is not None, wait=wait)
+    return error or ("A raw recipient rejected device completion" if failed else None)
+
+
 class DeviceDirectBackend(CommBackend):
     """PyTorch distributed communication backend using NCCL (GPU) or GLOO
     (CPU).
@@ -977,28 +1003,7 @@ class DeviceDirectBackend(CommBackend):
                 force_full=self.args.offload_rollout,
             )
         if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
-
-            def finish_actor_fwd_sync() -> None:
-                payload = {
-                    "names": [
-                        "weight_updated_stop",
-                    ],
-                    "dtypes": [],
-                    "shapes": [],
-                    "group_name": "end",
-                }
-                logger.info("start post end send_weight_meta to actor fwd nodes...")
-                response = self.http_client.post(
-                    f"{self.coordinator_url}/send_weight_meta",
-                    json=payload,
-                )
-                response.raise_for_status()
-
-            if managed:
-                run_on_training_rank_zero(finish_actor_fwd_sync, phase="actor_fwd weight completion")
-            elif dist.get_rank() == 0:
-                finish_actor_fwd_sync()
-            dist.barrier(group=get_gloo_group())
+            self._finish_actor_fwd_ref_sync()
 
         # Adapter mode: (re)register the trained LoRA adapter on every rollout engine. The base
         # was already broadcast above on the first sync; the adapter itself is broadcast over the
@@ -1075,6 +1080,67 @@ class DeviceDirectBackend(CommBackend):
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
+
+    def _finish_actor_fwd_ref_sync(self) -> None:
+        """Keep stop metadata until every participating role has consumed
+        it."""
+        training_group = get_gloo_group()
+        root = dist.get_process_group_ranks(training_group)[0]
+
+        def coordinator_call(request: Callable[[], httpx.Response], phase: str) -> None:
+            error = [None]
+            if dist.get_rank(group=training_group) == 0:
+                try:
+                    request().raise_for_status()
+                except Exception as exc:
+                    error[0] = str(exc)
+            dist.broadcast_object_list(error, src=root, group=training_group)
+            if error[0] is not None:
+                raise RuntimeError(f"Actor_fwd/reference metadata {phase} failed: {error[0]}")
+
+        coordinator_call(
+            lambda: self.http_client.post(
+                f"{self.coordinator_url}/send_weight_meta",
+                json=dict(names=["weight_updated_stop"], dtypes=[], shapes=[], group_name="end"),
+            ),
+            "stop",
+        )
+        error = None
+        if self._is_pp_src_rank:
+            try:
+                if self._model_update_groups_for_actor_fwd_ref is None:
+                    raise RuntimeError("Actor_fwd/reference completion group is not initialized")
+                error = _complete_raw_group(self._model_update_groups_for_actor_fwd_ref, self.device)
+            except Exception as exc:
+                error = str(exc)
+        errors = [None] * dist.get_world_size(group=training_group)
+        # This is also the original training-side completion rendezvous. Every
+        # PP source shares an ACK/fence failure before anyone clears or commits.
+        dist.all_gather_object(errors, error, group=training_group)
+        failed = any(error is not None for error in errors)
+        clear_error = None
+        if not failed:
+            try:
+                coordinator_call(
+                    lambda: self.http_client.get(f"{self.coordinator_url}/clear_weight_meta"),
+                    "clear",
+                )
+            except Exception as exc:
+                clear_error = str(exc)
+                failed = True
+        error = None
+        if self._is_pp_src_rank:
+            try:
+                if _raw_group_status(self._model_update_groups_for_actor_fwd_ref, self.device, failed):
+                    error = "A raw recipient rejected release"
+            except Exception as exc:
+                error = str(exc)
+        release_errors = [None] * dist.get_world_size(group=training_group)
+        dist.all_gather_object(release_errors, error, group=training_group)
+        if failed or any(error is not None for error in release_errors):
+            raise RuntimeError(
+                f"Actor_fwd/reference completion failed: ready={errors}, clear={clear_error}, release={release_errors}"
+            )
 
     def _rollout_control_request(self, endpoint: str, payload: Optional[Dict] = None) -> None:
         """Await receiver lifecycle operations and share failures with every
@@ -1479,9 +1545,27 @@ class DeviceDirectBackend(CommBackend):
                 # termination marker
                 if names and names[0] == "weight_updated_stop":
                     dist.barrier(get_gloo_group())
-                    if dist.get_rank() == 0:
-                        response = self.http_client.get(f"{self.coordinator_url}/clear_weight_meta")
-                        response.raise_for_status()
+                    errors = []
+                    groups = self._model_update_groups_for_actor_fwd_ref
+                    for group_name in sorted(groups):
+                        try:
+                            error = _complete_raw_group(groups[group_name], self.device, wait=False)
+                            if error is not None:
+                                errors.append(error)
+                        except Exception as exc:
+                            errors.append(str(exc))
+                    failed = bool(errors)
+                    # Do not return into the next partition while the previous
+                    # directory/stop remains visible. Failure still traverses
+                    # every PP Release so one role cannot strand other peers.
+                    for group_name in sorted(groups):
+                        try:
+                            failed = _raw_group_status(groups[group_name], self.device, failed) or failed
+                        except Exception as exc:
+                            errors.append(str(exc))
+                            failed = True
+                    if failed:
+                        raise RuntimeError(f"Actor_fwd/reference completion failed: {errors}")
 
                     logger.info("Received final weight update marker for actor_fwd nodes")
                     return
