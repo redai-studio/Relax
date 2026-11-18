@@ -99,16 +99,25 @@ def test_flat_packed_documents_reset_and_preserve_padding_and_deltas(runtime):
 
 
 @pytest.mark.parametrize("kind", ["image", "video"])
-def test_real_grid_uses_original_multimodal_positions(runtime, kind):
+@pytest.mark.parametrize("cpt", [False, True])
+def test_real_grid_uses_original_multimodal_positions(runtime, kind, cpt):
     recipe, patched = runtime
+    recipe._TEXT_ONLY_CPT = cpt
     arguments = kwargs(**{f"{kind}_grid_thw": torch.tensor([[1, 4, 4]])})
     token = IMAGE if kind == "image" else VIDEO
     tokens = torch.tensor([7, VISION, token, token, token, token, 8])
-    expected = patched._build_llm_rope_positions(tokens, **arguments)
-    recipe._TEXT_ONLY_CPT = True
-    actual = patched._build_llm_rope_positions(tokens, **arguments)
-    torch.testing.assert_close(actual[0], expected[0])
-    assert actual[1:] == expected[1:]
+    # Two prefix tokens occupy 0 and 1. The merged 1x2x2 grid starts at 2;
+    # the trailing text token follows its largest coordinate, at 4.
+    expected = torch.tensor(
+        [
+            [0, 1, 2, 2, 2, 2, 4],  # time
+            [0, 1, 2, 2, 3, 3, 4],  # height
+            [0, 1, 2, 3, 2, 3, 4],  # width
+        ]
+    )
+    actual, image_index, video_index = patched._build_llm_rope_positions(tokens, **arguments)
+    torch.testing.assert_close(actual, expected)
+    assert (image_index, video_index) == ((1, 0) if kind == "image" else (0, 1))
 
 
 @pytest.mark.parametrize("loaded", [False, True])

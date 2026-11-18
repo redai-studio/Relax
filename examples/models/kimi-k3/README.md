@@ -259,7 +259,9 @@ Both Dockerfiles include bounded synchronous staging through the `common` sectio
 - Budget `0` stages/writes one tensor at a time; it does **not** select the original writer.
 - This bounds live staging tensors, not total RSS, optimizer/offload memory, serialization scratch or filesystem page cache. Writing may trade throughput for memory; measure on the target storage.
 
-The recipe forwards both environment variables to training actors. Old images without this patch continue using their original save implementation even if these variables are set; rebuild or patch all nodes consistently to obtain the optimization. Existing running jobs do not pick up the patch. Checkpoint format and loading remain unchanged. See `docker/patch/megatron/sync-save-bounded-staging.md` for failure handling and validation limits.
+The recipe forwards both environment variables to training actors; use the same settings on every rank before launch. Old images without this patch continue using their original save implementation even if these variables are set; deploy a rebuilt image consistently on all nodes to obtain the optimization. Existing running jobs do not pick up the patch. Checkpoint format and loading remain unchanged.
+
+Staging, write and cleanup errors propagate through checkpoint finalization, preserving the first failure. This cannot recover from process death or a broken process group. Validate full-size save/reload on the target cluster and measure per-node memory; CPU tests do not establish multi-node GPU correctness.
 
 ### Diagnosing Train/Rollout Differences
 
