@@ -3,6 +3,7 @@ import json
 import sys
 import types
 from argparse import Namespace
+from datetime import timedelta
 
 import pytest
 import torch
@@ -627,3 +628,67 @@ def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
     torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
     torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
     assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows
+
+
+def _known_tensor_broadcast_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    torch.set_num_threads(1)
+    timeout = timedelta(seconds=90)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=8, timeout=timeout)
+    try:
+        coordinates = (rank // 4, rank // 2 % 2, rank % 2)  # PP2, TP2, CP2
+        axes = ("pipeline_model", "tensor_model", "context")
+        groups = {}
+        for index, axis in enumerate(axes):
+            for first in range(8):
+                if (first // (4, 2, 1)[index]) % 2:
+                    continue
+                members = [first, first + (4, 2, 1)[index]]
+                group = dist.new_group(members, backend="gloo", timeout=timeout)
+                if rank in members:
+                    groups[axis] = group
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            stream_module = _load_stream_module(monkeypatch)
+            for index, axis in enumerate(axes):
+                monkeypatch.setattr(
+                    stream_module.mpu,
+                    f"get_{axis}_parallel_rank",
+                    lambda index=index: coordinates[index],
+                    raising=False,
+                )
+                monkeypatch.setattr(stream_module.mpu, f"get_{axis}_parallel_world_size", lambda: 2, raising=False)
+                monkeypatch.setattr(
+                    stream_module.mpu, f"get_{axis}_parallel_group", lambda axis=axis: groups[axis], raising=False
+                )
+            calls = []
+            original_broadcast = dist.broadcast
+
+            def broadcast(tensor, src, group):
+                calls.append(group)
+                return original_broadcast(tensor, src=src, group=group)
+
+            monkeypatch.setattr(stream_module.dist, "broadcast", broadcast)
+            pp, tp, cp = coordinates
+            for broadcast_pp in (True, False):
+                calls.clear()
+                source = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3) + (0 if broadcast_pp else 100 * pp)
+                expected = source.clone()
+                is_src = tp == cp == 0 and (pp == 0 or not broadcast_pp)
+                result = stream_module._bcast_known_tensor(
+                    source if is_src else None, is_src, source.dtype, source.shape, torch.device("cpu"), broadcast_pp
+                )
+                assert torch.equal(result, expected)
+                assert torch.equal(source, expected), "Source CPU tensor must remain unchanged"
+                assert calls.count(groups["context"]) == int(tp == 0)
+                assert calls.count(groups["tensor_model"]) == 1
+                assert calls.count(groups["pipeline_model"]) == int(broadcast_pp)
+    finally:
+        dist.destroy_process_group(dist.group.WORLD)
+
+
+def test_known_tensor_broadcast_cpu_processes(tmp_path):
+    torch.multiprocessing.spawn(
+        _known_tensor_broadcast_worker, args=(str(tmp_path / "rendezvous"),), nprocs=8, join=True
+    )

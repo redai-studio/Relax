@@ -26,6 +26,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.models.common.lora import resolve_lora_targets
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -62,17 +63,14 @@ def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
     """Preserve GDN A_log precision before Float16Module, DDP and HF
     loading."""
     for module in model.modules():
+        # MCore and MindSpeed-Bridge both expose A_log on their GDN layers.
         if not any(cls.__name__ == "GatedDeltaNet" for cls in type(module).__mro__):
             continue
-        # Import only for GDN models; other architectures need no GDN dependencies.
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.module import mark_keep_in_fp32
 
-        if isinstance(module, GatedDeltaNet):
-            # Keep Parameter identity and TP metadata. This also preserves the
-            # constructor's RNG sequence and works for meta-device construction.
-            module.A_log.data = module.A_log.data.float()
-            mark_keep_in_fp32(module.A_log)
+        # Preserve Parameter identity and TP metadata before mixed precision wrapping.
+        module.A_log.data = module.A_log.data.float()
+        mark_keep_in_fp32(module.A_log)
 
 
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
@@ -300,7 +298,7 @@ def get_model_provider_func(
 
     args._relax_qwen35_optimized = optimized_recipe(args)
     if args._relax_qwen35_optimized:
-        assert not getattr(args, "sft_async_prepack", False), "Whole-pack recipe requires foreground packing"
+        assert not getattr(args, "sft_async_prepack", False), "Qwen optimization recipe requires foreground packing"
         from relax.models.qwen3_5.deepep_backend import ensure_backend
 
         ensure_backend(args)
@@ -407,6 +405,8 @@ def get_model_provider_func(
             "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
+            "moe_megakernel_backend",
+            "moe_megakernel_backend_config",
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",
@@ -481,6 +481,13 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        # Match MCore's CLI conversion: interleaved P2P overlap and batched
+        # communication are mutually exclusive. Parser validation already
+        # disables overlap for schedules without virtual pipeline stages.
+        if getattr(args, "overlap_p2p_comm", None) is not None:
+            provider.overlap_p2p_comm = args.overlap_p2p_comm
+            provider.batch_p2p_comm = not args.overlap_p2p_comm
 
         if callable(getattr(provider, "configure_runtime", None)):
             provider.configure_runtime(args)
@@ -563,6 +570,11 @@ def get_model_provider_func(
                 )
                 provider.num_layers_in_first_pipeline_stage = None
                 provider.num_layers_in_last_pipeline_stage = None
+
+        # Preserve the provider default unless the launch explicitly selects a
+        # backend for models with provider-owned DSA defaults.
+        if getattr(args, "dsa_kernel_backend", None) is not None:
+            provider.dsa_kernel_backend = args.dsa_kernel_backend
 
         # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
         # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
@@ -799,12 +811,13 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
+            peft.target_modules = resolve_lora_targets(model, list(peft.target_modules), args)
             # Restrict adapter injection to the requested model region (e.g. language-only
             # for VL models). Overriding target_modules post-construction is supported:
             # PEFT.__call__ rebuilds its matcher state from the current target_modules.
             scope = getattr(args, "lora_scope", "all")
             if scope != "all":
-                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+                peft.target_modules = scope_target_modules_to_region(model, list(peft.target_modules), scope)
             if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
                 peft.target_modules = exclude_frozen_lora_target_modules(
                     model, list(peft.target_modules), args.freeze_params_name_list

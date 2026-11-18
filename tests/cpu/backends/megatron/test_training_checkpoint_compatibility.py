@@ -105,7 +105,7 @@ def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
     )
     chain = SimpleNamespace(chained_optimizers=[SimpleNamespace(optimizer=optimizer)], scale_loss=Mock())
     with pytest.raises(StopAfterReset):
-        module.train(0, [SimpleNamespace(train=Mock())], chain, None, [[]], [])
+        module.train(0, [SimpleNamespace(train=Mock(), parameters=lambda: iter(()))], chain, None, [[]], [])
     parameter.grad.zero_()
     optimizer.step()
     assert torch.equal(parameter, before) == reset

@@ -1,5 +1,58 @@
 # Qwen3.8 QSA backends and parallelism
 
+## Opt-in CuTe attention and static CP
+
+The `cute` long-document backend uses the QSA kernels adapted from [Megatron-LM PR #7553](https://github.com/NVIDIA/Megatron-LM/pull/7553), pinned to `b375677531eb8374769260b18458231d26763a34`. Use the CUDA 13 Blackwell image built from this revision: it supplies CuTe DSL 4.6.2 and the Megatron dispatch, MTP metadata and PLE hooks. Pointing `MEGATRON` at an older checkout bypasses those image patches. This backend does not require the optional cuDNN PR1765 package or MoK.
+
+CuTe is a CUDA kernel programming DSL; selecting it changes QSA attention, not the optimizer or MoE backend. The mixed adapter requires CUDA BF16, D256, a frozen Stage-1 indexer, zero indexer loss and R4 selected IDs. Local Q heads must be divisible by local KV heads, with a GQA group of 5–128. For the 24Q/2KV model this admits TP1/2/4 kernel geometry, but not TP8. The 32-GPU HybridEP recipe supports TP2/PP4/EP8/ETP1; geometry alone does not authorize other training topologies.
+
+Start with CP1 when the workload fits. In CP1, documents of at most `4*K+3` tokens use Flash by default (`K=512` gives 2051); longer documents use CuTe. There is no intermediate Flex branch for `cute`. Invalid shapes or missing dependencies raise an error instead of silently switching to Grouped.
+
+```bash
+export MODEL_DIR=/path/to/model
+export DATA_DIR=/path/to/sft-data
+export SAVE_DIR=/path/to/checkpoints
+export MEGATRON=/path/to/image-patched/Megatron-LM
+export RAY_JOBS_ADDRESS=http://ray-head:8265
+export RAY_ADDRESS="$RAY_JOBS_ADDRESS"
+export RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
+export EXP_NAME=qwen38-cute-cp1
+bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh
+```
+
+The script supplies mixed routing, disables the legacy fused attention/selector, and forwards its environment settings to training actors. It retains the image's `RELAX_HYBRID_EP_COMMIT` requirement. Set `DRY_RUN=1` to inspect the effective arguments and actor environment before submitting.
+
+For static CP2, keep the preceding environment and add:
+
+```bash
+export QWEN38_CP_SIZE=2
+export RELAX_QWEN38_QSA_CP=1
+export RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE=1
+export RELAX_QWEN38_PLE_CP_FUSED_CONV=1
+export RELAX_QWEN38_QSA_CP_TP_SELECTOR=1
+export RELAX_QWEN38_QSA_SELECTOR_BACKEND=torch
+export EXP_NAME=qwen38-cute-cp2
+bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh
+```
+
+Use `QWEN38_CP_SIZE=4` and a distinct experiment name for CP4. At 32 GPUs with TP2/PP4, CP1/2/4 leave DP4/2/1 respectively. These paths require static, per-document zigzag THD packing, explicit TP/CP groups, zero attention dropout and unfused RoPE. The script already supplies `--no-rope-fusion`. Dynamic CP and trainable Stage-2 indexers are not supported by this CuTe CP adapter.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND` | `grouped` | Select `cute` explicitly; retain `grouped` as the CP1 control |
+| `QWEN38_CP_SIZE` | `1` in this recipe | Set the static CP degree; does not by itself enable CuTe CP |
+| `RELAX_QWEN38_QSA_CP` | `0` | Use local-query CuTe attention and its CP selector when CP>1 |
+| `RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE` | `0` | Build each microbatch's GDN layout route from producer CPU boundaries and reuse it across layers; keep native FLA computation |
+| `RELAX_QWEN38_PLE_CP_FUSED_CONV` | `0` | Fuse the PLE convolution tail after native CP reconstruction; leaves gathers and output slicing unchanged |
+| `RELAX_QWEN38_QSA_CP_TP_SELECTOR` | `0` | Partition CP selector query tiles across TP ranks and gather selected IDs; requires the `torch` selector |
+| `RELAX_QWEN38_QSA_SELECTOR_BACKEND` | `torch` | Optional `radix` selection for long documents; CP1 uses the TP-selector path, and CP TP partitioning must be disabled for radix |
+
+Radix has setup overhead and can regress short or mixed-document batches. Compare it with `torch` on the actual length distribution before enabling it. CP TP partitioning assigns 512-row tiles; tail tiles and short documents can leave uneven work across TP ranks. It is not a load-balancing guarantee.
+
+CP retains only local Q rows and attention output, gathers complete K/V and raw indexer keys, then reduce-scatters K/V gradients with summation. Packed documents keep separate positions and causal tails. It does not implement a ring attention exchange or fetch only selected remote K/V. GDN continues to use its chunkwise CP layout, while PLE reconstructs a full stream before convolution by default (the local computation option below reduces this cost). Consequently, CP reduces some activation/workspace costs but adds communication, reduces DP, and need not improve end-to-end throughput on short packed data. CP support alone does not establish 1M training capacity or long-context model quality.
+
+For a CP1 Grouped control, restore `QWEN38_CP_SIZE=1`, `RELAX_QWEN38_QSA_CP=0`, and `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`; disable the three CP optimization flags and retain `SELECTOR_BACKEND=torch`. For a CP2/4 ablation, keep `QSA_CP=1` and `MIXED_LONG_BACKEND=cute`, then switch each CP optimization flag independently. Always use distinct checkpoint directories or experiment names for comparison arms. Preserve the data, token budget, batch size, recomputation and profiling settings when comparing throughput.
+
 This guide covers training-side QSA in the Megatron image, with source baseline `97210aaf5b40db54eb63e80748b5f34b3433fb78` (PR1). Local kernel geometry, Relax adapter acceptance, and a validated training topology are separate contracts. The NV recipes later in this guide are configuration examples, not a guarantee for every backend or parallel layout.
 
 ## Execution layers
@@ -79,8 +132,8 @@ Selector entry priority is mixed wrapper → fused-selector wrapper if enabled �
 | Dimension | QSA/model behavior | Scope of the restriction |
 | --- | --- | --- |
 | TP | Global attention heads are partitioned; when TP exceeds two KV heads, KV groups are replicated and Q/gate slices are narrowed within each group | Model projection layout, not an attention-kernel topology test. See [projection patch][projection] and `qsa_routed_qkv.route_table` |
-| CP | Native sparse core reconstructs full Q and differentiable K/V, then splits output back to the local slice | Baseline communication path; full activations still exist on each CP rank. Mixed producer explicitly requires **CP1** |
-| CP local-query | `RELAX_QWEN38_QSA_LOCAL_QUERY=1` keeps Q local and gathers K/V with gradient summation | Only CP>1, THD, CUDA, Flex, nonempty R4 bitset, Stage-1/no differentiable indexer tensors, suitable sparse selection. Ineligible calls return to native core; it does not enable mixed CP>1 |
+| CP | Native sparse core reconstructs full Q and differentiable K/V, then splits output back to the local slice | Baseline communication path; full activations still exist on each CP rank. Grouped/cuDNN mixed producers require **CP1**; CuTe has the opt-in static CP path above |
+| CP local-query | `RELAX_QWEN38_QSA_LOCAL_QUERY=1` keeps Q local and gathers K/V with gradient summation | Only CP>1, THD, CUDA, Flex, nonempty R4 bitset, Stage-1/no differentiable indexer tensors, suitable sparse selection. Ineligible calls return to native core; it does not enable Grouped/cuDNN mixed CP>1 |
 | SP | Native/TP selector gathers hidden states from the explicit TP group when sequence parallelism is active | Orthogonal to attention GQA. TP selector still requires gathered length divisible by TP; a script's `--sequence-parallel` is not a kernel-only capability |
 | PP | QSA executes in its owning pipeline layer; MTP can add a QSA layer on the last stage | No general PP4 guard in the attention kernel. Layer partition, MTP and recomputation integration must be checked separately |
 | EP / ETP | MoE communication is independent of attention head grouping | The selected dispatcher can impose physical topology and package constraints even if local QSA shapes pass |
@@ -106,7 +159,7 @@ The [projection patch][projection] gathers projection shards when query groups a
 
 The shared `geometry.validate_geometry` check in [geometry.py][geometry] is used by the public mixed entry, Grouped long adapter and direct NV adapter.
 
-Mixed QSA requires CUDA BF16, D256, CP1, and a frozen Stage-1 indexer. Local head geometry depends on the selected long-document backend:
+Grouped/cuDNN mixed QSA requires CUDA BF16, D256, CP1, and a frozen Stage-1 indexer. CuTe also supports the static CP path above. Local head geometry depends on the selected long-document backend:
 
 | Long backend | Accepted local geometry |
 | --- | --- |
@@ -155,9 +208,9 @@ These links identify repository implementations; function names above identify t
 - [Mixed entry and geometry][mixed]; [Grouped composition][mixed-dispatch]; [NV adapter][nv]; [TP selector][tp-selector]; [selector postprocessing][select].
 - [CP/replay][cp]; [routed QKV][routed]; [attention retention][retain]; [HybridEP preflight][hybrid]; [shared model defaults][model-script].
 
-[native]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20261016-qwen38-models.patch
-[integration]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20261020-model-operators.patch
-[projection]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20261020-qwen35-optimized.patch
+[native]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20260915-4a4de8657.patch
+[integration]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20260915-4a4de8657.patch
+[projection]: https://github.com/redai-studio/Relax/blob/main/docker/patch/megatron/20260915-4a4de8657.patch
 [docker]: https://github.com/redai-studio/Relax/blob/main/docker/Dockerfile.cu13
 [env]: https://github.com/redai-studio/Relax/blob/main/relax/utils/env.py
 [dispatch]: https://github.com/redai-studio/Relax/blob/main/relax/models/qwen3_8/qsa_dispatch.py
@@ -300,3 +353,53 @@ The recipes configure load and save at the stable SAVE_DIR/EXP_NAME path, save e
 Both recipes disable custom record-function tags and autotune logging and do not enable the PyTorch profiler. They use a 120-minute producer queue timeout and zero automatic global restarts. See [Performance Tuning](./performance-tuning.md) for explicit diagnostic profiling.
 
 Compare Actor throughput using **sum of logical training tokens / sum of Actor training seconds / GPU count** over the same step window. End-to-end throughput uses total step seconds instead. Preserve slow steps, list cold compilation and checkpoint saves separately, and compare equal data/topology/packing/recomputation settings. A faster QSA kernel does not imply the same speedup for the full training pipeline.
+
+## Runtime prerequisites for long-context CP
+
+The 32-GPU HybridEP preflight supports TP1/PP2/EP8/ETP1 with CP8 or CP16. This requires QSA CP, the mixed community backend, and the CuTe long backend to be explicitly enabled. Physical EP membership, hostname, and accessible NVLink-domain checks still apply.
+
+With CP16, GDN can have three local V heads. The CUDA13 image applies a FlashQLA chunk64 cumsum head-alignment patch to avoid compilation failure for this shape. It does not change the training configuration or enable an optimization policy.
+
+## Local computation for frozen PLE
+
+Enable this for static CP, TP1, packed THD inputs, and fully frozen PLE parameters. This 32-GPU example uses **TP1/PP2/CP8/EP8/ETP1** with a 128K sequence limit. The script forwards both PLE settings to the Ray job and training actors without script edits. Use the image with HybridEP installed as described above, and run from the repository root:
+
+```bash
+export MODEL_DIR=/path/to/model
+export DATA_DIR=/path/to/sft-data
+export SAVE_DIR=/path/to/checkpoints
+export MEGATRON=/path/to/image-patched/Megatron-LM
+export RAY_JOBS_ADDRESS=http://ray-head:8265
+export RAY_ADDRESS="$RAY_JOBS_ADDRESS"
+export RAY_API_SERVER_ADDRESS="$RAY_JOBS_ADDRESS"
+export QWEN38_PLE_INPUT_HALO_CP=1
+export QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+export RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
+export RELAX_QWEN38_QSA_CP=1
+export QWEN38_CP_SIZE=8
+export QWEN38_PP_LAYOUT='Et*24|t*24mL'
+export QWEN38_SFT_MODALITY=text
+export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS=1
+export EXP_NAME=qwen38-ple-halo-cp8
+NUM_STEPS=20 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh \
+  --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
+  --linear-cp-mode headwise --global-batch-size 32 --rollout-batch-size 32 \
+  --max-tokens-per-gpu 16384 \
+  --chunked-optimizer-state-offload --optimizer-state-offload-fraction 1.0
+```
+
+The trailing TP/PP arguments override the script's TP2/PP4 defaults; Megatron disables sequence parallelism at TP1. The script already freezes every PLE parameter. Add `DRY_RUN=1` first to inspect the final configuration. This is a PLE launch example, not a 512K/1M capacity validation.
+
+The feature is off by default. Each rank computes its own output rows and the left input context needed by convolution, preserving zero padding at document boundaries. Batch preparation records padded document boundaries automatically; the QSA CPU layout flag is not required. Native GPT and VL Bridge preserve PLE state per microbatch during recomputation. Requires per-document zigzag partitioning; allgather CP, dynamic CP, TP greater than one, and trainable PLE parameters are unsupported.
+
+| Transport | Input communication | PLE computation |
+| --- | --- | --- |
+| `full` | Gather the complete input | Owned output rows and their left convolution context |
+| `halo` (default when enabled) | Exchange required boundary input rows | Owned output rows and their left convolution context |
+| `adaptive` | Use `halo` if every document's CP chunk covers the left convolution context; otherwise use `full` for the entire batch | Owned output rows and their left convolution context |
+
+`full` is useful for comparisons with identical inputs; it still uses local PLE computation. Boundary gradients are reduced back to the input owner. Changed reduction order can introduce BF16 differences, so validate with the intended data. This path takes precedence over the existing PLE streamed/fused-conv flags.
+
+Building `docker/Dockerfile` or `docker/Dockerfile.cu13` installs the required Megatron patch. External Megatron checkouts also need the patch. The 512K/1M training recipes are delivered separately.
+
+See the [long-context training recipes](./qwen38-long-context.md) for 32-GPU 512K/1M entrypoints, data construction, and save/resume instructions.

@@ -54,12 +54,13 @@ def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
     for mm_input in inputs:
         if mm_input is None:
             continue
-        grid = mm_input.get("image_grid_thw")
-        if grid is None:
-            continue
-        if isinstance(grid, torch.Tensor):
-            grid = grid.tolist()
-        grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
+        for key in ("image_grid_thw", "video_grid_thw"):
+            grid = mm_input.get(key)
+            if grid is None:
+                continue
+            if isinstance(grid, torch.Tensor):
+                grid = grid.tolist()
+            grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
     return grids
 
 
@@ -120,6 +121,13 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             if missing:
                 raise ValueError(
                     f"Score Centering custom converter omitted required behavior probability fields: {missing}"
+                )
+            if "rollout_topk_support_complete" not in train_data:
+                log_probs = train_data["rollout_log_probs"]
+                train_data["rollout_topk_support_complete"] = (
+                    torch.zeros_like(log_probs, dtype=torch.bool)
+                    if isinstance(log_probs, torch.Tensor)
+                    else [torch.zeros(len(row), dtype=torch.bool) for row in log_probs]
                 )
         if agentic_obs_enabled(args):
             # Output rows may be reordered/expanded. Missing observation IDs
@@ -227,6 +235,12 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             # TQ's numeric nested-list path expects one flat variable-length row
             # per sample. Restore [R, K] at the training ingestion boundary.
             train_data[field] = [getattr(sample, field).reshape(-1).tolist() for sample in samples]
+        train_data["rollout_topk_support_complete"] = [
+            torch.from_numpy(sample.rollout_topk_support_complete)
+            if sample.rollout_topk_support_complete is not None
+            else torch.zeros(sample.response_length, dtype=torch.bool)
+            for sample in samples
+        ]
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
@@ -743,13 +757,28 @@ def get_serve_url(route_prefix: str = "") -> str:
     return serve_url
 
 
+def checkpoint_resume_step(path: str, ckpt_step: Optional[int] = None) -> int:
+    """Return the next rollout ID from the committed native checkpoint
+    tracker."""
+    root = Path(path)
+    tracker = (root / "latest_checkpointed_iteration.txt").read_text().strip()
+    if not tracker.isdecimal():
+        raise ValueError(f"Resuming training requires a numeric checkpoint tracker: {root}")
+    iteration = ckpt_step if ckpt_step is not None and ckpt_step > 0 else int(tracker)
+    if not (root / f"iter_{iteration:07d}").is_dir():
+        raise ValueError(f"Committed checkpoint directory is missing: {root}/iter_{iteration:07d}")
+    return iteration + 1
+
+
 def recovery_load_path(args: Namespace) -> Optional[str]:
     """Determine the checkpoint path to load for recovery, if applicable."""
     if args.save is not None and os.path.exists(os.path.join(args.save, "latest_checkpointed_iteration.txt")):
         args.no_load_optim = args.no_save_optim
         args.no_load_rng = args.no_save_rng
         args.finetune = False
+        # A save may finish before teardown; use the backend's actual loaded step.
         args.start_rollout_id = None
+        args._start_rollout_id_explicit = False
         args.load = args.save
 
 

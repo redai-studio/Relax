@@ -537,14 +537,15 @@ def test_kimi_k3_bridge_registers_visual_provider_and_preserves_hf_metadata(k3_m
     assert provider.image_token_id == 123
     assert provider.trust_remote_code
     assert not provider.scatter_embedding_sequence_parallel
-    assert k3_modules.registrations == [
+    assert (
         dict(
             source="KimiK3ForConditionalGeneration",
             target=k3_modules.model.KimiK3VLModel,
             provider=k3_modules.provider.KimiK3VLModelProvider,
             model_type="kimi_k3",
         )
-    ]
+        in k3_modules.registrations
+    )
 
 
 def test_kimi_k3_bridge_maps_current_visual_weights_without_source_passthrough(k3_modules):

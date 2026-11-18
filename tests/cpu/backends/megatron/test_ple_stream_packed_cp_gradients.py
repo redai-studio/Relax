@@ -3,14 +3,10 @@
 """Apply the packed CP/SP ownership contract to the opt-in streamed PLE
 forward."""
 
-import ast
-import math
+import importlib.util
 from pathlib import Path
 
 import pytest
-import torch
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 from tests.cpu.backends.megatron import test_ple_packed_cp_gradients as contract
 
@@ -19,37 +15,20 @@ from tests.cpu.backends.megatron import test_ple_packed_cp_gradients as contract
 def test_streamed_packed_cp_preserves_hidden_gradients(monkeypatch, tp_size):
     load_native = contract._load_ple
 
-    def load_streamed(parallel_state):
-        cls = load_native(parallel_state)
+    def load_streamed(parallel_state, monkeypatch):
+        cls = load_native(parallel_state, monkeypatch)
         native_forward = cls.forward
-        namespace = {
-            "torch": torch,
-            "Tensor": torch.Tensor,
-            "F": F,
-            "math": math,
-            "parallel_state": parallel_state,
-            "checkpoint": checkpoint,
-            "PerLayerEmbedding": cls,
-        }
-        hyper = ast.parse(contract._added_source("megatron/core/transformer/hyper_connection.py"))
-        norm = next(
-            node
-            for node in hyper.body
-            if isinstance(node, ast.FunctionDef) and node.name == "gated_residual_group_rmsnorm"
-        )
         source = Path(__file__).resolve().parents[4] / "relax/models/qwen3_8/ops/ple_stream.py"
-        functions = [
-            node
-            for node in ast.parse(source.read_text()).body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"_stream_conv", "_stream_forward", "_streamed_forward"}
-        ]
-        exec(compile(ast.Module(body=[norm, *functions], type_ignores=[]), str(source), "exec"), namespace)
+        spec = importlib.util.spec_from_file_location("ple_stream_contract", source)
+        streamed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(streamed)
+        monkeypatch.setattr(streamed, "parallel_state", parallel_state)
+        monkeypatch.setattr(streamed, "_STREAM_CHUNK_ROWS", 3)
 
         def forward(self, hidden):
             if self._cp_packed_seq_params is None:
                 return native_forward(self, hidden)
-            return namespace["_streamed_forward"](self, hidden)
+            return streamed._streamed_forward(self, hidden)
 
         cls.forward = forward
         return cls

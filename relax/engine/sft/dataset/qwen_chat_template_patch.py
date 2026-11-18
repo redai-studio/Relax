@@ -144,17 +144,21 @@ def is_qwen38_chat_template(template: str | None) -> bool:
     return isinstance(template, str) and template.count(_QWEN38_PRESERVE_HISTORY_GATE) == 1
 
 
-def split_qwen38_leading_thinking(content: str) -> tuple[str, str] | None:
+def split_qwen38_leading_thinking(content: str, *, reject_ambiguous: bool = False) -> tuple[str, str] | None:
     """Move an already rendered Qwen3.8 think block into message fields.
 
     The model template supplies this scaffold itself. Keep the answer bytes
     intact. Also accept complete compact blocks and think-only tool-call turns,
-    whose source data may omit the template's boundary newlines.
+    whose source data may omit the template's boundary newlines. When masking
+    reasoning, reject multiple closing tags before splitting because the
+    inferred reasoning field would hide the ambiguity from the mask.
     """
     if not content.startswith("<think>"):
         if content.lstrip().startswith("<think>"):
             raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
         return None
+    if reject_ambiguous and content.count("</think>") > 1:
+        raise ValueError("Ambiguous Qwen3.8 thinking block; provide separate reasoning_content and content fields")
     match = _QWEN38_LEADING_THINK_RE.fullmatch(content)
     if match is not None:
         reasoning, answer = match.groups()

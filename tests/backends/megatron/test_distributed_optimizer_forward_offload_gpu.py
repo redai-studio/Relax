@@ -204,7 +204,7 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
             for parameter, initial in zip(models[0].module.parameters(), source.parameters(), strict=True)
         )
         record_property("model_parameter_bytes", model_bytes)
-        record_property("gradient_norms", gradient_norms)
+        record_property("gradient_norms", [float(norm) for norm in gradient_norms])
         record_property("param_gather_calls", gather.call_count)
     finally:
         torch.cuda.synchronize()

@@ -1,0 +1,17 @@
+--- a/flash_qla/ops/utils/cumsum.py
++++ b/flash_qla/ops/utils/cumsum.py
+@@ -145,6 +145,14 @@
+ ):
+     batch_size, num_tokens, H = g.shape
+     assert g.stride(-1) == 1
++    # The scan fragment must cover whole 128-thread tiles. Small/odd head
++    # counts (e.g. H=3, chunk_size=64 after CP16) otherwise have no legal layout.
++    head_alignment = max(1, 128 // chunk_size)
++    padded_heads = ((H + head_alignment - 1) // head_alignment) * head_alignment
++    if padded_heads != H:
++        padded = torch.nn.functional.pad(g, (0, padded_heads - H))
++        scanned = chunk_local_cumsum(padded, chunk_size, cu_seqlens, reverse, zero_last_chunk)
++        return scanned[..., :H].contiguous()
+ 
+     if cu_seqlens is None:
+         num_chunks = batch_size * tilelang.cdiv(num_tokens, chunk_size)

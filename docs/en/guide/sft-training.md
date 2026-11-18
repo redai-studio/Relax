@@ -41,7 +41,7 @@ datasets:
 YAML mixtures automatically enable per-source training metrics, without an extra flag. Each optimizer step reports:
 
 - `train/dataset/general/loss`: summed supervised-token NLL divided by the source's effective supervised-token count.
-- `train/dataset/general/tokens`: effective tokens contributing to the main language-model objective.
+- `train/dataset/general/tokens`: effective tokens contributing to the main language-model objective in the current step, summed across ranks rather than cumulative.
 - `train/dataset/general/samples`: accepted samples, including fully masked rows and excluding dummy microbatches used for alignment.
 - `train/dataset/general/token_fraction` and `sample_fraction`: this source's share of the step's actual tokens and samples after filtering.
 
@@ -49,7 +49,7 @@ Other sources use the same suffixes. Source names are URL percent-encoded: `code
 
 Mixture weights allocate sample quotas over a complete logical epoch, rather than fixed proportions within every step. Filtering can change the accepted proportions; inspect source sample and token counts. These metrics cover the main language-model training loss, exclude MTP auxiliary loss, and leave evaluation metrics unchanged. FSDP, sequence classification, DPO/RM and custom datasets are outside this source-metric scope. Keep the YAML and data snapshot unchanged when resuming.
 
-With `--use-clearml --use-metrics-service`, ClearML uses the single SDK title `train`: the aggregate loss has series `loss`, and each dataset has series `loss/<name>`. In the task-list Scalars comparison view, expand `train` to see a separate plot named after each series, alongside the existing training plots. Per-source counts and fractions remain in the canonical training metrics but are not separately reported to ClearML, so they do not create extra plots or categories. CPT uses the same mapping. Historical tasks retain previously reported titles; start a new task to use this layout.
+With `--use-clearml --use-metrics-service`, ClearML uses the single SDK title `train`: the aggregate loss has series `loss`, and each dataset has series `loss/<name>` and `tokens/<name>`. The token series shows the current step's effective supervised-token count, including zero for a source with no supervised tokens. In the task-list Scalars comparison view, expand `train` to see a separate plot named after each series, alongside the existing training plots. Per-source sample counts and fractions remain in the canonical training metrics without additional ClearML plots. CPT uses the same mapping. Historical tasks retain previously reported titles; start a new task to use this layout.
 
 ## Data Preparation
 
@@ -388,6 +388,8 @@ Newer Qwen3.8 templates mark assistant turns with native `{% generation %}` tags
 
 ### Evaluation and Predict
 
+**SFT generation scoring, including async judging, requires `--sft-predict-interval N` and a scorer configured through `--custom-rm-path` or `--rm-type`.** The async setting only controls how scoring runs; it does not trigger evaluation by itself. `--eval-interval` only controls loss/PPL evaluation on reference answers and does not call the reward function.
+
 PPL evaluation is controlled by:
 
 ```bash
@@ -408,10 +410,35 @@ Generative prediction is controlled by:
 When `--sft-predict-interval` is set, Relax spins up the Rollout role automatically, and predictions are written under:
 
 ```text
-<save>/predict/predictions_step_<rollout_id>.jsonl
+<save>/predict/predictions_step_<train_step>.jsonl
 ```
 
 Use a longer `--eval-max-response-len` for math reasoning and a shorter value for captioning or image description tasks.
+
+Without a reward configuration, predict only writes the existing `prompt`, `reference`, and `completion` fields. To score generated answers, include the following options in your SFT launch arguments. Also set `--save` and provide exactly one eval source through `--eval-size` or `--eval-prompt-data`:
+
+```bash
+--sft-predict-interval 10
+--custom-rm-path your_module.reward_func
+--eval-reward-key score
+```
+
+You may use `--rm-type` instead for a built-in scorer. The reward receives a `Sample` with the generated response, token IDs, reference in `label`, and source metadata, with `evaluation=True`. SFT training still optimizes supervised loss; these rewards are evaluation metrics only. Neither an eval YAML nor a metadata flag is required. Scored SFT predict currently supports one answer per prompt (`--n-samples-per-eval-prompt 1`); a custom group reward receives a singleton prompt group.
+
+Async judge is enabled by default for eligible scorers. A custom scorer opts in as follows; a synchronous `def` still runs in the separate reward worker pool:
+
+```python
+def reward_func(args, sample, **kwargs):
+    assert kwargs["evaluation"]
+    return {"score": score_answer(sample.response, sample.label)}
+
+
+reward_func.supports_async_eval = True
+```
+
+This declaration requires the scorer to depend only on the supplied `Sample` and independent CPU or judge resources. It must return the actual score, and must not depend on live policy engines or a GenRM service that is offloaded for training. Built-in `remote_rm` is eligible automatically; other scorers without this declaration run inline. Use `--disable-eval-async-judge` to force inline scoring.
+
+Weight synchronization and answer generation still block the SFT predict cycle. Only eligible scoring runs in the background while training continues; normal shutdown waits for pending scores and propagates failures. Results are logged as `eval/sft_predict`, at the original completed training step, and saved to `<save>/rollout_result/eval/<train_step>.jsonl`. With `--save-debug-rollout-data`, the existing eval debug dump is also written. `--eval-interval` continues to control the separate loss/PPL evaluation.
 
 ### Parallelism and Resources
 

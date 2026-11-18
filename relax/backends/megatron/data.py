@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from copy import copy, deepcopy
@@ -26,6 +27,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
+from relax.utils.straggler import straggler_rollout_end
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
@@ -361,7 +363,17 @@ def pad_and_flatten(
         return t, [t.size(0)]
 
     if transpose is not None:
-        tensor_list = [t.transpose(*transpose) for t in tensor_list]
+        # Pad time independently of the number of media items/chunks. Using
+        # pad_sequence after transposing would require identical chunk counts
+        # across samples (or incorrectly broadcast a singleton chunk).
+        max_length = max(t.transpose(*transpose).size(0) for t in tensor_list)
+        padded_list = []
+        for tensor in tensor_list:
+            transposed = tensor.transpose(*transpose)
+            padding = [0] * (2 * transposed.ndim)
+            padding[-1] = max_length - transposed.size(0)
+            padded_list.append(F.pad(transposed, padding, value=padding_value).transpose(*transpose))
+        return torch.cat(padded_list, dim=0), [t.size(0) for t in tensor_list]
 
     padded = pad_sequence(
         tensor_list,
@@ -369,10 +381,7 @@ def pad_and_flatten(
         padding_value=padding_value,
     )
 
-    if transpose is not None:
-        padded_list = [t.transpose(*transpose) for t in padded]
-    else:
-        padded_list = [t for t in padded]  # noqa: C416
+    padded_list = [t for t in padded]  # noqa: C416
 
     num_items = [t.size(0) for t in padded_list]
     return torch.cat(padded_list, dim=0), num_items
@@ -477,6 +486,8 @@ def get_batch(
                 batch[key] = [torch.as_tensor(value, dtype=dtype, device=pack_device) for value in values]
 
     use_dynamic_context_parallel = getattr(get_args(), "dynamic_context_parallel", False)
+    if use_dynamic_context_parallel and os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
+        raise ValueError("Input-halo PLE does not support dynamic context parallelism")
     if use_dynamic_context_parallel and pack_device is not None and pack_device.type == "cpu":
         raise ValueError("CPU prepacking does not support dynamic context parallelism.")
     if use_dynamic_context_parallel:
@@ -497,6 +508,9 @@ def get_batch(
     else:
         cp_size = mpu.get_context_parallel_world_size()
         cp_rank = mpu.get_context_parallel_rank()
+
+    if allgather_cp and cp_size > 1 and os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
+        raise ValueError("Input-halo PLE requires per-document zigzag packing, not allgather CP")
 
     tokens = batch["tokens"]
     batch_device = pack_device or tokens[0].device
@@ -587,7 +601,9 @@ def get_batch(
                 select_offsets.append(select_offsets[-1] + length)
             vlm_packed_seq_params.cu_seqlens_q_cpu = select_offsets
             vlm_packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
-            if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+            if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not use_dynamic_context_parallel and not allgather_cp:
+                _prebuild_cp_route(vlm_packed_seq_params, select_offsets, cp_size, cp_rank, device)
+            if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
                 bind_physical_layout(vlm_packed_seq_params, tuple(select_offsets))
             if qsa_stage2_enabled:
                 # Keep the attention/CP boundaries physical. Stage-2 QSA uses
@@ -697,7 +713,9 @@ def get_batch(
         if allgather_cp:
             select_offsets[-1] += pad
         packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
-        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+        if Envs.RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE and not use_dynamic_context_parallel and not allgather_cp:
+            _prebuild_cp_route(packed_seq_params, select_offsets, cp_size, cp_rank, batch_device)
+        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT or os.environ.get("QWEN38_PLE_INPUT_HALO_CP") == "1":
             bind_physical_layout(packed_seq_params, tuple(select_offsets))
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
@@ -863,6 +881,7 @@ def get_batch(
             "rollout_log_probs",
             "rollout_topk_token_ids",
             "rollout_topk_log_probs",
+            "rollout_topk_support_complete",
             "advantages",
             "teacher_log_probs",
             "opd_reverse_kl",
@@ -891,7 +910,7 @@ def get_batch(
         Envs.RELAX_SFT_SELECTIVE_LOGITS
         and cp_size == 1
         and qkv_format == "thd"
-        and not has_mm_inputs
+        and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
         and "unsplit_tokens" not in batch
         and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"
@@ -1526,6 +1545,7 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
+                "rollout_topk_support_complete",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
                 "packed_seq_params",
@@ -1717,6 +1737,8 @@ def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter 
         ),
         flops_counter=flops_counter,
         world_size=dist.get_world_size(),
+        # A Gloo collective once per window: every rank of the actor group must reach it.
+        extra_metrics=straggler_rollout_end(rollout_id),
     )
 
 
@@ -1772,10 +1794,32 @@ def sync_actor_critic_data(
     )
 
 
+def _prebuild_cp_route(
+    packed: PackedSeqParams, offsets: Sequence[int], cp_size: int, cp_rank: int, device: torch.device
+) -> None:
+    """Build one microbatch route from producer CPU geometry, without a D2H
+    copy."""
+    if cp_size <= 1:
+        return
+    from megatron.core.context_parallel_layout.routes import build_thd_cp_partition_route
+
+    packed.cp_partition_route = build_thd_cp_partition_route(
+        torch.tensor(offsets, dtype=torch.int64, device="cpu"), cp_size, cp_rank, device=device
+    )
+
+
 def _map_packed_seq_params(data: PackedSeqParams, map_value: Callable[[Any], Any]) -> PackedSeqParams:
     record = valid_physical_layout(data)
     mapped = copy(data)
     for name, value in vars(data).items():
+        # ThdCpRoute is a dataclass, not a list/dict handled by the tensor mapper.
+        # Preserve host split sizes while mapping the two device index tensors.
+        if name == "cp_partition_route" and value is not None:
+            route = copy(value)
+            route.zigzag_index = map_value(value.zigzag_index)
+            route.contiguous_index = map_value(value.contiguous_index)
+            setattr(mapped, name, route)
+            continue
         setattr(mapped, name, map_value(value))
     rebind_mapped_layout(mapped, record)
     return mapped
@@ -1837,7 +1881,11 @@ def record_tensors_on_stream(data: Any, stream: Any) -> None:
         for value in data:
             record_tensors_on_stream(value, stream)
     elif isinstance(data, PackedSeqParams):
-        for value in vars(data).values():
-            record_tensors_on_stream(value, stream)
+        for name, value in vars(data).items():
+            if name == "cp_partition_route" and value is not None:
+                record_tensors_on_stream(value.zigzag_index, stream)
+                record_tensors_on_stream(value.contiguous_index, stream)
+            else:
+                record_tensors_on_stream(value, stream)
     elif isinstance(data, torch.Tensor) and data.device.type != "cpu":
         data.record_stream(stream)
