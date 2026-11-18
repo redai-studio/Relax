@@ -10,9 +10,11 @@ def validate_geometry(backend: str, q_heads: int, kv_heads: int, q_dim: int, k_d
         raise ValueError(f"Unknown mixed QSA long backend: {backend}")
     actual = f"{q_heads}Q/{kv_heads}KV, Q D{q_dim}/K D{k_dim}"
     if backend == "cudnn_pr1765":
-        if (q_heads, kv_heads, q_dim, k_dim) != (12, 1, 256, 256):
+        # Match the local head pairs in the pinned NVIDIA PR1765 contract.
+        if (q_heads, kv_heads) not in ((12, 1), (24, 2)) or (q_dim, k_dim) != (256, 256):
             raise NotImplementedError(
-                f"Mixed QSA backend={backend} received {actual}; the Relax adapter supports only 12Q/1KV/D256. "
+                f"Mixed QSA backend={backend} received {actual}. "
+                "The Relax adapter supports 12Q/1KV/D256 and 24Q/2KV/D256. "
                 "For other positive integral GQA layouts with D256, select "
                 "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped."
             )
