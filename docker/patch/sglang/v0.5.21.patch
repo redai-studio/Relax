@@ -10215,10 +10215,10 @@ index 0000000..f9d6aef
 +    return FlowStepOutput(next_sample, mean, noise_std, dt, score, score_kind)
 diff --git a/python/sglang/multimodal_gen/runtime/post_training/flow_matching_scheduler.py b/python/sglang/multimodal_gen/runtime/post_training/flow_matching_scheduler.py
 new file mode 100644
-index 0000000..08b1f8a
+index 0000000..470c4e5
 --- /dev/null
 +++ b/python/sglang/multimodal_gen/runtime/post_training/flow_matching_scheduler.py
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,108 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Explicit-noise flow scheduler using the shared rollout session lifecycle.
 +
@@ -10320,14 +10320,6 @@ index 0000000..08b1f8a
 +            self.append_local_rollout_log_probs(
 +                batch, output.score.detach(), torch.ones_like(output.score)
 +            )
-+            if batch.rollout_debug_mode:
-+                self.append_local_rollout_debug_tensors(
-+                    batch,
-+                    variance_noise=noise,
-+                    prev_sample_mean=output.mean.detach(),
-+                    noise_std_dev=output.noise_std.reshape(-1, 1),
-+                    model_output=model_output.detach(),
-+                )
 +        self._step_index += 1
 +        return output.next_sample
 +
@@ -10335,11 +10327,6 @@ index 0000000..08b1f8a
 +        if not self._get_rollout_session_data(batch).local_log_prob_sum:
 +            return None
 +        return super().collect_rollout_log_probs(batch)
-+
-+    def collect_rollout_debug_tensors(self, batch):
-+        if not self._get_rollout_session_data(batch).local_variance_noises:
-+            return None
-+        return super().collect_rollout_debug_tensors(batch)
 diff --git a/python/sglang/multimodal_gen/runtime/post_training/rl_dataclasses.py b/python/sglang/multimodal_gen/runtime/post_training/rl_dataclasses.py
 index 012c69c..6f7ac49 100644
 --- a/python/sglang/multimodal_gen/runtime/post_training/rl_dataclasses.py

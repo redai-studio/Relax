@@ -169,7 +169,6 @@ class SenseNovaU1ImageEditAdapter:
             noise_level=0.0 if algorithm == "art" else float(sampling["eta"]),
             sde_step_indices=[] if algorithm == "art" else resolve_sde_indices(sampling),
             return_step_indices=(sampling.get("art") or {}).get("train_step_indices") if algorithm == "art" else None,
-            debug=bool(sampling.get("debug", False)),
         )
         request["_task"] = "i2i"
         if fixed_pixels:

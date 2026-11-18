@@ -49,7 +49,6 @@ def build_sensenova_rollout_request(
     sigmas: Optional[List[float]] = None,
     timesteps: Optional[List[float]] = None,
     storage_dtype: str = "bfloat16",
-    debug: bool = False,
     think_mode: bool = False,
     think_token_ids: Optional[List[int]] = None,
     max_think_tokens: int = 1024,
@@ -162,7 +161,6 @@ def build_sensenova_rollout_request(
         "rollout_sde_type": dynamics,
         "rollout_noise_level": 0.0 if dynamics == "ode" else noise_level,
         "rollout_log_prob_no_const": dynamics != "sde",
-        "rollout_debug_mode": debug,
         "rollout_return_denoising_env": True,
         "rollout_return_dit_trajectory": True,
         "rollout_sde_step_indices": sde_step_indices,
@@ -431,7 +429,6 @@ def validate_sensenova_rollout_response(response: Mapping[str, Any], request: Ma
                 ),
             }
         ),
-        "rollout_debug_tensors": response.get("rollout_debug_tensors"),
         "generated_output": generated,
         "height": conditioning["height"],
         "width": conditioning["width"],
