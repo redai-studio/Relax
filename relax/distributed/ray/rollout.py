@@ -1118,6 +1118,7 @@ class RolloutManager(ReloadableMixin):
         self._colocate_scale_outs: set[str] = set()
         self._colocate_source = None
         self._colocate_remote_group: tuple[str, tuple[str, ...]] | None = None
+        self._colocate_retiring: str | None = None
         self._colocate_disposing = False
         self._port_cursors: dict[str, int] = {}
 
@@ -1422,18 +1423,20 @@ class RolloutManager(ReloadableMixin):
             if _synchronous_colocate(self.args):
                 with self._engine_lifecycle_lock:
                     self._colocate_disposing = True
+                deadline = time.monotonic() + 35.0
+                while self.training_weight_updating and time.monotonic() < deadline:
+                    time.sleep(0.2)
+                with self._engine_lifecycle_lock:
+                    if self._training_weight_updating:
+                        raise RuntimeError("Colocate FULL still holds the shutdown fence")
                     elastic_groups = [
                         group for srv in self.servers.values() for group in srv.engine_groups if group.is_scaled_out
                     ]
                     candidates = list(self._colocate_candidates.values())
                     current = self._colocate_remote_group
                     source = self._colocate_source
-                    updating = self._training_weight_updating
-                if current is not None and not updating:
-                    try:
-                        ray.get(source.disconnect_colocate_weight_group.remote(current[0]), timeout=35)
-                    except Exception:
-                        logger.exception("Failed to disconnect the colocate update group during disposal")
+                if current is not None:
+                    ray.get(source.disconnect_colocate_weight_group.remote(current[0]), timeout=35)
                 elastic_groups.extend(candidate.group for candidate in candidates if candidate.result is None)
             self._shutdown_all_engines(extra_groups=elastic_groups)
             for group in elastic_groups:
@@ -1532,7 +1535,10 @@ class RolloutManager(ReloadableMixin):
             and _resolve_rollout_engine_class(self.args) is SGLangEngine
             and bool(self.server.engine_groups)
             and all(
-                group.worker_type == "regular" and group.num_gpus_per_engine == self.args.rollout_num_gpus_per_engine
+                group.worker_type == "regular"
+                and group.num_gpus_per_engine == self.args.rollout_num_gpus_per_engine
+                and group.sglang_overrides.get("pp_size", getattr(self.args, "sglang_pp_size", 1)) == 1
+                and group.sglang_overrides.get("dp_size", getattr(self.args, "sglang_dp_size", 1)) == 1
                 for group in self.server.engine_groups
             )
         )
@@ -1553,6 +1559,10 @@ class RolloutManager(ReloadableMixin):
             shared = [group for group in groups if not group.is_scaled_out]
             dynamic = [group for group in groups if group.is_scaled_out]
             old = self._colocate_remote_group
+            if old is not None and self._colocate_source != source:
+                raise RuntimeError("Colocate FULL source changed while a remote group is connected")
+            if self._colocate_retiring is not None:
+                return None, self._colocate_retiring
             if any(group.lifecycle_status is EngineGroupLifecycle.DRAINING for group in dynamic):
                 return None, old[0] if old else None
 
@@ -1588,6 +1598,7 @@ class RolloutManager(ReloadableMixin):
         with self._engine_lifecycle_lock:
             if self._colocate_remote_group and self._colocate_remote_group[0] == group_name:
                 self._colocate_remote_group = None
+                self._colocate_retiring = None
                 logger.info("[Colocate FULL] Removed group %s", group_name)
 
     @ray.method(concurrency_group="scale_in")
@@ -1610,7 +1621,7 @@ class RolloutManager(ReloadableMixin):
             attempted_registration = False
             try:
                 with self._engine_lifecycle_lock:
-                    eligible = candidate.eligible()
+                    eligible = candidate.eligible() and not self._colocate_disposing
                 if eligible:
                     if not all(engine._actor_id.hex() in synced for engine in engines):
                         raise RuntimeError("Candidate was absent from the completed FULL")
@@ -1620,7 +1631,7 @@ class RolloutManager(ReloadableMixin):
                     if not all(str(value) == str(version) for value in versions):
                         raise RuntimeError("Candidate reported a different FULL version")
                     with self._engine_lifecycle_lock:
-                        eligible = candidate.eligible()
+                        eligible = candidate.eligible() and not self._colocate_disposing
                     if eligible:
                         evictions = await asyncio.wait_for(
                             asyncio.gather(*(engine.is_evicted.remote() for engine in group.all_engines)), timeout=5
@@ -1629,7 +1640,8 @@ class RolloutManager(ReloadableMixin):
                 if eligible:
                     attempted_registration = True
                     registered = await asyncio.wait_for(
-                        asyncio.gather(*(engine.register_to_router.remote() for engine in engines)), timeout=30
+                        asyncio.gather(*(engine.register_to_router.remote(confirm=True) for engine in engines)),
+                        timeout=35,
                     )
                     if not all(result is True for result in registered):
                         raise RuntimeError("Router rejected a candidate")
@@ -1637,7 +1649,7 @@ class RolloutManager(ReloadableMixin):
                         asyncio.gather(*(engine.is_evicted.remote() for engine in group.all_engines)), timeout=5
                     )
                     with self._engine_lifecycle_lock:
-                        if candidate.eligible() and not any(evictions):
+                        if candidate.eligible() and not self._colocate_disposing and not any(evictions):
                             srv = self._get_server(candidate.request.model_name)
                             srv.engine_groups.append(group)
                             group.num_new_engines = 0
@@ -1671,6 +1683,7 @@ class RolloutManager(ReloadableMixin):
                     [(group, idx) for idx in range(len(engines))],
                     timeout=getattr(self.args, "scale_in_drain_timeout", 30.0),
                     force=False,
+                    allow_already_absent=True,
                 )
                 if failed:
                     raise RuntimeError("Could not confirm removal of a rejected colocate candidate")
@@ -1731,6 +1744,7 @@ class RolloutManager(ReloadableMixin):
             if current is None or not engine_ids.intersection(current[1]):
                 return
             name, source = current[0], self._colocate_source
+            self._colocate_retiring = name
         # A worker inside train() services the same generation at update admission
         # before the queued RPC can run. Both paths use this acknowledgment.
         ref = source.disconnect_colocate_weight_group.remote(name)
@@ -2355,7 +2369,7 @@ class RolloutManager(ReloadableMixin):
         ):
             raise ValueError(
                 "Colocate scale-out requires Ray-native Megatron/SGLang with homogeneous regular engines "
-                "and FULL weights (without adapter mode or explicit expert routing)"
+                "using SGLang PP=DP=1 and FULL weights (without adapter mode or explicit expert routing)"
             )
 
         # Mutual exclusion: reject if any scale operation is in progress
@@ -2841,6 +2855,15 @@ class RolloutManager(ReloadableMixin):
 
             bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_gpus)]
             sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
+            if _synchronous_colocate(self.args):
+                local_span = min(gpus_per_engine, self.args.num_gpus_per_node)
+                for start in range(0, num_gpus, local_span):
+                    span = sorted_bundle_infos[start : start + local_span]
+                    first_gpu = int(span[0][2])
+                    if len(span) != local_span or any(
+                        host != span[0][1] or int(gpu) != first_gpu + idx for idx, (_, host, gpu) in enumerate(span)
+                    ):
+                        raise ValueError("A colocate replica PG must match the engine's contiguous per-node GPU span")
             pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
             pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
             pg_tuple = (pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids)
@@ -4846,7 +4869,9 @@ class RolloutManager(ReloadableMixin):
         self._cleanup_engine_groups(srv)
         return removed, failed
 
-    async def _drain_engines(self, engine_infos: list, timeout: float, force: bool) -> tuple[list, list[str]]:
+    async def _drain_engines(
+        self, engine_infos: list, timeout: float, force: bool, *, allow_already_absent: bool = False
+    ) -> tuple[list, list[str]]:
         """Remove all engines from the router, then wait once for the drain
         period.
 
@@ -4891,6 +4916,7 @@ class RolloutManager(ReloadableMixin):
                 engine.unregister_from_router.remote(
                     wait_for_removal=True,
                     timeout=router_removal_timeout,
+                    **({"allow_already_absent": True} if allow_already_absent else {}),
                 ),
                 timeout=router_removal_timeout + 5.0,
             )

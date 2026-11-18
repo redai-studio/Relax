@@ -27,6 +27,7 @@ def pool():
     manager._colocate_scale_outs = set()
     manager._colocate_source = None
     manager._colocate_remote_group = None
+    manager._colocate_retiring = None
     manager._colocate_disposing = False
     manager._health_monitors = []
     return manager, server, baseline
@@ -67,7 +68,7 @@ async def test_colocate_publishes_only_snapshot_members(pool):
     assert request.status is ScaleOutStatus.WAITING_FOR_WEIGHT_SYNC
     assert server.engine_groups == [baseline, group1]
     assert not second.done()
-    engine1.register_to_router.remote.assert_called_once_with()
+    engine1.register_to_router.remote.assert_called_once_with(confirm=True)
     engine1.register_dcs.remote.assert_not_called()
     engine2.register_to_router.remote.assert_not_called()
 
@@ -126,3 +127,37 @@ async def test_unclaimed_timeout_cannot_join_later_full(pool):
     manager.release_colocate_full()
     assert server.engine_groups == [baseline]
     engine.register_to_router.remote.assert_not_called()
+
+
+def test_sglang_pipeline_override_is_rejected_before_scale_request(pool):
+    manager, _, baseline = pool
+    baseline.sglang_overrides["pp_size"] = 2
+
+    with pytest.raises(ValueError, match="SGLang PP=DP=1"):
+        manager.create_scale_out_request(num_replicas=2)
+
+    assert not manager._scale_out_requests
+
+
+@pytest.mark.asyncio
+async def test_noncontiguous_pg_cannot_start_an_engine(pool, monkeypatch):
+    from unittest.mock import Mock
+
+    from relax.distributed.ray import rollout
+
+    manager, server, _ = pool
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    probe = Mock()
+    probe.get_ip_and_gpu_id.remote.side_effect = [AwaitableValue(("10.0.0.1", 4)), AwaitableValue(("10.0.0.1", 6))]
+    probe_class = Mock()
+    probe_class.options.return_value.remote.return_value = probe
+    create_group = Mock()
+    monkeypatch.setattr(rollout, "EngineGroup", create_group)
+    monkeypatch.setattr(rollout.ray, "kill", Mock())
+
+    result = await manager._bring_up_single_replica(
+        request, server, object(), 0, 2, 2, 4, lambda bundle: bundle[2], probe_class
+    )
+
+    assert not result.success
+    create_group.assert_not_called()

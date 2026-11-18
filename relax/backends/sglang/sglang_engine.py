@@ -1136,13 +1136,13 @@ class SGLangEngine(RayActor):
         self._skip_router_registration = False
         return True
 
-    def _wait_for_registered_pd_worker(self, timeout: float = 60.0) -> None:
-        """Recovery must reach a healthy registry entry before init
-        succeeds."""
+    def _wait_for_registered_worker(self, timeout: float = 60.0, *, healthy: bool = True) -> None:
+        """Wait for the Router to apply its asynchronous registration."""
         deadline = time.monotonic() + timeout
-        expected = self.get_pd_router_worker_spec()
-        if expected is None:
+        url = self.get_url()
+        if url is None:
             return
+        pd = self.worker_type in ("prefill", "decode")
         last_error = None
         while time.monotonic() < deadline:
             try:
@@ -1154,15 +1154,24 @@ class SGLangEngine(RayActor):
                 matches = [
                     worker
                     for worker in response.json().get("workers", [])
-                    if worker.get("url", "").rstrip("/") == expected["url"].rstrip("/")
+                    if worker.get("url", "").rstrip("/") == url.rstrip("/")
                 ]
                 if len(matches) > 1:
                     raise ValueError("Duplicate PD worker URL in router registry")
-                if len(matches) == 1 and matches[0].get("is_healthy") is True:
+                if len(matches) == 1 and (not healthy or matches[0].get("is_healthy") is True):
                     registered_id = self._router_worker_id
                     if registered_id is not None and matches[0].get("id") != registered_id:
                         raise ValueError("PD worker registration ID changed before readiness")
-                    self.bind_registered_pd_worker(self.router_ip, self.router_port, matches[0])
+                    if pd:
+                        self.bind_registered_pd_worker(self.router_ip, self.router_port, matches[0])
+                    else:
+                        worker = matches[0]
+                        actor_id = ray.get_runtime_context().get_actor_id()
+                        if worker.get("metadata", {}).get("relax_actor_id") != actor_id or not worker.get("id"):
+                            raise ValueError("Router worker does not match the registering engine")
+                        self._router_worker_id = str(worker["id"])
+                        self._router_unregister_submitted = False
+                        self._skip_router_registration = False
                     return
             except requests.RequestException as error:
                 last_error = type(error).__name__
@@ -1182,24 +1191,30 @@ class SGLangEngine(RayActor):
             pass
         return {"pid": os.getpid(), "node_id": node_id}
 
-    def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
+    def register_to_router(
+        self, bootstrap_port: int | None = None, strict: bool = True, *, confirm: bool = False
+    ) -> bool:
         required = getattr(self, "_require_router_registration", False)
         if self.node_rank != 0:
             return True
         if not self.router_ip or not self.router_port:
-            return not required
+            return not (required or confirm)
         if self.is_evicted():
             return False
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
+        tracked = required or (
+            confirm and not self.args.use_slime_router and parse(sglang_router.__version__) >= parse("0.3.0")
+        )
+        confirm_timeout = 15.0 if confirm else 60.0
         try:
-            if required and (
+            if tracked and (
                 getattr(self, "_router_registration_pending", False)
                 or (self._router_worker_id is not None and not self._router_unregister_submitted)
             ):
                 # A POST may be accepted before health registration completes.
                 # Retry its readiness check, not the mutation that creates a worker.
-                self._wait_for_registered_pd_worker()
+                self._wait_for_registered_worker(timeout=confirm_timeout)
                 self._router_registration_pending = False
                 return True
             if required and self.worker_type == "prefill" and bootstrap_port is None:
@@ -1226,7 +1241,7 @@ class SGLangEngine(RayActor):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
-                if required:
+                if tracked:
                     # The router may accept the worker before its HTTP response
                     # is lost. Reconcile that mutation instead of posting twice.
                     self._router_registration_pending = True
@@ -1235,13 +1250,13 @@ class SGLangEngine(RayActor):
                     response = requests.post(
                         f"http://{self.router_ip}:{self.router_port}/workers",
                         json=payload,
-                        timeout=30,
+                        timeout=10 if confirm else 30,
                     )
                 except ConnectTimeout:
-                    if required:
+                    if tracked:
                         self._router_registration_pending = False
                     raise
-                if required and response.status_code >= 400:
+                if tracked and response.status_code >= 400:
                     # Client rejections and the router's queue errors prove
                     # that no registration was submitted. A gateway timeout
                     # or an unrecognized server error can still hide acceptance.
@@ -1283,9 +1298,9 @@ class SGLangEngine(RayActor):
                 if self._router_worker_id is None:
                     logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
             self._router_unregister_submitted = False
-            if required:
+            if tracked:
                 self._router_registration_pending = True
-                self._wait_for_registered_pd_worker()
+                self._wait_for_registered_worker(timeout=confirm_timeout)
                 self._router_registration_pending = False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
@@ -1319,7 +1334,9 @@ class SGLangEngine(RayActor):
                 return False
             time.sleep(0.5)
 
-    def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
+    def unregister_from_router(
+        self, wait_for_removal: bool = False, timeout: float = 30.0, *, allow_already_absent: bool = False
+    ) -> bool:
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
         worker_url = f"http://{self.server_host}:{self.server_port}"
@@ -1333,6 +1350,11 @@ class SGLangEngine(RayActor):
             return removed
 
         try:
+            if allow_already_absent and getattr(self, "_router_registration_pending", False):
+                # An accepted or uncertain POST may still be queued. Resolve this
+                # generation before allowing absence to count as removal.
+                self._wait_for_registered_worker(timeout=timeout, healthy=False)
+                self._router_registration_pending = False
             if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
@@ -1374,6 +1396,8 @@ class SGLangEngine(RayActor):
                     )
                     return False
                 if exact_worker is None:
+                    if allow_already_absent:
+                        return True
                     logger.warning(f"Worker {worker_url} not found in router during unregister.")
                     return False
 

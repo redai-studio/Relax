@@ -2923,7 +2923,6 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
-    @timer
     def disconnect_colocate_weight_group(self, name: str) -> None:
         self.weight_updater.disconnect_distributed_group(name)
         ray.get(self.rollout_manager.acknowledge_colocate_group_removed.remote(name))
@@ -2949,6 +2948,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.disconnect_colocate_weight_group(retired)
         ray.get(self.rollout_manager.release_colocate_full.remote())
 
+    @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
