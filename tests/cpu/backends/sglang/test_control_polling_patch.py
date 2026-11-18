@@ -20,8 +20,9 @@ async def _health_generate(request):
 async def _pause_generation(self, obj):
     if obj.mode == "abort":
         while True:
-            self.aborts.append(True)
-            if not self.locked.pop(0):
+            self.abort_request(abort_all=True)
+            is_locked = await self.model_update_lock.is_locked()
+            if not is_locked:
                 break
             await asyncio.sleep(1.0)
     else:
@@ -29,7 +30,8 @@ async def _pause_generation(self, obj):
 
 
 async def _unsupported(self, obj):
-    await asyncio.sleep(0.5)
+    # Same delay, different pause contract: neither function should be patched.
+    await asyncio.sleep(1.0)
 
 
 def _install(monkeypatch, pause=_pause_generation):
@@ -69,16 +71,48 @@ def test_poll_patch_preserves_routes_abort_and_other_one_constants(monkeypatch):
     patch_control_poll_interval(0.01)
     assert module.app.routes[0].endpoint is route
     assert asyncio.run(route(2)) == 1
-    state = SimpleNamespace(aborts=[], locked=[True, True, False], dispatched=[])
-    asyncio.run(pause(state, SimpleNamespace(mode="abort")))
-    assert len(state.aborts) == 3 and not state.locked
+    state = SimpleNamespace(dispatched=[])
     asyncio.run(pause(state, SimpleNamespace(mode="retract")))
     assert state.dispatched == ["retract"]
-    assert delays == [0.01] * 4
+    assert delays == [0.01] * 2
     assert asyncio.sleep is sleep
     assert health._relax_control_poll_interval == 0.01
     with pytest.raises(RuntimeError, match="different interval"):
         patch_control_poll_interval(0.02)
+
+
+@pytest.mark.parametrize(
+    ("release_ms", "required_sends", "expected_sends", "expected_done_ms"),
+    [(0, 1, [0], 0), (35, 1, [0], 40), (1000, 1, [0], 1000), (2035, 3, [0, 1000, 2000], 2040)],
+)
+def test_abort_resends_only_while_locked(monkeypatch, release_ms, required_sends, expected_sends, expected_done_ms):
+    _, _, pause = _install(monkeypatch)
+    patch_control_poll_interval(0.01)
+    now_ms = 0
+    sends = []
+
+    def abort_request(*, abort_all):
+        assert abort_all
+        sends.append(now_ms)
+
+    async def is_locked():
+        return len(sends) < required_sends or now_ms < release_ms
+
+    async def sleep(delay):
+        nonlocal now_ms
+        assert 0 < delay <= 0.01
+        now_ms += round(delay * 1000)
+
+    manager = SimpleNamespace(abort_request=abort_request, model_update_lock=SimpleNamespace(is_locked=is_locked))
+
+    async def run():
+        monkeypatch.setattr(asyncio.get_running_loop(), "time", lambda: now_ms / 1000)
+        monkeypatch.setattr(asyncio, "sleep", sleep)
+        await pause(manager, SimpleNamespace(mode="abort"))
+
+    asyncio.run(run())
+    assert sends == expected_sends
+    assert now_ms == expected_done_ms
 
 
 def test_unsupported_second_function_does_not_partially_patch_first(monkeypatch):
