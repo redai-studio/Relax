@@ -1414,9 +1414,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--task-type",
                 type=str,
-                choices=["causal_lm", "seq_cls"],
+                choices=["causal_lm", "seq_cls", "embedding"],
                 default="causal_lm",
-                help="SFT task type. `seq_cls` replaces the vocabulary head with a classification head.",
+                help=(
+                    "SFT task type. seq_cls installs a classification head; "
+                    "embedding trains pooled sequence representations."
+                ),
+            )
+            parser.add_argument(
+                "--contrastive-temperature",
+                type=float,
+                default=0.05,
+                help="Positive temperature passed to the embedding loss callback.",
             )
             parser.add_argument(
                 "--num-labels",
@@ -2080,8 +2089,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Path to the custom loss function, if the loss_type is `custom_loss`, "
-                    "we will use this function to calculate the loss. "
+                    "Dotted loss callback path. For embedding SFT this overrides the default InfoNCE loss. The callback receives "
+                    "pooled query and positive tensors, with temperature and process_group as keyword arguments, and returns "
+                    "a scalar mean loss. Top-level custom_loss uses the standard training loss arguments."
                 ),
             )
             parser.add_argument(
@@ -4875,6 +4885,10 @@ def relax_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    if args.task_type == "embedding":
+        from relax.utils.training.embedding import validate_embedding_args
+
+        validate_embedding_args(args)
     _validate_sft_epoch_eval_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):

@@ -887,6 +887,10 @@ def wrap_model_provider_with_freeze(original_provider, args):
         )
 
         freeze_model_params(model, args)
+        if getattr(args, "task_type", "causal_lm") == "embedding":
+            from relax.utils.training.embedding import freeze_embedding_unused_heads
+
+            freeze_embedding_unused_heads(model)
         ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
         return model
