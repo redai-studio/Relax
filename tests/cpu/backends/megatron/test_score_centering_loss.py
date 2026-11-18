@@ -189,9 +189,9 @@ def test_scoring_uses_real_vocab_once_for_sample_head_and_entropy(monkeypatch, d
     torch.testing.assert_close(reference["log_probs"][0], expected[0])
 
 
-@pytest.mark.parametrize("dynamic", [False, True])
-def test_scoring_ring_and_dynamic_cp_align_head_rows(monkeypatch, dynamic):
-    args = _args()
+@pytest.mark.parametrize("dynamic,zigzag_allgather", [(False, False), (True, False), (False, True)])
+def test_scoring_ring_and_dynamic_cp_align_head_rows(monkeypatch, dynamic, zigzag_allgather):
+    args = _args(allgather_cp=zigzag_allgather)
     base, tokens, ids = _score_inputs()
     expected = _dense_scoring(base, tokens, ids, args.rollout_temperature)
     for rank in range(2):
@@ -208,6 +208,7 @@ def test_scoring_ring_and_dynamic_cp_align_head_rows(monkeypatch, dynamic):
             response_lengths=[6],
             gather_topk_token_ids=[local_ids],
             with_entropy=True,
+            cp_output_is_zigzag=zigzag_allgather,
             **cp_kwargs,
         )
         for key, reference in zip(("log_probs", "topk_log_probs", "entropy"), expected, strict=True):

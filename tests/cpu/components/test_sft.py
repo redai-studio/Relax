@@ -2,6 +2,7 @@
 
 """Unit tests for SFT producer component (loop-only, no Ray runtime)."""
 
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -965,3 +966,53 @@ async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
     await sft._async_run()
 
     sft._produce_one_step.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "config_values",
+    [
+        {"model_type": "llama"},
+        {"model_type": "custom_unregistered", "auto_map": {"AutoConfig": "custom.Config"}},
+        {},
+    ],
+)
+def test_pad_token_resolution_propagates_invalid_config_errors(monkeypatch, config_values):
+    from relax.components import sft
+
+    error = ValueError("invalid model configuration")
+
+    def invalid_config(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(sft.AutoConfig, "from_pretrained", invalid_config)
+    monkeypatch.setattr(sft.PretrainedConfig, "get_config_dict", lambda *a, **kw: (config_values, {}))
+    with pytest.raises(ValueError) as actual:
+        sft._resolve_pad_token_ids_from_config("unused")
+    assert actual.value is error
+
+
+def test_pad_token_resolution_supports_unregistered_model_type(tmp_path):
+    from relax.components.sft import _resolve_pad_token_ids_from_config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "custom_model_not_registered_with_transformers",
+                "image_token_id": 101,
+                "video_token_id": 102,
+                "audio_token_id": 103,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _resolve_pad_token_ids_from_config(str(tmp_path)) == frozenset({101, 102, 103})
+
+
+def test_pad_token_resolution_keeps_registered_config_defaults(monkeypatch):
+    from relax.components import sft
+
+    config = SimpleNamespace(to_dict=lambda: {"image_token_id": 201, "video_token_id": 202})
+    monkeypatch.setattr(sft.AutoConfig, "from_pretrained", lambda *args, **kwargs: config)
+
+    assert sft._resolve_pad_token_ids_from_config("unused") == frozenset({201, 202})

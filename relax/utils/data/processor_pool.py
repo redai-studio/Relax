@@ -134,7 +134,9 @@ class MediaLoadError(RuntimeError):
     """A sample's media file could not be read in a pool worker."""
 
 
-def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[Any]]:
+def _load_media_for_worker(
+    media_paths: dict[str, list[Any]], *, use_audio_in_video: bool = False
+) -> dict[str, list[Any]]:
     """Load image/video/audio sources inside the worker.
 
     The producer used to decode media in the parent and pickle it into the
@@ -144,6 +146,11 @@ def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[
     parallel — the same path-fed pipeline the rank-side rebuild already proved
     bitwise identical to the decoded-array one.
     """
+    if use_audio_in_video and media_paths.get("video"):
+        raise ValueError(
+            "SFT ProcessorPool does not support extracting audio from video. "
+            "Set use_audio_in_video=False and supply audio as a separate input."
+        )
     loaded: dict[str, list[Any]] = {}
     for kind in ("image", "video", "audio"):
         sources = media_paths.get(kind) or []
@@ -164,10 +171,15 @@ def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[
         items: list[Any] = []
         for position, source in enumerate(sources):
             try:
-                items.append(loader(source))
+                if kind == "video":
+                    frames, metadata, _, _ = loader(source, use_audio_in_video=use_audio_in_video)
+                    items.append(frames)
+                    loaded.setdefault("video_metadata", []).append(metadata)
+                else:
+                    items.append(loader(source))
             except Exception as exc:  # noqa: BLE001 - re-raised with position context
                 raise MediaLoadError(f"failed to load {kind} position={position}: {source!r}") from exc
-        loaded[f"{kind}s"] = items
+        loaded["audio" if kind == "audio" else f"{kind}s"] = items
     return loaded
 
 
@@ -186,7 +198,7 @@ def process_sample_from_paths_in_worker(
         MediaLoadError: A referenced media file could not be read (the dataset
             maps this to its invalid-multimodal skip policy).
     """
-    media = _load_media_for_worker(media_paths)
+    media = _load_media_for_worker(media_paths, use_audio_in_video=processor_kwargs.get("use_audio_in_video", False))
     prompt_ids, train_inputs = process_sample_in_worker(text, prepare_mm_inputs_for_ipc(media), processor_kwargs)
     if train_inputs is not None:
         processor = get_worker_processor()

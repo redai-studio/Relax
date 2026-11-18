@@ -21,6 +21,7 @@ from relax.engine.sft.dataset.sample import (
     CanonicalMessage,
     CanonicalSample,
 )
+from relax.utils.data import processor_pool as worker_processor_pool
 from relax.utils.data.processor_pool import MediaLoadError, _load_media_for_worker
 
 
@@ -128,6 +129,26 @@ def test_worker_media_loader_reports_position(monkeypatch):
     assert isinstance(exc_info.value.__cause__, AssertionError)
 
 
+def test_worker_media_loader_unpacks_video_and_uses_singular_audio_key(monkeypatch):
+    video_utils = ModuleType("relax.utils.multimodal.video_utils")
+    frames = torch.zeros(2, 3, 56, 56)
+    video_utils.load_video = MagicMock(return_value=(frames, {"fps": 2}, None, None))
+    audio_utils = ModuleType("relax.utils.multimodal.audio_utils")
+    waveform = torch.zeros(6400)
+    audio_utils.load_audio = MagicMock(return_value=waveform)
+    monkeypatch.setitem(sys.modules, video_utils.__name__, video_utils)
+    monkeypatch.setitem(sys.modules, audio_utils.__name__, audio_utils)
+
+    loaded = _load_media_for_worker({"video": ["clip.mp4"], "audio": ["tone.wav"]})
+
+    assert set(loaded) == {"videos", "video_metadata", "audio"}
+    assert loaded["video_metadata"] == [{"fps": 2}]
+    assert loaded["videos"][0] is frames
+    assert loaded["audio"][0] is waveform
+    video_utils.load_video.assert_called_once_with("clip.mp4", use_audio_in_video=False)
+    audio_utils.load_audio.assert_called_once_with("tone.wav")
+
+
 def test_preprocess_wraps_worker_media_load_error():
     pool = MagicMock()
     pool.executor.submit.return_value.result.side_effect = MediaLoadError(
@@ -183,3 +204,37 @@ async def test_preprocess_multimodal_async_text_only_returns_none():
 async def test_preprocess_multimodal_async_without_pool_raises():
     with pytest.raises(ValueError, match="processor_pool"):
         await preprocess_multimodal_async(_image_sample(), processor_pool=None)
+
+
+def test_worker_rejects_video_audio_before_loading_media(monkeypatch):
+    processor_pool = worker_processor_pool
+
+    load_video = MagicMock()
+    module = ModuleType("relax.utils.multimodal.video_utils")
+    module.load_video = load_video
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    process = MagicMock()
+    monkeypatch.setattr(processor_pool, "process_sample_in_worker", process)
+
+    with pytest.raises(ValueError, match="does not support extracting audio from video"):
+        processor_pool.process_sample_from_paths_in_worker(
+            "video prompt", {"video": ["clip.mp4"]}, {"use_audio_in_video": True}
+        )
+    load_video.assert_not_called()
+    process.assert_not_called()
+
+
+def test_worker_forwards_disabled_video_audio_option(monkeypatch):
+    processor_pool = worker_processor_pool
+
+    load = MagicMock(return_value={"videos": []})
+    process = MagicMock(return_value=([1, 2], None))
+    monkeypatch.setattr(processor_pool, "_load_media_for_worker", load)
+    monkeypatch.setattr(processor_pool, "process_sample_in_worker", process)
+    options = {"use_audio_in_video": False}
+    assert processor_pool.process_sample_from_paths_in_worker("video prompt", {"video": ["clip.mp4"]}, options) == (
+        [1, 2],
+        None,
+    )
+    load.assert_called_once_with({"video": ["clip.mp4"]}, use_audio_in_video=False)
+    process.assert_called_once_with("video prompt", {"videos": []}, options)

@@ -564,6 +564,11 @@ def get_model_provider_func(
                 provider.num_layers_in_first_pipeline_stage = None
                 provider.num_layers_in_last_pipeline_stage = None
 
+        # Preserve the provider default unless the launch explicitly selects a
+        # backend for models with provider-owned DSA defaults.
+        if getattr(args, "dsa_kernel_backend", None) is not None:
+            provider.dsa_kernel_backend = args.dsa_kernel_backend
+
         # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
         # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
         # fusion flag defaults to None. Let finalize() validate explicit backend/flag conflicts.

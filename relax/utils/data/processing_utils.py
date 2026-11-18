@@ -378,6 +378,9 @@ def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:
 
 
 def load_processor(name_or_path: str, **kwargs):
+    # Register local model integrations in fresh preprocessing workers as well.
+    import relax.models  # noqa: F401
+
     try:
         proc = AutoProcessor.from_pretrained(name_or_path, **kwargs)
     except (OSError, ValueError) as e:
