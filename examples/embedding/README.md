@@ -79,7 +79,3 @@ to the anchor than the negative.
 | --------------------- | -----: | ------: | ------: | ------: | ------: |
 | Relax                 | 65.43% |  81.15% |  84.18% |  86.04% |  87.30% |
 | Sentence Transformers | 65.43% |  80.57% |  84.47% |  85.55% |  87.11% |
-
-![AllNLI held-out accuracy and training loss over 80 optimizer updates](assets/allnli-training-curve.png)
-
-[Per-step losses and validation counts](assets/allnli-training-metrics.csv)
