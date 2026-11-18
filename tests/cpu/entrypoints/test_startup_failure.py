@@ -580,6 +580,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     partial_controller = SimpleNamespace(
         serve_dict={},
         _teacher_manager=teacher,
+        _stop_prepared_sft=Mock(),
         _shutdown_agentic_rollout_services=Mock(),
         _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
@@ -643,7 +644,7 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
     ray_get = Mock(side_effect=RuntimeError("Manager unavailable") if manager_fails else None)
     ns = {
         "logger": Mock(),
-        "ROLES": SimpleNamespace(rollout="rollout"),
+        "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
         "asyncio": asyncio,
         "run": asyncio.run,
         "ray": SimpleNamespace(get=ray_get),
