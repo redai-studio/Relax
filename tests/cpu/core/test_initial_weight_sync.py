@@ -49,7 +49,7 @@ class InitialWeightSyncTests(unittest.TestCase):
 
     def _startup(self, fail_role=None, receivers=("actor_fwd", "reference"), **config):
         roles = SimpleNamespace(
-            actor="actor", rollout="rollout", actor_fwd="actor_fwd", reference="reference", critic="critic"
+            actor="actor", rollout="rollout", actor_fwd="actor_fwd", reference="reference", critic="critic", sft="sft"
         )
         started, completed, cancelled, responses = [], [], [], {}
         sender_started, receivers_started = asyncio.Event(), asyncio.Event()
@@ -131,6 +131,7 @@ class InitialWeightSyncTests(unittest.TestCase):
             _restarting=False,
             _cleanup_s3_model_weights_after_init=MagicMock(),
             _report_error_to_metrics_service=MagicMock(),
+            _restart_lock=threading.RLock(),
             _pending_task_refs_lock=threading.Lock(),
             _pending_task_refs=[],
         )
