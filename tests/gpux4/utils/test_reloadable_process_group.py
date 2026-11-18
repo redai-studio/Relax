@@ -3,6 +3,7 @@
 """Exercise imported Torch collectives across process-group reloads."""
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -87,4 +88,54 @@ def test_collectives_follow_reloaded_inner_group(tmp_path, backend: str) -> None
         pytest.skip("Two CUDA devices and NCCL are required")
     torch.multiprocessing.spawn(
         _collective_worker, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=2, join=True
+    )
+
+
+def _check_collectives_after_reload(rank: int, rendezvous: str) -> None:
+    # Megatron caches these aliases before Relax patches torch.distributed.
+    from torch.distributed import all_gather_into_tensor, all_to_all_single, reduce_scatter_tensor
+
+    from relax.utils.reloadable_process_group import (
+        destroy_process_groups,
+        monkey_patch_torch_dist,
+        reload_process_groups,
+    )
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2)
+    monkey_patch_torch_dist()
+    group = dist.new_group(ranks=[0, 1], backend="nccl")
+    try:
+        for cycle in range(2):
+            value = torch.tensor([rank + 1.0], device="cuda")
+            gathered = torch.empty(2, device="cuda")
+            for gather in (all_gather_into_tensor, dist.all_gather_single):
+                gather(gathered, value, group=group)
+                torch.testing.assert_close(gathered, torch.tensor([1.0, 2.0], device="cuda"))
+
+            values = torch.ones(2, device="cuda") * (rank + 1)
+            reduced = torch.empty(1, device="cuda")
+            for scatter in (reduce_scatter_tensor, dist.reduce_scatter_single):
+                scatter(reduced, values, group=group)
+                torch.testing.assert_close(reduced, torch.tensor([3.0], device="cuda"))
+
+            all_to_all_single(gathered, torch.arange(2, device="cuda", dtype=torch.float32) + rank * 2, group=group)
+            torch.testing.assert_close(gathered, torch.tensor([rank, rank + 2], device="cuda", dtype=torch.float32))
+            destroy_process_groups(post_destroy_delay=0)
+            if cycle == 0:
+                reload_process_groups()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2 or not hasattr(dist, "all_gather_single"),
+    reason="Requires two CUDA devices and the new PyTorch tensor collective APIs",
+)
+def test_reloadable_process_group_cached_collectives_after_reload(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _check_collectives_after_reload,
+        args=((tmp_path / "rendezvous").as_uri(),),
+        nprocs=2,
+        join=True,
     )

@@ -237,3 +237,28 @@ async def test_sglang_rollout_defers_drain_filter_without_dynamic_batch_size(run
     assert result.buffered == [drained]
     assert result.output.metrics == {}
     assert [call.args[1] for call in filter_fn.call_args_list] == [accepted]
+
+
+async def test_sync_rollout_replaces_aborted_groups_before_committing(run_rollout: Callable) -> None:
+    aborted = _group(0, (None, None), status=Sample.Status.ABORTED)
+    accepted = _group(1)
+    result = await run_rollout([[aborted], [accepted]])
+
+    assert result.output.samples == result.transferred == [accepted]
+    assert result.buffered == []
+    assert result.fetch.call_count == 2
+
+
+@pytest.mark.parametrize("partial_rollout", [False, True])
+async def test_sync_rollout_carries_completed_surplus_only_with_partial_rollout(
+    run_rollout: Callable, partial_rollout: bool
+) -> None:
+    groups = [_group(0), _group(1)]
+    result = await run_rollout(
+        [groups], partial_rollout=partial_rollout, dynamic_global_batch_size=False, filter_fn=None
+    )
+
+    assert len(result.transferred) == 1
+    assert result.output.samples == result.transferred
+    assert _group_ids(result.transferred).isdisjoint(_group_ids(result.buffered))
+    assert len(result.buffered) == int(partial_rollout)

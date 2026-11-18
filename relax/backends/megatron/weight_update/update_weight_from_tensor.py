@@ -91,6 +91,7 @@ class UpdateWeightFromTensor:
         self._auto_route_candidate = (
             not self._route_experts
             and args.colocate
+            and not getattr(args, "hybrid", False)
             and args.megatron_to_hf_mode == "bridge"
             and not self.lora_enabled
             and not quantization_config

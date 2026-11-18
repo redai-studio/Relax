@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -13,6 +14,40 @@ from tests.cpu.engine.lora_versions.test_training import ThreadRanks, assert_ran
 pytest.importorskip("megatron.core")
 from relax.backends.megatron import actor as actor_module
 from relax.distributed.checkpoint_service.client.engine import CheckpointEngineClient
+
+
+@pytest.mark.parametrize(
+    "overrides", [None, {"quantization_config": {"quant_method": "fp8"}}, {"quantization_config": None}]
+)
+def test_checkpoint_sender_uses_effective_rollout_quantization(monkeypatch, overrides):
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    checkpoint_quantization = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    actor.hf_config = SimpleNamespace(quantization_config=checkpoint_quantization)
+    actor.args = SimpleNamespace(
+        sglang_json_model_override_args=None if overrides is None else json.dumps(overrides),
+        hf_checkpoint="unused",
+        coordinator_url="http://coordinator.test",
+        model_name="test-model",
+        checkpoint_engine_backend="test",
+    )
+    actor.model = []
+    actor.lock = object()
+    for name in ("tensor_model", "pipeline_model", "expert_model", "context"):
+        monkeypatch.setattr(actor_module.mpu, f"get_{name}_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(actor_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1)
+    monkeypatch.setattr(actor_module.mpu, "get_data_parallel_rank", lambda **kwargs: 1)
+    monkeypatch.setattr(actor_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(actor_module.mpu, "get_pipeline_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(actor_module, "run", asyncio.run)
+    client = AsyncMock(return_value=object())
+    monkeypatch.setattr(actor_module, "create_client", client)
+
+    actual = actor._create_checkpoint_engine_client("actor")
+
+    expected = checkpoint_quantization if overrides is None else overrides["quantization_config"]
+    assert actual is client.return_value
+    assert client.call_args.kwargs["quantization_config"] == expected
 
 
 @pytest.mark.parametrize("failure", ["none", "acquire", "publish", "release"])

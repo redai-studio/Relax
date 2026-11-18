@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 import logging
 import os
 import random
@@ -558,6 +559,12 @@ class MegatronTrainRayActor(TrainRayActor):
             with_opd_teacher=with_opd_teacher,
         )
         use_tensor_backuper = not skip_weight_management and (not self.args.fully_async or self.args.hybrid)
+        # The rollout may quantize a BF16 training checkpoint through its HF
+        # overrides. The sender must use that same effective quantization config.
+        rollout_overrides = json.loads(getattr(args, "sglang_json_model_override_args", None) or "{}")
+        rollout_quant_config = rollout_overrides.get(
+            "quantization_config", getattr(self.hf_config, "quantization_config", None)
+        )
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
                 source_getter=lambda: named_params_and_buffers(
@@ -603,7 +610,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             else:
                 update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-                # Push-side repack is decided by the HF config: an FP8 release auto-routes
+                # Push-side repack uses the effective rollout config: FP8 auto-routes
                 # through quantize_params_fp8, a compressed-tensors release through
                 # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
                 # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
@@ -616,7 +623,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 from relax.utils.quant_cast import augment_compressed_tensors_ignore
 
                 push_quant_config = augment_compressed_tensors_ignore(
-                    getattr(self.hf_config, "quantization_config", None),
+                    rollout_quant_config,
                     args.hf_checkpoint,
                 )
                 self.weight_updater = update_weight_cls(
@@ -1024,8 +1031,9 @@ class MegatronTrainRayActor(TrainRayActor):
         }
         from relax.utils.quant_cast import augment_compressed_tensors_ignore
 
+        rollout_overrides = json.loads(getattr(self.args, "sglang_json_model_override_args", None) or "{}")
         push_quant_config = augment_compressed_tensors_ignore(
-            getattr(self.hf_config, "quantization_config", None),
+            rollout_overrides.get("quantization_config", getattr(self.hf_config, "quantization_config", None)),
             self.args.hf_checkpoint,
         )
         return run(
