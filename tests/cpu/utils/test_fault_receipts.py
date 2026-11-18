@@ -414,9 +414,13 @@ def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exc
     cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "Actor")
     fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "update_weights_fully_async")
     ns = {}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), "Actor", "exec"), ns)
+    module = ast.Module(body=ast.parse("from __future__ import annotations").body + [fn], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "Actor", "exec"), ns)
     calls = []
-    owner = SimpleNamespace(actor_model=SimpleNamespace(update_weights_fully_async=lambda *a, **k: calls.append(k)))
+    owner = SimpleNamespace(
+        actor_model=SimpleNamespace(async_inference_call=lambda *a, **k: calls.append(k)),
+        _recovery=SimpleNamespace(state=None, wait=lambda refs: refs),
+    )
     ns[fn.name](owner)
     assert calls == [{"rollout_only": False, "actor_fwd_only": False}]
     assert not hasattr(owner, "_fault_receipt_sender")
@@ -434,7 +438,7 @@ def test_ordinary_component_calls_start_no_sender_and_observer_failure_keeps_exc
     token = {"run_id": new_id(), "recovery_id": new_id(), "recovery_generation": 1}
     ns[fn.name](owner, recovery_token=token)
     assert len(calls) == 2
-    owner.actor_model.update_weights_fully_async = broken_worker
+    owner.actor_model.async_inference_call = broken_worker
     with pytest.raises(ValueError, match="original worker error"):
         ns[fn.name](owner, recovery_token=token)
 

@@ -12,6 +12,7 @@ import concurrent.futures
 import copy
 import os
 import threading
+import time
 import traceback
 from argparse import Namespace
 from enum import Enum, IntEnum
@@ -22,8 +23,10 @@ from types import SimpleNamespace
 import ray
 from ray import serve
 
+from relax.components.recovery import RecoveryGate
 from relax.utils.async_utils import run as training_run
 from relax.utils.async_utils import shutdown_async_loop
+from relax.utils.env import Envs
 from relax.utils.fault_events import recovery
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.health_system import HealthChecker, HealthManager
@@ -62,6 +65,7 @@ def production_method(path, cls, method):
 SEND = production_method("relax/components/actor.py", "Actor", "update_weights_fully_async")
 RECV = production_method("relax/components/actor_fwd.py", "ActorFwd", "recv_weight_fully_async")
 GROUP_SEND = production_method("relax/distributed/ray/actor_group.py", "RayTrainGroup", "update_weights_fully_async")
+GROUP_INFERENCE = production_method("relax/distributed/ray/actor_group.py", "RayTrainGroup", "async_inference_call")
 GROUP_RECV = production_method("relax/distributed/ray/actor_group.py", "RayTrainGroup", "recv_weight_fully_async")
 
 
@@ -104,6 +108,9 @@ class CPUTrainGroup:
     def __init__(self, role, fail, gate):
         self._actor_handlers = [CPUWeightWorker.remote(role, fail, gate)]
 
+    def async_inference_call(self, *args, **kwargs):
+        return GROUP_INFERENCE(self, *args, **kwargs)
+
     def update_weights_fully_async(self, *args, **kwargs):
         return GROUP_SEND(self, *args, **kwargs)
 
@@ -120,6 +127,7 @@ class CPUReplica:
         self.step = 0
         self.done = asyncio.Event()
         self.actor_model = CPUTrainGroup(role, fail_weights, gate)
+        self._recovery = RecoveryGate(Namespace(), role)
 
     def update_weights_fully_async(self, **kwargs):
         return SEND(self, **kwargs)
@@ -169,6 +177,7 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
         traceback=traceback,
         Enum=Enum,
         IntEnum=IntEnum,
+        Envs=Envs,
         partial=partial,
         ray=ray_adapter,
         serve=serve_adapter,
@@ -185,7 +194,7 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
         tq=SimpleNamespace(close=lambda: None),
         close_tq_owner=lambda _owner: None,  # Data-system initialization is also replaced below.
         recovery_load_path=lambda _: None,
-        time=SimpleNamespace(sleep=lambda _: None),
+        time=SimpleNamespace(sleep=lambda _: None, monotonic=time.monotonic),
         resolve_sft_algo_key=lambda _: "cpu",
         ALGOS={"cpu": {role: CPUReplica for role in ("actor", "actor_fwd", "reference", "advantages")}},
         register_extra_roles=lambda *args: None,
@@ -193,6 +202,8 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
         set_managed_opd_teacher_on_actor_service=noop,
     )
     cls = load_definitions("relax/core/controller.py", namespace)["Controller"]
+    # These cases isolate global recovery; local admission has its own runtime tests.
+    cls._create_inference_recovery_state = lambda self: None
     cls._initialize_data_system = lambda self: None
     cls._shutdown_agentic_rollout_services = lambda self: None
     cls._cleanup_s3_model_weights_after_init = lambda *args, **kwargs: None

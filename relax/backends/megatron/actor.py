@@ -12,7 +12,6 @@ from threading import Event
 from typing import Any, List
 
 import ray
-import requests
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
@@ -85,7 +84,6 @@ from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
-    consume_opd_train_data,
     has_managed_opd_teacher_manager,
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
@@ -97,7 +95,7 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.data_fields import build_async_train_data_fields, build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
@@ -106,7 +104,6 @@ from relax.utils.utils import (
     _extract_image_grids,
     _has_image_inputs,
     get_debug_data,
-    get_serve_url,
     merge_dict_list,
     process_args,
 )
@@ -858,6 +855,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._train_state_offloader.offload()
 
         print_memory("after offload model")
+        self._training_state_parked = True
 
     @timer
     def wake_up(self) -> None:
@@ -892,6 +890,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 raise RuntimeError("RELAX_DEBUG_DSV4_CP_P2P_WARMUP only supports static context parallelism")
             warmup_static_cp_forward_neighbor_p2p()
         print_memory("after wake_up model")
+        self._training_state_parked = False
 
     def _switch_model(self, target_tag: str) -> None:
         self._flush_resident_sft_parameters()
@@ -1372,82 +1371,33 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
-    def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
-        is_offline = is_offline_mode(self.args)
+    def _run_step_evaluation(self, rollout_id: int) -> None:
+        """Run backend-local offline evaluation and prediction on every
+        rank."""
         has_rollout = getattr(self, "rollout_manager", None) is not None
-
-        if not is_offline and dist.get_rank() != 0:
-            return
-
-        if is_offline:
-            should_run_eval = should_run_sft_eval(self.args, rollout_id)
-            should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
-            if should_run_eval or should_run_predict:
-                self._flush_resident_sft_parameters()
-            try:
-                if should_run_eval:
-                    if rollout_id > 0 and dist.get_rank() == 0:
-                        for partition_id in sft_partition_ids(self.args, rollout_id - 1):
-                            run(
-                                self.data_system_client.async_clear_partition(
-                                    partition_id=partition_id,
-                                )
+        should_run_eval = should_run_sft_eval(self.args, rollout_id)
+        should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
+        if should_run_eval or should_run_predict:
+            self._flush_resident_sft_parameters()
+        try:
+            if should_run_eval:
+                if rollout_id > 0 and dist.get_rank() == 0:
+                    for partition_id in sft_partition_ids(self.args, rollout_id - 1):
+                        run(
+                            self.data_system_client.async_clear_partition(
+                                partition_id=partition_id,
                             )
-                    dist.barrier(group=get_gloo_group())
-                    with manual_gc_eval(self.args):
-                        run_sft_eval(self, rollout_id)
+                        )
+                dist.barrier(group=get_gloo_group())
+                with manual_gc_eval(self.args):
+                    run_sft_eval(self, rollout_id)
 
-                if should_run_predict:
-                    with manual_gc_eval(self.args):
-                        run_sft_predict(self, rollout_id)
-            except Exception as e:
-                logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
-                raise
-            return
-
-        # RL path: trigger rollout-based evaluation if configured.
-        # Telemetry marks for RL eval live on the Rollout side
-        # (see Rollout._run_eval_with_mark), so we don't emit them here.
-        if not has_rollout:
-            return
-        rollout_serve_url = get_serve_url("rollout")
-        try:
-            # NOTE: /evaluate runs rollout-side inference and can legitimately
-            # take much longer than a short RPC, so it is intentionally left
-            # without an HTTP timeout -- a fixed timeout would falsely abort a
-            # long eval. This block's failure is non-fatal (logged, training
-            # continues).
-            response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
-            response.raise_for_status()
+            if should_run_predict:
+                with manual_gc_eval(self.args):
+                    run_sft_predict(self, rollout_id)
         except Exception as e:
-            logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
-        finally:
-            # Cleanup MUST run even if /evaluate failed, otherwise rollout + health
-            # monitoring stay paused forever. Short call -> keep the timeout;
-            # swallow its own errors independently.
-            if end_update_weight:
-                self._end_rollout_weight_update(rollout_id)
-
-    def _end_rollout_weight_update(self, rollout_id: int) -> None:
-        """Release the rollout handshake even when no new policy was
-        published."""
-        if (
-            getattr(self, "_managed_lora_publication", False)
-            or getattr(self, "rollout_manager", None) is None
-            or dist.get_rank(group=dist.group.WORLD) != 0
-        ):
-            return
-        try:
-            response = requests.get(
-                f"{get_serve_url('rollout')}/end_update_weight", timeout=self.args.rollout_http_timeout
-            )
-            response.raise_for_status()
-        except Exception as e:
-            logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
-
-    def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
-        """Backward-compatible name kept for existing internal call sites."""
-        self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
+            logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
+            raise
 
     @manual_gc_training
     def train(self, rollout_id: int) -> None:
@@ -2346,25 +2296,8 @@ class MegatronTrainRayActor(TrainRayActor):
             and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
         ):
             self.save_model(rollout_id, force_sync=is_train_done)
-        has_rollout = getattr(self, "rollout_manager", None) is not None
-        if self._per_step_rollout:
-            if self.args.offload_train:
-                self.sleep()
-            if has_rollout:
-                self.update_weights()
-        with timer("train_metrics_flush"):
-            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done)
-        # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
-        # uses local eval/predict runner below.
-        dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
-
-        # On the final training step the rollout component has already exited
-        # its main loop, so nothing else awaits the eval handler. Block here
-        # until eval finishes; otherwise the controller's atexit shutdown
-        # races with eval and tears down the SGLang engines mid-flight.
-        if is_train_done:
-            self._wait_for_previous_eval()
+        if self._per_step_rollout and self.args.offload_train:
+            self.sleep()
 
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
@@ -2404,9 +2337,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
                 self._put_data_to_transfer_queue(output_dict, batch_meta, data)
         self.prof.step(rollout_id=rollout_id)
-
-        self.recv_weight_fully_async(rollout_id)
-        log_perf_data_fwd(self.args, rollout_id)
 
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
@@ -2458,7 +2388,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     RoutingReplay.clear_all_forward()
         self.prof.step(rollout_id=rollout_id)
 
-        self.recv_weight_fully_async(rollout_id)
+    def finish_forward_metrics(self, rollout_id: int) -> None:
         log_perf_data_fwd(self.args, rollout_id)
 
     def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch) -> None:
@@ -2823,77 +2753,13 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             self.sleep()
 
-        if self.args.debug_train_only:
-            # In debug_train_only mode no rollout/eval services exist, so skip the
-            # weight-sync + eval coordination below (mirrors `train`'s debug path
-            # which never touches those services). Metrics are still flushed.
-            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-            return
-
-        # Mirror train_async's pause/resume coordination so the rollout service
-        # has a chance to finish its in-flight step (and refill any partition
-        # gaps it owes) before we swap weights. Without this gate the rollout
-        # can race ahead while train_hybrid is still mid-consume on a
-        # partially-filled partition, deadlocking against the staleness bound.
-        self._wait_for_previous_eval()
-        rollout_only, actor_fwd_only = self._check_services_health()
-
-        # DCS shares the full-async lock and recovered-engine publication path.
-        if actor_fwd_only:
-            # Match full-async: a failed rollout handshake must not bypass the drain fence.
-            logger.warning("skip weight sync this step: rollout handshake failed")
-        else:
-            self.update_weights()
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-        dist.barrier(group=get_gloo_group())
-        if actor_fwd_only:
-            self._end_rollout_weight_update(rollout_id)
-            return
-        self._run_step_evaluation(
-            evaluation_step_for_rollout(self.args, rollout_id),
-            end_update_weight=True,
-        )
-
-        # On the final training step the rollout component has already exited
-        # its main loop, so the eval just triggered above will not be awaited
-        # anywhere. Block until it finishes; otherwise the controller's atexit
-        # shutdown races with eval and tears down the SGLang engines mid-flight.
-        if is_train_done:
-            self._wait_for_previous_eval()
-
     @manual_gc_training
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train step.")
-        data_fields = [
-            "tokens",
-            "total_lengths",
-            "response_lengths",
-            "loss_masks",
-            "advantages",
-            "returns",
-            "rollout_log_probs",
-            "rewards",
-            "sample_indices",
-            "sample_index_mask_sums",
-            "group_index",
-        ]
-        # In true on-policy mode, actor_fwd is absent and old_log_probs is
-        # recomputed inline from the train forward (see policy_loss_function).
-        if self.args.advantage_estimator == "score_centering":
-            data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
-        if not getattr(self.args, "true_on_policy_mode", False):
-            data_fields.append("log_probs")
-        if self.args.kl_coef != 0 or self.args.use_kl_loss:
-            data_fields.append("ref_log_probs")
-        if self.args.multimodal_keys is not None:
-            data_fields.append("multimodal_train_inputs")
-        if self.args.use_opd:
-            consume_opd_train_data(data_fields, self.args)
-        if agentic_obs_enabled(self.args):
-            data_fields.extend(OBSERVATION_DATA_FIELDS)
+        data_fields = build_async_train_data_fields(self.args)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
@@ -2941,27 +2807,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
             )
 
-            # Wait for prior eval before pausing rollout for weight sync.
-            self._wait_for_previous_eval()
-
-            rollout_only, actor_fwd_only = self._check_services_health()
-            self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
-            dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(
-                evaluation_step_for_rollout(self.args, rollout_id),
-                end_update_weight=True,
-            )
-            # On the final training step the rollout component has already
-            # exited its main loop, so the eval just triggered above will not
-            # be awaited anywhere. Block until it finishes; otherwise the
-            # controller's atexit shutdown races with eval and tears down the
-            # SGLang engines mid-flight.
-            if (rollout_id + 1) == self.args.num_rollout:
-                self._wait_for_previous_eval()
-
             if self.args.use_routing_replay:
                 RoutingReplay.clear_all()
 
+        self._pending_training_metrics = rollout_data
+        # Keep the step interval open until the component finishes its tail.
+        Timer().end("train_wait")
+        Timer().start("train")
+
+    def _log_async_training_perf(self, rollout_id: int, rollout_data: dict) -> None:
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
@@ -3002,7 +2856,25 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+
+    def finish_training_metrics(self, rollout_id: int) -> None:
+        if self.args.fully_async and not self.args.hybrid:
+            Timer().end("train")
+            Timer().start("train_wait")
+            self._log_async_training_perf(rollout_id, self._pending_training_metrics)
+            del self._pending_training_metrics
+        if not self.args.fully_async and not self.args.hybrid:
+            with timer("train_metrics_flush"):
+                tracking_utils.flush_metrics(
+                    self.args,
+                    compute_rollout_step(self.args, rollout_id),
+                    wait=rollout_id + 1 == self.args.num_rollout,
+                )
+        else:
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+
+    def record_inference_wait(self, elapsed_seconds: float) -> None:
+        Timer().add("wait update_weights_fully_async", elapsed_seconds)
 
     @timer
     @annotate_failure_stage("checkpoint")
@@ -3080,6 +2952,52 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("rollout_actor")
         else:
             self.weights_backuper.backup("old_actor")
+
+    def evaluate_after_training(self, rollout_id: int) -> None:
+        """Evaluate the admitted model version using the backend's local
+        state."""
+        dist.barrier(group=get_gloo_group())
+        self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
+
+    def reset_inference_transport(self, role: str) -> None:
+        """Called on every idle original Actor rank under a recovery
+        reservation."""
+        run(self.checkpoint_engine_client.reset_inference_transport(role))
+
+    def unregister_inference_transport(self) -> None:
+        """Strictly unregister an idle old ActorFwd worker before replacing
+        it."""
+        run(self.checkpoint_engine_client.unregister_for_recovery())
+
+    def recovery_update_weights_colocate(
+        self, engines: list, engine_lock: Any, engine_gpu_counts: list[int], engine_gpu_offsets: list[int]
+    ) -> None:
+        """Push the existing CPU Actor backup without waking or rotating
+        training state."""
+        if (
+            self.role != "actor"
+            or not self.args.colocate
+            or self.args.fully_async
+            or not self.args.offload_train
+            or not self.args.enable_weights_backuper
+            or not getattr(self, "_training_state_parked", False)
+            or not isinstance(self.weight_updater, UpdateWeightFromTensor)
+        ):
+            raise RuntimeError("Colocate recovery requires the sleeping Actor and its CPU weight backup")
+        weights = self.weights_backuper.get("actor")
+        if not weights or any(tensor.device.type != "cpu" for tensor in weights.values()):
+            raise RuntimeError("Colocate recovery requires a nonempty CPU Actor backup")
+        reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes, max_retries=1, retry_delay=0)
+        try:
+            self.weight_updater.prepare_for_recovery(engines, engine_lock, engine_gpu_counts, engine_gpu_offsets)
+            with self._train_state_offloader.disable_during_update():
+                try:
+                    self.weight_updater.update_weights()
+                    device_module.synchronize()
+                finally:
+                    clear_memory()
+        finally:
+            destroy_process_groups()
 
     @timer
     def update_weights(self) -> None:
@@ -3211,137 +3129,14 @@ class MegatronTrainRayActor(TrainRayActor):
             if handles:
                 ray.get(handles)
 
-    @timer("wait update_weights_fully_async")
-    def _check_services_health(self) -> tuple[bool, bool]:
-        """Check rollout and actor_fwd service health before weight update.
-
-        Only rank 0 sends HTTP requests to check service availability, then
-        the results are broadcast via allreduce to ensure all ranks have a
-        consistent view.
-
-        Returns:
-            (rollout_only, actor_fwd_only): Flags indicating which services
-            are unavailable and should be skipped during weight update.
-        """
-        # Default: both services healthy → update both
-        rollout_only = False
-        actor_fwd_only = False
-        process_group = get_gloo_group()
-
-        # When true_on_policy_mode is enabled, actor_fwd is intentionally absent
-        # (its log_probs are recomputed inline by the train forward). Force
-        # rollout-only weight update and skip the actor_fwd HTTP probe.
-        actor_fwd_absent = getattr(self.args, "true_on_policy_mode", False)
-
-        if dist.get_rank(process_group) == 0:
-            # Check rollout service
-            try:
-                if getattr(self, "_managed_lora_publication", False):
-                    # Version publication owns rollout readiness. Do not enter
-                    # the legacy pause/recovery handshake.
-                    rollout_serve_url = None
-                else:
-                    rollout_serve_url = get_serve_url("rollout")
-                retry_deadline = None
-                while rollout_serve_url is not None:
-                    request_timeout = self.args.rollout_http_timeout
-                    if retry_deadline is not None:
-                        request_timeout = retry_deadline - time.monotonic()
-                        if request_timeout <= 0:
-                            raise requests.exceptions.Timeout("elastic scale-in fence did not clear")
-                    response = requests.get(
-                        f"{rollout_serve_url}/can_do_update_weight_for_async",
-                        timeout=request_timeout,
-                    )
-                    if getattr(response, "status_code", 200) == 503:
-                        if retry_deadline is None:
-                            retry_deadline = time.monotonic() + max(float(self.args.rollout_http_timeout), 1.0)
-                        logger.warning("Elastic scale-in is draining; retrying before weight update.")
-                        time.sleep(min(1.0, max(0.0, retry_deadline - time.monotonic())))
-                        continue
-                    response.raise_for_status()
-                    # A successful non-503 response means the scale-in fence
-                    # has cleared. Do not let an earlier draining deadline
-                    # bound the normal readiness polling below.
-                    retry_deadline = None
-                    res = response.json()
-                    if res:
-                        response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
-                        response.raise_for_status()
-                        break
-                    else:
-                        time.sleep(1)
-            except Exception as e:
-                logger.warning(
-                    f"Error checking rollout service: {e}, maybe caused by rollout server failure. "
-                    "Will continue without rollout update for this step."
-                )
-                actor_fwd_only = True
-
-            # Check actor_fwd service. Skip the probe when actor_fwd is
-            # intentionally absent — either true_on_policy_mode (log_probs
-            # recomputed inline by train forward) or hybrid mode (actor
-            # handles forward via _switch_model, no separate service).
-            if actor_fwd_absent or getattr(self.args, "hybrid", False):
-                rollout_only = True
-            else:
-                try:
-                    actor_fwd_serve_url = get_serve_url("actor_fwd")
-                    response = requests.get(f"{actor_fwd_serve_url}/get_step", timeout=self.args.rollout_http_timeout)
-                    response.raise_for_status()
-                except Exception as e:
-                    logger.warning(
-                        f"Error checking actor_fwd service: {e}, maybe caused by actor_fwd server failure. "
-                        "Will continue without actor_fwd update for this step."
-                    )
-                    rollout_only = True
-
-        # Broadcast results from rank 0 to all ranks via allreduce
-        # Encode booleans as integers: 1 = skip, 0 = healthy
-        flags = torch.tensor(
-            [int(rollout_only), int(actor_fwd_only)],
-            dtype=torch.int32,
-            device="cpu",
-        )
-        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=process_group)
-        rollout_only = bool(flags[0].item())
-        actor_fwd_only = bool(flags[1].item())
-
-        return rollout_only, actor_fwd_only
-
-    def _wait_for_previous_eval(self, max_wait_seconds: int = 1800) -> None:
-        """Block until the rollout service's previous evaluation has finished.
-
-        Only rank 0 polls the rollout HTTP endpoint; all ranks synchronise via
-        a barrier afterwards so they proceed together.
-        Args:
-            max_wait_seconds: Maximum time (in seconds) to wait for eval
-                completion before giving up and proceeding. Defaults to 300.
-        """
-        if dist.get_rank() == 0:
-            try:
-                rollout_serve_url = get_serve_url("rollout")
-                start_time = time.monotonic()
-                while True:
-                    response = requests.get(f"{rollout_serve_url}/is_eval_done", timeout=10)
-                    response.raise_for_status()
-                    if response.json().get("done", True):
-                        break
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= max_wait_seconds:
-                        logger.warning(
-                            f"Timed out waiting for previous evaluation after {elapsed:.1f}s "
-                            f"(max_wait_seconds={max_wait_seconds}), proceeding with weight update."
-                        )
-                        break
-                    logger.info("Waiting for previous evaluation to finish before updating weights...")
-                    time.sleep(10)
-            except Exception as e:
-                logger.warning(f"Error checking eval status: {e}, proceeding with weight update.")
-        dist.barrier(group=get_gloo_group())
-
     @timer
-    def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
+    def update_weights_fully_async(
+        self,
+        rollout_id,
+        rollout_only=False,
+        actor_fwd_only=False,
+        expected_rollout_actor_ids: list[str] | None = None,
+    ) -> None:
         """Fully async version of update_weights, which will be called by actor
         train engine after it train update.
 
@@ -3383,8 +3178,11 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
+            sync_options = {}
+            if expected_rollout_actor_ids is not None:
+                sync_options["expected_rollout_actor_ids"] = expected_rollout_actor_ids
             synced_actor_ids = run(
-                self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only)
+                self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only, **sync_options)
             )
             if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0 and synced_actor_ids:
                 try:

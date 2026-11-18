@@ -8,6 +8,7 @@ import pytest
 
 from relax.backends.megatron import actor as actor_module
 from relax.components.actor import Actor
+from relax.distributed.ray import inference_sync
 
 
 @pytest.fixture(params=[None, "elastic.yaml"])
@@ -30,6 +31,7 @@ def hybrid_actor(monkeypatch, request):
         keep_old_actor=False,
     )
     actor.role = "actor"
+    actor._inference_recovery = None
     actor._use_dcs_hybrid_weight_sync = True
     state = SimpleNamespace(awake=True, tp_group=object(), updating=False, events=[])
 
@@ -119,7 +121,9 @@ def test_hybrid_dcs_restores_explicit_rollout_offload(hybrid_actor, monkeypatch,
 
 @pytest.mark.parametrize("offload_train", [False, True])
 @pytest.mark.parametrize("fail_sync", [False, True])
-def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_actor, offload_train, fail_sync):
+def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(
+    hybrid_actor, monkeypatch, offload_train, fail_sync
+):
     actor, state = hybrid_actor
     actor.args.offload_train = offload_train
     if offload_train:
@@ -135,13 +139,21 @@ def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_ac
             raise RuntimeError("sync failed")
 
     actor.update_weights_fully_async = push
-    config = SimpleNamespace(hybrid=True, fully_async=True, autoscaler_config="elastic.yaml", loss_type="policy_loss")
+    config = SimpleNamespace(
+        hybrid=True,
+        fully_async=True,
+        autoscaler_config="elastic.yaml",
+        loss_type="policy_loss",
+        train_backend="megatron",
+    )
+    manager = SimpleNamespace(get_lora_training_config=SimpleNamespace(remote=lambda: None))
+    monkeypatch.setattr(actor_module.ray, "get", lambda value: value)
     service = SimpleNamespace(config=config, actor_model=actor)
     if fail_sync:
         with pytest.raises(RuntimeError, match="sync failed"):
-            Actor.func_or_class.set_rollout_manager(service, object())
+            Actor.func_or_class.set_rollout_manager(service, manager)
     else:
-        Actor.func_or_class.set_rollout_manager(service, object())
+        Actor.func_or_class.set_rollout_manager(service, manager)
     assert state.awake is not offload_train
     assert (state.tp_group is None) is offload_train
     assert not state.updating
@@ -195,13 +207,12 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     actor.all_consumed = lambda *_a, **_kw: False
     actor._get_data_from_transfer_queue = lambda *_a: ({"total_lengths": [2, 3]}, None)
     actor._hybrid_forward_subbatch = Mock()
-    actor._wait_for_previous_eval = Mock()
-    actor._check_services_health = lambda: (True, not handshake_ok)
-    actor._run_step_evaluation = Mock()
+    monkeypatch.setattr(inference_sync, "wait_for_previous_eval", Mock())
+    monkeypatch.setattr(inference_sync, "check_services_health", lambda *a, **k: (True, not handshake_ok))
     actor.rollout_manager = object()
     cleanup = Mock(return_value=SimpleNamespace(raise_for_status=lambda: None))
-    monkeypatch.setattr(actor_module.requests, "get", cleanup)
-    monkeypatch.setattr(actor_module, "get_serve_url", lambda role: "http://rollout")
+    monkeypatch.setattr(inference_sync.requests, "get", cleanup)
+    monkeypatch.setattr(inference_sync, "get_serve_url", lambda role: "http://rollout")
     monkeypatch.setattr(actor_module.dist, "get_rank", lambda *args, **kwargs: 0)
 
     def checkpoint(*_a, **_kw):
@@ -239,7 +250,7 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     monkeypatch.setattr(actor_module, "train", Mock())
     monkeypatch.setattr(actor_module, "log_rollout_data", Mock())
     monkeypatch.setattr(actor_module, "log_perf_data", Mock())
-    monkeypatch.setattr(actor_module, "Timer", SimpleNamespace)
+    monkeypatch.setattr(actor_module, "Timer", lambda: SimpleNamespace(add=Mock()))
     monkeypatch.setattr(actor_module.train_dump_utils, "save_debug_train_data", Mock())
     monkeypatch.setattr(actor_module.tracking_utils, "flush_metrics", Mock())
     monkeypatch.setattr(actor_module, "compute_rollout_step", lambda *_a: 0)
@@ -247,11 +258,17 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
     state.events.clear()
     for step in range(2):
         actor.train_hybrid(step)
+        group = SimpleNamespace(
+            async_inference_call=lambda method, *args, **kwargs: [getattr(actor, method)(*args, **kwargs)]
+        )
+        inference_sync.complete_inference_step(
+            actor.args, group, step, has_rollout=True, managed=False, settle=lambda refs: refs
+        )
         assert not state.awake and state.tp_group is None
     assert state.events.count("push") == (2 if handshake_ok else 0)
     assert state.events.count("checkpoint") == (2 if save_checkpoint else 0)
     assert actor._advance_keep_old_actor_queue.call_count == (2 if handshake_ok else 0)
-    assert actor._run_step_evaluation.call_count == (2 if handshake_ok else 0)
+    assert sum(call.args[0].endswith("/evaluate") for call in cleanup.call_args_list) == (2 if handshake_ok else 0)
     assert actor_module.tracking_utils.flush_metrics.call_count == 2
     if not handshake_ok:
         assert cleanup.call_count == 2

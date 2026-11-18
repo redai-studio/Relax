@@ -29,6 +29,7 @@ from relax.agentic.session.service import (
     _SessionResultCell,
 )
 from relax.agentic.stage_recorder import StageRecorder
+from relax.components.recovery import RecoveryGate
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
 
@@ -325,6 +326,7 @@ class _Harness:
         self.rollout = object.__new__(Rollout)
         self.rollout._logger_instance = get_logger(__name__)
         self.rollout.config = self.args
+        self.rollout._recovery_gate = RecoveryGate(self.args, "rollout")
         self.rollout.step = 0
         self.rollout.status = "running"
         self.rollout.eval_handler = None

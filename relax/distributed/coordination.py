@@ -38,6 +38,10 @@ class RolloutOffloadBarrier:
         self._poll_interval = poll_interval
         self._logger = logger
 
+    def is_offloaded_sync(self) -> bool:
+        """Observe GPU ownership without blocking recovery admission."""
+        return ray.get(self._rollout_manager.get_status.remote()) != "onload"
+
     async def wait_offloaded(self) -> None:
         while ray.get(self._rollout_manager.get_status.remote()) == "onload":
             await asyncio.sleep(self._poll_interval)

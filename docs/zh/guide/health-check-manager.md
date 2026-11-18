@@ -11,6 +11,8 @@
 
 ## 快速开始
 
+Rollout 和独立 ActorFwd 还有一条针对明确异常的局部恢复路径，可以保留训练 Actor。它的默认开关、支持条件以及与健康检查的关系，见[推理服务局部自愈](./inference-recovery.md)。
+
 在训练命令中添加 `--use-health-check` 即可启用健康检查：
 
 ```bash

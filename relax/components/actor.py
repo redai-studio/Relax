@@ -3,6 +3,7 @@
 import threading
 import time
 from argparse import Namespace
+from contextlib import suppress
 from typing import Any, Dict, Optional
 
 import ray
@@ -11,8 +12,11 @@ from ray import serve
 
 from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
+from relax.components.recovery import RecoveryGate
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.distributed.ray.inference_sync import complete_inference_step
 from relax.distributed.ray.placement_group import allocate_train_group
+from relax.distributed.settlement import wait_all
 from relax.engine.sft.runtime import (
     is_dpo_mode,
     is_offline_mode,
@@ -22,6 +26,7 @@ from relax.engine.sft.runtime import (
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.training.data_fields import build_async_train_data_fields, build_data_fields
 
 
 app = FastAPI()
@@ -66,6 +71,9 @@ class Actor(Base):
         self._lock = threading.RLock()
         self.healthy = healthy
         self.role = role
+        self._recovery = RecoveryGate(config, role)
+        self.rollout_manager = None
+        self._managed_lora_publication = False
         self.genrm_manager = None  # Set later via set_genrm_manager if genRM is enabled
 
         # Threading primitives so the training loop doesn't block the Serve/FastAPI thread
@@ -112,11 +120,33 @@ class Actor(Base):
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         """Set the rollout manager and initialize weights."""
         self.rollout_manager = rollout_manager
+        if self.config.train_backend == "megatron":
+            self._managed_lora_publication = ray.get(rollout_manager.get_lora_training_config.remote()) is not None
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
         # The backend owns sync and offload lifecycles. SFT syncs before predict.
         if (not self.config.fully_async or self.config.hybrid) and not is_offline_mode(self.config):
             self.actor_model.update_weights()
+
+    def rebind_rollout_manager(self, rollout_manager: Any) -> None:
+        """Replace the inference target while the original training workers are
+        idle."""
+        self.rollout_manager = rollout_manager
+        if self.config.train_backend == "megatron":
+            self._managed_lora_publication = ray.get(rollout_manager.get_lora_training_config.remote()) is not None
+        wait_all(self.actor_model.async_inference_call("set_rollout_manager", rollout_manager))
+
+    def recovery_update_weights_colocate(
+        self, engines: list, engine_lock: Any, engine_gpu_counts: list[int], engine_gpu_offsets: list[int]
+    ) -> None:
+        wait_all(
+            self.actor_model.async_inference_call(
+                "recovery_update_weights_colocate", engines, engine_lock, engine_gpu_counts, engine_gpu_offsets
+            )
+        )
+
+    def reset_inference_transport(self, role: str) -> None:
+        wait_all(self.actor_model.async_inference_call("reset_inference_transport", role))
 
     def set_barriers(
         self,
@@ -150,11 +180,18 @@ class Actor(Base):
         rollout_only: bool = False,
         actor_fwd_only: bool = False,
         recovery_token: dict | None = None,
+        expected_rollout_actor_ids: Optional[list[str]] = None,
+        sync_step: int = 0,
     ) -> None:
         from relax.utils.fault_events.receipts import emit_receipt
 
+        sync_options = dict(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        if expected_rollout_actor_ids is not None:
+            sync_options["expected_rollout_actor_ids"] = expected_rollout_actor_ids
         try:
-            self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+            self._recovery.wait(
+                self.actor_model.async_inference_call("update_weights_fully_async", sync_step, **sync_options)
+            )
         except Exception:
             emit_receipt(self, recovery_token, "actor_send", "failed")
             raise
@@ -193,24 +230,24 @@ class Actor(Base):
                     if not self._wait_for_rollout_data():
                         continue
 
-                self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
-                did_train = self._execute_training()
-
-                self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
-
-                if did_train:
-                    for partition_id in sft_partition_ids(self.config, local_step):
-                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
-                    self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
-
+                fields = ()
+                if self._recovery.state is not None:
+                    fields = (
+                        build_async_train_data_fields(self.config)
+                        if self.config.fully_async and not getattr(self.config, "hybrid", False)
+                        else build_data_fields(self.config, consumer="actor")
+                    )
+                local_step = self._recovery.admit(local_step, self.data_system_client, fields, self._stop_event)
+                if local_step is None:
+                    break
+                self.step = local_step
                 try:
-                    self.healthy.update_heartbeat.remote("actor", local_step + 1)
-                except Exception:
-                    pass
-
-                # increment step with lock
-                with self._lock:
-                    self.step += 1
+                    self._run_training_step(local_step)
+                except Exception as exc:
+                    self._recovery.fail(exc)
+                    raise
+                finally:
+                    self._recovery.leave()
 
         except Exception as e:
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
@@ -232,6 +269,21 @@ class Actor(Base):
         if self.step < self.config.num_rollout:
             raise RuntimeError("Actor stopped before all training steps finished")
 
+    def _run_training_step(self, local_step: int) -> None:
+        """Train and clear consumed data before committing the next step."""
+        self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
+        did_train = self._execute_training()
+        self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
+        if did_train:
+            for partition_id in sft_partition_ids(self.config, local_step):
+                run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+            self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
+        # Heartbeat submission is best-effort; training and data errors must propagate.
+        with suppress(Exception):
+            self.healthy.update_heartbeat.remote("actor", local_step + 1)
+        with self._lock:
+            self.step = local_step + 1
+
     def _wait_for_rollout_data(self) -> bool:
         """Wait for rollout data to be ready in async colocate mode.
 
@@ -239,6 +291,20 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
+        if self._recovery.state is not None:
+            if ray.get(self._recovery.state.snapshot.remote())["paused"]:
+                time.sleep(0.05)
+                return False
+            if self.config.offload_rollout and self._rollout_barrier is not None:
+                try:
+                    if not self._rollout_barrier.is_offloaded_sync():
+                        time.sleep(0.05)
+                        return False
+                except Exception:
+                    if not ray.get(self._recovery.state.snapshot.remote())["paused"]:
+                        raise
+                    return False
+            return True
         partition_list = run(self.data_system_client.async_get_partition_list())
         if not partition_list or not all(
             partition_id in partition_list for partition_id in sft_partition_ids(self.config, self.step)
@@ -299,16 +365,28 @@ class Actor(Base):
                 self.actor_model.update_weights()
             return False
 
-        # Use appropriate training method based on mode
         if self.config.hybrid:
-            # hybrid mode: actor handles ref/actor_fwd/adv internally
-            ray.get(self.actor_model.train_hybrid(self.step))
+            refs = self.actor_model.train_hybrid(self.step)
         elif self.config.fully_async:
-            ray.get(self.actor_model.train_fully_async(self.step))
-            # Save model checkpoint if needed
-            self._maybe_save_model()
+            refs = self.actor_model.train_fully_async(self.step)
         else:
-            ray.get(self.actor_model.async_train(self.step))
+            refs = self.actor_model.async_train(self.step)
+        self._recovery.wait(refs)
+        if self.config.train_backend == "megatron":
+            synchronized = self._recovery.synchronize(
+                lambda: complete_inference_step(
+                    self.config,
+                    self.actor_model,
+                    self.step,
+                    has_rollout=self.rollout_manager is not None,
+                    managed=self._managed_lora_publication,
+                    settle=self._recovery.wait,
+                )
+            )
+            if not synchronized:
+                self._recovery.wait(self.actor_model.async_inference_call("finish_training_metrics", self.step))
+        if self.config.fully_async and not self.config.hybrid:
+            self._maybe_save_model()
         return True
 
     def _maybe_save_model(self) -> None:
