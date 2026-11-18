@@ -4,12 +4,14 @@
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from relax.components.sft import SFT
 from tests.cpu.components.test_sft import _make_args, _make_processed
+from tests.cpu.core.controller_test_utils import load_controller_with_stubbed_dependencies
 
 
 def _service():
@@ -215,6 +217,70 @@ async def test_cancelled_stop_request_keeps_resource_cleanup_owned():
     release.set()
     await asyncio.wait_for(asyncio.gather(preparing, service.stop()), timeout=5)
     pool.shutdown.assert_called_once_with(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_controller_waits_for_slow_first_batch_before_closing_queue(monkeypatch):
+    controller_module = load_controller_with_stubbed_dependencies("_test_sft_slow_cleanup")
+    entered, release, stop_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    events = []
+
+    class Dataset:
+        async def get_batch_async(self, count):
+            entered.set()
+            await release.wait()
+            return [_make_processed(0)], False
+
+        def stop(self):
+            events.append("dataset-stopped")
+
+    service = _service()
+    service.config = _make_args(global_batch_size=1, num_rollout=1)
+    service._dataset = Dataset()
+    service._tokenizer = MagicMock()
+    service._train_size = 1
+    service._init_data_pipeline = MagicMock()
+    service.data_system_client = MagicMock()
+    service.data_system_client.async_get_partition_list = AsyncMock(return_value=[])
+    service.data_system_client.async_put = AsyncMock(side_effect=lambda **_kwargs: events.append("put"))
+    loop = asyncio.get_running_loop()
+
+    async def owned_stop():
+        stop_started.set()
+        await service.stop()
+
+    async def remote_stop():
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(owned_stop(), loop))
+
+    deployment = SimpleNamespace(
+        _sft_prepare_response=object(), handle=SimpleNamespace(stop=SimpleNamespace(remote=remote_stop))
+    )
+    controller = controller_module.Controller.__new__(controller_module.Controller)
+    original_wait_for = asyncio.wait_for
+
+    async def shortened_timeout(awaitable, timeout):
+        # Exercise the old 30-second cutoff without making this a slow test.
+        return await original_wait_for(awaitable, timeout=0.01)
+
+    monkeypatch.setattr(controller_module.asyncio, "wait_for", shortened_timeout)
+
+    def close_after_stop():
+        controller._stop_prepared_sft(deployment)
+        events.append("queue-closed")
+
+    preparing = asyncio.create_task(service.prepare(prefetch_first_batch=True))
+    async with asyncio.timeout(5):
+        await entered.wait()
+        closing = asyncio.create_task(asyncio.to_thread(close_after_stop))
+        try:
+            await stop_started.wait()
+            await asyncio.sleep(0.05)
+            assert not closing.done()
+            assert "queue-closed" not in events
+        finally:
+            release.set()
+            await asyncio.gather(preparing, closing, service.stop())
+    assert events == ["put", "dataset-stopped", "queue-closed"]
 
 
 @pytest.mark.asyncio

@@ -804,7 +804,9 @@ class Controller:
             return
 
         async def stop() -> None:
-            await asyncio.wait_for(service.handle.stop.remote(), timeout=30)
+            # SFT owns shielded prepare/cleanup tasks. A local timeout would
+            # leave them running while callers tear down their TransferQueue.
+            await service.handle.stop.remote()
 
         try:
             run(stop())
