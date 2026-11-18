@@ -4177,7 +4177,14 @@ def slime_validate_args(args):
         )
 
     if getattr(args, "use_rollout_indexer_replay", False):
+        is_keye = getattr(args, "sglang_external_model_package", None) == "relax.models.keye_vl2.sglang"
         unsupported = []
+        if is_keye and args.dsa_indexer_loss_coeff != 0:
+            unsupported.append("Keye replay requires explicit --dsa-indexer-loss-coeff 0")
+        if is_keye and args.micro_batch_size != 1:
+            unsupported.append("Keye requires micro batch size 1")
+        if is_keye and args.recompute_granularity == "selective":
+            unsupported.append("Keye does not support selective recomputation")
         if is_offline:
             unsupported.append(f"offline training ({args.loss_type})")
         if args.train_backend != "megatron":
@@ -4200,17 +4207,30 @@ def slime_validate_args(args):
             unsupported.append(f"custom generate_function_path={args.custom_generate_function_path}")
         if args.qkv_format != "thd":
             unsupported.append(f"qkv_format={args.qkv_format}")
-        if args.context_parallel_size <= 1:
-            unsupported.append(f"context_parallel_size={args.context_parallel_size}")
-        if not args.allgather_cp or args.cp_partition_mode != "contiguous":
-            unsupported.append("non-contiguous/non-allgather CP")
+        if is_keye:
+            if args.allgather_cp or (args.context_parallel_size > 1 and args.cp_partition_mode != "zigzag"):
+                unsupported.append("Keye requires per-sample zigzag CP")
+            if args.pipeline_model_parallel_size != 1 or getattr(args, "virtual_pipeline_model_parallel_size", None):
+                unsupported.append("Keye requires PP1 without virtual pipeline stages")
+            if not getattr(args, "sglang_disable_overlap_schedule", False):
+                unsupported.append("Keye requires non-overlapped SGLang scheduling")
+        else:
+            if args.context_parallel_size <= 1:
+                unsupported.append(f"context_parallel_size={args.context_parallel_size}")
+            if not args.allgather_cp or args.cp_partition_mode != "contiguous":
+                unsupported.append("non-contiguous/non-allgather CP")
         if args.tensor_model_parallel_size != 1 or args.sequence_parallel:
             unsupported.append("TP>1/sequence parallel")
         if args.dynamic_context_parallel:
             unsupported.append("dynamic CP")
         if args.enable_mtp_training or args.sglang_speculative_algorithm:
             unsupported.append("MTP/speculative decoding")
-        if not args.sglang_enable_dp_attention:
+        if is_keye:
+            rollout_tp = args.rollout_num_gpus_per_engine // args.sglang_pp_size
+            rollout_dp = args.sglang_dp_size if args.sglang_enable_dp_attention else 1
+            if args.sglang_pp_size != 1 or rollout_tp != rollout_dp:
+                unsupported.append("Keye requires SGLang attention TP1 and PP1")
+        elif not args.sglang_enable_dp_attention:
             unsupported.append("SGLang attention TP>1")
         if getattr(args, "sglang_enable_hierarchical_cache", False):
             unsupported.append("SGLang hierarchical cache")
@@ -4222,9 +4242,9 @@ def slime_validate_args(args):
             unsupported.append("combined-1f1b")
         if unsupported:
             raise ValueError(
-                "--use-rollout-indexer-replay currently supports only colocated Megatron DeepSeek-V4 "
-                "THD with static contiguous allgather CP, TP1, SGLang DP attention, no MTP, and zero "
-                f"indexer teacher-loss coefficient; unsupported settings: {', '.join(unsupported)}."
+                "--use-rollout-indexer-replay requires colocated Megatron THD with supported "
+                "DeepSeek-V4 C4 or Keye-VL2 text attention. "
+                f"Unsupported settings: {', '.join(unsupported)}."
             )
 
     validate_reward_side_kl(args, is_offline)

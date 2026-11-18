@@ -10,7 +10,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
 
 from ._prefetch import _ConsumerReadAhead
 from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, validate_sample
@@ -198,11 +198,11 @@ class ConsumerReadSession:
         """Conservative body plus row-selection scratch, including a large
         chunk.
 
-        Storage uses its publication byte limit for explicit-key read batches.
-        One indivisible chunk can exceed that limit.
+        Storage uses its read byte limit for explicit-key read batches. One
+        indivisible chunk can exceed that limit.
         """
         largest_chunk = max(min(ref.rows, ref.chunk_rows) * ref.topk * 4 for ref in self.refs)
-        return 2 * max(self.store.publication_bytes, largest_chunk)
+        return 2 * max(self.store.read_batch_bytes, largest_chunk)
 
     def retain(self) -> None:
         with self._lock:
@@ -238,7 +238,13 @@ class ConsumerReadSession:
                     output,
                 )
 
-    def _read_layers_into(self, samples: tuple[ConsumerSampleRowMap, ...], outputs: list[tuple[int, Any]]) -> None:
+    def _read_layers_into(
+        self,
+        samples: tuple[ConsumerSampleRowMap, ...],
+        outputs: list[tuple[int, Any]],
+        *,
+        on_layer: Callable[[int], None] | None = None,
+    ) -> None:
         with self._lock:
             if self._closing:
                 raise RuntimeError("Replay reader is closing or released")
@@ -246,7 +252,11 @@ class ConsumerReadSession:
                 (self.refs[row.sample_index], row.source_rows, row.output_rows, self._leases[row.sample_index])
                 for row in samples
             ]
-            self.store._read_layers_into([(requests, layer, output) for layer, output in outputs])
+            layers = [(requests, layer, output) for layer, output in outputs]
+            if on_layer is None:
+                self.store._read_layers_into(layers)
+            else:
+                self.store._read_layers_into(layers, on_layer=on_layer)
 
     def release(self) -> None:
         with self._lock:
@@ -374,6 +384,10 @@ class ConsumerLayerReader(ConsumerSource):
         cached = self.cache._read_ahead.read(self) if self.cache is not None else self._materialize()
         staging, mask = cached
         device = torch.device(self.device)
+        if self.kind == "indexer" and device.type == "cuda":
+            from ._staging import copy_indexer
+
+            return copy_indexer(staging, mask, device)
         # Callers own their returned tensors, while cached CPU storage stays
         # immutable. CUDA gets an independent allocation on the current stream.
         dtype = torch.long if self.kind == "moe" else torch.int32
@@ -401,14 +415,13 @@ class ConsumerLayerReader(ConsumerSource):
         staging_dtype = torch.int32
         if self.kind == "moe" and (not compact_cache or self.num_experts > 2**31):
             staging_dtype = torch.long
-        # A pageable as_tensor(..., device="cuda") serializes each replay read
-        # with the current CUDA stream. Pinned staging lets the copy enqueue
-        # on that stream without waiting for preceding model kernels.
+        # Indexer retention is pageable; its H2D path uses a bounded reusable
+        # pinned pool. MoE keeps its existing directly pinned materialization.
         staging = torch.empty(
             (len(self.batch_layout), first.topk),
             dtype=staging_dtype,
             device="cpu",
-            pin_memory=device.type == "cuda",
+            pin_memory=device.type == "cuda" and self.kind == "moe",
         )
         output = staging.numpy()
         output.fill(-1)
@@ -438,9 +451,7 @@ class ConsumerLayerReader(ConsumerSource):
                 compact.numpy()[:] = output
                 staging = compact
             return staging, None
-        mask = torch.empty(
-            self.batch_layout.valid.shape, dtype=torch.bool, device="cpu", pin_memory=device.type == "cuda"
-        )
+        mask = torch.empty(self.batch_layout.valid.shape, dtype=torch.bool, device="cpu")
         mask.numpy()[:] = self.batch_layout.valid
         # Never mutate/reuse a cached buffer; PyTorch also tracks outstanding
         # asynchronous copies if an eviction drops the final Python reference.

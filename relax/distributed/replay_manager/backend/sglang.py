@@ -83,6 +83,10 @@ class SGLangProducer(Producer):
                     )
                     if kind == "indexer":
                         topk = getattr(args, "dsa_indexer_topk", None)
+                        if getattr(args, "sglang_external_model_package", None) == "relax.models.keye_vl2.sglang":
+                            from relax.models.keye_vl2.topk import KEYE_INDEXER_TOPK
+
+                            topk = KEYE_INDEXER_TOPK
                         if topk is None:
                             from relax.utils.misc import get_hf_config
 
@@ -259,8 +263,9 @@ def _install_abort_patch() -> None:
         if cancelled:
             from sglang.srt.managers.io_struct import AbortReq
 
+            channels = getattr(self, "ipc_channels", self)
             for req in cancelled:
-                self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         return result
 
     abort._relax_replay_cleanup = True
@@ -332,7 +337,10 @@ def _advance_publication(
                 first = publication.rows
                 # Transfer the lightweight stable slot range once. Body copies
                 # remain chunked and admitted by the writer before KV reuse.
-                slots = processor.req_to_token_pool.req_to_token[req.req_pool_idx][first:end].cpu().numpy()
+                request_kv = getattr(req, "kv", req)
+                if request_kv.req_pool_idx is None:
+                    raise ValueError("Replay capture requires a live request KV row")
+                slots = processor.req_to_token_pool.req_to_token[request_kv.req_pool_idx][first:end].cpu().numpy()
                 if len(slots) != end - first or np.any(slots < 0) or np.any(slots >= len(buffer)):
                     raise ValueError("Replay capture slot range is invalid")
                 cache = buffer.numpy()
@@ -513,7 +521,13 @@ def _install_response_patch(owner: Any) -> bool:
 
     if getattr(Scheduler, "_relax_replay_async_output", False):
         return True
-    original_output = Scheduler.stream_output
+    original_output = getattr(Scheduler, "stream_output", None)
+    component_output = original_output is None
+    if component_output:
+
+        def original_output(self, *args, **kwargs):
+            return self._relax_replay_original_output(self.output_streamer, *args, **kwargs)
+
     original_input = Scheduler.process_input_requests
     original_idle = Scheduler.maybe_sleep_on_idle
 
@@ -603,7 +617,30 @@ def _install_response_patch(owner: Any) -> bool:
             return None
         return original_idle(self, *args, **kwargs)
 
-    Scheduler.stream_output = output
+    if component_output:
+        original_factory = Scheduler.get_output_streamer_class
+
+        @wraps(original_factory)
+        def output_factory(self):
+            cached = getattr(self, "_relax_replay_output_class", None)
+            if cached is not None:
+                return cached
+            base = original_factory(self)
+            self._relax_replay_original_output = base.stream_output
+            scheduler = self
+
+            class ReplayOutputStreamer(base):
+                __slots__ = ()
+
+                def stream_output(self, reqs, return_logprob, skip_req=None):
+                    return output(scheduler, reqs, return_logprob, skip_req)
+
+            self._relax_replay_output_class = ReplayOutputStreamer
+            return ReplayOutputStreamer
+
+        Scheduler.get_output_streamer_class = output_factory
+    else:
+        Scheduler.stream_output = output
     Scheduler.process_input_requests = process_input
     Scheduler.maybe_sleep_on_idle = idle
     Scheduler._relax_replay_async_output = True

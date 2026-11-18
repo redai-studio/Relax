@@ -1197,27 +1197,35 @@ class MegatronTrainRayActor(TrainRayActor):
         indexer_topk = None
         for vp_stage, model in enumerate(self.model):
             config = model.module.config
-            ratios_value = getattr(config, "csa_compress_ratios", None)
-            if ratios_value is None or not hasattr(config, "dsa_indexer_topk"):
-                raise RuntimeError("Rollout indexer replay requires a DeepSeek-V4 hybrid Megatron model")
-            indexer_loss_coeff = getattr(config, "dsa_indexer_loss_coeff", 0.0) or 0.0
-            if indexer_loss_coeff != 0.0:
-                raise RuntimeError(
-                    "Rollout indexer replay requires dsa_indexer_loss_coeff=0, "
-                    f"got {indexer_loss_coeff} from the Megatron model config"
-                )
-            ratios = list(ratios_value)
-            if len(ratios) < config.num_layers:
-                raise RuntimeError(
-                    f"DSV4 csa_compress_ratios has {len(ratios)} entries for {config.num_layers} layers"
-                )
-            c4_ordinal = 0
-            for layer_id, ratio in enumerate(ratios[: config.num_layers]):
-                if ratio == 4:
-                    layer_to_ordinal[layer_id] = c4_ordinal
-                    c4_ordinal += 1
+            if hasattr(config, "keye_indexer_loss_coeff"):
+                from relax.models.keye_vl2.topk import KEYE_INDEXER_TOPK
 
-            model_topk = int(config.dsa_indexer_topk)
+                if config.keye_indexer_loss_coeff != 0:
+                    raise RuntimeError("Keye replay requires a frozen indexer with zero teacher loss")
+                layer_to_ordinal.update({layer: layer for layer in range(config.num_layers)})
+                model_topk = KEYE_INDEXER_TOPK
+            else:
+                ratios_value = getattr(config, "csa_compress_ratios", None)
+                if ratios_value is None or not hasattr(config, "dsa_indexer_topk"):
+                    raise RuntimeError("Rollout indexer replay requires a DeepSeek-V4 hybrid Megatron model")
+                indexer_loss_coeff = getattr(config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+                if indexer_loss_coeff != 0.0:
+                    raise RuntimeError(
+                        "Rollout indexer replay requires dsa_indexer_loss_coeff=0, "
+                        f"got {indexer_loss_coeff} from the Megatron model config"
+                    )
+                ratios = list(ratios_value)
+                if len(ratios) < config.num_layers:
+                    raise RuntimeError(
+                        f"DSV4 csa_compress_ratios has {len(ratios)} entries for {config.num_layers} layers"
+                    )
+                c4_ordinal = 0
+                for layer_id, ratio in enumerate(ratios[: config.num_layers]):
+                    if ratio == 4:
+                        layer_to_ordinal[layer_id] = c4_ordinal
+                        c4_ordinal += 1
+
+                model_topk = int(config.dsa_indexer_topk)
             if indexer_topk is not None and indexer_topk != model_topk:
                 raise RuntimeError(f"Inconsistent DSV4 indexer top-k widths: {indexer_topk} vs {model_topk}")
             indexer_topk = model_topk

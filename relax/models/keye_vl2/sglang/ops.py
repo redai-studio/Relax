@@ -80,14 +80,22 @@ def paged_decode(
     requests: torch.Tensor,
     lengths: torch.Tensor,
     width: int,
+    *,
+    capture: tuple[Any, int] | None = None,
 ) -> torch.Tensor:
     """Keep KV paged while using the same sparse forward as training."""
     from relax.models.keye_vl2.sparse_attention import compact_indices, sparse_attention
-    from relax.models.keye_vl2.topk import dsa_topk_indices
+    from relax.models.keye_vl2.topk import KEYE_INDEXER_TOPK, copy_capture_rows, dsa_topk_indices
 
     scores = paged_scores(index_query, index_cache, weights, table, requests, lengths, width)
     selected = dsa_topk_indices(scores)
-    ordered, counts = compact_indices(selected, selected < lengths[:, None])
+    valid = selected < lengths[:, None]
+    if capture is not None:
+        capturer, layer_id = capture
+        rows = torch.empty((selected.shape[0], KEYE_INDEXER_TOPK), dtype=torch.int32, device=selected.device)
+        copy_capture_rows(rows, selected, valid)
+        capturer.capture(layer_id=layer_id, topk_indices=rows)
+    ordered, counts = compact_indices(selected, valid)
     slots = table[requests.long()[:, None], ordered.long()].int().contiguous()
     return sparse_attention(query, key, value, slots, counts).flatten(1)
 

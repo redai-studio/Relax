@@ -22,7 +22,7 @@ class ReplayConfig:
     run_id: str = ""
     capacity_bytes: int = 16 << 30
     chunk_rows: int = 1024
-    publication_bytes: int = 64 << 20
+    publication_bytes: int = 128 << 20
     materialization_bytes: int = 256 << 20
 
     def __post_init__(self) -> None:
@@ -41,6 +41,7 @@ class ReplayConfig:
             delivery="reference" if references_enabled() else "full",
             run_id=Envs.RELAX_REPLAY_RUN_ID,
             capacity_bytes=Envs.RELAX_REPLAY_CAPACITY_MB << 20,
+            materialization_bytes=Envs.RELAX_REPLAY_MATERIALIZATION_MB << 20,
         )
 
     def fields(self, fields: Sequence[str]) -> list[str]:
@@ -58,7 +59,12 @@ def references_enabled() -> bool:
 
 
 def reference_environment() -> dict[str, str]:
-    names = ("RELAX_REPLAY_REFERENCES", "RELAX_REPLAY_RUN_ID", "RELAX_REPLAY_CAPACITY_MB")
+    names = (
+        "RELAX_REPLAY_REFERENCES",
+        "RELAX_REPLAY_RUN_ID",
+        "RELAX_REPLAY_CAPACITY_MB",
+        "RELAX_REPLAY_MATERIALIZATION_MB",
+    )
     return {name: os.environ[name] for name in names if name in os.environ}
 
 

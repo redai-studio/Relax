@@ -14,7 +14,7 @@ from torch import nn
 
 from .indexer import KeyeIndexer, indexer_scores
 from .sparse_attention import compact_indices, sparse_attention
-from .topk import dsa_topk_indices
+from .topk import KEYE_INDEXER_TOPK, _resolve_replayed_rows, dsa_topk_indices, resolve_replayed_selection
 
 
 def query_chunks(length: int, cp_size: int, cp_rank: int, chunk_size: int) -> Iterator[tuple[int, int, int]]:
@@ -53,12 +53,15 @@ class KeyeCoreAttention(nn.Module):
     def __init__(self, config: Any, layer_number: int, **kwargs: Any) -> None:
         super().__init__()
         self.config = config
+        self.layer_number = layer_number
         self.tp_size = config.tensor_model_parallel_size
         self.tp_group = getattr(kwargs.get("pg_collection"), "tp", None)
         if self.tp_size > 1 and (not config.sequence_parallel or self.tp_group is None):
             raise ValueError("Keye TP attention requires sequence parallelism and an explicit TP group")
         self.cp_group = getattr(kwargs.get("pg_collection"), "cp", None)
         self.sa_indexer = KeyeIndexer(config.hidden_size, config.layernorm_epsilon, config.rotary_base)
+        if config.keye_indexer_loss_coeff == 0:
+            self.sa_indexer.requires_grad_(False)
         for parameter in self.sa_indexer.parameters():
             parameter.allreduce = True
             parameter.sequence_parallel = False
@@ -125,6 +128,26 @@ class KeyeCoreAttention(nn.Module):
             and self.config.keye_indexer_loss_coeff > 0
             and any(parameter.requires_grad for parameter in self.sa_indexer.parameters())
         )
+        replay = None
+        fallback_ranges = None
+        if getattr(self.config, "relax_use_indexer_replay", False):
+            from relax.utils.training.indexer_replay import IndexerReplay
+
+            replay = IndexerReplay.read(self.layer_number)
+            if replay is not None:
+                if train_indexer:
+                    raise RuntimeError("Keye indexer replay requires a frozen indexer")
+                if replay[0].shape != (query.shape[0], KEYE_INDEXER_TOPK) or replay[1].shape != (query.shape[0],):
+                    raise RuntimeError("Keye indexer replay does not match the local packed token layout")
+                # The BF16 CUDA scorer uses a fixed per-query tile, so selecting
+                # fewer rows preserves its arithmetic. Other scorers retain the
+                # original shape-dependent path. Eager payloads have no CPU plan.
+                if iq.is_cuda and iq.dtype == ik.dtype == iw.dtype == torch.bfloat16:
+                    layout = IndexerReplay._last_cpu_fallback_ranges(self.layer_number)
+                    if layout is not None:
+                        if layout[0] != query.shape[0]:
+                            raise RuntimeError("Indexer replay CPU row layout differs from the query shape")
+                        fallback_ranges = layout[1]
         local_start = 0
         for start, end in zip(boundaries, boundaries[1:]):
             length = (end - start) // size
@@ -138,14 +161,39 @@ class KeyeCoreAttention(nn.Module):
             chunk_size = getattr(self.config, "keye_attention_chunk_size", 1024)
             for offset, stop, prefix in query_chunks(length, size, rank, chunk_size):
                 lo, hi = local_start + offset, local_start + stop
-                scores = indexer_scores(iq[lo:hi], ik[start : start + prefix], iw[lo:hi])
                 causal = (indices[start : start + prefix][None] <= token_offsets[offset:stop, None]) & valid[
                     start : start + prefix
                 ][None]
-                scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
-                selected = dsa_topk_indices(scores)
-                support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
-                slots, counts = compact_indices(selected, causal.gather(1, selected))
+                if replay is not None and fallback_ranges is not None:
+                    selected, selected_valid = _resolve_replayed_rows(
+                        causal,
+                        replay[0][lo:hi],
+                        replay[1][lo:hi],
+                        fallback_ranges,
+                        row_offset=lo,
+                        score_rows=lambda first, last: indexer_scores(
+                            iq[lo + first : lo + last], ik[start : start + prefix], iw[lo + first : lo + last]
+                        ),
+                    )
+                else:
+                    scores = indexer_scores(iq[lo:hi], ik[start : start + prefix], iw[lo:hi])
+                    scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
+                    selected = dsa_topk_indices(scores)
+                    if replay is not None:
+                        selected, selected_valid = resolve_replayed_selection(
+                            selected, causal, replay[0][lo:hi], replay[1][lo:hi]
+                        )
+                if replay is None:
+                    selected_valid = causal.gather(1, selected)
+                    support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
+                else:
+                    # Route invalid slots to a spare column so they cannot
+                    # overwrite a real key (including key zero).
+                    sentinel = causal.shape[1]
+                    support = causal.new_zeros((causal.shape[0], sentinel + 1))
+                    support.scatter_(1, selected.masked_fill(~selected_valid, sentinel), True)
+                    support = support[:, :sentinel]
+                slots, counts = compact_indices(selected, selected_valid)
                 chunk_q = q[offset:stop].transpose(0, 1)
                 output = sparse_attention(q[offset:stop], k[:prefix], v[:prefix], slots, counts, support)
                 outputs.append(output.reshape(stop - offset, -1))

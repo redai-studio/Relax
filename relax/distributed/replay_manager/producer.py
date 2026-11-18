@@ -3,6 +3,8 @@
 """Engine-independent publication, admission and immutable reference
 handoff."""
 
+from __future__ import annotations
+
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Condition
@@ -12,7 +14,40 @@ from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, token_digest
 
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from .core import ReplayManager
+
+
+_PUBLICATION_WORKERS = 4
+_INDEXER_CHUNK_BYTES = 4 << 20
+_INDEXER_BATCH_BYTES = 32 << 20
+_MOE_BATCH_BYTES = 1 << 20
+
+
+def _encode_indexer_bodies(values: tuple[Any, ...], *, kind: str, topk: int) -> tuple[Any, ...] | np.ndarray:
+    """Losslessly pack eligible Indexer bodies; retain full-width fallback.
+
+    The private TQ representation uses int32 containers holding two int16
+    indices each. Capture and materialization still expose int32 indices.
+    """
+    import numpy as np
+
+    if (
+        kind == "indexer"
+        and topk > 1
+        and np.little_endian
+        and all(value.min() >= -32768 and value.max() <= 32767 for value in values)
+    ):
+        # Encode directly into the contiguous batch to avoid a second stack.
+        bodies = np.empty((len(values), len(values[0]), (topk + 1) // 2), dtype=np.int32)
+        halves = bodies.view(np.int16)
+        if topk % 2:
+            halves[:, :, -1] = 0
+        for index, value in enumerate(values):
+            halves[index, :, :topk] = value
+        return bodies
+    return values
 
 
 @dataclass(frozen=True)
@@ -60,9 +95,10 @@ class ProducerChunkWriter:
     snapshot.
 
     Workers receive independent CPU arrays, never a KV-slot view. Backpressure
-    blocks the scheduler only when the in-flight byte budget is exhausted. The
-    TQ writer may additionally pack up to 1 MiB; single-layer writes use a
-    view. This budget does not include TQ serialization or stored bodies.
+    blocks the scheduler only when the in-flight byte budget is exhausted.
+    Encoding and packing use up to another capacity_bytes of scratch, excluding
+    TQ serialization and stored bodies. Each write uses an independent
+    transport client; the snapshot budget is shared.
     """
 
     def __init__(self, capacity_bytes: int) -> None:
@@ -73,7 +109,7 @@ class ProducerChunkWriter:
         self._error = None
         self._closed = False
         self._condition = Condition()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-publish")
+        self._executor = ThreadPoolExecutor(max_workers=_PUBLICATION_WORKERS, thread_name_prefix="replay-publish")
 
     def submit(self, size: int, snapshot: Callable[[], Any], write_block: Callable[[Any], None]):
         if size > self.capacity_bytes:
@@ -125,7 +161,7 @@ class ProducerChunkWriter:
             raise
 
     def submit_completion(self, complete: Callable[[], Any]) -> Future:
-        """Run publication sealing after already queued body writes."""
+        """Enqueue sealing; its callback waits for the publication's writes."""
         with self._condition:
             if self._closed:
                 raise RuntimeError("Replay writer is closing")
@@ -153,6 +189,10 @@ class ProducerPublication:
         self.store, self.writer = store, writer
         self.kind, self.layers, self.topk = kind, layers, topk
         self.chunk_rows = min(store.chunk_rows, writer.capacity_bytes // (topk * 4))
+        if kind == "indexer":
+            # CP consumers select token ranges. Small independently addressed
+            # blocks avoid fetching large unused portions at range boundaries.
+            self.chunk_rows = min(self.chunk_rows, max(1, _INDEXER_CHUNK_BYTES // (topk * 4)))
         if not self.chunk_rows:
             raise BufferError("One replay row exceeds publication budget")
         self.record = new_data_id()
@@ -188,18 +228,23 @@ class ProducerPublication:
                 raise ValueError("Replay layer snapshot must be int32 [chunk rows, topk]")
             return values
 
+        def write(chunk: int, layers: tuple[int, ...], values: tuple[Any, ...]) -> None:
+            bodies = _encode_indexer_bodies(values, kind=self.kind, topk=self.topk)
+            self.store.write_blocks(self.record, chunk, layers, bodies)
+
         # Amortize RPCs across layers while preserving one key per layer.
         # Admission still happens before snapshots; packing runs on the writer.
-        layers_per_batch = max(1, min(self.writer.capacity_bytes, 1 << 20) // size)
+        # Keep Indexer publications large even though their addressable row
+        # blocks are small; otherwise finer reads multiply writer RPCs.
+        pack_bytes = _INDEXER_BATCH_BYTES if self.kind == "indexer" else _MOE_BATCH_BYTES
+        layers_per_batch = max(1, min(self.writer.capacity_bytes, pack_bytes) // size)
         for first in range(0, self.layers, layers_per_batch):
             layers = tuple(range(first, min(first + layers_per_batch, self.layers)))
             self._futures.append(
                 self.writer.submit(
                     size * len(layers),
                     lambda layers=layers: tuple(snapshot(layer) for layer in layers),
-                    lambda values, layers=layers, chunk=self.rows // self.chunk_rows: self.store.write_blocks(
-                        self.record, chunk, layers, values
-                    ),
+                    lambda values, layers=layers, chunk=self.rows // self.chunk_rows: write(chunk, layers, values),
                 )
             )
         self.rows += count
@@ -224,7 +269,7 @@ class ProducerPublication:
         writes = tuple(self._futures)
 
         def complete():
-            # These writes were enqueued before this task on the same worker.
+            # Writes were enqueued first, but may still run on another worker.
             for future in writes:
                 future.result()
             ref = self.store.invoke("finish_publication", self.record, self.rows, digest)

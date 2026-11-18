@@ -20,6 +20,7 @@ from ..consumer import (
     ConsumerBatchLayout,
     ConsumerChannelKey,
     ConsumerLayerBinding,
+    ConsumerLayerReader,
     ConsumerModelLayout,
     ConsumerReadSession,
     ConsumerRecord,
@@ -167,15 +168,28 @@ def _indexer_layout(actor: Any) -> ConsumerModelLayout:
     topk = None
     capture_layers = None
     for config, layers in _local_layer_ranges(actor):
-        ratios = getattr(config, "csa_compress_ratios", None)
-        if ratios is None or not hasattr(config, "dsa_indexer_topk") or getattr(config, "dsa_indexer_loss_coeff", 0):
-            raise RuntimeError("Indexer reference replay requires the supported DSV4 C4 configuration")
-        c4_layers = [layer for layer, ratio in enumerate(ratios[: config.num_layers]) if ratio == 4]
-        if not c4_layers or len(ratios) < config.num_layers:
-            raise ValueError("Invalid C4 layer map")
-        if topk is not None and (topk != config.dsa_indexer_topk or capture_layers != c4_layers):
+        if hasattr(config, "keye_indexer_loss_coeff"):
+            from relax.models.keye_vl2.topk import KEYE_INDEXER_TOPK
+
+            if config.keye_indexer_loss_coeff != 0:
+                raise RuntimeError("Keye replay requires a frozen indexer with zero teacher loss")
+            c4_layers = list(range(config.num_layers))
+            model_topk = KEYE_INDEXER_TOPK
+        else:
+            ratios = getattr(config, "csa_compress_ratios", None)
+            if (
+                ratios is None
+                or not hasattr(config, "dsa_indexer_topk")
+                or getattr(config, "dsa_indexer_loss_coeff", 0)
+            ):
+                raise RuntimeError("Indexer reference replay requires the supported DSV4 C4 configuration")
+            c4_layers = [layer for layer, ratio in enumerate(ratios[: config.num_layers]) if ratio == 4]
+            if not c4_layers or len(ratios) < config.num_layers:
+                raise ValueError("Invalid C4 layer map")
+            model_topk = config.dsa_indexer_topk
+        if topk is not None and (topk != model_topk or capture_layers != c4_layers):
             raise ValueError("Inconsistent Indexer capture layout")
-        topk = config.dsa_indexer_topk
+        topk = model_topk
         capture_layers = c4_layers
         local_layers.extend((layer, c4_layers.index(layer)) for layer in layers if layer in c4_layers)
     if topk is None or capture_layers is None:
@@ -544,6 +558,41 @@ class IndexerReplay:
         except KeyError as exc:
             raise RuntimeError(f"Unexpected DSV4 indexer replay layer {layer_number}") from exc
         replay.record(topk, row_valid)
+
+    @classmethod
+    def read(cls, layer_number: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Consume one complete layer/microbatch before attention chunking."""
+        if not cls._enabled or cls.get_stage() == "fallthrough":
+            return None
+        try:
+            replay = cls._layers[layer_number]
+        except KeyError as exc:
+            raise RuntimeError(f"Missing rollout indexer replay for layer {layer_number}") from exc
+        return replay.pop(cls.get_stage())
+
+    @classmethod
+    def _last_cpu_fallback_ranges(cls, layer_number: int) -> tuple[int, tuple[tuple[int, int], ...]] | None:
+        """Describe missing rows of the just-consumed reference, without CUDA
+        reads."""
+        import numpy as np
+
+        replay = cls._layers.get(layer_number)
+        stage = cls.get_stage()
+        if replay is None or stage not in ("replay_forward", "replay_backward"):
+            return None
+        index = (replay.forward_index if stage == "replay_forward" else replay.backward_index) - 1
+        if not 0 <= index < len(replay.entries):
+            return None
+        source = replay.entries[index]
+        if not isinstance(source, ConsumerLayerReader):
+            return None
+        valid = source.batch_layout.valid
+        missing = np.flatnonzero(~valid)
+        if not len(missing):
+            return len(valid), ()
+        boundaries = np.flatnonzero(np.diff(missing) != 1) + 1
+        ranges = tuple((int(part[0]), int(part[-1]) + 1) for part in np.split(missing, boundaries))
+        return len(valid), ranges
 
     @classmethod
     def replay(cls, layer_number: int, computed_topk: torch.Tensor | None) -> torch.Tensor | None:

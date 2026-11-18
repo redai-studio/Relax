@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import get_model, get_parallel
 from relax.models.keye_vl2.indexer import KeyeIndexer, indexer_scores
 from relax.models.keye_vl2.norm import RMSNorm as StableRMSNorm
 from relax.models.keye_vl2.sparse_attention import compact_indices, sparse_attention
-from relax.models.keye_vl2.topk import dsa_topk_indices
+from relax.models.keye_vl2.topk import KEYE_INDEXER_TOPK, copy_capture_rows, dsa_topk_indices
 from relax.models.keye_vl2.vision import build_vision, image_features
 
 from .ops import expert_forward, paged_decode, paged_scores, rope
@@ -159,6 +159,13 @@ class KeyeAttention(Qwen3MoeAttention):
         outputs = []
         offset = 0
         lengths = forward_batch.seq_lens_cpu
+        capturer = None
+        if getattr(self, "keye_capture_indexer", False):
+            from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+
+            capturer = get_global_indexer_capturer()
+            if capturer is None:
+                raise RuntimeError("SGLang did not initialize the Keye Indexer capturer")
         if forward_batch.forward_mode.is_decode():
             # A fixed index-score capacity is safe for CUDA graph replay;
             # GPU lengths gate actual cache reads. The shared GQA forward
@@ -174,6 +181,7 @@ class KeyeAttention(Qwen3MoeAttention):
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 min(req_to_token.shape[1], get_model().context_length or req_to_token.shape[1]),
+                capture=(capturer, layer_id) if capturer is not None else None,
             )
             output, _ = self.o_proj(output)
             return output
@@ -182,6 +190,9 @@ class KeyeAttention(Qwen3MoeAttention):
             req_to_token = req_to_token[forward_batch.req_pool_indices]
         else:
             raise ValueError("Keye reference rollout supports extend/decode only")
+        captured = None
+        if capturer is not None:
+            captured = torch.empty((q.shape[0], KEYE_INDEXER_TOPK), dtype=torch.int32, device=q.device)
         for batch_index, (length, query_length) in enumerate(zip(lengths, query_lengths)):
             length = int(length)  # CPU metadata, never a GPU synchronization.
             slots = req_to_token[batch_index, :length].long()
@@ -194,10 +205,15 @@ class KeyeAttention(Qwen3MoeAttention):
                 causal = torch.arange(length, device=q.device)[None, :] <= positions[start:end, None]
                 scores.masked_fill_(~causal, torch.finfo(scores.dtype).min)
                 selected = dsa_topk_indices(scores)
-                selected_slots, counts = compact_indices(selected, causal.gather(1, selected))
+                selected_valid = causal.gather(1, selected)
+                if captured is not None:
+                    copy_capture_rows(captured[start:end], selected, selected_valid)
+                selected_slots, counts = compact_indices(selected, selected_valid)
                 result = sparse_attention(q[start:end], all_k, all_v, selected_slots, counts)
                 outputs.append(result.reshape(end - start, -1))
             offset += query_length
+        if captured is not None:
+            capturer.capture(layer_id=layer_id, topk_indices=captured)
         output, _ = self.o_proj(torch.cat(outputs, 0))
         return output
 
@@ -270,7 +286,20 @@ class KeyeVL2MoeForConditionalGeneration(Qwen3MoeForCausalLM):
         super().__init__(config, quant_config, prefix)
         self.lm_head.quant_method = KeyeLinearMethod()
         self.model.__class__ = KeyeLanguageModel
-        self.multimodal_enabled = process_model_config().is_multimodal
+        model_config = process_model_config()
+        self.multimodal_enabled = model_config.is_multimodal
+        from sglang.srt.runtime_context import get_exec
+
+        capture_indexer = get_exec().features.enable_return_indexer_topk
+        if capture_indexer and self.multimodal_enabled:
+            raise ValueError("Keye indexer capture requires language_model_only rollout")
+        if capture_indexer:
+            # SGLang sizes its native capturer after loading the external model.
+            from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
+
+            text_config = get_hf_text_config(config)
+            text_config.num_indexer_layers = text_config.num_hidden_layers
+            text_config.index_topk = KEYE_INDEXER_TOPK
         if self.multimodal_enabled:
             self.visual, self.mlp_AR = build_vision(config, get_model().model_path)
         KeyeRMSNorm.convert(self.model.norm)
@@ -295,6 +324,7 @@ class KeyeVL2MoeForConditionalGeneration(Qwen3MoeForCausalLM):
                 weight.data = weight.new_empty((weight.shape[0], config.num_attention_heads * attention.head_dim))
                 weight.weight_loader = default_weight_loader
             attention.keye_multimodal_enabled = bool(self.multimodal_enabled)
+            attention.keye_capture_indexer = capture_indexer
             attention.sa_indexer = KeyeIndexer(config.hidden_size, config.rms_norm_eps, config.rope_theta)
             attention.sa_indexer.q_proj.__class__ = KeyeLinear
             attention.sa_indexer.k_proj.__class__ = KeyeLinear
