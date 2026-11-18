@@ -1,6 +1,6 @@
 # Agentic Rollout
 
-Agentic rollout 将已有 agent app (harness) 接入 Relax 训练。Relax 为每个 Session 启动并管理一个 agent process，
+Agentic rollout 将已有 agent app (harness) 接入 Relax 训练。默认情况下，Relax 为每个 Session 启动并管理一个 agent process，
 由该 process 运行原有 harness。Relax 记录已提交的 conversation，并把选中的 context 转换为训练 sample。
 
 **当您已经有一个通过 OpenAI-compatible Chat Completions API 调用模型的 agent application (harness) 时，
@@ -84,6 +84,12 @@ message 结构。
 #### Metadata-Only Task
 
 `--metadata-key` 把 dataset object 映射到 `metadata`。Harness 可以在运行时读取 metadata，并现场组装 messages。
+
+#### 单轮直答样本
+
+在样本的 `metadata.agentic_single_turn` 中填写 chat template 参数，Relax 就会在 Session 内用该样本的 prompt 完成一次 chat。
+填 `{}` 使用默认模板，填 `{"enable_thinking": false}` 可对该样本关闭思考。文本和带图样本沿用现有的 Session 导出。
+同一批中省略此字段的样本继续执行配置的 agent 命令。
 
 #### Multimodal Input
 

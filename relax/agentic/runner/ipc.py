@@ -392,6 +392,43 @@ class _ActiveTimeout:
         await self._on_expire()
 
 
+class SingleTurnTask:
+    """One in-process chat owned by the Session that requested it."""
+
+    def __init__(self, session_id: str, timeout_s: float, task: asyncio.Task[SessionOutput]) -> None:
+        self._task = task
+        self._timeout = _ActiveTimeout(timeout_s, f"single-turn-timeout:{session_id}", self._on_timeout)
+        self._timed_out = False
+
+    async def _on_timeout(self) -> None:
+        self._timed_out = self._task.cancel()
+
+    async def wait(self) -> None:
+        try:
+            await asyncio.shield(self._task)
+        except asyncio.CancelledError:
+            if self._timed_out and self._task.cancelled():
+                raise AgentExecutionError("Single-turn chat timed out", reason_code="agent_timeout") from None
+            raise
+
+    @property
+    def output(self) -> SessionOutput:
+        return self._task.result()
+
+    @property
+    def active_ms(self) -> float:
+        return self._timeout.active_ms
+
+    async def set_timeout_active(self, active: bool) -> None:
+        if not self._task.done():
+            await self._timeout.set_active(active)
+
+    async def terminate_and_join(self) -> None:
+        await self._timeout.pause()
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+
+
 class ManagedAgentProcess:
     """One Session-owned command process with an active-time budget."""
 

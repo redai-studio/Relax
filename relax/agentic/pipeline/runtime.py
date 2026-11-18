@@ -837,12 +837,14 @@ def _build_session_specs(
     session_ids: Sequence[str],
     include_input_payload: bool,
 ) -> Tuple[SessionSpec, ...]:
-    shared_messages = _sample_messages(samples[0]) if include_input_payload else []
+    shared_messages = _sample_messages(samples[0]) if include_input_payload else None
     session_specs = []
     for sample, session_id in zip(samples, session_ids, strict=True):
         metadata = sample.metadata
         input_payload: dict[str, Any] = {}
-        if include_input_payload:
+        if metadata and "agentic_single_turn" in metadata:
+            input_payload.update(messages=_sample_messages(sample), metadata=metadata)
+        elif shared_messages is not None:
             input_payload["messages"] = shared_messages
             if metadata:
                 input_payload["metadata"] = metadata
