@@ -408,7 +408,10 @@ def test_receiver_mode_names_preserve_dense_block_fp8_layout(quantization_args, 
         from importlib.metadata import version
 
         from packaging.version import Version
+        from sglang.srt.utils import is_hip
 
+        if is_hip():
+            pytest.skip("modelopt_fp4 is not supported by SGLang on ROCm")
         if Version(version("sglang")) < Version("0.5.21"):
             pytest.skip("Loading serialized FP8 with modelopt_fp4 requires SGLang >= 0.5.21")
     LoadConfig = pytest.importorskip("sglang.srt.configs.load_config").LoadConfig
