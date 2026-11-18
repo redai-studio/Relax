@@ -53,7 +53,7 @@ def qsa_bridge_checkpointed_forward(
         for index in range(start, end):
             ple = getattr(self._get_layer(index), "per_layer_embedding", None)
             if ple is not None:
-                ple_states[index] = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
+                ple_states[index] = ple.capture_checkpoint_state()
 
         def custom_forward(
             hidden_states,
@@ -70,8 +70,8 @@ def qsa_bridge_checkpointed_forward(
                 layer = self._get_layer(index)
                 ple = getattr(layer, "per_layer_embedding", None)
                 if ple is not None:
-                    previous_ple_state = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
-                    ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = ple_states[index]
+                    previous_ple_state = ple.capture_checkpoint_state()
+                    ple.restore_checkpoint_state(ple_states[index])
                 inner_fp8_context = (
                     get_fp8_context(self.config, layer.layer_number - 1) if use_inner_fp8_context else nullcontext()
                 )
@@ -99,7 +99,7 @@ def qsa_bridge_checkpointed_forward(
                                 )
                 finally:
                     if ple is not None:
-                        ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = previous_ple_state
+                        ple.restore_checkpoint_state(previous_ple_state)
             return hidden_states, context
 
         return custom_forward

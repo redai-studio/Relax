@@ -124,11 +124,12 @@ def test_bad_group_fails_collectively(preflight, monkeypatch, failure):
         detect.assert_not_called()
 
 
-@pytest.mark.parametrize("cp", [2, 4])
+@pytest.mark.parametrize("tp,pp,cp", [(2, 4, 2), (2, 4, 4), (1, 2, 8), (1, 2, 16)])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkeypatch, cp, enabled):
+def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkeypatch, tp, pp, cp, enabled):
     module, mpu, _, detect, expert, _ = preflight
-    mpu.get_tensor_model_parallel_world_size = lambda: 2
+    mpu.get_tensor_model_parallel_world_size = lambda: tp
+    mpu.get_pipeline_model_parallel_world_size = lambda: pp
     mpu.get_context_parallel_world_size = lambda: cp
     monkeypatch.setenv("RELAX_QWEN38_QSA_CP", str(int(enabled)))
     monkeypatch.setenv("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", "mixed")

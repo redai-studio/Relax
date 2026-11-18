@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import math
+import os
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -81,7 +82,10 @@ class TinySelfAttention(torch.nn.Module):
 
 
 def native_source(relative):
-    section = PATCH.read_text().split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
+    patch = (
+        PATCH.parent.parent / "latest/megatron.patch" if relative == PLE_MODULE.replace(".", "/") + ".py" else PATCH
+    )
+    section = patch.read_text().split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
     return ast.parse(
         "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++"))
     )
@@ -94,6 +98,7 @@ def load_native():
         nn=torch.nn,
         F=F,
         math=math,
+        os=os,
         dataclass=dataclass,
         replace=replace,
         nullcontext=nullcontext,

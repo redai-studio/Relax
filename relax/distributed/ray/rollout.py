@@ -33,7 +33,7 @@ from relax.distributed.ray.rollout_scale_types import (
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
-from relax.engine.rollout.base_types import call_rollout_fn
+from relax.engine.rollout.base_types import DatasetStateMismatchError, call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -443,6 +443,10 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                    # Mooncake's default 15000-17000 overlaps allocated HTTP ports
+                    # before they bind. Use the upper range reserved by ray-job.sh.
+                    "MC_MIN_RPC_PORT": "65001",
+                    "MC_MAX_RPC_PORT": "65500",
                     # OPD per-position token_ids logprob patch: default off, enabled
                     # via env (affects the student engine too, like the teacher).
                     "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
@@ -1702,6 +1706,11 @@ class RolloutManager(ReloadableMixin):
             await self.data_source.load.remote(rollout_id)
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
+            if (
+                isinstance(e, DatasetStateMismatchError)
+                or (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
+            ):
+                raise
 
     async def offload(self):
         self._offload_local()

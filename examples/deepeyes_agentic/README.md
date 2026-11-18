@@ -23,7 +23,7 @@ Each training script enables agentic rollout and points Relax to the agent proce
 
 ```bash
 --use-agentic-rollout
---agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+--agent-command "bash ${SCRIPT_DIR}/run_agent_app.sh"
 --agent-cwd "${SCRIPT_DIR}"
 --custom-rm-path examples.deepeyes_agentic.reward_deepeyes.reward_func
 ```
