@@ -185,6 +185,7 @@ def test_tokenizer_without_eos_is_rejected(tmp_path):
         {"system_prompt": "assistant"},
         {"loss_last_turn_only": True},
         {"loss_ignore_empty_think": True},
+        {"loss_mask_reasoning": True},
         {"apply_chat_template_kwargs": {"enable_thinking": False}},
         {"capacity": 1},
         {"oversize_strategy": "custom", "oversize_custom_fn": lambda **kwargs: None},
