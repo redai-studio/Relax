@@ -9,7 +9,7 @@ inside `backends/megatron/data.py:get_batch` — the producer only filters
 oversized samples and emits per-sample lists.
 
 When ``--eval-interval`` is set, the producer also pushes an eval batch on
-every step where ``(step + 1) % eval_interval == 0``. The eval set is split
+each configured step or epoch boundary. The eval set is split
 into ``ceil(n_eval / global_batch_size)`` chunks and pushed serially under
 ``partition_id=f"sft_eval_{step}_n{N}_{i}"`` (with backpressure between
 chunks) so each partition fits within TQ's per-step storage cap. The
@@ -27,8 +27,8 @@ Mirrors `relax/components/advantages.py` in shape: no FastAPI ingress, plain
 
 import asyncio
 import os
-import random
 import time
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -206,6 +206,7 @@ def _create_sft_train_dataset(
             classification_sentinel_token_id=classification_sentinel_token_id,
             loss_last_turn_only=getattr(config, "sft_loss_last_turn_only", False),
             loss_ignore_empty_think=getattr(config, "sft_ignore_empty_think", False),
+            loss_mask_reasoning=getattr(config, "sft_mask_reasoning", False),
             image_preprocess_on_rank=image_preprocess_on_rank,
         )
     return dataset_cls.from_args(
@@ -737,6 +738,9 @@ class SFT(Base):
             num_labels=getattr(self.config, "num_labels", None),
             problem_type=getattr(self.config, "problem_type", "single_label_classification"),
             classification_sentinel_token_id=classification_sentinel_token_id,
+            loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
+            loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
+            loss_mask_reasoning=getattr(self.config, "sft_mask_reasoning", False),
             image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
         )
 
@@ -875,6 +879,7 @@ class SFT(Base):
                     classification_sentinel_token_id=classification_sentinel_token_id,
                     loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
                     loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
+                    loss_mask_reasoning=getattr(self.config, "sft_mask_reasoning", False),
                     image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
                 )
 
@@ -1115,8 +1120,8 @@ class SFT(Base):
                 "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
                 "skip warnings."
             )
-        # Causal eval pads sub-GBS pools because its legacy consumer requests a
-        # fixed batch size. Preference eval uses actual partial-chunk sizes and
+        # Causal eval zero-masks padding because its consumer requests a fixed
+        # batch size. Preference eval uses actual partial-chunk sizes and
         # must preserve every evaluation pair without padding.
         gbs = self.config.global_batch_size
         n_original = len(samples)
@@ -1133,15 +1138,23 @@ class SFT(Base):
                 f"Classification eval @ step {self.step}: {n_original} real samples, "
                 f"{pad_count} zero-weight padding samples, {n_chunks} chunk(s)."
             )
-        elif n_original < gbs and not preference_mode:
-            rng = random.Random(completed_steps)
-            pad_count = gbs - n_original
-            samples = list(samples) + rng.choices(samples, k=pad_count)
-            self._logger.warning(
-                f"Eval @ completed_steps={completed_steps}: eval pool of {n_original} samples is smaller than "
-                f"global_batch_size ({gbs}); random-padded with {pad_count} resampled (with "
-                f"replacement) samples to fill one batch. PPL counts duplicated samples — "
-                f"interpret with caution."
+        elif not preference_mode:
+            pad_count = (-n_original) % gbs
+            if pad_count:
+                shortest = min(samples, key=lambda sample: sample.total_length)
+                padding = replace(
+                    shortest,
+                    loss_mask=shortest.loss_mask.new_zeros(shortest.loss_mask.shape),
+                    pre_shifted_labels=(
+                        shortest.pre_shifted_labels.new_full(shortest.pre_shifted_labels.shape, -100)
+                        if shortest.pre_shifted_labels is not None
+                        else None
+                    ),
+                )
+                samples = list(samples) + [padding] * pad_count
+            self._logger.info(
+                f"Causal eval @ completed_steps={completed_steps}: {n_original} real samples, "
+                f"{pad_count} zero-mask padding samples."
             )
 
         if preference_mode:
@@ -1181,21 +1194,13 @@ class SFT(Base):
                 int(getattr(self.config, "data_parallel_size", 1)),
             )
             n_chunks = len(chunk_sizes)
-            n_dropped = 0
         else:
             n_chunks = n_samples // chunk_size
-            n_dropped = n_samples - n_chunks * chunk_size
             chunk_sizes = [chunk_size] * n_chunks
         if n_chunks == 0:
             raise RuntimeError(
                 f"Eval @ completed_steps={completed_steps}: eval pool of {n_samples} samples is smaller than "
                 f"global_batch_size ({chunk_size}); cannot push the full partition expected by the consumer."
-            )
-        if n_dropped > 0:
-            self._logger.warning(
-                f"Eval @ completed_steps={completed_steps}: dropping {n_dropped} trailing sample(s) so eval "
-                f"chunks align to global_batch_size ({chunk_size}); raise eval pool size or "
-                f"reduce global_batch_size if this matters."
             )
         # Per-chunk drain timeout. If consumers crash mid-eval (the actor's
         # try/except swallows the failure), the producer would otherwise spin

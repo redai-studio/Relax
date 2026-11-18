@@ -71,3 +71,29 @@ def test_compute_sft_eval_step_forwards_dynamic_cp_context(monkeypatch):
     assert calls["sum"]["dynamic_cp_rank"] == 1
     assert metrics["sum_neg_log_prob"][0].item() == 5.0
     assert metrics["num_tokens"][0].item() == 2
+
+
+def test_zero_mask_padding_preserves_eval_numerator_and_denominator(monkeypatch):
+    from relax.engine.sft.eval.ppl import compute_sft_eval_step
+
+    loss = ModuleType("relax.backends.megatron.loss")
+    # Only model output is replaced; execute the real CP mask reduction.
+    loss.get_log_probs_and_entropy = lambda _logits, **kw: (
+        torch.empty(0),
+        {"log_probs": [torch.tensor([-2.0, -3.0]) for _ in kw["total_lengths"]]},
+    )
+    monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", loss)
+    totals = []
+    for masks in ([torch.ones(2)], [torch.ones(2), torch.zeros(2)], [torch.zeros(2)]):
+        _, result = compute_sft_eval_step(
+            torch.empty(0),
+            args=Namespace(qkv_format="thd"),
+            unconcat_tokens=[torch.tensor([1, 2, 3])] * len(masks),
+            total_lengths=[3] * len(masks),
+            response_lengths=[2] * len(masks),
+            loss_masks=masks,
+            dynamic_cp_size=1,
+            dynamic_cp_rank=0,
+        )
+        totals.append((result["sum_neg_log_prob"][0].item(), result["num_tokens"][0].item()))
+    assert totals == [(5.0, 2), (5.0, 2), (0.0, 0)]

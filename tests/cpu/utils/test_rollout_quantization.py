@@ -202,19 +202,32 @@ def test_rollout_quantization_uses_receiver_checkpoint(quantization_args, tmp_pa
 
 
 @pytest.mark.parametrize(
-    "nested_override,keeps_fp8", [({"use_cache": False}, True), ({"quantization_config": None}, False)]
+    "overrides,root_null,keeps_fp8",
+    [
+        ({"text_config": {"use_cache": False}}, False, True),
+        ({"text_config": {"quantization_config": None}}, False, True),
+        ({"quantization_config": None, "text_config": {"quantization_config": None}}, False, False),
+        ({"text_config": {"quantization_config": None}}, True, False),
+    ],
 )
-def test_rollout_quantization_preserves_partial_text_config(quantization_args, nested_override, keeps_fp8):
+def test_rollout_quantization_matches_receiver_text_config(quantization_args, overrides, root_null, keeps_fp8):
     from pathlib import Path
 
+    from transformers import Qwen3VLConfig
+
+    ModelConfig = pytest.importorskip("sglang.srt.configs.model_config").ModelConfig
     expected = {"quant_method": "fp8", "weight_block_size": [128, 128]}
-    (Path(quantization_args.hf_checkpoint) / "config.json").write_text(
-        json.dumps({"text_config": {"quantization_config": expected, "use_cache": True}})
-    )
-    quantization_args.sglang_json_model_override_args = json.dumps({"text_config": nested_override})
-    assert resolve_rollout_quantization_config(quantization_args, SimpleNamespace()) == (
-        expected if keeps_fp8 else None
-    )
+    path = Path(quantization_args.hf_checkpoint)
+    config = Qwen3VLConfig(text_config={"quantization_config": expected})
+    config.architectures = ["Qwen3VLForConditionalGeneration"]
+    if root_null:
+        config.quantization_config = None
+    config.save_pretrained(path)
+    quantization_args.sglang_json_model_override_args = json.dumps(overrides)
+    receiver = ModelConfig(str(path), model_override_args=json.dumps(overrides))
+    actual = resolve_rollout_quantization_config(quantization_args, SimpleNamespace())
+    assert (actual["quant_method"] if actual else None) == receiver.quantization == ("fp8" if keeps_fp8 else None)
+    assert actual == (expected if keeps_fp8 else None)
 
 
 @pytest.mark.parametrize("order", ["single", "empty-first", "plain-first"])

@@ -482,6 +482,13 @@ def get_model_provider_func(
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
 
+        # Match MCore's CLI conversion: interleaved P2P overlap and batched
+        # communication are mutually exclusive. Parser validation already
+        # disables overlap for schedules without virtual pipeline stages.
+        if getattr(args, "overlap_p2p_comm", None) is not None:
+            provider.overlap_p2p_comm = args.overlap_p2p_comm
+            provider.batch_p2p_comm = not args.overlap_p2p_comm
+
         if callable(getattr(provider, "configure_runtime", None)):
             provider.configure_runtime(args)
 

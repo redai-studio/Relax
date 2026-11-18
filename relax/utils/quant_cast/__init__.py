@@ -36,6 +36,12 @@ def resolve_receiver_quantization_config(
             from transformers import PretrainedConfig
 
             config_values, _ = PretrainedConfig.get_config_dict(model_path)
+        # HF parsing promotes missing root metadata before JSON overrides.
+        # An explicit root null is already present and must not be promoted.
+        text_config = config_values.get("text_config") or {}
+        for key in ("quantization_config", "compression_config"):
+            if key not in config_values and text_config.get(key) is not None:
+                config_values = {**config_values, key: text_config[key]}
         # SGLang updates an existing text sub-config field by field, but
         # replaces top-level quantization dictionaries and explicit None.
         overrides = json.loads(override_json or "{}")

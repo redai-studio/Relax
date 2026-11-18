@@ -252,14 +252,16 @@ Both recipes enable `OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG=1` and `FLA_TILELANG=0` t
 
 ### Bounded Synchronous Checkpoint Saving
 
-Both Dockerfiles apply `docker/patch/megatron/sync-save-bounded-staging.patch` after the main Megatron patch. The full GRPO recipe explicitly enables it; set `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` to revert that recipe to the original synchronous writer. For other launches, the patch defaults to disabled. Async saving is unchanged.
+Both Dockerfiles include bounded synchronous staging through the `common` section of `docker/patch/latest/megatron.patch`. The full GRPO recipe explicitly enables it; set `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` to revert that recipe to the original synchronous writer. For other launches, the patch defaults to disabled. Async saving is unchanged.
 
 - `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=1`: stage a bounded window and write sequentially instead of preloading the complete checkpoint onto CPU.
 - `MEGATRON_SYNC_SAVE_STAGE_BYTES`: per-rank live staging budget, default 1 GiB. A single larger tensor is allowed when the window is empty, so the bound is `max(budget, largest_tensor)`.
 - Budget `0` stages/writes one tensor at a time; it does **not** select the original writer.
 - This bounds live staging tensors, not total RSS, optimizer/offload memory, serialization scratch or filesystem page cache. Writing may trade throughput for memory; measure on the target storage.
 
-The recipe forwards both environment variables to training actors. Old images without this patch continue using their original save implementation even if these variables are set; rebuild or patch all nodes consistently to obtain the optimization. Existing running jobs do not pick up the patch. Checkpoint format and loading remain unchanged. See `docker/patch/megatron/sync-save-bounded-staging.md` for failure handling and validation limits.
+The recipe forwards both environment variables to training actors; use the same settings on every rank before launch. Old images without this patch continue using their original save implementation even if these variables are set; deploy a rebuilt image consistently on all nodes to obtain the optimization. Existing running jobs do not pick up the patch. Checkpoint format and loading remain unchanged.
+
+Staging, write and cleanup errors propagate through checkpoint finalization, preserving the first failure. This cannot recover from process death or a broken process group. Validate full-size save/reload on the target cluster and measure per-node memory; CPU tests do not establish multi-node GPU correctness.
 
 ### Diagnosing Train/Rollout Differences
 
