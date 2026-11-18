@@ -112,7 +112,8 @@ def _submit(runtime, client, *, cancel=None, timeout=2.0, poll_interval=0.005):
     )
 
 
-def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(runtime):
+@pytest.mark.parametrize("flops", [False, True])
+def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(runtime, flops):
     ready, empty_seen, fetched = Event(), Event(), Event()
     requests = []
     data_calls = []
@@ -134,6 +135,16 @@ def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(runtime)
         return payload
 
     actor = runtime.actor
+    geometry = {
+        "version": 4,
+        "capacity": 10,
+        "context_parallel_size": 1,
+        "microbatch_group_size": 1,
+        "pipeline_stages": 1,
+    }
+    if flops:
+        actor.args.balance_by_flops = True
+        runtime.namespace["get_dp_packing_geometry"] = Mock(return_value=geometry)
     actor.data_system_client = SimpleNamespace(get_meta=get_meta, get_data=get_data)
     actor._start_sft_train_prefetch(3, "sft_train", ["tokens"], 2)
     assert empty_seen.wait(1)
@@ -145,12 +156,16 @@ def test_prefetch_waits_for_publish_and_fetches_before_main_thread_take(runtime)
     assert len(data_calls) == 1
     assert len(requests) >= 2
     assert all(request == requests[0] for request in requests)
-    assert requests[0]["sampling_config"] == {
+    expected_config = {
         "dp_rank": 3,
         "task_name": "sft_train",
         "batch_index": 0,
         "partition_id": "sft_4",
     }
+    if flops:
+        expected_config["packing_geometry"] = geometry
+        runtime.namespace["get_dp_packing_geometry"].assert_called_once_with(actor.args, "sft_train")
+    assert requests[0]["sampling_config"] == expected_config
     assert rpc_seconds >= 0
     assert runtime.groups == ["tp_cp", "pp"]
     assert actor._sft_train_prefetch is None

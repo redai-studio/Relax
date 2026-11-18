@@ -185,6 +185,10 @@ class _EnvsMeta(type):
 
 
 class Envs(metaclass=_EnvsMeta):
+    # ------------- Training numerics -------------
+    RELAX_FA2_DQ_SPLITS = EnvProperty("RELAX_FA2_DQ_SPLITS", str, None)
+    RELAX_RMSNORM_FP32_WEIGHT_GRAD = EnvProperty("RELAX_RMSNORM_FP32_WEIGHT_GRAD", bool, False)
+
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)

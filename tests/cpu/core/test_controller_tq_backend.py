@@ -45,6 +45,50 @@ def _is_simple(backend: dict[str, Any]) -> bool:
     return backend["storage_backend"] == "SimpleStorage"
 
 
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("legacy_balance", [False, True])
+def test_single_switch_selects_both_schedulers_before_queue_publication(
+    monkeypatch, algorithm, enabled, legacy_balance
+):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = _config(
+        loss_type="sft" if algorithm == "sft" else "grpo",
+        task_type="causal_lm",
+        tq_rdma_mode="off",
+        fully_async=False,
+        balance_data=legacy_balance,
+        balance_by_flops=enabled,
+        polling_mode=True,
+    )
+    selected, published = [], []
+
+    def constructor(kind):
+        def make(**kwargs):
+            selected.append((kind, kwargs))
+            return object()
+
+        return make
+
+    monkeypatch.setattr(controller, "resolve_sft_algo_key", lambda _: algorithm)
+    monkeypatch.setattr(controller, "compute_dp_size", lambda _: 4)
+    monkeypatch.setattr(controller, "with_control_plane_affinity", lambda _: {})
+    monkeypatch.setattr(controller, "reap_unusable_tq_controller", lambda: None)
+    monkeypatch.setattr(controller, "SeqlenBalancedSampler", constructor("tokens"))
+    monkeypatch.setattr(controller, "FlopsBalancedSampler", constructor("flops"))
+    monkeypatch.setattr(controller, "IdentityWindowSampler", constructor("identity"))
+    monkeypatch.setattr(instance, "_resolve_tq_backend", lambda: {"storage_backend": "SimpleStorage"})
+    monkeypatch.setattr(controller.tq, "init", lambda conf: published.append(conf) or conf)
+    instance._initialize_data_system()
+    assert len(published) == 1
+    if algorithm == "sft":
+        assert selected == [("flops" if enabled else "tokens", {"dp_size": 4, "n_samples_per_prompt": 1})]
+    elif enabled or legacy_balance:
+        assert selected == [("identity", {"dp_size": 4, "placement": "balanced", "balance_by_flops": enabled})]
+    else:
+        assert selected == [("identity", {"dp_size": 4, "placement": "sequential"})]
+
+
 class _DecisionHarness:
     def __init__(self, monkeypatch: pytest.MonkeyPatch, failure: str | None, *, stub_backend: bool = True) -> None:
         self.calls: list[str] = []
@@ -178,7 +222,7 @@ def test_initialized_data_system_preserves_storage_and_affinity(
         tq_rdma_mode="off" if stage == "off" else "auto",
         fully_async=False,
         balance_data=False,
-        polling_mode=False,
+        polling_mode=True,
     )
     instance._tq_owner = None
     instance._tq_legacy_init = False
@@ -288,7 +332,7 @@ def test_off_mode_rejects_a_healthy_existing_controller_before_legacy_init(
         tq_rdma_mode="off",
         fully_async=False,
         balance_data=False,
-        polling_mode=False,
+        polling_mode=True,
     )
     instance._tq_owner = None
     instance._tq_legacy_init = False
