@@ -369,6 +369,7 @@ export SAVE_DIR=/path/to/checkpoints
 export MEGATRON=/path/to/image-patched/Megatron-LM
 export RAY_JOBS_ADDRESS=http://ray-head:8265
 export RAY_ADDRESS="$RAY_JOBS_ADDRESS"
+export RAY_API_SERVER_ADDRESS="$RAY_JOBS_ADDRESS"
 export QWEN38_PLE_INPUT_HALO_CP=1
 export QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
 export RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
