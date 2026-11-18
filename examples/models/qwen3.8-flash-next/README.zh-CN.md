@@ -73,6 +73,17 @@ OpenR1-MM GRPO 读取转换后的 Parquet，字段为 `prompt`、`label` 和 `im
 | 32×Blackwell，128K packing，历史 CuTe/MoK 环境 | CP1 从 Grouped 到 CuTe，第 3–5 步 Actor 吞吐提高 17.23%。另有一次 CP1 运行累计完成 200 次更新，包含从 checkpoint 49 续训。                                                                                                                     | [CuTe 与 CP 实测](https://github.com/redai-studio/Relax/pull/691)                        |
 | 32×Blackwell，128K packing，历史静态 CP2/CP4   | 对比各自 CP 基线，预建 GDN route 使 Actor 吞吐分别提高 15.27%/18.82%。在此基础上同时打开 PLE 卷积融合和 TP selector，再提高 5.79%/11.37%。最终配置相对 CuTe CP1 的峰值 allocated 显存分别下降 16.07%/26.00%，Actor 吞吐分别下降 8.10%/26.16%。 | [CuTe 与 CP 实测](https://github.com/redai-studio/Relax/pull/691)                        |
 
+### Blackwell 上的 OpenSearch-VL SFT
+
+本次 OpenSearch-VL 训练使用 32 张 280G Blackwell GPU 对 Qwen3.8-Flash-Next-F0 做 SFT，启用 cuDNN QSA，并冻结视觉编码器和 PLE。评测对比原始 F0 权重和 step 66 的最终 BF16 SFT 权重（共 67 次优化器更新）。两个模型均在 Blackwell 上使用 TP2，按同一套 JSON `crop` 协议评测，上下文为 32K，每题最多 10 轮。 [V\*Bench 评测协议](../../opensearch_vl/evaluation.md)
+
+| 权重              | 正确题数 / 总题数 | Pass@1 | 训练集去重 Pass@1 |
+| ----------------- | ----------------- | ------ | ----------------- |
+| F0 基座           | 39 / 191          | 20.42% | 20.42%            |
+| OpenSearch-VL SFT | 161 / 191         | 84.29% | 84.29%            |
+
+按训练集去重后仍保留全部 191 题。基座有 146 道题因工具调用格式错误而中断，SFT 在其中答对了 122 道。
+
 ### 待补的公开复现
 
 - 用当前 128×H800 和 40×H20 脚本在公开数据上做端到端实测。记录数据版本与切分、镜像 digest、生效配置、训练 loss、MTP loss、梯度范数、留出集 loss、TPS/GPU 和整卡显存峰值。现有 PR 提供脚本配置验证。 [H800 配方](https://github.com/redai-studio/Relax/pull/637) · [H20 默认值](https://github.com/redai-studio/Relax/pull/635)

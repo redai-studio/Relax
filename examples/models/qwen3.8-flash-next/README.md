@@ -73,6 +73,17 @@ The public results below describe the recorded configurations and step windows. 
 | 32×Blackwell, 128K packing, historical CuTe/MoK runtime | Grouped to CuTe at CP1 improved Actor throughput by 17.23% over steps 3–5. A separate CP1 run reached 200 cumulative updates, including a resume from checkpoint 49.                                                                                                                                                            | [CuTe and CP results](https://github.com/redai-studio/Relax/pull/691)                                   |
 | 32×Blackwell, 128K packing, historical static CP2/CP4   | GDN route prebuild improved Actor throughput by 15.27%/18.82% versus the respective CP baselines. PLE convolution fusion and TP selector together added 5.79%/11.37% over route prebuild. The resulting configurations used 16.07%/26.00% less peak allocated memory and had 8.10%/26.16% lower Actor throughput than CuTe CP1. | [CuTe and CP results](https://github.com/redai-studio/Relax/pull/691)                                   |
 
+### OpenSearch-VL SFT on Blackwell
+
+The OpenSearch-VL run fine-tuned Qwen3.8-Flash-Next-F0 on 32 Blackwell GPUs (280G) with cuDNN QSA and froze the vision encoder and PLE. The evaluation compared the original F0 checkpoint and the final BF16 SFT checkpoint at step 66 (67 optimizer updates). Both used TP2 on Blackwell, a 32K context and up to 10 turns per question under the same JSON `crop` protocol. [V\*Bench evaluation protocol](../../opensearch_vl/evaluation.md)
+
+| Checkpoint        | Correct / total | Pass@1 | Train-deduplicated Pass@1 |
+| ----------------- | --------------- | ------ | ------------------------- |
+| F0 base           | 39 / 191        | 20.42% | 20.42%                    |
+| OpenSearch-VL SFT | 161 / 191       | 84.29% | 84.29%                    |
+
+All 191 questions remained after training-set deduplication. The base model stopped on 146 questions due to invalid tool-call formatting. The SFT model answered 122 of those questions correctly.
+
 ### Public Reproduction Gaps
 
 - Publish an open-data end-to-end run for the current 128×H800 and 40×H20 launchers. Record the dataset revision and split, image digest, effective configuration, training loss, MTP loss, gradient norm, held-out loss, TPS/GPU, and peak device memory. The launcher PRs document their configuration checks. [H800 recipe](https://github.com/redai-studio/Relax/pull/637) · [H20 defaults](https://github.com/redai-studio/Relax/pull/635)
