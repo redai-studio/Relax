@@ -16,6 +16,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.agentic.policy_audit import POLICY_AUDIT_FIELD
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
@@ -1087,7 +1088,7 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Keep scalar metadata as Python values across the TensorDict boundary,
             # including NestedTensor values reconstructed by TransferQueue.
-            if k == "agentic_group_ids":
+            if k in ("agentic_group_ids", POLICY_AUDIT_FIELD):
                 from relax.utils.agentic_obs.records import decode_group_ids
 
                 new_rollout_data[k] = decode_group_ids(v)
