@@ -6,7 +6,7 @@
 
 Qwen3.8-Flash-Next 是带视觉编码器的多模态 MoE 模型，语言主干有 48 层、125B 参数，每个 token 激活 6B，另有 51B n-gram embedding 表和 4B 多 token 预测（MTP）模块。主干每三层 Gated DeltaNet（GDN）接一层 Qwen Sparse Attention（QSA）。QSA 最多选择 512 个四 token 块。Gated Residual 在四条残差流之间混合，Per-Layer Embedding（PLE）引入 bigram 和 trigram 特征。发布权重的原生上下文为 262,144 token。 [模型卡](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) · [架构报告](https://arxiv.org/abs/2608.30320)
 
-Relax 提供 Megatron/Bridge 监督微调（SFT）和 Megatron/SGLang 共置 GRPO 配方。模型的公共配置在 [`qwen38-flash-next.sh`](../../../scripts/models/qwen38-flash-next.sh)。下文的 SFT 配方使用 BF16，冻结 QSA 索引器、视觉编码器和投影层，并训练一层 MTP。H800 冻结 n-gram 表，H20 和 Blackwell SFT 配方冻结整个 PLE 模块。
+Relax 提供 Megatron/Bridge 全模型和 LoRA 监督微调（SFT）和 Megatron/SGLang 共置 GRPO 配方。模型的公共配置在 [`qwen38-flash-next.sh`](../../../scripts/models/qwen38-flash-next.sh)。下文的全模型 SFT 配方使用 BF16，冻结 QSA 索引器、视觉编码器和投影层，并训练一层 MTP。H800 冻结 n-gram 表，H20 和 Blackwell SFT 配方冻结整个 PLE 模块。
 
 ## 快速开始
 
@@ -47,14 +47,15 @@ DRY_RUN=1 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32x
 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh
 ```
 
-| 配方                                                                                                                                 | GPU               | SFT 默认配置                                                                                   |
-| ------------------------------------------------------------------------------------------------------------------------------------ | ----------------- | ---------------------------------------------------------------------------------------------- |
-| [H800 图文](./scripts/run-qwen38-qsa-sft-128xh800.sh)                                                                                | 128×H800          | TP4/PP8/CP1/EP8/ETP1，GBS512，单样本上限 32K、packing 预算 64K                                 |
-| [H20 图文](./scripts/run-qwen38-qsa-sft-40xh20.sh)                                                                                   | 40×H20            | TP4/PP5/CP1/EP4/ETP1，GBS1024，单样本及 packing 上限 64K，从 HF 权重开始更新 100 次            |
-| [Blackwell 图文](./scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh)                                                                   | 32×280G Blackwell | TP2/PP4/CP1/EP8/ETP1，GBS512，单样本及 packing 上限 128K，HybridEP，mixed QSA 长文档走 Grouped |
-| [NV 纯文](./scripts/run-qwen38-qsa-nv-text-sft-32xgpu-blackwell.sh) / [NV 图文](./scripts/run-qwen38-qsa-nv-sft-32xgpu-blackwell.sh) | 32×280G Blackwell | 并行度与 128K 预算同上，长文档走 cuDNN QSA，纯文配方单独划分 PP 层数                           |
-| [Blackwell 长上下文](./scripts/run-qwen38-qsa-sft-256k-32xgpu-blackwell.sh)                                                          | 32×280G Blackwell | packing 软预算 128K，单样本可放宽到 256K，GBS4096，默认 HybridEP。超长单样本仍可能 OOM。       |
-| [Blackwell OpenR1-MM SFT](./scripts/run-qwen38-qsa-sft-openr1mm-32xgpu-blackwell.sh)                                                 | 32×280G Blackwell | 单样本及 packing 上限 32K，GBS128，默认 MoK。设置 `MOE_BACKEND=hybridep` 可切换到对照后端。    |
+| 配方                                                                                                                                                                                            | GPU               | SFT 默认配置                                                                                   |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------- |
+| [H800 图文](./scripts/run-qwen38-qsa-sft-128xh800.sh)                                                                                                                                           | 128×H800          | TP4/PP8/CP1/EP8/ETP1，GBS512，单样本上限 32K、packing 预算 64K                                 |
+| [H20 图文](./scripts/run-qwen38-qsa-sft-40xh20.sh)                                                                                                                                              | 40×H20            | TP4/PP5/CP1/EP4/ETP1，GBS1024，单样本及 packing 上限 64K，从 HF 权重开始更新 100 次            |
+| [Blackwell 图文](./scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh)                                                                                                                              | 32×280G Blackwell | TP2/PP4/CP1/EP8/ETP1，GBS512，单样本及 packing 上限 128K，HybridEP，mixed QSA 长文档走 Grouped |
+| [NV 纯文](./scripts/run-qwen38-qsa-nv-text-sft-32xgpu-blackwell.sh) / [NV 图文](./scripts/run-qwen38-qsa-nv-sft-32xgpu-blackwell.sh)                                                            | 32×280G Blackwell | 并行度与 128K 预算同上，长文档走 cuDNN QSA，纯文配方单独划分 PP 层数                           |
+| [Blackwell 长上下文](./scripts/run-qwen38-qsa-sft-256k-32xgpu-blackwell.sh)                                                                                                                     | 32×280G Blackwell | packing 软预算 128K，单样本可放宽到 256K，GBS4096，默认 HybridEP。超长单样本仍可能 OOM。       |
+| [Blackwell OpenR1-MM SFT](./scripts/run-qwen38-qsa-sft-openr1mm-32xgpu-blackwell.sh)                                                                                                            | 32×280G Blackwell | 单样本及 packing 上限 32K，GBS128，默认 MoK。设置 `MOE_BACKEND=hybridep` 可切换到对照后端。    |
+| [Blackwell LoRA SFT](https://github.com/redai-studio/Relax/blob/c75b0a1cb3d03119b02933036287b8c6ad605cf0/examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-lora-sft-8xgpu-blackwell.sh) | 8×Blackwell       | TP2/PP1/CP1/EP8，单样本及 packing 上限 128K，GBS512，默认 rank 32 的语言 LoRA，使用 merge 模式 |
 
 为 OpenR1-MM 准备 SFT 数据时，将公开数据的 `problem` 和 `solution` 分别映射为用户和助手消息，并将图片保存在 `images` 对应的共享路径。[OpenR1-MM 数据集](https://huggingface.co/datasets/lmms-lab/multimodal-open-r1-8k-verified)
 
@@ -62,7 +63,7 @@ OpenR1-MM GRPO 读取转换后的 Parquet，字段为 `prompt`、`label` 和 `im
 
 ## 验证指标
 
-下表记录公开实测的配置和统计步数。TPS/GPU 用逻辑 token 总数除以累计耗时和 GPU 数。端到端 TPS 用整步耗时，Actor TPS 用训练阶段耗时。H20 对比中的参考 MFU 使用固定的有效工作量估算，单卡参考峰值为 148 TFLOP/s。
+下表记录已公开的性能对照、对应配置和统计步数。TPS/GPU 用逻辑 token 总数除以累计耗时和 GPU 数。端到端 TPS 用整步耗时，Actor TPS 用训练阶段耗时。H20 对比中的参考 MFU 使用固定的有效工作量估算，单卡参考峰值为 148 TFLOP/s。
 
 | 硬件与负载                                     | 公开结果                                                                                                                                                                                                                                       | 来源                                                                                     |
 | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
@@ -82,11 +83,34 @@ OpenR1-MM GRPO 读取转换后的 Parquet，字段为 `prompt`、`label` 和 `im
 | F0 基座           | 39 / 191          | 20.42% | 20.42%            |
 | OpenSearch-VL SFT | 161 / 191         | 84.29% | 84.29%            |
 
-按训练集去重后仍保留全部 191 题。基座有 146 道题因工具调用格式错误而中断，SFT 在其中答对了 122 道。
+按训练集去重后仍保留全部 191 题。基座有 146 道题因工具调用格式错误而中断，SFT 在其中答对了 122 道。 在剩余题目中，两版得分均为 39/45。这组分数反映同一 crop 协议下的任务完成率。 [OpenSearch-VL 数据准备](../../opensearch_vl/data-preparation.md)
+
+### H800 图文 SFT 的 64K 与 128K 实测
+
+这些 128 卡对照在每组内使用相同的 HF 权重，逐步 token 数对齐。64K 使用 TP4/PP8/CP1/EP8/ETP1、GBS512。128K 使用 TP8/PP8/CP1/EP8/ETP1、GBS1024。表中的 TPS/GPU 为日志记录的逐步端到端速率均值。
+
+| Packing 与配置变化                                                | 统计步数 |         整步耗时 |      端到端 TPS/GPU |
+| ----------------------------------------------------------------- | -------: | ---------------: | ------------------: |
+| 64K，调整 PP 层分布，Adam 状态留在 GPU                            |     2–10 | 40.33 → 38.85 秒 | 1,032.88 → 1,071.36 |
+| 128K，从 Triton v2 切到实验版 Triton QSA，预取 K/V 并调整反向实现 |     4–27 | 97.08 → 93.11 秒 |     909.41 → 946.04 |
+| 128K，在实验版 QSA + NVLS 上加入 Triton GDN 输入投影前向          |      4–8 | 93.05 → 91.72 秒 |     940.83 → 956.84 |
+
+64K 调优配置的整卡显存采样峰值为 65.93 GiB。128K 的 GDN 前向方案完成了 9 次配对更新，训练 loss 和 MTP loss 的最大相对差分别为 0.111% 和 0.056%。后续叠加 split-K 投影权重梯度算子，第 4–8 步测得 898.55 TPS/GPU，统计窗口保留了一个长尾步。上述 128K 算子属于实验实现。 [H800 参考配方](./scripts/run-qwen38-qsa-sft-128xh800.sh)
+
+### H800 可训练 PLE
+
+128 张 H800 上的 32K 实验对比了 CPU 冻结 n-gram 表（`QWEN38_PLE_CPU_OFFLOAD=1`）和 GPU 可训练表（`QWEN38_PLE_CPU_OFFLOAD=0`）。两组使用相同的初始权重、数据 batch 和并行拓扑，完成 50 次更新。GPU 组将 n-gram 表移出冻结规则，设置 `RELAX_QWEN38_PLE_STREAMED=0`，并在启动配方中做了显存调优。Loss 取第 6–50 次更新均值，吞吐对两组都排除了写 checkpoint 的第 26 次。
+
+| PLE n-gram 表 | 平均 TPS/GPU | 平均训练 loss | 平均 MTP loss |
+| ------------- | -----------: | ------------: | ------------: |
+| CPU 冻结表    |       528.72 |       0.90678 |       1.20293 |
+| GPU 可训练表  |       433.87 |       0.90643 |       1.19943 |
+
+在第 50 次更新的 checkpoint 中，可训练表对应的 Adam 动量已经出现非零值。另一组 64×H800 训练用 32K packing、TP8/PP8/CP1/EP8，在第 500 次更新后保存了可训练表的全部 8 个分片。完整尺寸的优化器状态重新加载和续训一步对齐仍待验证。公开 H800 脚本默认使用 CPU 冻结表。
 
 ### 待补的公开复现
 
-- 用当前 128×H800 和 40×H20 脚本在公开数据上做端到端实测。记录数据版本与切分、镜像 digest、生效配置、训练 loss、MTP loss、梯度范数、留出集 loss、TPS/GPU 和整卡显存峰值。现有 PR 提供脚本配置验证。 [H800 配方](https://github.com/redai-studio/Relax/pull/637) · [H20 默认值](https://github.com/redai-studio/Relax/pull/635)
+- 在公开数据上复现 H800 吞吐对照，并实测当前 40×H20 脚本的端到端性能。记录数据版本与切分、镜像 digest、生效配置、训练 loss、MTP loss、梯度范数、留出集 loss、TPS/GPU 和整卡显存峰值。现有 PR 提供脚本配置验证。 [H800 配方](https://github.com/redai-studio/Relax/pull/637) · [H20 默认值](https://github.com/redai-studio/Relax/pull/635)
 - 发布准备好的 OpenR1-MM SFT 数据，或提供可复现的转换及切分方式。补原始权重和 SFT checkpoint 在同一留出集上的分数，附评分规则和解码参数。GRPO 补 reward、训练与 rollout 的 log-probability 差异以及留出集分数。 [OpenR1-MM 评测脚本](../../../scripts/tools/eval_openr1mm.py)
 - 在 280G Blackwell 上用发布镜像复验 CuTe 与 MoK，补齐 MoK 对 HybridEP 的对照、256K 单样本的显存和运行结果，以及 checkpoint 保存和恢复验证。对照时固定数据、packing、重算和统计窗口。 [CuTe 验证范围](https://github.com/redai-studio/Relax/pull/691) · [MoK 验证范围](https://github.com/redai-studio/Relax/pull/704)
 
@@ -112,5 +136,7 @@ OpenR1-MM GRPO 读取转换后的 Parquet，字段为 `prompt`、`label` 和 `im
 | Megatron MoE       | 128K 配方使用 `--moe-flex-dispatcher-backend hybridep`、`--moe-hybridep-pad-variable-tokens`、`--moe-shared-expert-overlap`、`--overlap-grad-reduce` 和 `--overlap-param-gather`。长上下文和 OpenR1-MM SFT 配方可选 MoK，对应 `--moe-megakernel-backend mok`。该配置要求 SM103 派生镜像和节点内 EP8。 [MoK 镜像与启动参数](../../../docker/mok/README.md)                                                                  |
 | 模型融合算子       | 128K 和 256K 配方均启用 `RELAX_QWEN38_HC_FUSED_MIX=1`、`RELAX_QWEN38_HC_FUSED_COMBINE=1` 和 `RELAX_QWEN38_PLE_FUSED_CONV=1`。128K 配方的 `NVTE_USE_CUTLASS_GROUPED_GEMM` 单独控制 MoE GEMM，默认 `0`。                                                                                                                                                                                                                     |
 | 长上下文显存       | 256K 配方启用优化器状态分块卸载、CPU PLE 和 `RELAX_QWEN38_HC_RECOMPUTE=1`。`SEQ_LENGTH` 设置单样本上限，`MAX_TOKENS_PER_GPU` 设置 packing 软预算。                                                                                                                                                                                                                                                                         |
+
+更长上下文可在 32 张 Blackwell 上使用 TP1/PP2/EP8/ETP1 搭配 CP8 或 CP16 的 HybridEP 路径，同时启用 mixed CuTe QSA CP。完全冻结 PLE 参数并使用静态 packed THD 时，设置 `QWEN38_PLE_INPUT_HALO_CP=1` 和 `QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive`，让每卡计算自己的 PLE 输出，在文档分片足够长时只交换卷积需要的左侧边界。历史对照保持局部计算开启，仅将通信从 `full` 切到 `adaptive`。各跑 3 步，512K/CP8 的 PyTorch 峰值 allocated 显存从 204.05 降到 200.02 GiB，1M/CP16 从 171.72 降到 157.67 GiB。两组对照中，3 步的训练 loss、MTP loss 和梯度范数均逐值一致。 [长上下文设置](https://github.com/redai-studio/Relax/blob/c75b0a1cb3d03119b02933036287b8c6ad605cf0/docs/zh/guide/qwen38-qsa.md) · [显存结果](https://github.com/redai-studio/Relax/pull/716)
 
 对照组使用各自的 checkpoint 目录。报告单算子收益时，用 trace 核对实际执行的 attention 和 MoE 路径。 [性能调优](../../../docs/zh/guide/performance-tuning.md)
