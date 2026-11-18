@@ -1,4 +1,4 @@
-# CPU Cache
+# CPU and Mooncake Cache
 
 CPU caching extends reusable prompt state from GPU memory into host memory. SGLang HiCache restores prefixes evicted from the GPU, reducing repeated prefill work. Multi-turn conversations and agents that repeatedly submit long prefixes can benefit; actual gains depend on prefix reuse and transfer costs.
 
@@ -7,7 +7,7 @@ CPU caching extends reusable prompt state from GPU memory into host memory. SGLa
 | L1 | GPU memory | Reuse a resident prefix directly |
 | L2 | CPU memory | Restore a backed-up prefix to the GPU after device eviction |
 
-**CPU cache works independently in regular deployment and can also be combined with [PD disaggregation](./pd-disaggregation.md).** A regular engine handles both prefill and decode; PD assigns these stages to separate engines. Cache placement and engine topology are independent settings. This guide and its recipes support GPU+CPU caching only; L3 storage is outside this change.
+**CPU cache works independently in regular deployment and can also be combined with [PD disaggregation](./pd-disaggregation.md).** A regular engine handles both prefill and decode; PD assigns these stages to separate engines. Cache placement and engine topology are independent settings. The same engines can optionally use Mooncake Store as L3, independently of whether PD is enabled.
 
 ## Regular deployment
 
@@ -104,3 +104,57 @@ Inspect actual engine roles, `enable_hierarchical_cache`, host allocations, and 
 | Restore slower than recompute | Prefix length, transfer costs, and full rollout time |
 
 The [Mini SWE example](../../../examples/mini_swe_agent/README.md#train-with-cpu-caching) includes regular and PD launch commands and Qwen3.5-specific YAML. See [Agentic Rollout](./agentic-rollout.md) for concurrency and export contracts. Functional validation does not establish a speedup; performance comparisons require equal models, requests, concurrency, and cache capacities, plus independent repeated runs.
+
+## Mooncake Store L3
+
+Mooncake Store adds a third tier: **GPU → CPU → Store**, with restoration in the reverse direction. L3 describes its position in this cache hierarchy; a DRAM-backed Store is not an SSD cache. The Mooncake transport used for P/D transfer and the Mooncake Store service are separate features. Enabling P/D transfer does not enable L3.
+
+Use the CUDA 12 image built from `docker/Dockerfile`, which applies the patched SGLang 0.5.17 and pins `mooncake-transfer-engine==0.3.12.post1`. The CUDA 13 images use SGLang 0.5.21 and do not include these L3 lifecycle changes. Start a dedicated Mooncake Store master and storage client before starting the engines. For a single-node TCP validation setup, choose unused ports and set `MOONCAKE_RPC_PORT`, `MOONCAKE_METADATA_PORT`, `MOONCAKE_METRICS_PORT`, and `MOONCAKE_CLIENT_PORT`:
+
+```bash
+mooncake_master --rpc_address=127.0.0.1 --port="$MOONCAKE_RPC_PORT" \
+  --enable_http_metadata_server=true --http_metadata_server_host=127.0.0.1 \
+  --http_metadata_server_port="$MOONCAKE_METADATA_PORT" --metrics_port="$MOONCAKE_METRICS_PORT"
+
+# Run separately and keep it alive for the duration of the job.
+mooncake_client --host=127.0.0.1 --port="$MOONCAKE_CLIENT_PORT" \
+  --master_server_address="127.0.0.1:$MOONCAKE_RPC_PORT" \
+  --metadata_server="http://127.0.0.1:$MOONCAKE_METADATA_PORT/metadata" \
+  --protocol=tcp --global_segment_size="16 GB"
+```
+
+Create a JSON connection file using those ports:
+
+```json
+{
+  "local_hostname": "127.0.0.1",
+  "master_server_address": "127.0.0.1:<RPC port>",
+  "metadata_server": "http://127.0.0.1:<metadata port>/metadata",
+  "master_metrics_port": 0,
+  "check_server": false,
+  "protocol": "tcp",
+  "device_name": "",
+  "global_segment_size": 0,
+  "standalone_storage": false
+}
+```
+
+Replace the port placeholders. `global_segment_size: 0` makes engine clients use the separate storage client's capacity. A positive value contributes capacity from every cache-enabled rank, divided by attention TP size: a DP2 × TP2 prefill engine contributes twice the configured value in total. This is additional to the CPU HiCache pools. Store capacity is shared across namespaces; old epochs can occupy space until Store eviction. The example does not enable SSD offload, multi-node storage, or standalone dummy-client allocation.
+
+After preparing Mini SWE inputs and output directories as in the [example](../../../examples/mini_swe_agent/README.md#train-with-cpu-caching), launch:
+
+```bash
+HICACHE_TIER=mooncake HICACHE_DEPLOYMENT=regular \
+HICACHE_MOONCAKE_CONFIG=/shared/path/mooncake.json \
+  bash scripts/entrypoint/ray-job.sh examples/mini_swe_agent/run_mini_swe_agent_hicache.sh
+```
+
+Choose `HICACHE_DEPLOYMENT=pd` for 2P2D TP2 or `pd-dp2` for 1P1D attention DP2 × TP2 / EP4 with DP-aware consistent hashing. The wrapper embeds the connection settings in `${EXP_ROOT}/hicache-mooncake.yaml`; Ray workers need the shared output directory, not the original connection file or submitter's environment. Regular/P engines use `hicache_storage_backend: mooncake` and `wait_complete`; D remains without HiCache. `HICACHE_TIER=cpu` remains the default.
+
+The runtime support here targets Qwen3.5 Unified Full KV + Mamba. Both components must match the same prefix, owner and weights, on every attention TP rank. Each owner receives a new incarnation on startup. Every weight mutation, including unversioned buckets and post-processing, drains storage workers, advances the epoch, and flushes local state before modifying weights. Failure is agreed across global TP; a partial mutation fails the engine. Namespace checks compare ranks within each owner, not different DP owners. Other cache implementations do not receive this Unified namespace and are rejected before online weight mutation with Mooncake.
+
+Mooncake L3 is rejected when `enable_lora` is set. LoRA adapter updates do not run the weight-mutation drain, so a new adapter could otherwise restore KV/Mamba state computed with the old weights. Use CPU-only HiCache or disable LoRA until both adapter-update paths perform the storage drain and namespace invalidation.
+
+A normal GPU/CPU flush or offload/onload without a weight change preserves the L3 namespace. A restart creates a new incarnation. Global Store clearing is disabled because the service may contain other engines' data. Missing or short KV/Mamba objects cause recomputation; cancellation retains host-buffer ownership until the reader exits. Storage shutdown has a bounded join; an unresponsive reader causes failure rather than freeing a buffer still in use. This does not promise that a blocked C++ transport call can be interrupted.
+
+To prove L3 use, first finish a request and its asynchronous backup, flush GPU/CPU cache without clearing Store, and repeat the prompt on the same owner. Require `cached_tokens_details.storage > 0`, H2D activity and agreement with an uncached reference. Check both prefill DP owners in the DP2 recipe. A file/object count or a GPU/CPU hit does not establish L3 consumption. Compare latency with cold recomputation at fixed input and capacity; cache functionality alone does not establish an end-to-end speedup.
