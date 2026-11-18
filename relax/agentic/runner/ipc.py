@@ -25,7 +25,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from relax.agentic.profile import agentic_trace_events, mark_agentic_event
 from relax.utils.agentic_obs.writers import best_effort, submit_background
@@ -346,6 +346,52 @@ class SessionInput:
         return copy.deepcopy(self.input_payload)
 
 
+class _ActiveTimeout:
+    """Count only active time and notify the owner when the budget expires."""
+
+    def __init__(self, timeout_s: float, name: str, on_expire: Callable[[], Awaitable[None]]) -> None:
+        self._timeout_s = self._remaining_timeout = timeout_s
+        self._name = name
+        self._on_expire = on_expire
+        self._timeout_started: Optional[float] = None
+        self._timeout_task: Optional[asyncio.Task[None]] = None
+
+    @property
+    def active_ms(self) -> float:
+        elapsed = self._timeout_s - self._remaining_timeout
+        if self._timeout_started is not None:
+            elapsed += time.monotonic() - self._timeout_started
+        return max(0.0, elapsed * 1000)
+
+    async def set_active(self, active: bool) -> None:
+        """Start or pause the process active-time budget."""
+
+        if active:
+            if self._timeout_started is not None:
+                return
+            self._timeout_started = time.monotonic()
+            self._timeout_task = asyncio.create_task(self._expire_timeout(), name=self._name)
+            return
+        await self.pause()
+
+    async def pause(self) -> None:
+        """Retain the remaining timeout budget across generation gates."""
+
+        started = self._timeout_started
+        self._timeout_started = None
+        if started is not None:
+            self._remaining_timeout -= time.monotonic() - started
+        timeout_task = self._timeout_task
+        self._timeout_task = None
+        if timeout_task is not None and timeout_task is not asyncio.current_task():
+            timeout_task.cancel()
+            await asyncio.gather(timeout_task, return_exceptions=True)
+
+    async def _expire_timeout(self) -> None:
+        await asyncio.sleep(self._remaining_timeout)
+        await self._on_expire()
+
+
 class ManagedAgentProcess:
     """One Session-owned command process with an active-time budget."""
 
@@ -360,11 +406,9 @@ class ManagedAgentProcess:
         self._session_id = session_input.session_id
         self._group_id = session_input.group_id
         self._rollout_mode = session_input.rollout_mode
-        self._remaining_timeout = spec.timeout_s
+        self._timeout = _ActiveTimeout(spec.timeout_s, f"managed-agent-timeout:{self._session_id}", self._on_timeout)
         self._process: Optional[_LauncherProcess] = None
         self._launch_finished = asyncio.Event()
-        self._timeout_started: Optional[float] = None
-        self._timeout_task: Optional["asyncio.Task[None]"] = None
         self._timed_out = False
         self._terminated = False
         self._output = SessionOutput()
@@ -394,32 +438,17 @@ class ManagedAgentProcess:
 
     @property
     def active_ms(self) -> float:
-        elapsed = self._spec.timeout_s - self._remaining_timeout
-        if self._timeout_started is not None:
-            elapsed += time.monotonic() - self._timeout_started
-        return max(0.0, elapsed * 1000)
+        return self._timeout.active_ms
 
     async def set_timeout_active(self, active: bool) -> None:
-        """Start or pause the process active-time budget."""
-
-        if self._task.done():
-            return
-        if active:
-            if self._timeout_started is not None:
-                return
-            self._timeout_started = time.monotonic()
-            self._timeout_task = asyncio.create_task(
-                self._expire_timeout(),
-                name=f"managed-agent-timeout:{self._session_id}",
-            )
-            return
-        await self._pause_timeout()
+        if not self._task.done():
+            await self._timeout.set_active(active)
 
     async def terminate_and_join(self) -> None:
         """Terminate the process group and join its task."""
 
         self._terminated = True
-        await self._pause_timeout()
+        await self._timeout.pause()
 
         async def terminate() -> None:
             await self._launch_finished.wait()
@@ -517,7 +546,7 @@ class ManagedAgentProcess:
                 execution_error = sys.exc_info()[1]
                 self._launch_finished.set()
                 try:
-                    await self._pause_timeout()
+                    await self._timeout.pause()
                     if self._observation_log_path is not None:
                         try:
                             await self._persist_observation_log(log_path)
@@ -551,28 +580,14 @@ class ManagedAgentProcess:
             # A reference to queued diagnostics, not an acknowledgement of persistence.
             self.observation_log_ref = f"logs/{self._observation_log_path.name}"
 
-    async def _expire_timeout(self) -> None:
+    async def _on_timeout(self) -> None:
         """Terminate the process after its active-time budget expires."""
 
-        await asyncio.sleep(self._remaining_timeout)
         self._timed_out = True
         await self._launch_finished.wait()
         process = self._process
         if process is not None:
             await process.terminate()
-
-    async def _pause_timeout(self) -> None:
-        """Retain the remaining timeout budget across generation gates."""
-
-        started = self._timeout_started
-        self._timeout_started = None
-        if started is not None:
-            self._remaining_timeout -= time.monotonic() - started
-        timeout_task = self._timeout_task
-        self._timeout_task = None
-        if timeout_task is not None and timeout_task is not asyncio.current_task():
-            timeout_task.cancel()
-            await asyncio.gather(timeout_task, return_exceptions=True)
 
 
 def _persist_log_tail(payload: bytes, target: Path) -> None:
