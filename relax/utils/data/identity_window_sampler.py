@@ -2,7 +2,11 @@
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+
+if TYPE_CHECKING:
+    from relax.utils.data.flops_balancing import FlopsWorkload
 
 
 try:
@@ -31,6 +35,7 @@ class _WindowState:
     admission_closed: bool = False
     terminal_batch_by_dp: dict[int, int] = field(default_factory=dict)
     finalized_dps: set[int] = field(default_factory=set)
+    flops_plan: dict[int, dict[str, Any]] | None = None
 
     @property
     def admitted_count(self) -> int:
@@ -95,10 +100,14 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         dp_size: int,
         placement: Literal["sequential", "balanced", "streaming"],
         balance_unit_multiplier: int = 1,
+        workload: "FlopsWorkload | None" = None,
     ) -> None:
         super().__init__(n_samples_per_prompt=1, balance_unit_multiplier=balance_unit_multiplier)
         self.dp_size = dp_size
         self.placement = placement
+        if workload is not None and placement != "balanced":
+            raise ValueError("FLOPs placement requires non-streaming balanced identity windows")
+        self.workload = workload
         self._partition_task_states: dict[tuple[str, str], _PartitionTaskState] = {}
         self._cache_window_by_key: dict[tuple[str, str, int, int], int] = {}
         self._window_buckets: dict[tuple[str, str, int], dict[int, list[int]]] = {}
@@ -156,6 +165,7 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         dp_rank = kwargs.get("dp_rank")
         batch_index = kwargs.get("batch_index")
         partition = kwargs["partition"]
+        geometry = kwargs.get("dp_packing_geometry")
 
         if dp_rank is None or batch_index is None:
             rows_by_identity, identity_order, _ = self._ready_identities(
@@ -170,6 +180,12 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
 
         cached = self._cached_result(partition_id, task_name, dp_rank, batch_index)
         if cached is not None:
+            if self.workload is not None:
+                from relax.utils.data.flops_balancing import apply_schedule_metadata
+
+                window_id = self._cache_window_by_key[(partition_id, task_name, dp_rank, batch_index)]
+                window = self._task_state(partition_id, task_name).windows[window_id]
+                apply_schedule_metadata(partition, window.flops_plan, geometry)
             self._mark_cache_served(partition_id, task_name, dp_rank, batch_index, cached[0])
             return cached
 
@@ -208,14 +224,32 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         if len(identity_order) < target_identity_count:
             return [], []
 
-        window = self._window(task_state, batch_index, target_identity_count)
         selected_identities = identity_order[:target_identity_count]
+        selected_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
+        updates = None
+        if geometry is not None:
+            from relax.utils.data.flops_balancing import apply_schedule_metadata, encode_schedule
+
+            if self.workload is None:
+                raise ValueError("Global FLOPs scheduling requires a configured workload estimator")
+            rank_rows, updates = encode_schedule(
+                selected_rows,
+                custom_meta,
+                self.workload,
+                geometry,
+                self.dp_size,
+                len(selected_identities),
+                (partition_id, task_name, batch_index),
+            )
+            apply_schedule_metadata(partition, updates, geometry)
+        else:
+            lengths = {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
+            rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
+
+        window = self._window(task_state, batch_index, target_identity_count)
+        window.flops_plan = updates
         self._admit_identities(task_state, window, selected_identities, rows_by_identity)
         window.admission_closed = True
-
-        selected_rows = [index for identity in selected_identities for index in rows_by_identity[identity]]
-        lengths = {index: int(custom_meta[index]["total_lengths"]) for index in selected_rows}
-        rank_rows = _BalancedRowPlacement.place(selected_rows, lengths, self.dp_size)
 
         for rank, rows in enumerate(rank_rows):
             self._cache_result(partition_id, task_name, rank, batch_index, (rows, rows.copy()))
@@ -496,11 +530,14 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
                 "resolved_lengths": self._resolved_lengths,
                 "dispatched": self._dispatched,
                 "dummy_rounds": self._dummy_rounds,
+                "flops_dp_size": self.dp_size if self.workload is not None else None,
             }
         )
         return state
 
     def load_checkpoint(self, state: dict) -> None:
+        if state.get("flops_dp_size") != (self.dp_size if self.workload is not None else None):
+            raise ValueError("FLOPs mode or DP size differs from the sampler checkpoint")
         super().load_checkpoint(state)
         self._partition_task_states = state["partition_task_states"]
         self._cache_window_by_key = state["cache_window_by_key"]
