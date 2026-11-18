@@ -617,6 +617,8 @@ async def reward(args, sample, *, genrm_generate=None):
 
 回调与 `GenRMClient.generate` 一样，接受 `messages`、可选 `sampling_params` 和可选 `route_key`。rollout 截止时，会同时中断在途 Policy 和 Judge 请求，把 Judge 已生成的 token ID 和文本保存在样本上。下一步复用 Policy 回答，Judge 带上已有前缀和剩余 token 预算续跑；评分成功后清除保存的状态。
 
+停止条件使用 EOS 或 `stop_token_ids`。本次最小接入不跨请求保存字符串/正则停止匹配状态，因此非空的 `stop`、`stop_regex` 请求参数会在发送前直接报错。评估和未启用 partial rollout 时仍沿用普通 client 的采样行为。
+
 reward 可能重新执行：同一样本的 Judge 调用须逐个 await，恢复时保持调用顺序、路由、消息和采样参数一致。多次调用会分别保存结果，已完成的直接复用，未完成的继续生成。业务保留自己的提示词和分数解析。评估和未启用 partial rollout 时，走 `None` 回退，通过原有 GenRM client 完整评分。
 
 当前支持由 Relax 管理的本地 GenRM，以及 inline、逐样本、异步 custom reward。不支持 group reward、自定义 generation、post-process 延迟评分或标记了 `supports_async_eval` 的 reward，配置冲突会直接报错。未声明此参数的 reward 保持原有行为。原有中断次数保护和 off-policy mask 规则继续生效：受保护的组会等到评分完成，仅 Judge 续跑的样本也可能全部 policy token 被 mask。实际吞吐和精度需用业务配置验证。

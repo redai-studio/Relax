@@ -110,6 +110,39 @@ async def test_partial_genrm_resumes_multibyte_text_and_preserves_stop_options(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("no_stop_trim,expected", [(False, "OK"), (True, "OKEND")])
+async def test_partial_genrm_trims_characters_after_stop_inside_one_token(
+    judge, monkeypatch, byte_tokenizer, no_stop_trim, expected
+):
+    byte_tokenizer.add_tokens(["END!"])
+    stop_token = byte_tokenizer.convert_tokens_to_ids("END!")
+    assert byte_tokenizer.decode([stop_token]) == "END!"
+    prefix = byte_tokenizer.encode("OK", add_special_tokens=False)
+    judge.tokenizers["__default__"] = byte_tokenizer
+    last = _chunk("END" if no_stop_trim else "", [stop_token], "stop")
+    last["meta_info"]["finish_reason"]["matched"] = "END"
+    post = AsyncMock(side_effect=[_chunk("OK", prefix, "abort"), last])
+    monkeypatch.setattr(partial_genrm, "_post", post)
+    sample = Sample(status=Sample.Status.COMPLETED)
+    params = {"max_new_tokens": 20, "no_stop_trim": no_stop_trim}
+    with pytest.raises(PartialGenRMAborted):
+        await judge.bind(sample)(MESSAGES, params)
+    assert await judge.bind(sample)(MESSAGES, params) == expected
+    assert await judge.bind(sample)(MESSAGES, params) == expected
+    assert post.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [{"stop": "END"}, {"stop": ["END"]}, {"stop_regex": "END[.!]"}])
+async def test_partial_genrm_rejects_request_local_stop_conditions_before_dispatch(judge, monkeypatch, params):
+    post = AsyncMock(return_value=_chunk("END!", [1], "length"))
+    monkeypatch.setattr(partial_genrm, "_post", post)
+    with pytest.raises(ValueError, match="stop/stop_regex.*stop_token_ids"):
+        await judge.bind(Sample(status=Sample.Status.COMPLETED))(MESSAGES, params)
+    post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_partial_genrm_replays_completed_calls_and_resumes_prefix(judge, monkeypatch):
     post = AsyncMock(side_effect=[_chunk("first", [1], "stop"), _chunk("pre", [2, 3], "abort")])
     monkeypatch.setattr(partial_genrm, "_post", post)
@@ -154,16 +187,23 @@ async def test_partial_genrm_rejects_changed_resume_input(judge, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ignore_eos,aborted", [(False, False), (True, True)])
-async def test_partial_genrm_honors_eos_on_abort(judge, monkeypatch, ignore_eos, aborted):
+@pytest.mark.parametrize(
+    "params,aborted",
+    [
+        ({"ignore_eos": False}, False),
+        ({"ignore_eos": True}, True),
+        ({"ignore_eos": True, "stop_token_ids": [99], "stop": None, "stop_regex": []}, False),
+    ],
+)
+async def test_partial_genrm_honors_eos_on_abort(judge, monkeypatch, params, aborted):
     post = AsyncMock(return_value=_chunk("done", [99], "abort"))
     monkeypatch.setattr(partial_genrm, "_post", post)
     generate = judge.bind(Sample(status=Sample.Status.COMPLETED))
     if aborted:
         with pytest.raises(PartialGenRMAborted):
-            await generate(MESSAGES, {"ignore_eos": ignore_eos})
+            await generate(MESSAGES, params)
     else:
-        assert await generate(MESSAGES, {"ignore_eos": ignore_eos}) == "done"
+        assert await generate(MESSAGES, params) == "done"
 
 
 @pytest.mark.asyncio

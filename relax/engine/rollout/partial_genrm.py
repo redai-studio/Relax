@@ -164,6 +164,10 @@ class PartialGenRM:
             "max_new_tokens": config.get("max_response_len", 1024),
         }
         params.update(sampling_params or {})
+        if params.get("stop") or params.get("stop_regex"):
+            raise ValueError(
+                "Partial GenRM does not support stop/stop_regex across rollout steps; use EOS or stop_token_ids"
+            )
         fingerprint = hashlib.sha256(json.dumps([key, messages, params], sort_keys=True).encode()).hexdigest()
         if index < len(calls):
             call = calls[index]
@@ -251,8 +255,9 @@ class PartialGenRM:
                 spaces_between_special_tokens=params.get("spaces_between_special_tokens", True),
                 clean_up_tokenization_spaces=False,
             )
-            if not params.get("no_stop_trim", False) and isinstance(matched, str) and matched:
-                text = text.partition(matched)[0]
+            if isinstance(matched, str) and matched:
+                before, stop, _ = text.partition(matched)
+                text = before + stop if params.get("no_stop_trim", False) else before
         call["response"] = text
         if reason in {"stop", "length"}:
             call["terminal"] = True

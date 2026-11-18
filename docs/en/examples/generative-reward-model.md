@@ -618,6 +618,8 @@ async def reward(args, sample, *, genrm_generate=None):
 
 The callback accepts `messages`, optional `sampling_params`, and optional `route_key`, like `GenRMClient.generate`. At the rollout cutoff, active Judge requests are aborted together with policy requests. Generated Judge token IDs and text are saved on the sample. On the next step, the policy response is reused and the Judge continues from its prefix with the remaining token budget. Successfully scored samples discard this checkpoint.
 
+For stopping, use EOS or `stop_token_ids`. Non-empty `stop` and `stop_regex` request parameters are rejected before dispatch: this minimal integration does not carry string/regex stop-matching state across requests. Evaluation and non-partial rollout keep the normal client's sampling behavior.
+
 Reward execution can be replayed: await Judge calls sequentially and keep their order, routes, messages and sampling parameters identical on resume. Completed calls are cached separately; unfinished calls resume. Business prompts and score parsing remain in your reward function. Evaluation and non-partial rollout use the `None` fallback and run the regular GenRM client to completion.
 
 This opt-in supports inline per-sample async custom rewards with managed local GenRM instances. Group rewards, custom generation functions, deferred post-process rewards, and rewards marked `supports_async_eval` are rejected. Existing rewards without the explicit parameter keep their current behavior. The existing abort-count protection and off-policy masking also remain: protected groups finish naturally, and a Judge-only resumed response can have an entirely masked policy loss. GPU throughput and precision should be validated for your workload.
