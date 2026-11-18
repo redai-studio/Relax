@@ -404,6 +404,13 @@ def test_receiver_mode_names_preserve_dense_block_fp8_layout(quantization_args, 
     from transformers import Qwen3Config
 
     ModelConfig = pytest.importorskip("sglang.srt.configs.model_config").ModelConfig
+    if method == "modelopt_fp4":
+        from importlib.metadata import version
+
+        from packaging.version import Version
+
+        if Version(version("sglang")) < Version("0.5.21"):
+            pytest.skip("Loading serialized FP8 with modelopt_fp4 requires SGLang >= 0.5.21")
     LoadConfig = pytest.importorskip("sglang.srt.configs.load_config").LoadConfig
     get_quant_config = pytest.importorskip("sglang.srt.model_loader.weight_utils").get_quant_config
     LinearBase = pytest.importorskip("sglang.srt.layers.linear").LinearBase
@@ -435,7 +442,7 @@ def test_receiver_mode_names_preserve_dense_block_fp8_layout(quantization_args, 
     assert receiver.quantization == method.lower()
     assert isinstance(layer.quant_method, Fp8LinearMethod)
     assert layer.quant_method.is_checkpoint_fp8_serialized
-    assert layer.quant_method.weight_block_size == [128, 128]
+    assert loaded.weight_block_size == [128, 128]
     assert resolve_rollout_quantization_config(quantization_args, SimpleNamespace()) == expected
 
 
