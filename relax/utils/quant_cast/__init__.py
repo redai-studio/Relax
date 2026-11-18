@@ -48,7 +48,12 @@ def resolve_receiver_quantization_config(
         if isinstance(overrides.get("text_config"), dict) and isinstance(config_values.get("text_config"), dict):
             overrides["text_config"] = {**config_values["text_config"], **overrides["text_config"]}
         config_values = {**config_values, **overrides}
-        quant_config = _get_checkpoint_quantization_config(config_values) or None
+        # After promotion and overrides the receiver only consults root
+        # metadata; a null root must not re-enable the nested checkpoint copy.
+        quant_config = config_values.get("quantization_config")
+        if quant_config is None:
+            quant_config = config_values.get("compression_config")
+        quant_config = quant_config or None
         # None here is the effective format, not permission to reread the
         # original checkpoint and undo an explicit override.
         if quant_config:

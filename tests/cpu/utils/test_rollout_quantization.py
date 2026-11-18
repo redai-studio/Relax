@@ -208,6 +208,8 @@ def test_rollout_quantization_uses_receiver_checkpoint(quantization_args, tmp_pa
         ({"text_config": {"quantization_config": None}}, False, True),
         ({"quantization_config": None, "text_config": {"quantization_config": None}}, False, False),
         ({"text_config": {"quantization_config": None}}, True, False),
+        ({"quantization_config": None}, False, False),
+        ({"text_config": {"use_cache": False}}, True, False),
     ],
 )
 def test_rollout_quantization_matches_receiver_text_config(quantization_args, overrides, root_null, keeps_fp8):
