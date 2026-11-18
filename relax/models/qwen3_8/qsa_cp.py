@@ -146,6 +146,12 @@ def _core_forward(
     selection = qsa_selection if qsa_selection is not None else self._selection
     cp_group = self.pg_collection.cp
     cp_size = qsa.get_pg_size(cp_group)
+    if getattr(selection, "_relax_qsa_query_positions", None) is not None:
+        if attention_bias is not None or qsa_index_query is not None or qsa_compressed_key is not None:
+            raise NotImplementedError("CuTe CP requires Stage-1 attention without additive bias")
+        from relax.models.qwen3_8.ops.qsa_cute.cp import core_forward
+
+        return core_forward(self, query, key, value, selection, packed_seq_params)
     # Preserve dense/all-selected, stage-2, non-THD and alternate backend behavior.
     if (
         cp_size <= 1

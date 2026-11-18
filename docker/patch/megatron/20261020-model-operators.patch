@@ -36,6 +36,36 @@ diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/attention.py b/me
          nvtx_range_pop(suffix="linear_proj")
  
          return output, bias
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+@@ -18,7 +18,7 @@
+ 3e5a40f2ee42a2c74/mbridge/models/qwen3_vl/gpt_model.py
+ """
+ 
+-from dataclasses import replace
++from copy import copy
+ from typing import Any, Callable, Literal, Optional
+ 
+ import torch
+@@ -48,11 +48,12 @@
+     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+     if cu_seqlens_kv is None:
+         cu_seqlens_kv = cu_seqlens_q
+-    return replace(
+-        packed_seq_params,
+-        cu_seqlens_q=cu_seqlens_q,
+-        cu_seqlens_kv=cu_seqlens_kv,
+-    )
++    # Preserve producer-added QSA boundaries and CP route metadata. A dataclass
++    # replacement drops attributes that are not declared dataclass fields.
++    mtp_packed = copy(packed_seq_params)
++    mtp_packed.cu_seqlens_q = cu_seqlens_q
++    mtp_packed.cu_seqlens_kv = cu_seqlens_kv
++    return mtp_packed
+ 
+ 
+ class Qwen3VLGPTModel(GPTModel):
 diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
 --- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
 +++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py
@@ -609,7 +639,7 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/qsa.py b/m
          qsa_compressed_key: Optional[Tensor] = None,
      ) -> Tensor:
 +        from relax.utils.env import Envs
-+        if Envs.RELAX_QWEN38_QSA_LOCAL_QUERY:
++        if Envs.RELAX_QWEN38_QSA_LOCAL_QUERY or Envs.RELAX_QWEN38_QSA_CP:
 +            from relax.models.qwen3_8.qsa_cp import _core_forward
 +
 +            return _core_forward(self, query, key, value, attention_mask, attn_mask_type, attention_bias, packed_seq_params, qsa_selection=qsa_selection, qsa_index_query=qsa_index_query, qsa_compressed_key=qsa_compressed_key)
@@ -821,6 +851,22 @@ diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/tr
          if self._ngram_ids is None:
              raise RuntimeError("PerLayerEmbedding.prepare() must be called before forward().")
          from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp, split_tensor_cp
+@@ -576,8 +584,13 @@
+             gated_value, self.norm_conv.weight, n, self.norm_eps
+         )
+         positions = self._local_positions(s_local)
+-        conv_out = self._causal_dilated_conv(gated_value_normed, positions)
+-        out = gated_value + F.silu(conv_out.float()).to(dtype)
++        if thd_cp and Envs.RELAX_QWEN38_PLE_CP_FUSED_CONV:
++            from relax.models.qwen3_8.ops.ple_fused_conv import cp_convolution
++
++            out = cp_convolution(self, gated_value_normed, gated_value, positions)
++        else:
++            conv_out = self._causal_dilated_conv(gated_value_normed, positions)
++            out = gated_value + F.silu(conv_out.float()).to(dtype)
+         if thd_cp:
+             out = split_tensor_cp(out, self._cp_packed_seq_params, dim=0)
+             if sp_replicated:
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
 --- a/megatron/core/transformer/transformer_layer.py
 +++ b/megatron/core/transformer/transformer_layer.py

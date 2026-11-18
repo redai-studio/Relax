@@ -16,6 +16,10 @@ def cpu_forward(self, *args, **kwargs):
 
 
 def tp_forward(self, *args, **kwargs):
+    if Envs.RELAX_QWEN38_QSA_CP and self.config.context_parallel_size > 1:
+        from .ops.qsa_cute.cp import forward
+
+        return forward(self, *args, **kwargs)
     if os.environ.get("RELAX_QWEN38_QSA_TP_SELECTOR", "0") == "1":
         if Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND != "mixed":
             raise ValueError("TP QSA selector requires the mixed community attention backend")

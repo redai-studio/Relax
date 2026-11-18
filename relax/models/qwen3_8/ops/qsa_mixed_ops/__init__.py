@@ -32,6 +32,10 @@ def attention_for_selection(
     bounds = getattr(selection, "_relax_qsa_mixed_bounds", None) if is_thd else (0, length)
     if bounds is None or bounds[0] != 0 or bounds[-1] != length:
         raise ValueError("Mixed packed QSA requires producer CPU document boundaries")
+    if long_backend == "cute":
+        from relax.models.qwen3_8.ops.qsa_cute.adapter import attention_for_selection as cute_mixed
+
+        return cute_mixed(query, key, value, selection, scale, bounds)
     if long_backend == "cudnn_pr1765":
         from relax.models.qwen3_8.ops.qsa_mixed_ops.cudnn import attention_for_selection as cudnn_mixed
 
@@ -78,7 +82,11 @@ def forward(
 
     if Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
         raise ValueError("Mixed QSA must not be combined with fused attention")
-    if self.config.context_parallel_size != 1 or self.config.qsa_indexer_loss_coeff != 0:
+    if self.config.context_parallel_size != 1:
+        if not Envs.RELAX_QWEN38_QSA_CP or Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND != "cute":
+            raise NotImplementedError("Mixed QSA CP requires the opt-in CuTe CP path")
+        return selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
+    if self.config.qsa_indexer_loss_coeff != 0:
         raise NotImplementedError("Mixed QSA supports CP1 frozen Stage-1 indexers")
     if any(parameter.requires_grad for parameter in self.parameters()):
         raise NotImplementedError("Mixed QSA requires a frozen indexer")

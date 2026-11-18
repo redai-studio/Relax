@@ -2,7 +2,8 @@
 
 Load this reference when prelaunch, partial rollout, or fully async is enabled.
 
-Partial rollout and fully async are mutually exclusive. Apply the sections for the selected mode.
+Use the lifecycle for the selected training mode. Fully async already retains unfinished work and does not require
+`--partial-rollout`; do not combine its partition debt rules with the dynamic-GBS close path.
 
 ## Partial rollout transition
 
@@ -26,6 +27,13 @@ process timer continues; timeout still terminates the agent process. Step close 
 finalize both before and after the Shard pause transition. Process timeout does not bound every backend or finalization
 RPC.
 
+## Session ownership across steps
+
+Prelaunch shares the Group budget and keeps generation gated until lease. Partial rollout and fully async retain
+Session/request identity under their original partition rules. A Group with members still awaiting first IRs cannot
+count as interrupted credit. A synchronous boundary drops Runtime owners; a final step also drops surplus prepared
+Groups, including completed Prepare tasks that never leased. Physical cleanup runs independently after logical drop.
+
 ## Timeout boundary
 
 One call made by the agent application's Relax-facing Chat Completions, Responses, or Messages client remains the same
@@ -35,7 +43,7 @@ wall-clock time throughout that wait. Buffered SSE connection frames and heartbe
 
 `--agent-timeout` is a separate active process budget for containing defects in the agent itself, such as a stuck loop
 or tool execution. Gated normal Sessions pause it and resumed Sessions restore it. Raising it does not extend the
-Relax-facing client request timeout, bound the Prepare first-request barrier, or guarantee that a backend abort RPC
+Relax-facing client request timeout, bound an agent's wait for its first request, or guarantee that a backend abort RPC
 returns.
 
 When repeated cross-step waits have no known finite wall-clock bound, use a client configuration that intentionally has
@@ -46,11 +54,12 @@ no read/overall deadline and retain explicit cancellation and the agent process 
 
 Fully async may close a step with physical debt only when resident Groups provide interrupted credit. Unfinished Groups remain resident for later steps. Final backfill closes remaining partition debt without opening a new train partition.
 
-Dynamic global batch close is a separate partial-rollout path: it pauses generation, collects a DP-aligned completed surplus, seals the partition, and waits for Transfer writes. Do not combine its accounting with fully-async backfill.
+Agentic dynamic global batch size requires `--partial-rollout` and `over_sampling_batch_size > rollout_batch_size`;
+it remains incompatible with fully async. Its close is a separate partial-rollout path: it pauses generation, collects a DP-aligned completed surplus, seals the partition, and waits for Transfer writes. Do not combine its accounting with fully-async backfill.
 
 ## Check before launch
 
-- Confirm which Sessions may survive a step boundary.
+- Confirm which Sessions and requests may survive a step boundary.
 - Confirm Eval overlap and external slots using the retained-Session capacity rule.
 - Confirm protection threshold semantics and timeout behavior.
 - Confirm the Relax-facing client timeout spans every applicable prelaunch, abort, park, resume, and fully-async hold.

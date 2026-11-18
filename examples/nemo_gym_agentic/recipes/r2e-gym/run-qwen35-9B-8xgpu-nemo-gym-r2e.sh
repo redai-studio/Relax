@@ -63,7 +63,7 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
 
    --use-agentic-rollout
-   --agent-command ". ${RELAX_ROOT}/examples/nemo_gym_agentic/scripts/run_agent_app.sh"
+   --agent-command "bash ${RELAX_ROOT}/examples/nemo_gym_agentic/scripts/run_agent_app.sh"
    --agent-cwd "${RELAX_ROOT}"
    --agent-env
      "NEMO_GYM_URL=${GATEWAY_URL}"

@@ -120,6 +120,9 @@ def forward(
         or any(parameter.requires_grad for parameter in self.parameters())
     ):
         raise NotImplementedError("TP selector supports CP1 frozen Stage-1 selected IDs")
+    selector_backend = os.environ.get("RELAX_QWEN38_QSA_SELECTOR_BACKEND", "torch")
+    if selector_backend not in ("torch", "radix"):
+        raise ValueError("QSA selector backend must be torch or radix")
     if not self.config.layernorm_zero_centered_gamma:
         raise NotImplementedError("Gemma RMSNorm requires zero-centered gamma weights")
     if (
@@ -275,7 +278,11 @@ def forward(
             local_positions = torch.arange(a, b, device=hidden.device)
             q_start = start + a - (first_query if local_projection else 0)
             q_stop = start + b - (first_query if local_projection else 0)
-            if os.environ.get("RELAX_QWEN38_QSA_SELECTOR_COMPILE", "0") == "1":
+            if selector_backend == "radix":
+                from relax.models.qwen3_8.ops.qsa_cute.selector import select_ids
+
+                ids = select_ids(q[q_start:q_stop], pooled, local_positions, topk)
+            elif os.environ.get("RELAX_QWEN38_QSA_SELECTOR_COMPILE", "0") == "1":
                 previous = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
                 try:
                     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False

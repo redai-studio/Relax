@@ -165,6 +165,46 @@ def test_score_centering_tiny_tail_and_extreme_ratios_are_finite(mode: str) -> N
     assert metrics["sc_tail_floor_fraction"].item() == 1
 
 
+@pytest.mark.parametrize("mode", ["none", "tis", "mis"])
+def test_score_centering_mixed_support_matches_direct_support_scoring(mode: str) -> None:
+    logits = torch.tensor(
+        [[2.0, 4.0, 0.0, -1.0], [-0.4, 0.7, 1.0, -0.1], [0.0] * 4, [0.0, 0.5, -0.2, 1.0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    full_logp = logits.log_softmax(-1)
+    sampled_ids = torch.tensor([0, 2, 1, 2])
+    head_ids = torch.tensor([[0, 2], [0, 1], [0, 1], [2, 1]])
+    q = torch.tensor([[0.3, 0.7], [0.2, 0.15], [0.0, 0.0], [1.0, 0.0]], dtype=logits.dtype)
+    sampled_q = torch.tensor([0.3, 0.1, 0.0, 1.0], dtype=logits.dtype)
+    args = dict(
+        log_probs=full_logp.gather(-1, sampled_ids[:, None]).squeeze(-1),
+        advantages=torch.ones(4),
+        rollout_log_probs=sampled_q.log(),
+        train_topk_log_probs=full_logp.gather(-1, head_ids),
+        rollout_topk_log_probs=q.log(),
+        loss_mask=torch.tensor([1, 1, 0, 1]),
+        mode=mode,
+    )
+    coverage = torch.tensor([True, False, True, True])
+    actual, metrics = compute_score_centering_loss(**args, support_complete=coverage)
+    fallback, _ = compute_score_centering_loss(**args)
+    direct_logp = logits[0, head_ids[0]].log_softmax(-1)
+    p = direct_logp.detach().exp()
+    weighted = q[0] * _weight(p / q[0], mode)
+    correction = ((weighted - weighted.sum() * p) * direct_logp).sum()
+    expected = -weighted[0] / q[0, 0] * direct_logp[0] + correction
+    torch.testing.assert_close(actual[0], expected)
+    torch.testing.assert_close(actual[1], fallback[1])
+    torch.testing.assert_close(actual[2:], torch.zeros_like(actual[2:]), atol=1e-12, rtol=0)
+    torch.testing.assert_close(metrics["sc_support_aligned"], (coverage & args["loss_mask"].bool()).to(logits.dtype))
+
+    grad = torch.autograd.grad(actual.sum(), logits, retain_graph=True)[0]
+    reference = torch.autograd.grad(expected + fallback[1], logits)[0]
+    torch.testing.assert_close(grad, reference, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(grad[0, [1, 3]], torch.zeros_like(grad[0, [1, 3]]), atol=1e-12, rtol=0)
+
+
 def _args() -> SimpleNamespace:
     return SimpleNamespace(
         advantage_estimator="score_centering",
