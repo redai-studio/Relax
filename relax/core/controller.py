@@ -35,7 +35,7 @@ from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rol
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
-from relax.utils.env import Envs
+from relax.utils.env import Envs, resolve_in
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.fault_events.recovery import GlobalStartup
 from relax.utils.health_system import HealthManager
@@ -291,6 +291,8 @@ class Controller:
             # Release this job's TQ state immediately if initialization fails,
             # before the entrypoint runs its broader shutdown cleanup.
             logger.error("Controller construction failed; closing any initialized TQ state.")
+            for service in self.serve_dict.values():
+                self._stop_prepared_sft(service)
             try:
                 self._close_data_system()
             except Exception as cleanup_error:  # pragma: no cover - best effort
@@ -777,7 +779,8 @@ class Controller:
 
     def _maybe_prepare_sft_data(self, role: str, service: Service) -> None:
         """Overlap fresh-run CPU data preparation with GPU service startup."""
-        if role != "sft" or os.environ.get("RELAX_SFT_EARLY_PREPARE") != "1":
+        runtime_env_vars = (getattr(self, "runtime_env", None) or {}).get("env_vars", {})
+        if role != "sft" or not resolve_in("RELAX_SFT_EARLY_PREPARE", {**os.environ, **runtime_env_vars}):
             return
         from relax.engine.sft.runtime import is_i2i_sft, should_run_sft_eval, should_run_sft_predict
 

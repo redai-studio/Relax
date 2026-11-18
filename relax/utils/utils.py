@@ -568,6 +568,11 @@ def post_process_env(args, env):
     # tokenizer threads without overriding an explicit runtime configuration.
     env["env_vars"].setdefault("TOKENIZERS_PARALLELISM", "true")
 
+    # Controller and detached training workers must use the same opt-in;
+    # explicit runtime configuration takes precedence over the driver env.
+    if "RELAX_SFT_EARLY_PREPARE" not in env["env_vars"]:
+        env["env_vars"]["RELAX_SFT_EARLY_PREPARE"] = str(int(Envs.RELAX_SFT_EARLY_PREPARE))
+
     logger.info(f"Ray runtime env: {env['env_vars']}")
 
     # Last point where both env sources are merged and still on the driver:

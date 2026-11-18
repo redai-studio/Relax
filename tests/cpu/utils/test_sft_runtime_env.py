@@ -1,11 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from relax.engine.sft.runtime import sft_tq_num_shards
-from relax.utils.env import Envs, known_env_names
+from relax.utils.env import OWNED_ENV_PREFIXES, Envs, known_env_names
 from relax.utils.utils import post_process_env
 
 
@@ -46,6 +47,35 @@ def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch):
     runtime_env = post_process_env(_make_args(), {"env_vars": {"RELAX_SFT_TQ_SHARDS": "2"}})
 
     assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == "2"
+
+
+@pytest.mark.parametrize(
+    "driver,configured,expected",
+    [
+        (None, {}, False),
+        ("yes", {}, True),
+        (None, {"RELAX_SFT_EARLY_PREPARE": "on"}, True),
+        ("1", {"RELAX_SFT_EARLY_PREPARE": "0"}, False),
+    ],
+)
+def test_early_prepare_runtime_env_is_registered_and_consistent(monkeypatch, driver, configured, expected):
+    # Strict validation should inspect this controlled driver configuration,
+    # independently of optional Relax exports inherited from a CI image.
+    for name in tuple(os.environ):
+        if name.startswith(OWNED_ENV_PREFIXES):
+            monkeypatch.delenv(name)
+    if driver is not None:
+        monkeypatch.setenv("RELAX_SFT_EARLY_PREPARE", driver)
+    monkeypatch.setenv("RELAX_STRICT_ENV", "1")
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+
+    runtime_env = post_process_env(_make_args(), {"env_vars": configured.copy()})
+
+    assert "RELAX_SFT_EARLY_PREPARE" in known_env_names()
+    # Apply the actual runtime env at the worker boundary, then read the
+    # same typed binding used by the Megatron worker.
+    monkeypatch.setenv("RELAX_SFT_EARLY_PREPARE", runtime_env["env_vars"]["RELAX_SFT_EARLY_PREPARE"])
+    assert Envs.RELAX_SFT_EARLY_PREPARE is expected
 
 
 def test_post_process_env_propagates_kernel_cache_session(monkeypatch):

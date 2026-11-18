@@ -502,7 +502,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if (
             role == "actor"
             and self._sft_image_preprocess_on_rank
-            and os.environ.get("RELAX_SFT_EARLY_PREPARE") == "1"
+            and Envs.RELAX_SFT_EARLY_PREPARE
             and not resumed_from_megatron
             and (getattr(args, "start_rollout_id", 0) or 0) == 0
             and not should_run_sft_eval(args, 1)
@@ -676,16 +676,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
-        if (
-            is_sft_mode(self.args)
-            and getattr(self.args, "sft_train_data_prefetch", False)
-            and os.environ.get("RELAX_SFT_EARLY_PREPARE") == "1"
-        ):
-            # First use initializes the same NCCL groups used to agree on CPU
-            # prefetch state. Do this on the main thread during initialization,
-            # before measuring the first training data fetch.
-            _agree_sft_train_prefetch_result(None, None)
-            logger.info("Initialized SFT prefetch control communicators")
         self.prof.on_init_end()
         self.data_iterator = None
         self._sft_window_prefetcher = SFTWindowPrefetcher() if is_sft_async_prepack_enabled(self.args) else None
