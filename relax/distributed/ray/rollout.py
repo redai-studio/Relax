@@ -33,7 +33,7 @@ from relax.distributed.ray.rollout_scale_types import (
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
-from relax.engine.rollout.base_types import call_rollout_fn
+from relax.engine.rollout.base_types import DatasetStateMismatchError, call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -1624,6 +1624,11 @@ class RolloutManager(ReloadableMixin):
             await self.data_source.load.remote(rollout_id)
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
+            if (
+                isinstance(e, DatasetStateMismatchError)
+                or (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
+            ):
+                raise
 
     async def offload(self):
         self._offload_local()
