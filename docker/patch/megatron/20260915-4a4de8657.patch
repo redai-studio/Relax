@@ -2127,7 +2127,7 @@ diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gp
 diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/transformer/per_layer_embedding.py
 --- /dev/null
 +++ b/megatron/core/transformer/per_layer_embedding.py
-@@ -0,0 +1,606 @@
+@@ -0,0 +1,616 @@
 +# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +
 +"""Per-Layer (hashed n-gram) Embedding of Qwen4-Exp / Qwen3.8-Flash-Next.
@@ -2554,6 +2554,16 @@ diff --git a/megatron/core/transformer/per_layer_embedding.py b/megatron/core/tr
 +        # of the sbhd SP-sharded path. None means sbhd / CP=1.
 +        self._cp_packed_seq_params: Optional["PackedSeqParams"] = None
 +
++    def capture_checkpoint_state(self) -> Tuple[Optional[Tensor], Optional[Tensor], Optional["PackedSeqParams"]]:
++        """Keep this microbatch's input references for activation recomputation."""
++        return self._ngram_ids, self._position_in_sequence, self._cp_packed_seq_params
++
++    def restore_checkpoint_state(
++        self, state: Tuple[Optional[Tensor], Optional[Tensor], Optional["PackedSeqParams"]]
++    ) -> None:
++        """Restore captured references without copying tensors or packed metadata."""
++        self._ngram_ids, self._position_in_sequence, self._cp_packed_seq_params = state
++
 +    # ------------------------------------------------------------------ inputs
 +    def prepare(self, token_ids: Tensor, cu_seqlens: Optional[Tensor] = None) -> None:
 +        """Stash the n-gram ids and positions for the next forward pass.
@@ -2963,7 +2973,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
 +            for index in range(start, end):
 +                ple = getattr(self._get_layer(index), "per_layer_embedding", None)
 +                if ple is not None:
-+                    ple_states[index] = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
++                    ple_states[index] = ple.capture_checkpoint_state()
 +
              def custom_forward(
                  hidden_states,
@@ -2986,8 +2996,8 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
 -                            )
 +                    ple = getattr(layer, "per_layer_embedding", None)
 +                    if ple is not None:
-+                        previous_ple_state = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
-+                        ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = ple_states[index]
++                        previous_ple_state = ple.capture_checkpoint_state()
++                        ple.restore_checkpoint_state(ple_states[index])
 +                    try:
 +
 +                        # Get appropriate inner quantization context
@@ -3037,7 +3047,7 @@ diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/tran
 +                            )
 +                    finally:
 +                        if ple is not None:
-+                            ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = previous_ple_state
++                            ple.restore_checkpoint_state(previous_ple_state)
                  return hidden_states, context
  
              return custom_forward
