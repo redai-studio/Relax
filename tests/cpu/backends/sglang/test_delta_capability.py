@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.backends.sglang.delta_capability import full_loader_inputs, sparse_loader_identity
+from relax.backends.sglang.delta_capability import _trivial_expert_layout, full_loader_inputs, sparse_loader_identity
 from relax.backends.sglang.delta_loader import load_delta_weights
 from relax.distributed.weight_sync.codec import encode
 
@@ -33,6 +33,72 @@ def model_with_row():
     row.weight.input_dim, row.weight.weight_loader = 1, row.weight_loader
     model.model.row = row
     return model, row
+
+
+def expert_metadata():
+    pytest.importorskip("sglang.srt.eplb.expert_location")
+    from dataclasses import fields
+
+    from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+
+    physical = torch.arange(4).repeat(2, 1)
+    logical = torch.full((2, 4, 4), -1, dtype=torch.int64)
+    logical[..., 0] = physical
+    values = dict(
+        physical_to_logical_map=physical.clone(),
+        physical_to_logical_map_cpu=physical,
+        logical_to_all_physical_map=logical.clone(),
+        logical_to_all_physical_map_cpu=logical,
+        logical_to_all_physical_map_num_valid=torch.ones(2, 4, dtype=torch.int64),
+        logical_to_rank_dispatch_physical_map=None,
+        ep_size=2,
+    )
+    metadata = ExpertLocationMetadata(**{field.name: values[field.name] for field in fields(ExpertLocationMetadata)})
+    # The older local SG schema exposes ep_size through a distributed property;
+    # model the new explicit metadata field without initializing any PG.
+    vars(metadata)["ep_size"] = 2
+    return metadata
+
+
+def test_static_expert_layout_tracks_actual_loader_mapping_and_mutation():
+    metadata = expert_metadata()
+    identity = _trivial_expert_layout(metadata)
+    assert identity is not None
+    with torch.device("meta"):
+        assert _trivial_expert_layout(metadata) == identity
+    for layer in range(2):
+        for expert in range(4):
+            assert metadata.logical_to_all_physical(layer, expert) == [expert]
+    metadata.logical_to_all_physical_map_cpu[0, 0, 0] = 1
+    assert _trivial_expert_layout(metadata) is None
+    metadata.logical_to_all_physical_map_cpu[0, 0, 0] = 0
+    assert _trivial_expert_layout(metadata) != identity
+    before = _trivial_expert_layout(metadata)
+    metadata.logical_to_all_physical_map_cpu = metadata.logical_to_all_physical_map_cpu.clone()
+    assert _trivial_expert_layout(metadata) != before
+
+
+def test_static_expert_layout_rejects_duplicate_remap_and_unknown_helper():
+    metadata = expert_metadata()
+    metadata.logical_to_all_physical_map_cpu[0, 0, 1] = 1
+    assert _trivial_expert_layout(metadata) is None
+    metadata.logical_to_all_physical_map_cpu[0, 0, 1] = -1
+    other = expert_metadata()
+    other.logical_to_all_physical_map_cpu[0, 0, 0] = 1
+    metadata.logical_to_all_physical = other.logical_to_all_physical
+    assert metadata.logical_to_all_physical(0, 0) == [1]
+    assert _trivial_expert_layout(metadata) is None
+    metadata.logical_to_all_physical = lambda *args: [0]
+    assert _trivial_expert_layout(metadata) is None
+    assert _trivial_expert_layout(SimpleNamespace()) is None
+
+
+def test_static_expert_layout_identity_tracks_class_helper_replacement(monkeypatch):
+    metadata = expert_metadata()
+    before = _trivial_expert_layout(metadata)
+    monkeypatch.setattr(type(metadata), "logical_to_all_physical", lambda *args: [1])
+    assert metadata.logical_to_all_physical(0, 0) == [1]
+    assert _trivial_expert_layout(metadata) != before
 
 
 def begin(model, version, *, seed=False, base=None):

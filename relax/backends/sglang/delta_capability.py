@@ -87,6 +87,82 @@ def _geometry(owner: Any) -> tuple:
     )
 
 
+def _trivial_expert_layout(metadata: Any) -> tuple | None:
+    """Admit the ordinary loader's static identity mapping using CPU mirrors.
+
+    The loader reads logical_to_all_physical_map_cpu. Validate those values
+    without copying GPU metadata, and freeze every metadata tensor's storage,
+    geometry and version along with the object. Dynamic layouts stay FULL.
+    """
+    from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+
+    if (
+        type(metadata) is not ExpertLocationMetadata
+        or (
+            getattr(metadata.logical_to_all_physical, "__func__", None)
+            is not ExpertLocationMetadata.logical_to_all_physical
+        )
+        or getattr(metadata.logical_to_all_physical, "__self__", None) is not metadata
+    ):
+        return None
+    physical = metadata.physical_to_logical_map_cpu
+    logical = metadata.logical_to_all_physical_map_cpu
+    ep_size = vars(metadata).get("ep_size")
+    if (
+        any(
+            type(tensor) is not torch.Tensor or tensor.device.type != "cpu" or tensor.layout != torch.strided
+            for tensor in (physical, logical)
+        )
+        or any(tensor.dtype != torch.int64 for tensor in (physical, logical))
+        or physical.ndim != 2
+        or logical.ndim != 3
+        or type(ep_size) is not int
+        or ep_size <= 0
+    ):
+        return None
+    layers, experts = physical.shape
+    if layers <= 0 or experts <= 0 or experts % ep_size or tuple(logical.shape) != (layers, experts, experts):
+        return None
+    expected = torch.arange(experts, dtype=physical.dtype, device="cpu").expand(layers, -1)
+    if (
+        not torch.equal(physical, expected)
+        or not torch.equal(logical[..., 0], expected)
+        or not torch.equal(
+            logical[..., 1:], torch.tensor(-1, dtype=logical.dtype, device="cpu").expand_as(logical[..., 1:])
+        )
+    ):
+        return None
+    for value, expected_shape in (
+        (metadata.physical_to_logical_map, physical.shape),
+        (metadata.logical_to_all_physical_map, logical.shape),
+    ):
+        if (
+            type(value) is not torch.Tensor
+            or value.dtype != torch.int64
+            or value.device.type not in ("cpu", "cuda")
+            or value.layout != torch.strided
+            or tuple(value.shape) != tuple(expected_shape)
+        ):
+            return None
+    identity = []
+    for field in fields(metadata):
+        value = getattr(metadata, field.name)
+        if isinstance(value, torch.Tensor):
+            if type(value) is not torch.Tensor:
+                return None
+            value = (
+                storage_identity(value),
+                None if value.is_inference() else value._version,
+                tuple(value.shape),
+                tuple(value.stride()),
+                value.dtype,
+            )
+        elif value is not None and type(value) is not int:
+            return None
+        identity.append((field.name, value))
+    return id(metadata), metadata.logical_to_all_physical.__func__, ep_size, tuple(identity)
+
+
 def sparse_loader_identity(model: Any) -> tuple | None:
     loader = getattr(model, "load_weights", None)
     function = getattr(loader, "__func__", None)
@@ -131,6 +207,8 @@ def sparse_loader_identity(model: Any) -> tuple | None:
         return None  # AITER post-load shuffling is a different storage contract.
     methods = (UnquantizedEmbeddingMethod, UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
     identity = [function, getattr(getattr(model, "config", None), "tie_word_embeddings", None)]
+    expert_layout_checked = False
+    metadata = None
     for name, module in model.named_modules():
         if any(callable(value) and callable(getattr(type(module), key, None)) for key, value in vars(module).items()):
             return None  # An instance helper override changes the reviewed loader call graph.
@@ -156,8 +234,32 @@ def sparse_loader_identity(model: Any) -> tuple | None:
                 return None
             from sglang.srt.layers.moe.fused_moe_triton.layer import get_global_expert_location_metadata
 
-            if get_global_expert_location_metadata() is not None:
-                return None  # Dynamic physical-expert remapping needs a separately reviewed layout contract.
+            if not expert_layout_checked:
+                metadata = get_global_expert_location_metadata()
+                if metadata is not None:
+                    try:
+                        from sglang.srt.runtime_context import get_exec, get_parallel
+
+                        policy = get_exec().moe
+                        supported = (
+                            policy.enable_eplb is False
+                            and policy.init_expert_location == "trivial"
+                            and policy.ep_join_mode is None
+                            and not policy.is_ep_scale_joiner
+                            and get_parallel().max_ep_size is None
+                            and policy.moe_a2a_backend == "none"
+                        )
+                    except (ImportError, AttributeError):
+                        return None
+                    if not supported:
+                        return None
+                    layout = _trivial_expert_layout(metadata)
+                    if layout is None:
+                        return None
+                    identity.append(("static_expert_layout", layout))
+                expert_layout_checked = True
+            if metadata is not None and vars(metadata)["ep_size"] != module.moe_ep_size:
+                return None
         try:
             geometry = _geometry(module)
         except TypeError:
