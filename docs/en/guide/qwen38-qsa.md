@@ -360,16 +360,32 @@ With CP16, GDN can have three local V heads. The CUDA13 image applies a FlashQLA
 
 ## Local computation for frozen PLE
 
-For static CP, TP1, packed THD input, and fully frozen PLE parameters, set:
-
-With an existing Ray cluster, submission-side `export` alone does not forward these settings to training processes. In this guide's launch scripts, add the following before `export "${ENV_ARGS[@]}"`. The scripts merge these entries with existing settings and pass them to both the Ray job's `runtime_env.env_vars` and the training processes' `--train-env-vars`:
+Enable this for static CP, TP1, packed THD inputs, and fully frozen PLE parameters. This 32-GPU example uses **TP1/PP2/CP8/EP8/ETP1** with a 128K sequence limit. The script forwards both PLE settings to the Ray job and training actors without script edits. Use the image with HybridEP installed as described above, and run from the repository root:
 
 ```bash
-ENV_ARGS+=(
-    QWEN38_PLE_INPUT_HALO_CP=1
-    QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
-)
+export MODEL_DIR=/path/to/model
+export DATA_DIR=/path/to/sft-data
+export SAVE_DIR=/path/to/checkpoints
+export MEGATRON=/path/to/image-patched/Megatron-LM
+export RAY_JOBS_ADDRESS=http://ray-head:8265
+export RAY_ADDRESS="$RAY_JOBS_ADDRESS"
+export QWEN38_PLE_INPUT_HALO_CP=1
+export QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+export RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
+export RELAX_QWEN38_QSA_CP=1
+export QWEN38_CP_SIZE=8
+export QWEN38_PP_LAYOUT='Et*24|t*24mL'
+export QWEN38_SFT_MODALITY=text
+export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS=1
+export EXP_NAME=qwen38-ple-halo-cp8
+NUM_STEPS=20 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh \
+  --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
+  --linear-cp-mode headwise --global-batch-size 32 --rollout-batch-size 32 \
+  --max-tokens-per-gpu 16384 \
+  --chunked-optimizer-state-offload --optimizer-state-offload-fraction 1.0
 ```
+
+The trailing TP/PP arguments override the script's TP2/PP4 defaults; Megatron disables sequence parallelism at TP1. The script already freezes every PLE parameter. Add `DRY_RUN=1` first to inspect the final configuration. This is a PLE launch example, not a 512K/1M capacity validation.
 
 The feature is off by default. Each rank computes its own output rows and the left input context needed by convolution, preserving zero padding at document boundaries. Batch preparation records padded document boundaries automatically; the QSA CPU layout flag is not required. Native GPT and VL Bridge preserve PLE state per microbatch during recomputation. Requires per-document zigzag partitioning; allgather CP, dynamic CP, TP greater than one, and trainable PLE parameters are unsupported.
 
