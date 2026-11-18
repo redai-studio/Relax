@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3.6-35B-A3B Muon TP4/CP1/PP1/EP8/ETP1 SFT on 64 Blackwell GPUs.
+# Qwen3.6-35B-A3B Muon TP4/CP1/PP1/EP8/ETP1 SFT on 32 Blackwell GPUs.
 # Set MODEL_DIR, DATA_DIR and a persistent shared SAVE_DIR.
 # DRY_RUN=1 renders the command and worker environment without submitting a job.
 # Multimodal SFT is enabled by default. Resume from SAVE_DIR/EXP_NAME when available.
@@ -12,7 +12,7 @@ export RELAX="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
 : "${MODEL_DIR:?Set MODEL_DIR}"
 : "${DATA_DIR:?Set DATA_DIR}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent shared checkpoint root}"
-export NUM_GPUS=64
+export NUM_GPUS=32
 export RAY_ADDRESS="${RAY_ADDRESS:-http://127.0.0.1:8265}"
 export RAY_JOBS_ADDRESS="${RAY_JOBS_ADDRESS:-$RAY_ADDRESS}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -36,7 +36,7 @@ for arg in "$@"; do
 done
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen36}"
-EXP_NAME="${EXP_NAME:-qwen36-35B-A3B-64xB300-muon}"  # gitleaks:allow -- stable experiment/checkpoint identity
+EXP_NAME="${EXP_NAME:-qwen36-35B-A3B-32xB300-muon}"  # gitleaks:allow -- stable experiment/checkpoint identity
 now="$(date +%Y%m%d-%H%M%S)"
 TASK_NAME="${EXP_NAME}-${now}-$$"
 SUBMISSION_ID="${SUBMISSION_ID:-$TASK_NAME}"
@@ -191,7 +191,7 @@ SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
     --seq-length 262144
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-1600}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-800}"
     --use-dynamic-batch-size
     --balance-data
     --sft-oversize-strategy keep
@@ -305,7 +305,7 @@ MONITOR_ARGS=(
 )
 
 MISC_ARGS=(
-    --resource '{"sft":[1,0],"actor":[1,64]}'
+    --resource '{"sft":[1,0],"actor":[1,32]}'
     --max-staleness 0
     --num-data-storage-units 8
     --log-probs-chunk-size 2048
