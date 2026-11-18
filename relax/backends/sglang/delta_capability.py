@@ -15,6 +15,19 @@ from typing import Any
 
 import torch
 
+from relax.utils.sparse_tensor import storage_identity
+
+
+def full_loader_inputs(model: Any) -> frozenset[str]:
+    """Aliased named inputs must preserve ordinary FULL's last-writer order."""
+    aliases = {}
+    # The reviewed SG loaders build params_dict from named_parameters(), which
+    # omits duplicate names of the exact same Parameter. Distinct Parameters
+    # sharing storage remain separate ordinary loader inputs.
+    for name, parameter in model.named_parameters():
+        aliases.setdefault(storage_identity(parameter), set()).add(name)
+    return frozenset(name for names in aliases.values() if len(names) > 1 for name in names)
+
 
 def _layout(value: Any) -> Any:
     """Freeze loader geometry without reading GPU values on the hot path."""
@@ -40,7 +53,10 @@ def _geometry(owner: Any) -> tuple:
         for name in (
             "tp_rank",
             "tp_size",
+            "kv_tp_rank",
+            "kv_tp_size",
             "use_presharded_weights",
+            "output_size",
             "output_sizes",
             "num_heads",
             "num_kv_heads",
@@ -56,6 +72,8 @@ def _geometry(owner: Any) -> tuple:
             "moe_ep_rank",
             "moe_ep_size",
             "num_local_experts",
+            "num_fused_shared_experts",
+            "layer_id",
             "_num_local_routed",
             "_num_global_routed",
             "_has_fused_shared",
@@ -87,6 +105,11 @@ def sparse_loader_identity(model: Any) -> tuple | None:
             known.append(cls.load_weights)
     if function not in known or getattr(model, "quant_config", None) is not None:
         return None
+    aliased = full_loader_inputs(model)
+    if aliased - {"model.embed_tokens.weight", "lm_head.weight"}:
+        # Unknown aliases may name fused destinations rather than HF inputs.
+        # Only ordinary direct embedding/head inputs have a reviewed mapping.
+        return None
     from sglang.srt.layers.linear import (
         ColumnParallelLinear,
         MergedColumnParallelLinear,
@@ -106,12 +129,12 @@ def sparse_loader_identity(model: Any) -> tuple | None:
     if torch.version.hip is not None:
         return None  # AITER post-load shuffling is a different storage contract.
     methods = (UnquantizedEmbeddingMethod, UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
-    identity = [function]
+    identity = [function, getattr(getattr(model, "config", None), "tie_word_embeddings", None)]
     for name, module in model.named_modules():
         if any(callable(value) and callable(getattr(type(module), key, None)) for key, value in vars(module).items()):
             return None  # An instance helper override changes the reviewed loader call graph.
         method = getattr(module, "quant_method", None)
-        if method is not None and type(method) not in methods:
+        if (method is not None and type(method) not in methods) or getattr(module, "scheme", None) is not None:
             return None
         if method is not None and any(
             callable(value) and callable(getattr(type(method), key, None)) for key, value in vars(method).items()
@@ -125,7 +148,7 @@ def sparse_loader_identity(model: Any) -> tuple | None:
                 or getattr(method, "use_flashinfer_cutlass", False)
                 or getattr(method, "use_deep_gemm", False)
                 or getattr(method, "scheme", None) is not None
-                or hasattr(module, "scheme")
+                or getattr(method, "w13_swiglu_interleaved", False)
                 or getattr(method, "use_triton_kernels", False) != module.use_triton_kernels
                 or next(module.parameters()).device.type != "cuda"
             ):
@@ -164,18 +187,18 @@ def sparse_loader_identity(model: Any) -> tuple | None:
             return None
         if parameter.numel() == 1:
             return None  # default_weight_loader uses scalar item()/fill_, not a masked copy.
-        if (
-            any(
-                getattr(parameter, name, False)
-                for name in (
-                    "is_gguf_weight",
-                    "is_gguf_weight_type",
-                    "is_metadata",
-                    "needs_scalar_to_array",
-                    "use_bitsandbytes_4bit",
-                )
+        if any(
+            getattr(parameter, name, False)
+            for name in (
+                "is_gguf_weight",
+                "is_gguf_weight_type",
+                "is_metadata",
+                "needs_scalar_to_array",
+                "use_bitsandbytes_4bit",
             )
-            or getattr(parameter, "packed_dim", None) is not None
+        ) or any(
+            getattr(parameter, key, None) is not None
+            for key in ("packed_dim", "pack_factor", "packed_factor", "marlin_tile_size")
         ):
             return None  # These actual SG branches retain/transform input or read scalar values.
         bound = getattr(parameter, "weight_loader", default_weight_loader)
@@ -196,7 +219,11 @@ def sparse_loader_identity(model: Any) -> tuple | None:
                 parameter.dtype,
                 tuple(parameter.shape),
                 tuple(parameter.stride()),
-                tuple((key, getattr(parameter, key, None)) for key in ("input_dim", "output_dim", "is_transposed")),
+                storage_identity(parameter),
+                tuple(
+                    (key, getattr(parameter, key, None))
+                    for key in ("input_dim", "output_dim", "is_transposed", "_sglang_require_global_experts")
+                ),
             )
         )
     return tuple(identity)

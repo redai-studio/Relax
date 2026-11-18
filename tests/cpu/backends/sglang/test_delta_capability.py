@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.backends.sglang.delta_capability import sparse_loader_identity
+from relax.backends.sglang.delta_capability import full_loader_inputs, sparse_loader_identity
 from relax.backends.sglang.delta_loader import load_delta_weights
 from relax.distributed.weight_sync.codec import encode
 
@@ -94,6 +94,21 @@ def test_actual_sg_vocab_shard_dataclass_is_admitted_and_geometry_is_tracked(hea
     assert sparse_loader_identity(model) != before
 
 
+def test_qkv_constructor_geometry_includes_separate_kv_partition():
+    model, _row = model_with_row()
+    from sglang.srt.layers.linear import QKVParallelLinear
+
+    qkv = QKVParallelLinear(4, 1, 8, 4, bias=False, params_dtype=torch.bfloat16, tp_rank=0, tp_size=2)
+    # Separate KV partitions exist in the actual deployment's SG release.
+    # Older local releases inherit the query partition; make that explicit.
+    qkv.kv_tp_rank, qkv.kv_tp_size = 0, 2
+    model.model.qkv = qkv
+    before = sparse_loader_identity(model)
+    assert before is not None
+    qkv.kv_tp_rank = 1
+    assert sparse_loader_identity(model) != before
+
+
 @pytest.mark.parametrize(
     "attribute,value",
     [
@@ -103,6 +118,9 @@ def test_actual_sg_vocab_shard_dataclass_is_admitted_and_geometry_is_tracked(hea
         ("needs_scalar_to_array", True),
         ("use_bitsandbytes_4bit", True),
         ("packed_dim", 1),
+        ("pack_factor", 2),
+        ("packed_factor", 2),
+        ("marlin_tile_size", 16),
     ],
 )
 def test_actual_sg_special_parameter_metadata_prevents_sparse_admission(attribute, value):
@@ -110,3 +128,54 @@ def test_actual_sg_special_parameter_metadata_prevents_sparse_admission(attribut
     assert sparse_loader_identity(model) is not None
     setattr(row.weight, attribute, value)
     assert sparse_loader_identity(model) is None
+
+
+def test_real_qwen_distinct_embedding_alias_inputs_require_full_and_preserve_last_writer():
+    model, _row = model_with_row()
+    shared = torch.zeros(2, 2)
+    model.model.embed_tokens = torch.nn.Module()
+    model.model.embed_tokens.weight = torch.nn.Parameter(shared, requires_grad=False)
+    model.lm_head = torch.nn.Module()
+    model.lm_head.weight = torch.nn.Parameter(shared, requires_grad=False)
+    names = ("model.embed_tokens.weight", "lm_head.weight")
+    assert sparse_loader_identity(model) is not None
+    assert full_loader_inputs(model) == frozenset(names)
+    begin(model, "0", seed=True)
+    metadata, raw = encode(
+        [(name, (2, 2), torch.float32, None, torch.full((4,), float(i))) for i, name in enumerate(names)],
+        max_bytes=1024,
+    )
+    status = torch.empty(2, dtype=torch.uint8)
+    load_delta_weights(
+        model,
+        [
+            (json.dumps(dict(op="consume", version="0", frame=0, metadata=metadata)), raw),
+            ("__delta_capability__", status),
+        ],
+    )
+    assert status.tolist() == [1, 1]
+    assert torch.equal(shared, torch.ones(2, 2))
+    load_delta_weights(model, [(json.dumps(dict(op="finalize", version="0", frames=1)), torch.empty(0))])
+    begin(model, "1", base="0")
+    metadata, raw = encode(
+        [(names[0], (2, 2), torch.float32, torch.tensor([0], dtype=torch.int32), torch.tensor([7.0]))],
+        max_bytes=1024,
+    )
+    with pytest.raises(ValueError, match="complete conversion group as FULL"):
+        load_delta_weights(
+            model,
+            [
+                (json.dumps(dict(op="consume", version="1", frame=0, metadata=metadata)), raw),
+                ("__delta_capability__", status[:1]),
+            ],
+        )
+    assert torch.equal(shared, torch.ones(2, 2))
+
+
+def test_duplicate_name_for_same_parameter_follows_sg_named_parameter_deduplication():
+    model, _row = model_with_row()
+    model.model.embed_tokens = torch.nn.Module()
+    model.model.embed_tokens.weight = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+    model.lm_head = model.model.embed_tokens
+    assert full_loader_inputs(model) == frozenset()
+    assert sparse_loader_identity(model) is not None

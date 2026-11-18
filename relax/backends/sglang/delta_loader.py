@@ -23,7 +23,7 @@ from torch.utils._pytree import tree_leaves
 from relax.distributed.weight_sync.codec import tensors, validate_directory
 from relax.utils.sparse_tensor import FullTensorRequired, SparseTensor, storage_identity
 
-from .delta_capability import sparse_loader_identity
+from .delta_capability import full_loader_inputs, sparse_loader_identity
 
 
 LOADER = "relax.backends.sglang.delta_loader.load_delta_weights"
@@ -114,6 +114,8 @@ class DeltaReceiver:
         if not control["seed"] and destinations != self.destinations and capability is not None:
             raise ValueError("Reallocated sparse model storage requires a new FULL seed")
         self.capability = capability
+        if capability is not None:
+            self.full_only.update(full_loader_inputs(self.model))
         self.destinations = destinations
         device = next(self.model.parameters()).device
         if device.type == "cuda":
@@ -259,7 +261,11 @@ class DeltaReceiver:
         self.destinations = _model_storage(self.model)
         if full_required:
             self.full_only.update(entry["name"] for entry, _, _ in entries)
-        status.fill_(int(full_required))
+        required = [full_required or entry["name"] in self.full_only for entry, _, _ in entries]
+        if all(required) or not any(required):
+            status.fill_(int(all(required)))
+        else:
+            status.copy_(torch.tensor(required, dtype=torch.uint8, device=status.device))
         if raw.device.type == "cuda":
             torch.cuda.synchronize(raw.device)
             peak = max(0, torch.cuda.max_memory_allocated(raw.device) - allocated_before)
