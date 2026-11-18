@@ -12,6 +12,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from relax.engine.sft.dataset.chat_template import render_with_loss_mask
+from relax.engine.sft.dataset.qwen_chat_template_patch import _QWEN38_PRESERVE_HISTORY_GATE
 from relax.engine.sft.dataset.streaming import SFTStreamingDataset, _build_canonical_sample_from_row
 from tests.cpu.engine.sft.dataset.test_chat_template import (
     _ds_sample,
@@ -64,6 +65,62 @@ def _sample(messages):
         require_response=True,
         source_name="test",
     )
+
+
+@pytest.fixture
+def qwen38_tokenizer():
+    tokenizer = _tokenizer()
+    tokenizer.chat_template = (
+        "{%- set ns = namespace(last_query_index=0) -%}"
+        "{%- for message in messages -%}"
+        "{{- '<|im_start|>' + message.role + '\\n' -}}"
+        "{%- if message.role == 'assistant' -%}"
+        "{%- set reasoning_content = message.get('reasoning_content', '') -%}"
+        + _QWEN38_PRESERVE_HISTORY_GATE
+        + "{{- '<think>\\n' + reasoning_content + '\\n</think>\\n\\n' -}}"
+        "{%- endif -%}"
+        "{%- endif -%}"
+        "{{- message.content + '<|im_end|>\\n' -}}"
+        "{%- endfor -%}"
+    )
+    return tokenizer
+
+
+def test_qwen38_mask_rejects_ambiguous_embedded_reasoning(qwen38_tokenizer):
+    sample = _sample(
+        [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "<think>A literal </think> SECOND_SECRET</think>\n\nANSWER"},
+        ]
+    )
+    kwargs = {"tokenizer": qwen38_tokenizer, "apply_chat_template_kwargs": {"reasoning_effort": "low"}}
+    with pytest.raises(ValueError, match="provide separate reasoning_content and content fields"):
+        render_with_loss_mask(sample, mask_reasoning=True, **kwargs)
+
+    ids, mask = render_with_loss_mask(sample, mask_reasoning=False, **kwargs)
+    assert "ANSWER" in qwen38_tokenizer.decode(ids[mask.bool()])
+
+
+@pytest.mark.parametrize(
+    "reasoning,ignore_empty_think",
+    [("A literal </think> SECOND_SECRET", False), ("</think> SECOND_SECRET", True)],
+)
+def test_qwen38_mask_keeps_literal_close_tag_in_structured_reasoning(qwen38_tokenizer, reasoning, ignore_empty_think):
+    sample = _sample(
+        [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "reasoning_content": reasoning, "content": "ANSWER"},
+        ]
+    )
+    ids, mask = render_with_loss_mask(
+        sample,
+        tokenizer=qwen38_tokenizer,
+        apply_chat_template_kwargs={"reasoning_effort": "low"},
+        mask_reasoning=True,
+        ignore_empty_think=ignore_empty_think,
+    )
+    assert f"<think>\n{reasoning}\n</think>" in qwen38_tokenizer.decode(ids)
+    assert qwen38_tokenizer.decode(ids[mask.bool()]).strip() == "ANSWER<|im_end|>"
 
 
 @pytest.mark.parametrize(

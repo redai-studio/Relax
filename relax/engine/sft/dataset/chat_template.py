@@ -67,6 +67,7 @@ def _to_chat_messages(
     normalize_deepseek_reasoning: bool = False,
     normalize_qwen38_reasoning: bool = False,
     include_tool_correlation: bool = True,
+    mask_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     """Convert CanonicalMessage list to dict format expected by
     apply_chat_template."""
@@ -87,7 +88,8 @@ def _to_chat_messages(
                 else None
             )
             split = split_qwen38_leading_thinking(
-                content if isinstance(content, str) else text_item["text"] if text_item is not None else ""
+                content if isinstance(content, str) else text_item["text"] if text_item is not None else "",
+                reject_ambiguous=mask_reasoning and reasoning_content is None,
             )
             if split is not None:
                 if reasoning_content is not None:
@@ -141,6 +143,7 @@ def _render_with_assistant_mask(
         last_turn_only=last_turn_only,
         normalize_deepseek_reasoning=normalize_deepseek_reasoning,
         normalize_qwen38_reasoning=normalize_qwen38_reasoning,
+        mask_reasoning=mask_reasoning,
     )
     result = tokenizer.apply_chat_template(
         messages,
@@ -489,6 +492,7 @@ def _prepare_chat_messages(
     last_turn_only: bool,
     normalize_deepseek_reasoning: bool = False,
     normalize_qwen38_reasoning: bool = False,
+    mask_reasoning: bool = False,
 ) -> tuple[list[dict[str, Any]], dict]:
     """Prepare template input, including the ms-swift non-thinking prefix.
 
@@ -506,6 +510,7 @@ def _prepare_chat_messages(
         normalize_deepseek_reasoning=normalize_deepseek_reasoning,
         include_tool_correlation=not ms_swift_compat,
         normalize_qwen38_reasoning=normalize_qwen38_reasoning,
+        mask_reasoning=mask_reasoning,
     )
     if not add_non_thinking_prefix or normalize_qwen38_reasoning:
         # Qwen3.8's native template renders one think scaffold per assistant
@@ -624,6 +629,7 @@ def _render_per_message_fallback(
             and _EMBEDDED_THINK_INDICES_KEY in (apply_chat_template_kwargs or {})
         ),
         normalize_qwen38_reasoning=qwen38_template,
+        mask_reasoning=mask_reasoning,
     )
     rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
 
@@ -731,9 +737,13 @@ def _render_per_message_fallback(
 
         mask_start = (header_pos if msg.role != "tool" else content_start) if message_selection_only else content_start
         if msg.role == "assistant" and not message_selection_only:
+            reasoning = msgs[msg_idx].get("reasoning_content")
+            # A literal closing tag at the start of structured reasoning can look like an empty block.
             think_end = (
                 _empty_think_region_end(rendered_text, content_start, span_end)
-                if ignore_empty_think and dialect is _CHATML
+                if ignore_empty_think
+                and dialect is _CHATML
+                and not (mask_reasoning and reasoning and reasoning.strip())
                 else -1
             )
             if think_end >= 0:
@@ -741,9 +751,7 @@ def _render_per_message_fallback(
                 # stays out of the loss.
                 mask_start = think_end
             elif mask_reasoning and dialect is _CHATML:
-                mask_start = _reasoning_region_end(
-                    rendered_text, content_start, span_end, msgs[msg_idx].get("reasoning_content")
-                )
+                mask_start = _reasoning_region_end(rendered_text, content_start, span_end, reasoning)
             elif dialect.think_open is not None and rendered_text.startswith(dialect.think_open, content_start):
                 if dialect.think_close is None:
                     # ms-swift's Qwen3.8 ignore_empty_think policy learns the
