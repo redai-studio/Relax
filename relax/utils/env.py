@@ -324,6 +324,8 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- Device / Training -------------
     RELAX_DEVICE_TYPE = EnvProperty("RELAX_DEVICE_TYPE", str, "")
+    # Explicit dense BF16 peak per physical GPU when its reported name is masked.
+    RELAX_DEVICE_PEAK_TFLOPS = EnvProperty("RELAX_DEVICE_PEAK_TFLOPS", float, None)
     RELAX_EMPTY_POLL_SLEEP_MS = EnvProperty("RELAX_EMPTY_POLL_SLEEP_MS", float, 50.0)
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
     RELAX_SFT_TQ_SHARDS = EnvProperty("RELAX_SFT_TQ_SHARDS", int, 1)

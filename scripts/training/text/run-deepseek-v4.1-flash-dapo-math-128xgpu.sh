@@ -185,6 +185,10 @@ import os
 
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
 runtime.setdefault("env_vars", {}).update({
+    # Physical H800 GPUs; reported device names may be masked.
+    "RELAX_DEVICE_PEAK_TFLOPS": os.environ.get(
+        "RELAX_DEVICE_PEAK_TFLOPS", runtime.get("env_vars", {}).get("RELAX_DEVICE_PEAK_TFLOPS", "989")
+    ),
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "0",
     "NCCL_CUMEM_ENABLE": "1",

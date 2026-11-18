@@ -78,13 +78,13 @@ PERF_ARGS=(
     --allgather-cp
     --cp-partition-mode contiguous
     --calculate-per-token-loss
-    --empty-unused-memory-level 1
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
     --recompute-loss-function
     --log-probs-chunk-size 4096
     --moe-token-dispatcher-type alltoall
+    --sft-max-in-flight-steps 2
 )
 
 OPTIMIZER_ARGS=(
@@ -112,8 +112,6 @@ MISC_ARGS=(
     --bf16
     --transformer-impl transformer_engine
     --seed "${SEED}"
-    # Match the full-model RL numerical settings for the future Miles comparison.
-    --deterministic-mode
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
@@ -149,13 +147,15 @@ import os
 
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
 runtime.setdefault("env_vars", {}).update({
+    # Physical H800 GPUs; reported device names may be masked.
+    "RELAX_DEVICE_PEAK_TFLOPS": os.environ.get(
+        "RELAX_DEVICE_PEAK_TFLOPS", runtime.get("env_vars", {}).get("RELAX_DEVICE_PEAK_TFLOPS", "989")
+    ),
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "0",
     "NCCL_CUMEM_ENABLE": "1",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     "NCCL_ALGO": "Ring",
-    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     # Bound host staging for synchronous CPU-optimizer checkpoints.
     "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": os.environ.get("MEGATRON_SYNC_SAVE_BOUNDED_STAGING", "1"),
     "MEGATRON_SYNC_SAVE_STAGE_BYTES": os.environ.get("MEGATRON_SYNC_SAVE_STAGE_BYTES", "0"),

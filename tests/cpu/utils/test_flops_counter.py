@@ -49,6 +49,23 @@ def test_get_device_peak_flops_unknown_gpu():
     assert result == float("inf")
 
 
+def test_device_peak_override_handles_masked_names_without_changing_l20(monkeypatch):
+    monkeypatch.delenv("RELAX_DEVICE_PEAK_TFLOPS", raising=False)
+    monkeypatch.delenv("RELAX_TELEMETRY_HOOK", raising=False)
+    assert get_device_peak_flops(device_name="NVIDIA L20") == pytest.approx(119.5)
+
+    monkeypatch.setenv("RELAX_DEVICE_PEAK_TFLOPS", "989")
+    assert get_device_peak_flops(device_name="NVIDIA L20Z") == pytest.approx(989.0)
+    assert get_device_peak_flops(unit="G", device_name="NVIDIA L20Z") == pytest.approx(989000.0)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_device_peak_override_rejects_invalid_peak(monkeypatch, value):
+    monkeypatch.setenv("RELAX_DEVICE_PEAK_TFLOPS", value)
+    with pytest.raises(ValueError, match="RELAX_DEVICE_PEAK_TFLOPS"):
+        get_device_peak_flops(device_name="NVIDIA H800")
+
+
 def test_get_device_peak_flops_defaults_to_cpu_when_device_properties_unavailable(monkeypatch):
     device_module = types.ModuleType("relax.utils.device")
 

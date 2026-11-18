@@ -8,6 +8,7 @@ import math
 
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.training.deepseek_v41_flops import estimate_deepseek_v41_flops
 from relax.utils.training.gemma4_flops import estimate_gemma4_flops
 from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
 from relax.utils.training.qwen38_flops import _estimate_qwen38_flops
@@ -56,9 +57,16 @@ def _unit_convert(value: float, target_unit: str) -> float:
 def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> float:
     """Get theoretical BF16 peak FLOPS for the current GPU.
 
-    Prefer the optional telemetry hook's device mapping when available. Returns
+    Prefer an explicit RELAX_DEVICE_PEAK_TFLOPS override, then the optional
+    telemetry hook's device mapping when available. Returns
     ``float('inf')`` for unknown GPUs (MFU silently skipped).
     """
+    peak_override = Envs.RELAX_DEVICE_PEAK_TFLOPS
+    if peak_override is not None:
+        if not math.isfinite(peak_override) or peak_override <= 0:
+            raise ValueError("RELAX_DEVICE_PEAK_TFLOPS must be a finite positive BF16 TFLOPS value")
+        return _unit_convert(peak_override * 1e12, unit)
+
     if device_name is None:
         try:
             from relax.utils.device import device_module
@@ -542,6 +550,8 @@ _ESTIMATE_FUNC = {
     "glm4v_moe": _estimate_qwen2_moe_flops,
     # MLA + MoE (DeepSeek-V3 style: MLA attention + shared experts + dense-replace)
     "deepseek_v3": _estimate_deepseek_v3_flops,
+    "deepseek_v41": estimate_deepseek_v41_flops,
+    "deepseek_v41_text": estimate_deepseek_v41_flops,
     "glm4_moe_lite": _estimate_deepseek_v3_flops,
     "glm_moe_dsa": _estimate_deepseek_v3_flops,
     # Vision-language
@@ -579,7 +589,7 @@ class FlopsCounter:
         """Return (estimated_tflops, peak_device_tflops).
 
         ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``.
-        K3/K3.1 honors independent frozen-region flags; other estimators retain
+        K3/K3.1 and V4.1 account for frozen regions; other estimators retain
         their existing 3x-forward training convention.
         """
         tokens_sum = sum(batch_seqlens)
@@ -601,6 +611,8 @@ class FlopsCounter:
                     self._warned_unsupported_trainability = True
                 return float("nan"), get_device_peak_flops(unit="T")
             kwargs["forward_only"] = forward_only
+        elif func is estimate_deepseek_v41_flops:
+            kwargs["forward_only"] = forward_only
         sig = inspect.signature(func)
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
             estimated_tflops = func(self.config, tokens_sum, batch_seqlens, delta_time, **kwargs)
@@ -614,7 +626,15 @@ class FlopsCounter:
                     "Image/audio batches require a separate modality formula. Token throughput and timing remain available."
                 )
                 self._warned_unsupported_trainability = True
-        if forward_only and func is not estimate_kimi_k3_flops:
+        if func is estimate_deepseek_v41_flops and not math.isfinite(estimated_tflops):
+            if not self._warned_unsupported_trainability:
+                logger.warning(
+                    "DeepSeek V4.1 FLOPs/MFU omitted: requires the text-only backbone with frozen routers, "
+                    "indexers and Engram tables, without LoRA, custom parameter masks or MTP; "
+                    "check the compression/source schedule and candidate budget."
+                )
+                self._warned_unsupported_trainability = True
+        if forward_only and func not in (estimate_kimi_k3_flops, estimate_deepseek_v41_flops):
             estimated_tflops /= 3
         peak_tflops = get_device_peak_flops(unit="T")
         return estimated_tflops, peak_tflops

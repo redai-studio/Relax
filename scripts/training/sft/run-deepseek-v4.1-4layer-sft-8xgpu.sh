@@ -17,6 +17,8 @@
 # With an existing Ray cluster, use scripts/entrypoint/ray-job.sh as usual.
 # DRY_RUN=1 prints argv/runtime env without starting Ray or importing ML packages.
 # Reuse SAVE_DIR/EXP_NAME to resume; change EXP_NAME for an independent baseline.
+# SKIP_SAVING=1 disables checkpoint loading and saving for short performance tests.
+# MOE_DISPATCHER=alltoall provides a baseline without DeepEP.
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -30,8 +32,9 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
 HF_CKPT="${HF_CKPT:-${MODEL_DIR}/DeepSeek-V4.1-4layer}"
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/sft/data/OpenMathReasoning-mini/data/cot-00000-of-00001.parquet}"
 QKV_FORMAT="${QKV_FORMAT:-bshd}"
+MOE_DISPATCHER="${MOE_DISPATCHER:-deepep}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/deepseek-v41-openmath}"
-EXP_NAME="${EXP_NAME:-deepseek-v41-4layer-sft-openmath-${QKV_FORMAT}-tp2-pp2-cp2-ep4-deepep-gpu8}"
+EXP_NAME="${EXP_NAME:-deepseek-v41-4layer-sft-openmath-${QKV_FORMAT}-tp2-pp2-cp2-ep4-${MOE_DISPATCHER}-gpu8}"
 NUM_STEPS="${NUM_STEPS:-100}"
 case "${QKV_FORMAT}" in
     bshd|thd) ;;
@@ -49,11 +52,15 @@ CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --ref-load "${HF_CKPT}"
     --megatron-to-hf-mode bridge
-    --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
-    --save-interval "${SAVE_INTERVAL:-100}"
-    --max-actor-ckpt-to-keep 1
 )
+if [ "${SKIP_SAVING:-0}" != 1 ]; then
+    CKPT_ARGS+=(
+        --load "${SAVE_DIR}/${EXP_NAME}"
+        --save "${SAVE_DIR}/${EXP_NAME}"
+        --save-interval "${SAVE_INTERVAL:-100}"
+        --max-actor-ckpt-to-keep 1
+    )
+fi
 
 SFT_ARGS=(
     --loss-type sft
@@ -94,10 +101,13 @@ PERF_ARGS=(
     --recompute-num-layers 1
     --recompute-loss-function
     --log-probs-chunk-size 4096
-    --moe-token-dispatcher-type flex
-    --moe-flex-dispatcher-backend deepep
     --moe-router-dtype fp32
 )
+case "${MOE_DISPATCHER}" in
+    deepep) PERF_ARGS+=(--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep) ;;
+    alltoall) PERF_ARGS+=(--moe-token-dispatcher-type alltoall) ;;
+    *) echo "MOE_DISPATCHER must be deepep or alltoall" >&2; exit 1 ;;
+esac
 
 if [ "${QKV_FORMAT}" = thd ]; then
     PERF_ARGS+=(
@@ -173,7 +183,9 @@ runtime.setdefault("env_vars", {}).update({
     "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": os.environ.get("MEGATRON_SYNC_SAVE_BOUNDED_STAGING", "1"),
     "MEGATRON_SYNC_SAVE_STAGE_BYTES": os.environ.get("MEGATRON_SYNC_SAVE_STAGE_BYTES", "0"),
 })
-for name in ("CLEARML_CONFIG_FILE", "CUDA_HOME", "NO_VCS_VERSION"):
+for name in ("CLEARML_CONFIG_FILE", "CUDA_HOME", "CUDNN_HOME", "NO_VCS_VERSION",
+             "NCCL_ALGO", "NVTE_ALLOW_NONDETERMINISTIC_ALGO", "CUBLAS_WORKSPACE_CONFIG",
+             "RELAX_PROFILE_GZIP_LEVEL"):
     if os.environ.get(name):
         runtime["env_vars"][name] = os.environ[name]
 print(json.dumps(runtime))
