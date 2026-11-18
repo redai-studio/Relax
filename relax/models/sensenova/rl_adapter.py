@@ -126,10 +126,13 @@ class SenseNovaU1ImageEditAdapter:
         rollout_id = int(sampling.get("_rollout_id", 0))
         sample_id = str(sampling.get("_sample_id", seed))
         group_id = f"rollout:{rollout_id}:group:{getattr(sample, 'group_index', 0)}"
+        if sampling.get("_evaluation", False):
+            group_id = f"eval:{sampling['_eval_dataset_id']}:group:{getattr(sample, 'group_index', 0)}"
         candidate_id = f"{group_id}:{sample_id}"
         # Unlike Qwen, this adapter does not supply driver-owned x_T. Derive
         # noise from identity even when the common driver's fallback seed is
-        # constant, and include the round to avoid recycling the same noise.
+        # constant. Training includes the round; held-out evaluation keeps a
+        # stable dataset/candidate identity across rounds.
         key = f"{sampling.get('_base_seed', seed)}:{candidate_id}".encode()
         candidate_seed = int.from_bytes(hashlib.sha256(key).digest()[:8], "little") % (2**63)
         steps = int(sampling.get("num_inference_steps", 50))

@@ -359,8 +359,60 @@ def test_art_evaluation_requests_only_images_and_scores_saved_candidates(monkeyp
     monkeypatch.setattr(generative, "score_samples", score)
     result = ng.evaluate_rollout(args, 3)
     assert result.data == {"heldout": {"rewards": [0.75, 0.5]}}
+    assert ng.evaluate_rollout(args, 9).data == result.data
+    assert seeds[:2] == seeds[2:]
     assert len(set(seeds)) == 2
+    for rollout_id in (3, 9):
+        assert len(list((tmp_path / "eval" / "i2i" / f"rollout_{rollout_id:07d}").glob("*.png"))) == 2
     assert sampling["art"]["train_step_indices"] == [0, 2]
+
+
+@pytest.mark.parametrize("driver_xt", [True, False])
+def test_qwen_eval_noise_is_fixed_across_rounds_and_distinct_across_datasets(monkeypatch, tmp_path, driver_xt):
+    from relax.engine.rewards import generative
+    from relax.models.qwen_image.adapter import QwenImageAdapter
+
+    prompts = tmp_path / "eval.jsonl"
+    prompts.write_text('{"prompt":"draw", "metadata":{"prompt_id":"p"}}\n')
+    sampling = dict(height=64, width=64, num_inference_steps=4, sde_indices=[1, 2], eta=0.8, driver_xt=driver_xt)
+    args = SimpleNamespace(
+        artifact_root=str(tmp_path),
+        generation_task="t2i",
+        generation_seed=42,
+        sampling_config=sampling,
+        model_adapter_path="relax.models.qwen_image.adapter.QwenImageAdapter",
+        eval_datasets=[SimpleNamespace(name=name, path=str(prompts)) for name in ("a", "b")],
+        n_samples_per_eval_prompt=2,
+        reward_component_weights={"ocr": 1.0},
+    )
+    captured = []
+    monkeypatch.setattr(ng, "_get_engines", lambda *_: [object()])
+    monkeypatch.setattr(ng, "_log_eval_perf", lambda *_: None)
+    monkeypatch.setattr(generative, "score_samples", lambda _args, rows: {"ocr": [1.0] * len(rows)})
+
+    def dispatch(_engines, groups):
+        captured.extend(request for group in groups for request in group)
+        return [[{"generated_output": torch.zeros(3, 64, 64)} for request in group] for group in groups]
+
+    monkeypatch.setattr(ng, "_dispatch_groups", dispatch)
+    assert ng.evaluate_rollout(args, 3).data == ng.evaluate_rollout(args, 9).data
+    first, second = captured[:4], captured[4:]
+    for left, right in zip(first, second):
+        assert left["seed"] == right["seed"]
+        assert left["extra_sampling_params"] == right["extra_sampling_params"]
+    assert len({request["seed"] for request in first}) == 4
+    if driver_xt:
+        assert len({request["extra_sampling_params"]["initial_noise_group_ids"][0] for request in first}) == 4
+    # Training retains round-dependent initial noise identities.
+    sample = Sample(prompt="draw", index=0)
+    requests = [
+        QwenImageAdapter().build_rollout_request(sample, {**sampling, "driver_xt": True, "_rollout_id": r}, 42)
+        for r in (3, 9)
+    ]
+    assert (
+        requests[0]["extra_sampling_params"]["initial_noise_group_ids"]
+        != requests[1]["extra_sampling_params"]["initial_noise_group_ids"]
+    )
 
 
 # ---------------------------------------------------------------------------

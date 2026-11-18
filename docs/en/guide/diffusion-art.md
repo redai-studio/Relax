@@ -90,8 +90,10 @@ manifest contents, slices, parsing and shuffle/seed configuration. Fingerprints
 are computed once at data-source startup and reused for saves; legacy cursors
 without a fingerprint warn that identity is unverified. Referenced media and
 tokenizer assets must remain immutable.
-Held-out evaluation uses image-only
-terminal ODE requests, without collecting training states or replay conditions.
+Held-out evaluation uses image-only terminal ODE requests. Its explicit evaluation
+identity fixes initial noise per dataset and candidate across rounds for both
+SenseNova and Qwen-Image; the actual round still selects the output directory.
+Training noise continues to vary with the round.
 
 ## Algorithm and scheduling boundaries
 

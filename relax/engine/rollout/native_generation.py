@@ -587,7 +587,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
             raise ValueError("ART dense trajectory lower bound exceeds max_cache_bytes before dispatch.")
     out_groups: List[List[Sample]] = []
     base_seed = int(getattr(args, "generation_seed", 1234))
-    request_sampling_base = {**sampling, "_rollout_id": int(rollout_id), "_base_seed": base_seed}
+    request_sampling_base = {**sampling, "_rollout_id": int(rollout_id), "_base_seed": base_seed, "_evaluation": False}
     driver_xt = bool(sampling.get("driver_xt", True))
     # Constant for the whole rollout (see _sampling_fingerprint) — hoisted out of
     # the per-group loop.
@@ -740,8 +740,12 @@ def evaluate_rollout(args, rollout_id: int):
     engines = _get_engines(args, None)
     sampling = dict(getattr(args, "sampling_config", None) or {})
     base_seed = int(getattr(args, "generation_seed", 1234))
-    request_sampling_base = {**sampling, "_rollout_id": int(rollout_id), "_base_seed": base_seed}
-    driver_xt = bool(sampling.get("driver_xt", True))
+    request_sampling_base = {
+        **sampling,
+        "_rollout_id": int(rollout_id),
+        "_base_seed": base_seed,
+        "_evaluation": True,
+    }
     artifact_root = os.path.join(args.artifact_root, "eval")
 
     results: Dict[str, Dict[str, Any]] = {}
@@ -779,8 +783,10 @@ def evaluate_rollout(args, rollout_id: int):
                     request_sampling = {
                         **request_sampling_base,
                         "_sample_id": _native_generation_sample_id(sample, group_index, slot, sampling),
+                        "_eval_dataset_id": str(cfg.name),
                     }
-                    seed = base_seed if driver_xt else base_seed + (int(group_index) * n) + slot
+                    identity = f"{base_seed}:{cfg.name}:{request_sampling['_sample_id']}".encode()
+                    seed = int.from_bytes(hashlib.sha256(identity).digest()[:8], "little") % (2**63)
                     req = adapter.build_rollout_request(sample, request_sampling, seed)
                     if is_sensenova_rollout_request(req):
                         req["extra_sampling_params"]["rollout_options"]["capture"] = "terminal"
