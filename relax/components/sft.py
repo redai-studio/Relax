@@ -403,6 +403,7 @@ class _SFTBatchProducerActor:
                 self.config.hf_checkpoint,
                 pool_size=prefetch_num_workers,
                 trust_remote_code=True,
+                multimodal_config=MultimodalConfig.from_args(self.config),
             )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
@@ -666,7 +667,10 @@ class SFT(Base):
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         try:
             self._processor_pool = ProcessorPool(
-                self.config.hf_checkpoint, pool_size=_PRODUCER_POOL_SIZE, trust_remote_code=True
+                self.config.hf_checkpoint,
+                pool_size=_PRODUCER_POOL_SIZE,
+                trust_remote_code=True,
+                multimodal_config=MultimodalConfig.from_args(self.config),
             )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal eval samples will fail at push.")

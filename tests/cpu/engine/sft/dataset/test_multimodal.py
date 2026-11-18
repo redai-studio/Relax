@@ -132,7 +132,8 @@ def test_worker_media_loader_reports_position(monkeypatch):
 def test_worker_media_loader_unpacks_video_and_uses_singular_audio_key(monkeypatch):
     video_utils = ModuleType("relax.utils.multimodal.video_utils")
     frames = torch.zeros(2, 3, 56, 56)
-    video_utils.fetch_video = MagicMock(return_value=(frames, {"fps": 2}, None, None))
+    metadata = {"fps": 2, "total_num_frames": 2, "frames_indices": torch.tensor([0, 1]), "sample_fps": 2}
+    video_utils.fetch_video = MagicMock(return_value=(frames, metadata, None, None))
     audio_utils = ModuleType("relax.utils.multimodal.audio_utils")
     waveform = torch.zeros(6400)
     audio_utils.load_audio = MagicMock(return_value=waveform)
@@ -147,7 +148,7 @@ def test_worker_media_loader_unpacks_video_and_uses_singular_audio_key(monkeypat
     loaded = _load_media_for_worker({"video": ["clip.mp4"], "audio": ["tone.wav"]})
 
     assert set(loaded) == {"videos", "video_metadata", "audio"}
-    assert loaded["video_metadata"] == [{"fps": 2}]
+    assert loaded["video_metadata"] == [{"fps": 2, "total_num_frames": 2, "frames_indices": [0, 1]}]
     assert loaded["videos"][0] is frames
     assert loaded["audio"][0] is waveform
     video_utils.fetch_video.assert_called_once_with(
@@ -245,15 +246,27 @@ def test_worker_forwards_disabled_video_audio_option(monkeypatch):
         None,
     )
     load.assert_called_once_with({"video": ["clip.mp4"]}, use_audio_in_video=False)
-    process.assert_called_once_with("video prompt", {"videos": [frames]}, options)
+    process.assert_called_once_with(
+        "video prompt",
+        {"videos": [frames]},
+        {**options, "videos_kwargs": {"do_sample_frames": False, "do_resize": False}},
+    )
     assert process.call_args.args[1]["videos"][0] is frames
     assert not frames.is_shared()
 
 
 def test_worker_video_applies_frame_and_pixel_limits_before_processing(monkeypatch):
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import (
+        PreTrainedTokenizerFast,
+        Qwen2VLImageProcessor,
+        Qwen3VLProcessor,
+        Qwen3VLVideoProcessor,
+    )
+
     from relax.utils.multimodal import video_utils
 
-    frames = torch.zeros(12, 3, 224, 224)
+    frames = torch.arange(12, dtype=torch.float32).view(12, 1, 1, 1).expand(12, 3, 224, 224).clone()
     monkeypatch.setattr(
         video_utils, "load_video", lambda *a, **kw: (frames, {"fps": 2, "total_num_frames": 12}, None, None)
     )
@@ -267,17 +280,33 @@ def test_worker_video_applies_frame_and_pixel_limits_before_processing(monkeypat
             video_max_token_num=16,
         ),
     )
-    monkeypatch.setattr(
-        worker_processor_pool, "_worker_processor", SimpleNamespace(image_processor=SimpleNamespace(patch_size=14))
+    vocab = {"<unk>": 0, **{token: i + 1 for i, token in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}}
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        additional_special_tokens=["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"],
     )
-    process = MagicMock(return_value=([1, 2], None))
-    monkeypatch.setattr(worker_processor_pool, "process_sample_in_worker", process)
+    processor = Qwen3VLProcessor(
+        image_processor=Qwen2VLImageProcessor(patch_size=16),
+        tokenizer=tokenizer,
+        video_processor=Qwen3VLVideoProcessor(do_rescale=False, do_normalize=False),
+    )
+    monkeypatch.setattr(worker_processor_pool, "_worker_processor", processor)
 
-    worker_processor_pool.process_sample_from_paths_in_worker("video", {"video": ["clip.mp4"]}, {})
-
-    media = process.call_args.args[1]
+    media = worker_processor_pool._load_media_for_worker({"video": ["clip.mp4"]})
     sampled = media["videos"][0]
     assert sampled.shape[0] == 4
-    assert sampled.shape[-1] * sampled.shape[-2] <= 16 * 28**2
-    assert media["video_metadata"][0]["frames_indices"].tolist() == [0, 4, 7, 11]
+    assert sampled.shape[-1] * sampled.shape[-2] <= 16 * 32**2
     assert not sampled.is_shared() and not frames.is_shared()
+
+    prompt_ids, train_inputs = worker_processor_pool.process_sample_from_paths_in_worker(
+        "Describe <|video_pad|>", {"video": ["clip.mp4"]}, {"return_tensors": "pt"}
+    )
+    assert train_inputs["video_grid_thw"].tolist() == [[2, 8, 8]]
+    assert torch.unique(train_inputs["pixel_values_videos"].float()).tolist() == [0, 4, 7, 11]
+    rendered = tokenizer.decode(prompt_ids, clean_up_tokenization_spaces=False)
+    assert "<1.0 seconds>" in rendered
+    assert "<4.5 seconds>" in rendered

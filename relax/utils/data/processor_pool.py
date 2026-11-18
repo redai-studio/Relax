@@ -180,7 +180,13 @@ def _load_media_for_worker(
                         config=_worker_multimodal_config,
                     )
                     items.append(frames)
-                    loaded.setdefault("video_metadata", []).append(metadata)
+                    loaded.setdefault("video_metadata", []).append(
+                        {
+                            "fps": metadata["fps"],
+                            "total_num_frames": metadata["total_num_frames"],
+                            "frames_indices": metadata["frames_indices"].tolist(),
+                        }
+                    )
                 else:
                     items.append(loader(source))
             except Exception as exc:  # noqa: BLE001 - re-raised with position context
@@ -211,6 +217,16 @@ def process_sample_from_paths_in_worker(
     media = prepare_mm_inputs_for_ipc(media)
     if videos is not None:
         media["videos"] = videos
+        # fetch_video already sampled and resized these frames. Preserve its
+        # original timestamps and pixel limits without affecting image kwargs.
+        processor_kwargs = {
+            **processor_kwargs,
+            "videos_kwargs": {
+                **processor_kwargs.get("videos_kwargs", {}),
+                "do_sample_frames": False,
+                "do_resize": False,
+            },
+        }
     prompt_ids, train_inputs = process_sample_in_worker(text, media, processor_kwargs)
     if train_inputs is not None:
         processor = get_worker_processor()
