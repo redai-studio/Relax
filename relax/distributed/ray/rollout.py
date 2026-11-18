@@ -1054,6 +1054,25 @@ class RolloutManager(ReloadableMixin):
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
 
+    # Keep synchronous reload RPCs serialized without blocking generation or
+    # health-monitoring calls. Deferred judge workers must reload as well.
+    @ray.method(concurrency_group="reload")
+    def reload_function_by_name(self, module_name: str) -> dict[str, Any]:
+        return super().reload_function_by_name(module_name)
+
+    @ray.method(concurrency_group="reload")
+    def reload_module(self, module_name: str, module_path: str | None = None) -> dict[str, Any]:
+        return super().reload_module(module_name, module_path)
+
+    @ray.method(concurrency_group="reload")
+    def reload_all_functions(self) -> dict[str, Any]:
+        return super().reload_all_functions()
+
+    def _on_custom_reward_reloaded(self, module_path: str) -> None:
+        eval_judge = getattr(self, "_eval_judge", None)
+        if eval_judge is not None:
+            ray.get(eval_judge.reload_custom_reward.remote(module_path))
+
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
         reused."""
@@ -1243,10 +1262,10 @@ class RolloutManager(ReloadableMixin):
 
     def _require_unmanaged_engine_pool(self) -> None:
         if (
-            self._lora_runtime is not None
-            or self._lora_configuring
+            getattr(self, "_lora_runtime", None) is not None
+            or getattr(self, "_lora_configuring", False)
             or getattr(self, "_lora_configuration_failed", False)
-            or self._lora_training_config is not None
+            or getattr(self, "_lora_training_config", None) is not None
         ):
             raise RuntimeError("managed LoRA currently requires a fixed engine pool")
 
@@ -1420,6 +1439,7 @@ class RolloutManager(ReloadableMixin):
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
 
     async def generate(self, rollout_id):
+        self._begin_generation()
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
@@ -1518,7 +1538,8 @@ class RolloutManager(ReloadableMixin):
         """
         from relax.engine.sft.predict.loop import run_predict_loop
 
-        await self.onload_kv()
+        if self.args.offload_rollout:
+            await self.onload_kv()
         await run_predict_loop(self, self.args, train_step)
 
     async def generate_predict(
@@ -4870,6 +4891,18 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
 
+    genrm_instances = getattr(args, "_genrm_instances_resolved", None)
+    if genrm_instances is None:
+        genrm_instances = getattr(args, "genrm_instances", None)
+    genrm_count = (
+        len(genrm_instances) if genrm_instances is not None else int(bool(getattr(args, "genrm_model_path", None)))
+    )
+    genrm_ports = None
+    if genrm_count:
+        from .genrm import _GENRM_PORT_BASE, _GENRM_PORT_WINDOW_SIZE
+
+        genrm_ports = (_GENRM_PORT_BASE, _GENRM_PORT_BASE + genrm_count * _GENRM_PORT_WINDOW_SIZE)
+
     # Track per-node port cursors so that different engine groups (called
     # sequentially) never race for the same ports on a given node.
     node_port_cursor: dict[int, int] = {}
@@ -4892,12 +4925,17 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
             def port(consecutive=1):
                 nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
+                while True:
+                    _, port = ray.get(
+                        engine._get_current_node_ip_and_free_port.remote(
+                            start_port=start_port,
+                            consecutive=consecutive,
+                        )
                     )
-                )
+                    if genrm_ports and port < genrm_ports[1] and port + consecutive > genrm_ports[0]:
+                        start_port = genrm_ports[1]
+                        continue
+                    break
                 start_port = port + consecutive
                 node_port_cursor[node_idx] = start_port
                 return port
