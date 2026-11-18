@@ -5,6 +5,7 @@
 import hashlib
 import json
 import struct
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -12,7 +13,7 @@ from .codecs import replay_codec
 
 
 REFERENCE_FIELD = "rollout_replay_refs"
-FIELDS = {"moe": "rollout_routed_experts", "indexer": "rollout_indexer_topk"}
+FIELDS = {"moe": "rollout_routed_experts", "indexer": "rollout_indexer_topk", "mm_embedding": "rollout_mm_embeddings"}
 
 
 def register_kind(kind: str, field: str) -> None:
@@ -98,6 +99,13 @@ def encode_refs(value: dict[str, Any]) -> bytes:
     """
     if not value or len(value) > 65535:
         raise ValueError("Invalid replay manifest entry count")
+    if "mm_embedding" in value:
+        list(iter_refs(value))
+        body = json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        size = _HEADER.size + len(body)
+        if size > _MAX_WIRE_BYTES:
+            raise ValueError("Replay manifest exceeds wire limit")
+        return _HEADER.pack(_MAGIC, 4, len(value), size) + body
     wire_version = 3 if any(item.get("codec", "int32") != "int32" for item in value.values()) else 2
     entries = []
     for kind, item in sorted(value.items()):
@@ -129,15 +137,19 @@ def decode_refs(payload: bytes) -> dict[str, Any]:
         result = json.loads(payload)
         if not isinstance(result, dict) or not result:
             raise ValueError("Invalid legacy replay manifest")
-        for kind, item in result.items():
-            if ReplayRef.from_dict(item).kind != kind:
-                raise ValueError("Replay kind mismatch")
+        list(iter_refs(result))
         return result
     if len(payload) < _HEADER.size:
         raise ValueError("Truncated replay header")
     magic, version, count, size = _HEADER.unpack_from(payload)
-    if magic != _MAGIC or version not in (2, 3) or size != len(payload) or not count:
+    if magic != _MAGIC or version not in (2, 3, 4) or size != len(payload) or not count:
         raise ValueError("Invalid replay header/version/length")
+    if version == 4:
+        result = json.loads(payload[_HEADER.size :])
+        if not isinstance(result, dict) or len(result) != count or "mm_embedding" not in result:
+            raise ValueError("Invalid multimodal replay envelope")
+        list(iter_refs(result))
+        return result
     offset = _HEADER.size
 
     def take(size: int) -> bytes:
@@ -233,6 +245,60 @@ def validate_sample(value: dict[str, Any], tokens: list[int]) -> None:
     if not value:
         raise ValueError("Missing replay reference")
     for kind, item in value.items():
+        if kind == "mm_embedding":
+            validate_mm_envelope(item)
+            continue
         ref = ReplayRef.from_dict(item)
         if kind != ref.kind or ref.rows != len(tokens) - 1 or ref.tokens != token_digest(tokens):
             raise ValueError("Replay reference does not match sample tokens or kind")
+
+
+def validate_mm_envelope(value: dict[str, Any]) -> None:
+    """Validate media-coordinate metadata independently of generated text."""
+    if not isinstance(value, dict) or set(value) != {"version", "media"} or value["version"] != 1:
+        raise ValueError("Invalid MM replay envelope")
+    if not isinstance(value["media"], list):
+        raise ValueError("MM replay media must be a list")
+    for item in value["media"]:
+        if not isinstance(item, dict) or set(item) != {"hash", "modality", "grid", "ref", "lease"}:
+            raise ValueError("Invalid MM replay media entry")
+        image_hash, grid, lease = item["hash"], item["grid"], item["lease"]
+        if (
+            not isinstance(image_hash, str)
+            or len(image_hash) != 64
+            or any(c not in "0123456789abcdef" for c in image_hash)
+            or item["modality"] not in ("image", "video")
+            or not isinstance(grid, list)
+            or len(grid) != 3
+            or any(type(n) is not int or n <= 0 for n in grid)
+            or grid[1] % 2
+            or grid[2] % 2
+            or not isinstance(lease, str)
+            or len(lease) != 32
+            or any(c not in "0123456789abcdef" for c in lease)
+        ):
+            raise ValueError("Invalid MM replay hash, grid or lease")
+        ref = ReplayRef.from_dict(item["ref"])
+        if (
+            ref.kind != "mm_embedding"
+            or ref.codec != "bf16-raw-v1"
+            or ref.layers != 1
+            or ref.topk != 2560
+            or ref.tokens != image_hash
+            or ref.rows != grid[0] * grid[1] * grid[2] // 4
+        ):
+            raise ValueError("MM replay reference differs from its media geometry")
+
+
+def iter_refs(value: dict[str, Any]) -> Iterator[ReplayRef]:
+    """Yield owned bodies from both token selections and media references."""
+    for kind, item in value.items():
+        if kind == "mm_embedding":
+            validate_mm_envelope(item)
+            for media in item["media"]:
+                yield ReplayRef.from_dict(media["ref"])
+        else:
+            ref = ReplayRef.from_dict(item)
+            if ref.kind != kind:
+                raise ValueError("Replay kind mismatch")
+            yield ref

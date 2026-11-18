@@ -504,7 +504,9 @@ def post_process_env(args, env):
     from relax.distributed.replay_manager import reference_environment
 
     for name, value in reference_environment().items():
-        if getattr(args, "use_rollout_indexer_replay", False):
+        if getattr(args, "use_rollout_indexer_replay", False) or getattr(
+            args, "use_rollout_mm_embedding_replay", False
+        ):
             env["env_vars"][name] = value
         else:
             env["env_vars"].setdefault(name, value)

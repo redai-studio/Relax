@@ -67,10 +67,11 @@ class ReplayCodec:
         decode_contiguous_into(data, source_start, destination_start, count, output)
 
 
+BF16_RAW = ReplayCodec("bf16-raw-v1", kind="mm_embedding", topk=2560, element_bytes=2)
 RAW = ReplayCodec("int32")
 KEYE_BITMAP = ReplayCodec("keye-bitmap-v1", kind="indexer", topk=2048, max_encoded_width=1025)
 QSA_BITMAP = ReplayCodec("qsa-r4-bitmap-v1", kind="indexer", topk=512, max_encoded_width=2049)
-_CODECS = {codec.name: codec for codec in (RAW, KEYE_BITMAP, QSA_BITMAP)}
+_CODECS = {codec.name: codec for codec in (RAW, KEYE_BITMAP, QSA_BITMAP, BF16_RAW)}
 
 
 def replay_codec(name: str) -> ReplayCodec:

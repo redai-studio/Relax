@@ -19,7 +19,7 @@ from .consumer import (
     ConsumerRequest,
     ConsumerSource,
 )
-from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, register_kind, token_digest
+from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, register_kind, token_digest
 
 
 if TYPE_CHECKING:
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 
 def refs_from_samples(samples: list[Any]) -> list[ReplayRef]:
-    return [ReplayRef.from_dict(item) for sample in samples for item in (sample.rollout_replay_refs or {}).values()]
+    return [ref for sample in samples for ref in iter_refs(sample.rollout_replay_refs or {})]
 
 
 def new_data_id() -> str:
@@ -129,7 +129,7 @@ def _builtin_kinds() -> dict[str, ReplayKind]:
             prefix + ".megatron:MegatronConsumer",
             (("sglang", prefix + ".sglang:apply_sglang_patch"),),
         )
-        for kind in ("moe", "indexer")
+        for kind in ("moe", "indexer", "mm_embedding")
     }
 
 
@@ -335,7 +335,17 @@ class ReplayManager:
     def discard(self, samples: Sequence[Any]) -> None:
         refs = self.sample_refs(samples)
         if refs:
-            self.store().discard(refs)
+            self.store().discard([ref for ref in refs if ref.kind != "mm_embedding"])
+            from .mm_embedding import release_media_entries
+
+            release_media_entries(
+                self.store(),
+                [
+                    item
+                    for sample in samples
+                    for item in (sample.rollout_replay_refs or {}).get("mm_embedding", {}).get("media", [])
+                ],
+            )
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -428,8 +438,7 @@ class ReplayManager:
             for value in values:
                 # Descriptors remain CPU metadata: never copy replay contents to GPU here.
                 decoded = decode_refs(value.cpu().numpy().tobytes())
-                for item in decoded.values():
-                    ReplayRef.from_dict(item)
+                list(iter_refs(decoded))
                 result.append(decoded)
             return result
         import torch
@@ -562,6 +571,16 @@ class ReplayRegion:
         yield
         if refs:
             self.manager.store().commit(refs)
+            from .mm_embedding import release_media_entries
+
+            release_media_entries(
+                self.manager.store(),
+                [
+                    item
+                    for sample in samples
+                    for item in (sample.rollout_replay_refs or {}).get("mm_embedding", {}).get("media", [])
+                ],
+            )
 
     def retire(self) -> None:
         self.manager._ensure_open()
@@ -576,7 +595,7 @@ class ReplayRegion:
         self.manager._ensure_open()
         if batch is None or REFERENCE_FIELD not in batch:
             return
-        refs = [ReplayRef.from_dict(item) for sample_refs in batch[REFERENCE_FIELD] for item in sample_refs.values()]
+        refs = [ref for sample_refs in batch[REFERENCE_FIELD] for ref in iter_refs(sample_refs)]
         self.manager.store().validate_partition(refs, self.partition)
 
 
@@ -596,6 +615,7 @@ class ReplayInventory:
         self._delete = delete
         self._lock = RLock()
         self.state = {"objects": {}, "closed_partitions": [], "closed": False}
+        self._media: dict[str, dict] = {}
 
     @contextmanager
     def _state(self, *, write: bool = True):
@@ -620,6 +640,14 @@ class ReplayInventory:
             item.get("codec", "int32"),
         )
         self.seal(ref)
+        if ref.kind == "mm_embedding":
+            # Seal and install the first publisher/cache reader hold in this
+            # same inventory transaction, before any other producer can drop it.
+            lease = self._media[ref.tokens]["initial_lease"]
+            if lease not in item["readers"]:
+                item["readers"].append(lease)
+            if lease not in item["media_producer_readers"]:
+                item["media_producer_readers"].append(lease)
         return ref
 
     def begin(self, record: str, kind: str, layers: int, topk: int, chunk_rows: int, codec: str = "int32") -> None:
@@ -641,6 +669,7 @@ class ReplayInventory:
             publisher=True,
             partitions=[],
             readers=[],
+            media_producer_readers=[],
             blocks={},
             kind=kind,
             codec=codec,
@@ -667,7 +696,12 @@ class ReplayInventory:
         if any(key in item["blocks"] for key in keys):
             raise ValueError("Replay blocks are write-once")
         size = count * item["topk"] * 4 * len(keys)
-        if item.get("codec", "int32") != "int32":
+        if item.get("codec") == "bf16-raw-v1":
+            expected = count * item["topk"] * 2 * len(keys)
+            if encoded_bytes != expected:
+                raise ValueError("Invalid BF16 byte reservation")
+            size = expected
+        elif item.get("codec", "int32") != "int32":
             from .codecs import replay_codec
 
             codec = replay_codec(item["codec"])
@@ -731,6 +765,9 @@ class ReplayInventory:
             if not item["writing"] and not item["publisher"] and not item["partitions"] and not item["readers"]:
                 self._delete(list(item["blocks"]))
                 del state["objects"][record]
+                for key, media in tuple(self._media.items()):
+                    if media["record"] == record:
+                        del self._media[key]
 
     def close(self) -> None:
         self.state["closing"] = True
@@ -739,9 +776,19 @@ class ReplayInventory:
         for item in self.state["objects"].values():
             if item["writing"] and all(block["ready"] for block in item["blocks"].values()):
                 item["writing"] = False
-        if any(item["writing"] or item["readers"] or item["partitions"] for item in self.state["objects"].values()):
+        if any(
+            item["writing"] or item["partitions"] or set(item["readers"]) - set(item.get("media_producer_readers", []))
+            for item in self.state["objects"].values()
+        ):
             raise RuntimeError("Replay run still has writers, readers or queue holds")
         for item in self.state["objects"].values():
+            # Owning-driver shutdown runs after producer engines are disposed.
+            # MM cache/response leases are producer holds, not training readers;
+            # SIGKILL cannot run their process-exit cleanup. Never drop leases
+            # acquired by generic acquire_many for active training consumers.
+            producer_readers = set(item.get("media_producer_readers", []))
+            item["readers"] = [lease for lease in item["readers"] if lease not in producer_readers]
+            item["media_producer_readers"] = []
             item["publisher"] = False
         self._collect(self.state)
         self.state["closed"] = True
@@ -781,6 +828,71 @@ class ReplayInventory:
                 item["manifest"] = mapped.to_dict()
         return mapped
 
+    def claim_media(
+        self, image_hash: str, grid: list[int], record: str, modality: str, *, lease: str | None = None
+    ) -> dict:
+        """Choose one publisher by image hash, and retain every ready lookup
+        atomically."""
+        with self._state() as state:
+            if state["closed"] or state.get("closing"):
+                raise RuntimeError("Replay run is closing")
+            lease = uuid.uuid4().hex if lease is None else lease
+            if not isinstance(lease, str) or len(lease) != 32 or any(c not in "0123456789abcdef" for c in lease):
+                raise ValueError("Invalid media reader lease")
+            previous = self._media.get(image_hash)
+            if previous is None:
+                self._media[image_hash] = {
+                    "record": record,
+                    "grid": grid,
+                    "modality": modality,
+                    "initial_lease": lease,
+                }
+                return {"status": "claimed", "lease": lease}
+            if previous["grid"] != grid or previous["modality"] != modality:
+                raise ValueError("One media hash has incompatible geometry or modality")
+            item = state["objects"].get(previous["record"])
+            if item is None or not item["ready"]:
+                return {"status": "pending"}
+            ref = ReplayRef.from_dict(item["manifest"])
+            if lease not in item["readers"]:
+                item["readers"].append(lease)
+            if lease not in item["media_producer_readers"]:
+                item["media_producer_readers"].append(lease)
+            return {"status": "ready", "ref": ref.to_dict(), "lease": lease}
+
+    def lookup_media(
+        self, image_hash: str, grid: list[int], modality: str, *, lease: str | None = None
+    ) -> dict | None:
+        with self._state():
+            previous = self._media.get(image_hash)
+            if previous is None:
+                return None
+            result = self.claim_media(image_hash, grid, previous["record"], modality, lease=lease)
+            return result if result["status"] == "ready" else None
+
+    def abort_media_claim(self, image_hash: str, record: str) -> None:
+        with self._state() as state:
+            previous = self._media.get(image_hash)
+            if previous is not None and previous["record"] == record and record not in state["objects"]:
+                del self._media[image_hash]
+
+    def release_media(self, refs: list[ReplayRef], leases: list[str]) -> None:
+        """Release independent response/cache holds even when another response
+        queued the body."""
+        with self._state() as state:
+            for ref, lease in zip(refs, leases, strict=True):
+                if ref.kind != "mm_embedding" or ref.owner != self.owner or ref.run != self.run:
+                    raise ValueError("Invalid media publisher release")
+                item = state["objects"].get(ref.record)
+                if item is not None:
+                    item = self._object(state, ref)
+                    if lease in item["readers"]:
+                        item["readers"].remove(lease)
+                    if lease in item["media_producer_readers"]:
+                        item["media_producer_readers"].remove(lease)
+                    item["publisher"] = False
+            self._collect(state)
+
     def acquire_many(
         self, refs: list[ReplayRef], *, partition: str | None = None, leases: list[str] | None = None
     ) -> list[str]:
@@ -807,6 +919,9 @@ class ReplayInventory:
         identities = set(leases)
         for item in self.state["objects"].values():
             item["readers"] = [lease for lease in item["readers"] if lease not in identities]
+            item["media_producer_readers"] = [
+                lease for lease in item.get("media_producer_readers", []) if lease not in identities
+            ]
         self._collect(self.state)
 
     def _partition_items(self, state: dict, refs: list[ReplayRef], partition: str | None) -> list[dict]:
@@ -878,6 +993,8 @@ class ReplayInventory:
             for item, lease in items:
                 if lease in item["readers"]:
                     item["readers"].remove(lease)
+                if lease in item.get("media_producer_readers", []):
+                    item["media_producer_readers"].remove(lease)
             self._collect(state)
 
     def retire_partition(self, partition: str) -> None:

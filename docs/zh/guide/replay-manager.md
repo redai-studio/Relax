@@ -1,6 +1,6 @@
 # Replay Manager
 
-Replay Manager 将 SGLang rollout 中的离散模型决策交给 Megatron 训练重放。内置两类数据：`moe` 对应专家路由（R3），`indexer` 对应 DSA、QSA 等稀疏 attention 的选择结果。重放让训练复用 rollout 选中的集合；QSA 还可以跳过已有 replay 行的 indexer 打分计算。
+Replay Manager 将 SGLang rollout 中的离散模型决策交给 Megatron 训练重放。内置三类数据：`moe` 对应专家路由（R3），`indexer` 对应 DSA、QSA 等稀疏 attention 的选择结果，`mm_embedding` 对应冻结的视觉输出。重放让训练复用 rollout 选中的集合；QSA 还可以跳过已有 replay 行的 indexer 打分计算。
 
 本文重点介绍 **reference 模式**：sample 只携带小型描述符，不可变的 replay body 存放在 TransferQueue（TQ）。它与记录离线 loss/advantage 复现数据的[轨迹重放](./trajectory-replay.md)是两套功能。
 
@@ -52,6 +52,20 @@ Token 身份、kind、codec、layer 和 partition 检查会拒绝不兼容的 re
 该参数会自动设置 `RELAX_REPLAY_REFERENCES=1`，按需生成 run ID，并把 reference 环境传给 worker，无须再配置一个 reference 开关。
 
 MoE replay 由 `--use-rollout-routing-replay` 独立开启；`--use-routing-replay` 控制训练侧路由重放，`--optimize-routing-replay` 选择已有的路由重放优化。这些参数不会开启 QSA。Indexer replay 与 rollout routing replay 同时开启时，两类数据共用 reference 基础设施。
+
+### 冻结视觉 embedding replay
+
+```bash
+--use-rollout-mm-embedding-replay
+```
+
+此参数同样自动启用 reference。Qwen3.8 适配器要求在线 colocate Megatron、CP1、BF16，并冻结整个视觉编码器，**包括 merger/projection**。Checkpoint 必须输出 2560 维视觉 embedding，且没有 DeepStack。此适配器不支持依赖 Critic 的算法、MTP、推测解码、partial rollout、hierarchical cache 和自定义生成路径。现有 indexer replay 的多模态限制保持不变，此参数不会开启 indexer replay。
+
+采集边界位于视觉 merger 之后、与文本 embedding 混合之前。新计算、embedding cache 命中、预计算特征和 chunked prefill 都引用完整媒体 body。按引擎的图片 hash 去重：同 hash 复用第一次发布的 body，不再比较后续特征数值；grid 或 modality 不兼容时拒绝使用。
+
+`bf16-raw-v1` 将 BF16 原始位按字节传输，不做量化。Body 大小为 `N_visual × 2560 × 2` 字节，1024 个视觉 token 对应 5 MiB。多个 response 共用 body，不为每条回答复制。Sample 队列仅携带 reference 和布局元数据，校验 grid 后移除原始 pixel tensor；存储、reader lease 和 partition 回收沿用现有 TQ 机制。
+
+训练只在输入 PP stage 加载，每个 TP 组读取一次后广播给组内其他 rank。有界缓存复用于 log-probability 和训练前向，保留原有 placeholder scatter、MRoPE 及语言模型梯度。不开此参数时仍走原有视觉计算路径。
 
 ### 当前 indexer 接入范围
 
@@ -133,6 +147,21 @@ Bitmap 从 consumer 一直保留到 mixed attention。专用 Triton 实现按 ke
 | QSA + R3，bitmap 算子 v2 (`f6ee7d39`) | 2 | 3.093 | 63.18 | 442.27 |
 
 以 step 2 为例，bitmap v2 的训练区域为 63.18 秒，基线为 68.18 秒；对应完整 step 却分别为 442.27 和 427.43 秒。各实验的 token 数和 rollout 长度不同，这些观测不能构成严格的 replay 或算子加速对照，也不能将上述单算子收益直接换算为 step time 收益。单开 QSA replay 没有明显降低实测 mismatch。
+
+### 冻结视觉 embedding：OpenR1MM GRPO
+
+2026-11-18 的 Qwen3.8-Flash-Next OpenR1MM 对照使用 32 张 Blackwell GPU（每卡 280 GB），训练 TP4/PP4/CP1/EP8、rollout 四个 TP8/EP8 引擎，单卡动态 microbatch token 预算 16384。Prompt batch 为 128，每题生成 8 个回答，global batch 为 1024；视觉编码器及 merger/projection 冻结。两组各跑 10 步，不保存 checkpoint，只切换 `--use-rollout-mm-embedding-replay`，均未开启 QSA indexer replay 或 R3。
+
+| 耗时中位数（排除 step 0，统计 step 1–9） | 原生视觉路径 | MM embedding replay | 下降 |
+| --- | ---: | ---: | ---: |
+| `perf/train_time` | 81.01 s | 74.53 s | 8.0% |
+| `perf/step_time` | 313.68 s | 302.81 s | 3.5% |
+
+相同统计区间内，以训练 token 总数除以 `train_time` 总和得到的吞吐由 20.05K 提高至 24.40K token/s（约 21.7%）。生成结果和响应长度并非逐 token 相同，基线后续也触发过形状编译，因此这些是本配置下的观测收益，不能将吞吐变化全部归因于视觉计算的省略。
+
+消费端输入 PP stage 的一个 TP0 rank 在代表步中实际读取约 126 MB，CPU 读取耗时约 0.9–1.1 秒，TP broadcast 的 CPU 调用耗时约 0.02 秒；缓存命中约 900 次、未命中约 120 次，无淘汰。这里的 CPU 耗时包含调用和等待，不是通过 CUDA 同步测得的 GPU 完成时间，也不是全局通信量。
+
+训推一致性略有改善：两组前 10 步的 `train/mismatch_kl` 均值由 0.002208 降至 0.002012（约 8.9%），logprob 绝对差由 0.02814 降至 0.02703（约 4.0%）。后续 200 步长跑在观察时已完成 39 步，其前 10 步 mismatch KL 相对基线低约 6.5%；这不是长跑完成结果，也不足以单独证明 replay 对 mismatch 的因果影响。
 
 ## 运行时观察
 

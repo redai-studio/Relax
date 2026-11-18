@@ -1,6 +1,6 @@
 # Replay Manager
 
-Replay Manager carries discrete model decisions from SGLang rollout into Megatron training. It has two built-in kinds: `moe` for expert routing (R3), and `indexer` for sparse attention selections such as DSA and QSA. Replaying a selection avoids choosing a different set in training; QSA can also skip indexer scoring for rows covered by rollout.
+Replay Manager carries discrete model decisions from SGLang rollout into Megatron training. It has three built-in kinds: `moe` for expert routing (R3), `indexer` for sparse attention selections such as DSA and QSA, and `mm_embedding` for frozen visual outputs. Replaying a selection avoids choosing a different set in training; QSA can also skip indexer scoring for rows covered by rollout.
 
 This page focuses on **reference delivery**: samples carry small descriptors, and immutable replay bodies live in TransferQueue (TQ). This is separate from [Trajectory Replay](./trajectory-replay.md), which records offline loss/advantage reproduction bundles.
 
@@ -52,6 +52,20 @@ Add the following to a supported online, colocated Megatron recipe:
 This flag automatically enables `RELAX_REPLAY_REFERENCES=1`, allocates a run ID when needed, and forwards the reference environment to workers. There is no second reference-mode switch to configure.
 
 MoE replay is independently enabled with `--use-rollout-routing-replay`; `--use-routing-replay` controls training-side routing replay. `--optimize-routing-replay` selects the existing routing replay optimizations. These flags do not enable QSA. When indexer replay and rollout routing replay are combined, both kinds use the same reference infrastructure.
+
+### Frozen multimodal embedding replay
+
+```bash
+--use-rollout-mm-embedding-replay
+```
+
+This flag also selects reference delivery automatically. The Qwen3.8 adapter requires online colocated Megatron training, CP1, BF16, and a fully frozen vision encoder **including the merger/projection**. The checkpoint must produce 2560-wide visual embeddings without DeepStack. Critic-based algorithms, MTP, speculative decoding, partial rollout, hierarchical cache and custom generation paths are not supported by this adapter. Existing indexer-replay restrictions on multimodal input remain in place; this flag does not enable indexer replay.
+
+Capture occurs after the visual merger and before visual embeddings are combined with text embeddings. Newly computed features, embedding-cache hits, precomputed features and chunked prefill all refer to the complete media body. The deduplication key is the engine's image hash: the first published body is reused for that hash, without comparing subsequent feature values. Conflicting grid or modality metadata is rejected.
+
+The `bf16-raw-v1` codec transports the original BF16 bits as bytes, with no quantization. A body uses `N_visual × 2560 × 2` bytes: 1024 visual tokens occupy 5 MiB. Multiple responses reference the same body instead of each carrying a copy. The sample queue carries only references and layout metadata; raw pixel tensors are removed after their grids are validated. Existing TQ storage, reader leases and partition retirement manage ownership.
+
+Training loads the body on the input pipeline stage, reads once per tensor-parallel group and broadcasts to its peers. A bounded cache reuses embeddings for log-probability and training forwards; the original placeholder scatter, MRoPE and language-model gradients are preserved. Disabling the flag leaves the original visual computation path in use.
 
 ### Supported indexer layouts
 
@@ -133,6 +147,21 @@ The following are logged observations from the 32-GPU TP4/PP4/CP1/EP8 runs, with
 | QSA + R3, bitmap kernel v2 (`f6ee7d39`) | 2 | 3.093 | 63.18 | 442.27 |
 
 The bitmap-v2 step-2 training window was 63.18 seconds, versus 68.18 seconds for the baseline, while the corresponding step times were 442.27 and 427.43 seconds. Token counts and rollout lengths differ, so these observations do not establish a controlled replay or kernel speedup. The single-operator result above does not translate directly into step-time savings. QSA replay alone did not materially lower the measured mismatch.
+
+### Frozen visual embeddings: OpenR1MM GRPO
+
+The 2026-11-18 Qwen3.8-Flash-Next OpenR1MM comparison used 32 Blackwell GPUs (280 GB each), TP4/PP4/CP1/EP8 training, four TP8/EP8 rollout engines, and a per-GPU dynamic microbatch token budget of 16384. The prompt batch was 128 with eight responses per prompt and a global batch of 1024. The vision encoder and merger/projection were frozen. Each run completed ten steps without checkpoint saving; only `--use-rollout-mm-embedding-replay` was toggled. Neither run enabled QSA indexer replay or R3.
+
+| Median duration (steps 1–9, excluding step 0) | Native vision path | MM embedding replay | Reduction |
+| --- | ---: | ---: | ---: |
+| `perf/train_time` | 81.01 s | 74.53 s | 8.0% |
+| `perf/step_time` | 313.68 s | 302.81 s | 3.5% |
+
+Over the same interval, total training tokens divided by total `train_time` increased from 20.05K to 24.40K tokens/s (about 21.7%). Generated responses and lengths were not token-identical, and the baseline also encountered shape compilation after the first step. These are observations for this configuration; the throughput change cannot be attributed entirely to skipping visual computation.
+
+On a representative step, one TP0 rank on the input pipeline stage read about 126 MB, spending approximately 0.9–1.1 seconds in CPU-side reads and 0.02 seconds in TP broadcast calls. It recorded about 900 cache hits and 120 misses, without eviction. CPU durations include calls and waits; they do not measure GPU completion through CUDA synchronization, and the byte count is not a global communication total.
+
+Training/rollout consistency improved modestly: across the first ten steps, mean `train/mismatch_kl` fell from 0.002208 to 0.002012 (about 8.9%), and absolute log-probability difference fell from 0.02814 to 0.02703 (about 4.0%). A subsequent 200-step run had completed 39 steps at observation time; its first-ten-step mismatch KL was about 6.5% below the baseline. This is not a completed long-run result or, by itself, proof of a causal mismatch improvement from replay.
 
 ## Inspecting a run
 

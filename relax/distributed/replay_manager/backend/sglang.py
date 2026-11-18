@@ -46,13 +46,22 @@ class SGLangProducer(Producer):
     format.
     """
 
-    def request_options(self, *, evaluation: bool = False) -> dict[str, bool]:
+    def request_options(self, *, evaluation: bool = False) -> dict[str, Any]:
         self.manager._ensure_open()
         options = {}
         if "moe" in self.kinds and not (evaluation and self.manager.uses_references):
             options["return_routed_experts"] = True
         if "indexer" in self.kinds and not evaluation:
             options["return_indexer_topk"] = True
+        if "mm_embedding" in self.kinds and not evaluation:
+            from uuid import uuid4
+
+            from .mm_sglang import REQUEST_PREFIX
+
+            options["rid"] = REQUEST_PREFIX + uuid4().hex
+            # Eval prefixes have no replay body; keep training KV references in
+            # their own existing SGLang cache namespace.
+            options["cache_salt"] = "relax-mm-embedding-replay"
         return options
 
     def accept_response(
@@ -66,7 +75,7 @@ class SGLangProducer(Producer):
             capture = sample.tokens if captured_tokens is None else captured_tokens
             if len(capture) != len(sample.tokens):
                 raise ValueError("Replay token normalization must preserve row positions")
-            for kind in self.kinds:
+            for kind in self.kinds - {"mm_embedding"}:
                 field = _CAPTURE_FIELDS[kind]
                 value = meta[field]
                 if isinstance(value, dict) and "replay_manifest" in value:
@@ -103,6 +112,10 @@ class SGLangProducer(Producer):
                     value = mapped.to_dict()
                     meta[field] = value
                 refs[kind] = value
+            if "mm_embedding" in self.kinds:
+                from .mm_sglang import accept_mm_response
+
+                refs["mm_embedding"] = accept_mm_response(sample, meta)
             validate_sample(refs, sample.tokens)
             sample.rollout_replay_refs = refs
         else:
@@ -121,6 +134,16 @@ class SGLangProducer(Producer):
             yield
         except BaseException as error:
             if self.manager.uses_references and not evaluation:
+                if "mm_embedding" in self.kinds:
+                    from ..mm_embedding import release_media_entries
+                    from .mm_sglang import META_FIELD
+
+                    entries = meta.get(META_FIELD, [])
+                    if entries:
+                        try:
+                            release_media_entries(self.manager.store(), entries)
+                        except Exception as cleanup:
+                            error.add_note(f"MM replay response cleanup failed: {cleanup!r}")
                 for field in _CAPTURE_FIELDS.values():
                     value = meta.get(field)
                     if isinstance(value, dict):
@@ -176,6 +199,10 @@ def _scheduler_contract() -> tuple[str, str, str]:
 
 def _validate_capture_api(kinds: frozenset[str]) -> None:
     """Check installed source without importing SGLang's CUDA runtime."""
+    if "mm_embedding" in kinds:
+        from .mm_sglang import validate_capture_api
+
+        validate_capture_api()
     root = Path(importlib.util.find_spec("sglang").origin).parent
     module, classname, prefix = _scheduler_contract()
 
@@ -188,7 +215,7 @@ def _validate_capture_api(kinds: frozenset[str]) -> None:
 
     collectors = methods(root.joinpath(*module.split(".")[1:]).with_suffix(".py"), classname)
     encoders = methods(root / "srt/managers/detokenizer_manager.py", "DetokenizerManager")
-    for kind in kinds:
+    for kind in kinds - {"mm_embedding"}:
         field = _CAPTURE_FIELDS[kind]
         if prefix + "maybe_collect_" + field not in collectors or not (
             "_b64_encode_per_request" in encoders or "_extract_" + field in encoders
@@ -794,4 +821,10 @@ def apply_sglang_patch(manager: ReplayManager | None = None, *, kinds: frozenset
     """Install the supported scheduler hooks once in the scheduler process."""
     selected = replay_data_manager if manager is None else manager
     if selected.uses_references:
-        install_scheduler_patch(selected, kinds=kinds)
+        ordinary = None if kinds is None else kinds - {"mm_embedding"}
+        if ordinary is None or ordinary:
+            install_scheduler_patch(selected, kinds=ordinary)
+        if kinds is not None and "mm_embedding" in kinds:
+            from .mm_sglang import install_capture_patch
+
+            install_capture_patch(selected)

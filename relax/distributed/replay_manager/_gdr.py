@@ -91,10 +91,12 @@ class GdrBodyReader:
                 raise RuntimeError("Unexpected TQ GPU replay field mapping")
             values = self._receive(manager.storage_client, body_keys, shapes, dtypes, custom)
             if len(values) != len(keys) or any(
-                not isinstance(value, torch.Tensor) or not value.is_cuda or value.dtype != torch.int32
+                not isinstance(value, torch.Tensor)
+                or not value.is_cuda
+                or value.dtype not in (torch.int32, torch.uint8)
                 for value in values
             ):
-                raise RuntimeError("TQ GDR replay GET did not return int32 GPU bodies")
+                raise RuntimeError("TQ GDR replay GET did not return supported GPU bodies")
             self.read_bytes += sum(value.nbytes for value in values)
             self.read_calls += 1
             self.read_seconds += perf_counter() - started

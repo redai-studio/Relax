@@ -76,6 +76,12 @@ class MegatronConsumer(Consumer):
                 region=region,
                 cache=cache,
             )
+        if "mm_embedding" in self.kinds:
+            from .mm_megatron import prepare_mm_replay
+
+            if region is None:
+                raise ValueError("MM replay requires a queue partition consumption region")
+            prepare_mm_replay(self.manager, actor, batch, region)
         return cache
 
 
@@ -85,6 +91,9 @@ def log_reference_replay_metrics(cache: ConsumerTensorCache, args: Any, rollout_
     Every rank logs its own counters; ClearML uses the same primary rank as the
     existing training performance report, not a cross-rank maximum.
     """
+    from .mm_megatron import log_mm_replay_metrics
+
+    log_mm_replay_metrics(args, rollout_id)
     ahead = cache._read_ahead
     if not ahead.read_calls and not cache.decoded_rows:
         return
@@ -770,6 +779,13 @@ def reference_execution(function: Callable[P, R]) -> Callable[P, R]:
                 IndexerReplay.clear()
             except Exception as exc:
                 errors.append(exc)
+            if args and getattr(getattr(args[0], "args", None), "use_rollout_mm_embedding_replay", False):
+                from .mm_megatron import close_mm_replay
+
+                try:
+                    close_mm_replay()
+                except Exception as exc:
+                    errors.append(exc)
             if errors:
                 cleanup_error = errors[0]
                 if hasattr(cleanup_error, "add_note"):

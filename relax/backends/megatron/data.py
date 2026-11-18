@@ -442,6 +442,8 @@ def get_batch(
     """
 
     assert "tokens" in keys
+    if getattr(get_args(), "use_rollout_mm_embedding_replay", False):
+        keys = tuple(dict.fromkeys((*keys, "rollout_replay_refs")))
     if isinstance(data_iterator, DataIterator):
         batch = data_iterator.get_next(
             [*keys, "selective_loss_masks_cpu"] if Envs.RELAX_SFT_SELECTIVE_LOGITS else keys
@@ -847,6 +849,11 @@ def get_batch(
 
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
+
+    if getattr(get_args(), "use_rollout_mm_embedding_replay", False):
+        from relax.distributed.replay_manager.backend.mm_megatron import bind_mm_replay_batch
+
+        bind_mm_replay_batch(batch)
 
     # Dynamic CP: forward_only merged its per-sample outputs back to full-length
     # responses (dynamic_cp_merge_output), so rollout_data stores full fields.

@@ -190,3 +190,60 @@ def validate_indexer_replay_args(args: Any, *, is_offline: bool) -> None:
         raise ValueError(
             f"--use-rollout-indexer-replay ({model_type}): unsupported settings: {', '.join(unsupported)}"
         )
+
+
+def validate_mm_embedding_replay_args(args: Any, *, is_offline: bool) -> None:
+    """Validate the frozen Qwen3.8 CP1 reference consumer before launching
+    workers."""
+    from relax.utils.misc import get_hf_config
+
+    config = get_hf_config(args.hf_checkpoint)
+    vision = getattr(config, "vision_config", None)
+    text = getattr(config, "text_config", config)
+    unsupported = []
+    if getattr(config, "model_type", None) != "qwen4_exp" or vision is None:
+        unsupported.append("requires the multimodal Qwen3.8 checkpoint")
+    if vision is not None and (
+        getattr(vision, "out_hidden_size", None) != 2560
+        or getattr(vision, "spatial_merge_size", None) != 2
+        or getattr(vision, "deepstack_visual_indexes", None)
+        or getattr(text, "hidden_size", None) != 2560
+    ):
+        unsupported.append("requires 2560-wide R4 visual embeddings without DeepStack")
+    if is_offline or getattr(args, "train_backend", None) != "megatron" or not getattr(args, "colocate", False):
+        unsupported.append("requires online colocated Megatron training")
+    if getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False):
+        unsupported.append("requires CP1 without dynamic CP")
+    if not getattr(args, "freeze_vision_model", False) or not getattr(args, "freeze_vision_projection", False):
+        unsupported.append("requires frozen vision model and projection/merger")
+    if not getattr(args, "bf16", True):
+        unsupported.append("requires BF16 visual embeddings")
+    if getattr(args, "multimodal_keys", None) is None:
+        unsupported.append("requires multimodal input mapping")
+    from relax.algorithms import algorithm_needs_critic
+
+    if algorithm_needs_critic(args):
+        unsupported.append("critic-based algorithms do not yet consume MM replay")
+    for field in (
+        "fully_async",
+        "hybrid",
+        "partial_rollout",
+        "use_agentic_rollout",
+        "enable_mtp_training",
+        "sglang_speculative_algorithm",
+        "sglang_enable_hierarchical_cache",
+        "use_slime_router",
+        "use_opd",
+    ):
+        if getattr(args, field, False):
+            unsupported.append(field)
+    if (
+        getattr(args, "rollout_function_path", "relax.engine.rollout.sglang_rollout.generate_rollout")
+        != ("relax.engine.rollout.sglang_rollout.generate_rollout")
+        or getattr(args, "custom_generate_function_path", None) is not None
+    ):
+        unsupported.append("custom rollout/generation function")
+    if getattr(args, "qkv_format", "thd") != "thd":
+        unsupported.append("requires packed THD")
+    if unsupported:
+        raise ValueError("--use-rollout-mm-embedding-replay: " + ", ".join(unsupported))

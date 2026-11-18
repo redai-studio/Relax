@@ -35,6 +35,8 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
+    if getattr(args, "use_rollout_mm_embedding_replay", False):
+        fields.append("rollout_mm_embeddings")
     if getattr(args, "multimodal_keys", None) is not None:
         fields.append("multimodal_train_inputs")
     if agentic_obs_enabled(args):

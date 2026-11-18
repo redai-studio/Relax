@@ -2233,6 +2233,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Replay SGLang's indexer choices in Megatron training using reference delivery.",
             )
             parser.add_argument(
+                "--use-rollout-mm-embedding-replay",
+                action="store_true",
+                default=False,
+                help="Replay frozen Qwen3.8 visual embeddings through lossless BF16 references.",
+            )
+            parser.add_argument(
                 "--optimize-routing-replay",
                 action="store_true",
                 default=False,
@@ -4175,6 +4181,13 @@ def slime_validate_args(args):
             "'use_rollout_routing_replay' addresses mismatch problem between training and inference, "
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
+
+    if getattr(args, "use_rollout_mm_embedding_replay", False):
+        from relax.distributed.replay_manager.core import enable_reference_replay
+        from relax.distributed.replay_manager.validation import validate_mm_embedding_replay_args
+
+        enable_reference_replay()
+        validate_mm_embedding_replay_args(args, is_offline=is_offline)
 
     if getattr(args, "use_rollout_indexer_replay", False):
         from relax.distributed.replay_manager.core import enable_reference_replay

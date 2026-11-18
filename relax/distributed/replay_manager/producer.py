@@ -146,19 +146,30 @@ class ProducerPublication:
     """
 
     def __init__(
-        self, store: Any, writer: ProducerChunkWriter, *, kind: str, layers: int, topk: int, codec: str = "int32"
+        self,
+        store: Any,
+        writer: ProducerChunkWriter,
+        *,
+        kind: str,
+        layers: int,
+        topk: int,
+        codec: str = "int32",
+        record: str | None = None,
     ):
         from .core import new_data_id
 
         if kind not in FIELDS or min(layers, topk) <= 0:
             raise ValueError("Invalid streaming replay shape/kind")
+        replay_codec(codec).validate(kind, topk)
+        if kind == "mm_embedding" and (codec != "bf16-raw-v1" or layers != 1):
+            raise ValueError("Media replay requires a single BF16 embedding tensor")
         self.store, self.writer = store, writer
         self.kind, self.layers, self.topk = kind, layers, topk
         self.codec = codec
-        self.chunk_rows = min(store.chunk_rows, writer.capacity_bytes // (topk * 4))
+        self.chunk_rows = min(store.chunk_rows, writer.capacity_bytes // (topk * replay_codec(codec).element_bytes))
         if not self.chunk_rows:
             raise BufferError("One replay row exceeds publication budget")
-        self.record = new_data_id()
+        self.record = new_data_id() if record is None else record
         self.rows = 0
         self._futures = []
         self._sealed = self._aborted = False
@@ -183,15 +194,17 @@ class ProducerPublication:
             else:
                 pending.append(future)
         self._futures = pending
-        width = self.topk if self.codec == "int32" else encoded_width
-        if self.codec != "int32":
+        byte_payload = self.codec == "bf16-raw-v1"
+        width = self.topk * 2 if byte_payload else (self.topk if self.codec == "int32" else encoded_width)
+        if not byte_payload and self.codec != "int32":
             replay_codec(self.codec).validate_width(width)
-        size = count * width * 4
+        size = count * width * (1 if byte_payload else 4)
 
         def snapshot(layer: int) -> Any:
             values = snapshot_layer(layer)
-            if not isinstance(values, np.ndarray) or values.dtype != np.int32 or values.shape != (count, width):
-                raise ValueError("Replay layer snapshot must be int32 [chunk rows, topk]")
+            dtype = np.uint8 if byte_payload else np.int32
+            if not isinstance(values, np.ndarray) or values.dtype != dtype or values.shape != (count, width):
+                raise ValueError("Replay layer snapshot differs from its codec shape/dtype")
             return values
 
         # Amortize RPCs across layers while preserving one key per layer.
@@ -229,7 +242,19 @@ class ProducerPublication:
             return self._finish_future
         if self._sealed or self.rows != len(tokens) - 1:
             raise ValueError("Replay publication does not cover the finalized request")
-        digest = self._finish_digest = token_digest(tokens)
+        return self._finish_with_digest(token_digest(tokens))
+
+    def finish_media(self, image_hash: str) -> ReplayRef:
+        """Seal media coordinates with their hash, not generated token
+        identity."""
+        if self.kind != "mm_embedding" or self.codec != "bf16-raw-v1" or self._aborted or self._sealed:
+            raise ValueError("Invalid media replay finalization")
+        if len(image_hash) != 64 or any(c not in "0123456789abcdef" for c in image_hash) or self.rows <= 0:
+            raise ValueError("Invalid media hash or empty publication")
+        return self._finish_with_digest(image_hash).result()
+
+    def _finish_with_digest(self, digest: str) -> Future:
+        self._finish_digest = digest
         writes = tuple(self._futures)
 
         def complete():

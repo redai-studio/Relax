@@ -65,7 +65,11 @@ def reference_environment() -> dict[str, str]:
 def rollout_kinds(args: Any) -> frozenset[str]:
     return frozenset(
         kind
-        for kind, flag in (("moe", "use_rollout_routing_replay"), ("indexer", "use_rollout_indexer_replay"))
+        for kind, flag in (
+            ("moe", "use_rollout_routing_replay"),
+            ("indexer", "use_rollout_indexer_replay"),
+            ("mm_embedding", "use_rollout_mm_embedding_replay"),
+        )
         if getattr(args, flag, False)
     )
 
