@@ -290,13 +290,8 @@ def _sft_batch_producer_actor_options(config: Any, runtime_env: Any | None, num_
 async def _ray_get_many_async(refs: list[Any]) -> list[Any]:
     if not refs:
         return []
-    # A failed shard must not release ownership of still-running siblings.
-    # ray.get(list) raises on the first error before the other writers finish.
-    results = await asyncio.gather(*refs, return_exceptions=True)
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
-    return results
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, ray.get, refs)
 
 
 def _set_sft_dataset_position(dataset: Any, epoch: int, position: int, prefetch_limit: int | None = None) -> None:
@@ -591,6 +586,7 @@ class SFT(Base):
         self._init_task: asyncio.Task | None = None
         self._stop_task: asyncio.Task | None = None
         self._prepare_batch_task: asyncio.Task | None = None
+        self._prepare_write_refs: list[Any] = []
         self._prefetch_first_batch_requested = False
 
     def _should_use_remote_batch_producer(self) -> bool:
@@ -1028,17 +1024,19 @@ class SFT(Base):
                     f"SFT remote producer shard count mismatch: actors={len(batch_producers)}, "
                     f"partitions={num_shards}."
                 )
-            payloads = await _ray_get_many_async(
-                [
+            refs = []
+            if asyncio.current_task() is getattr(self, "_prepare_batch_task", None):
+                self._prepare_write_refs = refs
+            for producer, partition_id in zip(batch_producers, partition_ids, strict=True):
+                refs.append(
                     producer.produce_partition.remote(
                         self.step,
                         partition_id,
                         self.config.global_batch_size,
                         self.config.multimodal_keys is not None,
                     )
-                    for producer, partition_id in zip(batch_producers, partition_ids, strict=True)
-                ]
-            )
+                )
+            payloads = await _ray_get_many_async(refs)
             crossed_epoch = any(bool(payload["crossed_epoch"]) for payload in payloads)
             current_epoch = max(payload.get("epoch") or 0 for payload in payloads)
             if crossed_epoch:
@@ -1312,6 +1310,10 @@ class SFT(Base):
                 await asyncio.shield(prepared_batch)
             except Exception as exc:
                 self._logger.warning(f"SFT initial batch failed before shutdown: {exc}")
+        # Propagate prepare failures promptly, but retain sibling writes until
+        # cleanup. Waiting here keeps the Controller's stop deadline effective.
+        await asyncio.gather(*getattr(self, "_prepare_write_refs", []), return_exceptions=True)
+        self._prepare_write_refs = []
         for producer in getattr(self, "_batch_producers", []):
             try:
                 await _ray_get_many_async([producer.stop.remote()])

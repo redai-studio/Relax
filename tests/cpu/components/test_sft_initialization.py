@@ -338,7 +338,8 @@ async def test_prepare_then_run_publishes_consecutive_partitions_without_replayi
 
 
 @pytest.mark.asyncio
-async def test_failed_prepare_shard_keeps_sibling_writer_owned_until_stop(monkeypatch):
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+async def test_failed_prepare_shard_keeps_sibling_writer_owned_until_stop(monkeypatch, dispatch_fails):
     from relax.components import sft as sft_module
 
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
@@ -350,8 +351,6 @@ async def test_failed_prepare_shard_keeps_sibling_writer_owned_until_stop(monkey
     release = asyncio.Event()
     events = []
     first_error = ValueError("first shard failed")
-    failed = asyncio.get_running_loop().create_future()
-    failed.set_exception(first_error)
 
     async def put():
         await release.wait()
@@ -366,12 +365,23 @@ async def test_failed_prepare_shard_keeps_sibling_writer_owned_until_stop(monkey
         result.set_result(None)
         return result
 
+    class Produce:
+        def __init__(self, ref):
+            self.ref = ref
+
+        def remote(self, *_args):
+            if isinstance(self.ref, Exception):
+                raise self.ref
+            return self.ref
+
+    if dispatch_fails:
+        refs = (writer, first_error)
+    else:
+        failed = asyncio.get_running_loop().create_future()
+        failed.set_exception(first_error)
+        refs = (failed, writer)
     service._batch_producers = [
-        SimpleNamespace(
-            produce_partition=SimpleNamespace(remote=lambda *_args, ref=ref: ref),
-            stop=SimpleNamespace(remote=stopped),
-        )
-        for ref in (failed, writer)
+        SimpleNamespace(produce_partition=Produce(ref), stop=SimpleNamespace(remote=stopped)) for ref in refs
     ]
     # Ray get(list) reports an errored shard immediately, even while another
     # ObjectRef remains pending. Isolate that external RPC contract here.
@@ -382,8 +392,9 @@ async def test_failed_prepare_shard_keeps_sibling_writer_owned_until_stop(monkey
             await asyncio.sleep(0)
         stopping = asyncio.create_task(service.stop())
         try:
-            await asyncio.sleep(0.02)
-            assert not preparing.done(), "One failed shard must not release a still-running sibling writer"
+            await asyncio.wait({preparing}, timeout=0.5)
+            assert preparing.done(), "The first failure must reach the driver even if a sibling writer is stuck"
+            await asyncio.wait({stopping}, timeout=0.05)
             assert not stopping.done()
             assert events == []
         finally:
