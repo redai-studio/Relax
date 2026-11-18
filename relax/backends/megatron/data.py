@@ -523,10 +523,6 @@ def get_batch(
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
     pre_shifted_labels = batch.get("pre_shifted_labels")
-    if batch.get("__is_dummy__", False):
-        batch["loss_masks"] = [torch.zeros_like(mask) for mask in batch["loss_masks"]]
-        if pre_shifted_labels is not None:
-            pre_shifted_labels = [torch.full_like(labels, -100) for labels in pre_shifted_labels]
     if pre_shifted_labels is not None:
         args = get_args()
         if args.loss_type != "sft":

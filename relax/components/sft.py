@@ -99,7 +99,6 @@ def _resolve_pad_token_ids_from_config(model_path: str) -> frozenset[int]:
     """
     try:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        config_values = config.to_dict()
     except ValueError:
         # Custom checkpoints may be loadable by a model-specific backend even
         # when this standalone SFT Ray worker has not imported that backend's
@@ -111,6 +110,8 @@ def _resolve_pad_token_ids_from_config(model_path: str) -> frozenset[int]:
         has_custom_auto_config = isinstance(auto_map, dict) and "AutoConfig" in auto_map
         if not isinstance(model_type, str) or model_type in CONFIG_MAPPING or has_custom_auto_config:
             raise
+    else:
+        config_values = {key: getattr(config, key, None) for key in _PAD_TOKEN_ID_KEYS}
     ids: list[int] = []
     for key in _PAD_TOKEN_ID_KEYS:
         v = config_values.get(key)

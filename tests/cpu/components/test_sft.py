@@ -1009,10 +1009,13 @@ def test_pad_token_resolution_supports_unregistered_model_type(tmp_path):
     assert _resolve_pad_token_ids_from_config(str(tmp_path)) == frozenset({101, 102, 103})
 
 
-def test_pad_token_resolution_keeps_registered_config_defaults(monkeypatch):
+def test_pad_token_resolution_keeps_registered_config_aliases(monkeypatch):
+    from transformers.models.gemma3.configuration_gemma3 import Gemma3Config
+
     from relax.components import sft
 
-    config = SimpleNamespace(to_dict=lambda: {"image_token_id": 201, "video_token_id": 202})
+    config = Gemma3Config()
+    assert "image_token_id" not in config.to_dict()
     monkeypatch.setattr(sft.AutoConfig, "from_pretrained", lambda *args, **kwargs: config)
 
-    assert sft._resolve_pad_token_ids_from_config("unused") == frozenset({201, 202})
+    assert sft._resolve_pad_token_ids_from_config("unused") == frozenset({262144})

@@ -59,8 +59,6 @@ def prepare_selective_logits_from_cpu_masks(batch: dict, args: Namespace) -> Non
     ):
         if mask.device.type != "cpu":
             raise ValueError("Selective logits masks must stay on CPU")
-        if batch.get("__is_dummy__", False):
-            mask = torch.zeros_like(mask)
         if batch.get("unconcat_pre_shifted_labels") is None and total == response:
             mask = align_loss_mask_for_sft(mask)
         masks.append(mask)

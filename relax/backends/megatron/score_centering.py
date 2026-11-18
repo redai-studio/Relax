@@ -24,12 +24,11 @@ def align_score_centering_candidate_ids(
     padded_total_lengths: list[int] | None,
     dynamic_cp_size: int | None,
     dynamic_cp_rank: int | None,
-    cp_output_is_zigzag: bool = False,
 ) -> list[torch.Tensor] | None:
     """Match ring-layout candidate rows to the contiguous allgather-CP
     logits."""
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
-    if token_ids is None or not args.allgather_cp or cp_size == 1 or cp_output_is_zigzag:
+    if token_ids is None or not args.allgather_cp or cp_size == 1:
         return token_ids
     cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
     cp_group = (

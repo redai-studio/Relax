@@ -448,7 +448,6 @@ def get_log_probs_and_entropy(
             padded_total_lengths=padded_total_lengths,
             dynamic_cp_size=dynamic_cp_size,
             dynamic_cp_rank=dynamic_cp_rank,
-            cp_output_is_zigzag=cp_output_is_zigzag,
         )
     if lm_head_forward is not None:
         assert not with_entropy and not with_topk, (

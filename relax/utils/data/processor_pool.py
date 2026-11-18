@@ -161,9 +161,9 @@ def _load_media_for_worker(
 
             loader = load_image
         elif kind == "video":
-            from relax.utils.multimodal.video_utils import load_video
+            from relax.utils.multimodal.video_utils import fetch_video
 
-            loader = load_video
+            loader = fetch_video
         else:
             from relax.utils.multimodal.audio_utils import load_audio
 
@@ -172,7 +172,13 @@ def _load_media_for_worker(
         for position, source in enumerate(sources):
             try:
                 if kind == "video":
-                    frames, metadata, _, _ = loader(source, use_audio_in_video=use_audio_in_video)
+                    image_processor = getattr(_worker_processor, "image_processor", None)
+                    frames, metadata, _, _ = loader(
+                        {"video": source},
+                        image_patch_size=getattr(image_processor, "patch_size", 14),
+                        use_audio_in_video=use_audio_in_video,
+                        config=_worker_multimodal_config,
+                    )
                     items.append(frames)
                     loaded.setdefault("video_metadata", []).append(metadata)
                 else:
@@ -190,16 +196,22 @@ def process_sample_from_paths_in_worker(
 ) -> tuple[list[int], dict[str, Any] | None]:
     """``process_sample_in_worker`` with the media read inside the worker.
 
-    The load and the IPC-shaped conversion mirror the parent-side chain exactly
-    (same loaders, same ``prepare_mm_inputs_for_ipc``), so the processor sees the
-    same inputs it did when the parent shipped decoded arrays.
+    Sample and resize videos locally before processor execution. Normalize
+    image types through the shared IPC conversion without moving worker-local
+    video frames into shared memory.
 
     Raises:
         MediaLoadError: A referenced media file could not be read (the dataset
             maps this to its invalid-multimodal skip policy).
     """
     media = _load_media_for_worker(media_paths, use_audio_in_video=processor_kwargs.get("use_audio_in_video", False))
-    prompt_ids, train_inputs = process_sample_in_worker(text, prepare_mm_inputs_for_ipc(media), processor_kwargs)
+    # These frames stay inside this worker; only parent-to-worker transfers
+    # need prepare_mm_inputs_for_ipc's shared video storage.
+    videos = media.pop("videos", None)
+    media = prepare_mm_inputs_for_ipc(media)
+    if videos is not None:
+        media["videos"] = videos
+    prompt_ids, train_inputs = process_sample_in_worker(text, media, processor_kwargs)
     if train_inputs is not None:
         processor = get_worker_processor()
         train_inputs[SFT_HF_IMAGE_REBUILD_SUPPORTED] = getattr(
