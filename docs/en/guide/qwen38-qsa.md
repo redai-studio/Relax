@@ -399,3 +399,5 @@ The feature is off by default. Each rank computes its own output rows and the le
 `full` is useful for comparisons with identical inputs; it still uses local PLE computation. Boundary gradients are reduced back to the input owner. Changed reduction order can introduce BF16 differences, so validate with the intended data. This path takes precedence over the existing PLE streamed/fused-conv flags.
 
 Building `docker/Dockerfile` or `docker/Dockerfile.cu13` installs the required Megatron patch. External Megatron checkouts also need the patch. The 512K/1M training recipes are delivered separately.
+
+See the [long-context training recipes](./qwen38-long-context.md) for 32-GPU 512K/1M entrypoints, data construction, and save/resume instructions.
