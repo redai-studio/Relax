@@ -1526,6 +1526,7 @@ class RolloutManager(ReloadableMixin):
             return False
         from relax.engine.sft.runtime import is_offline_mode
 
+        placement_overrides = {"base_gpu_id", "gpu_id_step", "nnodes", "node_rank", "tp_size", "dist_init_addr"}
         return (
             getattr(self.args, "train_backend", "megatron") == "megatron"
             and not is_offline_mode(self.args)
@@ -1539,6 +1540,7 @@ class RolloutManager(ReloadableMixin):
                 and group.num_gpus_per_engine == self.args.rollout_num_gpus_per_engine
                 and group.sglang_overrides.get("pp_size", getattr(self.args, "sglang_pp_size", 1)) == 1
                 and group.sglang_overrides.get("dp_size", getattr(self.args, "sglang_dp_size", 1)) == 1
+                and not placement_overrides.intersection(group.sglang_overrides)
                 for group in self.server.engine_groups
             )
         )
@@ -2369,7 +2371,8 @@ class RolloutManager(ReloadableMixin):
         ):
             raise ValueError(
                 "Colocate scale-out requires Ray-native Megatron/SGLang with homogeneous regular engines "
-                "using SGLang PP=DP=1 and FULL weights (without adapter mode or explicit expert routing)"
+                "using SGLang PP=DP=1 and PG-derived placement, with FULL weights "
+                "(without adapter mode or explicit expert routing)"
             )
 
         # Mutual exclusion: reject if any scale operation is in progress
@@ -2770,10 +2773,11 @@ class RolloutManager(ReloadableMixin):
             # Phase C: Determine final status
             if _synchronous_colocate(self.args):
                 await self._confirm_unused_colocate_pgs(srv, per_replica_pgs)
-            if request.status is not ScaleOutStatus.CANCELLED:
-                self._update_scale_out_final_status(
-                    request, srv, succeeded_engine_ids, failed_replica_ids, failure_reasons
-                )
+            with self._engine_lifecycle_lock:
+                if request.status is not ScaleOutStatus.CANCELLED:
+                    self._update_scale_out_final_status(
+                        request, srv, succeeded_engine_ids, failed_replica_ids, failure_reasons
+                    )
 
         except Exception as e:
             if _synchronous_colocate(self.args):
@@ -4363,8 +4367,11 @@ class RolloutManager(ReloadableMixin):
                     logger.debug(f"[DryRun] Would skip request {request.request_id}: {reason}")
             else:
                 # Live mode: actually cancel the request
-                if request.can_cancel():
-                    request.update_status(ScaleOutStatus.CANCELLED)
+                with self._engine_lifecycle_lock:
+                    cancelled = request.can_cancel()
+                    if cancelled:
+                        request.update_status(ScaleOutStatus.CANCELLED)
+                if cancelled:
                     succeeded.append(request.request_id)
                     logger.info(f"[CancelAll] Cancelled scale-out request {request.request_id}")
                 else:

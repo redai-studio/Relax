@@ -129,9 +129,10 @@ async def test_unclaimed_timeout_cannot_join_later_full(pool):
     engine.register_to_router.remote.assert_not_called()
 
 
-def test_sglang_pipeline_override_is_rejected_before_scale_request(pool):
+@pytest.mark.parametrize("overrides", [{"pp_size": 2}, {"base_gpu_id": 0}])
+def test_incompatible_engine_override_is_rejected_before_scale_request(pool, overrides):
     manager, _, baseline = pool
-    baseline.sglang_overrides["pp_size"] = 2
+    baseline.sglang_overrides.update(overrides)
 
     with pytest.raises(ValueError, match="SGLang PP=DP=1"):
         manager.create_scale_out_request(num_replicas=2)
