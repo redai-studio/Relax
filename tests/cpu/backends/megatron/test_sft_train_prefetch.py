@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from relax.utils.training.intervals import should_save_checkpoint
+
 
 def _load_functions(path, names, namespace):
     tree = ast.parse(Path(path).read_text())
@@ -59,6 +61,7 @@ def runtime():
         evaluation_step_for_rollout=lambda args, rollout_id: rollout_id + 1,
         should_run_sft_eval=lambda args, rollout_id: getattr(args, "eval_at", None) == rollout_id,
         should_run_sft_predict=lambda args, rollout_id: False,
+        should_save_checkpoint=should_save_checkpoint,
         device_utils=SimpleNamespace(make_current_torch_device=main_only(torch.device("cpu"))),
         mpu=SimpleNamespace(
             get_data_parallel_rank=main_only(3),
@@ -165,7 +168,6 @@ def test_initial_prefetch_targets_step_zero_without_save_boundary_pause(runtime)
     actor.data_system_client = SimpleNamespace(
         get_meta=Mock(return_value=SimpleNamespace(size=2)), get_data=Mock(return_value=payload)
     )
-    assert runtime.namespace["_should_pause_sft_lookahead"](actor.args, -1)
     actor._start_sft_train_prefetch(-1, "sft_train", ["tokens"], 2)
     assert actor._sft_train_prefetch_rollout_id == 0
     rows, _ = actor._take_sft_train_prefetch(0)

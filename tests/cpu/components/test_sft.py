@@ -627,6 +627,9 @@ def test_sft_independent_eval_propagates_rank_image_preprocessing(monkeypatch, r
     args.eval_prompt_data = "/fake/eval.jsonl"
     args.multimodal_keys = {"image": "images"}
     args.sft_image_preprocess_on_rank = True
+    args.sft_mask_reasoning = True
+    args.sft_loss_last_turn_only = True
+    args.sft_ignore_empty_think = True
 
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
@@ -652,6 +655,9 @@ def test_sft_independent_eval_propagates_rank_image_preprocessing(monkeypatch, r
     eval_kwargs = dataset_calls[-1]
     assert eval_kwargs["path"] == ["/fake/eval.jsonl"]
     assert eval_kwargs["image_preprocess_on_rank"] is True
+    assert all(call["loss_mask_reasoning"] is True for call in dataset_calls)
+    assert all(call["loss_last_turn_only"] is True for call in dataset_calls)
+    assert all(call["loss_ignore_empty_think"] is True for call in dataset_calls)
 
 
 @pytest.mark.asyncio
@@ -965,3 +971,43 @@ async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
     await sft._async_run()
 
     sft._produce_one_step.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n_real,pre_shifted", [(3, False), (5, True)])
+async def test_causal_eval_keeps_every_real_sample_and_zero_masks_padding(n_real, pre_shifted):
+    from relax.components.sft import SFT
+
+    samples = [_make_processed(i) for i in range(n_real)]
+    for sample in samples:
+        sample.tokens = sample.tokens + sample.source_idx * 10
+        if pre_shifted:
+            sample.pre_shifted_labels = torch.where(sample.loss_mask.bool(), sample.tokens, -100)
+    original_masks = [sample.loss_mask.clone() for sample in samples]
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = SimpleNamespace(
+        loss_type="sft",
+        eval_size=n_real,
+        eval_interval=1,
+        global_batch_size=4,
+        task_type="causal_lm",
+        multimodal_keys=None,
+    )
+    sft.step = 0
+    sft._logger_instance = MagicMock()
+    sft.data_system_client = MagicMock(async_put=AsyncMock())
+    sft._build_eval_batches = MagicMock(return_value=samples)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+    await sft._maybe_produce_eval(1)
+    chunks = [call.kwargs["data"] for call in sft.data_system_client.async_put.call_args_list]
+    masks = [mask for chunk in chunks for mask in chunk["loss_masks"]]
+    tokens = [row for chunk in chunks for row in chunk["tokens"]]
+    assert all(len(chunk["tokens"]) == 4 for chunk in chunks)
+    assert len(chunks) == (n_real + 3) // 4
+    assert all(torch.equal(tokens[i], samples[i].tokens) for i in range(n_real))
+    assert sum(int(mask.sum()) for mask in masks) == sum(int(mask.sum()) for mask in original_masks)
+    assert all(not mask.any() for mask in masks[n_real:])
+    assert all(torch.equal(sample.loss_mask, mask) for sample, mask in zip(samples, original_masks, strict=True))
+    if pre_shifted:
+        labels = [row for chunk in chunks for row in chunk["pre_shifted_labels"]]
+        assert all(torch.all(row == -100) for row in labels[n_real:])
