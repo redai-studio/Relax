@@ -207,7 +207,7 @@ PARALLEL_ARGS=(
     --recompute-method uniform
     --recompute-num-layers 2
     --no-offload-train
-    --empty-unused-memory-level 1
+    --empty-unused-memory-level 0
 )
 
 # Relax takes an integer interval and always saves on the final step.

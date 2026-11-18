@@ -85,6 +85,7 @@ def test_scenario_cli_and_real_parser(tmp_path, monkeypatch, scenario, seq, cp, 
     assert (args.seq_length, args.context_parallel_size, args.pipeline_model_parallel_size) == (seq, cp, 2)
     assert (args.tensor_model_parallel_size, args.expert_model_parallel_size, args.global_batch_size) == (1, 8, 32)
     assert args.num_layers == 48 and args.mtp_num_layers == 1
+    assert args.empty_unused_memory_level == 0
     assert args.max_tokens_per_gpu == budget
     assert args.resource["actor"] == [1, 32]
     assert not torch.cuda.is_initialized()

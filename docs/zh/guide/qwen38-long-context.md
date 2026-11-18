@@ -43,7 +43,7 @@ DATA_MODE=filled bash scripts/training/text/run-qwen38-1m-cp.sh
 
 默认异步提交。各场景的默认 `EXP_NAME` 独立，`SUBMISSION_ID` 每次唯一；提交日志及实际参数保存在 `$SAVE_DIR/$EXP_NAME/logs/`。常用变量：`NUM_STEPS`、`NUM_EPOCH`、`EXP_NAME`、`SAVE_INTERVAL`、`MAX_TOKENS_PER_GPU`、`QWEN38_PLE_INPUT_HALO_TRANSPORT`。`USE_CLEARML=1` 可启用 ClearML，需自行配置凭据；checkpoint 路径统一由 `SAVE_DIR`、`EXP_NAME` 和 `SAVE_INTERVAL` 设置，不接受附加 `--load` / `--save`。其他训练参数可追加在命令末尾，改变配置后需重新验证。
 
-默认不保存 checkpoint。至少准备 6400 条有效样本供 200 步使用，或配置足够的数据轮次；不要把不足 GBS32 的尾批当成满批验证。
+默认不主动清理 CUDA 缓存（`--empty-unused-memory-level 0`），首步和后续步骤一致。默认不保存 checkpoint。至少准备 6400 条有效样本供 200 步使用，或配置足够的数据轮次；不要把不足 GBS32 的尾批当成满批验证。
 
 ## 保存与续训
 
@@ -63,15 +63,21 @@ EXP_NAME=real512-save RESUME=1 SAVE_INTERVAL=100 \
 
 ## 验证范围
 
-以下是整理前相同模型/数据设计的 32 卡历史验证，指标取训练阶段，非全任务墙钟吞吐。两个满长度任务在完整 40 步后计划停止，状态为 STOPPED，未完成 200 步。
+本分支在 4 节点 × 8 张 Blackwell GPU（每卡可见显存约 269 GiB） 上完成四场景各 20 步复测，首步及后续均不主动清缓存。以下 TPS/card 和 MFU 取 step5–19 的合计训练时间；显存取完整 20 步，空闲显存为 NVML 采样值。
 
-| 场景 | 已验证步数 | 观测 TPS/card | 峰值 reserved | 最低采样空闲显存 |
-| --- | --- | --- | --- | --- |
-| real512 | 200 + 恢复后 10 步 | 2572.16（无复制窗口） | 221.05 GiB | 21.81 GiB |
-| filled512 | 40 步完整前缀 | 3316.92 | 231.19 GiB | 12.35 GiB |
-| real1m | 100 | 2501.36 | 195.26 GiB | 46.21 GiB |
-| filled1m | 40 步完整前缀 | 2696.45 | 216.39 GiB | 25.85 GiB |
+| 场景 | TPS/card | MFU | 峰值 reserved | 最低采样空闲显存 |
+| --- | ---: | ---: | ---: | ---: |
+| real512 | 2624 | 5.52% | 219.33 GiB | 24.72 GiB |
+| filled512 | 3314 | 7.07% | 229.51 GiB | 14.14 GiB |
+| real1m | 2496 | 5.28% | 176.11 GiB | 66.93 GiB |
+| filled1m | 2701 | 5.87% | 214.85 GiB | 25.29 GiB |
 
-各完整步的 loss/MTP loss/grad norm 有限；real512 保存恢复后的 10 步与连续训练的 loss、MTP loss、grad norm、LR 及数据位置逐值一致。其他场景未分别验证保存恢复。
+四场景均为完整 GBS32，loss/MTP loss/grad norm 有限，无报告的跳步。逐步对照历史运行的 loss、MTP loss、grad norm、LR 及 token/packing 指标。
 
-**本分支未重新运行上述 GPU 训练或构建镜像。** 历史运行包含“仅首步释放缓存”和独立数据位置记录，本 PR 未提交这两项；发布配置使用主线默认缓存释放逻辑，不保证复现历史吞吐或 reserved 峰值。CPU 检查覆盖四场景真实 parser、数据与监督 mask、场景隔离和续训参数；GPU 容量仍需在目标环境验收。
+real512、real1m 全部逐值一致；filled512 前 20 步最大 loss 绝对差 3.59e-6、grad norm 相对差 0.41%，filled1m 分别为 3.30e-6、0.65%。
+
+filled512 首轮延至 25 步时 grad norm 最大相对差 2.02%；另一次同配置 20 步复测与历史逐值一致。重复运行不保证逐值相同，差异原因尚未定位。
+
+同代码 real512 的 10 步清缓存对照中，loss/MTP loss/grad norm/LR 逐值一致；step5–9 不主动清缓存为 2884 TPS/card，每步清缓存（level1）为 1444 TPS/card。
+
+此前长跑覆盖 real512 200 步及恢复后 10 步、real1m 100 步、两个满长度场景各 40 步。real512 恢复后的 loss/MTP loss/grad norm/LR/数据位置与连续训练逐值一致；其他场景未分别验证保存恢复。此次 20 步复测未重新验证 GPU checkpoint 恢复，也未重新构建镜像。CPU 相关回归 65 项通过，无跳过；覆盖实际 parser、数据与监督 mask、场景隔离和续训参数。

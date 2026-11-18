@@ -43,7 +43,7 @@ Alternatively, select a scenario through `SCENARIO=real512 bash scripts/training
 
 Submission is asynchronous by default. Scenarios have separate default `EXP_NAME` values; each `SUBMISSION_ID` is unique. Submission logs and effective arguments are saved under `$SAVE_DIR/$EXP_NAME/logs/`. Common overrides include `NUM_STEPS`, `NUM_EPOCH`, `EXP_NAME`, `SAVE_INTERVAL`, `MAX_TOKENS_PER_GPU`, and `QWEN38_PLE_INPUT_HALO_TRANSPORT`. Set `USE_CLEARML=1` to enable ClearML with your credentials. Checkpoint paths must use `SAVE_DIR`, `EXP_NAME`, and `SAVE_INTERVAL`; extra `--load` / `--save` arguments are rejected. Additional training arguments can be appended; changed configurations require revalidation.
 
-Checkpoint saving is disabled by default. Provide at least 6400 accepted samples for 200 steps, or enough data epochs. Do not count incomplete final batches as GBS32 validation.
+Recipes do not explicitly clear the CUDA cache (`--empty-unused-memory-level 0`), including the first step. Checkpoint saving is disabled by default. Provide at least 6400 accepted samples for 200 steps, or enough data epochs. Do not count incomplete final batches as GBS32 validation.
 
 ## Save and resume
 
@@ -63,15 +63,21 @@ Resume automatically adds `--use-checkpoint-opt_param-scheduler`, restoring the 
 
 ## Validation scope
 
-These are historical 32-GPU runs with the same model/data design, measured over training time rather than total wall time. Both filled scenarios were deliberately stopped after 40 complete steps; their status is STOPPED, not a completed 200-step run.
+This branch completed 20 steps per scenario on 4 nodes × 8 Blackwell GPUs (approximately 269 GiB visible memory per GPU), without explicit cache clearing at any step. TPS/card and MFU use aggregate training time over steps 5–19. Memory covers the complete 20-step prefix; free memory is sampled through NVML.
 
-| Scenario | Validated steps | Observed TPS/card | Peak reserved | Minimum sampled free memory |
-| --- | --- | --- | --- | --- |
-| real512 | 200 + 10 resumed steps | 2572.16 (excluding the copy window) | 221.05 GiB | 21.81 GiB |
-| filled512 | 40-step complete prefix | 3316.92 | 231.19 GiB | 12.35 GiB |
-| real1m | 100 | 2501.36 | 195.26 GiB | 46.21 GiB |
-| filled1m | 40-step complete prefix | 2696.45 | 216.39 GiB | 25.85 GiB |
+| Scenario | TPS/card | MFU | Peak reserved | Minimum sampled free memory |
+| --- | ---: | ---: | ---: | ---: |
+| real512 | 2624 | 5.52% | 219.33 GiB | 24.72 GiB |
+| filled512 | 3314 | 7.07% | 229.51 GiB | 14.14 GiB |
+| real1m | 2496 | 5.28% | 176.11 GiB | 66.93 GiB |
+| filled1m | 2701 | 5.87% | 214.85 GiB | 25.29 GiB |
 
-Loss, MTP loss, and grad norm were finite for all complete steps. The 10 resumed real512 steps matched continuous training exactly for loss, MTP loss, grad norm, LR, and data position. Save/resume was not independently validated for the other scenarios.
+All scenarios had complete GBS 32 batches, finite loss/MTP loss/grad norm, and no reported skipped updates. Per-step comparisons cover loss, MTP loss, grad norm, LR, and token/packing metrics.
 
-**These GPU runs and the image build were not repeated on this branch.** Historical runs included first-step-only cache release and separate data-position recording, neither delivered here. Published recipes retain main's default cache-release behavior, so historical throughput and reserved peaks are not guaranteed. CPU checks cover actual parser acceptance for all scenarios, tokens and supervision masks, scenario isolation, and resume arguments; GPU capacity still needs validation in the target environment.
+real512 and real1m matched history exactly. For the first 20 steps, filled512 had maximum absolute loss difference 3.59e-6 and relative grad-norm difference 0.41%; filled1m had 3.30e-6 and 0.65%, respectively.
+
+Extending the first filled512 run to 25 steps produced a maximum relative grad-norm difference of 2.02%; a separate 20-step repeat with the same configuration matched history exactly. Repeated runs are not guaranteed to be bitwise identical; the cause remains unresolved.
+
+A same-code 10-step real512 cache-control comparison matched loss/MTP loss/grad norm/LR exactly. Over steps 5–9, no explicit cache clearing achieved 2884 TPS/card, versus 1444 with per-step clearing (level 1).
+
+Earlier long runs covered 200 real512 steps plus 10 resumed steps, 100 real1m steps, and 40 steps for each filled scenario. The resumed real512 loss/MTP loss/grad norm/LR/data position matched continuous training exactly; save/resume was not separately validated for the other scenarios. This 20-step revalidation did not repeat GPU checkpoint recovery or rebuild the image. All 65 relevant CPU regressions passed without skips, covering the real parser, tokens and supervision masks, scenario isolation, and resume arguments.
