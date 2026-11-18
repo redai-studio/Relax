@@ -42,6 +42,7 @@ def test_dependency_patch_hunk_counts_are_valid(patch):
     "variable,patch",
     [
         ("OPTIMIZED_MCORE_SOURCE", "megatron/20261020-qwen35-optimized.patch"),
+        ("MEGATRON_BASE_SOURCE", "latest/megatron.patch"),
         ("MODEL_OPERATORS_SOURCE", "megatron/20261020-model-operators.patch"),
         ("OPTIMIZED_DEEPEP_SOURCE", "deepep/2.1.0-relax-namespace.patch"),
         ("OPTIMIZED_FA4_SOURCE", "flash-attention/56e48e3-fa4-isolated.patch"),
@@ -73,7 +74,7 @@ def test_optimized_patch_replays_without_fuzz(variable, patch, tmp_path):
     assert "offset" not in result.stdout and "fuzz" not in result.stdout
     for path in tmp_path.rglob("*.py"):
         compile(path.read_text(), str(path), "exec")
-        if variable == "MODEL_OPERATORS_SOURCE":
+        if variable in {"MEGATRON_BASE_SOURCE", "MODEL_OPERATORS_SOURCE"}:
             _check_model_helper_signatures(path)
     if variable == "OPTIMIZED_MCORE_SOURCE":
         mtp = (tmp_path / "megatron/core/transformer/multi_token_prediction.py").read_text()

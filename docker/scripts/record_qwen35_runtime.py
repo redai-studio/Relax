@@ -137,6 +137,13 @@ def main() -> None:
         set(protected_sources)
         | {line[6:] for line in operator_patch.read_text().splitlines() if line.startswith("+++ b/")}
     )
+    protected_sources.extend(
+        [
+            "megatron/core/transformer/per_layer_embedding.py",
+            "megatron/core/transformer/ple_input_halo_cp.py",
+            "megatron/core/models/gpt/gpt_model.py",
+        ]
+    )
     report = {
         "deepep_commit": os.environ["DEEP_EP_V2_COMMIT"],
         "fa4_commit": os.environ["FA4_COMMIT"],
@@ -172,6 +179,7 @@ def main() -> None:
         },
         "gpu_validated": False,
     }
+    report["patch_sha256"]["megatron_base"] = Path("/etc/relax-megatron-patch.sha256").read_text().split()[0]
     Path("/etc/relax-qwen35-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
