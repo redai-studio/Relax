@@ -33,6 +33,7 @@ def pool():
     manager._colocate_retiring = None
     manager._colocate_disposing = False
     manager._colocate_failure = None
+    manager._colocate_dispose_deadline = None
     manager._colocate_shutdown_pgs = set()
     manager._colocate_pending_pgs = {}
     manager._health_monitors = []
@@ -211,6 +212,46 @@ async def test_late_receiver_probe_ack_does_not_interrupt_baseline_full(
             waiter.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await waiter
+
+
+@pytest.mark.parametrize("router_ack", [True, False])
+@pytest.mark.asyncio
+async def test_dispose_bounds_rejected_colocate_registration_rollback(pool, router_ack):
+    manager, _, _ = pool
+    manager.args.scale_in_drain_timeout = 30
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    _, engine, waiter = await start_candidate(manager, request, 4)
+    snapshot, _ = manager.acquire_colocate_full(object())
+    engine.register_to_router.remote.return_value = AwaitableValue(False)
+    unregistering = asyncio.Event()
+    removal = asyncio.get_running_loop().create_future()
+    if router_ack:
+        removal.set_result(True)
+
+    def unregister(**_kwargs):
+        unregistering.set()
+        return removal
+
+    engine.unregister_from_router.remote.side_effect = unregister
+    publication = asyncio.create_task(manager.publish_colocate_full(4, ["candidate-4"]))
+    try:
+        await asyncio.wait_for(unregistering.wait(), timeout=2)
+        await asyncio.sleep(0.25)
+        assert not publication.done()
+        assert engine.unregister_from_router.remote.call_args.kwargs["wait_for_removal"]
+        manager._colocate_dispose_deadline = time.monotonic() + (30 if router_ack else 7)
+        manager._colocate_disposing = True
+        if router_ack:
+            assert await asyncio.wait_for(publication, timeout=2) == snapshot["group_name"]
+            assert manager._colocate_failure is None
+        else:
+            with pytest.raises(TimeoutError, match="Router removal unconfirmed"):
+                await asyncio.wait_for(publication, timeout=2)
+            assert manager._colocate_failure == "mixed FULL"
+    finally:
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
 
 
 @pytest.mark.parametrize("outcome", ["rpc_error", "late_ack", "dispose"])
