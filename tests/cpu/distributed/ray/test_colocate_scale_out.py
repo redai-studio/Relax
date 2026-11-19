@@ -308,6 +308,39 @@ async def test_failed_full_blocks_publication_and_disposes_only_after_exit(pool,
 
 
 @pytest.mark.asyncio
+async def test_dispose_stops_colocate_receivers_when_group_retirement_fails(pool, monkeypatch):
+    from relax.distributed.ray import rollout
+
+    manager, _, baseline = pool
+    manager._eval_judge = None
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    group, candidate, waiter = await start_candidate(manager, request, 4)
+    group.pg = (SimpleNamespace(id="candidate-pg"), [0, 1], [4, 5])
+    source = Mock()
+    snapshot, _ = manager.acquire_colocate_full(source)
+    await manager.publish_colocate_full(4, ["candidate-4"])
+    manager.release_colocate_full()
+    assert (await waiter).success
+    manager.fail_colocate_full("stale")
+    assert manager._colocate_failure is None
+    retire = source.disconnect_colocate_weight_group.remote.return_value
+
+    def get(ref, **kwargs):
+        if ref is retire:
+            raise RuntimeError("receiver ACK failed")
+
+    monkeypatch.setattr(rollout.ray, "get", get)
+    remove_pg = Mock()
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+    manager.dispose()
+
+    source.abort_colocate_weight_group.remote.assert_called_once_with(snapshot["group_name"])
+    baseline.engines[0].shutdown.remote.assert_called_once()
+    candidate.shutdown.options.assert_called_once_with(concurrency_group="colocate_shutdown")
+    remove_pg.assert_called_once_with(group.pg[0])
+
+
+@pytest.mark.asyncio
 async def test_dispose_reports_unconfirmed_sender_probe(pool, patch_ray_get, monkeypatch):
     from relax.distributed.ray import rollout
 

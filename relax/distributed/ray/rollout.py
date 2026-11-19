@@ -1379,6 +1379,16 @@ class RolloutManager(ReloadableMixin):
                     if time.monotonic() >= dispose_deadline:
                         raise RuntimeError("Colocate FULL still holds the shutdown fence")
                     time.sleep(0.2)
+                if not failed and current is not None:
+                    try:
+                        ray.get(
+                            source.disconnect_colocate_weight_group.remote(current[0]),
+                            timeout=max(0.0, dispose_deadline - time.monotonic() - 8),
+                        )
+                    except Exception:
+                        self.fail_colocate_full(current[0])
+                        failed = True
+                        logger.exception("[Colocate FULL] Group retirement failed during shutdown")
                 sender_error = None
                 if failed:
                     # Stop the receiver process trees before releasing their PGs.
@@ -1398,8 +1408,6 @@ class RolloutManager(ReloadableMixin):
                                 sender_error = error
                                 logger.exception("[Colocate FULL] Failed to abort the sender's group during shutdown")
                 else:
-                    if current is not None:
-                        ray.get(source.disconnect_colocate_weight_group.remote(current[0]), timeout=35)
                     self._shutdown_all_engines(extra_groups=pending_groups)
                 for group in [*elastic_groups, *pending_groups]:
                     if id(group) not in unconfirmed_probes:
@@ -1642,7 +1650,9 @@ class RolloutManager(ReloadableMixin):
     def fail_colocate_full(self, group_name: str) -> None:
         with self._engine_lifecycle_lock:
             current = self._colocate_remote_group
-            if self._training_weight_updating and (current is None or current[0] == group_name):
+            if (current is not None and current[0] == group_name) or (
+                current is None and self._training_weight_updating
+            ):
                 self._colocate_failure = "mixed FULL"
                 for candidate in self._colocate_candidates.values():
                     if candidate.claimed and candidate.result is None and candidate.failure is None:

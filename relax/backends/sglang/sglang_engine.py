@@ -1770,9 +1770,8 @@ class SGLangEngine(RayActor):
                 )
 
             failed = [result for result in results if not result["success"]]
-            return {
+            verdict = {
                 "success": not failed,
-                "stopped": all(process.poll() is not None for _, process, _, _ in processes),
                 "category": failed[0]["category"] if failed else None,
                 "error_type": failed[0].get("error_type") if failed else None,
                 "error": failed[0].get("error") if failed else None,
@@ -1789,6 +1788,8 @@ class SGLangEngine(RayActor):
                 except Exception:
                     pass
             log_directory.cleanup()
+        verdict["stopped"] = all(process.poll() is not None for _, process, _, _ in processes)
+        return verdict
 
     def pause_generation(self, timeout: float | None = None):
         response = requests.post(

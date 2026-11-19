@@ -157,6 +157,20 @@ def test_mixed_full_failure_is_reported_before_actor_raises(monkeypatch, failing
     actor._publish_colocate_full.assert_not_called()
 
 
+def test_failed_colocate_retirement_reports_failure_before_rethrowing(monkeypatch):
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.weight_updater = Mock()
+    actor.rollout_manager = Mock()
+    actor.weight_updater.disconnect_distributed_group.side_effect = RuntimeError("receiver ACK failed")
+    monkeypatch.setattr(actor_module.ray, "get", lambda ref, **kwargs: ref)
+
+    with pytest.raises(RuntimeError, match="receiver ACK failed"):
+        actor.disconnect_colocate_weight_group("retired")
+
+    actor.rollout_manager.fail_colocate_full.remote.assert_called_once_with("retired")
+    actor.rollout_manager.acknowledge_colocate_group_removed.remote.assert_not_called()
+
+
 def test_colocate_admission_probes_before_requesting_full_snapshot(monkeypatch):
     actor = object.__new__(actor_module.MegatronTrainRayActor)
     engines = [Mock(), Mock()]

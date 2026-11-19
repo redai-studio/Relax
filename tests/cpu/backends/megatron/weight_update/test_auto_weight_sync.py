@@ -269,13 +269,34 @@ def test_independent_engines_reuse_group_and_destroy_only_matching_generation(mo
     assert connect.call_args.kwargs["engine_gpu_counts"] == [2]
     dynamic.get_pid_and_node_id.remote.assert_not_called()
     updater.disconnect_distributed_group("old")
-    disconnect.assert_called_once_with(updater.args, "old", "old-handle", [dynamic], strict=True)
+    assert disconnect.call_args.args == (updater.args, "old", "old-handle", [dynamic])
+    assert disconnect.call_args.kwargs["strict"]
     updater.connect_rollout_engines(
         [baseline, dynamic], None, [2, 2], [0, 0], shared_engine_count=1, remote_group_name="next"
     )
     updater.disconnect_distributed_group("old")
     assert updater._model_update_groups == "next-handle"
     assert disconnect.call_count == 1
+
+
+def test_failed_retirement_ack_does_not_destroy_the_local_group_twice(monkeypatch):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace()
+    group = updater._model_update_groups = Mock()
+    updater._group_name = "full"
+    updater.distributed_rollout_engines = [Mock()]
+    destroy_group = Mock()
+    monkeypatch.setattr(sync.dist, "destroy_process_group", destroy_group)
+    monkeypatch.setattr(sync.ray, "get", Mock(return_value=[{"success": False}]))
+
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
+        updater.disconnect_distributed_group("full")
+    with pytest.raises(RuntimeError, match="without all acknowledgments"):
+        updater.disconnect_distributed_group("full")
+
+    updater.abort_colocate_group("full")
+    destroy_group.assert_called_once_with(group)
+    group.abort.assert_not_called()
 
 
 def test_failed_receiver_ack_keeps_the_sender_group_for_abort(monkeypatch):

@@ -225,7 +225,7 @@ def test_distributed_update_selects_same_checkpoint_nextn_runners(
     }
     if selector is not None:
         payload["selector"] = selector
-    request.assert_called_once_with("update_weights_from_distributed", payload)
+    request.assert_called_once_with("update_weights_from_distributed", payload, timeout=None)
 
 
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
