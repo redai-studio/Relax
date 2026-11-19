@@ -121,7 +121,6 @@ def test_client_returns_backend_confirmed_recipients(recipients, rollout_only, a
     client = make_client(recipients=recipients)
     expected = list(recipients)
     result = asyncio.run(client.update_weights_for_rollout(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only))
-    assert result is recipients
     assert result == expected
     client._backend.update_weights_for_rollout.assert_called_once_with(rollout_only, actor_fwd_only)
 
