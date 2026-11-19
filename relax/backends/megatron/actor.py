@@ -2606,7 +2606,13 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         for data, batch_meta in streaming_iter:
             n = len(data["total_lengths"])
-            data_iterator = [DataIterator(data, micro_batch_indices=[list(range(n))])]
+            data_iterator = [
+                DataIterator(
+                    data,
+                    micro_batch_indices=[list(range(n))],
+                    start_micro_batch_index=data["replay_micro_batch_index"],
+                )
+            ]
             num_microbatches = [1]
             output_dict = self.compute_log_prob(
                 data_iterator,
@@ -3932,6 +3938,9 @@ class MegatronTrainRayActor(TrainRayActor):
             "returns",
             "opd_reverse_kl",
         }
+        if getattr(self.args, "dynamic_context_parallel", False):
+            # forward_only already reconstructed these responses in their original sample order.
+            token_fields -= {"log_probs", "ref_log_probs"}
         fields_to_gather = [
             key for key, value in output_dict.items() if key in token_fields and isinstance(value, List)
         ]

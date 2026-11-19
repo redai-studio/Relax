@@ -1,8 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -79,3 +80,45 @@ def test_dynamic_cp_rotation_round_trip(tmp_path):
     """Ref and training agree on ownership, and outputs restore original order
     over DP3 x CP2."""
     mp.start_processes(_exercise_rank, args=((tmp_path / "gloo").as_uri(),), nprocs=6, start_method="fork")
+
+
+@pytest.mark.parametrize("prefix", ["ref_", ""])
+def test_streaming_forward_preserves_ordinals_and_full_logprobs(monkeypatch, prefix):
+    from relax.backends.megatron import actor as actor_module
+    from relax.utils.data import stream_dataloader
+
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(max_tokens_per_gpu=16, dynamic_context_parallel=True, qkv_format="thd")
+    actor.data_system_client = SimpleNamespace(async_put=AsyncMock(), get_meta=Mock())
+    mpu = actor_module.mpu
+    monkeypatch.setattr(mpu, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpu, "get_data_parallel_world_size", lambda **_: 1)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda: True)
+
+    stream = []
+    for ids in ([9, 4], [8, 3]):
+        data = dict(ids=ids, total_lengths=[6, 6], response_lengths=[2, 2])
+        stream.append((data, SimpleNamespace(samples=ids)))
+    pending = iter(stream)
+    monkeypatch.setattr(stream_dataloader, "get_data_from_transfer_queue", lambda *_, **__: next(pending))
+
+    ordinals = []
+
+    def compute_log_prob(iterators, counts, store_prefix):
+        batch = iterators[0].get_next(["ids"])
+        ordinals.append(batch["replay_micro_batch_index"])
+        return {store_prefix + "log_probs": [torch.tensor([i, i + 0.5]) for i in batch["ids"]]}
+
+    actor.compute_log_prob = compute_log_prob
+    key = prefix + "log_probs"
+    actor._streaming_fwd_putback(0, key, prefix, ["ids"])
+    assert ordinals == [0, 1]
+    puts = actor.data_system_client.async_put.await_args_list
+    for call, (_, expected_meta) in zip(puts, stream, strict=True):
+        assert call.kwargs["metadata"] is expected_meta
+        rows = call.kwargs["data"][key].unbind()
+        for actual, i in zip(rows, expected_meta.samples, strict=True):
+            torch.testing.assert_close(actual, torch.tensor([i, i + 0.5]), rtol=0, atol=0)
