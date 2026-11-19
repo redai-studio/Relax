@@ -454,7 +454,7 @@ class WeightSyncProxy:
             raise ValueError("Proxy document exceeds its bounded worker directory capacity")
         identities = [hashlib.sha256(data.encode()).hexdigest() for data in encoded]
         # Decide the complete fragment set before publishing its first fragment.
-        width = max(1, MAX_HTTP_BYTES // (8 * len(encoded)))
+        width = max(1, MAX_HTTP_BYTES // (4 * len(encoded)))
         while True:
             count = max((len(data) + width - 1) // width for data in encoded)
             controls = [
