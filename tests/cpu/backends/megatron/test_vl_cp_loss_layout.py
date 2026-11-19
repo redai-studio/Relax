@@ -4,6 +4,7 @@
 alignment."""
 
 from argparse import Namespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 
 
 try:
-    from relax.backends.megatron import cp_utils
+    from relax.backends.megatron import cp_utils, data
     from relax.backends.megatron import loss as loss_module
     from relax.engine.sft.eval.ppl import compute_sft_eval_step
     from relax.utils.sft_utils import align_loss_mask_for_sft
@@ -132,3 +133,110 @@ def test_contiguous_allgather_layout_is_preserved_without_bridge_metadata(monkey
     assert chunks[0][0].numel() == 0
     assert chunks[1][0].flatten().tolist() == [11, 12, 13, 14]
     assert chunks[1][1].tolist() == [12, 13, 14, 15]
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_glm_packed_batch_matches_unsplit_next_token_loss(monkeypatch, cp_size):
+    args = Namespace(
+        qkv_format="thd",
+        loss_type="sft",
+        allgather_cp=False,
+        rollout_temperature=1.0,
+        glm53_packed_cp=True,
+        sft_chunked_logits=False,
+    )
+    monkeypatch.setattr(data, "get_args", lambda: args)
+    monkeypatch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: cp_size)
+    documents = [torch.arange(1, 6), torch.arange(11, 28)]
+    lengths = [doc.numel() for doc in documents]
+    masks = [torch.tensor([0, 0, 1, 0, 1]), torch.zeros(17, dtype=torch.int)]
+    expected = [(3, 2), (5, 4)]
+    supervised = []
+    for rank in range(cp_size):
+        monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda r=rank: r)
+        batch = dict(
+            tokens=documents,
+            total_lengths=lengths,
+            response_lengths=lengths,
+            loss_masks=masks,
+            multimodal_train_inputs=[{"pixel_values": torch.ones(2, 3)}, None],
+        )
+        packed = data.get_batch(
+            iter([(batch, None)]), list(batch), pad_multiplier=8, is_vl_model=True, pack_device=torch.device("cpu")
+        )
+        local_ids = packed["tokens"]
+        if cp_size > 1:
+            padded = packed["padded_total_lengths"]
+            padded_documents = [F.pad(doc, (0, size - len(doc))) for doc, size in zip(documents, padded, strict=True)]
+            assert packed["unsplit_tokens"].tolist() == [torch.cat(padded_documents).tolist()]
+            for key in ("packed_seq_params", "vlm_packed_seq_params"):
+                assert packed[key].cu_seqlens_q.tolist() == [0, padded[0], sum(padded)]
+            torch.testing.assert_close(
+                local_ids.squeeze(0),
+                _local_hidden(torch.cat(documents).unsqueeze(-1), lengths, padded, cp_size, rank).flatten(),
+            )
+        else:
+            assert "unsplit_tokens" not in packed
+        assert "unsplit_attention_mask" not in packed
+        assert packed["multimodal_train_inputs"]["pixel_values"].shape == (2, 3)
+        metadata = dict(
+            total_lengths=lengths,
+            response_lengths=lengths,
+            padded_total_lengths=packed.get("padded_total_lengths"),
+        )
+        local_masks = cp_utils.get_cp_local_loss_masks(loss_masks=packed["loss_masks"], **metadata)
+        responses = loss_module.get_responses(
+            local_ids.float().unsqueeze(-1),
+            args=args,
+            unconcat_tokens=packed["unconcat_tokens"],
+            cp_output_is_zigzag=packed.get("cp_output_is_zigzag", False),
+            **metadata,
+        )
+        for (predictors, labels), mask in zip(responses, local_masks, strict=True):
+            supervised.extend(
+                zip(labels[mask.bool()].tolist(), predictors[mask.bool()].flatten().tolist(), strict=True)
+            )
+        assert packed["full_loss_masks"].sum() == sum(mask.sum() for mask in local_masks)
+    assert sorted(supervised) == expected
+
+
+def test_glm_cp_vision_matches_full_insertion_and_gradients():
+    try:
+        from megatron.bridge.models.glm5next.glm53flash_bridge import GLM53FlashModel
+        from transformers.models.glm5_next.modeling_glm5_next import Glm5NextModel
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"Requires the pinned GLM Bridge runtime: {exc}")
+
+    class Vision(torch.nn.Module):
+        dtype = torch.float32
+
+        def forward(self, pixels, grid_thw):
+            return SimpleNamespace(pooler_output=pixels * 2)
+
+    model = GLM53FlashModel.__new__(GLM53FlashModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(image_token_id=28, video_start_token_id=29, video_end_token_id=30)
+    model.get_placeholder_mask = MethodType(Glm5NextModel.get_placeholder_mask, model)
+    model.visual = Vision()
+    model.get_image_features = lambda pixels, grid: SimpleNamespace(pooler_output=(pixels * 2,))
+    model.get_video_features = lambda pixels, grid: SimpleNamespace(pooler_output=(pixels * 3,))
+
+    # GLM uses the same placeholder ID in both modalities. The image straddles
+    # two zigzag shards and the video is entirely on rank 1.
+    tokens = torch.tensor([[1, 2, 3, 28, 28, 28, 29, 28, 28, 30, 4, 5, 6, 0, 0, 0]])
+    embeds = torch.randn(1, 16, 5, requires_grad=True)
+    images = torch.randn(3, 5, requires_grad=True)
+    video = torch.randn(2, 5, requires_grad=True)
+    inputs = dict(pixel_values=images, pixel_values_videos=video, image_grid_thw=None, video_grid_thw=None)
+    reference = model._insert_vision_features(tokens, embeds, **inputs)
+    variables = (embeds, images, video)
+    expected_grads = torch.autograd.grad(reference.square().sum(), variables)
+    local_loss = 0
+    for indices in ([0, 1, 2, 3, 12, 13, 14, 15], [4, 5, 6, 7, 8, 9, 10, 11]):
+        index = torch.tensor(indices)
+        local = model._insert_cp_vision_features(tokens, embeds.index_select(1, index), index, **inputs)
+        torch.testing.assert_close(local, reference.index_select(1, index))
+        local_loss += local.square().sum()
+    for grad, expected in zip(torch.autograd.grad(local_loss, variables), expected_grads, strict=True):
+        torch.testing.assert_close(grad, expected)

@@ -44,6 +44,9 @@ def _expert_adapter_finalize_worker(rank: int, rendezvous: str) -> None:
                     sequence_parallel=False,
                     qk_layernorm=False,
                     mtp_num_layers=None,
+                    gtp_weight_remat_size=1,
+                    expert_gtp_weight_remat_size=1,
+                    calculate_per_token_loss=True,
                 )
 
             def finish_grad_sync(self, **kwargs) -> None:
