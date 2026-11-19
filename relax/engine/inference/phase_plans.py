@@ -28,6 +28,16 @@ def deferred_genrm_enabled(args: Any) -> bool:
     return genrm_shares_rollout_bundles(args) and bool(getattr(args, "defer_reward_to_post_process", False))
 
 
+def manual_genrm_hook_enabled(args: Any) -> bool:
+    """Whether the post-process hook drives a shared GenRM phase handoff."""
+    return (
+        getattr(args, "_inference_phase_coordinator", None) is not None
+        and genrm_shares_rollout_bundles(args)
+        and not getattr(args, "defer_reward_to_post_process", False)
+        and bool(getattr(args, "custom_reward_post_process_path", None))
+    )
+
+
 def uses_managed_genrm_hook(args: Any) -> bool:
     """An opted-in hook scores samples while the coordinator owns GPU
     residency."""

@@ -211,7 +211,8 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
     rm_calls: list = []
 
-    async def fake_batched_rm(args, group, *, evaluation):
+    async def fake_batched_rm(args, group, *, evaluation, inline_generation):
+        assert inline_generation
         rm_calls.append((group, evaluation))
         return [1.0] * len(group)
 
@@ -230,12 +231,48 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
         assert rm_calls == [(group, evaluation)]
 
 
+@pytest.mark.parametrize("evaluation", [False, True])
+@pytest.mark.asyncio
+async def test_native_reward_route_rejects_inline_shared_genrm(monkeypatch, evaluation):
+    from unittest.mock import Mock
+
+    from relax.engine.rewards import dapo_genrm
+    from relax.utils.training.eval_config import EvalDatasetConfig
+
+    args = _group_args(group_rm=evaluation)
+    args.custom_rm_path = None
+    args.rm_type = "dummy"
+    args.reward_key = "score"
+    args._genrm_instances_resolved = {"judge": {}}
+    args._genrm_colocate_with_rollout = True
+    sample = Sample(index=7, prompt="question", response="Answer: 1", label="1")
+    if evaluation:
+        sample.metadata = EvalDatasetConfig("eval", "dataset", rm_type="dapo-genrm").inject_metadata({})
+    else:
+        sample.metadata = {"rm_type": "boxed_dapo-genrm"}
+
+    async def generate(state, args, sample, sampling_params, evaluation=False):
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    judge = SimpleNamespace(generate=Mock(side_effect=AssertionError("judge must stay asleep")))
+    monkeypatch.setattr(dapo_genrm, "get_genrm_client", lambda: judge)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: _GroupState())
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", generate)
+
+    with pytest.raises(ValueError, match="Sample 7 routes to inline dapo-genrm"):
+        await sglang_rollout.generate_and_rm_group(args, [sample], {}, evaluation=evaluation)
+    judge.generate.assert_not_called()
+    assert sample.reward is None
+
+
 class _RolloutState:
     def __init__(self, last_step_current_deficit=1):
         self.last_step_current_deficit = last_step_current_deficit
         self.remaining_batch_size = 0
         self.prefetched_samples_ref = None
         self.tokenizer = None
+        self.opd_manager = None
         self.pendings = set()
         self.protected_pendings = set()
 

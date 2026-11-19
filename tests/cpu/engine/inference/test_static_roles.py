@@ -321,8 +321,8 @@ def test_shared_static_pool_borrows_binding_and_records_selected_phase(monkeypat
         genrm_num_gpus=2,
         genrm_engine_config={},
         genrm_sampling_config={},
-        _genrm_instances_resolved=[{}],
-        _genrm_colocate_with_rollout=deferred,
+        _genrm_instances_resolved=[{}] if role is Role.GENRM else [],
+        _genrm_colocate_with_rollout=deferred and role is Role.GENRM,
         defer_reward_to_post_process=deferred,
         use_opd=True,
         opd_type="sglang",
@@ -354,7 +354,17 @@ def test_shared_static_pool_borrows_binding_and_records_selected_phase(monkeypat
             backend._engine_placements = {0: (options["pg"], False)}
 
     monkeypatch.setattr(implementation, "__init__", initialize)
-    monkeypatch.setattr(implementation, "offload", lambda backend: releases.append(backend))
+
+    def offload(backend):
+        if role is Role.TEACHER:
+            from relax.utils.opd.opd_utils import build_teacher_overrides
+
+            overrides = build_teacher_overrides(backend.args, colocate_sync=True)
+            assert overrides["enable_memory_saver"]
+            assert backend.args._requires_weights_cpu_backup
+        releases.append(backend)
+
+    monkeypatch.setattr(implementation, "offload", offload)
     # GenRM receives an absolute bundle offset; legacy Teacher offsets are
     # relative to the rollout region, which deferred startup sets to zero.
     offset = 1 if deferred or role is Role.TEACHER else 5

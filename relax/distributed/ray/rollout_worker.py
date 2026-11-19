@@ -10,6 +10,7 @@ from typing import Any
 
 import ray
 
+from relax.engine.inference.phase_plans import PHASE_GENERATE
 from relax.engine.rollout.workload import RolloutWorkload
 from relax.utils.http_utils import init_http_client
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
@@ -40,6 +41,9 @@ class RolloutWorker:
         self.args = args
         self.manager = manager
         self._closed = False
+        self._rollout_completed: bool | None = None
+        self._training_ready = False
+        self._phase_lock = asyncio.Lock()
         self._active: set[asyncio.Task] = set()
         init_tracking(args, primary=False)
         init_http_client(args)
@@ -72,14 +76,33 @@ class RolloutWorker:
     async def generate(self, rollout_id: int) -> None:
         coordinator = getattr(self.args, "_inference_phase_coordinator", None)
         if coordinator is not None:
-            await coordinator.switch.remote("inference")
+            async with self._phase_lock:
+                if self._rollout_completed is False:
+                    raise RuntimeError("Shared rollout has an unfinished generation round")
+                self._rollout_completed = False
+                self._training_ready = False
+            await coordinator.switch.remote(PHASE_GENERATE)
         await self.manager.begin_rollout.remote(rollout_id)
         await self._run("generate", rollout_id)
+        if coordinator is not None:
+            self._rollout_completed = True
+
+    async def offload(self) -> None:
+        async with self._phase_lock:
+            if self._rollout_completed is False:
+                raise RuntimeError("Cannot release shared rollout GPUs before generation and scoring complete")
+            await self.args._inference_phase_coordinator.switch.remote("startup")
+            self._training_ready = self._rollout_completed is True
+
+    def get_status(self) -> str:
+        # The training barrier requires a completed workload (including its
+        # dynamic batch size) and a confirmed release of every shared owner.
+        return "offload" if self._training_ready else "onload"
 
     async def eval(self, rollout_id: int) -> None:
         coordinator = getattr(self.args, "_inference_phase_coordinator", None)
         if coordinator is not None:
-            await coordinator.switch.remote("inference")
+            await coordinator.switch.remote(PHASE_GENERATE)
         await self.manager.begin_rollout.remote(rollout_id)
         await self._run("eval", rollout_id)
 

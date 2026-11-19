@@ -49,7 +49,9 @@ class _PoolCall:
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
         if self.method == "offload" and self.handle.phase_coordinator is not None:
-            return self.handle.phase_coordinator.switch.remote("startup")
+            return self.handle.worker.offload.remote()
+        if self.method == "get_status" and self.handle.phase_coordinator is not None:
+            return self.handle.worker.get_status.remote()
         if self.method == "dispose":
             from relax.distributed.ray.inference_manager import dispose_managed_rollout
 
@@ -104,11 +106,27 @@ def use_managed_auxiliary(args: Any) -> bool:
 
 def shared_task_enabled(args: Any) -> bool:
     """Shared-GPU native rollout uses independent owners plus a coordinator."""
+    from relax.engine.inference.phase_plans import deferred_opd_enabled, genrm_shares_rollout_bundles
     from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
 
-    return (
+    shared_teacher = deferred_opd_enabled(args)
+    managed = (
         bool(getattr(args, "colocate", False))
         and not getattr(args, "hybrid", False)
         and (bool(getattr(args, "_genrm_instances_resolved", None)) or is_managed_opd_teacher_enabled(args))
         and use_managed_rollout(args)
     )
+    if not managed and shared_teacher:
+        raise ValueError(
+            "An OPD Teacher sharing rollout GPUs requires managed rollout. "
+            "Use split Teacher bundles or a managed rollout configuration. For deferred shared GenRM, "
+            "use a scoring-only post-process hook with managed_genrm_scoring=True."
+        )
+    if (
+        managed
+        and getattr(args, "offload_rollout", None) is False
+        and not getattr(args, "debug_rollout_only", False)
+        and (shared_teacher or genrm_shares_rollout_bundles(args))
+    ):
+        raise ValueError("Training with a Teacher or GenRM sharing rollout GPUs requires --offload-rollout.")
+    return managed

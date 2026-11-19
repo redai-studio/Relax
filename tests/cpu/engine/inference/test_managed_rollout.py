@@ -585,3 +585,54 @@ def test_manual_shared_genrm_hook_selects_managed_owners(shared):
     )
     assert use_managed_rollout(args) is shared
     assert shared_task_enabled(args) is shared
+
+
+@pytest.mark.parametrize("distributed_post", [False, True])
+def test_shared_teacher_rejects_legacy_rollout_before_placement(monkeypatch, distributed_post):
+    from relax.distributed.ray.inference_handle import shared_task_enabled
+    from relax.utils import misc
+
+    def hook(args, samples):
+        return [0.0] * len(samples)
+
+    monkeypatch.setattr(misc, "load_function", lambda path: hook)
+    args = SimpleNamespace(
+        colocate=True,
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="teacher",
+        resource={"actor": [1, 2], "rollout": [1, 2], "teacher": [1, 2]},
+        _genrm_instances_resolved={"judge": {}},
+        _genrm_colocate_with_rollout=True,
+        defer_reward_to_post_process=True,
+        custom_reward_post_process_path="test.legacy_hook",
+        use_distributed_post=distributed_post,
+    )
+    with pytest.raises(ValueError, match="Teacher sharing rollout GPUs requires managed rollout"):
+        shared_task_enabled(args)
+    hook.managed_genrm_scoring = True
+    if not distributed_post:
+        assert shared_task_enabled(args)
+
+
+@pytest.mark.parametrize("scorer", ["teacher", "genrm"])
+def test_shared_scoring_training_requires_rollout_offload(scorer):
+    from relax.distributed.ray.inference_handle import shared_task_enabled
+
+    args = SimpleNamespace(
+        colocate=True,
+        offload_rollout=False,
+        use_opd=scorer == "teacher",
+        opd_type="sglang",
+        teacher_hf_checkpoint="teacher",
+        resource={"actor": [1, 2], "rollout": [1, 2], "teacher": [1, 2]},
+        _genrm_instances_resolved={"judge": {}} if scorer == "genrm" else {},
+        _genrm_colocate_with_rollout=scorer == "genrm",
+    )
+    with pytest.raises(ValueError, match="requires --offload-rollout"):
+        shared_task_enabled(args)
+    args.debug_rollout_only = True
+    assert shared_task_enabled(args)
+    args.debug_rollout_only = False
+    args.offload_rollout = True
+    assert shared_task_enabled(args)

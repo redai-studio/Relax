@@ -37,8 +37,8 @@ class StaticInferencePool:
         if shared_teacher and self.spec.deployment.mode is DeploymentMode.DEFER:
             # The legacy TeacherManager adds the rollout slice before its
             # relative offset; deferred teachers reuse the bundles from zero.
-            args = copy(args)
             args.rollout_num_gpus = 0
+            args._requires_weights_cpu_backup = True
         if binding is not None:
             from relax.engine.inference.placement import PlacementPlanner
             from relax.engine.inference.task_placement import StaticPlacement, plan_static_placement

@@ -386,12 +386,14 @@ class RewardExecutor:
     # -- public API -----------------------------------------------------------
 
     async def execute_batch(
-        self, args: Any, samples: list[Sample], **kwargs: Any
+        self, args: Any, samples: list[Sample], *, inline_generation: bool = False, **kwargs: Any
     ) -> list[int | float | dict[str, Any]]:
         """Score a complete custom batch or fan out built-in rewards."""
         if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False):
             return await self._execute_custom_with_concurrency(args, samples, **kwargs)
-        return await asyncio.gather(*(self.execute(args, sample, **kwargs) for sample in samples))
+        return await asyncio.gather(
+            *(self.execute(args, sample, inline_generation=inline_generation, **kwargs) for sample in samples)
+        )
 
     async def _execute_custom_with_concurrency(self, args, sample: Sample | list[Sample], **kwargs):
         """Execute one custom reward call with concurrency control."""
@@ -411,7 +413,9 @@ class RewardExecutor:
             with collect_eval_rewards(args, enabled=False):
                 return await self._execute_custom(args, sample, kwargs)
 
-    async def execute(self, args, sample: Sample, *, _resolved_route=None, **kwargs):
+    async def execute(
+        self, args: Any, sample: Sample, *, _resolved_route=None, inline_generation: bool = False, **kwargs: Any
+    ):
         """Execute a single reward computation with concurrency control.
 
         - Custom rm paths bypass the format-aware router: async customs are
@@ -432,6 +436,14 @@ class RewardExecutor:
             fallback=getattr(args, "rm_type_fallback", None),
             sample_index=getattr(sample, "index", None),
         )
+        if inline_generation and route.rm_type == "dapo-genrm":
+            from relax.engine.inference.phase_plans import genrm_shares_rollout_bundles
+
+            if genrm_shares_rollout_bundles(args):
+                raise ValueError(
+                    f"Sample {sample.index} routes to inline dapo-genrm while GenRM shares the rollout GPUs. "
+                    "Use split GenRM bundles or route this sample to a score computed without the shared GenRM."
+                )
         # Managed GenRM may share/offload policy GPUs; only independent
         # HTTP judges are safe to detach automatically. Capture before taking
         # a training-pool permit, and pin the resolved route for later scoring.

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import os
 import socket
 from argparse import Namespace
@@ -691,7 +692,23 @@ async def transfer_batch_to_data_system(
             batch_samples = sum(batch_samples, [])
         global CURRENT_ROLLOUT_BATCH
         CURRENT_ROLLOUT_BATCH.extend(batch_samples)
-        rollout_batch = convert_samples_to_train_data(args, batch_samples)
+        from relax.engine.inference.phase_plans import manual_genrm_hook_enabled
+
+        if operation_id is not None and manual_genrm_hook_enabled(args):
+            # The hook may synchronously wait for a phase RPC. Keep the event
+            # loop available and let the hook finish its handoff on cancellation.
+            conversion = asyncio.create_task(asyncio.to_thread(convert_samples_to_train_data, args, batch_samples))
+            cancelled = False
+            while not conversion.done():
+                try:
+                    await asyncio.shield(conversion)
+                except asyncio.CancelledError:
+                    cancelled = True
+            rollout_batch = conversion.result()
+            if cancelled:
+                raise asyncio.CancelledError
+        else:
+            rollout_batch = convert_samples_to_train_data(args, batch_samples)
         logger.info(f"Prepared rollout batch {batch_count} with {rollout_batch.numel()} samples for transfer")
         logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
 

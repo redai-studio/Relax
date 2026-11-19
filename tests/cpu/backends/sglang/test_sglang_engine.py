@@ -411,6 +411,54 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
     assert result["disable_shared_experts_fusion"] is expected_disabled
 
 
+@pytest.mark.parametrize("weight_cache_mode", ["off", "read"])
+def test_sleeping_teacher_enforces_weight_backup_after_overrides(monkeypatch, sglang_engine_module, weight_cache_mode):
+    from relax.engine.inference import phase_plans
+
+    module = sglang_engine_module
+    # The Teacher's legacy placement arguments no longer describe the task layout.
+    monkeypatch.setattr(phase_plans, "deferred_opd_enabled", lambda args: False)
+    monkeypatch.setattr(
+        module,
+        "ServerArgs",
+        make_dataclass(
+            "ServerArgs",
+            [
+                ("enable_memory_saver", bool, False),
+                ("enable_weights_cpu_backup", bool, False),
+                ("weight_cache_mode", str, "off"),
+            ],
+        ),
+    )
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu_id: gpu_id)
+    args = SimpleNamespace(
+        _requires_weights_cpu_backup=True,
+        rollout_num_gpus=0,
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=8,
+        hf_checkpoint="teacher",
+        seed=42,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=False,
+        fp16=False,
+    )
+    overrides = {"weight_cache_mode": weight_cache_mode, "enable_weights_cpu_backup": False}
+
+    def compute():
+        return module._compute_server_args(
+            args, 0, "localhost:8000", 8001, "localhost", 8002, base_gpu_id=0, sglang_overrides=overrides
+        )[0]
+
+    if weight_cache_mode == "off":
+        assert compute()["enable_weights_cpu_backup"] is True
+    else:
+        with pytest.raises(ValueError, match="SGLang disables CPU backup"):
+            compute()
+
+
 @pytest.mark.parametrize(
     "existing", [None, [], ["custom.loader"], ["relax.backends.sglang.weight_loader.load_expert_slices"]]
 )

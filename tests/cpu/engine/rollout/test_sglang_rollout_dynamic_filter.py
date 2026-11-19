@@ -62,6 +62,10 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         filter_fn: Callable | None = check_reward_nonzero_std,
         rollout_batch_size: int = 1,
         dp_size: int = 1,
+        args_overrides: dict | None = None,
+        abort_fn: Callable | None = None,
+        transfer_fn: Callable | None = None,
+        client: object | None = None,
     ) -> SimpleNamespace:
         args = Namespace(
             rollout_global_dataset=True,
@@ -78,7 +82,9 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
             debug_rollout_only=False,
             reward_key=reward_key,
         )
+        vars(args).update(args_overrides or {})
         state = SimpleNamespace(
+            opd_manager=None,
             last_step_current_deficit=0,
             remaining_batch_size=0,
             prefetched_samples_ref=None,
@@ -118,16 +124,18 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         monkeypatch.setattr(sglang_rollout, "load_function", lambda path: filter_fn)
         monkeypatch.setattr(sglang_rollout, "start_sglang_profile", AsyncMock())
         monkeypatch.setattr(sglang_rollout, "stop_sglang_profile", AsyncMock())
-        monkeypatch.setattr(sglang_rollout, "abort", AsyncMock(return_value=drained or ([], [])))
-        monkeypatch.setattr(sglang_rollout, "transfer_batch_to_data_system", transfer)
+        monkeypatch.setattr(sglang_rollout, "abort", abort_fn or AsyncMock(return_value=drained or ([], [])))
+        monkeypatch.setattr(sglang_rollout, "transfer_batch_to_data_system", transfer_fn or transfer)
         monkeypatch.setattr(sglang_rollout, "CURRENT_ROLLOUT_BATCH", current_batch)
+        monkeypatch.setattr("relax.utils.utils.CURRENT_ROLLOUT_BATCH", current_batch)
         monkeypatch.setattr(sglang_rollout, "compute_dp_size", lambda args: dp_size)
         monkeypatch.setattr(sglang_rollout, "save_debug_rollout_data", Mock())
         monkeypatch.setattr(sglang_rollout, "_log_rollout_data", log)
         monkeypatch.setattr(sglang_rollout, "tqdm", Mock())
 
         output, buffered = await asyncio.wait_for(
-            sglang_rollout.generate_rollout_async(args, 0, data_source, object()), timeout=5
+            sglang_rollout.generate_rollout_async(args, 0, data_source, client if client is not None else object()),
+            timeout=5,
         )
         log.assert_called_once()
         state.reset.assert_called_once()
@@ -231,3 +239,89 @@ async def test_sglang_rollout_defers_drain_filter_without_dynamic_batch_size(run
     assert result.buffered == [drained]
     assert result.output.metrics == {}
     assert [call.args[1] for call in filter_fn.call_args_list] == [accepted]
+
+
+async def test_manual_genrm_hook_runs_after_generation_drain(run_rollout, monkeypatch):
+    import numpy as np
+
+    from relax.engine.inference.lifecycle import AdmissionLedger
+    from relax.engine.inference.phases import PhaseCoordinator
+    from relax.utils import utils
+
+    loop = asyncio.get_running_loop()
+    ledger = AdmissionLedger()
+    permit = ledger.admit("policy")
+    events = []
+
+    async def drain_generation(args, rollout_id):
+        await ledger.complete(permit)
+        events.append("generation drained")
+        return [], []
+
+    async def call(owner, method):
+        if (owner, method) == ("policy", "offload"):
+            await ledger.drain("memory", timeout=0.5)
+        events.append((owner, method))
+
+    coordinator = PhaseCoordinator({"inference": ("policy",), "genrm": ("judge",)}, "inference", call)
+
+    async def score():
+        await coordinator.switch("genrm")
+        try:
+            events.append("score")
+        finally:
+            await coordinator.switch("inference")
+
+    def hook(args, samples):
+        assert not ledger.permits, "Manual GenRM hook ran before generation drained"
+        future = asyncio.run_coroutine_threadsafe(score(), loop)
+        try:
+            future.result(timeout=1)
+        finally:
+            future.cancel()
+        return [0.75] * len(samples)
+
+    async def put(*, data, partition_id, custom_meta, is_last):
+        assert data["rewards"].tolist() == [0.75, 0.75]
+        assert partition_id == "train_0"
+        events.append("publish")
+        return SimpleNamespace(global_indexes=[10, 11])
+
+    client = SimpleNamespace(
+        async_put=AsyncMock(side_effect=put),
+        async_get_production_status=AsyncMock(return_value=(np.array([10, 11]), np.array([True, True]))),
+    )
+    monkeypatch.setattr(utils, "load_function", lambda path: hook)
+    group = _group(0)
+    for index, sample in enumerate(group):
+        sample.index = index
+        sample.tokens = [1, 2]
+        sample.response_length = 1
+
+    result = await run_rollout(
+        [[group]],
+        args_overrides={
+            "_genrm_instances_resolved": {"judge": {}},
+            "_genrm_colocate_with_rollout": True,
+            "_inference_phase_coordinator": coordinator,
+            "custom_reward_post_process_path": "test.manual_hook",
+            "defer_reward_to_post_process": False,
+            "debug_train_only": False,
+            "multimodal_keys": None,
+            "use_opd": False,
+        },
+        abort_fn=drain_generation,
+        transfer_fn=utils.transfer_batch_to_data_system,
+        client=client,
+    )
+    assert result.output.samples == [group]
+    client.async_put.assert_awaited_once()
+    assert events == [
+        "generation drained",
+        ("policy", "offload"),
+        ("judge", "onload"),
+        "score",
+        ("judge", "offload"),
+        ("policy", "onload"),
+        "publish",
+    ]

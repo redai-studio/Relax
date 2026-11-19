@@ -757,11 +757,11 @@ async def generate_and_rm(
     # Custom generation may already have assigned rewards to some outputs.
     if isinstance(generated, list):
         samples_need_reward = [sample for sample in generated if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
+        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation, inline_generation=True)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
     elif generated.reward is None:
-        generated.reward = await async_rm(args, generated, evaluation=evaluation)
+        generated.reward = await async_rm(args, generated, evaluation=evaluation, inline_generation=True)
 
     from relax.engine.rollout.deferred_opd import deferred_opd_active
 
@@ -858,7 +858,7 @@ async def generate_and_rm_group(
                 state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
-    rewards = await batched_async_rm(args, group, evaluation=evaluation)
+    rewards = await batched_async_rm(args, group, evaluation=evaluation, inline_generation=True)
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 

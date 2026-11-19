@@ -10,10 +10,9 @@ offloading it while requests are still in flight would abort them.
 Token selections that need a second pass on the student get an explicit follow-up
 stage, because the student was deliberately put to sleep for the teacher.
 
-The immediate path is untouched: when deferred scoring is off, no session is
-created and ``OpdManager.prefill`` keeps running inline. The resident Agentic
-pipeline stages its own transfer batches into the same session and flushes them
-when its step closes.
+Manual shared GenRM hooks also wait until generation drains before processing
+staged samples. The resident Agentic pipeline stages its own transfer batches
+into the same session and flushes them when its step closes.
 """
 
 import asyncio
@@ -102,9 +101,15 @@ class DeferredOpdSession:
         publish: Any,
         encode_multimodal_inputs: Any = None,
     ) -> "DeferredOpdSession | None":
-        if not _managed_genrm_scoring(args) and (opd_manager is None or not deferred_opd_active(args)):
+        from relax.engine.inference.phase_plans import manual_genrm_hook_enabled
+
+        if not (
+            _managed_genrm_scoring(args)
+            or manual_genrm_hook_enabled(args)
+            or (opd_manager is not None and deferred_opd_active(args))
+        ):
             return None
-        logger.info(f"Deferred OPD scoring active for rollout {rollout_id}: batches publish after scoring")
+        logger.info(f"Deferred scoring active for rollout {rollout_id}: batches publish after scoring")
         return cls(
             args,
             rollout_id,

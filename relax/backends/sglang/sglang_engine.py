@@ -2282,10 +2282,18 @@ def _compute_server_args(
 
     from relax.engine.inference.phase_plans import deferred_opd_enabled, genrm_shares_rollout_bundles
 
-    if genrm_shares_rollout_bundles(args) or deferred_opd_enabled(args):
-        # Scoring handoffs restore the current policy without another Actor push.
+    if (
+        getattr(args, "_requires_weights_cpu_backup", False)
+        or genrm_shares_rollout_bundles(args)
+        or deferred_opd_enabled(args)
+    ):
+        # A phase handoff restores weights without a subsequent weight push.
         if not kwargs.get("enable_memory_saver") or "enable_weights_cpu_backup" not in server_arg_field_names:
-            raise ValueError("Shared scoring requires SGLang memory saver with policy weight CPU backup")
+            raise ValueError("Shared scoring requires SGLang memory saver with weight CPU backup")
+        if kwargs.get("weight_cache_mode", "off") != "off":
+            raise ValueError(
+                "Shared scoring requires weight_cache_mode=off because SGLang disables CPU backup in IPC mode"
+            )
         kwargs["enable_weights_cpu_backup"] = True
 
     # Use CUDA IPC only for engines confined to one node; multi-node engines

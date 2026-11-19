@@ -77,22 +77,87 @@ async def test_shared_phase_cancellation_waits_until_handoff_finishes():
 
 
 @pytest.mark.asyncio
-async def test_managed_rollout_offload_releases_all_generation_phase_owners():
+async def test_shared_rollout_allows_training_only_after_round_and_all_releases(monkeypatch):
     from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
 
+    from relax.distributed.ray import rollout_worker
     from relax.distributed.ray.inference_handle import ManagedRolloutHandle
 
+    scoring = asyncio.Event()
+    finish_scoring = asyncio.Event()
+    releasing = asyncio.Event()
+    finish_release = asyncio.Event()
     released = []
+    dynamic_size = None
 
     async def call(owner, method):
-        released.append((owner, method))
+        if method == "offload":
+            if owner == "judge":
+                releasing.set()
+                await finish_release.wait()
+            released.append(owner)
 
-    coordinator = PhaseCoordinator({"inference": ("student", "teacher", "judge"), "startup": ()}, "inference", call)
-    handle = ManagedRolloutHandle(
-        object(), object(), SimpleNamespace(switch=SimpleNamespace(remote=coordinator.switch))
+    coordinator = PhaseCoordinator(
+        {"inference": ("student", "judge"), "teacher": ("teacher",), "startup": ()}, "inference", call
     )
-    await handle.offload.remote()
-    assert released == [("student", "offload"), ("teacher", "offload"), ("judge", "offload")]
+    coordinator_rpc = SimpleNamespace(switch=SimpleNamespace(remote=coordinator.switch))
+
+    async def generate(rollout_id):
+        nonlocal dynamic_size
+        await coordinator.switch("teacher")
+        scoring.set()
+        await finish_scoring.wait()
+        await coordinator.switch("inference")
+        dynamic_size = 4
+
+    monkeypatch.setattr(rollout_worker, "init_tracking", Mock())
+    monkeypatch.setattr(rollout_worker, "init_http_client", Mock())
+    monkeypatch.setattr(rollout_worker, "attach_tq_client", Mock())
+    monkeypatch.setattr(
+        rollout_worker,
+        "RolloutWorkload",
+        Mock(return_value=SimpleNamespace(generate=generate, get_dynamic_global_batch_size=lambda: dynamic_size)),
+    )
+    args = SimpleNamespace(_inference_phase_coordinator=coordinator_rpc, tq_config=None)
+    manager = SimpleNamespace(begin_rollout=SimpleNamespace(remote=AsyncMock()))
+    worker = rollout_worker.RolloutWorker.__ray_metadata__.modified_class(args, None, manager)
+    worker_rpc = SimpleNamespace(
+        offload=SimpleNamespace(remote=lambda: worker.offload()),
+        get_status=SimpleNamespace(remote=lambda: worker.get_status()),
+    )
+    owner = SimpleNamespace(
+        pool_call=SimpleNamespace(remote=lambda method: "offload" if "student" in released else "onload")
+    )
+    handle = ManagedRolloutHandle(owner, worker_rpc, coordinator_rpc)
+
+    assert handle.get_status.remote() == "onload"
+    round_task = asyncio.create_task(worker.generate(0))
+    # The first handoff already released the student. Treat a first batch as
+    # visible while the workload is still computing its final batch size.
+    await asyncio.wait_for(releasing.wait(), 2)
+    finish_release.set()
+    await asyncio.wait_for(scoring.wait(), 2)
+    assert "student" in released
+    assert handle.get_status.remote() == "onload"
+    assert worker.get_dynamic_global_batch_size() is None
+    with pytest.raises(RuntimeError, match="before generation and scoring complete"):
+        await handle.offload.remote()
+
+    finish_scoring.set()
+    await asyncio.wait_for(round_task, 2)
+    assert worker.get_dynamic_global_batch_size() == 4
+    assert handle.get_status.remote() == "onload"
+
+    releasing.clear()
+    finish_release.clear()
+    handoff = asyncio.create_task(handle.offload.remote())
+    await asyncio.wait_for(releasing.wait(), 2)
+    assert handle.get_status.remote() == "onload"
+    finish_release.set()
+    await asyncio.wait_for(handoff, 2)
+    assert released == ["student", "judge", "teacher", "student", "judge"]
+    assert handle.get_status.remote() == "offload"
 
 
 @pytest.mark.asyncio
