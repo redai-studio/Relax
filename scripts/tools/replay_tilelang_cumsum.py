@@ -3,7 +3,8 @@
 
 Pass the failed 32-GPU recipe's DRY_RUN JSON with --recipe-json. This
 reconstructs the recipe environment on the current host; it does not recover
-the old worker's complete process environment.
+the old worker's complete process environment. If the worker log records an
+extra preloaded library, pass its absolute path with --extra-preload.
 """
 
 import argparse
@@ -50,7 +51,7 @@ def failed_compile(log: Path) -> tuple[str, str, list[str]]:
     raise ValueError("No complete actor-prefixed local-cumsum CUDA source, segfault and command in this log")
 
 
-def replay(log: Path, recipe_json: Path, out: Path) -> None:
+def replay(log: Path, recipe_json: Path, out: Path, extra_preload: Path | None = None) -> None:
     worker, source, argv = failed_compile(log)
     if (
         Path(argv[0]).name != "nvcc"
@@ -73,6 +74,18 @@ def replay(log: Path, recipe_json: Path, out: Path) -> None:
     env = {**os.environ, **recipe["runtime_env"]["env_vars"], **json.loads(args[args.index("--train-env-vars") + 1])}
     if not env.get("LD_PRELOAD"):
         raise ValueError("No LD_PRELOAD in recipe environment; the two conditions would be identical")
+    clean = env.copy()
+    del clean["LD_PRELOAD"]
+    conditions = {"A": env, "B": clean}
+    labels = ("A1", "B1", "B2", "A2")
+    if extra_preload is not None:
+        if not extra_preload.is_absolute() or not extra_preload.is_file():
+            raise ValueError("--extra-preload must name an existing absolute library path from the worker log")
+        if any(Path(lib).name == extra_preload.name for lib in re.split(r"[:\s]+", env["LD_PRELOAD"])):
+            raise ValueError(f"{extra_preload.name} is already in the recipe preload")
+        full = {**env, "LD_PRELOAD": env["LD_PRELOAD"] + ":" + str(extra_preload)}
+        conditions = {"A": full, "B": env, "C": clean}
+        labels = ("A1", "B1", "C1", "C2", "B2", "A2")
     compiler = Path(argv[0]).resolve(strict=True)
     for lib in re.split(r"[:\s]+", env["LD_PRELOAD"]):
         if lib.startswith("/") and not Path(lib).is_file():
@@ -88,10 +101,11 @@ def replay(log: Path, recipe_json: Path, out: Path) -> None:
         "compiler_sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
         "LD_LIBRARY_PATH": env.get("LD_LIBRARY_PATH"),
         "LD_PRELOAD": env["LD_PRELOAD"],
+        "preload_by_condition": {key: values.get("LD_PRELOAD") for key, values in conditions.items()},
     }
     print(f"Original worker: {worker}\nSource SHA-256: {manifest['source_sha256']}", flush=True)
-    clean = env.copy()
-    del clean["LD_PRELOAD"]
+    for key, value in manifest["preload_by_condition"].items():
+        print(f"{key} LD_PRELOAD={value or '<unset>'}", flush=True)
     version = subprocess.check_output([argv[0], "--version"], env=clean, text=True)
     manifest["nvcc_version"] = version
     results = {}
@@ -103,11 +117,11 @@ def replay(log: Path, recipe_json: Path, out: Path) -> None:
         argv[argv.index("-o") + 1] = str(cubin)
         manifest["replay_argv"] = argv
         (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2))
-        for label in ("A1", "B1", "B2", "A2"):
+        for label in labels:
             cubin.unlink(missing_ok=True)
             with (evidence / f"{label}.log").open("wb") as stream:
                 rc = subprocess.run(
-                    argv, cwd=tmp, env=env if label.startswith("A") else clean, stdout=stream, stderr=subprocess.STDOUT
+                    argv, cwd=tmp, env=conditions[label[0]], stdout=stream, stderr=subprocess.STDOUT
                 ).returncode
             diagnostic = (evidence / f"{label}.log").read_text(errors="replace")
             data = cubin.read_bytes() if cubin.is_file() else b""
@@ -124,8 +138,9 @@ def replay(log: Path, recipe_json: Path, out: Path) -> None:
             results[label] = state
             print(f"{label}: rc={rc} {state}", flush=True)
             (evidence / "results.json").write_text(json.dumps(results, indent=2))
-    if list(results.values()) == ["segfault", "cubin", "cubin", "segfault"]:
-        print("Reproduced: the recipe preload triggers the segfault in this compiler environment.")
+    if results["A1"] == results["A2"] == "segfault" and results["B1"] == results["B2"] == "cubin":
+        difference = f"adding {extra_preload.name} to the recipe preload" if extra_preload else "the recipe preload"
+        print(f"Reproduced: {difference} triggers the segfault in this compiler environment.")
     else:
         print("Inconclusive for the preload hypothesis; see each compiler log.")
 
@@ -134,6 +149,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path, help="Original Ray training log")
     parser.add_argument("--recipe-json", type=Path, required=True, help="DRY_RUN output of the recipe used by the job")
+    parser.add_argument(
+        "--extra-preload", type=Path, help="Compare recipe plus this library, recipe alone, and no preload"
+    )
     parser.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Existing directory for evidence")
     options = parser.parse_args()
-    replay(options.log, options.recipe_json, options.output_dir.resolve())
+    replay(options.log, options.recipe_json, options.output_dir.resolve(), options.extra_preload)
