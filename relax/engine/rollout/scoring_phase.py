@@ -10,8 +10,8 @@ from relax.engine.inference.phase_plans import (
     PHASE_GENERATE,
     PHASE_GENRM,
     PHASE_TEACHER,
-    deferred_genrm_enabled,
     deferred_opd_enabled,
+    genrm_shares_rollout_bundles,
 )
 
 
@@ -33,7 +33,7 @@ async def _switch(args: Any, phase: str) -> None:
 
 @asynccontextmanager
 async def async_scoring_phase(args: Any, phase: str) -> AsyncIterator[bool]:
-    enabled = {PHASE_GENRM: deferred_genrm_enabled, PHASE_TEACHER: deferred_opd_enabled}[phase](args)
+    enabled = {PHASE_GENRM: genrm_shares_rollout_bundles, PHASE_TEACHER: deferred_opd_enabled}[phase](args)
     if not enabled:
         yield False
         return

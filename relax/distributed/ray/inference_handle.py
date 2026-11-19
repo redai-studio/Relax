@@ -60,6 +60,7 @@ class _PoolCall:
 def use_managed_rollout(args: Any) -> bool:
     """Select engine ownership for the complete task, including auxiliary
     roles."""
+    from relax.engine.inference.phase_plans import genrm_shares_rollout_bundles
     from relax.engine.sft.runtime import is_offline_mode
     from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
 
@@ -75,6 +76,7 @@ def use_managed_rollout(args: Any) -> bool:
         or (
             bool(getattr(args, "custom_reward_post_process_path", None))
             and not getattr(args, "defer_reward_to_post_process", False)
+            and not genrm_shares_rollout_bundles(args)
         )
         or bool(getattr(args, "custom_convert_samples_to_train_data_path", None))
         or bool(getattr(args, "debug_train_only", False))

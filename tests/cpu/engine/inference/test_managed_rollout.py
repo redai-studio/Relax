@@ -530,3 +530,18 @@ async def test_shutdown_closes_worker_with_dead_slots_or_abort_failure(monkeypat
     worker.close.remote.assert_awaited_once()
     kill.assert_called_once_with(worker)
     assert pool.backend.status == "disposed"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_manual_shared_genrm_hook_selects_managed_owners(shared):
+    from relax.distributed.ray.inference_handle import shared_task_enabled
+
+    args = SimpleNamespace(
+        colocate=True,
+        _genrm_instances_resolved={"judge": {}},
+        _genrm_colocate_with_rollout=shared,
+        defer_reward_to_post_process=False,
+        custom_reward_post_process_path="custom.manual_genrm",
+    )
+    assert use_managed_rollout(args) is shared
+    assert shared_task_enabled(args) is shared

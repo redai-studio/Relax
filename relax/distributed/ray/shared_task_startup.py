@@ -39,10 +39,6 @@ def start_shared_task(
     on the borrowed bundles. Returned owners remain sleeping until the phase
     coordinator activates generation. The caller owns all returned handles.
     """
-    from relax.engine.inference.phase_plans import require_deferred_shared_genrm
-
-    if args is not None:
-        require_deferred_shared_genrm(args)
     plan_task_placement(args, rollout_binding, [item.placement for item in static])
     if args is not None and getattr(args, "_shared_startup_pending_owners", None):
         raise RuntimeError("Shared startup has unconfirmed owners; retry cleanup before restarting")

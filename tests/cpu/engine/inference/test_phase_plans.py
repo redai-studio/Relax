@@ -38,13 +38,24 @@ def test_teacher_layout_adapts_existing_flags(rollout, phase, mode):
 
 
 @pytest.mark.parametrize(
-    "shared,deferred,phase", [(True, True, "genrm"), (False, True, "inference"), (True, False, "inference")]
+    "shared,deferred,phase", [(True, True, "genrm"), (False, True, "inference"), (True, False, "genrm")]
 )
-def test_genrm_phase_requires_deferred_shared_layout(shared, deferred, phase):
+def test_genrm_phase_is_independent_of_automatic_scoring(shared, deferred, phase):
     args = SimpleNamespace(
         _genrm_instances_resolved=[{"name": "judge"}],
         _genrm_colocate_with_rollout=shared,
         defer_reward_to_post_process=deferred,
+        genrm_model_path="judge",
+        genrm_num_gpus=4,
+        genrm_num_gpus_per_engine=4,
+        genrm_engine_config={},
+        genrm_sampling_config={},
+        num_gpus_per_node=4,
+        colocate=True,
+        hybrid=False,
     )
     assert placement_phase(args, "genrm") == phase
     assert deferred_genrm_enabled(args) is (shared and deferred)
+    spec = static_role_spec(Role.GENRM, args, {})
+    assert spec.deployment.phase == phase
+    assert spec.deployment.mode is (DeploymentMode.DEFER if shared else DeploymentMode.SPLIT)

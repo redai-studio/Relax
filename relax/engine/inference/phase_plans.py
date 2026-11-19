@@ -15,18 +15,17 @@ PHASE_GENRM = "genrm"
 PHASE_TEACHER = "teacher"
 
 
-def deferred_genrm_enabled(args: Any) -> bool:
-    """Whether GenRM scores in its own stage instead of inline with generation.
-
-    Only a GenRM that shares the rollout bundles has to take turns with
-    generation. Split and fully-async layouts keep it resident, so a deferred
-    post-process hook scores inline without a phase switch.
-    """
-    return (
-        bool(getattr(args, "_genrm_instances_resolved", None))
-        and bool(getattr(args, "defer_reward_to_post_process", False))
-        and bool(getattr(args, "_genrm_colocate_with_rollout", False))
+def genrm_shares_rollout_bundles(args: Any) -> bool:
+    """Shared placement requires a GenRM phase, independent of scoring
+    policy."""
+    return bool(getattr(args, "_genrm_instances_resolved", None)) and bool(
+        getattr(args, "_genrm_colocate_with_rollout", False)
     )
+
+
+def deferred_genrm_enabled(args: Any) -> bool:
+    """Whether the workload automatically stages shared GenRM scoring."""
+    return genrm_shares_rollout_bundles(args) and bool(getattr(args, "defer_reward_to_post_process", False))
 
 
 def deferred_opd_enabled(args: Any) -> bool:
@@ -43,19 +42,5 @@ def deferred_opd_enabled(args: Any) -> bool:
 
 def placement_phase(args: Any, phase_id: str) -> str:
     """The planner phase a role's engines occupy."""
-    deferred = {PHASE_GENRM: deferred_genrm_enabled, PHASE_TEACHER: deferred_opd_enabled}
+    deferred = {PHASE_GENRM: genrm_shares_rollout_bundles, PHASE_TEACHER: deferred_opd_enabled}
     return phase_id if deferred[phase_id](args) else PHASE_GENERATE
-
-
-def require_deferred_shared_genrm(args: Any) -> None:
-    """Require a GenRM on the rollout bundles to defer its scoring.
-
-    Such a GenRM only takes turns with generation; the planner rejects the
-    same-phase overlap once both roles are placed, and this check runs before
-    the first engine of the task starts.
-    """
-    if getattr(args, "_genrm_colocate_with_rollout", False) and not deferred_genrm_enabled(args):
-        raise ValueError(
-            "A GenRM on the rollout GPUs takes turns with generation and requires --defer-reward-to-post-process. "
-            "Add it, or split the GPUs (--rollout-num-gpus + GenRM GPUs == actor GPUs)."
-        )

@@ -246,12 +246,8 @@ def test_shared_teacher_and_genrm_validate_both_layouts(arguments_module, deferr
     args.genrm_num_gpus = 1
     args.genrm_num_gpus_per_engine = 1
     args.defer_reward_to_post_process = deferred
-    if not deferred:
-        with pytest.raises(ValueError, match="requires --defer-reward-to-post-process"):
-            arguments_module.relax_validate_args(args)
-        return
     arguments_module.relax_validate_args(args)
-    assert deferred_genrm_enabled(args)
+    assert deferred_genrm_enabled(args) is deferred
     assert deferred_opd_enabled(args)
     assert args.offload_train and args.offload_rollout
 

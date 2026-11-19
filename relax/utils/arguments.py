@@ -4086,8 +4086,6 @@ def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
 
 
 def _resolve_genrm_colocate_layout(args: Any, actor_total_gpus: int) -> None:
-    from relax.engine.inference.phase_plans import require_deferred_shared_genrm
-
     rollout_g = args.rollout_num_gpus
     genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
     if rollout_g + genrm_g == actor_total_gpus:
@@ -4095,12 +4093,11 @@ def _resolve_genrm_colocate_layout(args: Any, actor_total_gpus: int) -> None:
         logger.info(f"GenRM split bundles: rollout={rollout_g}, genrm={genrm_g}, actor={actor_total_gpus}")
     elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
         args._genrm_colocate_with_rollout = True
-        require_deferred_shared_genrm(args)
-        logger.info(f"GenRM deferred shared bundles: rollout=genrm={actor_total_gpus}")
+        logger.info(f"GenRM phase-shared bundles: rollout=genrm={actor_total_gpus}")
     else:
         raise ValueError(
             "GenRM colocate requires split bundles (rollout + genrm == actor), or deferred shared bundles "
-            "(rollout == genrm == actor with --defer-reward-to-post-process). "
+            "(rollout == genrm == actor with phase-controlled scoring). "
             f"Got rollout={rollout_g}, genrm={genrm_g}, actor={actor_total_gpus}."
         )
 

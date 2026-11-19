@@ -64,7 +64,8 @@ def test_startup_confirms_release_before_constructing_next_owner(monkeypatch, fa
         assert initial == "startup" and phases[initial] == ()
 
 
-def test_prepare_shared_task_injects_existing_genrm_owner(monkeypatch):
+@pytest.mark.parametrize("defer", [False, True])
+def test_prepare_shared_task_injects_existing_genrm_owner(monkeypatch, defer):
     from relax.engine.inference.types import Role
 
     owner = object()
@@ -88,7 +89,7 @@ def test_prepare_shared_task_injects_existing_genrm_owner(monkeypatch):
             }
         },
         _genrm_colocate_with_rollout=True,
-        defer_reward_to_post_process=True,
+        defer_reward_to_post_process=defer,
         num_gpus_per_node=4,
         colocate=True,
         use_opd=False,
@@ -99,6 +100,7 @@ def test_prepare_shared_task_injects_existing_genrm_owner(monkeypatch):
     assert args._genrm_managers == {"__default__": owner}
     assert args._inference_phase_coordinator is coordinator
     assert observed[0].placement.spec.role is Role.GENRM
+    assert observed[0].placement.spec.deployment.phase == "genrm"
     assert observed[0].placement.bundle_offset == 0
 
 

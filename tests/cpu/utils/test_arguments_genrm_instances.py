@@ -176,18 +176,14 @@ def test_genrm_resource_must_match_instance_gpu_sum(_arguments_module):
 
 
 @pytest.mark.parametrize("defer", [False, True])
-def test_full_gpu_genrm_requires_deferred_scoring(_arguments_module, defer):
+def test_full_gpu_genrm_accepts_manual_or_deferred_scoring(_arguments_module, defer):
     args = SimpleNamespace(
         rollout_num_gpus=8,
         _genrm_instances_resolved={"judge": {"num_gpus": 8}},
         defer_reward_to_post_process=defer,
     )
-    if defer:
-        _arguments_module._resolve_genrm_colocate_layout(args, 8)
-        assert args._genrm_colocate_with_rollout
-    else:
-        with pytest.raises(ValueError, match="--defer-reward-to-post-process"):
-            _arguments_module._resolve_genrm_colocate_layout(args, 8)
+    _arguments_module._resolve_genrm_colocate_layout(args, 8)
+    assert args._genrm_colocate_with_rollout
 
 
 def test_split_genrm_preserves_concurrent_layout(_arguments_module):
