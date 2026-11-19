@@ -254,12 +254,10 @@ def test_independent_engines_reuse_group_and_destroy_only_matching_generation(mo
     monkeypatch.setattr(sync, "connect_rollout_engines_from_distributed", connect)
     monkeypatch.setattr(sync, "disconnect_rollout_engines_from_distributed", disconnect)
     monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
-    monkeypatch.setattr(sync.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(sync.dist, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(sync.dist, "new_group", Mock(return_value="ipc"))
     monkeypatch.setattr(sync.dist, "all_reduce", Mock())
-    monkeypatch.setattr(sync.mpu, "get_data_parallel_rank", lambda **kwargs: 0)
-    monkeypatch.setattr(sync.mpu, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(sync.mpu, "get_pipeline_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(sync.mpu, "get_data_parallel_rank", Mock(side_effect=RuntimeError("DP group is offloaded")))
 
     for _ in range(2):
         updater.connect_rollout_engines(
