@@ -27,8 +27,7 @@ class MiMoV2Bridge(MegatronModelBridge):
         hf = hf_pretrained.config
         if getattr(hf, "attention_projection_layout", "split") != "split" or getattr(hf, "quantization_config", None):
             raise ValueError(
-                "MiMo-V2 bridge reads BF16 split q/k/v checkpoints; convert the official checkpoint "
-                "with the Miles tools/convert_mimo_v2_to_bf16.py script first"
+                "MiMo-V2 requires a BF16 text checkpoint with separate q_proj, k_proj and v_proj weights."
             )
         for swa_key, full_key in (
             ("swa_num_attention_heads", "num_attention_heads"),
