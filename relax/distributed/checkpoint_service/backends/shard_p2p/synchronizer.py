@@ -4,12 +4,14 @@ completion."""
 
 import json
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from uuid import uuid4
 
 import torch
 import torch.distributed as dist
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 from .common import worker_identity
@@ -49,10 +51,12 @@ class ShardP2PSynchronizer:
         control_loader: str,
         update_loader: str,
         validate_devices,
+        agent_future: Future | None = None,
     ) -> None:
         self.source, self.group, self.engines = source, process_group, engines
         self.serialize, self.control_loader, self.update_loader = serialize, control_loader, update_loader
         self.validate_devices = validate_devices
+        self._agent_future = agent_future
         self.rank = dist.get_rank(self.group)
         self.needs_seed, self.failed = True, False
         self.completed_version = None
@@ -143,6 +147,8 @@ class ShardP2PSynchronizer:
         return output
 
     def _dispatch(self, commands, *, engines=None) -> tuple[list, str | None]:
+        from relax.backends.sglang.weight_loader import COLOCATE_NIXL_LOADER
+
         refs, error = [], None
         if self.rank == 0:
             try:
@@ -154,9 +160,13 @@ class ShardP2PSynchronizer:
                     refs.append(
                         engine.update_weights_from_tensor.remote(
                             serialized_named_tensors=serialized,
-                            load_format=self.control_loader
-                            if pair[0]["op"] in ("describe_tp", "prepare", "seed")
-                            else self.update_loader,
+                            load_format=(
+                                COLOCATE_NIXL_LOADER
+                                if pair[0]["op"] == "bind_epoch" or "epoch_generation" in pair[0]
+                                else self.control_loader
+                                if pair[0]["op"] in ("describe_tp", "prepare", "seed")
+                                else self.update_loader
+                            ),
                             flush_cache=False,
                         )
                     )
@@ -240,6 +250,9 @@ class ShardP2PSynchronizer:
 
     def prepare(self, weights: Mapping[str, torch.Tensor], *, version: int, audit_native: bool) -> None:
         """Build the first direct plan inside an active weight update."""
+        # All adapters share this numerical-audit gate; layout and lifetime
+        # validation remain unconditional.
+        audit_native = bool(audit_native and Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK)
         self._audit_expert_replicas(weights)
         self.source.reset()
         if getattr(self.source, "has_ordinary", False):
@@ -258,6 +271,9 @@ class ShardP2PSynchronizer:
                 logger.info("ShardP2P source recipe=canonical; raw mapping unsupported on an owner")
 
         def endpoint():
+            self._source_schema = {
+                name: (tuple(value.shape), tuple(value.stride()), str(value.dtype)) for name, value in sources.items()
+            }
             if not sources:
                 self._source_device = None
                 return None
@@ -345,6 +361,7 @@ class ShardP2PSynchronizer:
                         batched=True,
                         cache_plan=True,
                         audit_native=audit_native,
+                        consistency_check=bool(Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK),
                     )
                     for tp_rank in range(self.tp_size)
                 ]
@@ -386,9 +403,15 @@ class ShardP2PSynchronizer:
         responses = self._fanout(probes)
 
         def read():
+            from .remote.plan import ReceiptValidator
+
             if self.rank != 0:
                 return None
             bindings, needed = [], [[] for _ in range(self.geometry["source_world_size"])]
+            remote_by_owner = [{} for _ in needed]
+            remote_plans = {}
+            remote_layouts = {}
+            self._remote_validators = {}
             for pair, response in zip(commands, responses, strict=True):
                 if not isinstance(response, Mapping) or response.get("success") is not True:
                     raise ValueError("Missing successful expert prepare response")
@@ -410,9 +433,22 @@ class ShardP2PSynchronizer:
                         raise ValueError("Expert receiver feedback differs from the actual source delivery")
                     command["delivery"] = binding
                     bindings.append(binding)
-                    if binding["delivery"]["routes"]["nixl"]:
-                        raise ValueError("Local expert IPC cannot import remote source allocations")
                     local = set(binding["delivery"]["routes"]["cuda_ipc"])
+                    remote = set(binding["delivery"]["routes"]["nixl"])
+                    remote_writes = [write for write in command["writes"] if write["id"] in remote]
+                    target = f"{command['engine']}-{tp_rank}"
+                    remote_plans[target] = dict(writes=remote_writes)
+                    self._remote_validators[target] = ReceiptValidator(remote_plans[target])
+                    shapes = self.source.target_layouts(command["geometry"])
+                    remote_layouts[target] = {
+                        name: shapes[name] for name in {write["param"] for write in remote_writes}
+                    }
+                    remote_hash = self._remote_validators[target].plan_hash
+                    for write in remote_writes:
+                        owner = remote_by_owner[write["source_rank"]].setdefault(
+                            target, dict(writes=[], plan_hash=remote_hash)
+                        )
+                        owner["writes"].append(write)
                     by_source = [set() for _ in needed]
                     for write in command["writes"]:
                         if write["id"] in local:
@@ -428,11 +464,141 @@ class ShardP2PSynchronizer:
                 ],
             )
             self._receiver_plan_hashes = tuple(binding["plan_hash"] for binding in bindings)
-            return needed
+            self._remote_expected_by_owner = tuple(frozenset(owner) for owner in remote_by_owner)
+            return needed, remote_by_owner, remote_plans, remote_layouts
 
-        needed = [self._phase(read)]
+        details = self._phase(read)
+        needed = [details[0] if self.rank == 0 else None]
         dist.broadcast_object_list(needed, src=0, group=self.group)
         self._needed_keys_by_slot = tuple(needed[0][self.rank])
+        slots = [None]
+        dist.scatter_object_list(
+            slots,
+            details[1] if self.rank == 0 else None,
+            src=0,
+            group=self.group,
+        )
+        self._remote_local_plans = slots[0]
+        self._remote_plans = details[2] if self.rank == 0 else None
+        self._remote_layouts = details[3] if self.rank == 0 else None
+        remote_active = [any(plan["writes"] for plan in details[2].values()) if self.rank == 0 else None]
+        dist.broadcast_object_list(remote_active, src=0, group=self.group)
+        self._has_remote = remote_active[0]
+
+    def _send_remote(self, sources: Mapping[str, torch.Tensor], version: int) -> tuple[dict, dict | None]:
+        """Bind fresh receiver addresses, then collect actual owner DONE
+        receipts."""
+        from .remote.rpc_receipts import index_receipts
+
+        def commands():
+            if self.rank != 0:
+                return None
+            return [
+                [
+                    dict(
+                        op="bind_epoch",
+                        session=self.session,
+                        engine=engine,
+                        tp_rank=tp,
+                        version=version,
+                        nonce=uuid4().hex,
+                        delivery_hash=self._receiver_plan_hashes[engine * self.tp_size + tp],
+                    )
+                    for tp in range(self.tp_size)
+                ]
+                for engine in range(self.engine_count)
+            ]
+
+        responses = self._fanout(self._phase(commands))
+
+        def read_manifests():
+            if self.rank != 0:
+                return None
+            manifests = {}
+            for engine, response in enumerate(responses):
+                if not isinstance(response, Mapping) or response.get("success") is not True:
+                    raise RuntimeError("Missing colocate NIXL epoch response")
+                replies = json.loads(response["message"])["shard_p2p_epochs"]
+                if len(replies) != self.tp_size:
+                    raise RuntimeError("Incomplete colocate NIXL TP epoch response")
+                for tp, manifest in enumerate(replies):
+                    key = f"{engine}-{tp}"
+                    expected = {write["param"] for write in self._remote_plans[key]["writes"]}
+                    if (
+                        manifest["tp_rank"] != tp
+                        or manifest["version"] != version
+                        or not isinstance(manifest.get("generation"), str)
+                        or not manifest["generation"]
+                        or type(manifest.get("gpu_id")) is not int
+                        or manifest["gpu_id"] < 0
+                        or manifest.get("target_memory_type", "VRAM") not in ("VRAM", "DRAM")
+                        or (
+                            manifest.get("target_memory_type") == "DRAM"
+                            and (
+                                type(manifest.get("persistent_registration_key")) is not str
+                                or len(manifest["persistent_registration_key"]) != 32
+                            )
+                        )
+                        or (
+                            manifest.get("target_memory_type", "VRAM") == "VRAM"
+                            and manifest.get("persistent_registration_key") is not None
+                        )
+                        or type(manifest.get("target_device_id", manifest["gpu_id"])) is not int
+                        or (
+                            manifest.get("target_device_id", manifest["gpu_id"])
+                            != (0 if manifest.get("target_memory_type") == "DRAM" else manifest["gpu_id"])
+                        )
+                        or set(manifest["params"]) != expected
+                        or bool(manifest["agent_metadata"]) != bool(expected)
+                        or any(
+                            manifest["params"][name].get("nbytes") != self._remote_layouts[key][name]["nbytes"]
+                            or manifest["params"][name].get("dtype") != str(torch.bfloat16)
+                            or type(manifest["params"][name].get("address")) is not int
+                            or manifest["params"][name]["address"] <= 0
+                            for name in expected
+                        )
+                    ):
+                        raise RuntimeError("Colocate NIXL epoch differs from the negotiated plan")
+                    manifests[key] = manifest
+            return manifests
+
+        manifests = [self._phase(read_manifests)]
+        dist.broadcast_object_list(manifests, src=0, group=self.group)
+
+        def send():
+            from .colocate_remote import send_remote_shards
+
+            receipts, self._writer = send_remote_shards(
+                sources,
+                self._remote_local_plans,
+                manifests[0],
+                rank=self.rank,
+                version=version,
+                writer=getattr(self, "_writer", None),
+                agent_future=self._agent_future,
+            )
+            return receipts
+
+        receipts = self._gather(self._phase(send))
+
+        def route():
+            if self.rank != 0:
+                return None
+            routed = {key: [] for key in self._remote_plans}
+            for rank, owner in enumerate(receipts):
+                expected = self._remote_expected_by_owner[rank]
+                if set(owner) != expected:
+                    raise RuntimeError("Colocate NIXL owner omitted or misrouted a receipt")
+                for key, receipt in owner.items():
+                    routed[key].append(receipt)
+            for key in self._remote_plans:
+                self._remote_validators[key].validate(
+                    index_receipts(routed[key]), manifests[0][key]["generation"], version
+                )
+            return routed
+
+        receipts = self._phase(route)
+        return manifests[0], receipts
 
     def update(self, weights: Mapping[str, torch.Tensor], *, version: int) -> None:
         if getattr(self, "disabled", False):
@@ -463,6 +629,15 @@ class ShardP2PSynchronizer:
         def bind():
             preflight()
             sources, plans = self.source.local_plan(weights, sources_only=True)
+            if (
+                self._has_remote
+                and {
+                    name: (tuple(value.shape), tuple(value.stride()), str(value.dtype))
+                    for name, value in sources.items()
+                }
+                != self._source_schema
+            ):
+                raise ValueError("Remote shard source schema changed; native reseeding is required")
             if {value.device for value in sources.values()} != (
                 set() if self._source_device is None else {self._source_device}
             ):
@@ -482,6 +657,9 @@ class ShardP2PSynchronizer:
 
         exports = self._phase(bind)
         gathered = self._gather(exports)
+        remote_manifests, remote_receipts = (
+            self._send_remote(self._pending.sources, version) if self._has_remote else (None, None)
+        )
 
         def prepare():
             if self.rank != 0:
@@ -502,6 +680,14 @@ class ShardP2PSynchronizer:
                             for rank, owner in enumerate(gathered)
                             for key, payload in owner[engine * self.tp_size + tp_rank].items()
                         ],
+                        **(
+                            dict(
+                                epoch_generation=remote_manifests[f"{engine}-{tp_rank}"]["generation"],
+                                source_receipts=remote_receipts[f"{engine}-{tp_rank}"],
+                            )
+                            if self._has_remote
+                            else {}
+                        ),
                     )
                     for tp_rank in range(self.tp_size)
                 ]
