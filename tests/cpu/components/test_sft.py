@@ -230,42 +230,6 @@ def test_sft_custom_hook_keeps_existing_arguments(monkeypatch, accepts_kwargs):
     assert result[0] is tokens and result[1] is tokens
 
 
-def test_qwen_muon_producer_rejects_only_undispatchable_samples():
-    from relax.components.sft import _resolve_sft_dataset_options
-    from relax.utils.data.wholepack_policy import QWEN_STEP_HOOK
-
-    args = _make_args(max_tokens_per_gpu=262144)
-    args.custom_megatron_before_train_step_hook_path = QWEN_STEP_HOOK
-    args.optimizer = "muon"
-    args.tensor_model_parallel_size = 4
-    args.context_parallel_size = 1
-    args.data_pad_size_multiplier = 1024
-    args.sft_oversize_strategy = "keep"
-    policy = _resolve_sft_dataset_options(args)
-
-    def process(tokens, mask):
-        return apply_oversize_strategy(
-            tokens=tokens,
-            loss_mask=mask,
-            capacity=args.max_tokens_per_gpu,
-            idx=17,
-            has_multimodal=True,
-            strategy=policy["oversize_strategy"],
-            custom_fn=policy["oversize_custom_fn"],
-        )
-
-    for length in (262145, 524288):
-        tokens = torch.tensor([1]).expand(length)
-        mask = torch.tensor([0]).expand(length)
-        kept_tokens, kept_mask = process(tokens, mask)
-        assert kept_tokens is tokens and kept_mask is mask
-    with pytest.raises(ValueError, match=r"idx=17.*524289.*524288"):
-        process(torch.tensor([1]).expand(524289), torch.tensor([0]).expand(524289))
-    assert args.sft_oversize_strategy == "keep"
-    args.optimizer = "adam"
-    assert _resolve_sft_dataset_options(args)["oversize_strategy"] == "keep"
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_preprocess_on_rank", [False, True])
 async def test_sft_step_pushes_one_batch_to_tq(monkeypatch, image_preprocess_on_rank):

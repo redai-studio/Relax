@@ -7,7 +7,7 @@ from typing import Any
 from relax.utils.data import wholepack_policy
 
 
-ENTRY = wholepack_policy.QWEN_STEP_HOOK
+ENTRY = "relax.models.qwen3_5.recipe.before_step"
 
 
 def enabled(args: Any) -> bool:
