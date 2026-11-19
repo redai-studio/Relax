@@ -1788,10 +1788,16 @@ class SGLangEngine(RayActor):
                 parsed = None
                 for line in reversed(combined_output.splitlines()):
                     try:
-                        parsed = json.loads(line)
-                        break
+                        record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if (
+                        isinstance(record, dict)
+                        and record.get("run_token") == f"{run_token}-{local_rank}"
+                        and isinstance(record.get("success"), bool)
+                    ):
+                        parsed = record
+                        break
                 # Category is derived from structured signals only: the manager
                 # deadline, the subprocess exit code, and its JSON — never by
                 # scanning the NCCL log text.

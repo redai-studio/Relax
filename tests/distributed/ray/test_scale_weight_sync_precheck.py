@@ -394,8 +394,9 @@ class _CompletedProcess:
         type(self)._next_pid += 1
         self.returncode = 0
         rank = int(self.command[self.command.index("--rank") + 1])
+        token = self.command[self.command.index("--run-token") + 1]
         kwargs["stdout"].write("NCCL INFO NET/Socket : Using eth0\n")
-        kwargs["stdout"].write(json.dumps({"success": True, "rank": rank}) + "\n")
+        kwargs["stdout"].write(json.dumps({"success": True, "rank": rank, "run_token": token}) + "\n")
         kwargs["stdout"].flush()
 
     def poll(self):
@@ -426,6 +427,8 @@ def test_actor_probe_explicitly_limits_child_visible_devices(world_size):
 
     def _popen(command, **kwargs):
         process = _CompletedProcess(command, **kwargs)
+        kwargs["stdout"].write('{"success": false, "run_token": "unrelated"}\n1\n')
+        kwargs["stdout"].flush()
         created.append(process)
         return process
 
