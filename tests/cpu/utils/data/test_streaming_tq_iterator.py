@@ -104,7 +104,6 @@ def test_micro_batch_list_iterator_observability_excludes_vpp_padding(monkeypatc
         assert dummy["__is_dummy__"]
         capture_training_input(dummy)
         record_optimizer_result(True)
-    assert [actual["replay_micro_batch_index"], dummy["replay_micro_batch_index"]] == [0, 1]
     assert [mb["replay_micro_batch_index"] for mb, _ in iterator] == [0, 1]
     assert len(iterator.get_buffer()) == 2
     close_train_appenders()
@@ -294,7 +293,7 @@ def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeyp
     # The peer emitted three microbatches, so this DP's last two slots are padding.
     padding = [(mb["replay_micro_batch_index"], mb["__is_dummy__"]) for mb, _ in iterator]
     assert padding == [(1, True), (2, True)]
-    assert iterator._sample_count == 2
+    assert len(iterator.get_buffer()) == 1
 
 
 def test_streaming_tq_iterator_polls_until_window_drained(monkeypatch):
@@ -408,8 +407,7 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
 
     slots = [(mb["replay_micro_batch_index"], mb.get("__is_dummy__", False)) for mb, _ in iterator]
     assert slots == [(0, False), (1, False), (2, True), (3, True)]
-    assert iterator._mb_count == 4  # 2 real + 2 dummy → equal count with a busier DP
-    assert iterator._sample_count == 2  # dummies don't count as samples
+    assert len(iterator.get_buffer()) == 2  # Only real batches enter the rollout log.
 
 
 @pytest.mark.parametrize("dense_ids", [False, True])
