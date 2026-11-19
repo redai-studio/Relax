@@ -186,3 +186,13 @@ class TestComputeScore:
         result = math_dapo_utils.compute_score(response, "9")
 
         assert result == {"score": 1.0, "acc": True, "pred": "9"}
+
+
+@pytest.mark.parametrize("end_token", ["<|endofassistant|>", "<|im_end|>", "<|endoftext|>"])
+@pytest.mark.parametrize("answer,score", [("768", 1.0), ("767", -1.0)])
+def test_compute_score_ignores_assistant_end_token(end_token, answer, score):
+    response = f"Reasoning... Answer: {answer}{end_token}"
+
+    result = math_dapo_utils.compute_score(response, "768")
+
+    assert result == {"score": score, "acc": score == 1.0, "pred": answer}

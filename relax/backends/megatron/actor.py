@@ -600,7 +600,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             else:
                 update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-                # Push-side repack is decided by the HF config: an FP8 release auto-routes
+                # Push-side repack uses the effective rollout config: FP8 auto-routes
                 # through quantize_params_fp8, a compressed-tensors release through
                 # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
                 # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
@@ -610,12 +610,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 # mm_projector — without augment_compressed_tensors_ignore the bridge
                 # would try to INT4-pack those BF16 tensors and SGLang would reject
                 # them with "weight_packed not found in params_dict".
-                from relax.utils.quant_cast import augment_compressed_tensors_ignore
-
-                push_quant_config = augment_compressed_tensors_ignore(
-                    getattr(self.hf_config, "quantization_config", None),
-                    args.hf_checkpoint,
-                )
+                push_quant_config = self._resolve_push_quantization_config()
                 self.weight_updater = update_weight_cls(
                     self.args,
                     self.model,
@@ -996,6 +991,40 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.non_persistent_ckpt_type = old_non_persistent_ckpt_type
             self._switch_model("actor")
 
+    def _resolve_push_quantization_config(self) -> dict | None:
+        """Resolve one sender format for all engines receiving this
+        publication."""
+        from relax.utils.quant_cast import resolve_receiver_quantization_config
+
+        args = self.args
+        default_path = getattr(args, "sglang_hf_checkpoint", None) or args.hf_checkpoint
+        global_overrides = getattr(args, "sglang_json_model_override_args", None)
+        global_quantization = getattr(args, "sglang_quantization", None)
+        recipients = [("default", default_path, global_overrides, global_quantization)]
+        if getattr(args, "sglang_config", None) is not None:
+            from relax.distributed.ray.rollout import _resolve_sglang_config
+
+            config = _resolve_sglang_config(args)
+            # Tensor updates target the first model. DCS registers every YAML
+            # model's engines under the shared rollout role.
+            models = config.models if args.fully_async or args.hybrid else config.models[:1]
+            recipients = []
+            for model in models:
+                model.resolve(args)
+                for index, group in enumerate(model.engine_groups):
+                    if group.worker_type == "placeholder":
+                        continue
+                    recipients.append(
+                        (
+                            f"{model.name}/{index}:{group.worker_type}",
+                            group.overrides["model_path"],
+                            group.overrides.get("json_model_override_args", global_overrides),
+                            group.overrides.get("quantization", global_quantization),
+                        )
+                    )
+
+        return resolve_receiver_quantization_config(args, self.hf_config, recipients)
+
     def _create_checkpoint_engine_client(self, role, weights_getter=None):
         is_pp_src_rank = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
@@ -1019,12 +1048,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "master_address": master_address,
             "master_port": master_port,
         }
-        from relax.utils.quant_cast import augment_compressed_tensors_ignore
-
-        push_quant_config = augment_compressed_tensors_ignore(
-            getattr(self.hf_config, "quantization_config", None),
-            self.args.hf_checkpoint,
-        )
+        push_quant_config = self._resolve_push_quantization_config()
         return run(
             create_client(
                 args=self.args,
