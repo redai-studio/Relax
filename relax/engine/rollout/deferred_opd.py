@@ -15,13 +15,13 @@ staged samples. The resident Agentic pipeline stages its own transfer batches
 into the same session and flushes them when its step closes.
 """
 
-import asyncio
 import copy
 import math
 from typing import Any
 from uuid import uuid4
 
 from relax.engine.rollout.deferred import DeferredExecutor, DeferredState, PublicationReceipt, seal_batch
+from relax.utils.async_utils import run_sync_to_completion
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
 
@@ -269,16 +269,7 @@ class DeferredOpdSession:
             scoring_args._managed_genrm_scoring_phase = True
             hook = load_function(path)
             async with async_scoring_phase(self.args, PHASE_GENRM):
-                scoring = asyncio.create_task(asyncio.to_thread(hook, scoring_args, samples))
-                cancelled = False
-                while not scoring.done():
-                    try:
-                        await asyncio.shield(scoring)
-                    except asyncio.CancelledError:
-                        cancelled = True
-                rewards = scoring.result()
-                if cancelled:
-                    raise asyncio.CancelledError
+                rewards = await run_sync_to_completion(hook, scoring_args, samples)
             if len(rewards) != len(samples):
                 raise ValueError("Deferred GenRM reward count differs from sealed batch")
             for sample, reward in zip(samples, rewards, strict=True):

@@ -615,24 +615,56 @@ def test_shared_teacher_rejects_legacy_rollout_before_placement(monkeypatch, dis
         assert shared_task_enabled(args)
 
 
-@pytest.mark.parametrize("scorer", ["teacher", "genrm"])
-def test_shared_scoring_training_requires_rollout_offload(scorer):
+@pytest.mark.parametrize(
+    "scorer,split,distributed_post",
+    [
+        ("teacher", False, False),
+        ("teacher", True, False),
+        ("teacher", True, True),
+        ("genrm", False, False),
+        ("genrm", False, True),
+        ("genrm", True, False),
+        ("genrm", True, True),
+    ],
+)
+def test_scoring_on_training_bundles_requires_rollout_offload(scorer, split, distributed_post):
     from relax.distributed.ray.inference_handle import shared_task_enabled
 
     args = SimpleNamespace(
         colocate=True,
         offload_rollout=False,
+        use_distributed_post=distributed_post,
         use_opd=scorer == "teacher",
         opd_type="sglang",
         teacher_hf_checkpoint="teacher",
-        resource={"actor": [1, 2], "rollout": [1, 2], "teacher": [1, 2]},
+        resource={"actor": [1, 2], "rollout": [1, 1 if split else 2], "teacher": [1, 1]},
         _genrm_instances_resolved={"judge": {}} if scorer == "genrm" else {},
-        _genrm_colocate_with_rollout=scorer == "genrm",
+        _genrm_colocate_with_rollout=scorer == "genrm" and not split,
     )
     with pytest.raises(ValueError, match="requires --offload-rollout"):
         shared_task_enabled(args)
+    uses_managed_owners = not distributed_post
     args.debug_rollout_only = True
-    assert shared_task_enabled(args)
+    assert shared_task_enabled(args) is uses_managed_owners
     args.debug_rollout_only = False
     args.offload_rollout = True
-    assert shared_task_enabled(args)
+    assert shared_task_enabled(args) is uses_managed_owners
+    args.colocate = False
+    args.offload_rollout = False
+    assert not shared_task_enabled(args)
+    assert use_managed_rollout(args) is uses_managed_owners
+
+
+def test_training_only_replay_skips_startup_with_shared_teacher():
+    from relax.distributed.ray.inference_handle import shared_task_enabled
+
+    args = SimpleNamespace(
+        colocate=True,
+        debug_train_only=True,
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="teacher",
+        resource={"actor": [1, 2], "rollout": [1, 2], "teacher": [1, 1]},
+        offload_rollout=False,
+    )
+    assert not shared_task_enabled(args)

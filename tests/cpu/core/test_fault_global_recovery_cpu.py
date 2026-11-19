@@ -237,6 +237,89 @@ def test_actual_startup_mode_and_role_matrix(runtime, fully_async, hybrid, debug
     assert records(runtime)[-1]["observed_evidence"] == expected
 
 
+def test_shared_actor_only_rollout_waits_for_weight_reload_between_rounds(runtime, monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from relax.components.rollout import Rollout
+    from relax.distributed.coordination import PeerStepBarrier
+
+    controller = startup_controller(runtime, (Roles.actor, Roles.rollout), [], fully_async=False)
+    controller.config._inference_phase_coordinator = object()
+    namespace = type(controller).training_loop.__globals__
+    monkeypatch.setitem(namespace, "PeerStepBarrier", PeerStepBarrier)
+    services = controller.serve_dict
+    actor_step = 0
+    actor_polled = asyncio.Event()
+
+    async def get_actor_step():
+        actor_polled.set()
+        return actor_step
+
+    services[Roles.actor].handle = SimpleNamespace(get_step=SimpleNamespace(remote=get_actor_step))
+    services[Roles.rollout].set_barriers = AsyncMock()
+    controller.training_loop()
+    services[Roles.rollout].set_barriers.assert_awaited_once()
+    barrier = services[Roles.rollout].set_barriers.await_args.kwargs["peers"]
+
+    async def run_two_rounds():
+        nonlocal actor_step
+        partitions = []
+        events = []
+        policy_resident = False
+
+        async def generate(rollout_id):
+            nonlocal policy_resident
+            if rollout_id == 1:
+                assert policy_resident
+            policy_resident = True
+            events.append(("generate", rollout_id))
+            partitions.append(f"train_{rollout_id}")
+
+        async def offload():
+            nonlocal policy_resident
+            policy_resident = False
+            events.append(("offload", len(partitions) - 1))
+
+        rollout = SimpleNamespace(
+            config=Namespace(eval_interval=None, num_rollout=2, offload_rollout=True, max_staleness=1),
+            eval_handler=None,
+            step=0,
+            status="running",
+            _stop_event=asyncio.Event(),
+            _peer_barrier=barrier,
+            _logger=Mock(),
+            healthy=Mock(),
+            rollout_manager=SimpleNamespace(
+                generate=SimpleNamespace(remote=generate), offload=SimpleNamespace(remote=offload)
+            ),
+            data_system_client=SimpleNamespace(async_get_partition_list=AsyncMock(side_effect=lambda: partitions)),
+            _maybe_save_data=AsyncMock(),
+        )
+        task = asyncio.create_task(Rollout.func_or_class._async_run(rollout))
+        try:
+            await asyncio.wait_for(actor_polled.wait(), 2)
+            assert partitions == ["train_0"]
+            assert not policy_resident
+            policy_resident = True  # Megatron restores weights and KV before advancing its step.
+            events.append(("restore_weights_and_kv", 0))
+            actor_step = 1
+            await asyncio.wait_for(task, 5)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        assert not policy_resident
+        assert events == [
+            ("generate", 0),
+            ("offload", 0),
+            ("restore_weights_and_kv", 0),
+            ("generate", 1),
+            ("offload", 1),
+        ]
+
+    asyncio.run(run_two_rounds())
+
+
 def test_failed_weight_response_waits_for_operation_receipt(runtime):
     controller = startup_controller(runtime, (Roles.actor,), [], failure="weight")
     recovery = prepare_handoff(controller, runtime)

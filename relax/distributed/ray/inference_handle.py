@@ -106,27 +106,27 @@ def use_managed_auxiliary(args: Any) -> bool:
 
 def shared_task_enabled(args: Any) -> bool:
     """Shared-GPU native rollout uses independent owners plus a coordinator."""
-    from relax.engine.inference.phase_plans import deferred_opd_enabled, genrm_shares_rollout_bundles
+    from relax.engine.inference.phase_plans import deferred_opd_enabled
+    from relax.engine.sft.runtime import is_offline_mode
     from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
 
-    shared_teacher = deferred_opd_enabled(args)
-    managed = (
+    if getattr(args, "debug_train_only", False) or is_offline_mode(args):
+        return False
+    colocated_auxiliary = (
         bool(getattr(args, "colocate", False))
         and not getattr(args, "hybrid", False)
         and (bool(getattr(args, "_genrm_instances_resolved", None)) or is_managed_opd_teacher_enabled(args))
-        and use_managed_rollout(args)
     )
-    if not managed and shared_teacher:
+    if not colocated_auxiliary:
+        return False
+
+    managed = use_managed_rollout(args)
+    if not managed and deferred_opd_enabled(args):
         raise ValueError(
             "An OPD Teacher sharing rollout GPUs requires managed rollout. "
             "Use split Teacher bundles or a managed rollout configuration. For deferred shared GenRM, "
             "use a scoring-only post-process hook with managed_genrm_scoring=True."
         )
-    if (
-        managed
-        and getattr(args, "offload_rollout", None) is False
-        and not getattr(args, "debug_rollout_only", False)
-        and (shared_teacher or genrm_shares_rollout_bundles(args))
-    ):
-        raise ValueError("Training with a Teacher or GenRM sharing rollout GPUs requires --offload-rollout.")
+    if getattr(args, "offload_rollout", None) is False and not getattr(args, "debug_rollout_only", False):
+        raise ValueError("Training with inference roles on training GPU bundles requires --offload-rollout.")
     return managed

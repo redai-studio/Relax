@@ -1429,32 +1429,23 @@ class Controller:
                     rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
                     await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
 
-                    # Colocate wiring topology:
-                    #   - actor.rollout_barrier: always, so wake_up doesn't
-                    #     collide with SGLang's static KV pool.
-                    #   - critic.rollout_barrier / actor.peer_barrier /
-                    #     rollout.peer_barrier: only when critic is co-hosted
-                    #     (PPO colocate). GRPO has no third GPU claimant.
-                    # In fully_async / hybrid nothing is wired and every
-                    # barrier-guarded site short-circuits.
+                    # Shared-phase rollout waits for Actor's weight update
+                    # before generating the next round. PPO also waits for Critic.
                     if _is_colocate(self.config):
                         rollout_barrier = RolloutOffloadBarrier(rollout_manager, logger=logger)
                         actor_set_kwargs: dict[str, Any] = {"rollout": rollout_barrier}
+                        rollout_peers = {}
                         if ROLES.critic in self.serve_dict:
                             critic_handle = self.serve_dict[ROLES.critic].handle
-                            actor_handle = self.serve_dict[ROLES.actor].handle
                             await self.serve_dict[ROLES.critic].set_barriers(rollout=rollout_barrier)
                             actor_set_kwargs["peers"] = PeerStepBarrier(
                                 {ROLES.critic.value: critic_handle}, logger=logger
                             )
+                            rollout_peers[ROLES.critic.value] = critic_handle
+                        if rollout_peers or getattr(self.config, "_inference_phase_coordinator", None) is not None:
+                            rollout_peers[ROLES.actor.value] = self.serve_dict[ROLES.actor].handle
                             await self.serve_dict[ROLES.rollout].set_barriers(
-                                peers=PeerStepBarrier(
-                                    {
-                                        ROLES.actor.value: actor_handle,
-                                        ROLES.critic.value: critic_handle,
-                                    },
-                                    logger=logger,
-                                ),
+                                peers=PeerStepBarrier(rollout_peers, logger=logger),
                             )
                         await self.serve_dict[ROLES.actor].set_barriers(**actor_set_kwargs)
 

@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -102,6 +104,55 @@ def test_managed_genrm_hook_uses_coordinator_lifecycle_without_legacy_swap(monke
     sample = Sample(response_length=1)
     assert hook.custom_reward_post_process(args, [sample]) == [0.75]
     assert sample.reward == 0.75
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_sync_scoring_keeps_phase_until_callback_finishes(fail):
+    from relax.engine.inference.phases import PhaseCoordinator
+    from relax.engine.rollout.scoring_phase import async_scoring_phase
+    from relax.utils.async_utils import run_sync_to_completion
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    events = []
+
+    async def call(owner, method):
+        events.append((owner, method))
+
+    coordinator = PhaseCoordinator({"inference": ("student",), "genrm": ("judge",)}, "inference", call)
+    args = SimpleNamespace(
+        _genrm_instances_resolved={"judge": {}},
+        _genrm_colocate_with_rollout=True,
+        _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=coordinator.switch)),
+    )
+
+    def hook():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5)
+        events.append("scored")
+        if fail:
+            raise ConnectionError("judge unavailable")
+
+    async def score():
+        async with async_scoring_phase(args, "genrm"):
+            await run_sync_to_completion(hook)
+
+    task = asyncio.create_task(score())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        for _ in range(2):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert events == [("student", "offload"), ("judge", "onload")]
+    finally:
+        release.set()
+    error = ConnectionError if fail else asyncio.CancelledError
+    with pytest.raises(error):
+        await asyncio.wait_for(task, 2)
+    assert events[-3:] == ["scored", ("judge", "offload"), ("student", "onload")]
 
 
 @pytest.mark.asyncio

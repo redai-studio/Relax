@@ -1,8 +1,28 @@
 import asyncio
 import threading
+from collections.abc import Callable
+from typing import TypeVar
 
 
 __all__ = ["get_async_loop", "run"]
+
+_T = TypeVar("_T")
+
+
+async def run_sync_to_completion(callback: Callable[..., _T], *args: object) -> _T:
+    """Run a synchronous callback in a thread and defer cancellation until it
+    finishes."""
+    task = asyncio.create_task(asyncio.to_thread(callback, *args))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 # Create a background event loop thread
