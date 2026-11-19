@@ -11,6 +11,48 @@ import pytest
 from relax.components.background_loop import BackgroundLoopRunner
 
 
+@pytest.mark.parametrize("fails", [False, True])
+async def test_actor_sync_initialization_keeps_event_loop_live_and_awaits_installation(fails, monkeypatch):
+    monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())
+    deployment = importlib.import_module("relax.components.actor").Actor.func_or_class
+    cls = next(cls for cls in deployment.__mro__ if "run" in cls.__dict__)
+    actor = object.__new__(cls)
+    actor.config = Namespace(
+        memory_weight_sync_config="sync.json", fully_async=False, hybrid=False, loss_type="policy_loss"
+    )
+    actor.actor_model = Mock()
+    entered, release = threading.Event(), threading.Event()
+    error = RuntimeError("installation failed")
+
+    def install():
+        entered.set()
+        assert release.wait(5)
+        if fails:
+            raise error
+
+    actor.actor_model.update_weights.side_effect = install
+    manager = object()
+    task = asyncio.create_task(actor.set_rollout_manager(manager))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        # Both this continuation and the scheduled callback need a live loop.
+        assert not task.done()
+        asyncio.get_running_loop().call_soon(release.set)
+        if fails:
+            with pytest.raises(RuntimeError) as caught:
+                await asyncio.wait_for(task, 2)
+            assert caught.value is error
+        else:
+            await asyncio.wait_for(task, 2)
+        assert actor.rollout_manager is manager
+        actor.actor_model.set_rollout_manager.assert_called_once_with(manager)
+        actor.actor_model.update_weights.assert_called_once()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        actor.__del__()
+
+
 @pytest.fixture(params=[("actor", "Actor"), ("actor_fwd", "ActorFwd"), ("critic", "Critic")])
 def component(request, monkeypatch):
     monkeypatch.setattr("relax.utils.tq.lifecycle.detach_tq_client", Mock())

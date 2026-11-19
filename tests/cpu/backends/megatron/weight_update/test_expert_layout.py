@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -206,6 +207,70 @@ def test_receiver_layout_agreement_includes_gate_up_order():
     assert cutlass != triton
     assert triton != DirectExpertLayout.from_receiver(receiver(ep_size=2))
     assert triton != DirectExpertLayout.from_receiver(receiver(moe_dp_size=2))
+
+
+@pytest.fixture
+def native_memory_engine(tmp_path, monkeypatch):
+    import requests
+
+    from relax.backends.sglang.sglang_engine import SGLangEngine
+    from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
+
+    model_path = tmp_path / "runtime-model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(dict(model_type="qwen2_moe", hidden_size=6, moe_intermediate_size=8, num_experts=4))
+    )
+    base = receiver(
+        model_path=str(model_path),
+        dp_size=1,
+        disable_cuda_graph=True,
+        # Permission to use piecewise graphs is not proof one is enabled.
+        disable_piecewise_cuda_graph=False,
+        quantization=None,
+        enable_lora=False,
+        speculative_algorithm=None,
+        custom_weight_loader=[SHARDED_MEMORY_LOADER],
+    )
+    runtime = base | {"memory_usage": {"graph": 0}}
+    response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: base | {"internal_states": [runtime]})
+    monkeypatch.setattr(requests, "get", lambda *_args, **_kwargs: response)
+    engine = object.__new__(SGLangEngine)
+    engine.node_rank, engine.worker_type, engine.rank = 0, "regular", 0
+    engine.server_host, engine.server_port = "localhost", 1234
+    engine.num_gpus_per_engine = 2
+    engine.args = SimpleNamespace(memory_weight_sync_config="enabled", rollout_num_gpus_per_engine=2)
+    requests_sent = []
+    engine._make_request = lambda *args, **kwargs: requests_sent.append((args, kwargs))
+    return engine, runtime, requests_sent
+
+
+def test_native_memory_capability_does_not_require_canonical_loader(native_memory_engine):
+    engine, _, requests_sent = native_memory_engine
+    layout = engine.get_expert_weight_sync_layout()
+    assert layout["memory_capability"]["workers"] == 2
+    assert layout["memory_capability"] == engine._native_memory_capability
+    assert not requests_sent
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"dp_size": 2}, "runtime PP/DP/EP/MoE-DP=1"),
+        ({"speculative_draft_model_path": "draft-model"}, "unsupported quantization, adapter, draft or routing"),
+        ({"disable_cuda_graph": False}, "runtime CUDA graphs disabled"),
+        ({"moe_runner_backend": "flashinfer_cutlass"}, "Native memory runtime capability changed"),
+    ],
+)
+def test_native_memory_rechecks_runtime_overrides_before_install(native_memory_engine, override, message):
+    engine, runtime, requests_sent = native_memory_engine
+    engine.get_expert_weight_sync_layout()
+    runtime.update(override)
+    # Use the real installation entry point: a changed scheduler capability
+    # must fail before sessions open or any custom-loader write is dispatched.
+    with pytest.raises(ValueError, match=message):
+        engine.install_sharded_memory_update([], timeout=5)
+    assert not requests_sent
 
 
 @pytest.mark.parametrize(

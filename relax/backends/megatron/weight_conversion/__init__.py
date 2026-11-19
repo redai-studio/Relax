@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from .deepseekv3 import convert_deepseekv3_to_hf
 from .glm4 import convert_glm4_to_hf
 from .glm4moe import convert_glm4moe_to_hf
@@ -35,7 +37,8 @@ _cached_tensors = {}
 
 # TODO optimize code details
 def _convert_to_hf_core(args, model_name, name, param):
-    if "glm4moelite" in model_name or "deepseekv3" in model_name:
+    # V2/V3 share the MLA parameter map; V2-Lite uses its direct q_proj branch.
+    if "glm4moelite" in model_name or "deepseekv2" in model_name or "deepseekv3" in model_name:
         converted_named_tensors = convert_deepseekv3_to_hf(args, name, param)
     elif "glm4moe" in model_name:
         converted_named_tensors = convert_glm4moe_to_hf(args, name, param)
