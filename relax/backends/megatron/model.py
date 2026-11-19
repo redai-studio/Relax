@@ -565,10 +565,6 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
-    if Envs.RELAX_QWEN_DEEPEP_GROUP_CAPACITY:
-        from relax.models.qwen3_5.deepep_capacity import install_group_capacity
-
-        install_group_capacity(args, model)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
