@@ -107,6 +107,8 @@ def main() -> None:
         assert md.version(name).split("+")[0] == version, (name, md.version(name))
     assert list((site / "_relax_deep_ep_v2").glob("_C*.so"))
     assert (site / "_relax_hybrid_ep/hybrid_ep_buffer.py").is_file()
+    flashqla_cumsum_sha256 = hashlib.sha256((site / "flash_qla/ops/utils/cumsum.py").read_bytes()).hexdigest()
+    assert flashqla_cumsum_sha256 == "c633788d4b1fc0f672d6bf4f72262b0144fef800c76c842b68ffd47d0d350df7"
     # Torch's metadata pins the older NCCL; accept only this documented base-image
     # override. A missing dependency or any other version conflict still fails.
     check = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True)
@@ -130,7 +132,7 @@ def main() -> None:
         "megatron/core/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py",
         "megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py",
     )
-    operator_patch = Path("/root/Megatron-LM/20261020-model-operators.patch")
+    operator_patch = Path("/root/Megatron-LM/megatron.patch")
     protected_sources = sorted(
         set(protected_sources)
         | {line[6:] for line in operator_patch.read_text().splitlines() if line.startswith("+++ b/")}
@@ -139,6 +141,7 @@ def main() -> None:
         "deepep_commit": os.environ["DEEP_EP_V2_COMMIT"],
         "fa4_commit": os.environ["FA4_COMMIT"],
         "flashqla_commit": os.environ["FLASHQLA_COMMIT"],
+        "flashqla_cumsum_sha256": flashqla_cumsum_sha256,
         "delivery_commit": "3fb0859060e51700cba8d30f8d00dac4b9989cbd",
         "flashqla_upstream_archive_source_verified": os.environ["FLASHQLA_COMMIT"]
         == "5538c35f0df33ef804eacd90c77d9d9087c1d4e4",
@@ -161,13 +164,13 @@ def main() -> None:
                 "deepep": "/tmp/qwen35-build/2.1.0-relax-namespace.patch",
                 "fa4": "/tmp/qwen35-build/56e48e3-fa4-isolated.patch",
                 "flashqla": "/tmp/qwen35-build/0.1.3-kkt-no-tma.patch",
-                "megatron": "/root/Megatron-LM/20261020-qwen35-optimized.patch",
-                "model_operators": "/root/Megatron-LM/20261020-model-operators.patch",
-                "checkpoint": "/root/Megatron-LM/20261028-dp-reshardable-checkpoint.patch",
+                "flashqla_cumsum": "/tmp/qwen35-build/0.1.3-cumsum-heads.patch",
             }.items()
         },
         "gpu_validated": False,
     }
+    megatron_sha256 = Path("/etc/relax-megatron-patch.sha256").read_text().split()[0]
+    report["patch_sha256"].update(megatron=megatron_sha256, megatron_base=megatron_sha256)
     Path("/etc/relax-qwen35-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
 
 

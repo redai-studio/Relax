@@ -149,12 +149,18 @@ def _selection(total):
     return SimpleNamespace(compress_ratio=4, selected_ids=torch.full((total, 512), -1, dtype=torch.int32))
 
 
-def test_mixed_pack_restores_order_and_gradients(adapter, monkeypatch):
+@pytest.mark.parametrize("geometry", [(12, 1), (24, 2)])
+def test_mixed_pack_restores_order_and_gradients(adapter, entry, monkeypatch, geometry):
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
+    monkeypatch.setenv("RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS", "0")
+    monkeypatch.setitem(sys.modules, f"{PREFIX}.cudnn", adapter)
     bounds = (0, 7, 2055, 4107, 4110)
     total = bounds[-1]
-    q = torch.zeros((1, total, 12, 256), dtype=torch.bfloat16, requires_grad=True)
-    k = torch.zeros((1, total, 1, 256), dtype=torch.bfloat16)
+    q_heads, kv_heads = geometry
+    q = torch.zeros((1, total, q_heads, 256), dtype=torch.bfloat16, requires_grad=True)
+    k = torch.zeros((1, total, kv_heads, 256), dtype=torch.bfloat16)
+    selection = _selection(total)
+    selection._relax_qsa_mixed_bounds = bounds
     calls = []
 
     def flash(query, key, value, lengths, scale):
@@ -162,12 +168,14 @@ def test_mixed_pack_restores_order_and_gradients(adapter, monkeypatch):
         return query + 10
 
     def nv(query, key, value, ids, scale):
+        assert query.shape[1:] == (q_heads, 256)
+        assert key.shape[1:] == value.shape[1:] == (kv_heads, 256)
         calls.append(("nv", query.shape[0]))
         return query + 20
 
     monkeypatch.setattr(adapter, "_flash", flash)
     monkeypatch.setattr(adapter._CudnnAttention, "apply", nv)
-    out = adapter.attention_for_selection(q, k, k, _selection(total), 0.0625, bounds)
+    out = entry.attention_for_selection(q, k, k, selection, 0.0625, True)
     expected = torch.full_like(q, 20)
     expected[:, :2055] = 10
     expected[:, 4107:] = 10
@@ -210,7 +218,7 @@ def test_multiple_packed_documents_preserve_all_qkv_gradients(adapter, monkeypat
     assert torch.equal(v.grad, upstream.sum(dim=2, keepdim=True) * (3 * factor))
 
 
-@pytest.mark.parametrize("geometry", [(24, 2), (6, 1), (3, 1)])
+@pytest.mark.parametrize("geometry", [(6, 1), (3, 1)])
 @pytest.mark.parametrize("length", [7, 2052])
 def test_cudnn_rejects_unsupported_geometry_before_dispatch(adapter, monkeypatch, geometry, length):
     q_heads, kv_heads = geometry
@@ -226,7 +234,7 @@ def test_cudnn_rejects_unsupported_geometry_before_dispatch(adapter, monkeypatch
     message = str(error.value)
     assert "backend=cudnn_pr1765" in message
     assert f"{q_heads}Q/{kv_heads}KV" in message
-    assert "supports only 12Q/1KV/D256" in message
+    assert "supports 12Q/1KV/D256 and 24Q/2KV/D256" in message
     assert "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped" in message
 
 
@@ -290,7 +298,7 @@ def test_entry_uses_selected_backend_geometry(adapter, entry, monkeypatch, backe
             (12, 1, 256, 128),
         )
     ]
-    + [("cudnn_pr1765", (q, kv, 256, 256)) for q, kv in [(24, 2), (6, 1), (3, 1)]],
+    + [("cudnn_pr1765", (q, kv, 256, 256)) for q, kv in [(6, 1), (3, 1)]],
 )
 def test_entry_rejects_geometry_before_execution(adapter, entry, monkeypatch, backend, geometry):
     monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", backend)
@@ -316,7 +324,7 @@ def test_entry_rejects_geometry_before_execution(adapter, entry, monkeypatch, ba
         with pytest.raises(NotImplementedError) as direct:
             adapter.attention_for_selection(q, k, k, _selection(7), 0.0625, (0, 7))
         assert str(direct.value) == message
-        assert "supports only 12Q/1KV/D256" in message
+        assert "supports 12Q/1KV/D256 and 24Q/2KV/D256" in message
         assert "RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped" in message
 
 

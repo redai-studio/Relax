@@ -485,6 +485,10 @@ def _estimate_fallback_flops(config, tokens_sum, batch_seqlens, delta_time):
     """Fallback for unknown model types using standard dense transformer
     formula."""
     text_config = config.text_config if hasattr(config, "text_config") else config
+    # Heterogeneous configs reject global attention dimensions. A dense
+    # estimate would also misrepresent their per-layer attention/MoE costs.
+    if getattr(text_config, "per_layer_config", None) is not None:
+        return float("nan")
     required = ("hidden_size", "vocab_size", "num_hidden_layers", "num_attention_heads", "intermediate_size")
     if not all(hasattr(text_config, attr) for attr in required):
         return 0
@@ -517,6 +521,7 @@ _ESTIMATE_FUNC = {
     "gemma4": estimate_gemma4_flops,
     "gemma4_text": estimate_gemma4_flops,
     "kimi_k3": estimate_kimi_k3_flops,
+    "kimi_k31": estimate_kimi_k3_flops,
     # Dense transformers (SwiGLU + GQA)
     "qwen2": _estimate_qwen2_flops,
     "qwen3": _estimate_qwen2_flops,
@@ -577,9 +582,9 @@ class FlopsCounter:
     def estimate(self, batch_seqlens, delta_time, **kwargs):
         """Return (estimated_tflops, peak_device_tflops).
 
-        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``. K3
-        honors independent frozen-region flags; other estimators retain their
-        existing 3x-forward training convention.
+        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``.
+        K3/K3.1 honors independent frozen-region flags; other estimators retain
+        their existing 3x-forward training convention.
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
@@ -593,7 +598,7 @@ class FlopsCounter:
             ):
                 if not self._warned_unsupported_trainability:
                     logger.warning(
-                        "K3 FLOPs/MFU omitted for LoRA or custom parameter masks: "
+                        "K3/K3.1 FLOPs/MFU omitted for LoRA or custom parameter masks: "
                         "HF config cannot determine adapter dimensions and actual trainability. "
                         "Token throughput and timing remain available."
                     )

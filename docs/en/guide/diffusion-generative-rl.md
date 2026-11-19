@@ -458,7 +458,7 @@ Bucket size drives the RPC count, and a sync's cost is almost entirely per-RPC o
 **Warnings** (logged, not fatal):
 
 - `fsdp_trainable_mode='lora'` without `--fsdp-master-dtype fp32`.
-- `async_save` (the DCP save is synchronous; this cannot be a hard error because `slime_validate_args` requires `--async-save` alongside `--rotate-ckpt`).
+- `async_save` (the DCP save is synchronous; this cannot be a hard error because `relax_validate_args` requires `--async-save` alongside `--rotate-ckpt`).
 - `lr_decay_style` set while `--fsdp-lr-scheduler` is `constant`.
 - `save_debug_train_data` (the generative actor emits numeric indices plus on-disk sidecars, not token sequences).
 
@@ -734,3 +734,6 @@ We thank the UniRL authors for the Qwen-Image / PickScore reference recipe and m
 
 - [Architecture](./architecture.md) — the controller / service / component model the generative path plugs into
 - [OOM Troubleshooting](./oom-troubleshooting.md) — general memory-pressure playbook
+
+
+[SenseNova image-edit ART RL](./diffusion-art.md) reuses the merged SFT model implementation.

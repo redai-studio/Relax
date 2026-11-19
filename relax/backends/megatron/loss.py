@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -15,7 +16,7 @@ from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import is_embedding_sft_mode, is_sft_mode
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.env import Envs
 from relax.utils.misc import load_function
@@ -58,7 +59,7 @@ from .cp_utils import (
 from .score_centering import (
     align_score_centering_candidate_ids,
     build_score_centering_context,
-    get_score_centering_chunk,
+    get_score_centering_batch,
 )
 
 
@@ -113,7 +114,7 @@ def get_responses(
 
     Args:
         logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
-            (value). Must be float32.
+            (value). Raw Score Centering logits may use model precision.
         args: Configuration containing `rollout_temperature` for scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
@@ -126,11 +127,12 @@ def get_responses(
     """
     qkv_format = args.qkv_format
 
-    # SFT chunked path (--sft-chunked-logits) feeds hidden_states (bf16) into
-    # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
-    # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
-    # produce real fp32 logits and must stay strict.
-    if is_sft_mode(args) and getattr(args, "sft_chunked_logits", False):
+    # Score Centering and chunked SFT upcast only their scoring workspace.
+    algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+    raw_score_centering = (
+        not apply_temperature and algorithm is not None and algorithm.policy_loss_fn == "score_centering"
+    )
+    if raw_score_centering or (is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)):
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -225,7 +227,17 @@ def get_responses(
             assert logits_0.size(0) == tokens_0.size(0), f"{logits_0.size(0)} vs {tokens_0.size(0)}"
             assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}"
 
-            logits_chunk = torch.cat([logits_0, logits_1], dim=0)
+            if raw_score_centering:
+                # When the response intersects both local chunks, it covers
+                # the end of the first and the beginning of the second.
+                if logits_0.size(0) and logits_1.size(0):
+                    start = end - 2 * chunk_size + logits_offset[0][0] - chunks_offset[0][0]
+                    stop = end - chunk_size + logits_offset[1][1] - chunks_offset[1][0]
+                    logits_chunk = logits[start:stop]
+                else:
+                    logits_chunk = logits_0 if logits_0.size(0) else logits_1
+            else:
+                logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
 
         seq_start += total_length
@@ -426,7 +438,7 @@ def get_log_probs_and_entropy(
     sc_cp_size = dynamic_cp_size
     if is_score_centering and sc_cp_size is None:
         sc_cp_size = mpu.get_context_parallel_world_size()
-    if is_score_centering:
+    if is_score_centering and not cp_output_is_zigzag:
         gather_topk_token_ids = align_score_centering_candidate_ids(
             gather_topk_token_ids,
             logits=logits,
@@ -477,39 +489,21 @@ def get_log_probs_and_entropy(
     entropy_list = []
     topk_token_ids_list = []
     topk_log_probs_list: list[torch.Tensor] = []
-    for sample_idx, (logits_chunk, tokens_chunk) in enumerate(
-        get_responses(
-            logits,
-            args=args,
-            unconcat_tokens=unconcat_tokens,
-            total_lengths=total_lengths,
-            response_lengths=response_lengths,
-            pre_shifted_labels=pre_shifted_labels,
-            max_seq_lens=max_seq_lens,
-            padded_total_lengths=padded_total_lengths,
-            cp_output_is_zigzag=cp_output_is_zigzag,
-            dynamic_cp_size=dynamic_cp_size,
-            dynamic_cp_rank=dynamic_cp_rank,
-        )
-    ):
-        if is_score_centering:
-            chunk = get_score_centering_chunk(
-                logits_chunk,
-                tokens_chunk,
-                tp_group,
-                args=args,
-                candidate_ids=gather_topk_token_ids[sample_idx] if gather_topk_token_ids is not None else None,
-                with_entropy=with_entropy,
-                with_topk=with_topk,
-                topk_k=resolved_topk_k,
-            )
-            log_probs_list.append(chunk["log_probs"])
-            entropy_list.append(chunk["entropy"])
-            if with_topk:
-                topk_token_ids_list.append(chunk["topk_token_ids"])
-            if gather_topk_token_ids is not None:
-                topk_log_probs_list.append(chunk["topk_log_probs"])
-            continue
+    responses = get_responses(
+        logits,
+        args=args,
+        unconcat_tokens=unconcat_tokens,
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        pre_shifted_labels=pre_shifted_labels,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+        cp_output_is_zigzag=cp_output_is_zigzag,
+        apply_temperature=not is_score_centering,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
+    )
+    for sample_idx, (logits_chunk, tokens_chunk) in enumerate(() if is_score_centering else responses):
         if lm_head_forward is not None:
             full_rows = logits_chunk.size(0)
             selected_rows = None
@@ -555,10 +549,9 @@ def get_log_probs_and_entropy(
             log_prob = (
                 torch.cat(chunk_lps, dim=0)
                 if chunk_lps
-                # fp32 to match calculate_log_probs_and_entropy's return dtype;
-                # logits are upcast above. A mismatch would break the downstream
-                # torch.cat over per-sample log-probabilities.
-                else logits_chunk.new_zeros((0,), dtype=torch.float32)
+                # Keep empty shards connected for CP collective backward, in fp32
+                # to match the non-empty log-probabilities.
+                else logits_chunk.float().sum(dim=-1)
             )
             if selected_rows is not None:
                 log_prob = log_prob.new_zeros(full_rows).index_copy(0, selected_rows, log_prob)
@@ -584,15 +577,27 @@ def get_log_probs_and_entropy(
         if gather_topk_token_ids is not None:
             topk_log_probs_list.append(compute_opd_topk_log_probs(logits_chunk, gather_topk_token_ids, sample_idx))
 
-    res = {
-        "log_probs": log_probs_list,
-    }
-    if with_entropy:
-        res["entropy"] = entropy_list
-    if with_topk:
-        res["topk_token_ids"] = topk_token_ids_list
-    if gather_topk_token_ids is not None:
-        res["topk_log_probs"] = topk_log_probs_list
+    if is_score_centering:
+        with torch.no_grad():
+            response_views = list(responses)
+        res = get_score_centering_batch(
+            logits,
+            response_views,
+            tp_group,
+            args=args,
+            candidate_ids=gather_topk_token_ids,
+            with_entropy=with_entropy,
+            with_topk=with_topk,
+            topk_k=resolved_topk_k,
+        )
+    else:
+        res = {"log_probs": log_probs_list}
+        if with_entropy:
+            res["entropy"] = entropy_list
+        if with_topk:
+            res["topk_token_ids"] = topk_token_ids_list
+        if gather_topk_token_ids is not None:
+            res["topk_log_probs"] = topk_log_probs_list
 
     # we need to turn the all gather kv into zigzag ring attn kv. Guard on
     # cp_world_size > 1 (matching the loss_function guard below): at CP=1 each
@@ -1257,7 +1262,7 @@ def policy_loss_function(
         loss = loss + opd_loss
 
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+        loss += 0 * logits.sum(dtype=torch.float32)
 
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
@@ -1637,6 +1642,92 @@ def get_sequence_classification_outputs(
     return torch.stack(local_logits, dim=0), local_indices
 
 
+def gather_with_local_grad(features: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
+    """Gather detached remote features, preserving only this rank's graph."""
+    world_size = dist.get_world_size(process_group)
+    if world_size == 1:
+        return features
+    # Shape agreement is checked collectively before all_gather, so one rank's
+    # partial batch cannot leave its peers hanging in a tensor collective.
+    shape = torch.tensor(features.shape, device=features.device, dtype=torch.long)
+    shapes = [torch.empty_like(shape) for _ in range(world_size)]
+    dist.all_gather(shapes, shape, group=process_group)
+    torch._assert_async(torch.stack(shapes).eq(shape).all(), "InfoNCE ranks must have equal complete feature batches")
+    gathered = [torch.empty_like(features) for _ in range(world_size)]
+    dist.all_gather(gathered, features.contiguous(), group=process_group)
+    gathered[dist.get_rank(process_group)] = features
+    return torch.cat(gathered, dim=0)
+
+
+def infonce_loss(
+    query: torch.Tensor,
+    positive: torch.Tensor,
+    *,
+    temperature: float = 0.05,
+    process_group: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Native mean one-way InfoNCE, before the backend's gradient reduction.
+
+    Every DP rank evaluates the global objective with only its own feature
+    graph attached. Summing those rank-local gradients gives the gradient of
+    the full objective.
+    """
+    if query.ndim != 2 or query.shape != positive.shape or query.shape[0] == 0:
+        raise ValueError("InfoNCE features must have matching nonempty [pairs, hidden] shapes")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("InfoNCE temperature must be finite and positive")
+    if process_group is None and dist.is_initialized():
+        raise ValueError("Distributed InfoNCE requires an explicit data-parallel process group")
+    if process_group is not None:
+        query = gather_with_local_grad(query, process_group)
+        positive = gather_with_local_grad(positive, process_group)
+    if query.shape[0] < 2:
+        raise ValueError("InfoNCE requires at least two pairs per global batch")
+    if query.dtype in (torch.float16, torch.bfloat16):
+        query, positive = query.float(), positive.float()
+    # Apply the cosine epsilon per row after feature normalization, without
+    # constructing a [pairs, pairs, hidden] tensor.
+    query = F.normalize(F.normalize(query, dim=-1), dim=-1, eps=1e-8)
+    positive = F.normalize(F.normalize(positive, dim=-1), dim=-1, eps=1e-8)
+    scores = (query @ positive.transpose(0, 1)) / temperature
+    return F.cross_entropy(scores, torch.arange(scores.shape[0], device=scores.device))
+
+
+infonce_loss.requires_dp_gradient_sum = True
+
+
+def embedding_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply InfoNCE or a custom embedding loss, then scale it."""
+    from relax.utils.training.embedding import pool_packed_embeddings, scale_for_megatron_sample_mean
+
+    features = pool_packed_embeddings(
+        hidden_states,
+        batch["total_lengths"],
+        positions=batch.get("embedding_positions"),
+        padded_lengths=batch.get("padded_total_lengths"),
+    )
+    group = mpu.get_data_parallel_group(with_context_parallel=False)
+    loss_path = getattr(args, "custom_loss_function_path", None)
+    compute_loss = load_function(loss_path) if loss_path else infonce_loss
+    mean_loss = compute_loss(
+        features[::2], features[1::2], temperature=args.contrastive_temperature, process_group=group
+    )
+    global_pairs = int(batch.get("dynamic_global_batch_size", args.global_batch_size))
+    dp_size = dist.get_world_size(group)
+    loss = scale_for_megatron_sample_mean(mean_loss, global_pairs=global_pairs, dp_size=dp_size)
+    metric_loss = loss.detach()
+    if getattr(compute_loss, "requires_dp_gradient_sum", False):
+        # Each rank owns a disjoint part of the global gradient; compensate
+        # for DDP averaging while keeping the forward value and metric intact.
+        loss = metric_loss + (loss - metric_loss) * dp_size
+    return loss, {"loss": metric_loss}
+
+
 def sequence_classification_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1705,6 +1796,19 @@ def sft_loss_function_chunked(
     ``lm_head_forward`` into ``get_log_probs_and_entropy`` (which then chunks
     the lm_head + CE matmul internally — see that function's docstring).
     """
+    plans = batch.get("selective_logit_rows")
+    if plans and Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS:
+        # Compare the CPU-built plan against the actual supervision mask
+        # after multimodal expansion and alignment.
+        coverage = []
+        for mask, (full_rows, indices) in zip(batch["loss_masks"], plans, strict=True):
+            flat = mask.reshape(-1)
+            if flat.numel() != full_rows or flat.device != indices.device:
+                raise ValueError("Selective SFT logits metadata does not match the loss mask")
+            kept = torch.zeros_like(flat, dtype=torch.bool).index_fill_(0, indices, True)
+            coverage.append(((flat == 0) | kept).all())
+        torch._assert_async(torch.stack(coverage).all(), "Selective SFT logits omit supervised rows")
+
     if getattr(args, "_qwen_fused_head", False):
         assert args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == "linear"
         assert args.context_parallel_size == 1 and args.rollout_temperature == 1.0
@@ -1727,7 +1831,6 @@ def sft_loss_function_chunked(
             loss = hidden_states.sum() * 0
             per_row_loss = hidden_states.new_empty(0)
         else:
-            plans = batch.get("selective_logit_rows")
             if plans is not None:
                 from relax.models.qwen3_5.selective_loss import selected_linear_loss
 
@@ -1753,7 +1856,7 @@ def sft_loss_function_chunked(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         lm_head_forward=lm_head_forward,
-        selective_logit_rows=batch.get("selective_logit_rows"),
+        selective_logit_rows=plans,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1816,24 +1919,29 @@ def loss_function(
           "values" (1D tensor: [denominator, metric1, metric2, ...]). The
           denominator is the token count for per-token loss and a zero
           placeholder for sample-mean loss. "num_tokens" separately carries
-          the effective token count used to detect no-signal steps.
+          the effective signal count used to detect no-signal steps
+          (pairs for embedding, tokens otherwise).
     """
-    # CP-local token count (tokens whose loss this rank actually contributes).
-    # Summed across the CP group in finalize_model_grads / the metric all-reduce,
-    # it counts every token exactly once regardless of CP degree, so the per-token
-    # normalizer is correct even when CP differs across micro-batches (dynamic CP).
-    # Under static CP it equals the old full-sample count distributed across ranks,
-    # so the final loss/grad/metric are unchanged after all-reduce.
-    num_tokens = get_cp_local_num_tokens(
-        batch["total_lengths"],
-        batch["response_lengths"],
-        batch["loss_masks"],
-        args.qkv_format,
-        batch.get("max_seq_lens", None),
-        batch.get("padded_total_lengths", None),
-        dynamic_cp_size=batch.get("dynamic_cp_size", None),
-        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
-    )
+    is_embedding = is_embedding_sft_mode(args)
+    if is_embedding:
+        if num_microbatches != 1:
+            raise ValueError("embedding requires one complete contrastive microbatch per optimizer update")
+        # A single-token sequence can yield a useful embedding even when its
+        # shifted language-model mask is empty.
+        num_tokens = logits.new_tensor(len(batch["total_lengths"]) // 2, dtype=torch.int)
+    else:
+        # Count this rank's contributing tokens so the CP reduction counts
+        # each token once, including when the CP degree changes per microbatch.
+        num_tokens = get_cp_local_num_tokens(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            args.qkv_format,
+            batch.get("max_seq_lens", None),
+            batch.get("padded_total_lengths", None),
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1862,7 +1970,9 @@ def loss_function(
             case "rm":
                 func = reward_model_loss_function
             case "sft":
-                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                if is_embedding:
+                    func = embedding_loss_function
+                elif getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function
                 elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
                     # Bind lm_head_forward so chunked path matches the standard
@@ -1906,7 +2016,7 @@ def loss_function(
     # CP ranks that call it. Adding this zero loss forces autograd to traverse the full
     # graph on every rank without changing gradient values.
     if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
-        loss = loss + 0 * logits.sum()
+        loss = loss + 0 * logits.sum(dtype=torch.float32)
 
     # Fully-async + dynamic-batch path injects per-rollout loss_scale and tags
     # dummy micro-batches (used to align num_microbatches across DPs). Dummy
