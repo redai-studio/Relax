@@ -701,7 +701,7 @@ class SGLangEngine(RayActor):
         )
         self._router_dp_size = server_args.dp_size
         if (
-            self._is_scaled_out
+            getattr(self, "_is_scaled_out", False)
             and getattr(self.args, "colocate", False)
             and not getattr(self.args, "hybrid", False)
             and not getattr(self.args, "fully_async", False)
