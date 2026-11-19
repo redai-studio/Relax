@@ -24,6 +24,8 @@ def main() -> None:
     result = json.loads((PACKAGE / "build-result.json").read_text())
     if digest(PACKAGE / "manifest.json") != result["manifest_sha256"]:
         raise RuntimeError("The build manifest has changed")
+    if metadata.version("torch") != result["torch"]:
+        raise RuntimeError("The installed Torch version differs from the MoK wheel build")
     megatron = Path(os.environ.get("RELAX_MEGATRON_ROOT", result["megatron_root"]))
     mok_source = Path(os.environ.get("RELAX_MOK_SOURCE_ROOT", result["mok_root"]))
     check_megatron(megatron, manifest["megatron"], "after")

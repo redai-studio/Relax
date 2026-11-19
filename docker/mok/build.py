@@ -66,14 +66,19 @@ def check_transformer_engine(root: Path, manifest: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--megatron-root", type=Path, required=True)
+    parser.add_argument("--megatron-root", type=Path)
     parser.add_argument("--mok-root", type=Path)
     parser.add_argument("--arch", choices=["SM103"], default="SM103")
-    parser.add_argument("--check-base-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check-base-only", action="store_true")
+    mode.add_argument("--wheel-dir", type=Path, help="Build a wheel and its receipt without installing into the image")
     args = parser.parse_args()
+    if args.wheel_dir is None and args.megatron_root is None:
+        parser.error("--megatron-root is required unless --wheel-dir is used")
     manifest = json.loads((PACKAGE / "manifest.json").read_text())
-    check_megatron(args.megatron_root, manifest["megatron"], "after")
-    print("Megatron patch-target fingerprints verified.", flush=True)
+    if args.megatron_root is not None:
+        check_megatron(args.megatron_root, manifest["megatron"], "after")
+        print("Megatron patch-target fingerprints verified.", flush=True)
     if args.check_base_only:
         return
     if args.mok_root is None:
@@ -106,11 +111,12 @@ def main() -> None:
     apply_patches(thunderkittens, manifest["patch_order"]["thunderkittens"], manifest)
     check_files(args.mok_root, manifest["mok"]["after_sha256"])
     check_files(thunderkittens, manifest["thunderkittens"]["after_sha256"])
-    check_megatron(args.megatron_root, manifest["megatron"], "after")
-    te = manifest["transformer_engine"]
-    if metadata.version(te["distribution"]) != te["version"]:
-        raise RuntimeError(f"Expected Transformer Engine {te['version']}")
-    check_transformer_engine(Path(metadata.distribution(te["distribution"]).locate_file("")), manifest)
+    if args.wheel_dir is None:
+        check_megatron(args.megatron_root, manifest["megatron"], "after")
+        te = manifest["transformer_engine"]
+        if metadata.version(te["distribution"]) != te["version"]:
+            raise RuntimeError(f"Expected Transformer Engine {te['version']}")
+        check_transformer_engine(Path(metadata.distribution(te["distribution"]).locate_file("")), manifest)
 
     env = dict(
         os.environ,
@@ -141,19 +147,24 @@ def main() -> None:
         if len(artifacts) != 1:
             raise RuntimeError(f"Expected one MoK wheel: {artifacts}")
         wheel_hash = digest(artifacts[0])
-        run(
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-deps",
-            "--no-index",
-            "--force-reinstall",
-            str(artifacts[0]),
-            env=env,
-        )
-    run(sys.executable, "-m", "compileall", "-q", str(args.megatron_root / "megatron"))
-    (PACKAGE / "build-result.json").write_text(
+        if args.wheel_dir is not None:
+            args.wheel_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(artifacts[0], args.wheel_dir / artifacts[0].name)
+        else:
+            run(
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "--no-index",
+                "--force-reinstall",
+                str(artifacts[0]),
+                env=env,
+            )
+            run(sys.executable, "-m", "compileall", "-q", str(args.megatron_root / "megatron"))
+    receipt_dir = args.wheel_dir if args.wheel_dir is not None else PACKAGE
+    (receipt_dir / "build-result.json").write_text(
         json.dumps(
             {
                 "status": "SOURCE_AND_WHEEL_BUILT",
@@ -162,7 +173,7 @@ def main() -> None:
                 "torch": str(torch.__version__),
                 "cuda": torch.version.cuda,
                 "nvcc": nvcc.strip(),
-                "megatron_root": str(args.megatron_root),
+                "megatron_root": str(args.megatron_root or "/root/Megatron-LM"),
                 "mok_root": str(args.mok_root),
                 "manifest_sha256": digest(PACKAGE / "manifest.json"),
                 "runtime_gpu_validation": "PENDING",
@@ -171,7 +182,7 @@ def main() -> None:
         )
         + "\n"
     )
-    print("MoK wheel built from source and installed; GPU runtime validation remains separate.", flush=True)
+    print("MoK wheel built from source; GPU runtime validation remains separate.", flush=True)
 
 
 if __name__ == "__main__":

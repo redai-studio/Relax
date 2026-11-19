@@ -13,7 +13,7 @@ docker build -f docker/Dockerfile.cu13 --build-arg GPU_ARCH=blackwell \
 
 构建上下文为仓库根目录。MoK 使用主镜像的 Python 3.12、Torch `2.13.0+cu130`、CUDA 13.0 NVCC 和 TE 2.18；构建不升级这些依赖。Megatron 路径为 `/root/Megatron-LM`，目标架构为 Blackwell `SM103`。Hopper 和 CUDA 12 不构建这个后端。
 
-Megatron 适配由主补丁 `docker/patch/latest/megatron.patch` 的 Blackwell 段安装。MoK 构建检查适配涉及的 8 个文件的最终 SHA256；未知源码版本会拒绝。更新主补丁涉及的文件时，需要同步审查 `manifest.json` 中的源码指纹。
+Megatron 适配由主补丁 `docker/patch/latest/megatron.patch` 的 Blackwell 段安装。最终镜像在安装 wheel 后检查适配涉及的 8 个文件的最终 SHA256。更新主补丁涉及的文件时，需要同步审查 `manifest.json` 中的源码指纹。
 
 ## 来源与补丁
 
@@ -27,7 +27,7 @@ Megatron 适配由主补丁 `docker/patch/latest/megatron.patch` 的 Blackwell �
 
 补丁顺序及目标文件 SHA256 见 `manifest.json`。MoK 尾块和调度器改动合并在 `patches/mok.patch`；ThunderKittens 保持独立补丁。TE bounded Adam 修复已合入主镜像的 TE 2.18 补丁，MoK 构建只检查最终源码。
 
-`build.py` 使用 `pip wheel --no-deps --no-build-isolation` 编译并安装 MoK。CUDA driver stub 仅用于链接，不写入运行时 `LD_LIBRARY_PATH`。普通 `docker build` 不需要 GPU，只检查源码、安装路径及 SM103 cubin。
+`mok_builder` 从同一 `TRAIN_IMAGE` 派生，在应用 Megatron 补丁之前用 `pip wheel --no-deps --no-build-isolation` 编译 MoK。最终 Blackwell 镜像安装该 wheel，再检查源码、安装路径及 SM103 cubin。CUDA driver stub 仅用于链接。普通 `docker build` 不需要 GPU。
 
 ## 运行检查
 
