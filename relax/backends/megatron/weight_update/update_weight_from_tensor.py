@@ -45,6 +45,7 @@ from .update_weight_from_distributed import (
 
 
 logger = get_logger(__name__)
+_COLOCATE_NCCL_TIMEOUT_SECS = 30.0
 
 
 class UpdateWeightFromTensor:
@@ -209,12 +210,22 @@ class UpdateWeightFromTensor:
 
             error = None
             if self._is_distributed_src_rank and self._model_update_groups is None:
+                connection_options = (
+                    {
+                        "max_retries": 1,
+                        "timeout_secs": _COLOCATE_NCCL_TIMEOUT_SECS,
+                        "remember_group": lambda group: setattr(self, "_model_update_groups", group),
+                    }
+                    if self._colocate_remote_full
+                    else {}
+                )
                 try:
                     self._model_update_groups = connect_rollout_engines_from_distributed(
                         self.args,
                         self._group_name,
                         distributed_engines,
                         engine_gpu_counts=engine_gpu_counts[colocate_engine_nums:],
+                        **connection_options,
                     )
                 except Exception as exc:
                     if shared_engine_count is None:
@@ -314,6 +325,12 @@ class UpdateWeightFromTensor:
             self._uncertain_group_removal = group_name
             raise
         self._model_update_groups = None
+
+    def abort_colocate_group(self, group_name: str) -> None:
+        if self._model_update_groups is not None and self._group_name == group_name:
+            self._model_update_groups.abort()
+            dist.destroy_process_group(self._model_update_groups)
+            self._model_update_groups = None
 
     def _configure_sync_process_groups(self) -> None:
         """Retain the audited iterator's communicator closure, independently of
@@ -970,6 +987,9 @@ class UpdateWeightFromTensor:
             all_refs.extend(refs_colocated)
 
         if self.use_distribute and self._is_distributed_src_rank:
+            timeout_args = (
+                {"timeout_secs": _COLOCATE_NCCL_TIMEOUT_SECS} if getattr(self, "_colocate_remote_full", False) else {}
+            )
             try:
                 remote_refs = update_weights_from_distributed(
                     self._group_name,
@@ -977,6 +997,7 @@ class UpdateWeightFromTensor:
                     self.weight_version,
                     self.distributed_rollout_engines,
                     hf_named_tensors,
+                    **timeout_args,
                 )
             except Exception as exc:
                 # A failed broadcast can leave remote receivers waiting for data.

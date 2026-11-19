@@ -264,7 +264,9 @@ def test_independent_engines_reuse_group_and_destroy_only_matching_generation(mo
             [baseline, dynamic], None, [2, 2], [0, 0], shared_engine_count=1, remote_group_name="old"
         )
     assert updater._ipc_engine is baseline
-    connect.assert_called_once_with(updater.args, "old", [dynamic], engine_gpu_counts=[2])
+    assert connect.call_count == 1
+    assert connect.call_args.args == (updater.args, "old", [dynamic])
+    assert connect.call_args.kwargs["engine_gpu_counts"] == [2]
     dynamic.get_pid_and_node_id.remote.assert_not_called()
     updater.disconnect_distributed_group("old")
     disconnect.assert_called_once_with(updater.args, "old", "old-handle", [dynamic], strict=True)
@@ -274,6 +276,75 @@ def test_independent_engines_reuse_group_and_destroy_only_matching_generation(mo
     updater.disconnect_distributed_group("old")
     assert updater._model_update_groups == "next-handle"
     assert disconnect.call_count == 1
+
+
+def test_failed_receiver_ack_keeps_the_sender_group_for_abort(monkeypatch):
+    from relax.backends.megatron.weight_update import update_weight_from_distributed as distributed
+
+    local_group, receiver = Mock(), Mock()
+    remember_group = Mock()
+    monkeypatch.setattr(distributed.device_utils, "get_dist_backend", lambda: "nccl")
+    monkeypatch.setattr(distributed.ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(distributed, "init_process_group", Mock(return_value=local_group))
+    monkeypatch.setattr(distributed.ray, "get", Mock(side_effect=TimeoutError("receiver ACK missing")))
+
+    with pytest.raises(RuntimeError, match="Failed to connect rollout engines"):
+        distributed.connect_rollout_engines_from_distributed(
+            SimpleNamespace(), "full", [receiver], [2], max_retries=1, timeout_secs=30, remember_group=remember_group
+        )
+
+    remember_group.assert_called_once_with(local_group)
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater._model_update_groups = local_group
+    updater._group_name = "full"
+    destroy_group = Mock()
+    monkeypatch.setattr(sync.dist, "destroy_process_group", destroy_group)
+    updater.abort_colocate_group("full")
+    local_group.abort.assert_called_once_with()
+    destroy_group.assert_called_once_with(local_group)
+    assert updater._model_update_groups is None
+
+
+@pytest.mark.parametrize("file_unavailable", [False, True])
+def test_colocate_precheck_uses_sender_device_and_every_receiver_rank(monkeypatch, file_unavailable):
+    from relax.backends.megatron.weight_update import update_weight_from_distributed as distributed
+
+    receivers = [Mock(), Mock()]
+    for receiver in receivers:
+        receiver.get_scale_weight_sync_transport_fingerprint.remote.return_value = {}
+        receiver.run_scale_weight_sync_precheck.remote.return_value = {"success": True, "stopped": True}
+    monkeypatch.setattr(distributed, "os", SimpleNamespace(environ={}))
+    monkeypatch.setattr(distributed.device_utils, "get_dist_backend", lambda: "nccl")
+    monkeypatch.setattr(distributed.torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(distributed.torch.cuda, "mem_get_info", lambda device: (1 << 30, 1 << 30))
+    monkeypatch.setattr(distributed.ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(distributed.ray, "get", lambda refs, **kwargs: refs)
+    monkeypatch.setattr(distributed.ray, "wait", lambda refs, **kwargs: (refs, []))
+    launch = Mock(return_value=Mock(wait=Mock(return_value=0), poll=Mock(return_value=0)))
+    monkeypatch.setattr(distributed.subprocess, "Popen", launch)
+
+    if file_unavailable:
+        monkeypatch.setattr(distributed.tempfile, "TemporaryFile", Mock(side_effect=OSError("FD limit")))
+        assert distributed.precheck_colocate_receiver(receivers, [2, 2], timeout=30) == (False, True, True, ())
+        launch.assert_not_called()
+        for receiver in receivers:
+            receiver.run_scale_weight_sync_precheck.remote.assert_not_called()
+        return
+
+    assert distributed.precheck_colocate_receiver(receivers, [2, 2], timeout=30) == (True, True, True, ())
+
+    command = launch.call_args.args[0]
+    assert command[command.index("--device-id") + 1] == "3"
+    assert command[command.index("--world-size") + 1] == "5"
+    assert command[command.index("--rank") + 1] == "0"
+    receiver_calls = [receiver.run_scale_weight_sync_precheck.remote.call_args.kwargs for receiver in receivers]
+    assert [(call["group_rank"], call["tp_size"], call["world_size"]) for call in receiver_calls] == [
+        (1, 2, 5),
+        (3, 2, 5),
+    ]
+    assert all(
+        call["ports"].split(",") == [command[command.index("--master-port") + 1]] * 2 for call in receiver_calls
+    )
 
 
 @pytest.mark.parametrize("geometry", [(256, 2048, 512), (256, 7168, 2048)])

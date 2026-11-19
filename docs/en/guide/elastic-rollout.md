@@ -15,13 +15,15 @@
 
 ### Prerequisites
 
-- Training uses **Fully Async mode (`--fully-async`)** or **Hybrid mode (`--hybrid`)**; Hybrid mode uses DCS by default, so that every weight update reaches scaled-out engines through the DCS broadcast
+- Training uses **Fully Async (`--fully-async`)**, **Hybrid (`--hybrid`)**, or **synchronous colocate (`--colocate`)**
 - Rollout engines use **SGLang** as the inference backend
 - Training backend uses **Megatron**
 
 ::: tip
-Elastic scaling is available in Fully Async mode and in Hybrid mode (with the DCS weight-sync backend). In these modes, Rollout occupies dedicated GPU resources and runs as an independent service, making it naturally suited for elastic scaling; engines added by scale-out register with DCS and then receive the latest weights on every broadcast. For more information about Fully Async mode, see [Fully Async Training Pipeline](./fully-async-training.md); for Hybrid mode, see [Hybrid Training](./hybrid-training.md).
+Fully Async and Hybrid use dedicated Rollout GPUs. See [Fully Async Training Pipeline](./fully-async-training.md) and [Hybrid Training](./hybrid-training.md) for their training and weight-sync setup.
 :::
+
+Synchronous colocate requires a training Actor and `ray_native` scale-out. Use one pool of homogeneous regular SGLang engines with PP and DP both set to 1, GPU placement derived from Ray placement groups, and automatically assigned endpoints. Use full model weights and leave fault tolerance, LoRA adapter mode, and explicit expert routing disabled for scale-out.
 
 For a runnable Qwen3-4B setup with Autoscaler-based scaling and external
 graceful-eviction requirements, see the
@@ -125,11 +127,14 @@ PENDING → CREATING/CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY
 | `CREATING`        | (ray_native) Creating Ray Actors and starting SGLang engines |
 | `CONNECTING`      | (external) Connecting to external engines                    |
 | `HEALTH_CHECKING` | Engine started/connected, running health checks              |
+| `WAITING_FOR_WEIGHT_SYNC` | A healthy synchronous colocate candidate is waiting for a normal Actor FULL update |
 | `WEIGHT_SYNCING`  | Health check passed, syncing latest model weights            |
 | `READY`           | Weight sync complete, registered with Router                 |
 | `ACTIVE`          | Receiving and processing inference requests                  |
 | `FAILED`          | Scale-out failed (error at any stage)                        |
 | `CANCELLED`       | Cancelled by user                                            |
+
+In synchronous colocate, `WAITING_FOR_WEIGHT_SYNC` uses the original scale-out timeout budget. The request remains in progress while it waits and during `WEIGHT_SYNCING`.
 
 ### API Reference
 
@@ -238,7 +243,9 @@ curl -X POST http://<rollout-host>/rollout/scale_out_cancel \
 
 ### Weight Synchronization
 
-New engines must sync the latest model weights before they can receive inference requests. The system uses **remote instance weight sync** for scaled-out engines:
+In synchronous colocate, baseline engines share the Actor's GPUs and receive weights over CUDA IPC. Each new engine uses its own placement group and receives a FULL update from the Actor over NCCL. The Router admits the engine after the load acknowledgment and registration are confirmed.
+
+The flow below describes **remote instance weight sync** in Fully Async and Hybrid.
 
 #### Weight Sync Flow
 
@@ -296,6 +303,10 @@ When weight sync fails, scaled-out engines will serve requests with stale weight
 :::
 
 ### Weight Sync Precheck
+
+In synchronous colocate, the default precheck uses the training sender GPU and all TP GPUs of each first-time candidate. It runs a small NCCL collective in subprocesses before the candidate joins an Actor FULL update. A failed candidate stays out of the Router. The existing `--no-scale-weight-sync-precheck` option skips this check.
+
+The two-stage seed-engine flow below applies to Fully Async and Hybrid Ray-native scale-out.
 
 Before scale-out weight sync, Relax runs an independent NCCL precheck that confirms a new engine can form a compatible NCCL communication domain with the seed engine, without touching the seed. A precheck failure is **fail-closed**: the scale-out request is rejected, the new engine receives no weights and is not admitted to business — avoiding placing a faulty engine in the router only to cause the whole NCCL group to fail during weight sync and force a global restart back to step 0.
 

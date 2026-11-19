@@ -416,7 +416,11 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
+        engine_class = _resolve_rollout_engine_class(self.args)
+        if self.is_scaled_out and _synchronous_colocate(self.args):
+            RolloutRayActor = ray.remote(concurrency_groups={"colocate_shutdown": 1})(engine_class)
+        else:
+            RolloutRayActor = ray.remote(engine_class)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -640,6 +644,10 @@ class _ColocateCandidate:
     group: EngineGroup
     deadline: float
     claimed: bool = False
+    prechecking: bool = False
+    prechecked: bool = False
+    probe_cleanup_pending: bool = False
+    pending_probe_refs: tuple[ray.ObjectRef, ...] = ()
     failure: ScaleOutFailure | None = None
     result: EngineFinalizeResult | None = None
 
@@ -1028,6 +1036,10 @@ class RolloutManager(ReloadableMixin):
         self._colocate_remote_group: tuple[str, tuple[str, ...]] | None = None
         self._colocate_retiring: str | None = None
         self._colocate_disposing = False
+        self._colocate_full_failed = False
+        self._colocate_sender_probe_unconfirmed = False
+        self._colocate_shutdown_pgs: set[ray.PlacementGroupID] = set()
+        self._colocate_pending_pgs: dict[ray.PlacementGroupID, Any] = {}
         self._port_cursors: dict[str, int] = {}
 
         # Elastic scale-in tracking
@@ -1299,6 +1311,7 @@ class RolloutManager(ReloadableMixin):
 
     @ray.method(concurrency_group="lora_publication")
     def dispose(self):
+        dispose_deadline = time.monotonic() + 30.0
         try:
             # Signal every monitor before bounded joins so a stalled health
             # RPC cannot consume the driver's entire shutdown budget.
@@ -1328,27 +1341,94 @@ class RolloutManager(ReloadableMixin):
                 ray.kill(host)
                 self._lora_runtime = None
             if _synchronous_colocate(getattr(self, "args", None)):
+                raw_pg_error = None
                 with self._engine_lifecycle_lock:
                     self._colocate_disposing = True
-                deadline = time.monotonic() + 35.0
-                while self.training_weight_updating and time.monotonic() < deadline:
-                    time.sleep(0.2)
-                with self._engine_lifecycle_lock:
-                    if self._training_weight_updating:
+                    # These PGs have no engine or outstanding GPU transfer.
+                    for pg in list(self._colocate_pending_pgs.values()):
+                        try:
+                            self._submit_colocate_pg_removal(pg, self._colocate_shutdown_pgs)
+                        except Exception as error:
+                            raw_pg_error = error
+                            logger.exception("[Colocate FULL] Could not remove pending PG %s", pg.id)
+                while True:
+                    with self._engine_lifecycle_lock:
+                        failed = self._colocate_full_failed
+                        busy = self._training_weight_updating or any(
+                            candidate.prechecking for candidate in self._colocate_candidates.values()
+                        )
+                        if failed or not busy:
+                            elastic_groups = [
+                                group
+                                for srv in self.servers.values()
+                                for group in srv.engine_groups
+                                if group.is_scaled_out
+                            ]
+                            pending_groups = [
+                                candidate.group
+                                for candidate in self._colocate_candidates.values()
+                                if candidate.result is None
+                            ]
+                            unconfirmed_probes = {
+                                id(candidate.group)
+                                for candidate in self._colocate_candidates.values()
+                                if candidate.prechecking or candidate.probe_cleanup_pending
+                            }
+                            current = self._colocate_remote_group
+                            source = self._colocate_source
+                            break
+                    if time.monotonic() >= dispose_deadline:
                         raise RuntimeError("Colocate FULL still holds the shutdown fence")
-                    elastic_groups = [
-                        group for srv in self.servers.values() for group in srv.engine_groups if group.is_scaled_out
-                    ]
-                    pending_groups = [
-                        candidate.group for candidate in self._colocate_candidates.values() if candidate.result is None
-                    ]
-                    current = self._colocate_remote_group
-                    source = self._colocate_source
-                if current is not None:
-                    ray.get(source.disconnect_colocate_weight_group.remote(current[0]), timeout=35)
-                self._shutdown_all_engines(extra_groups=pending_groups)
+                    time.sleep(0.2)
+                sender_error = None
+                if failed:
+                    # Stop the receiver process trees before releasing their PGs.
+                    # A failed or partially created group cannot be retired by a
+                    # normal group-destroy RPC to a receiver waiting in NCCL.
+                    try:
+                        self._shutdown_all_engines(
+                            timeout=max(0.0, dispose_deadline - time.monotonic() - 3),
+                            extra_groups=pending_groups,
+                            confirm_exit=True,
+                        )
+                    finally:
+                        if current is not None:
+                            try:
+                                ray.get(source.abort_colocate_weight_group.remote(current[0]), timeout=2)
+                            except Exception as error:
+                                sender_error = error
+                                logger.exception("[Colocate FULL] Failed to abort the sender's group during shutdown")
+                else:
+                    if current is not None:
+                        ray.get(source.disconnect_colocate_weight_group.remote(current[0]), timeout=35)
+                    self._shutdown_all_engines(extra_groups=pending_groups)
+                removed_pgs = set()
                 for group in [*elastic_groups, *pending_groups]:
-                    ray.util.remove_placement_group(group.pg[0])
+                    if id(group) not in unconfirmed_probes:
+                        ray.util.remove_placement_group(group.pg[0])
+                        if failed:
+                            removed_pgs.add(group.pg[0].id)
+                if failed:
+                    with self._engine_lifecycle_lock:
+                        self._colocate_shutdown_pgs.update(removed_pgs)
+                        self._training_weight_updating = False
+                        for candidate in self._colocate_candidates.values():
+                            if candidate.result is None and not candidate.probe_cleanup_pending:
+                                failure = candidate.failure or ScaleOutFailure(
+                                    ScaleOutFailureCategory.WEIGHT_SYNC_FAILED
+                                )
+                                candidate.result = EngineFinalizeResult(False, reason=failure)
+                                candidate.request.update_status(ScaleOutStatus.FAILED, failure.message())
+                if sender_error is not None:
+                    raise RuntimeError("Could not confirm abort of the colocate FULL sender") from sender_error
+                if self._colocate_sender_probe_unconfirmed:
+                    raise RuntimeError("Could not confirm exit of the colocate NCCL sender probe")
+                if unconfirmed_probes:
+                    raise RuntimeError(
+                        "Could not confirm that all colocate NCCL probes stopped; their PGs were retained"
+                    )
+                if raw_pg_error is not None:
+                    raise RuntimeError("Could not remove all pending colocate scale-out PGs") from raw_pg_error
             else:
                 self._shutdown_all_engines()
         finally:
@@ -1362,7 +1442,9 @@ class RolloutManager(ReloadableMixin):
                 # owns the registry; the Controller driver's registry is separate.
                 stop_launched_routers()
 
-    def _shutdown_all_engines(self, timeout: float = 15.0, *, extra_groups: tuple | list = ()):
+    def _shutdown_all_engines(
+        self, timeout: float = 15.0, *, extra_groups: tuple | list = (), confirm_exit: bool = False
+    ):
         """Shut down all SGLang engine actors and their child processes.
 
         This method is called during dispose() to ensure SGLang subprocesses
@@ -1372,12 +1454,13 @@ class RolloutManager(ReloadableMixin):
         if not self.servers:
             return
 
-        all_engines = [engine for group in extra_groups for engine in group.all_engines if engine is not None]
-        for srv in self.servers.values():
-            for group in srv.engine_groups:
-                for engine in group.all_engines:
-                    if engine is not None:
-                        all_engines.append(engine)
+        groups = [*extra_groups, *(group for srv in self.servers.values() for group in srv.engine_groups)]
+        all_engines = [
+            (engine, confirm_exit and group.is_scaled_out)
+            for group in groups
+            for engine in group.all_engines
+            if engine is not None
+        ]
 
         if not all_engines:
             return
@@ -1387,12 +1470,18 @@ class RolloutManager(ReloadableMixin):
         # Step 1: Call shutdown() on each engine to kill child processes
         # (sglang::scheduler, sglang::detokenizer, etc.)
         shutdown_refs = []
-        for engine in all_engines:
+        unconfirmed = False
+        kwargs = {"wait_for_exit": min(5.0, timeout)} if confirm_exit else {}
+        for engine, scaled_out in all_engines:
             try:
-                ref = engine.shutdown.remote()
+                shutdown = engine.shutdown
+                if confirm_exit and scaled_out:
+                    shutdown = shutdown.options(concurrency_group="colocate_shutdown")
+                ref = shutdown.remote(**kwargs)
                 shutdown_refs.append((engine, ref))
             except Exception as e:
                 logger.warning(f"[Shutdown] Failed to call shutdown on engine: {e}")
+                unconfirmed = True
 
         # Bound the whole batch so router cleanup can finish before the driver's
         # signal-exit watchdog, even when every engine is unresponsive.
@@ -1402,12 +1491,15 @@ class RolloutManager(ReloadableMixin):
                 ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
             except Exception as e:
                 logger.warning(f"[Shutdown] Engine shutdown timed out or failed: {e}")
+                unconfirmed = True
                 # Force-kill the Ray actor as a fallback
                 try:
                     ray.kill(engine)
                 except Exception:
                     pass
 
+        if confirm_exit and unconfirmed:
+            raise RuntimeError("Could not confirm that all colocate engines stopped after a failed FULL")
         logger.info(f"[Shutdown] All {len(all_engines)} SGLang engine(s) shut down.")
 
     @property
@@ -1441,6 +1533,7 @@ class RolloutManager(ReloadableMixin):
         return (
             getattr(self.args, "train_backend", "megatron") == "megatron"
             and not is_offline_mode(self.args)
+            and not getattr(self.args, "debug_rollout_only", False)
             and not getattr(self.args, "rollout_external", False)
             and not getattr(self.args, "colocate_expert_weight_routing", False)
             and not getattr(self.args, "lora_adapter_mode", False)
@@ -1463,7 +1556,7 @@ class RolloutManager(ReloadableMixin):
         """Claim one immutable set of receivers or report the old group to
         clear."""
         with self._engine_lifecycle_lock:
-            if self._colocate_disposing or self._training_weight_updating:
+            if self._colocate_disposing or self._colocate_full_failed or self._training_weight_updating:
                 raise RuntimeError("Colocate FULL ownership is unavailable")
             groups = tuple(self.server.engine_groups)
             candidates = [
@@ -1480,6 +1573,23 @@ class RolloutManager(ReloadableMixin):
                 return None, self._colocate_retiring
             if any(group.lifecycle_status is EngineGroupLifecycle.DRAINING for group in dynamic):
                 return None, old[0] if old else None
+
+            if getattr(self.args, "scale_weight_sync_precheck", True):
+                for candidate in candidates:
+                    if not candidate.prechecking and not candidate.prechecked:
+                        group = candidate.group
+                        candidate.prechecking = True
+                        gpu_count = min(group.num_gpus_per_engine, self.args.num_gpus_per_node)
+                        remaining = candidate.deadline - time.monotonic()
+                        return {
+                            "precheck": (
+                                group.rank_offset,
+                                list(group.all_engines),
+                                gpu_count,
+                                time.time() + remaining,
+                            )
+                        }, None
+                candidates = [candidate for candidate in candidates if candidate.prechecked]
 
             receivers = []
             for group in [*shared, *dynamic, *(candidate.group for candidate in candidates)]:
@@ -1528,11 +1638,44 @@ class RolloutManager(ReloadableMixin):
                 logger.info("[Colocate FULL] Removed group %s", group_name)
 
     @ray.method(concurrency_group="scale_in")
+    def finish_colocate_precheck(
+        self,
+        rank_offset: int,
+        success: bool,
+        sender_stopped: bool,
+        receivers_stopped: bool,
+        pending_receiver_refs: tuple[ray.ObjectRef, ...],
+    ) -> None:
+        with self._engine_lifecycle_lock:
+            candidate = self._colocate_candidates.get(rank_offset)
+            if candidate is None or not candidate.prechecking:
+                raise RuntimeError("Colocate precheck does not own the candidate")
+            candidate.prechecking = False
+            candidate.probe_cleanup_pending = not receivers_stopped or bool(pending_receiver_refs)
+            candidate.pending_probe_refs = pending_receiver_refs if receivers_stopped else ()
+            candidate.prechecked = success and sender_stopped and not candidate.probe_cleanup_pending
+            if not candidate.prechecked and candidate.failure is None:
+                candidate.failure = ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL)
+            if not sender_stopped:
+                self._colocate_full_failed = True
+                self._colocate_sender_probe_unconfirmed = True
+
+    @ray.method(concurrency_group="scale_in")
+    def fail_colocate_full(self, group_name: str) -> None:
+        with self._engine_lifecycle_lock:
+            current = self._colocate_remote_group
+            if self._training_weight_updating and (current is None or current[0] == group_name):
+                self._colocate_full_failed = True
+                for candidate in self._colocate_candidates.values():
+                    if candidate.claimed and candidate.result is None and candidate.failure is None:
+                        candidate.failure = ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED)
+
+    @ray.method(concurrency_group="scale_in")
     async def publish_colocate_full(self, version: int, synced_actor_ids: list[str]) -> str | None:
         """Publish claimed candidates and return the group to retire after a
         failed publication."""
         with self._engine_lifecycle_lock:
-            if not self._training_weight_updating:
+            if not self._training_weight_updating or self._colocate_full_failed:
                 raise RuntimeError("No colocate FULL in progress")
             claimed = [
                 candidate
@@ -1620,6 +1763,8 @@ class RolloutManager(ReloadableMixin):
     @ray.method(concurrency_group="scale_in")
     def release_colocate_full(self) -> None:
         with self._engine_lifecycle_lock:
+            if self._colocate_full_failed:
+                raise RuntimeError("Cannot release a failed colocate FULL before shutdown")
             rejected = [
                 candidate
                 for candidate in self._colocate_candidates.values()
@@ -1639,7 +1784,7 @@ class RolloutManager(ReloadableMixin):
         candidate = _ColocateCandidate(request, group, time.monotonic() + remaining)
         key = group.rank_offset
         with self._engine_lifecycle_lock:
-            if self._colocate_disposing or not candidate.eligible():
+            if self._colocate_disposing or self._colocate_full_failed or not candidate.eligible():
                 return EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
             self._colocate_candidates[key] = candidate
             syncing = any(
@@ -1652,16 +1797,31 @@ class RolloutManager(ReloadableMixin):
         while True:
             with self._engine_lifecycle_lock:
                 result = candidate.result
-                if self._colocate_disposing and result is None and not candidate.claimed:
+                owned = candidate.claimed or candidate.prechecking or candidate.probe_cleanup_pending
+                if self._colocate_disposing and result is None and not owned:
                     result = EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN))
                 if not candidate.eligible() and result is None:
                     if candidate.failure is None:
                         candidate.failure = ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT)
-                    if not candidate.claimed:
+                    if not owned:
                         result = EngineFinalizeResult(False, reason=candidate.failure)
                 if result is not None and (not candidate.claimed or not self._training_weight_updating):
                     self._colocate_candidates.pop(key, None)
                     return result
+                probe_refs = candidate.pending_probe_refs
+            if probe_refs:
+                try:
+                    ready, pending = ray.wait(list(probe_refs), num_returns=len(probe_refs), timeout=0)
+                except (ray.exceptions.RayError, RuntimeError):
+                    await asyncio.sleep(1)
+                    continue
+                if not pending:
+                    replies = await asyncio.gather(*ready, return_exceptions=True)
+                    with self._engine_lifecycle_lock:
+                        candidate.pending_probe_refs = ()
+                        candidate.probe_cleanup_pending = not all(
+                            isinstance(reply, dict) and reply.get("stopped", True) for reply in replies
+                        )
             await asyncio.sleep(0.2)
 
     async def _disconnect_colocate_group_for_removal(self, engine_ids: set[str], timeout: float) -> None:
@@ -2296,8 +2456,9 @@ class RolloutManager(ReloadableMixin):
             scale_mode is not ScaleOutMode.RAY_NATIVE or not self.supports_colocate_scale_out()
         ):
             raise ValueError(
-                "Colocate scale-out requires Ray-native Megatron/SGLang with homogeneous regular engines "
-                "using SGLang PP=DP=1, PG-derived placement, and automatically assigned endpoints, with FULL weights "
+                "Colocate scale-out requires a training Actor and Ray-native Megatron/SGLang with "
+                "homogeneous regular engines using SGLang PP=DP=1, PG-derived placement, and automatically assigned "
+                "endpoints, with FULL weights "
                 "(without adapter mode, explicit expert routing, or --use-fault-tolerance)"
             )
 
@@ -2516,14 +2677,13 @@ class RolloutManager(ReloadableMixin):
 
         def try_remove_replica_pg(idx: int) -> None:
             pg = per_replica_pgs[idx]
-            if removal_submitted is not None and pg.id in removal_submitted:
-                return
             try:
-                ray.util.remove_placement_group(pg)
+                if removal_submitted is None:
+                    ray.util.remove_placement_group(pg)
+                else:
+                    self._submit_colocate_pg_removal(pg, removal_submitted)
             except Exception:
                 return
-            if removal_submitted is not None:
-                removal_submitted.add(pg.id)
 
         try:
             # Step 1: Update status
@@ -2550,7 +2710,14 @@ class RolloutManager(ReloadableMixin):
                 num_gpus = gpus_per_engine
                 accel_resource = device_utils.get_ray_accelerator_name()
                 bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
-                pg = ray.util.placement_group(bundles, strategy="PACK")
+                if removal_submitted is None:
+                    pg = ray.util.placement_group(bundles, strategy="PACK")
+                else:
+                    with self._engine_lifecycle_lock:
+                        if self._colocate_disposing:
+                            raise RuntimeError("Colocate scale-out is shutting down")
+                        pg = ray.util.placement_group(bundles, strategy="PACK")
+                        self._colocate_pending_pgs[pg.id] = pg
                 per_replica_pgs.append(pg)
 
             logger.info(
@@ -2580,6 +2747,8 @@ class RolloutManager(ReloadableMixin):
 
             # Phase A: Wait for PGs to become ready, with incremental processing
             while pending_indices:
+                if removal_submitted is not None and self._colocate_disposing:
+                    break
                 elapsed = time.monotonic() - start_time
                 remaining = request.timeout_secs - elapsed
 
@@ -2634,6 +2803,11 @@ class RolloutManager(ReloadableMixin):
                     }
 
                     async def _bring_up_one(idx: int) -> tuple[int, bool, "ScaleOutFailure | None", int]:
+                        if removal_submitted is not None:
+                            with self._engine_lifecycle_lock:
+                                if self._colocate_disposing:
+                                    return (idx, False, None, replica_offsets[idx])
+                                self._colocate_pending_pgs.pop(per_replica_pgs[idx].id, None)
                         r = await self._bring_up_single_replica(
                             request=request,
                             srv=srv,
@@ -2695,7 +2869,10 @@ class RolloutManager(ReloadableMixin):
             if removal_submitted is not None:
                 await self._confirm_unused_colocate_pgs(srv, per_replica_pgs, removal_submitted)
             with self._engine_lifecycle_lock:
-                if request.status is not ScaleOutStatus.CANCELLED:
+                failed_during_dispose = (
+                    removal_submitted is not None and self._colocate_full_failed and self._colocate_disposing
+                )
+                if request.status is not ScaleOutStatus.CANCELLED and not failed_during_dispose:
                     self._update_scale_out_final_status(
                         request, srv, succeeded_engine_ids, failed_replica_ids, failure_reasons
                     )
@@ -2709,6 +2886,13 @@ class RolloutManager(ReloadableMixin):
             request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {failure.message()}")
             logger.exception(f"Scale-out failed for request {request.request_id}")
 
+    def _submit_colocate_pg_removal(self, pg: Any, submitted: set[ray.PlacementGroupID]) -> None:
+        with self._engine_lifecycle_lock:
+            if pg.id not in submitted and pg.id not in self._colocate_shutdown_pgs:
+                ray.util.remove_placement_group(pg)
+            submitted.add(pg.id)
+            self._colocate_pending_pgs.pop(pg.id, None)
+
     async def _confirm_unused_colocate_pgs(
         self, srv: RolloutServer, pgs: list, removal_submitted: set[ray.PlacementGroupID]
     ) -> None:
@@ -2720,9 +2904,7 @@ class RolloutManager(ReloadableMixin):
             retry_delay = 0.2
             for pg_id, pg in list(remaining.items()):
                 try:
-                    if pg_id not in removal_submitted:
-                        ray.util.remove_placement_group(pg)
-                        removal_submitted.add(pg_id)
+                    self._submit_colocate_pg_removal(pg, removal_submitted)
                     if self._colocate_disposing or ray.util.placement_group_table(pg).get("state") in (
                         None,
                         "REMOVED",
@@ -2884,7 +3066,8 @@ class RolloutManager(ReloadableMixin):
             if not result.success:
                 # Keep the pre-created group: the finalizer returns None on
                 # failure, but these engine actors still require rollback.
-                await self._rollback_engines(new_group)
+                if not (_synchronous_colocate(self.args) and self._colocate_full_failed and self._colocate_disposing):
+                    await self._rollback_engines(new_group)
                 return ScaleResult(
                     False, result.reason or ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, "finalize failed")
                 )

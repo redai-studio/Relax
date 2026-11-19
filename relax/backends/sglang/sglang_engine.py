@@ -1047,7 +1047,7 @@ class SGLangEngine(RayActor):
                 raise TimeoutError("Timeout while flushing cache.")
             time.sleep(1)
 
-    def shutdown(self):
+    def shutdown(self, *, wait_for_exit: float | None = None):
         if self.args.rollout_external:
             return
 
@@ -1067,7 +1067,10 @@ class SGLangEngine(RayActor):
         finally:
             process = getattr(self, "process", None)
             if process is not None:
-                kill_process_tree(process.pid)
+                if wait_for_exit is None:
+                    kill_process_tree(process.pid)
+                else:
+                    kill_process_tree(process.pid, wait_timeout=wait_for_exit)
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -1450,7 +1453,17 @@ class SGLangEngine(RayActor):
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
-    def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+    def init_weights_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend,
+        *,
+        timeout: float | None = None,
+    ):
         return self._make_request(
             "init_weights_update_group",
             {
@@ -1461,6 +1474,7 @@ class SGLangEngine(RayActor):
                 "group_name": group_name,
                 "backend": backend,
             },
+            timeout=timeout,
         )
 
     def destroy_weights_update_group(self, group_name, *, strict: bool = False):
@@ -1479,7 +1493,15 @@ class SGLangEngine(RayActor):
             pass
 
     def update_weights_from_distributed(
-        self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        flush_cache=False,
+        weight_version: str | None = None,
+        *,
+        timeout: float | None = None,
     ):
         payload = {
             "names": names,
@@ -1495,6 +1517,7 @@ class SGLangEngine(RayActor):
         return self._make_request(
             "update_weights_from_distributed",
             payload,
+            timeout=timeout,
         )
 
     def init_weights_send_group_for_remote_instance(
@@ -1541,6 +1564,9 @@ class SGLangEngine(RayActor):
         run_token: str,
         tp_size: int,
         timeout_secs: float,
+        *,
+        world_size: int | None = None,
+        expires_at: float | None = None,
     ) -> dict:
         """Run an independent NCCL probe without touching ModelRunner groups.
 
@@ -1550,7 +1576,7 @@ class SGLangEngine(RayActor):
         verbatim, so socket-only mode is accepted only when both engine actors
         already received the same job-start environment.
         """
-        if self.node_rank != 0:
+        if self.node_rank != 0 and world_size is None:
             return {"success": False, "category": PrecheckProbeCategory.UNSUPPORTED_NODE_RANK.value, "results": []}
         local_gpu_count = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
         if tp_size != local_gpu_count:
@@ -1561,6 +1587,10 @@ class SGLangEngine(RayActor):
                 "results": [],
             }
 
+        if expires_at is not None:
+            timeout_secs = min(timeout_secs, expires_at - time.time())
+            if timeout_secs <= 0:
+                return {"success": False, "category": PrecheckProbeCategory.TIMEOUT.value, "results": []}
         port_list = ports.split(",")
         if len(port_list) != tp_size:
             return {
@@ -1640,9 +1670,13 @@ class SGLangEngine(RayActor):
                 "results": [],
             }
 
+        if expires_at is not None:
+            timeout_secs = min(timeout_secs, expires_at - time.time())
+            if timeout_secs <= 0:
+                return {"success": False, "category": PrecheckProbeCategory.TIMEOUT.value, "results": []}
+        deadline = time.monotonic() + timeout_secs
         processes = []
         log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
-        started_at = time.monotonic()
         for local_rank, port in enumerate(port_list):
             command = [
                 sys.executable,
@@ -1653,7 +1687,9 @@ class SGLangEngine(RayActor):
                 "--master-port",
                 port,
                 "--rank",
-                str(group_rank),
+                str(group_rank if world_size is None else group_rank + local_rank),
+                "--world-size",
+                str(world_size or 2),
                 "--device-id",
                 str(local_rank),
                 "--timeout-secs",
@@ -1676,17 +1712,17 @@ class SGLangEngine(RayActor):
                 if "log_file" in locals() and not log_file.closed:
                     log_file.close()
                 for _, process, process_log, _ in processes:
-                    scale_utils._terminate_probe_process(process)
+                    scale_utils._terminate_probe_process(process, grace_secs=0.1 if world_size is not None else 2.0)
                     process_log.close()
                 log_directory.cleanup()
                 return {
                     "success": False,
                     "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value,
                     "message": f"failed to launch rank {local_rank}: {type(exc).__name__}: {exc}",
+                    "stopped": all(process.poll() is not None for _, process, _, _ in processes),
                     "results": [],
                 }
 
-        deadline = started_at + timeout_secs
         # Wrap the entire post-launch body so an unexpected exception (e.g.
         # ``open`` failing during result collection) cannot leak running child
         # processes (CUDA context + NCCL group on the LIVE gpu) or the tempdir.
@@ -1699,14 +1735,14 @@ class SGLangEngine(RayActor):
             timed_out = {local_rank for local_rank, process, _, _ in processes if process.poll() is None}
             for local_rank, process, _, _ in processes:
                 if local_rank in timed_out:
-                    scale_utils._terminate_probe_process(process)
+                    scale_utils._terminate_probe_process(process, grace_secs=0.1 if world_size is not None else 2.0)
 
             results = []
             for local_rank, process, log_file, log_path in processes:
                 # A probe wedged in an uninterruptible (D) state can survive SIGKILL,
                 # so bound the join instead of blocking this actor thread forever.
                 try:
-                    process.wait(timeout=10)
+                    process.wait(timeout=0 if world_size is not None else 10)
                 except subprocess.TimeoutExpired:
                     logger.error(
                         f"NCCL precheck rank {local_rank} (pid {process.pid}) unresponsive after "
@@ -1752,6 +1788,7 @@ class SGLangEngine(RayActor):
             failed = [result for result in results if not result["success"]]
             return {
                 "success": not failed,
+                "stopped": all(process.poll() is not None for _, process, _, _ in processes),
                 "category": failed[0]["category"] if failed else None,
                 "error_type": failed[0].get("error_type") if failed else None,
                 "error": failed[0].get("error") if failed else None,
@@ -1768,7 +1805,7 @@ class SGLangEngine(RayActor):
             }
         finally:
             for _, process, log_file, _ in processes:
-                scale_utils._terminate_probe_process(process)
+                scale_utils._terminate_probe_process(process, grace_secs=0.1 if world_size is not None else 2.0)
                 try:
                     log_file.close()
                 except Exception:
