@@ -189,15 +189,18 @@ class UpdateWeightFromTensor:
         self.rollout_engines = rollout_engines[:colocate_engine_nums]
         distributed_engines = rollout_engines[colocate_engine_nums:]
         if self.use_distribute:
-            self._is_distributed_src_rank = (
-                mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-                and mpu.get_tensor_model_parallel_rank() == 0
-                and mpu.get_pipeline_model_parallel_rank() == 0
-            )
             if shared_engine_count is None:
+                self._is_distributed_src_rank = (
+                    mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+                    and mpu.get_tensor_model_parallel_rank() == 0
+                    and mpu.get_pipeline_model_parallel_rank() == 0
+                )
                 self.disconnect_distributed_group()
                 self._group_name = "slime"
             else:
+                # The training rank that owns the FULL lease also owns the remote group.
+                # Megatron's DP group can be unloaded during weight export.
+                self._is_distributed_src_rank = dist.get_rank(group=get_gloo_group()) == 0
                 if remote_group_name is None:
                     raise ValueError("Independent engines require a weight-update group name")
                 if self._model_update_groups is not None and self._group_name != remote_group_name:
