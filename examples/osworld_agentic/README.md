@@ -6,6 +6,7 @@
 
 ## 目录与配置
 
+- [决策 hidden states](HIDDEN_STATES.md)：默认关闭的 rollout 表示采集、版本限制与成败关联示例。
 - [Visual Context Segmentation](VCS.md)：可选的追加式上下文与批量截图裁剪，连续多轮回答按片段训练，默认关闭。
 - [CUA 成功轨迹库](ARCHIVE.md)：训练脚本默认直接保存成功轨迹和图片，支持容量、每任务配额和多模态 SFT 离线导出，无需独立服务。
 - `env.example.sh`：公开的部署配置模板，不包含实际服务地址或密钥。

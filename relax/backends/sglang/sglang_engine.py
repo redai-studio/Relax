@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import importlib
 import ipaddress
 import json
 import multiprocessing
@@ -302,16 +303,16 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def _patched_run_scheduler_process(*args, **kwargs):
-    """Scheduler-subprocess entry used for the routing-replay path.
+    """Install independently opted-in patches inside each scheduler process."""
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+        from relax.backends.sglang.routing_replay_patch import apply_patch
 
-    This wrapper is only installed when ``--optimize-routing-replay`` is
-    enabled (see ``_launch_server_with_patches``), so the routing-replay async
-    D→H patch is applied **unconditionally** here, preserving the original
-    behavior.
-    """
-    from relax.backends.sglang.routing_replay_patch import apply_patch
-
-    apply_patch()
+        apply_patch()
+    if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
+        backend = importlib.import_module(
+            os.environ.get("RELAX_DECISION_HIDDEN_BACKEND", "relax.backends.sglang.decision_hidden")
+        )
+        backend.apply_patch()
 
     from sglang.srt.managers.scheduler import run_scheduler_process
 
@@ -325,8 +326,7 @@ def _launch_server_with_patches(server_args: ServerArgs):
     - main process: OPD pre-expanded multimodal patch
       (``RELAX_OPD_PREEXPANDED_PATCH=1``).
     - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
+      and decision hidden collection (``RELAX_DECISION_HIDDEN_DIR``).
     """
     from sglang.srt.entrypoints.http_server import launch_server
 
@@ -354,7 +354,12 @@ def _launch_server_with_patches(server_args: ServerArgs):
 
         apply_opd_preexpanded_patch()
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+    if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
+        backend = importlib.import_module(
+            os.environ.get("RELAX_DECISION_HIDDEN_BACKEND", "relax.backends.sglang.decision_hidden")
+        )
+        backend.validate_server(server_args)
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY or os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)

@@ -48,6 +48,7 @@ from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
 from relax.utils.training.packing_metrics import PackingMetrics
+from relax.utils.training.perf_trace import phase
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
@@ -1106,6 +1107,9 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    from relax.utils.training.prefix_runtime import actor_forward, create_prefix_runtime
+
+    prefix_runtime = create_prefix_runtime()
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()
 
@@ -1139,6 +1143,7 @@ def train_one_step(
                 data_iterator,
                 [
                     "tokens",
+                    "prefix_inputs",
                     "multimodal_train_inputs",
                     "packed_seq_params",
                     "total_lengths",
@@ -1171,6 +1176,8 @@ def train_one_step(
         # set in the SFT branch below; left as None for return_schedule_plan or
         # the non-SFT path so the original loss_function is used.
         lm_head_forward = None
+        if return_schedule_plan and prefix_runtime is not None:
+            raise NotImplementedError("Detached prefixes do not implement combined 1F1B scheduling")
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             # build_schedule_plan path doesn't go through model() so the
@@ -1262,15 +1269,15 @@ def train_one_step(
                 ) as lm_head_forward:
                     if use_indexer_replay:
                         with IndexerReplay.forward_stage():
-                            output_tensor = model(**forward_kwargs)
+                            output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
                     else:
-                        output_tensor = model(**forward_kwargs)
+                        output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
             else:
                 if use_indexer_replay:
                     with IndexerReplay.forward_stage():
-                        output_tensor = model(**forward_kwargs)
+                        output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
                 else:
-                    output_tensor = model(**forward_kwargs)
+                    output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -1322,16 +1329,22 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
+    try:
+        with phase("forward_backward"):
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+            )
+
+    finally:
+        if prefix_runtime is not None:
+            prefix_runtime.close()
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1377,7 +1390,8 @@ def train_one_step(
         grad_norm = 0.0
         num_zeros_in_grad = None
     else:
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        with phase("optimizer_step"):
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
         if not getattr(args, "check_for_nan_in_loss_and_grad", True):
             # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).

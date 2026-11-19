@@ -8,6 +8,7 @@ This recipe trains Qwen3-VL-8B-Thinking with GRPO, Relax resident agentic rollou
 
 ## Files and configuration
 
+- [Decision hidden states](HIDDEN_STATES.en.md): optional rollout representations, version constraints, and outcome joins.
 - [CUA success archive](ARCHIVE.en.md): direct storage of successful trajectories and images, enabled by the training script with capacity limits, task quotas and offline multimodal SFT export; no standalone service required.
 - `env.example.sh`: public deployment template without real endpoints or credentials.
 - `env.local.sh`: private copy of the template, ignored by Git; never commit it.

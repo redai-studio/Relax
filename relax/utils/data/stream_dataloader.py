@@ -1120,7 +1120,9 @@ def post_process_rollout_data(args, rollout_data):
         rollout_data.update(expanded)
 
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
+    from relax.utils.training.prefix_runtime import record_host_prefix_inputs
 
+    record_host_prefix_inputs(rollout_data)
     cuda_dev = device_utils.make_current_torch_device()
     rollout_data["tokens"] = [torch.as_tensor(t, dtype=torch.long, device=cuda_dev) for t in rollout_data["tokens"]]
     rollout_data["loss_masks"] = [

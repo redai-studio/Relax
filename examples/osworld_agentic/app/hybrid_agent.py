@@ -89,6 +89,8 @@ class RelaxHybridAgent(HybridAgentLocal):
         self._api_key = os.environ.get("OPENAI_API_KEY", "")
 
     def predict(self, instruction: str, obs: dict[str, Any], **kwargs: Any) -> Any:
+        if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
+            self._hidden_turn_id = int(kwargs.get("step_idx", len(self.actions)))
         if self.visual_context is not None:
             self.visual_context.begin_turn(int(kwargs.get("step_idx", len(self.actions))))
         return super().predict(instruction, obs, **kwargs)
@@ -113,6 +115,11 @@ class RelaxHybridAgent(HybridAgentLocal):
         visual_context = getattr(self, "visual_context", None)
         if visual_context is not None:
             payload = visual_context.prepare(payload)
+        if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
+            payload = {
+                **payload,
+                "relax_hidden_context": {"task_id": self._hidden_task_id, "turn_id": self._hidden_turn_id},
+            }
         archive = getattr(self, "archive", None)
         last_error = None
         for attempt in range(self._max_llm_call_retries):

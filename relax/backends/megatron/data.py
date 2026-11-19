@@ -29,6 +29,7 @@ from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
 from relax.utils.training.flops_counter import FlopsCounter
+from relax.utils.training.perf_trace import record_workload
 from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
 
@@ -1311,6 +1312,7 @@ def get_data_iterator(
             dummy_micro_batch_offsets=dummy_micro_batch_offsets,
         )
 
+    record_workload(rollout_data, data_iterator, num_microbatches, max_tokens_per_gpu)
     return (
         data_iterator,
         num_microbatches,

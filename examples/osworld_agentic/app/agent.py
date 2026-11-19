@@ -230,6 +230,8 @@ async def run_session(
         vcs_prune_images=int(config.get("vcs_prune_images", 2)),
     )
     agent.reset(logging.getLogger("osworld_agentic.hybrid_agent"))
+    if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
+        agent._hidden_task_id = str(task_config["id"])
     archive = None
     if os.environ.get("CUA_ARCHIVE_ENABLE") == "1":
         try:
@@ -351,6 +353,21 @@ async def run_session(
         phase_start = time.monotonic()
         reward = await env.evaluate()
         timings["evaluate"] = time.monotonic() - phase_start
+        if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
+            from relax.agentic.decision_hidden import write_record
+
+            evidence = getattr(env, "archive_evaluation", {})
+            write_record(
+                "outcomes",
+                {
+                    "task_id": str(task_config["id"]),
+                    "session_id": os.environ["RELAX_SESSION_ID"],
+                    "reward": float(reward),
+                    "success": bool(reward == 1.0) if not evidence.get("error") else None,
+                    "evaluation_error": evidence.get("error"),
+                    "stop_reason": stop_reason,
+                },
+            )
         if archive:
             evidence = getattr(env, "archive_evaluation", {})
             archive.finish(evidence.get("raw"), evidence.get("error", "missing evaluator evidence"), stop_reason)

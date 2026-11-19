@@ -27,6 +27,7 @@ from ray import serve
 from starlette.requests import ClientDisconnect
 
 from relax.agentic import AGENTIC_CHAT_API_ROUTE_PREFIX, AGENTIC_CHAT_API_SERVICE_NAME
+from relax.agentic.decision_hidden import enabled as decision_hidden_enabled
 from relax.agentic.pipeline import (
     RuntimeGroupError,
     SessionExportTransport,
@@ -863,7 +864,7 @@ def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
     ):
         raise AgenticChatRequestError("stop must be a string or list of strings", param="stop")
 
-    return _normalized_generation_request(
+    normalized = _normalized_generation_request(
         messages=messages,
         tools=payload.get("tools"),
         chat_template_kwargs=chat_template_kwargs,
@@ -873,6 +874,18 @@ def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
         seed=payload.get("seed"),
         logprobs=logprobs,
     )
+    if decision_hidden_enabled():
+        context = payload.get("relax_hidden_context")
+        if (
+            not isinstance(context, dict)
+            or not isinstance(context.get("task_id"), str)
+            or not isinstance(context.get("turn_id"), int)
+        ):
+            raise AgenticChatRequestError(
+                "Hidden collection requires task_id and turn_id", param="relax_hidden_context"
+            )
+        normalized["hidden_context"] = {"task_id": context["task_id"], "turn_id": context["turn_id"]}
+    return normalized
 
 
 def _normalized_responses_request(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1826,6 +1839,7 @@ class AgenticSessionShard:
         stop: Optional[list[str] | str],
         seed: Optional[int],
         logprobs: bool = False,
+        hidden_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve one HTTP route token to the actor-local Session ref."""
 
@@ -1842,6 +1856,7 @@ class AgenticSessionShard:
                 stop=stop,
                 seed=seed,
                 logprobs=logprobs,
+                hidden_context=hidden_context,
             )
         except AgenticChatRequestError as error:
             return _error_from_exception(error)
@@ -2004,6 +2019,7 @@ class AgenticSessionShard:
         stop: Optional[list[str] | str],
         seed: Optional[int],
         logprobs: bool,
+        hidden_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Commit one full OpenAI request to the Forest before scheduling
         it."""
@@ -2076,6 +2092,7 @@ class AgenticSessionShard:
                 wall_started_at=wall_started_at,
                 sampling_params=sampling_params,
                 logprobs=logprobs,
+                hidden_context=hidden_context,
                 history_train_token_prefix=prefix.train_token_prefix,
                 history_rollout_token_prefix=prefix.rollout_token_prefix,
                 history_backend_image_data=prefix.backend_image_data,
@@ -2429,6 +2446,7 @@ class AgenticSessionShard:
                                 video_data=ir.history_backend_video_data,
                                 return_logprob=group.rollout_mode == "train" or ir.logprobs,
                                 fail_fast_no_workers=router_recovery_enabled,
+                                **({"hidden_context": ir.hidden_context} if decision_hidden_enabled() else {}),
                             )
                         except httpx.HTTPStatusError as error:
                             router_unavailable = router_recovery_enabled and is_router_no_available_workers(error)
@@ -3064,6 +3082,7 @@ class AgenticChatAPIService:
                 stop=normalized["stop"],
                 seed=normalized["seed"],
                 logprobs=normalized["logprobs"],
+                **({"hidden_context": normalized.get("hidden_context")} if decision_hidden_enabled() else {}),
             )
         except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as error:
             if isinstance(error, ray.exceptions.RayTaskError) and not isinstance(

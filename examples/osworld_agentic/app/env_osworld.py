@@ -271,11 +271,11 @@ class OSWorldEnv:
         assert self._env is not None, "reset() must be called before evaluate()"
         try:
             raw = self._env.evaluate()
-            if getattr(self, "_archive_enabled", False):
+            if getattr(self, "_archive_enabled", False) or os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
                 self.archive_evaluation = {"raw": raw, "error": None}
             return float(raw)
         except Exception as exc:
-            if getattr(self, "_archive_enabled", False):
+            if getattr(self, "_archive_enabled", False) or os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
                 self.archive_evaluation = {"raw": None, "error": f"{type(exc).__name__}: {exc}"}
             if self._health:
                 self._health.emit(
