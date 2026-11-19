@@ -149,10 +149,22 @@ index faa198b..73e0daf 100644
                  return result
              if output_gate:
 diff --git a/megatron/bridge/models/glm5next/glm53flash_bridge.py b/megatron/bridge/models/glm5next/glm53flash_bridge.py
-index 902588e..d8a9c25 100644
+index 902588e..103d918 100644
 --- a/megatron/bridge/models/glm5next/glm53flash_bridge.py
 +++ b/megatron/bridge/models/glm5next/glm53flash_bridge.py
-@@ -49,6 +49,7 @@ from megatron.core.transformer.enums import AttnBackend
+@@ -28,9 +28,11 @@
+ """
+
+ import types
++from bisect import bisect_left
+ from collections.abc import Mapping
+ from copy import deepcopy
+ from dataclasses import dataclass
++from itertools import accumulate
+ from typing import TYPE_CHECKING, Any, Callable, Optional
+
+ import torch
+@@ -49,6 +51,7 @@
  from megatron.core.transformer.module import MegatronModule
  from torch import Tensor, nn
  from torch.distributed._tensor import DTensor
@@ -160,7 +172,7 @@ index 902588e..d8a9c25 100644
  from transformers import Glm5NextForConditionalGeneration
 
  from megatron.bridge.models.conversion import quantization_utils
-@@ -153,13 +154,23 @@ def _is_keep_mask(attention_mask: Optional[Tensor], input_ids: Tensor) -> bool:
+@@ -153,13 +156,23 @@
      return attention_mask is not None and attention_mask.dim() == 2 and attention_mask.shape == input_ids.shape
 
 
@@ -186,16 +198,25 @@ index 902588e..d8a9c25 100644
      starts = torch.repeat_interleave(cu_seqlens[:-1], cu_seqlens.diff())
      positions = torch.zeros(total_tokens, dtype=torch.long, device=device)
      covered = min(starts.numel(), total_tokens)
-@@ -358,7 +369,7 @@ class GLM53FlashModelProvider(HybridMLAModelProvider, KDALayerConfig):
+@@ -358,7 +371,8 @@
      # Vision configuration (HF Glm5NextVisionConfig object, stored as-is).
      vision_config: Any = None
      spatial_merge_size: int = 2
 -    # Inject vision features before scattering the full sequence across TP ranks.
++    vision_dp_when_tp: bool = False
 +    # Insert vision features before scattering the residual stream across TP ranks.
      scatter_embedding_sequence_parallel: bool = False
      # Required by HF's can_return_tuple-decorated feature extraction methods.
      return_dict: bool = True
-@@ -519,8 +530,8 @@ class GLM53FlashModel(MegatronModule):
+@@ -503,6 +517,7 @@
+         packed_seq_params: Optional["PackedSeqParams"] = None,
+         *,
+         loss_mask: Optional[Tensor] = None,
++        image_grid_thw_cpu: Optional[list[list[int]]] = None,
+     ) -> Tensor | tuple[Tensor, Tensor]:
+         """Insert vision features, then run the language model on a THD token stream.
+
+@@ -519,8 +534,8 @@
 
          The language model applies no positional embedding, so ``position_ids`` is not
          read; per-sequence positions in the packed layout are derived for MTP instead.
@@ -206,7 +227,7 @@ index 902588e..d8a9c25 100644
          Only the pre-process stage embeds tokens and runs the vision tower. Later stages
          read activations from ``set_input_tensor`` and use token IDs only for layout.
          """
-@@ -544,9 +555,7 @@ class GLM53FlashModel(MegatronModule):
+@@ -544,9 +559,7 @@
                  )
              cp_index = self._packed_cp_index(packed_seq_params, input_ids)
              lm_input_ids = _select_tokens(input_ids, cp_index)
@@ -217,7 +238,7 @@ index 902588e..d8a9c25 100644
              if cp_index is not None:
                  labels = _select_tokens(labels, cp_index)
                  if loss_mask is not None:
-@@ -569,21 +578,24 @@ class GLM53FlashModel(MegatronModule):
+@@ -569,21 +582,25 @@
          decoder_input = None
          if self.pre_process:
              if inputs_embeds is None:
@@ -234,6 +255,7 @@ index 902588e..d8a9c25 100644
 +            vision_inputs = dict(
                  pixel_values=pixel_values,
                  image_grid_thw=image_grid_thw,
++                image_grid_thw_cpu=image_grid_thw_cpu,
                  pixel_values_videos=pixel_values_videos,
                  video_grid_thw=video_grid_thw,
              )
@@ -249,10 +271,26 @@ index 902588e..d8a9c25 100644
              # Megatron expects [seq, batch, hidden]; THD uses batch 1.
              decoder_input = decoder_input.transpose(0, 1).contiguous()
              if self.config.sequence_parallel:
-@@ -633,6 +645,51 @@ class GLM53FlashModel(MegatronModule):
+@@ -614,11 +631,12 @@
+         image_grid_thw: Optional[Tensor],
+         pixel_values_videos: Optional[Tensor],
+         video_grid_thw: Optional[Tensor],
++        image_grid_thw_cpu: Optional[list[list[int]]] = None,
+     ) -> Tensor:
+         """Replace image and video placeholder embeddings with HF vision features."""
+         if pixel_values is not None:
+-            image_embeds = self.get_image_features(pixel_values, image_grid_thw).pooler_output
+-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
++            image_embeds = self._encode_images(pixel_values, image_grid_thw, image_grid_thw_cpu)
++            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+             image_mask, _ = self.get_placeholder_mask(
+                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+             )
+@@ -632,6 +650,101 @@
+             )
              inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
          return inputs_embeds
-
++
 +    def _insert_cp_vision_features(
 +        self,
 +        input_ids: Tensor,
@@ -263,6 +301,7 @@ index 902588e..d8a9c25 100644
 +        image_grid_thw: Optional[Tensor],
 +        pixel_values_videos: Optional[Tensor],
 +        video_grid_thw: Optional[Tensor],
++        image_grid_thw_cpu: Optional[list[list[int]]] = None,
 +    ) -> Tensor:
 +        if pixel_values is None and pixel_values_videos is None:
 +            return inputs_embeds
@@ -270,9 +309,7 @@ index 902588e..d8a9c25 100644
 +        # video span. Use HF's global masks before selecting the local shard.
 +        image_mask, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
 +        if pixel_values is not None:
-+            # The HF feature helper splits by image on the host. Packed SFT
-+            # consumes the original pooled rows in order, so skip split/concat.
-+            image_features = self.visual(pixel_values.type(self.visual.dtype), grid_thw=image_grid_thw).pooler_output
++            image_features = self._encode_images(pixel_values, image_grid_thw, image_grid_thw_cpu)
 +            inputs_embeds = self._insert_local_vision_features(image_mask, inputs_embeds, image_features, cp_index)
 +        if pixel_values_videos is not None:
 +            video_features = self.get_video_features(pixel_values_videos, video_grid_thw).pooler_output
@@ -280,6 +317,57 @@ index 902588e..d8a9c25 100644
 +                video_mask, inputs_embeds, torch.cat(video_features, dim=0), cp_index
 +            )
 +        return inputs_embeds
++
++    def _encode_images(
++        self,
++        pixels: Tensor,
++        grid: Tensor,
++        host_grid: Optional[list[list[int]]],
++    ) -> Tensor:
++        """Encode whole images on TP ranks and restore original feature order."""
++        tp_group = self.language_model.tp_group if getattr(self.config, "vision_dp_when_tp", False) else None
++        if (
++            tp_group is None
++            or tp_group.size() == 1
++            or not host_grid
++            or pixels.requires_grad
++            or any(parameter.requires_grad for parameter in self.visual.parameters())
++        ):
++            return self.visual(pixels.to(dtype=self.visual.dtype), grid_thw=grid).pooler_output
++
++        from transformers.utils.generic import is_flash_attention_requested
++        from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
++
++        rank = tp_group.rank()
++        size = tp_group.size()
++        merge = self.visual.spatial_merge_size
++        offsets = list(accumulate((t * h * w for t, h, w in host_grid), initial=0))
++        total = offsets[-1]
++        if len(host_grid) != grid.size(0) or total != pixels.size(0):
++            raise ValueError("GLM vision grid and pixel row counts do not agree.")
++        start = bisect_left(offsets, (total * rank + size - 1) // size)
++        stop = bisect_left(offsets, (total * (rank + 1) + size - 1) // size)
++        patches_per_output = merge**2
++        features = pixels.new_zeros(
++            (total // patches_per_output, self.visual.config.out_hidden_size), dtype=self.visual.dtype
++        )
++        if start < stop:
++            local_grid = torch.tensor(host_grid[start:stop], dtype=torch.long, device="cpu")
++            positions = get_vision_position_ids(local_grid, merge).to(pixels.device)
++            lengths = get_vision_cu_seqlens(local_grid)
++            if is_flash_attention_requested(self.visual.config):
++                lengths = lengths.to(pixels.device)
++            begin, end = offsets[start], offsets[stop]
++            local_features = self.visual(
++                pixels[begin:end].to(dtype=self.visual.dtype),
++                grid_thw=local_grid,
++                position_ids=positions,
++                cu_seqlens=lengths,
++                max_seqlen=max(h * w for _, h, w in host_grid[start:stop]),
++            ).pooler_output
++            features[begin // patches_per_output : end // patches_per_output].copy_(local_features)
++        torch.distributed.all_reduce(features, group=tp_group)
++        return features
 +
 +    @staticmethod
 +    def _insert_local_vision_features(
@@ -297,11 +385,10 @@ index 902588e..d8a9c25 100644
 +        table = torch.cat((features.new_zeros((1, features.size(-1))), features), dim=0)
 +        local_features = F.embedding(indices, table, padding_idx=0)
 +        return torch.where(local_mask.unsqueeze(-1), local_features, inputs_embeds)
-+
+
      def _pack_rows(self, tensor: Tensor, keep_mask: Tensor) -> tuple[Tensor, "PackedSeqParams"]:
          """Pack the kept tokens of dense rows into this rank's TP/CP/FP8-aligned THD stream."""
-         return preprocess_packed_seqs(
-@@ -716,7 +773,16 @@ class GLM53FlashBridge(MegatronModelBridge):
+@@ -716,7 +829,16 @@
          main_pattern, moe_layer_freq = _glm5next_hybrid_layout(hf_config)
          lin = text_config.linear_attn_config
          num_mtp = int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)

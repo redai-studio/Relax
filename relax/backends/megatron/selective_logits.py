@@ -7,6 +7,36 @@ from argparse import Namespace
 import torch
 
 
+def prepare_glm53_cp_selective_logits(batch: dict, cp_size: int, cp_rank: int) -> None:
+    """Build selection indices in the same zigzag order as the loss."""
+    from relax.utils.sft_utils import align_loss_mask_for_sft
+
+    from .cp_utils import get_cp_local_loss_masks
+
+    masks = batch["loss_masks"]
+    if batch["tokens"].device.type != "cpu":
+        raw_masks = batch.get("selective_loss_masks_cpu")
+        if raw_masks is None:
+            return
+        if any(mask.device.type != "cpu" for mask in raw_masks):
+            raise ValueError("Selective logits masks must stay on CPU")
+        masks = [
+            align_loss_mask_for_sft(mask) if total == response else mask
+            for mask, total, response in zip(raw_masks, batch["total_lengths"], batch["response_lengths"], strict=True)
+        ]
+    local_masks = get_cp_local_loss_masks(
+        batch["total_lengths"],
+        batch["response_lengths"],
+        masks,
+        padded_total_lengths=batch["padded_total_lengths"],
+        dynamic_cp_size=cp_size,
+        dynamic_cp_rank=cp_rank,
+    )
+    batch["selective_logit_rows"] = [
+        (mask.numel(), torch.nonzero(mask != 0, as_tuple=True)[0]) for mask in local_masks
+    ]
+
+
 def prepare_selective_logits(batch: dict, args: Namespace) -> None:
     """Attach per-microbatch indices before pinning/copying the CPU batch.
 
