@@ -3932,6 +3932,9 @@ class MegatronTrainRayActor(TrainRayActor):
             "returns",
             "opd_reverse_kl",
         }
+        if self.args.dynamic_context_parallel:
+            # forward_only already restored these responses in their original sample order.
+            token_fields -= {"log_probs", "ref_log_probs"}
         fields_to_gather = [
             key for key, value in output_dict.items() if key in token_fields and isinstance(value, List)
         ]
