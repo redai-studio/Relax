@@ -18,7 +18,7 @@ def require_functions(path: Path, names: set[str]) -> None:
 def main() -> None:
     for name, version in {
         "sglang": "0.5.21",
-        "transformers": "5.16.0",
+        "transformers": "5.23.0",
         "tokenizers": "0.23.2",
         "tilelang": "0.1.12",
         "quack-kernels": "0.6.4",

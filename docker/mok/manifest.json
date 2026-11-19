@@ -2,7 +2,7 @@
   "schema_version": 1,
   "scope": "MoK shipped by Dockerfile.cu13 Blackwell; Megatron adapter is part of the complete CUDA patch.",
   "megatron": {
-    "baseline": "Existing image /root/Megatron-LM snapshot (no git history)",
+    "baseline": "f78809f6d9c88f8638ea7822966f35057a63fd5c",
     "upstream_port_pr": 8497,
     "upstream_port_commit": "c42e8216d2031ab3ca191e56c9d370b347c2cf02",
     "changed_files": [
@@ -18,12 +18,12 @@
     "before_sha256": {
       "megatron/core/transformer/moe/megakernel/__init__.py": "58e10992bbd9be26e7f3405062edcb000a2d36f482777cb36be947e60a32ca32",
       "megatron/core/transformer/moe/megakernel/factory.py": "b57ba0c2d1ef7a57a6e9972d3b19ce5401093f16d4e5647ba7197eb2fac4e3ee",
-      "megatron/core/transformer/moe/megakernel/mok/backend.py": "dbc1a31cf9b8f5f908d837ea51038ce925ec911a94d067dd7139cfe0bb950088",
-      "megatron/core/transformer/moe/megakernel/mok/runtime.py": "4b023e432d033c2195307a8e3aae17de3a588f2c67ddd526226bd07e5cff3571",
-      "megatron/core/transformer/moe/megakernel/mok/weights.py": "6ce1077843b27adda17352876cbb4ea0da89ac1af9c8004264e8032232be22a3",
-      "megatron/core/transformer/moe/moe_layer.py": "7905b52b1e8aa39d402cb65fb34d492ca5959466b506ac9a4b47b4fd47557acf",
-      "megatron/core/transformer/transformer_config.py": "769a7dee2ab9d7ea74ec348a5eb251d2036c5bb2def37b6699fe62e773b54c57",
-      "megatron/training/arguments.py": "163660a1b4becb7bec59f2e2ea6bef6c53d4d32ee5c3dbef9a3705120416f8fa"
+      "megatron/core/transformer/moe/megakernel/mok/backend.py": "63326a8898483e2b31a00b190004d7b8a470da350e4658e71282fadea3c541fd",
+      "megatron/core/transformer/moe/megakernel/mok/runtime.py": "1e6b1b65f1203ddf40e5ea6f5135091903adb4385416fd217d5a5b244468607a",
+      "megatron/core/transformer/moe/megakernel/mok/weights.py": "802488aaf060e57793d33c4296ded6a7e33208a81da4c82260dcc64026f284cf",
+      "megatron/core/transformer/moe/moe_layer.py": "77afff5402f6c04b8df9d87adc502ac5f7a828c37edf9128367b522ff3cf5d25",
+      "megatron/core/transformer/transformer_config.py": "4eaeb8bbe4d3dea18fba81d260babadc564653662db022e1000e4cd93a3b7654",
+      "megatron/training/arguments.py": "f950eee6a3ae2177484808612b78868408382a0c6b615e28aa92254889ef4e1a"
     },
     "after_sha256": {
       "megatron/core/transformer/moe/megakernel/__init__.py": "46975e755a50423dde60ed4e2ea4dcaf5f4810095b773a05e67b79d010e83bca",
@@ -31,9 +31,9 @@
       "megatron/core/transformer/moe/megakernel/mok/backend.py": "cac7fae895389450d0ffce3a7ecbcf09ca141d0f28e4c135c844b2a932f5fbb7",
       "megatron/core/transformer/moe/megakernel/mok/runtime.py": "bfe82a05e6666fee644ce55e0ec98f7874ce296d33340a1de263671cd47eb98c",
       "megatron/core/transformer/moe/megakernel/mok/weights.py": "802488aaf060e57793d33c4296ded6a7e33208a81da4c82260dcc64026f284cf",
-      "megatron/core/transformer/moe/moe_layer.py": "c110fc199a901d0d869afa07b3f03b2024395646d40299b6005e72f2a6e1a7ff",
-      "megatron/core/transformer/transformer_config.py": "e2b7dd8f27cd0228c5a46615cfd0bc1db2cacf5e1db5491cff76c0ec397871f1",
-      "megatron/training/arguments.py": "b8cce01fd0c3f0256ec2743ed41514a6294df1ade09719c044177a94da14d94d"
+      "megatron/core/transformer/moe/moe_layer.py": "67582c592d56968e40fa00b090bb47e71647ec17a5f3d90a234860a9dc1ddb7e",
+      "megatron/core/transformer/transformer_config.py": "43fea4ed3b33ce15f3dcde55c7786a7b91578cf40946a2718b47248b8d9764e4",
+      "megatron/training/arguments.py": "b0dc9772658d8da13210e50b6c4aeee6f585bdcaa50abe595b03c09ba04f0755"
     }
   },
   "mok": {

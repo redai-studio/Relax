@@ -27,6 +27,7 @@ def test_bridge_forwards_qsa_force_sparse(force_sparse):
         "provider": SimpleNamespace(qsa_force_sparse=not force_sparse),
         "logger": Mock(),
         "is_kimi_k3": False,
+        "is_glm53_flash": False,
     }
     body = [statements[key] for key in ("bridge_keys", "args_dict", "override_loop")]
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), namespace)

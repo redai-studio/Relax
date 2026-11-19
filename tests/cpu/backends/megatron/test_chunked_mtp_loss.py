@@ -263,34 +263,32 @@ def test_token_aware_tracker_api_receives_scaled_sum_and_count(monkeypatch):
 
 @pytest.mark.parametrize("enabled,fused", [(False, False), (True, True), (True, False)])
 def test_static_dispatch_retains_native_fallback(monkeypatch, enabled, fused):
-    import ast
-    import inspect
-    import textwrap
+    class Head(_FakeHead):
+        def forward(
+            self, input_, weight=None, runtime_gather_output=None, output_cross_entropy_loss=False, labels=None
+        ):
+            logits, bias = super().forward(input_, weight=weight, runtime_gather_output=runtime_gather_output)
+            return _stub_clml(labels, logits) if output_cross_entropy_loss else (logits, bias)
 
-    source = textwrap.dedent(inspect.getsource(_mtp_mod.process_mtp_loss))
-    tree = ast.parse(source)
-    function = tree.body[0]
-    branch = next(
-        (
-            node
-            for node in function.body
-            if isinstance(node, ast.If) and "_chunked_mtp_enabled" in ast.unparse(node.test)
-        ),
+    chunked_result = object()
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: enabled)
+    monkeypatch.setattr(_patch, "process_mtp_loss", lambda *args, **kwargs: chunked_result)
+    hidden = torch.randn(S * (1 + LAYERS), B, H)
+    result = _mtp_mod.process_mtp_loss(
+        hidden,
+        torch.zeros(B, S, dtype=torch.long),
         None,
+        Head(H, V),
+        None,
+        None,
+        False,
+        _stub_clml,
+        _make_config(fuse_linear=fused),
     )
-    if branch is None:
-        pytest.skip("Requires image-built static chunked MTP dispatch")
-    # Execute the real dispatch condition with independent results for each path.
-    branch = ast.If(test=branch.test, body=[ast.Return(ast.Constant("chunked"))], orelse=[])
-    function = ast.FunctionDef(
-        name="dispatch",
-        args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-        body=[branch, ast.Return(ast.Constant("native"))],
-        decorator_list=[],
-    )
-    scope = {"_chunked_mtp_enabled": lambda: enabled, "config": _make_config(fuse_linear=fused)}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "dispatch", "exec"), scope)
-    assert scope["dispatch"]() == ("chunked" if enabled and not fused else "native")
+    if enabled and not fused:
+        assert result is chunked_result
+    else:
+        torch.testing.assert_close(result, hidden[:S])
 
 
 @pytest.mark.parametrize("batched_roll", [False, True])

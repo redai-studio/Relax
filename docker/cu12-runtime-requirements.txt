@@ -12,5 +12,5 @@ grpcio-health-checking==1.81.1
 grpcio-reflection==1.81.1
 cupy-cuda12x==13.6.0
 tifffile==2024.8.30
-huggingface-hub==1.10.0
+huggingface-hub==1.31.0
 pillow==11.3.0

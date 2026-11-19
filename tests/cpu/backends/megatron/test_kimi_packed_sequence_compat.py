@@ -31,58 +31,31 @@ def _bridge_root() -> Path:
 
 @pytest.mark.parametrize("tp,cp,rank", [(2, 2, 1)])
 @pytest.mark.parametrize("mask_dtype", [torch.bool])
-def test_kimi_packed_call_preserves_sequence_first_cp_layout(tp: int, cp: int, rank: int, mask_dtype) -> None:
-    root = _bridge_root()
-    utility = root / "qwen_vl/modelling_qwen3_vl/utils.py"
-    function = next(
-        node
-        for node in ast.parse(utility.read_text()).body
-        if isinstance(node, ast.FunctionDef) and node.name == "preprocess_packed_seqs"
-    )
-    namespace = {
-        "torch": torch,
-        "PackedSeqParams": SimpleNamespace,
-        "mpu": SimpleNamespace(
-            get_tensor_model_parallel_world_size=lambda: tp,
-            get_context_parallel_world_size=lambda: cp,
-            get_context_parallel_rank=lambda: rank,
-        ),
-    }
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(module), str(utility), "exec"), namespace)
-    helper = namespace[function.name]
-    captured = {}
+def test_kimi_packed_call_preserves_sequence_first_cp_layout(
+    tp: int, cp: int, rank: int, mask_dtype, monkeypatch
+) -> None:
+    from megatron.bridge.models.kimi_vl import modeling_kimi_k25_vl
+    from megatron.core import parallel_state
+    from megatron.core.packed_seq_params import PackedSeqParams
 
-    def preprocess(*args, **kwargs):
-        result = helper(*args, **kwargs)
-        captured["metadata"] = result[1]
-        return result
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp)
+    monkeypatch.setattr(parallel_state, "get_context_parallel_world_size", lambda: cp)
+    monkeypatch.setattr(parallel_state, "get_context_parallel_rank", lambda: rank)
 
-    model_path = root / "kimi_vl/modeling_kimi_k25_vl.py"
-    tree = ast.parse(model_path.read_text())
-    expression = next(
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "inputs_embeds" for target in node.targets)
-        and any(
-            isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "preprocess_packed_seqs"
-            for call in ast.walk(node.value)
-        )
-    )
+    # Run Bridge's actual forward and packing helper with a decoder that echoes
+    # its input. This isolates the GPU decoder and preserves the SBH contract.
+    model = modeling_kimi_k25_vl.KimiK25VLModel.__new__(modeling_kimi_k25_vl.KimiK25VLModel)
+    torch.nn.Module.__init__(model)
+    model.pre_process = True
+    model.config = SimpleNamespace(sequence_parallel=False)
+    model.language_model = SimpleNamespace(forward=lambda **kwargs: kwargs["decoder_input"])
+
     inputs = torch.arange(1, 37, dtype=torch.float32).reshape(2, 6, 3)
     mask = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 0, 0, 0, 0]], dtype=mask_dtype)
-    output = eval(
-        compile(ast.Expression(expression), str(model_path), "eval"),
-        {
-            "inputs_embeds": inputs,
-            "saved_attention_mask": mask,
-            "packed_seq_params": SimpleNamespace(),
-            "preprocess_packed_seqs": preprocess,
-        },
+    output = model(
+        inputs_embeds=inputs,
+        attention_mask=mask,
+        packed_seq_params=PackedSeqParams(qkv_format="thd"),
     )
     align = tp * cp * 2 if cp > 1 else tp
     expected = []
@@ -99,7 +72,7 @@ def test_kimi_packed_call_preserves_sequence_first_cp_layout(tp: int, cp: int, r
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     assert output.is_contiguous()
     assert output.shape[0] % tp == 0
-    params = captured["metadata"]
+    _, params = modeling_kimi_k25_vl.preprocess_packed_seqs(inputs, mask)
     assert params.qkv_format == "thd"
     assert params.cu_seqlens_q.tolist() == [0, padded_lengths[0], sum(padded_lengths)]
     assert params.cu_seqlens_kv.tolist() == params.cu_seqlens_q.tolist()

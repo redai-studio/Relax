@@ -204,6 +204,7 @@ def _distributed_state_loader(optimizer: HybridDeviceOptimizer) -> DistributedOp
     patch_hybrid_optimizer_native_fp32_checkpoint_load()
     distributed = object.__new__(DistributedOptimizer)
     distributed.optimizer = optimizer
+    distributed.data_parallel_group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
     distributed.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=True)
     originals = list(optimizer.param_to_inner_param)
     distributed.model_param_group_index_map = {parameter: (index, 0) for index, parameter in enumerate(originals)}
@@ -390,6 +391,7 @@ def test_mixed_hdo_resume_drops_only_cpu_owned_group_counter_before_chained_save
     moments = [child.state[next(iter(child.state))]["exp_avg"] for child in hdo.cpu_optimizers]
     distributed = object.__new__(DistributedOptimizer)
     distributed.optimizer = hdo
+    distributed.is_stub_optimizer = False
     distributed.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=True)
     distributed.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
     distributed.grad_scaler = None

@@ -161,7 +161,7 @@ ARG ENABLE_SGLANG_PATCH=1
 ARG HYBRID_EP_COMMIT
 ENV RELAX_HYBRID_EP_COMMIT=${HYBRID_EP_COMMIT}
 
-ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+ARG MEGATRON_BRIDGE_COMMIT=137121984ab50b00c7ee5ba38af9086b0ed2faab
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
@@ -220,8 +220,12 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 # The complete CUDA patch retains its provenance in the final image.
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/megatron.patch
 RUN cd /root/Megatron-LM && \
-    sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply --check - && \
-    sed -n '/^# BEGIN common$/,/^# END common$/p' megatron.patch | git apply - && \
+    profiles=common && \
+    if [ "$PATCH_VERSION" = latest ]; then profiles="common cu13"; fi && \
+    for profile in $profiles; do \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply --check - && \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply - || exit 1; \
+    done && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     python -m compileall -q megatron && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
@@ -270,11 +274,11 @@ RUN python -c 'import importlib.metadata as m; print("\n".join("{}=={}".format(d
     pip install --no-cache-dir setuptools-scm==9.2.2 && \
     SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG=0.5.17 \
         pip install --no-cache-dir --no-deps --no-build-isolation -e /sgl-workspace/sglang/python && \
-    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.16.0 tokenizers==0.23.2 && \
+    pip install --no-cache-dir -c /tmp/cu12-abi-constraints.txt transformers==5.23.0 tokenizers==0.23.2 && \
     pip uninstall -y nvidia-cuda-nvcc && \
     sha256sum /sgl-workspace/sglang/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     python -c 'from importlib.metadata import version; \
-        assert version("transformers") == "5.16.0"; assert version("tokenizers") == "0.23.2"; \
+        assert version("transformers") == "5.23.0"; assert version("tokenizers") == "0.23.2"; \
         assert version("sglang") == "0.5.17"; \
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING; \
         assert CONFIG_MAPPING["qwen4_exp"].model_type == "qwen4_exp"; \
