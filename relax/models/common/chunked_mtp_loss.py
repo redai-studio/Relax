@@ -149,7 +149,7 @@ def _chunked_head_ce(
                 hidden = mtp_hidden[rows]
                 labels = mtp_labels[:, rows]
 
-                def acceptance(logits):
+                def acceptance(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
                     if not collect_acceptance:
                         return None
                     return _COMPUTE_MTP_ACCEPTANCE_COUNTS(
