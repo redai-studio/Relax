@@ -67,6 +67,24 @@ def supported(self: Any, hidden: torch.Tensor) -> bool:
     )
 
 
+def cp_convolution(self: Any, normed: torch.Tensor, gated: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """Fuse only the convolution tail after native THD CP reconstruction.
+
+    The caller owns TP/CP gathers and output slicing. The full causal stream
+    needs left padding, never the TP halo used by the CP1 SP path.
+    """
+    if (
+        normed.is_cuda
+        and normed.dtype == torch.bfloat16
+        and not Envs.RELAX_QWEN38_PLE_STREAMED
+        and getattr(self, "_cp_packed_seq_params", None) is not None
+    ):
+        extended = F.pad(normed, (0, 0, 0, 0, self.halo, 0))
+        return _compiled_conv()(extended, normed, gated, self.conv1d.weight, positions, self.conv_dilation)
+    conv = self._causal_dilated_conv(normed, positions)
+    return gated + F.silu(conv.float()).to(gated.dtype)
+
+
 def fused_forward(self: Any, hidden: torch.Tensor) -> torch.Tensor:
 
     if self._ngram_ids is None:

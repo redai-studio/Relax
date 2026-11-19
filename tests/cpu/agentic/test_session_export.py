@@ -168,8 +168,8 @@ def _shard():
     shard = object.__new__(service.AgenticSessionShard.__ray_metadata__.modified_class)
     shard.args = SimpleNamespace(agentic_session_lifecycle=False, use_rollout_routing_replay=False)
     shard._groups, shard._session_records = {}, {}
-    shard._train_generation_open = True
-    shard._permit_cleanup_tasks = set()
+    shard._closed, shard._train_generation_open = False, True
+    shard._permit_cleanup_tasks, shard._agent_cleanup_tasks = set(), set()
     shard._notify_state_change = lambda group=None: None
     shard._trajectory_recorder = service.ShardTrajectoryRecorder(SimpleNamespace(), shard_ordinal=0)
 
@@ -191,13 +191,21 @@ def _session(shard, session_id: str):
     group = service.ResidentGroup("train", f"g-{session_id}", {session_id: cell}, [], ownership="runtime")
     output = SimpleNamespace(reward=1.0, metadata={}, records=())
     session = service._SessionRecord(group, session_id, {}, cell, forest=forest)
+    idle = SimpleNamespace(cancel=lambda: None)
     session.resources = SimpleNamespace(
-        process=SimpleNamespace(output=output, terminate_and_join=terminate_and_join), process_wait=None
+        process=SimpleNamespace(output=output, terminate_and_join=terminate_and_join),
+        process_wait=idle,
+        watcher_task=idle,
     )
     group.sessions.append(session)
     shard._groups[group.group_id] = group
     shard._session_records[session_id] = session
     return session
+
+
+async def _drain_cleanup(shard) -> None:
+    while shard._agent_cleanup_tasks:
+        await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
 
 
 class _GatedMaterialize:
@@ -274,6 +282,7 @@ def test_cancelled_finalize_finishes_export_before_propagating():
         gated.gate.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
+        await _drain_cleanup(shard)
 
     asyncio.run(scenario())
     assert isinstance(session.result_cell.payload, service.SessionExportTransport)

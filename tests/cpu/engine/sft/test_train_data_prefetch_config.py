@@ -19,6 +19,7 @@ _SOURCE = Path(__file__).resolve().parents[4] / "relax/utils/arguments.py"
 def make_args(**overrides):
     values = dict(
         loss_type="sft",
+        task_type="causal_lm",
         train_backend="megatron",
         max_staleness=1,
         per_rank_fetch=False,
@@ -116,7 +117,7 @@ def test_pipeline_selection_runs_after_custom_and_backend_validation():
         if isinstance(n, ast.Expr)
         and isinstance(n.value, ast.Call)
         and isinstance(n.value.func, ast.Name)
-        and n.value.func.id == "slime_validate_args"
+        and n.value.func.id == "relax_validate_args"
     )
     end = next(
         i
@@ -138,7 +139,7 @@ def test_pipeline_selection_runs_after_custom_and_backend_validation():
 
     namespace = dict(
         args=args,
-        slime_validate_args=custom,
+        relax_validate_args=custom,
         megatron_validate_args=backend,
         configure_sft_data_pipeline=configure_sft_data_pipeline,
     )
@@ -172,7 +173,7 @@ def test_late_custom_budget_controls_automatic_pipeline(steps, expected):
     normalize = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_normalize_sft_max_in_flight_steps"
     )
-    validate = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "slime_validate_args")
+    validate = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "relax_validate_args")
     names = {"apply_custom_config_overrides", "_normalize_sft_max_in_flight_steps"}
     calls = [
         n

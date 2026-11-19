@@ -134,7 +134,9 @@ class MediaLoadError(RuntimeError):
     """A sample's media file could not be read in a pool worker."""
 
 
-def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[Any]]:
+def _load_media_for_worker(
+    media_paths: dict[str, list[Any]], *, use_audio_in_video: bool = False
+) -> dict[str, list[Any]]:
     """Load image/video/audio sources inside the worker.
 
     The producer used to decode media in the parent and pickle it into the
@@ -144,6 +146,11 @@ def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[
     parallel — the same path-fed pipeline the rank-side rebuild already proved
     bitwise identical to the decoded-array one.
     """
+    if use_audio_in_video and media_paths.get("video"):
+        raise ValueError(
+            "SFT ProcessorPool does not support extracting audio from video. "
+            "Set use_audio_in_video=False and supply audio as a separate input."
+        )
     loaded: dict[str, list[Any]] = {}
     for kind in ("image", "video", "audio"):
         sources = media_paths.get(kind) or []
@@ -154,9 +161,9 @@ def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[
 
             loader = load_image
         elif kind == "video":
-            from relax.utils.multimodal.video_utils import load_video
+            from relax.utils.multimodal.video_utils import fetch_video
 
-            loader = load_video
+            loader = fetch_video
         else:
             from relax.utils.multimodal.audio_utils import load_audio
 
@@ -164,10 +171,27 @@ def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[
         items: list[Any] = []
         for position, source in enumerate(sources):
             try:
-                items.append(loader(source))
+                if kind == "video":
+                    image_processor = getattr(_worker_processor, "image_processor", None)
+                    frames, metadata, _, _ = loader(
+                        {"video": source},
+                        image_patch_size=getattr(image_processor, "patch_size", 14),
+                        use_audio_in_video=use_audio_in_video,
+                        config=_worker_multimodal_config,
+                    )
+                    items.append(frames)
+                    loaded.setdefault("video_metadata", []).append(
+                        {
+                            "fps": metadata["fps"],
+                            "total_num_frames": metadata["total_num_frames"],
+                            "frames_indices": metadata["frames_indices"].tolist(),
+                        }
+                    )
+                else:
+                    items.append(loader(source))
             except Exception as exc:  # noqa: BLE001 - re-raised with position context
                 raise MediaLoadError(f"failed to load {kind} position={position}: {source!r}") from exc
-        loaded[f"{kind}s"] = items
+        loaded["audio" if kind == "audio" else f"{kind}s"] = items
     return loaded
 
 
@@ -178,16 +202,32 @@ def process_sample_from_paths_in_worker(
 ) -> tuple[list[int], dict[str, Any] | None]:
     """``process_sample_in_worker`` with the media read inside the worker.
 
-    The load and the IPC-shaped conversion mirror the parent-side chain exactly
-    (same loaders, same ``prepare_mm_inputs_for_ipc``), so the processor sees the
-    same inputs it did when the parent shipped decoded arrays.
+    Sample and resize videos locally before processor execution. Normalize
+    image types through the shared IPC conversion without moving worker-local
+    video frames into shared memory.
 
     Raises:
         MediaLoadError: A referenced media file could not be read (the dataset
             maps this to its invalid-multimodal skip policy).
     """
-    media = _load_media_for_worker(media_paths)
-    prompt_ids, train_inputs = process_sample_in_worker(text, prepare_mm_inputs_for_ipc(media), processor_kwargs)
+    media = _load_media_for_worker(media_paths, use_audio_in_video=processor_kwargs.get("use_audio_in_video", False))
+    # These frames stay inside this worker; only parent-to-worker transfers
+    # need prepare_mm_inputs_for_ipc's shared video storage.
+    videos = media.pop("videos", None)
+    media = prepare_mm_inputs_for_ipc(media)
+    if videos is not None:
+        media["videos"] = videos
+        # fetch_video already sampled and resized these frames. Preserve its
+        # original timestamps and pixel limits without affecting image kwargs.
+        processor_kwargs = {
+            **processor_kwargs,
+            "videos_kwargs": {
+                **processor_kwargs.get("videos_kwargs", {}),
+                "do_sample_frames": False,
+                "do_resize": False,
+            },
+        }
+    prompt_ids, train_inputs = process_sample_in_worker(text, media, processor_kwargs)
     if train_inputs is not None:
         processor = get_worker_processor()
         train_inputs[SFT_HF_IMAGE_REBUILD_SUPPORTED] = getattr(

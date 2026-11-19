@@ -159,6 +159,8 @@ def resolve_shard_ordinal(default: int = 0) -> int:
     try:
         import ray
 
+        if not ray.is_initialized():
+            return default
         actor_name = ray.get_runtime_context().get_actor_name()
     except Exception:  # noqa: BLE001 — driver-side tests run outside an actor
         return default
@@ -459,9 +461,9 @@ def sample_reward_fields(
         return None, None
     if isinstance(reward, dict):
         detail = dict(reward)
-        key = getattr(args, "reward_key", None)
+        key = args.reward_key
         if rollout_mode == "eval":
-            key = getattr(args, "eval_reward_key", None) or key
+            key = args.eval_reward_key or key
         value = reward.get(key) if key else None
         return (float(value) if isinstance(value, (int, float)) else None), detail
     if isinstance(reward, (int, float)):

@@ -37,6 +37,7 @@ from relax.models.qwen3_8.ops.qsa_selector import (
 from relax.models.qwen3_8.ops.qsa_selector import (
     score_topk_pack as score_topk_pack,
 )
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -130,7 +131,11 @@ def select_blocks(
     # clamps every tile to its own ``visible`` count anyway.
     widest = min(columns, max(1, max(b - a for a, b in zip(offsets, offsets[1:])) // self.compress_ratio))
     per_query = 4 * (widest * heads + heads * dim + nbytes)
-    tile = max(1, min(total, _TILE_BYTES // max(1, per_query)))
+    tile_mib = Envs.RELAX_QWEN38_QSA_SELECTOR_TILE_MIB
+    if tile_mib is not None and tile_mib <= 0:
+        raise ValueError("RELAX_QWEN38_QSA_SELECTOR_TILE_MIB must be positive")
+    tile_bytes = _TILE_BYTES if tile_mib is None else tile_mib << 20
+    tile = max(1, min(total, tile_bytes // max(1, per_query)))
     k = min(self.block_topk, columns)
     for start_doc, end_doc, doc in zip(offsets, offsets[1:], range(n_docs)):
         if start_doc == end_doc:

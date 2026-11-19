@@ -211,8 +211,8 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
     rm_calls: list = []
 
-    async def fake_batched_rm(args, group):
-        rm_calls.append(group)
+    async def fake_batched_rm(args, group, *, evaluation):
+        rm_calls.append((group, evaluation))
         return [1.0] * len(group)
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: _GroupState())
@@ -226,6 +226,8 @@ async def test_group_reward_only_runs_for_completed_group(monkeypatch, status, e
 
     assert all(sample.status == status for sample in result)
     assert len(rm_calls) == expected_rm_calls
+    if expected_rm_calls:
+        assert rm_calls == [(group, evaluation)]
 
 
 class _RolloutState:
@@ -249,6 +251,7 @@ def _rollout_args(**overrides):
     values = {
         "rollout_global_dataset": True,
         "fully_async": True,
+        "max_staleness": 0,
         "num_rollout": 1,
         "rollout_batch_size": 1,
         "over_sampling_batch_size": 1,
@@ -358,6 +361,7 @@ async def test_eval_excludes_aborted_scored_and_unscored_samples(monkeypatch, gr
         rollout_skip_special_tokens=True,
         eval_reward_key="eval_score",
         reward_key="score",
+        sglang_enable_deterministic_inference=False,
     )
     cfg = SimpleNamespace(
         cache_key=("audit",),
@@ -409,6 +413,7 @@ async def test_eval_discards_whole_aborted_reward_group(monkeypatch):
         rollout_skip_special_tokens=True,
         eval_reward_key=None,
         reward_key=None,
+        sglang_enable_deterministic_inference=False,
     )
     cfg = SimpleNamespace(
         cache_key=("group-audit",),
@@ -461,6 +466,7 @@ async def test_eval_keeps_original_complete_prompt_groups(monkeypatch, group_rm,
         rollout_skip_special_tokens=True,
         eval_reward_key=None,
         reward_key=None,
+        sglang_enable_deterministic_inference=False,
     )
     cfg = SimpleNamespace(
         cache_key=("partial-eval",),

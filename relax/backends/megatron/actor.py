@@ -92,12 +92,14 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import SCORE_CENTERING_TRAIN_FIELDS
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -111,6 +113,7 @@ from relax.utils.utils import (
 )
 
 from ...utils.profile_utils import TrainProfiler
+from ...utils.straggler import install_straggler_profiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import _checkpoint_iteration_dir, is_megatron_checkpoint, load_checkpoint
 from .collective_utils import _agree_drained
@@ -264,11 +267,7 @@ def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
     """Avoid retaining the next prefetched window across memory-heavy step
     boundaries."""
     next_rollout_id = rollout_id + 1
-    is_train_done = next_rollout_id == args.num_rollout
-    should_save_after_step = args.save is not None and (
-        args.rotate_ckpt
-        or (args.save_interval is not None and (next_rollout_id % args.save_interval == 0 or is_train_done))
-    )
+    should_save_after_step = should_save_checkpoint(args, next_rollout_id)
     completed_steps = evaluation_step_for_rollout(args, rollout_id)
     return (
         should_run_sft_eval(args, completed_steps)
@@ -363,6 +362,21 @@ class _SFTPrepackedDeviceIterator:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def set_rollout_manager(self, rollout_manager: Any) -> None:
+        super().set_rollout_manager(rollout_manager)
+        config = ray.get(rollout_manager.get_lora_training_config.remote())
+        self._managed_lora_publication = config is not None
+        if config is not None:
+            if (
+                not self.args.fully_async
+                or self.args.hybrid
+                or self.args.colocate
+                or self.args.offload_rollout
+                or not is_lora_adapter_mode(self.args)
+            ):
+                raise ValueError("managed training publication requires fully-async adapter mode")
+            self.checkpoint_engine_client.backend.configure_lora_publication(config, rollout_manager)
+
     @property
     def _per_step_rollout(self) -> bool:
         """RL consumes weights every train step.
@@ -446,6 +460,8 @@ class MegatronTrainRayActor(TrainRayActor):
             init_tracking(args, primary=False)
 
         self.prof = TrainProfiler(args)
+        # Must precede initialize_model_and_optimizer: the optimizer config takes its timers from the profiler.
+        install_straggler_profiler(role, args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -823,6 +839,17 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
+        if getattr(self.args, "moe_megakernel_backend", None) == "mok":
+            from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+            from mok.functional import clear_workspace_cache
+
+            # Symmetric workspaces belong to the live EP group. Release them
+            # collectively before sleep destroys that group and recreates it on wake.
+            clear_workspace_cache()
+            for model_chunk in self.model:
+                for module in model_chunk.modules():
+                    if isinstance(module, MoKMegakernel):
+                        module.invalidate_storage_cache()
         destroy_process_groups()
 
         self._train_state_offloader.offload()
@@ -1401,7 +1428,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def _end_rollout_weight_update(self, rollout_id: int) -> None:
         """Release the rollout handshake even when no new policy was
         published."""
-        if getattr(self, "rollout_manager", None) is None or dist.get_rank(group=dist.group.WORLD) != 0:
+        if (
+            getattr(self, "_managed_lora_publication", False)
+            or getattr(self, "rollout_manager", None) is None
+            or dist.get_rank(group=dist.group.WORLD) != 0
+        ):
             return
         try:
             response = requests.get(
@@ -2047,13 +2078,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # ran with tms.paused and hit `CUDA error: invalid argument` on the
         # first cudaMalloc (e.g. all_gather_object's byte tensor).
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or (
-                self.args.save_interval is not None
-                and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-            )
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         # Mirror train_actor's post-train sleep so critic frees GPU before the
         # next rollout's SGLang resume tries to alloc KV pages.
@@ -2306,11 +2331,7 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
@@ -2645,7 +2666,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.advantage_estimator == "score_centering":
-                    data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+                    data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
@@ -2779,11 +2800,7 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
 
         if self.args.offload_train:
@@ -2849,7 +2866,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
         if self.args.advantage_estimator == "score_centering":
-            data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
+            data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
         if not getattr(self.args, "true_on_policy_mode", False):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
@@ -3202,9 +3219,14 @@ class MegatronTrainRayActor(TrainRayActor):
         if dist.get_rank(process_group) == 0:
             # Check rollout service
             try:
-                rollout_serve_url = get_serve_url("rollout")
+                if getattr(self, "_managed_lora_publication", False):
+                    # Version publication owns rollout readiness. Do not enter
+                    # the legacy pause/recovery handshake.
+                    rollout_serve_url = None
+                else:
+                    rollout_serve_url = get_serve_url("rollout")
                 retry_deadline = None
-                while True:
+                while rollout_serve_url is not None:
                     request_timeout = self.args.rollout_http_timeout
                     if retry_deadline is not None:
                         request_timeout = retry_deadline - time.monotonic()
@@ -3316,15 +3338,30 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         print_memory("before update_weights")
 
+        managed = getattr(self, "_managed_lora_publication", False)
+        if managed:
+            from relax.engine.lora_versions.training import run_on_training_rank_zero
+
+            def acquire_topology_lease() -> None:
+                if not ray.get(self.rollout_manager.set_weight_updating.remote(True)):
+                    raise RuntimeError("the managed engine pool is being changed")
+
+            run_on_training_rank_zero(acquire_topology_lease, phase="LoRA topology lease")
+
         weight_sync_lock = getattr(self, "_weight_sync_lock", None)
-        if weight_sync_lock is not None and dist.get_rank() == 0:
-            acquired = False
-            while not acquired:
-                acquired = ray.get(weight_sync_lock.acquire.remote())
-                if not acquired:
+
+        def acquire_sync_lock() -> None:
+            if weight_sync_lock is not None:
+                while not ray.get(weight_sync_lock.acquire.remote()):
                     time.sleep(1)
 
+        lock_acquired = False
         try:
+            if managed:
+                run_on_training_rank_zero(acquire_sync_lock, phase="LoRA weight-sync lock")
+            elif dist.get_rank() == 0:
+                acquire_sync_lock()
+            lock_acquired = True
             # Every PP source must select recipients after rank 0 owns the sync lock.
             dist.barrier(group=get_gloo_group())
             if not rollout_only:
@@ -3343,7 +3380,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     # sync without stranding other ranks at their barrier.
                     logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
-            if weight_sync_lock is not None and dist.get_rank() == 0:
+            if managed:
+
+                def release_managed_locks() -> None:
+                    try:
+                        if lock_acquired and weight_sync_lock is not None:
+                            ray.get(weight_sync_lock.release.remote())
+                    finally:
+                        ray.get(self.rollout_manager.set_weight_updating.remote(False))
+
+                run_on_training_rank_zero(release_managed_locks, phase="LoRA weight-sync cleanup")
+            elif lock_acquired and weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())
 
     @timer

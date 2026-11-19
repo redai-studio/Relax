@@ -91,10 +91,10 @@ class _SmokeShard(service.AgenticSessionShard.__ray_metadata__.modified_class):
     def __init__(self) -> None:
         self.args = SimpleNamespace(agentic_session_lifecycle=False, use_rollout_routing_replay=False)
         self._groups, self._session_records = {}, {}
-        self._train_generation_open = True
+        self._closed, self._train_generation_open = False, True
         self._state_revision = 0
         self._state_changed = asyncio.Event()
-        self._permit_cleanup_tasks = set()
+        self._permit_cleanup_tasks, self._agent_cleanup_tasks = set(), set()
         self._trajectory_recorder = service.ShardTrajectoryRecorder(SimpleNamespace(), shard_ordinal=0)
 
         async def shutdown_backend() -> None:
@@ -119,7 +119,8 @@ class _SmokeShard(service.AgenticSessionShard.__ray_metadata__.modified_class):
             output=SimpleNamespace(reward=1.0, metadata={}, records=()), terminate_and_join=terminate_and_join
         )
         session = service._SessionRecord(group, session_id, {}, cell, forest=forest)
-        session.resources = SimpleNamespace(process=process, process_wait=None)
+        idle = SimpleNamespace(cancel=lambda: None)
+        session.resources = SimpleNamespace(process=process, process_wait=idle, watcher_task=idle)
         group.sessions.append(session)
         self._groups[group.group_id] = group
         self._session_records[session_id] = session
