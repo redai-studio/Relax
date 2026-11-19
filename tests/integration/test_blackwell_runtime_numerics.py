@@ -44,6 +44,40 @@ def test_fla_packed_convolution_forward_and_backward(lengths):
         torch.testing.assert_close(actual.grad, expected.grad, rtol=5e-3, atol=5e-3)
 
 
+def test_qwen35_native_gdn_packed_forward_and_backward(monkeypatch):
+    monkeypatch.setenv("FLA_FLASH_QLA", "0")
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
+
+    monkeypatch.setattr("flash_qla.chunk_gated_delta_rule", lambda *a, **kw: pytest.fail("Unexpected FlashQLA call"))
+    torch.manual_seed(42)
+    lengths = (37, 80)
+    t = sum(lengths)
+    q, k = [F.normalize(torch.randn(1, t, 4, 128, device="cuda"), dim=-1).bfloat16() for _ in range(2)]
+    v = torch.randn(1, t, 8, 128, device="cuda", dtype=torch.bfloat16)
+    g = F.logsigmoid(torch.randn(1, t, 8, device="cuda"))
+    beta = torch.rand(1, t, 8, device="cuda", dtype=torch.bfloat16)
+    inputs = [x.requires_grad_() for x in (q, k, v, g, beta)]
+    cu = torch.tensor([0, lengths[0], t], device="cuda", dtype=torch.int32)
+    out, state = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, cu_seqlens=cu, output_final_state=False)
+    assert state is None
+
+    ref_inputs = [x.detach().float().requires_grad_() for x in inputs]
+    outputs = []
+    for qr, kr, vr, gr, br in zip(*(x.split(lengths, dim=1) for x in ref_inputs), strict=True):
+        # Each packed sequence starts with fresh state. Expand Q/K only in the reference.
+        ref_out, _ = naive_recurrent_gated_delta_rule(
+            qr.repeat_interleave(2, dim=2), kr.repeat_interleave(2, dim=2), vr, beta=br, g=gr
+        )
+        outputs.append(ref_out)
+    ref = torch.cat(outputs, dim=1)
+    grad = torch.randn_like(out)
+    actual_grads = torch.autograd.grad(out, inputs, grad)
+    ref_grads = torch.autograd.grad(ref, ref_inputs, grad.float())
+    for actual, expected in zip((out, *actual_grads), (ref, *ref_grads), strict=True):
+        assert (actual.float() - expected).norm() < 0.03 * expected.norm()
+
+
 def test_te_cross_entropy_forward_and_backward():
     from relax.utils.training.fused_ce import te_cross_entropy
 

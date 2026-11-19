@@ -3,7 +3,6 @@
 overlap."""
 
 import os
-from argparse import Namespace
 
 import torch
 from megatron.core.transformer.moe import fused_a2a as fa
@@ -160,10 +159,3 @@ class ExpandedManager(td._DeepepV2Manager):
         self.handle = None
         self.dispatched_probs = None
         return out
-
-
-def install_for_worker(args: Namespace) -> None:
-    """Select expanded DeepEP before this worker builds its MoE layers."""
-    if args.moe_token_dispatcher_type != "flex" or args.moe_flex_dispatcher_backend != "deepepv2":
-        raise ValueError("ExpandedManager requires the flex dispatcher with the deepepv2 backend")
-    td._DeepepV2Manager = ExpandedManager

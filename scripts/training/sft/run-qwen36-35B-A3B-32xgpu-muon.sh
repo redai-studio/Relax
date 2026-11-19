@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.6-35B-A3B multimodal SFT on 4 x 8 Blackwell GPUs with Megatron Muon.
-# Every training node needs a Blackwell image with FLA 0.4.2, DeepEP v2 and emerging-optimizers
+# Every training node needs a optimized Blackwell image with patched FLA 0.5.2, DeepEP v2 and emerging-optimizers
 # compatible with the image's Megatron. These packages must be available to the Ray training workers.
 # Expanded DeepEP requires each EP8 group on one NVLink node and at most 131072 input rows per rank after TP splitting.
 # Default Wholepack also needs the TransferQueue assignment_transform patch on the data service.
@@ -29,24 +29,16 @@ EXP_NAME="${EXP_NAME:-qwen36-35B-A3B-muon-native-tp4-32gpu}"
 RUN_NAME="$EXP_NAME-$(date +%Y%m%d-%H%M%S)-$$"
 CHECKPOINT_DIR="$SAVE_DIR/$EXP_NAME"
 
-# Select the image's Blackwell FLA build before Python imports Megatron's native GDN.
-# The standard Ray entrypoint supplies the other paths and the worker setup hook.
-FLA_ROOT="${RELAX_LEGACY_FLA_ROOT:-/opt/relax/compat/fla-0.4.2}"
-if [[ "${DRY_RUN:-0}" != 1 && ! -f "$FLA_ROOT/fla/ops/gated_delta_rule/chunk.py" ]]; then
-    echo "Missing Blackwell FLA runtime at $FLA_ROOT. Set RELAX_LEGACY_FLA_ROOT if installed elsewhere." >&2
-    exit 1
-fi
-ENV_JSON="$(python3 - "$FLA_ROOT" <<'PY'
+ENV_JSON="$(python3 - <<'PY'
 import json
 import os
-import sys
 import sysconfig
 from pathlib import Path
 
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
-paths = env.get("PYTHONPATH", os.environ.get("PYTHONPATH", "")).split(os.pathsep)
-env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([sys.argv[1], *filter(None, paths)]))
+if "PYTHONPATH" in os.environ:
+    env.setdefault("PYTHONPATH", os.environ["PYTHONPATH"])
 site = Path(sysconfig.get_paths()["purelib"])
 nccl = site / "nvidia/nccl"
 cublas = Path("/opt/relax/cublas13.3/nvidia/cu13/lib")
@@ -60,8 +52,8 @@ train = {
     "EP_NCCL_ROOT_DIR": str(nccl),
     "EP_JIT_CACHE_DIR": f"/tmp/relax-qwen35-{os.getuid()}/deepep",
     "EP_DISABLE_GIN": "1",
-    # DeepEP creates its own EP communicator for this standalone manager.
-    "EP_REUSE_NCCL_COMM": "0",
+    "RELAX_FLA_CONV_NB_MODE": "none",
+    "FLA_FLASH_QLA": "0",
     "NCCL_CUMEM_ENABLE": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "0",
@@ -179,10 +171,11 @@ PARALLEL_ARGS=(
     --expert-tensor-parallel-size 1
     --moe-token-dispatcher-type flex
     --moe-flex-dispatcher-backend deepepv2
-    --custom-megatron-init-path relax.models.qwen3_5.deepep_expanded.install_for_worker
+    --custom-megatron-before-train-step-hook-path relax.models.qwen3_5.recipe.before_step
     --moe-flex-dispatcher-num-sms 80
     --moe-router-fusion
     --moe-shared-expert-overlap
+    --overlap-dispatch-backward-with-experts-wgrad
     --data-pad-size-multiplier 1024
     --recompute-granularity full
     --recompute-method block
@@ -224,6 +217,7 @@ OPTIMIZER_ARGS=(
     --adam-beta1 0.9
     --adam-beta2 0.98
     --adam-eps 1e-8
+    --no-check-for-nan-in-loss-and-grad
     --clip-grad 1.0
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32

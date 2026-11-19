@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Install the Qwen TP4 optimization recipe."""
 
-from pathlib import Path
 from typing import Any
 
 from relax.utils.data import wholepack_policy
@@ -30,10 +29,16 @@ def _check_args(args: Any) -> None:
     assert padding > 0 and args.max_tokens_per_gpu > 0 and args.max_tokens_per_gpu % padding == 0
     assert args.tensor_model_parallel_size == 4
     assert args.hidden_size == 2048 and args.num_experts == 256
-    assert args.bf16 and args.use_distributed_optimizer and args.sequence_parallel
+    assert args.bf16 and args.sequence_parallel
     assert not getattr(args, "use_megatron_fsdp", False)
-    assert getattr(args, "use_precision_aware_optimizer", False)
-    assert getattr(args, "optimizer_cpu_offload", False)
+    if getattr(args, "optimizer", None) == "muon":
+        # Megatron normalizes --use-distributed-optimizer to layer-wise distribution for Muon.
+        assert getattr(args, "use_layer_wise_distributed_optimizer", False)
+        assert not args.use_precision_aware_optimizer and not args.optimizer_cpu_offload
+    else:
+        assert args.use_distributed_optimizer
+        assert getattr(args, "use_precision_aware_optimizer", False)
+        assert getattr(args, "optimizer_cpu_offload", False)
     assert args.optimizer_offload_fraction == 0.0
 
 
@@ -97,12 +102,16 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     assert not any(chunk.ddp_config.check_for_nan_in_grad for chunk in model)
     args._selective_loss_head = args._qwen_fused_head = True
     prime_expert_communicators(args, model)
-    install_norm_guard(args, optimizer)
+    use_muon = getattr(args, "optimizer", None) == "muon"
+    if use_muon:
+        # Megatron clips Muon gradients; Relax checks for nonfinite values before updating any parameters.
+        if not getattr(optimizer, "_relax_nonfinite_guard_installed", False):
+            raise RuntimeError("The optimized Muon recipe requires RELAX_SKIP_NONFINITE_GRAD=1")
+    else:
+        install_norm_guard(args, optimizer)
     _ACTIVE = True
     install_ce_launches()
-    import importlib.util
-
-    install_gdn(model, Path(importlib.util.find_spec("flash_qla").origin).parent.parent)
+    install_gdn(model, use_native_fla=use_muon)
     attention.before_step(args, rollout_id, step_id, model, optimizer, scheduler)
     attention_value.install(model, SelfAttention)
     attention_gate.install(model, SelfAttention)

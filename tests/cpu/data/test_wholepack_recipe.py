@@ -273,13 +273,10 @@ def test_model_recipe_and_wholepack_are_independent(wholepack, optimized):
     assert recipe.enabled(args) is optimized
 
 
-@pytest.mark.parametrize("wholepack", [False, True])
-@pytest.mark.parametrize("gbs", [16, 1600, 2048])
-@pytest.mark.parametrize("multimodal", [False, True])
-def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholepack, gbs, multimodal):
+def _optimization_args(wholepack: bool, gbs: int, multimodal: bool) -> SimpleNamespace:
     from relax.models.qwen3_5 import recipe
 
-    args = SimpleNamespace(
+    return SimpleNamespace(
         custom_megatron_before_train_step_hook_path=recipe.ENTRY,
         sft_wholepack=wholepack,
         tensor_model_parallel_size=4,
@@ -307,8 +304,16 @@ def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholep
         optimizer_cpu_offload=True,
         optimizer_offload_fraction=0.0,
     )
-    from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
 
+
+@pytest.mark.parametrize("wholepack", [False, True])
+@pytest.mark.parametrize("gbs", [16, 1600, 2048])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholepack, gbs, multimodal):
+    from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
+    from relax.models.qwen3_5 import recipe
+
+    args = _optimization_args(wholepack, gbs, multimodal)
     configure_sft_data_pipeline(args)
     assert not args.sft_async_prepack
     assert args.sft_train_data_prefetch
@@ -327,3 +332,24 @@ def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholep
         setattr(invalid, key, value)
         with pytest.raises((AssertionError, ValueError)):
             recipe._check_args(invalid)
+
+
+def test_muon_recipe_accepts_layerwise_optimizer_without_cpu_offload():
+    from relax.models.qwen3_5 import recipe
+
+    args = _optimization_args(wholepack=True, gbs=800, multimodal=True)
+    args.optimizer = "muon"
+    args.use_distributed_optimizer = False
+    args.use_layer_wise_distributed_optimizer = True
+    args.use_precision_aware_optimizer = False
+    args.optimizer_cpu_offload = False
+    recipe._check_args(args)
+
+    for flag, value in (
+        ("use_layer_wise_distributed_optimizer", False),
+        ("use_precision_aware_optimizer", True),
+        ("optimizer_cpu_offload", True),
+        ("optimizer", "adam"),
+    ):
+        with pytest.raises(AssertionError):
+            recipe._check_args(SimpleNamespace(**(vars(args) | {flag: value})))
