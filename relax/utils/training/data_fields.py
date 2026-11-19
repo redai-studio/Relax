@@ -33,9 +33,9 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "sample_index_mask_sums",
         "group_index",
     ]
-    if getattr(args, "use_rollout_routing_replay", False):
+    if args.use_rollout_routing_replay:
         fields.append("rollout_routed_experts")
-    if getattr(args, "multimodal_keys", None) is not None:
+    if args.multimodal_keys is not None:
         fields.append("multimodal_train_inputs")
     if agentic_obs_enabled(args):
         # Produced by convert_samples_to_train_data under the same gate.
@@ -53,11 +53,11 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return list(PREFERENCE_DATA_FIELDS)
     if is_sft_mode(args):
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
-        if getattr(args, "_sft_dataset_names", ()) and getattr(args, "task_type", "causal_lm") == "causal_lm":
+        if getattr(args, "_sft_dataset_names", ()) and args.task_type == "causal_lm":
             fields.append("dataset_ids")
         if Envs.RELAX_SFT_PRE_SHIFTED_LABELS:
             fields.append("pre_shifted_labels")
-        if getattr(args, "task_type", "causal_lm") == "seq_cls":
+        if args.task_type == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
         if is_embedding_sft_mode(args) and "multimodal_train_inputs" not in fields:
@@ -78,7 +78,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         fields = _base_rollout_fields(args)
         fields.append("values")
         if getattr(args, "kl_coef", 0.0) != 0:
-            if not getattr(args, "use_rollout_logprobs", False) and not getattr(args, "true_on_policy_mode", False):
+            if not getattr(args, "use_rollout_logprobs", False) and not args.true_on_policy_mode:
                 fields.append("log_probs")
             fields.append("ref_log_probs")
         if getattr(args, "use_opd", False):
@@ -90,13 +90,13 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
     fields = _base_rollout_fields(args)
     if getattr(args, "advantage_estimator", None) == "score_centering":
         fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
-    if getattr(args, "use_rollout_indexer_replay", False):
+    if args.use_rollout_indexer_replay:
         fields.append("rollout_indexer_topk")
     if has_critic:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces
         # ``advantages``/``returns``, actor just pulls the finished tensors.
-        if args.fully_async and not getattr(args, "hybrid", False):
+        if args.fully_async and not args.hybrid:
             fields.extend(["advantages", "returns"])
         else:
             fields.append("values")
@@ -106,7 +106,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         # (see relax/backends/megatron/actor.py). PPO does not deploy an
         # actor_fwd role in any mode, so nothing writes log_probs to the
         # TransferQueue; requesting it here would hang async_get_meta.
-        if getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False):
+        if getattr(args, "kl_coef", 0.0) != 0 or args.use_kl_loss:
             if "ref_log_probs" not in fields:
                 fields.append("ref_log_probs")
     if getattr(args, "use_opd", False):

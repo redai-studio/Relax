@@ -45,6 +45,7 @@ def validate_config(args: Any) -> list[str]:
     a checkpoint or built programmatically.
     """
     errors: list[str] = []
+    # Checkpoint-restored or programmatically built configs may omit the RDMA fields.
     mode = getattr(args, "tq_rdma_mode", "off")
     device = getattr(args, "tq_rdma_device", "")
 
@@ -274,8 +275,8 @@ def resolve_tq_capacity_batch_size(args: Any) -> int:
     MooncakeStore's payload capacity.
     """
     rollout_batch = getattr(args, "rollout_batch_size")
-    if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
-        over_sampling_batch = getattr(args, "over_sampling_batch_size", None)
+    if args.partial_rollout and args.use_dynamic_global_batch_size:
+        over_sampling_batch = args.over_sampling_batch_size
         if over_sampling_batch is not None:
             return int(over_sampling_batch)
     return int(rollout_batch)
@@ -300,7 +301,7 @@ def estimate_payload_bytes(args: Any) -> int:
             "the per-sample payload; got a missing or non-positive value."
         )
     per_sample = seq_length * _TEXT_BYTES_PER_TOKEN
-    if getattr(args, "multimodal_keys", None) is not None:
+    if args.multimodal_keys is not None:
         per_sample += seq_length * _MULTIMODAL_BYTES_PER_TOKEN
     return capacity_batch * n_samples * per_sample
 
