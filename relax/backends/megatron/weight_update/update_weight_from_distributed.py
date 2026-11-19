@@ -352,7 +352,7 @@ def precheck_colocate_receiver(
                         return False, sender_stopped, ()
                 return success and sender_stopped, sender_stopped, ()
         except Exception:
-            logger.exception("[Colocate FULL] Receiver probes did not confirm exit before the deadline")
+            logger.exception("[Colocate FULL] Could not collect receiver probe acknowledgments")
     return False, sender_stopped, tuple(refs)
 
 
