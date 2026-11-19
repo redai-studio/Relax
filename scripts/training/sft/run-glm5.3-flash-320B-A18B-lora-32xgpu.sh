@@ -5,7 +5,8 @@
 # MODEL_DIR/GLM-5.3-Flash is the original HF checkpoint.
 # DATA_DIR/train.jsonl contains OpenAI messages; heldout.jsonl is optional.
 # From an existing Ray cluster:
-#   MODEL_DIR=... DATA_DIR=... SAVE_DIR=... bash scripts/entrypoint/ray-job.sh \
+#   MODEL_DIR=... DATA_DIR=... SAVE_DIR=... RAY_JOB_ADDRESS=http://ray-head:8265 \
+#     bash scripts/entrypoint/ray-job.sh \
 #       scripts/training/sft/run-glm5.3-flash-320B-A18B-lora-32xgpu.sh
 
 set -eo pipefail

@@ -478,6 +478,8 @@ def get_model_provider_func(
                     continue
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
+                if attr == "linear_cp_mode" and new_val is None:
+                    continue
                 if attr == "cp_comm_type" and isinstance(new_val, list) and len(new_val) == 1:
                     new_val = new_val[0]
                 if getattr(args, "dynamic_context_parallel", False):
@@ -609,8 +611,8 @@ def get_model_provider_func(
                 provider.mtp_hybrid_override_pattern = None
                 provider.mtp_use_repeated_layer = False
 
-        _validate_linear_cp_mode(args, provider)
         provider.finalize()
+        _validate_linear_cp_mode(args, provider)
         if is_glm53_flash:
             # MCore records the source architecture in checkpoint args. Bridge
             # owns the physical layout, so the CLI never sees this pattern.

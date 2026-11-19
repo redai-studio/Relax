@@ -32,7 +32,7 @@
       "megatron/core/transformer/moe/megakernel/mok/runtime.py": "bfe82a05e6666fee644ce55e0ec98f7874ce296d33340a1de263671cd47eb98c",
       "megatron/core/transformer/moe/megakernel/mok/weights.py": "802488aaf060e57793d33c4296ded6a7e33208a81da4c82260dcc64026f284cf",
       "megatron/core/transformer/moe/moe_layer.py": "67582c592d56968e40fa00b090bb47e71647ec17a5f3d90a234860a9dc1ddb7e",
-      "megatron/core/transformer/transformer_config.py": "43fea4ed3b33ce15f3dcde55c7786a7b91578cf40946a2718b47248b8d9764e4",
+      "megatron/core/transformer/transformer_config.py": "3f135cf7a47d08758530818956da2cea700b5a99c75f524bb98dd26195e55f72",
       "megatron/training/arguments.py": "b0dc9772658d8da13210e50b6c4aeee6f585bdcaa50abe595b03c09ba04f0755"
     }
   },

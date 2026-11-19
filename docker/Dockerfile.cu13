@@ -47,7 +47,9 @@ COPY docker/scripts/blackwell_constraints.py /tmp/blackwell_constraints.py
 RUN python /tmp/blackwell_constraints.py && \
     pip install --no-cache-dir "ray[default,serve]==2.56.1"
 
+ARG EFA_INSTALLER_VERSION=latest
 # Refresh inconsistent Ubuntu indexes from the origin when a proxy has stale entries.
+# The EFA installer uses the same indexes to install its dependencies.
 RUN for attempt in 1 2 3; do \
         apt-get -o Acquire::http::No-Cache=true -o APT::Update::Error-Mode=any update && break; \
         if [ "$attempt" -eq 3 ]; then exit 100; fi; \
@@ -59,17 +61,15 @@ RUN for attempt in 1 2 3; do \
     libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync locales tzdata && \
     locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
-    rm -rf /var/lib/apt/lists/*
-
-ARG EFA_INSTALLER_VERSION=latest
-RUN if [ "$GPU_ARCH" = "blackwell" ]; then \
+    if [ "$GPU_ARCH" = "blackwell" ]; then \
     cd /tmp && \
     curl -fsSL -O https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
     tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
     cd aws-efa-installer && \
     ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify && \
     cd /tmp && rm -rf aws-efa-installer*; \
-    else echo "skip EFA installer (GPU_ARCH=$GPU_ARCH)"; fi
+    else echo "skip EFA installer (GPU_ARCH=$GPU_ARCH)"; fi && \
+    rm -rf /var/lib/apt/lists/*
 
 ENV PATH=/opt/amazon/efa/bin:${PATH} \
     LD_LIBRARY_PATH=/opt/amazon/efa/lib:${LD_LIBRARY_PATH}

@@ -7,6 +7,10 @@ import torch.distributed as dist
 
 
 def mark_expert_adapter_optimizer_replicas(optimizer: Any, *, expert_group: dist.ProcessGroup) -> int:
+    return exclude_replicated_expert_adapter_grads_from_norm(optimizer, ep_rank=dist.get_rank(group=expert_group))
+
+
+def exclude_replicated_expert_adapter_grads_from_norm(optimizer: Any, *, ep_rank: int) -> int:
     """Exclude EP copies of shared adapters from distributed optimizer norms.
 
     Only optimizer-owned views may be marked: Bridge's model parameter-norm
@@ -15,7 +19,7 @@ def mark_expert_adapter_optimizer_replicas(optimizer: Any, *, expert_group: dist
     clipping/updates continue to visit all replicas. Non-distributed optimizers
     without a model-to-owned-shard mapping are outside this helper's scope.
     """
-    if dist.get_rank(group=expert_group) == 0:
+    if ep_rank == 0:
         return 0
     marked = 0
     for member in getattr(optimizer, "chained_optimizers", [optimizer]):
@@ -29,21 +33,6 @@ def mark_expert_adapter_optimizer_replicas(optimizer: Any, *, expert_group: dist
                 shard.shared = True
                 marked += 1
     return marked
-
-
-def exclude_replicated_expert_adapter_grads_from_norm(optimizer: Any, *, ep_rank: int) -> None:
-    """Count EP-replicated adapters once in DistributedOptimizer gradient
-    norms.
-
-    Mark only optimizer shards: Bridge's model parameter norm requires expert
-    parameters to retain their original ``shared`` metadata.
-    """
-    if ep_rank == 0:
-        return
-    for child in getattr(optimizer, "chained_optimizers", (optimizer,)):
-        for param, (group, index) in getattr(child, "model_param_group_index_map", {}).items():
-            if getattr(param, "expert_parallel_replicated", False):
-                child.optimizer.param_groups[group]["params"][index].shared = True
 
 
 def inherit_lora_tp_grad_sync(model: torch.nn.Module) -> int:

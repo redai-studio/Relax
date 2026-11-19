@@ -161,7 +161,7 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
     rm -rf /root/Megatron-Bridge
 
 # The common and cu13 sections retain the existing ROCm Kimi/checkpoint fixes.
-COPY docker/patch/latest/megatron.patch /root/Megatron-LM/
+COPY docker/patch/megatron/20260915-4a4de8657.patch /root/Megatron-LM/megatron.patch
 RUN cd /root/Megatron-LM && \
     for profile in common cu13; do \
         sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply --check - && \
