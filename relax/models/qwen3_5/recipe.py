@@ -81,7 +81,7 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     from relax.models.qwen3_5 import attention_gate as attention_gate
     from relax.models.qwen3_5 import attention_value as attention_value
     from relax.models.qwen3_5 import shared_expert as shared_expert
-    from relax.models.qwen3_5.gdn_backend import flash_qla_enabled, install_gdn
+    from relax.models.qwen3_5.gdn_backend import install_gdn
     from relax.models.qwen3_5.grad_norm import install_norm_guard
     from relax.models.qwen3_5.loss_config import VOCAB_PER_SPLIT
     from relax.models.qwen3_5.mtp_loss import install_ce_launches
@@ -110,14 +110,9 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
         install_norm_guard(args, optimizer)
     _ACTIVE = True
     install_ce_launches()
-    if flash_qla_enabled():
-        import importlib.util
+    import importlib.util
 
-        install_gdn(model, Path(importlib.util.find_spec("flash_qla").origin).parent.parent)
-    else:
-        from relax.utils.logging_utils import get_logger
-
-        get_logger(__name__).info("Qwen GDN uses native FLA (FLA_FLASH_QLA=0)")
+    install_gdn(model, Path(importlib.util.find_spec("flash_qla").origin).parent.parent)
     attention.before_step(args, rollout_id, step_id, model, optimizer, scheduler)
     attention_value.install(model, SelfAttention)
     attention_gate.install(model, SelfAttention)
