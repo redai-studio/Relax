@@ -414,12 +414,14 @@ class _HangingProcess(_CompletedProcess):
         return self.returncode
 
 
-def test_actor_probe_explicitly_limits_child_visible_devices():
+@pytest.mark.parametrize("world_size", [None, 3], ids=["seed", "colocate"])
+def test_actor_probe_explicitly_limits_child_visible_devices(world_size):
     engine = object.__new__(SGLangEngine)
     engine.node_rank = 0
     engine.base_gpu_id = 4
     engine.num_gpus_per_engine = 2
     engine.args = SimpleNamespace(num_gpus_per_node=8)
+    engine._colocate_probe_cumem = "0"
     created = []
 
     def _popen(command, **kwargs):
@@ -430,7 +432,7 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
     with (
         patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=_popen),
         patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
-        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}),
+        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7", "NCCL_CUMEM_ENABLE": "1"}),
     ):
         result = engine.run_scale_weight_sync_precheck(
             master_address="10.0.0.1",
@@ -439,6 +441,7 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
             run_token="run",
             tp_size=2,
             timeout_secs=10,
+            world_size=world_size,
         )
 
     assert result["success"] is True
@@ -447,6 +450,9 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
         for process in created
     )
     assert [process.kwargs["env"]["CUDA_VISIBLE_DEVICES"] for process in created] == ["4,5", "4,5"]
+    assert {process.kwargs["env"]["NCCL_CUMEM_ENABLE"] for process in created} == {
+        "0" if world_size is not None else "1"
+    }
     device_ids = [process.command[process.command.index("--device-id") + 1] for process in created]
     assert device_ids == ["0", "1"]
     assert all(process.kwargs["start_new_session"] is True for process in created)

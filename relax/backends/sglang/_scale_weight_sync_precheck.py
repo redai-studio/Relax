@@ -101,7 +101,9 @@ def main() -> int:
             except Exception as exc:
                 result["success"] = False
                 result["destroy_error"] = f"{type(exc).__name__}: {exc}"
-        print(json.dumps(result, sort_keys=True), flush=True)
+        # Native NCCL logs can end mid-line on the same descriptor. Write the
+        # verdict as one framed record so the parent can decode a whole line.
+        os.write(sys.stdout.fileno(), f"\n{json.dumps(result, sort_keys=True)}\n".encode())
 
     return 0 if result["success"] else 1
 
