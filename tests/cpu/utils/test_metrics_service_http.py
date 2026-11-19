@@ -14,19 +14,6 @@ from pathlib import Path
 import pytest
 
 
-async def test_metrics_service_finishes_writers_once():
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    from relax.utils.metrics.service import MetricsService
-
-    writer = Mock()
-    instance = SimpleNamespace(_finished=False, _adapters={"clearml": writer})
-    await MetricsService.func_or_class.finish(instance)
-    await MetricsService.func_or_class.finish(instance)
-    writer.finish.assert_called_once_with()
-
-
 async def test_metrics_service_discovery_cancels_timed_out_serve_request(monkeypatch):
     import asyncio
     from types import SimpleNamespace
@@ -169,38 +156,3 @@ def _run_serve_smoke() -> None:
 
 if __name__ == "__main__" and "--serve-smoke" in sys.argv:
     _run_serve_smoke()
-
-
-async def test_independent_report_targets_existing_writer_only():
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    from relax.utils.metrics.service import MetricsService, ReportBackendRequest
-
-    clearml, tensorboard, buffer = Mock(), Mock(), Mock()
-    instance = SimpleNamespace(
-        _finished=False, _adapters={"clearml": clearml, "tensorboard": tensorboard}, metrics_buffer=buffer
-    )
-    request = ReportBackendRequest(backend="clearml", step=30, metrics={"observer/count": 1})
-    result = await MetricsService.func_or_class.report_backend(instance, request)
-    assert result["status"] == "success"
-    clearml.log.assert_called_once_with(data={"observer/count": 1}, step=30)
-    assert not tensorboard.mock_calls and not buffer.mock_calls
-    instance._finished = True
-    assert (await MetricsService.func_or_class.report_backend(instance, request))["status"] == "error"
-    instance._finished = False
-    clearml.log.side_effect = RuntimeError("offline")
-    assert (await MetricsService.func_or_class.report_backend(instance, request))["status"] == "error"
-
-
-def test_observer_finalizers_are_opt_in_idempotent_and_isolate_errors(monkeypatch):
-    from relax.utils import tracking_utils
-
-    monkeypatch.setattr(tracking_utils, "_observer_finalizers", [])
-    calls = []
-    tracking_utils.finish_observers()
-    tracking_utils.register_observer_finalizer(lambda: calls.append("flushed"))
-    tracking_utils.register_observer_finalizer(lambda: (_ for _ in ()).throw(RuntimeError("offline")))
-    tracking_utils.finish_observers()
-    tracking_utils.finish_observers()
-    assert calls == ["flushed"]

@@ -62,17 +62,6 @@ class MetricsClient:
         self._buffer = defaultdict(list)
         self._lock = threading.Lock()
 
-    def report_backend(self, backend: str, step: int, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        """Send directly to one existing backend; callers handle delivery
-        failures."""
-        response = requests.post(
-            f"{self.service_url}/report_backend",
-            json={"backend": backend, "step": step, "metrics": _sanitize_for_json(metrics)},
-            timeout=5,
-        )
-        response.raise_for_status()
-        return response.json()
-
     def log_metric(
         self,
         step: int,

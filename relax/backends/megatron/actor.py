@@ -101,7 +101,6 @@ from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields, needs_multimodal_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 from relax.utils.training.intervals import should_save_checkpoint
-from relax.utils.training.perf_trace import trace_training_step
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -1525,7 +1524,6 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
     @manual_gc_training
-    @trace_training_step
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []

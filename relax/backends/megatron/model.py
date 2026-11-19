@@ -57,7 +57,6 @@ from relax.utils.training.nonfinite_grad import (
     install_nonfinite_guard,
 )
 from relax.utils.training.packing_metrics import PackingMetrics
-from relax.utils.training.perf_trace import phase
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
@@ -1341,9 +1340,6 @@ def train_one_step(
     # the native schedule needs the fixed accumulation count.
     data_iterator, num_microbatches = _prepare_mtp_training_window(args, data_iterator, num_microbatches, model)
 
-    from relax.utils.training.prefix_runtime import actor_forward, create_prefix_runtime
-
-    prefix_runtime = create_prefix_runtime()
     main_loss_has_tokens = False
     packing_metrics = PackingMetrics()
 
@@ -1377,7 +1373,6 @@ def train_one_step(
                 data_iterator,
                 [
                     "tokens",
-                    "prefix_inputs",
                     "multimodal_train_inputs",
                     "packed_seq_params",
                     "total_lengths",
@@ -1417,8 +1412,6 @@ def train_one_step(
         # set in the SFT branch below; left as None for return_schedule_plan or
         # the non-SFT path so the original loss_function is used.
         lm_head_forward = None
-        if return_schedule_plan and prefix_runtime is not None:
-            raise NotImplementedError("Detached prefixes do not implement combined 1F1B scheduling")
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             # build_schedule_plan path doesn't go through model() so the
@@ -1531,15 +1524,15 @@ def train_one_step(
                 ) as lm_head_forward:
                     if use_indexer_replay:
                         with IndexerReplay.forward_stage():
-                            output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
+                            output_tensor = model(**forward_kwargs)
                     else:
-                        output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
+                        output_tensor = model(**forward_kwargs)
             else:
                 if use_indexer_replay:
                     with IndexerReplay.forward_stage():
-                        output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
+                        output_tensor = model(**forward_kwargs)
                 else:
-                    output_tensor = actor_forward(model, forward_kwargs, batch, prefix_runtime)
+                    output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -1596,22 +1589,16 @@ def train_one_step(
     timers = straggler_timers("train", model, num_microbatches)
     if timers is not None:
         get_model_config(model[0]).timers = timers
-    try:
-        with phase("forward_backward"):
-            losses_reduced = forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=False,
-            )
-
-    finally:
-        if prefix_runtime is not None:
-            prefix_runtime.close()
+    losses_reduced = forward_backward_func(
+        forward_step_func=forward_step,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=num_microbatches,
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False,
+    )
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1662,8 +1649,7 @@ def train_one_step(
         record_optimizer_result(False)
     else:
         try:
-            with phase("optimizer_step"):
-                update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         except NonFiniteGradientNormError as exc:
             # Only the synchronized pre-update norm guard can take this path: it runs before
             # clipping or *any* child optimizer update. Do not swallow unrelated

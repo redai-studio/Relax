@@ -89,8 +89,6 @@ class RelaxHybridAgent(HybridAgentLocal):
         self._api_key = os.environ.get("OPENAI_API_KEY", "")
 
     def predict(self, instruction: str, obs: dict[str, Any], **kwargs: Any) -> Any:
-        if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-            self._hidden_turn_id = int(kwargs.get("step_idx", len(self.actions)))
         if self.visual_context is not None:
             self.visual_context.begin_turn(int(kwargs.get("step_idx", len(self.actions))))
         return super().predict(instruction, obs, **kwargs)
@@ -115,15 +113,8 @@ class RelaxHybridAgent(HybridAgentLocal):
         visual_context = getattr(self, "visual_context", None)
         if visual_context is not None:
             payload = visual_context.prepare(payload)
-        if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-            payload = {
-                **payload,
-                "relax_hidden_context": {"task_id": self._hidden_task_id, "turn_id": self._hidden_turn_id},
-            }
-        archive = getattr(self, "archive", None)
         last_error = None
         for attempt in range(self._max_llm_call_retries):
-            call_id = archive.model_start(payload, model, attempt) if archive else None
             request_start = time.monotonic()
             try:
                 resp = httpx.post(
@@ -133,8 +124,6 @@ class RelaxHybridAgent(HybridAgentLocal):
                     timeout=self._llm_call_timeout_s,
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
-                if archive:
-                    archive.model_result(call_id, None, None, f"{type(exc).__name__}: {exc}")
                 self.transport_retries += 1
                 last_error = f"transport: {exc}"
                 logger.warning(
@@ -147,9 +136,6 @@ class RelaxHybridAgent(HybridAgentLocal):
                 continue
             finally:
                 self.model_request_s += time.monotonic() - request_start
-
-            if archive:
-                archive.model_result(call_id, resp.text, resp.status_code)
 
             if resp.status_code == 400:
                 # Distinguish context-length-exceeded (fatal, exit cleanly) from

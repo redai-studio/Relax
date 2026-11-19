@@ -8,7 +8,6 @@ from functools import wraps
 from time import time
 
 from relax.utils.logging_utils import get_logger
-from relax.utils.training import perf_trace
 
 from .misc import SingletonMeta
 
@@ -100,15 +99,10 @@ class Timer(metaclass=SingletonMeta):
         self.start_info = {}  # Store start info (timestamp, call_stack) for each timer
         # Store complete TimelineEvent records
         self.records: list[TimelineEvent] = []
-        self._perf_ranges = {}
 
     def start(self, name, **kwargs):
         assert name not in self.start_time, f"Timer {name} already started."
         self.start_time[name] = time()
-        if name != "train_wait" and perf_trace.active():
-            context = perf_trace.phase(name)
-            context.__enter__()
-            self._perf_ranges[name] = context
         if _is_dist_rank0():
             logger.debug(f"Timer {name} start")
 
@@ -146,9 +140,6 @@ class Timer(metaclass=SingletonMeta):
         )
         self.records.append(record)
 
-        context = self._perf_ranges.pop(name, None)
-        if context is not None:
-            context.__exit__(None, None, None)
         del self.start_time[name]
         if name in self.start_info:
             del self.start_info[name]

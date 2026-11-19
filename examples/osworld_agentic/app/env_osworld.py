@@ -32,8 +32,6 @@ from typing import Any, Optional
 from desktop_env.desktop_env import DesktopEnv
 from PIL import Image
 
-from .sandbox_health import journal, observe_nex
-
 
 logger = logging.getLogger("osworld_agentic.env")
 
@@ -52,8 +50,6 @@ class StepObs:
     done: bool = False
     exec_ok: bool = True
     exec_result: dict[str, Any] = field(default_factory=dict)
-    screenshot_valid: bool = False
-    archive_fields: dict[str, Any] = field(default_factory=dict)
 
 
 class OSWorldEnv:
@@ -80,20 +76,8 @@ class OSWorldEnv:
         self.headless = headless
         self.require_a11y_tree = require_a11y_tree
         self.cache_dir = cache_dir or os.environ.get("OSWORLD_CACHE_DIR", "/tmp/osworld_cache")
-        self._archive_enabled = os.environ.get("CUA_ARCHIVE_ENABLE") == "1"
-        self.archive_evaluation: dict[str, Any] = {}
         self._env: Optional[DesktopEnv] = None
         self._lock = asyncio.Lock()
-        self._health = journal()
-        self._health_screenshot_valid = False
-        if self._health is not None and self.provider_name == "nex":
-            try:
-                from desktop_env.providers.nex import client
-
-                observe_nex(self._health, client)
-            except Exception:
-                logger.warning("Sandbox identity observation unavailable", exc_info=True)
-                self._health.emit("observer_unavailable", error_category="unknown")
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -113,32 +97,12 @@ class OSWorldEnv:
         # file upload, sandbox-creation lock timeouts). Retry on a fresh sandbox:
         # a session that dies in here never reports back to Relax and deadlocks
         # the rollout batch. Retry and cleanup stay local to this adapter.
-        started = time.monotonic()
-        if self._health:
-            self._health.emit("init_started")
         last_error: Exception | None = None
         for attempt in range(_RESET_ATTEMPTS):
-            if self._health:
-                self._health.attempt = attempt + 1
-                self._health.emit("attempt_started")
             try:
-                result = self._reset_once()
-                if self._health:
-                    outcome = "ready" if self._health_screenshot_valid else "invalid_screenshot"
-                    if self._health_screenshot_valid:
-                        self._health.emit(
-                            "ready",
-                            sandbox_id=getattr(self._env, "path_to_vm", None),
-                            ready_seconds=time.monotonic() - started,
-                        )
-                    self._health.emit("init_done", outcome=outcome)
-                return result
+                return self._reset_once()
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                if self._health:
-                    self._health.emit(
-                        "attempt_failed", error_category="init_timeout" if isinstance(exc, TimeoutError) else "unknown"
-                    )
                 logger.warning(
                     "env reset attempt %d/%d failed: %s",
                     attempt + 1,
@@ -149,8 +113,6 @@ class OSWorldEnv:
                 if attempt + 1 < _RESET_ATTEMPTS:
                     time.sleep(_RESET_BACKOFF_S)
         self._close_sync()
-        if self._health:
-            self._health.emit("init_done", outcome="exhausted")
         raise RuntimeError(f"env reset failed after {_RESET_ATTEMPTS} attempts: {last_error}")
 
     def _reset_once(self) -> StepObs:
@@ -167,20 +129,8 @@ class OSWorldEnv:
                 os_type="Ubuntu",
                 enable_proxy=True,
             )
-        if self._health:
-            self._health.emit("resetting", sandbox_id=getattr(self._env, "path_to_vm", None))
         obs = self._env.reset(task_config=self.task_config)
-        if self._health:
-            self._health_screenshot_valid = _real_screenshot(obs.get("screenshot"))
-            if not self._health_screenshot_valid:
-                self._health.emit(
-                    "invalid_screenshot",
-                    sandbox_id=getattr(self._env, "path_to_vm", None),
-                    error_category="missing_or_invalid_screenshot",
-                )
-        return self._pack_obs(
-            obs, done=False, exec_ok=True, exec_result={}, capture=getattr(self, "_archive_enabled", False)
-        )
+        return self._pack_obs(obs, done=False, exec_ok=True, exec_result={})
 
     async def close(self) -> None:
         async with self._lock:
@@ -189,17 +139,9 @@ class OSWorldEnv:
     def _close_sync(self, *, release_slot: bool = True) -> None:
         try:
             if self._env is not None:
-                if self._health:
-                    self._health.emit("closing", sandbox_id=getattr(self._env, "path_to_vm", None))
                 try:
                     self._env.close()
                 except Exception:
-                    if self._health:
-                        self._health.emit(
-                            "close_error",
-                            sandbox_id=getattr(self._env, "path_to_vm", None),
-                            error_category="cleanup_error",
-                        )
                     logger.exception("DesktopEnv.close raised")
                 self._env = None
         finally:
@@ -216,17 +158,8 @@ class OSWorldEnv:
 
     def _exec_pyautogui_sync(self, code: str) -> StepObs:
         assert self._env is not None, "reset() must be called before exec_*"
-        try:
-            obs, _reward, done, info = self._env.step(code)
-        except Exception:
-            if self._health:
-                self._health.emit(
-                    "runtime_error", sandbox_id=getattr(self._env, "path_to_vm", None), error_category="unknown"
-                )
-            raise
-        return self._pack_obs(
-            obs, done=done, exec_ok=True, exec_result={"info": info}, capture=getattr(self, "_archive_enabled", False)
-        )
+        obs, _reward, done, info = self._env.step(code)
+        return self._pack_obs(obs, done=done, exec_ok=True, exec_result={"info": info})
 
     async def exec_mcp(self, tool_name: str, params: dict[str, Any]) -> StepObs:
         async with self._lock:
@@ -244,10 +177,6 @@ class OSWorldEnv:
                 exec_ok = False
         except Exception as exc:  # noqa: BLE001
             exec_ok = False
-            if self._health:
-                self._health.emit(
-                    "runtime_error", sandbox_id=getattr(self._env, "path_to_vm", None), error_category="unknown"
-                )
             raw_result = f"exception: {exc}"
             logger.warning("call_mcp_tool(%s) raised: %s", tool_name, exc)
 
@@ -259,9 +188,7 @@ class OSWorldEnv:
         # MCP tools don't advance the VM step counter; re-fetch a fresh obs so
         # the model sees any visual side effects (or their absence).
         obs = self._env._get_obs()  # noqa: SLF001 (verbatim upstream API)
-        return self._pack_obs(
-            obs, done=False, exec_ok=exec_ok, exec_result=exec_result, capture=getattr(self, "_archive_enabled", False)
-        )
+        return self._pack_obs(obs, done=False, exec_ok=exec_ok, exec_result=exec_result)
 
     async def evaluate(self) -> float:
         async with self._lock:
@@ -271,16 +198,8 @@ class OSWorldEnv:
         assert self._env is not None, "reset() must be called before evaluate()"
         try:
             raw = self._env.evaluate()
-            if getattr(self, "_archive_enabled", False) or os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-                self.archive_evaluation = {"raw": raw, "error": None}
             return float(raw)
-        except Exception as exc:
-            if getattr(self, "_archive_enabled", False) or os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-                self.archive_evaluation = {"raw": None, "error": f"{type(exc).__name__}: {exc}"}
-            if self._health:
-                self._health.emit(
-                    "runtime_error", sandbox_id=getattr(self._env, "path_to_vm", None), error_category="unknown"
-                )
+        except Exception:
             logger.exception("evaluate() raised; returning 0.0")
             return 0.0
 
@@ -293,7 +212,6 @@ class OSWorldEnv:
         done: bool,
         exec_ok: bool,
         exec_result: dict[str, Any],
-        capture: bool = False,
     ) -> StepObs:
         screenshot = obs.get("screenshot")
         if not isinstance(screenshot, (bytes, bytearray)):
@@ -307,8 +225,6 @@ class OSWorldEnv:
                 screenshot = buf.getvalue()
         return StepObs(
             screenshot_bytes=bytes(screenshot),
-            screenshot_valid=_real_screenshot(obs.get("screenshot")) if capture else False,
-            archive_fields={k: v for k, v in obs.items() if k != "screenshot"} if capture else {},
             cur_app=obs.get("cur_app"),
             app_info=obs.get("app_info"),
             tool_list=obs.get("tool_list") or [],
@@ -316,21 +232,6 @@ class OSWorldEnv:
             exec_ok=exec_ok,
             exec_result=exec_result,
         )
-
-
-def _real_screenshot(value: Any) -> bool:
-    """Inspect the original observation before _pack_obs can fabricate a
-    PNG."""
-    try:
-        if isinstance(value, str):
-            value = base64.b64decode(value, validate=True)
-        if not isinstance(value, (bytes, bytearray)) or not value:
-            return False
-        with Image.open(BytesIO(value)) as image:
-            image.verify()
-        return True
-    except Exception:
-        return False
 
 
 def parse_mcp_action(action: str) -> Optional[tuple[str, dict[str, Any]]]:

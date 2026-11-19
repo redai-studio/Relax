@@ -52,10 +52,7 @@ def test_recipe_logger_overrides_success_rate_without_duplicate_reporting(monkey
     monkeypatch.setattr(rollout, "save_rollout_result_jsonl", lambda *args: None)
     monkeypatch.setattr(rollout, "compute_metrics_from_samples", lambda *args, **kwargs: {"raw_reward": 0.0})
     monkeypatch.setattr(rollout, "compute_perf_metrics_from_samples", lambda *args: {"rollout_time": 5})
-    from examples.osworld_agentic.app import metrics
 
-    health_steps = []
-    monkeypatch.setattr(metrics, "report_rollout", health_steps.append)
     reported = []
     flushed = []
     monkeypatch.setattr(tracking_utils, "log", lambda args, data, **kwargs: reported.append(data))
@@ -72,4 +69,3 @@ def test_recipe_logger_overrides_success_rate_without_duplicate_reporting(monkey
     assert reported[0]["perf/rollout_time"] == 5
     assert reported[0]["rollout/step"] == 3
     assert flushed == [3]
-    assert health_steps == [3]

@@ -25,14 +25,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from app import shotdump
 from app.env_osworld import OSWorldEnv, StepObs, parse_mcp_action
 from app.hybrid_agent import (
     ContextLengthExceededError,
     RelaxHybridAgent,
     SessionDiscardedError,
 )
-from app.sandbox_health import emit, journal
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("osworld_config.yaml")
@@ -55,7 +53,7 @@ def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
     up with one leaf per turn and Relax's implicit export (which insists on a
     single committed leaf) drops the whole session. We therefore use the
     explicit path: one JSONL record per call in baseline, or per committed
-    segment in VCS. See VCS.md for the loss ownership contract.
+    segment in VCS. See the recipe README for the loss ownership contract.
     """
     records = payload.pop("_turn_records", []) or []
     segments = payload.pop("_segment_records", None)
@@ -177,8 +175,6 @@ async def _predict_one_step(
             parse_attempt=attempt,
             accepted_for_execution=parsed and not forced_cap and attempt == len(records) - 1,
         )
-    if getattr(agent, "archive", None):
-        agent.archive.parsed(records)
     return result
 
 
@@ -193,7 +189,6 @@ async def run_session(
     max_turns = int(config["max_turns"])
     task_config = _extract_task_config(session_input)
     instruction = task_config.get("instruction") or metadata.get("instruction") or ""
-    shotdump.init((task_config or {}).get("id", ""), instruction)
 
     env = OSWorldEnv(
         task_config=task_config,
@@ -230,17 +225,6 @@ async def run_session(
         vcs_prune_images=int(config.get("vcs_prune_images", 2)),
     )
     agent.reset(logging.getLogger("osworld_agentic.hybrid_agent"))
-    if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-        agent._hidden_task_id = str(task_config["id"])
-    archive = None
-    if os.environ.get("CUA_ARCHIVE_ENABLE") == "1":
-        try:
-            from app.archive import create_capture
-
-            archive = create_capture(task_config, config, metadata)
-            agent.archive = archive
-        except Exception:
-            logger.warning("Archive initialization failed; training continues", exc_info=True)
 
     stop_reason = "max_turns"
     action_types: list[str] = []
@@ -256,13 +240,8 @@ async def run_session(
         phase_start = time.monotonic()
         obs = await env.reset()
         timings["reset"] = time.monotonic() - phase_start
-        if archive:
-            archive.observe(obs, 0)
 
         for step_idx in range(max_turns):
-            if archive:
-                archive.before_predict(step_idx)
-            shotdump.shot(step_idx, getattr(obs, "screenshot_bytes", None))
             phase_start = time.monotonic()
             try:
                 response, pyautogui_actions, info = await _predict_one_step(
@@ -301,10 +280,7 @@ async def run_session(
                 # in `action_history` (evaluate() checks the last entry).
                 terminal = "DONE" if "DONE" in pyautogui_actions else "FAIL"
                 phase_start = time.monotonic()
-                action_id = archive.action_start(terminal, terminal=True) if archive else None
-                terminal_obs = await env.exec_pyautogui(terminal)
-                if archive:
-                    archive.action_result(action_id, terminal_obs)
+                await env.exec_pyautogui(terminal)
                 timings["execute"] += time.monotonic() - phase_start
                 agent.record_exec_result(action_type, True, {"ok": True, "terminal": terminal})
                 break
@@ -316,7 +292,6 @@ async def run_session(
             step_done = False
             phase_start = time.monotonic()
             for action in pyautogui_actions:
-                action_id = archive.action_start(action) if archive else None
                 mcp = parse_mcp_action(action)
                 if mcp is not None:
                     tool_name, params = mcp
@@ -327,23 +302,12 @@ async def run_session(
                     step_obs = await env.exec_pyautogui(action)
                     step_result = step_obs.exec_result
                     step_ok = step_ok and step_obs.exec_ok
-                if archive:
-                    archive.action_result(action_id, step_obs)
                 obs = step_obs
                 step_done = step_done or step_obs.done
 
             timings["execute"] += time.monotonic() - phase_start
             execution_failures += int(not step_ok)
             agent.record_exec_result(action_type, step_ok, step_result)
-            shotdump.turn(
-                {
-                    "step": step_idx,
-                    "action_type": action_type,
-                    "actions": pyautogui_actions,
-                    "response": response,
-                    "ok": step_ok,
-                }
-            )
 
             if step_done:
                 stop_reason = "env_done"
@@ -353,41 +317,7 @@ async def run_session(
         phase_start = time.monotonic()
         reward = await env.evaluate()
         timings["evaluate"] = time.monotonic() - phase_start
-        if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-            from relax.agentic.decision_hidden import write_record
-
-            evidence = getattr(env, "archive_evaluation", {})
-            write_record(
-                "outcomes",
-                {
-                    "task_id": str(task_config["id"]),
-                    "session_id": os.environ["RELAX_SESSION_ID"],
-                    "reward": float(reward),
-                    "success": bool(reward == 1.0) if not evidence.get("error") else None,
-                    "evaluation_error": evidence.get("error"),
-                    "stop_reason": stop_reason,
-                },
-            )
-        if archive:
-            evidence = getattr(env, "archive_evaluation", {})
-            archive.finish(evidence.get("raw"), evidence.get("error", "missing evaluator evidence"), stop_reason)
-        shotdump.finish(
-            {
-                "reward": reward,
-                "stop_reason": stop_reason,
-                "turns": len(action_types),
-                "parse_failed_steps": parse_failed_steps,
-            }
-        )
-    except asyncio.CancelledError:
-        emit("cancel_requested", error_category="cancelled")
-        raise
-    except Exception:
-        emit("session_error", error_category="unknown")
-        raise
     finally:
-        if archive:
-            archive.abort()
         phase_start = time.monotonic()
         await env.close()
         timings["close"] = time.monotonic() - phase_start
@@ -449,7 +379,6 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         # Never die silently: Relax waits for this file, and a session that
         # never reports back blocks its whole rollout group forever.
-        emit("session_error", error_category="unknown")
         logger.exception("run_session failed; reporting a zero-reward session")
         task_config = {}
         try:
@@ -471,9 +400,6 @@ def main() -> None:
             },
         }
     write_session_output(args.output_json, output)
-    writer = journal()
-    if writer is not None:
-        writer.flush()
 
 
 if __name__ == "__main__":

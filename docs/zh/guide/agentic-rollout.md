@@ -962,9 +962,3 @@ Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当�
 - `examples/mini_swe_agent/`：external agent server 与 sandboxed coding task。
 - [Fully Async Training](./fully-async-training.md)：异步 rollout 与 training。
 - [Dataset Design](./dataset-design.md)：dataset input 与 metadata。
-
-
-## CUA 训练资源优化
-
-VCS 分段、冻结视觉特征复用、完整 Group 提前传输与图片释放可以分别开启。
-开关、适配器接入条件、模型限制和统计口径见 [CUA 训练资源优化](../features/cua-training-optimizations.md)。

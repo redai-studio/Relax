@@ -2,7 +2,6 @@
 
 import dataclasses
 import functools
-import importlib
 import ipaddress
 import json
 import multiprocessing
@@ -316,16 +315,16 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def _patched_run_scheduler_process(*args, **kwargs):
-    """Install independently opted-in patches inside each scheduler process."""
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
-        from relax.backends.sglang.routing_replay_patch import apply_patch
+    """Scheduler-subprocess entry used for the routing-replay path.
 
-        apply_patch()
-    if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-        backend = importlib.import_module(
-            os.environ.get("RELAX_DECISION_HIDDEN_BACKEND", "relax.backends.sglang.decision_hidden")
-        )
-        backend.apply_patch()
+    This wrapper is only installed when ``--optimize-routing-replay`` is
+    enabled (see ``_launch_server_with_patches``), so the routing-replay async
+    D→H patch is applied **unconditionally** here, preserving the original
+    behavior.
+    """
+    from relax.backends.sglang.routing_replay_patch import apply_patch
+
+    apply_patch()
 
     from sglang.srt.managers.scheduler import run_scheduler_process
 
@@ -337,7 +336,8 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     SGLang patches, each gated by its own env flag so any combination is valid:
 
     - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      and decision hidden collection (``RELAX_DECISION_HIDDEN_DIR``).
+      installs ``_patched_run_scheduler_process``, which applies the
+      routing-replay patch unconditionally.
     """
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
@@ -347,6 +347,7 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     kill_itself_when_parent_died()
     if os.getppid() != parent_pid:
         return
+
     if getattr(server_args, "tokenizer_worker_num", 1) > 1:
         # uvicorn multi-worker mode (tokenizer_worker_num > 1) passes
         # sys.stdin.fileno() to every worker and re-opens it there.  Under
@@ -366,12 +367,7 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
         except OSError:
             _sys.stdin = None
 
-    if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
-        backend = importlib.import_module(
-            os.environ.get("RELAX_DECISION_HIDDEN_BACKEND", "relax.backends.sglang.decision_hidden")
-        )
-        backend.validate_server(server_args)
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY or os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)

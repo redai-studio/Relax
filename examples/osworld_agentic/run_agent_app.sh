@@ -6,21 +6,9 @@ set +x  # Private configuration must not appear in per-session logs.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 agent_python="${OSWORLD_AGENT_PYTHON:-}"
-# Keep the launcher's storage configuration when loading older private configs.
-declare -A archive_settings=()
-for archive_name in CUA_ARCHIVE_ENABLE CUA_ARCHIVE_BACKEND CUA_ARCHIVE_DIR CUA_ARCHIVE_MAX_BYTES \
-    CUA_ARCHIVE_PER_TASK_LIMIT CUA_ARCHIVE_TASK_LIMITS; do
-    if [[ -v "${archive_name}" ]]; then
-        archive_settings["${archive_name}"]="${!archive_name}"
-    fi
-done
 if [ -f "${SCRIPT_DIR}/env.local.sh" ]; then
     source "${SCRIPT_DIR}/env.local.sh"
 fi
-for archive_name in "${!archive_settings[@]}"; do
-    export "${archive_name}=${archive_settings[${archive_name}]}"
-done
-unset archive_settings archive_name
 # The launcher's resolved environment takes precedence over private defaults.
 export OSWORLD_AGENT_PYTHON="${agent_python:-${OSWORLD_AGENT_PYTHON:-${DATA_DIR:?Set DATA_DIR}/osworld-agent-venv/bin/python}}"
 unset agent_python

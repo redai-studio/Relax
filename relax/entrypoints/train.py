@@ -24,7 +24,7 @@ from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa:
 from relax.utils.agentic_obs.run_hooks import RunRecorder  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
-from relax.utils.tracking_utils import finish_observers, init_tracking  # noqa: E402
+from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
 
@@ -110,7 +110,6 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
             except Exception as e:
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
-        finish_observers()
         if ray.is_initialized():
             # Only the successful return of the training loop closes trackers.
             if (
@@ -211,7 +210,6 @@ def main(args):
         _run_recorder.set_phase("training")
         _ctrl.training_loop()
         _training_completed = True
-        finish_observers()
     except Exception as e:
         _run_recorder.record_outcome("failed", error=e)
         logger.exception(f"Training startup or loop failed with error: {e}")

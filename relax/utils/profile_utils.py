@@ -17,7 +17,6 @@ from relax.utils.env import Envs
 from relax.utils.http_utils import router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import print_memory
-from relax.utils.training.perf_trace import profiler_metadata
 
 
 logger = get_logger(__name__)
@@ -83,14 +82,6 @@ class TrainProfiler:
 
     def step(self, rollout_id: int):
         if self._torch_profiler_overall is not None:
-            if Envs.RELAX_TRAIN_PERF_DIR and self._torch_profiler_overall.current_action in (
-                torch.profiler.ProfilerAction.RECORD,
-                torch.profiler.ProfilerAction.RECORD_AND_SAVE,
-            ):
-                import json
-
-                # Kineto metadata must be added before step() stops recording.
-                self._torch_profiler_overall.add_metadata_json("relax", json.dumps(profiler_metadata()))
             self._torch_profiler_overall.step()
 
         if (
@@ -138,8 +129,6 @@ def _get_train_trace_dir(args):
 
     Uses ``./traces/<tb_experiment_name>/train_trace`` as the default location.
     """
-    if Envs.RELAX_TRAIN_PERF_DIR:
-        return os.path.join(Envs.RELAX_TRAIN_PERF_DIR, "traces")
     return os.path.join(_get_trace_base_dir(args), "train_trace")
 
 

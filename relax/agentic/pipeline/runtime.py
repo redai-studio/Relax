@@ -23,7 +23,6 @@ import ray
 import torch
 
 from relax.agentic import AGENTIC_CHAT_API_SERVICE_NAME, format_agentic_status
-from relax.agentic.decision_hidden import enabled as decision_hidden_enabled
 from relax.agentic.inventory import InventoryRecorder
 from relax.agentic.pipeline import (
     GroupExport,
@@ -610,10 +609,6 @@ class SGLangBackendAdapter:
         self._resources = load_agentic_compiler_resources(args)
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
-        if decision_hidden_enabled() and any(
-            getattr(args, name, False) for name in ("partial_rollout", "fully_async", "agentic_prelaunch")
-        ):
-            raise ValueError("Decision hidden collection does not support partial/async/prelaunch rollout")
         self._session_lifecycle = args.agentic_session_lifecycle
         self._request_endpoints: dict[str, str] = {}
         self._session_endpoints: dict[str, set[str]] = {}
@@ -650,12 +645,9 @@ class SGLangBackendAdapter:
         fail_fast_no_workers: bool = False,
         lora_path: str | None = None,
         engine_url: str | None = None,
-        hidden_context: dict[str, Any] | None = None,
     ) -> BackendGenerateResult:
         if (lora_path is None) != (engine_url is None):
             raise ValueError("managed generation requires both a version and an engine endpoint")
-        if decision_hidden_enabled() and (not hidden_context or not session_id):
-            raise ValueError("Decision hidden collection requires OSWorld task/turn context and session_id")
         payload = {
             "input_ids": input_ids,
             "sampling_params": sampling_params,
@@ -667,18 +659,6 @@ class SGLangBackendAdapter:
             if return_logprob and collect_score_centering
             else None
         )
-        if decision_hidden_enabled():
-            payload["sampling_params"] = {
-                **sampling_params,
-                "custom_params": {
-                    **(sampling_params.get("custom_params") or {}),
-                    "relax_decision_context": {
-                        **hidden_context,
-                        "session_id": session_id,
-                        "trajectory_id": session_id,
-                    },
-                },
-            }
         if self._args.use_rollout_routing_replay:
             payload["return_routed_experts"] = True
         if image_data:
@@ -723,13 +703,6 @@ class SGLangBackendAdapter:
             raise
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])
-        if decision_hidden_enabled():
-            records = meta_info.pop("relax_decision_hidden", None)
-            if not records or not isinstance(records[-1], dict):
-                raise RuntimeError("SGLang did not return decision hidden states; check engine opt-in/version")
-            record = records[-1]
-            if record["backend_request_id"] != request_id:
-                raise RuntimeError("Decision hidden request ID mismatch")
 
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])

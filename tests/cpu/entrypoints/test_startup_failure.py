@@ -55,7 +55,6 @@ def _train_namespace():
         "RunRecorder": RunRecorder,
         "post_process_env": lambda args, env: env,
         "init_tracking": Mock(),
-        "finish_observers": Mock(),
         "maybe_pin_baseline_to_stable": Mock(),
         "_ctrl": None,
         "_shutdown_done": False,
@@ -86,7 +85,6 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
 
         shutdown = controller.shutdown
         training_loop = controller.training_loop
-        _metrics_service_enabled = True
 
     def hard_exit(code):
         events.append(("exit", code))
@@ -96,21 +94,14 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
     ns["_hard_exit"] = hard_exit
     if fail_at == "training":
         controller.training_loop.side_effect = RuntimeError("training failed")
-    ns["finish_observers"].side_effect = lambda: events.append("observers")
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace(use_metrics_service=True))
-    finish = ns["serve"].get_app_handle.return_value.finish_tracking.remote
-    if fail_at is None:
-        finish.assert_called_once_with()
-        finish.return_value.result.assert_called_once_with(timeout_s=600)
-    else:
-        finish.assert_not_called()
+        ns["main"](SimpleNamespace())
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
     assert ns["_training_completed"] is (fail_at is None)
-    assert events == (["observers"] if fail_at is None else []) + ["observers", "serve", "ray", ("exit", expected)]
+    assert events == ["serve", "ray", ("exit", expected)]
     controller.shutdown.assert_called_once()
 
 

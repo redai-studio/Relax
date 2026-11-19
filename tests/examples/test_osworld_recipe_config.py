@@ -13,31 +13,10 @@ from examples.osworld_agentic.scripts.prepare_data import _select
 RECIPE = Path(__file__).resolve().parents[2] / "examples/osworld_agentic"
 
 
-@pytest.mark.parametrize("options,enabled", [([], "1"), (["--no-save-trajectories"], "0")])
-def test_trajectory_options_default_to_valid_json_without_task_file(options, enabled):
-    import json
-
-    launcher = (RECIPE / "scripts/run-qwen3vl-8B-osworld-8xgpu.sh").read_text()
-    setup = launcher.split("# Recipe-only options", 1)[1].split(': "${OSWORLD_REPO:', 1)[0]
-    command = "# Recipe-only options" + setup + "\npython3 -c 'import os, json; print(json.dumps(dict(os.environ)))'"
-    result = subprocess.run(
-        ["bash", "-eu", "-c", command, "test", *options],
-        env={"PATH": os.environ["PATH"]},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    settings = json.loads(result.stdout)
-    assert json.loads(settings["CUA_ARCHIVE_TASK_LIMITS"]) == {}
-    assert settings["CUA_ARCHIVE_ENABLE"] == enabled
-    assert settings["CUA_ARCHIVE_MAX_BYTES"] == "10737418240"
-    assert settings["CUA_ARCHIVE_PER_TASK_LIMIT"] == "5"
-
-
 def test_private_env_preserves_launch_roots_without_tracing_secrets(tmp_path):
     # Execute only configuration setup, before the cluster entrypoint can run.
     launcher = (RECIPE / "scripts/run-qwen3vl-8B-osworld-8xgpu.sh").read_text()
-    setup = launcher.split("# Keep launch-time roots authoritative", 1)[1].split("# Recipe-only options", 1)[0]
+    setup = launcher.split("# Keep launch-time roots authoritative", 1)[1].split(': "${OSWORLD_REPO:', 1)[0]
     setup = "# Keep launch-time roots authoritative" + setup
     (tmp_path / "setup.sh").write_text('set +x\nSCRIPT_DIR="$1"\n' + setup)
     secret = "test-only-secret-do-not-log"
@@ -81,42 +60,6 @@ def test_manifest_selects_requested_tasks(tmp_path):
     rows = _select(tasks, manifest)
     assert len(rows) == 1
     assert rows[0]["extra_info"]["task_id"] == "known"
-
-
-def test_agent_entry_keeps_launch_storage_settings_over_private_defaults(tmp_path):
-    import json
-    import shutil
-
-    runner = tmp_path / "run_agent_app.sh"
-    shutil.copyfile(RECIPE / runner.name, runner)
-    (tmp_path / "env.local.sh").write_text(
-        'export OSWORLD_REPO="/example/external" NEX_API_BASE="http://unused"\n'
-        'export NEX_WORKSPACE_ID="test" NEX_API_KEY="test" NEX_TEMPLATE="test"\n'
-        "export CUA_ARCHIVE_ENABLE=0 CUA_ARCHIVE_BACKEND=http CUA_ARCHIVE_DIR=/old\n"
-    )
-    python = tmp_path / "agent-python"
-    python.write_text(
-        "#!/bin/bash\nexec python3 -c 'import json, os; "
-        'print(json.dumps({k: v for k, v in os.environ.items() if k.startswith("CUA_ARCHIVE_")}))\'\n'
-    )
-    python.chmod(0o755)
-    env = dict(
-        os.environ,
-        OSWORLD_AGENT_PYTHON=str(python),
-        CUA_ARCHIVE_ENABLE="1",
-        CUA_ARCHIVE_BACKEND="directory",
-        CUA_ARCHIVE_DIR=str(tmp_path / "new"),
-        RELAX_BASE_URL="http://unused",
-        RELAX_SESSION_ID="session",
-        RELAX_INPUT_JSON="unused",
-        RELAX_OUTPUT_JSON="unused",
-    )
-    env.pop("AGENT_DEBUG_LOG_DIR", None)
-    result = subprocess.run(["bash", str(runner)], env=env, capture_output=True, text=True, check=True)
-    settings = json.loads(result.stdout)
-    assert settings["CUA_ARCHIVE_ENABLE"] == "1"
-    assert settings["CUA_ARCHIVE_BACKEND"] == "directory"
-    assert settings["CUA_ARCHIVE_DIR"] == str(tmp_path / "new")
 
 
 @pytest.mark.parametrize("gpu_count", [8, 16])
@@ -189,21 +132,8 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
     if external_entrypoint:
         env["RELAX_ENTRYPOINT_MODE"] = "ray-job"
         env["RUNTIME_ENV_JSON"] = json.dumps({"env_vars": {"ENTRY_SENTINEL": "kept"}, "working_dir": "kept"})
-    limits = tmp_path / "task limits.json"
-    limits.write_text('{"custom-task": 2, "disabled-task": 0}')
     result = subprocess.run(
-        [
-            "bash",
-            "-x",
-            str(launcher),
-            "--save-trajectories",
-            "--trajectory-max-bytes",
-            "20000000",
-            "--trajectory-per-task-limit",
-            "3",
-            "--trajectory-task-limits",
-            str(limits),
-        ],
+        ["bash", "-x", str(launcher)],
         env=env,
         capture_output=True,
         text=True,
@@ -213,20 +143,12 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
     assert ("--no-wait" in argv) == no_wait
     assert argv[argv.index("--working-dir") + 1] == str(repo)
     runtime = json.loads(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--runtime-env-json=")))
-    assert runtime["env_vars"]["OSWORLD_SANDBOX_HEALTH"] == "1"
-    assert runtime["env_vars"]["OSWORLD_HEALTH_DIR"].endswith(runtime["env_vars"]["OSWORLD_RUN_TAG"])
     assert runtime["working_dir"] == "kept"
     assert runtime["env_vars"]["ENTRY_SENTINEL"] == "kept"
     assert runtime["env_vars"]["OSWORLD_AGENT_PYTHON"] == "/tmp/test-local-agent-env/bin/python"
-    assert runtime["env_vars"]["CUA_ARCHIVE_ENABLE"] == "1"
-    assert runtime["env_vars"]["CUA_ARCHIVE_BACKEND"] == "directory"
-    assert runtime["env_vars"]["CUA_ARCHIVE_MAX_BYTES"] == "20000000"
-    assert runtime["env_vars"]["CUA_ARCHIVE_PER_TASK_LIMIT"] == "3"
-    assert json.loads(runtime["env_vars"]["CUA_ARCHIVE_TASK_LIMITS"]) == {"custom-task": 2, "disabled-task": 0}
-    assert runtime["env_vars"]["CUA_ARCHIVE_DIR"].endswith(runtime["env_vars"]["OSWORLD_RUN_TAG"] + "/sessions")
     assert secret not in json.dumps(argv) + result.stdout + result.stderr
     train = argv[argv.index("--") + 1 :]
-    assert train[:3] == ["python3", "-m", "examples.osworld_agentic.app.health_runner"]
+    assert train[:2] == ["python3", "relax/entrypoints/train.py"]
     for flag, expected in {
         "--lr": "5e-6",
         "--num-rollout": "200",

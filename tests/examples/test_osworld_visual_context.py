@@ -91,7 +91,6 @@ def hybrid(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.setenv("OPENAI_BASE_URL", "http://mock-only/v1")
-    monkeypatch.delenv("CUA_ARCHIVE_ENABLE", raising=False)
     return module
 
 
@@ -404,9 +403,6 @@ def test_real_session_driver_mock_environment_tail_and_early_stop(hybrid, monkey
     ns = adapter_functions(
         time=SimpleNamespace(monotonic=lambda: 1),
         _load_config=lambda: {"max_turns": 10, "context_mode": mode},
-        shotdump=SimpleNamespace(
-            init=lambda *a: None, shot=lambda *a: None, turn=lambda *a: None, finish=lambda *a: None
-        ),
         OSWorldEnv=Env,
         RelaxHybridAgent=hybrid.RelaxHybridAgent,
         parse_mcp_action=lambda a: None,

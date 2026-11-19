@@ -22,9 +22,3 @@ export NEX_API_KEY="${NEX_API_KEY:-}"
 # export download_proxy="http://your-proxy:port"
 # Configure ClearML on all training nodes (clearml-init or your secret manager).
 # Do not add its credentials to the committed template or runtime-env JSON.
-
-# The training script saves successful trajectories and images directly under
-# rollout_result/<run_tag>/sessions/. No writer URL or token is needed.
-# Configure with --no-save-trajectories, --trajectory-max-bytes,
-# --trajectory-per-task-limit and --trajectory-task-limits (JSON file).
-# Defaults: enabled, 10 GiB per run, up to 5 trajectories per task.

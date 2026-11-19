@@ -26,73 +26,6 @@ for root_name in "${!launch_roots[@]}"; do
     export "${root_name}=${launch_roots[${root_name}]}"
 done
 unset launch_roots
-# Recipe-only options; no changes to the framework's training argument parser.
-export CUA_ARCHIVE_ENABLE="${CUA_ARCHIVE_ENABLE:-1}"
-export CUA_ARCHIVE_BACKEND=directory
-export CUA_ARCHIVE_MAX_BYTES="${CUA_ARCHIVE_MAX_BYTES:-10737418240}"
-export CUA_ARCHIVE_PER_TASK_LIMIT="${CUA_ARCHIVE_PER_TASK_LIMIT:-5}"
-export CUA_ARCHIVE_TASK_LIMITS="${CUA_ARCHIVE_TASK_LIMITS:-}"
-if [ -z "${CUA_ARCHIVE_TASK_LIMITS}" ]; then
-    export CUA_ARCHIVE_TASK_LIMITS='{}'
-fi
-trajectory_task_limits_file=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --save-trajectories) export CUA_ARCHIVE_ENABLE=1; shift ;;
-        --no-save-trajectories) export CUA_ARCHIVE_ENABLE=0; shift ;;
-        --trajectory-max-bytes|--trajectory-per-task-limit|--trajectory-task-limits)
-            if [ "$#" -lt 2 ]; then
-                echo "Missing value for $1" >&2
-                exit 2
-            fi
-            case "$1" in
-                --trajectory-max-bytes) export CUA_ARCHIVE_MAX_BYTES="$2" ;;
-                --trajectory-per-task-limit) export CUA_ARCHIVE_PER_TASK_LIMIT="$2" ;;
-                --trajectory-task-limits) trajectory_task_limits_file="$2" ;;
-            esac
-            shift 2
-            ;;
-        --help|-h)
-            cat <<'HELP'
-Usage: bash run-qwen3vl-8B-osworld-8xgpu.sh [options]
-  --save-trajectories              Save complete successful trajectories (default)
-  --no-save-trajectories           Disable trajectory and image storage
-  --trajectory-max-bytes N         Total budget including in-progress data (default: 10737418240)
-  --trajectory-per-task-limit N    Default retained trajectories per task (default: 5)
-  --trajectory-task-limits FILE    JSON object mapping task IDs to limits; 0 disables a task
-Images and events are written directly to rollout_result/<run_tag>/sessions/.
-All Agent nodes must share that directory with coherent cross-node file locks.
-HELP
-            exit 0
-            ;;
-        *) echo "Unknown OSWorld recipe option: $1" >&2; exit 2 ;;
-    esac
-done
-CUA_ARCHIVE_TASK_LIMITS=$(python3 - "${trajectory_task_limits_file}" <<'PY_ARCHIVE'
-import json
-import os
-import sys
-from pathlib import Path
-
-try:
-    maximum = int(os.environ["CUA_ARCHIVE_MAX_BYTES"])
-    limit = int(os.environ["CUA_ARCHIVE_PER_TASK_LIMIT"])
-    if maximum < 1024 or limit < 1:
-        raise ValueError("max bytes must be >= 1024 and per-task limit >= 1")
-    if os.environ["CUA_ARCHIVE_ENABLE"] not in ("0", "1"):
-        raise ValueError("CUA_ARCHIVE_ENABLE must be 0 or 1")
-    limits = json.loads(Path(sys.argv[1]).read_text() if sys.argv[1] else os.environ["CUA_ARCHIVE_TASK_LIMITS"])
-    if not isinstance(limits, dict) or any(
-        not isinstance(k, str) or type(v) is not int or v < 0 for k, v in limits.items()
-    ):
-        raise ValueError("task limits must map task IDs to nonnegative integers")
-except (ValueError, OSError) as exc:
-    raise SystemExit(f"Invalid trajectory storage configuration: {exc}") from None
-print(json.dumps(limits))
-PY_ARCHIVE
-)
-export CUA_ARCHIVE_TASK_LIMITS
-unset trajectory_task_limits_file
 : "${OSWORLD_REPO:?Set OSWORLD_REPO in env.local.sh}"
 export OSWORLD_CACHE_DIR="${OSWORLD_CACHE_DIR:-${OSWORLD_REPO}/cache}"
 export MCP_SRC_ROOT="${MCP_SRC_ROOT:-${OSWORLD_REPO}}"
@@ -175,12 +108,6 @@ export EXP_NAME="${EXP_NAME:-qwen3vl-8b-osworld-${CLUSTER_GPUS}xgpu}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/osworld-agentic}"
 now=$(date "+%Y%m%d-%H%M%S")
 export OSWORLD_RUN_TAG="osworld-outcome-${now}-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
-export CUA_ARCHIVE_DIR="${SAVE_DIR}/${EXP_NAME}/rollout_result/${OSWORLD_RUN_TAG}/sessions"
-# Only this recipe opts in; all other entrypoints leave health monitoring off.
-export OSWORLD_SANDBOX_HEALTH="${OSWORLD_SANDBOX_HEALTH:-1}"
-export OSWORLD_HEALTH_DIR="${SAVE_DIR}/${EXP_NAME}/sandbox_health/${OSWORLD_RUN_TAG}"
-export OSWORLD_HEALTH_INTERVAL="${OSWORLD_HEALTH_INTERVAL:-30}"
-export OSWORLD_HEALTH_CLEANUP_GRACE="${OSWORLD_HEALTH_CLEANUP_GRACE:-120}"
 TRAIN_DATA="${DATA_DIR}/osworld/train.parquet"
 if [ ! -s "${TRAIN_DATA}" ]; then
     python3 "${SCRIPT_DIR}/scripts/prepare_data.py" \
@@ -203,10 +130,7 @@ runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
 for name in (
     "PYTHONPATH", "MASTER_ADDR", "MASTER_PORT", "RAY_ADDRESS",
-    "OSWORLD_SANDBOX_HEALTH", "OSWORLD_HEALTH_DIR", "OSWORLD_HEALTH_INTERVAL", "OSWORLD_HEALTH_CLEANUP_GRACE",
     "OSWORLD_AGENT_PYTHON", "OSWORLD_REPO", "OSWORLD_CACHE_DIR", "MCP_SRC_ROOT", "OSWORLD_RUN_TAG", "TENSORBOARD_DIR",
-    "CUA_ARCHIVE_ENABLE", "CUA_ARCHIVE_BACKEND", "CUA_ARCHIVE_DIR", "CUA_ARCHIVE_MAX_BYTES",
-    "CUA_ARCHIVE_PER_TASK_LIMIT", "CUA_ARCHIVE_TASK_LIMITS",
 ):
     env[name] = os.environ[name]
 env.update({
@@ -249,7 +173,7 @@ ROLLOUT_ARGS=(
     --use-agentic-rollout
     --multimodal-keys '{}'
     --rollout-result-dir "${SAVE_DIR}/${EXP_NAME}/rollout_result/${OSWORLD_RUN_TAG}"
-    --agent-command "python3 -m examples.osworld_agentic.app.health_runner --agent bash \"${SCRIPT_DIR}/run_agent_app.sh\""
+    --agent-command "bash \"${SCRIPT_DIR}/run_agent_app.sh\""
     --agent-cwd "${SCRIPT_DIR}"
     --agent-env "OPENAI_MODEL=Qwen3-VL-8B-Thinking"
         "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${OSWORLD_RUN_TAG}"
@@ -340,7 +264,7 @@ mkdir -p "${SCRIPT_DIR}/log" "${SAVE_DIR}/${EXP_NAME}/rollout_result/${OSWORLD_R
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS:-${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python3 -m examples.osworld_agentic.app.health_runner \
+    -- python3 relax/entrypoints/train.py \
     "${RESOURCE_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \

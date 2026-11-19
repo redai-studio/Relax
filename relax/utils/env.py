@@ -436,9 +436,6 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Agentic runner -------------
     RELAX = EnvProperty("RELAX", str, None)
     RELAX_VCS = EnvProperty("RELAX_VCS", bool, False)
-    RELAX_TRAIN_PREFIX_MODE = EnvProperty("RELAX_TRAIN_PREFIX_MODE", str, "baseline")
-    RELAX_TRAIN_PREFIX_MAX_BYTES = EnvProperty("RELAX_TRAIN_PREFIX_MAX_BYTES", int, 268435456)
-    RELAX_TRAIN_PERF_DIR = EnvProperty("RELAX_TRAIN_PERF_DIR", str, "")
     RELAX_TRAIN_VISION_CACHE = EnvProperty("RELAX_TRAIN_VISION_CACHE", bool, False)
     RELAX_TRAIN_VISION_CACHE_MAX_BYTES = EnvProperty("RELAX_TRAIN_VISION_CACHE_MAX_BYTES", int, 268435456)
     RELAX_VCS_KEEP_IMAGES = EnvProperty("RELAX_VCS_KEEP_IMAGES", int, 2)
