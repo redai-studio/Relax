@@ -9,6 +9,35 @@ from relax.backends.megatron import cp_utils
 from relax.utils.sft_utils import align_loss_mask_for_sft
 
 
+@pytest.mark.parametrize("layout", ["text", "vl_text", "media", "unsplit_text"])
+def test_cp_output_gather_matches_nullable_multimodal_layout(monkeypatch, layout):
+    from relax.backends.megatron import actor
+
+    monkeypatch.setattr(actor.mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(actor.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    padded_lengths = []
+
+    def gather(value, total_length, response_length, *, padded_total_length, **kwargs):
+        padded_lengths.append(padded_total_length)
+        return value
+
+    monkeypatch.setattr(actor, "all_gather_with_cp", gather)
+    instance = SimpleNamespace(
+        args=SimpleNamespace(
+            qkv_format="thd", is_vl_model=layout == "vl_text", uses_unsplit_forward=layout == "unsplit_text"
+        )
+    )
+    rollout_data = {
+        "total_lengths": [5, 9],
+        "response_lengths": [2, 2],
+        "multimodal_train_inputs": [None, {"pixel_values": torch.ones(4, 8)} if layout == "media" else None],
+    }
+    output = {"log_probs": [torch.zeros(2), torch.zeros(2)]}
+    actual = actor.MegatronTrainRayActor._gather_cp_output_for_transfer_queue(instance, output, rollout_data)
+    assert padded_lengths == ([None, None] if layout == "text" else [8, 16])
+    assert actual["log_probs"] == output["log_probs"]
+
+
 def _cp_kwargs(monkeypatch, cp_rank: int, dynamic_cp: bool) -> dict[str, int]:
     if dynamic_cp:
         return {"dynamic_cp_size": 2, "dynamic_cp_rank": cp_rank}

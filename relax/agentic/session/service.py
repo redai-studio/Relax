@@ -1492,7 +1492,6 @@ class _SessionRecord:
     lora_bind_task: Optional[asyncio.Task] = None
     observation: SessionObservation | None = None
     terminal_failure: tuple[str, str, str] | None = None
-    terminal_metrics_recorded: bool = False
     first_ir_ready: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -1777,16 +1776,7 @@ class AgenticSessionShard:
 
         return session_sampling_config(self.args, session_spec.sampling_params, sample_position)
 
-    def _record_terminal_metrics(self, session: _SessionRecord, status: str) -> None:
-        if not session.terminal_metrics_recorded:
-            session.terminal_metrics_recorded = True
-            counts = self.__dict__.setdefault("_session_terminal_counts", {})
-            key = (session.group.rollout_mode, status)
-            counts[key] = counts.get(key, 0) + 1
-
     def _observe_session(self, session: _SessionRecord, stage: str, status: str, **fields: Any) -> None:
-        if fields.get("is_terminal"):
-            self._record_terminal_metrics(session, status)
         observation = session.observation
         if observation is None:
             return
@@ -3282,6 +3272,29 @@ class AgenticSessionShard:
                     output_records=output.records,
                     finalize_events=finalize_events,
                 )
+                # Execution outcome is independent of reward and export validity.
+                execution_states = [output.metadata.get("execution_status")]
+                execution_states.extend(record["metadata"].get("execution_status") for record in output.records)
+                execution = next(
+                    (
+                        state
+                        for state in execution_states
+                        if isinstance(state, dict) and state.get("status") == "failed"
+                    ),
+                    None,
+                )
+                if execution is not None:
+                    failure = (
+                        str(execution.get("reason_code") or "agent_execution_failed"),
+                        "infra" if execution.get("category") == "infra" else "execution",
+                        str(execution.get("reason") or "agent reported an execution failure"),
+                    )
+                    logger.warning(
+                        "Agent execution failed; retaining committed exports session_id=%s group_id=%s reason=%s",
+                        session.session_id,
+                        session.group.group_id,
+                        failure[2],
+                    )
             except AgentExecutionError as error:
                 logger.error(
                     "Dropping non-finalizable agentic session session_id=%s group_id=%s error_type=%s\n%s",
@@ -3467,13 +3480,17 @@ class AgenticSessionShard:
         failure = session.terminal_failure or (
             session.observation.failure if session.observation is not None else None
         )
-        if isinstance(outcome, SessionExportTransport):
-            status = "completed"
-        elif isinstance(outcome, RuntimeGroupError) or (failure is not None and failure[1] != "selection"):
+        if failure is not None:
+            status = "cancelled" if failure[1] == "selection" else "failed"
+        elif isinstance(outcome, RuntimeGroupError):
             status = "failed"
+        elif isinstance(outcome, SessionExportTransport):
+            status = "completed"
         else:
             status = "cancelled"
-        self._record_terminal_metrics(session, status)
+        counts = self.__dict__.setdefault("_session_terminal_counts", {})
+        key = (session.group.rollout_mode, status)
+        counts[key] = counts.get(key, 0) + 1
         session.result_cell.publish(outcome)
         self._schedule_agent_cleanup(session, outcome)
         self._notify_state_change(group)
@@ -3582,7 +3599,7 @@ class AgenticSessionShard:
             failure = session.terminal_failure or (
                 session.observation.failure if session.observation is not None else None
             )
-            if isinstance(outcome, SessionExportTransport):
+            if isinstance(outcome, SessionExportTransport) and failure is None:
                 self._observe_session(session, "rollout", "completed", is_terminal=True)
             else:
                 if failure is None:

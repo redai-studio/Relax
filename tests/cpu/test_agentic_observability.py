@@ -2762,3 +2762,157 @@ def test_pre_request_failure_uses_terminal_metrics_without_training_samples(
         (failed,) = [event for event in events if event["session_id"] == "s" and event["is_terminal"]]
         assert failed["status"] == "failed" and failed["reason_code"] == "agent_no_request"
         assert failed["export_ids"] == [] and "Nex reset failed" in failed["reason"]
+
+
+@pytest.mark.parametrize("execution_failed", [False, True], ids=["evaluator-negative", "nex-execution-error"])
+@pytest.mark.parametrize("explicit", [False, True, "last-record"], ids=["implicit", "explicit", "last-record-status"])
+def test_execution_terminal_preserves_valid_exports(tmp_path, rollout_module, execution_failed, explicit):
+    from relax.agentic.pipeline import SessionExportTransport
+    from relax.agentic.runner.ipc import SessionOutput
+    from relax.agentic.session import service
+
+    async def scenario():
+        shard, session = _session_observation_fixture(tmp_path)
+        source, source_leaf = _two_turn_forest()
+        forest = SessionForest.create_empty(session_id="s", group_index=2, index=5)
+        parent_hash = forest.root_state_hash
+        for node in source.lineage(source_leaf)[1:]:
+            if node.kind == "obs":
+                current = forest.append_obs(
+                    parent_state_hash=parent_hash,
+                    rollout_id=0,
+                    abort_count=0,
+                    messages_delta=check_messages(node.messages_delta),
+                    train_token_delta=node.train_token_delta,
+                    rollout_token_delta=node.rollout_token_delta,
+                )
+            else:
+                current = forest.append_resp(
+                    parent_state_hash=parent_hash,
+                    rollout_id=0,
+                    abort_count=0,
+                    messages_delta=check_messages(node.messages_delta),
+                    token_delta=node.train_token_delta,
+                    logprob_delta=node.logprob_delta,
+                )
+            parent_hash = current.state_hash
+        leaf_hash = parent_hash
+        session.forest = forest
+        shard._generation_backend.compiler = SimpleNamespace(apply_chat_template_kwargs={})
+        metadata = {
+            "execution_status": (
+                {
+                    "status": "failed",
+                    "reason_code": "agent_execution_failed",
+                    "category": "execution",
+                    "reason": "Nex execute failed after a committed answer",
+                }
+                if execution_failed
+                else {"status": "completed"}
+            )
+        }
+        expected_exports = 1
+        if explicit:
+            records = [
+                {"name": "turn", "messages": forest.full_messages(leaf_hash), "metadata": metadata, "reward": 0.0}
+            ]
+            if explicit == "last-record":
+                observation = forest.append_obs(
+                    parent_state_hash=forest.root_state_hash,
+                    rollout_id=8,
+                    abort_count=0,
+                    messages_delta=[{"role": "user", "content": "another branch"}],
+                    train_token_delta=[10],
+                    rollout_token_delta=[10],
+                )
+                response = forest.append_resp(
+                    parent_state_hash=observation.state_hash,
+                    rollout_id=8,
+                    abort_count=0,
+                    messages_delta=[{"role": "assistant", "content": "other answer"}],
+                    token_delta=[11],
+                    logprob_delta=[-0.4],
+                )
+                records.insert(
+                    0,
+                    {
+                        "name": "earlier",
+                        "messages": forest.full_messages(response.state_hash),
+                        "metadata": {"execution_status": {"status": "completed"}},
+                    },
+                )
+                expected_exports = 2
+            output = SessionOutput.from_records(records)
+        else:
+            output = SessionOutput.from_payload({"metadata": metadata, "reward": 0.0})
+        process_wait = asyncio.create_task(asyncio.sleep(0))
+        watcher = asyncio.create_task(asyncio.Event().wait())
+        cleanup_release = asyncio.Event()
+        process = SimpleNamespace(output=output, terminate_and_join=AsyncMock(side_effect=cleanup_release.wait))
+        session.resources = service.SessionResources(process, process_wait, watcher)
+        await shard._finalize_terminal_session(session)
+        outcome = session.result_cell.payload
+        assert isinstance(outcome, SessionExportTransport) and len(outcome.exports) == expected_exports
+        sample = TrainingFieldArtifact(sample_payload=outcome.exports[-1]["sample_payload"]).to_sample()
+        assert sample.reward == 0.0
+        assert [p for p, mask in zip(sample.rollout_log_probs, sample.loss_mask, strict=True) if mask] == [
+            -0.1,
+            -0.2,
+            -0.3,
+        ]
+        assert not session.group.drop_committed
+        metrics = await shard.agentic_kv_metrics()
+        assert metrics["terminal/failed"] == int(execution_failed)
+        assert metrics["terminal/completed"] == int(not execution_failed)
+        # Concurrent finalizers and later event emission never publish/count twice.
+        await asyncio.gather(shard._finalize_terminal_session(session), shard._finish_session(session, outcome))
+        cleanup_release.set()
+        if shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        await asyncio.gather(watcher, return_exceptions=True)
+        assert await shard.agentic_kv_metrics() == metrics
+        await shard._trajectory_recorder.aclose()
+
+    asyncio.run(scenario())
+    (event,) = _read_jsonl(tmp_path / "run_test/stages/shard_00.jsonl")
+    assert event["status"] == ("failed" if execution_failed else "completed")
+    assert len(event["export_ids"]) == (2 if explicit == "last-record" else 1)
+    if execution_failed:
+        assert event["reason_code"] == "agent_execution_failed" and "Nex execute failed" in event["reason"]
+
+
+@pytest.mark.parametrize("missing_shards", [0, 1, 2])
+def test_session_metrics_mark_partial_shard_coverage(rollout_module, missing_shards):
+    async def scenario():
+        runtime = object.__new__(rollout_module.RuntimeDomain)
+        runtime.rollout_mode = "train"
+        runtime._admission_coordinator = None
+        snapshots = [
+            {"terminal/completed": 3.0, "terminal/failed": 1.0, "terminal/cancelled": 2.0},
+            {"terminal/completed": 1.0, "terminal/failed": 0.0, "terminal/cancelled": 0.0},
+        ]
+        runtime._shards = tuple(
+            SimpleNamespace(
+                handle=SimpleNamespace(
+                    agentic_kv_metrics=SimpleNamespace(
+                        remote=AsyncMock(side_effect=RuntimeError("shard unavailable"))
+                        if index < missing_shards
+                        else AsyncMock(return_value=snapshot)
+                    )
+                )
+            )
+            for index, snapshot in enumerate(snapshots)
+        )
+        metrics = await runtime.collect_agentic_kv_metrics()
+        assert metrics["agentic/session_metrics_shards_total"] == 2
+        assert metrics["agentic/session_metrics_shards_reported"] == 2 - missing_shards
+        assert metrics["agentic/session_metrics_complete"] == int(missing_shards == 0)
+        if missing_shards:
+            assert "agentic/session_error_rate" not in metrics
+        else:
+            assert metrics["agentic/session_error_rate"] == pytest.approx(1 / 5)
+        assert metrics["agentic/sessions_completed"] == sum(
+            snapshot["terminal/completed"] for snapshot in snapshots[missing_shards:]
+        )
+
+    asyncio.run(scenario())

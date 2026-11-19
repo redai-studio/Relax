@@ -333,6 +333,11 @@ async def run_session(
         "metadata": {
             **({"context_mode": "vcs", "model_calls": len(agent.turn_records)} if visual_context is not None else {}),
             "stop_reason": stop_reason,
+            "execution_status": (
+                {"status": "failed", "reason_code": "predict_error", "category": "execution", "reason": last_error}
+                if stop_reason == "predict_error"
+                else {"status": "completed"}
+            ),
             "agent_turns": len(action_types),
             "action_types": action_types,
             "parse_failed_steps": parse_failed_steps,
@@ -388,6 +393,12 @@ def main() -> None:
             "reward": 0.0,
             "metadata": {
                 "stop_reason": "session_error",
+                "execution_status": {
+                    "status": "failed",
+                    "reason_code": "agent_execution_failed",
+                    "category": "execution",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                },
                 "agent_turns": 0,
                 "action_types": [],
                 "parse_failed_steps": 0,

@@ -202,7 +202,7 @@ class MockBackend:
 
 def adapter_functions(**extras):
     path = ROOT / "examples/osworld_agentic/app/agent.py"
-    names = {"run_session", "_predict_one_step", "write_session_output", "_extract_task_config"}
+    names = {"main", "run_session", "_predict_one_step", "write_session_output", "_extract_task_config"}
     nodes = [
         n
         for n in ast.parse(path.read_text()).body
@@ -435,6 +435,9 @@ def test_real_session_driver_mock_environment_tail_and_early_stop(
     result = asyncio.run(ns["run_session"]({"task_config": {"id": "task", "instruction": "task"}}, {}))
     count = fail_at or config["max_turns"]
     assert result["reward"] == 1.0
+    assert result["metadata"]["execution_status"]["status"] == (
+        "failed" if error_kind == "predict_error" else "completed"
+    )
     if fail_at:
         assert result["metadata"]["stop_reason"] == error_kind
         assert "FAIL" not in actions
@@ -568,3 +571,26 @@ with patch("httpx.post", side_effect=replies) as post:
         [sys.executable, "-c", script, repo, str(ROOT)], input=source, capture_output=True, text=True, timeout=60
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_driver_reports_execution_failure_independently_of_reward(tmp_path):
+    path = tmp_path / "failed.json"
+
+    async def execution_failure(*args):
+        raise OSError("Nex execute failed")
+
+    namespace = adapter_functions(
+        parse_args=lambda: SimpleNamespace(input_json="unused", output_json=str(path)),
+        read_session_input=lambda path: {"task_config": {"id": "task"}},
+        logger=get_logger(__name__),
+    )
+    namespace["run_session"] = execution_failure
+    namespace["main"]()
+    result = json.loads(path.read_text())
+    assert result["reward"] == {"score": 0.0}
+    assert result["metadata"]["execution_status"] == {
+        "status": "failed",
+        "reason_code": "agent_execution_failed",
+        "category": "execution",
+        "reason": "OSError: Nex execute failed",
+    }

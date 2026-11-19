@@ -67,7 +67,9 @@ def test_explicit_balanced_matches_default(partitioner):
 
 
 @pytest.mark.parametrize("strategy", ["balanced", "binpack"])
-@pytest.mark.parametrize("unsplit", ["is_vl_model", "uses_unsplit_forward", "multimodal_train_inputs", None])
+@pytest.mark.parametrize(
+    "unsplit", ["is_vl_model", "uses_unsplit_forward", "multimodal_train_inputs", "nullable_multimodal", None]
+)
 @pytest.mark.parametrize("cp_size", [1, 4])
 def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner, strategy, unsplit, cp_size):
     from types import SimpleNamespace
@@ -117,10 +119,12 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
     data = {"total_lengths": lengths}
     if unsplit == "multimodal_train_inputs":
         data[unsplit] = [{}, {}]
+    elif unsplit == "nullable_multimodal":
+        data["multimodal_train_inputs"] = [None, None]
     elif unsplit is not None:
         setattr(args, unsplit, True)
     iterators, counts = namespace["get_data_iterator"](args, [], data)
-    padded = cp_size > 1 and unsplit is not None
+    padded = cp_size > 1 and unsplit not in (None, "nullable_multimodal")
     assert counts == [2 if padded else 1]
     assert sorted(i for pack in iterators[0].indices for i in pack) == [0, 1]
     if padded:

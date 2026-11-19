@@ -1450,8 +1450,17 @@ class RuntimeDomain:
         terminal = {status: metrics.pop(f"terminal/{status}", 0.0) for status in ("completed", "failed", "cancelled")}
         result = {f"agentic_kv/{key}": value for key, value in metrics.items()}
         result.update({f"agentic/sessions_{status}": value for status, value in terminal.items()})
+        reported_shards = sum(not isinstance(snapshot, BaseException) for snapshot in shard_metrics)
+        complete = reported_shards == len(self._shards)
+        result.update(
+            {
+                "agentic/session_metrics_shards_total": float(len(self._shards)),
+                "agentic/session_metrics_shards_reported": float(reported_shards),
+                "agentic/session_metrics_complete": float(complete),
+            }
+        )
         denominator = terminal["completed"] + terminal["failed"]
-        if denominator:
+        if complete and denominator:
             result["agentic/session_error_rate"] = terminal["failed"] / denominator
         return result
 

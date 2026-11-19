@@ -4007,7 +4007,7 @@ class MegatronTrainRayActor(TrainRayActor):
             total_lengths,
             self.args.qkv_format,
             getattr(self.args, "is_vl_model", False)
-            or "multimodal_train_inputs" in rollout_data
+            or any(mm is not None for mm in rollout_data.get("multimodal_train_inputs") or ())
             or getattr(self.args, "uses_unsplit_forward", False),
         )
         if padded_total_lengths is None:

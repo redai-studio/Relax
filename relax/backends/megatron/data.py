@@ -478,6 +478,11 @@ def get_batch(
     if isinstance(batch, PrepackedBatch):
         return batch
 
+    # Agentic rows always publish this nullable TQ column. An all-text
+    # microbatch must still use GPT's normal CP packing, not Bridge's layout.
+    if "multimodal_train_inputs" in batch and not any(mm is not None for mm in batch["multimodal_train_inputs"] or ()):
+        batch["multimodal_train_inputs"] = None
+
     if pack_device is not None:
         for key, dtype in (
             ("tokens", torch.long),
@@ -1434,7 +1439,7 @@ def get_data_iterator(
         needs_unsplit_input = (
             getattr(args, "is_vl_model", False)
             or getattr(args, "uses_unsplit_forward", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
+            or any(mm is not None for mm in rollout_data.get("multimodal_train_inputs") or ())
         )
         if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
@@ -1570,7 +1575,7 @@ def log_rollout_data(
             total_lengths,
             args.qkv_format,
             getattr(args, "is_vl_model", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
+            or any(mm is not None for mm in rollout_data.get("multimodal_train_inputs") or ())
             or getattr(args, "uses_unsplit_forward", False),
         )
 
