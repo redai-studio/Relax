@@ -346,6 +346,12 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
+    # A wedged actor cannot run shutdown(). Keep its server tied to its lifetime,
+    # including when the actor exits before the child installs this guard.
+    kill_itself_when_parent_died()
+    if os.getppid() != parent_pid:
+        return
+
     if Envs.SGLANG_CONTROL_POLL_INTERVAL != 1.0:
         from .control_polling_patch import patch_control_poll_interval
 
@@ -353,12 +359,6 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
             Envs.SGLANG_CONTROL_POLL_INTERVAL,
             tokenizer_worker_num=getattr(server_args, "tokenizer_worker_num", None),
         )
-
-    # A wedged actor cannot run shutdown(). Keep its server tied to its lifetime,
-    # including when the actor exits before the child installs this guard.
-    kill_itself_when_parent_died()
-    if os.getppid() != parent_pid:
-        return
 
     if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
