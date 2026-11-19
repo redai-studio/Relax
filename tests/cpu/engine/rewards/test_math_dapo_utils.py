@@ -11,6 +11,7 @@ dependencies.
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,32 @@ def _load_math_dapo_utils():
 
 
 math_dapo_utils = _load_math_dapo_utils()
+
+
+@pytest.mark.parametrize(
+    "prompt,response,status,expected",
+    [
+        ("", "Answer: 42", "completed", 1.0),
+        ("", r"\boxed{42}", "completed", 1.0),
+        ("", r"\boxed{42}" + "\nAnswer: 7", "completed", 0.0),
+        ("", "Answer: 42", "truncated", 0.0),
+        ("", "<think>Answer: 42", "completed", 0.0),
+        ("<think>", "Answer: 42", "completed", 0.0),
+        ("<think>", "Answer: 42</think>Answer: 7", "completed", 0.0),
+        ("<think>", "Answer: 7</think>Answer: 42", "completed", 1.0),
+        ("<think>", "</think>Answer: 42<|user|>", "completed", 1.0),
+        ("<think>", "</think>Answer: 42\nAnswer:", "completed", 0.0),
+        ("<think>", "</think>Answer: 42\n\\boxed{7", "completed", 0.0),
+        ("", "No answer", "completed", 0.0),
+    ],
+)
+def test_completed_math_score_final_answer_contract(prompt, response, status, expected):
+    sample = SimpleNamespace(prompt=prompt, response=response, status=status, label="42")
+
+    result = math_dapo_utils.compute_completed_math_score(None, sample)
+
+    assert result["acc"] == expected
+    assert result["score"] == 2 * expected - 1
 
 
 class TestLastBoxedOnlyString:

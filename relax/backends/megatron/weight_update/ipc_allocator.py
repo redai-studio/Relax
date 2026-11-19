@@ -101,3 +101,21 @@ class IpcBucketAllocator:
             if self._restore_effective_settings is not None:
                 self._setter(self._restore_effective_settings)
             self._setter(self._settings)
+
+    def can_share(self, tensor: torch.Tensor) -> bool:
+        """Check the source allocation, not the current expandable setting.
+
+        Only call for oversized singleton buckets: taking a snapshot for every
+        small chunk would add substantial CPU overhead to weight export.
+        Unknown or expandable storage must use a fresh IPC allocation.
+        """
+        if tensor.device.type != "cuda" or torch.version.hip is not None:
+            return False
+        if torch.cuda.memory.get_allocator_backend() != "native":
+            return False
+        pointer = tensor.untyped_storage().data_ptr()
+        return any(
+            segment.get("is_expandable") is False
+            and segment["address"] <= pointer < segment["address"] + segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+        )

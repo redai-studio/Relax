@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # the file to manage all sglang deps in the megatron actor
 try:
     from sglang.srt.layers.quantization.fp8_utils import quant_weight_ue8m0, transform_scale_ue8m0
@@ -21,6 +22,11 @@ try:
 except ImportError:
     from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
 
+try:
+    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorMetadata
+except ImportError:
+    FlattenedTensorMetadata = None
+
 __all__ = [
     "quant_weight_ue8m0",
     "transform_scale_ue8m0",
@@ -28,4 +34,5 @@ __all__ = [
     "monkey_patch_torch_reductions",
     "MultiprocessingSerializer",
     "FlattenedTensorBucket",
+    "FlattenedTensorMetadata",
 ]

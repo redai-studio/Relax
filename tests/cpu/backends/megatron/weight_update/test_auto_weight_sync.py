@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -317,6 +318,7 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
 
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
     updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
+    updater.args = SimpleNamespace(update_weight_buffer_size=16)
     updater.quantization_config = None
     updater.weight_version = 0
     updater.rollout_engines = updater.distributed_rollout_engines = []
@@ -358,6 +360,122 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
     with pytest.raises(RuntimeError):
         updater.update_weights()
     assert set(completed) == set(alive)
+
+
+@pytest.mark.parametrize("paired", [False, True])
+def test_full_chunk_is_released_before_next_parameter_is_constructed(paired):
+    import weakref
+
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _chunk_with_mla_pairing
+
+    names = (
+        ["model.layers.0.self_attn.q_a_proj.weight", "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"]
+        if paired
+        else ["model.embed_tokens.weight"]
+    )
+    alive = []
+
+    def parameters():
+        for name in names:
+            tensor = torch.ones(4)
+            alive.append(weakref.ref(tensor))
+            yield name, tensor
+            del tensor
+        assert all(ref() is None for ref in alive), "Previous full chunk survived into the next conversion"
+        yield "lm_head.weight", torch.zeros(4)
+
+    chunks = _chunk_with_mla_pairing(parameters(), chunk_size=16)
+    first = next(chunks)
+    assert [name for name, _ in first] == names
+    assert all(torch.equal(tensor, torch.ones(4)) for _, tensor in first)
+    del first
+    assert next(chunks)[0][0] == "lm_head.weight"
+    assert list(chunks) == []
+
+
+@pytest.mark.parametrize("failure", [None, "ack", "dispatch", "conversion"])
+def test_oversized_chunk_keeps_storage_until_ack_then_releases_before_conversion(monkeypatch, failure):
+    import weakref
+
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace(update_weight_buffer_size=16)
+    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
+    updater.quantization_config = None
+    updater.weight_version = 0
+    updater.rollout_engines = updater.distributed_rollout_engines = []
+    updater.weights_getter = lambda: {}
+    alive, completed = {}, []
+
+    def chunks(weights):
+        tensor = torch.ones(8)
+        alive["source"] = weakref.ref(tensor)
+        yield [("model.embed_tokens.weight", tensor)]
+        del tensor
+        assert completed
+        assert all(ref() is None for ref in alive.values()), "Large chunk survived into the next conversion"
+        if failure == "conversion":
+            raise RuntimeError("conversion failed")
+
+    def send(tensors, *, dispatch_errors):
+        payload = torch.cat([tensor for _, tensor in tensors])
+        alive["payload"] = weakref.ref(payload)
+        if failure == "dispatch":
+            dispatch_errors.append("dispatch failed")
+        return ["reader"], payload
+
+    def get(refs):
+        if refs:
+            assert all(ref() is not None for ref in alive.values())
+            completed.append(refs)
+            if failure == "ack" and len(completed) == 1:
+                raise RuntimeError("ack failed")
+        return []
+
+    updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=chunks)
+    updater._send_hf_params = send
+    monkeypatch.setattr(sync.ray, "get", get)
+    monkeypatch.setattr(sync.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(sync.dist, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.device_utils, "maybe_backend_barrier_on_weight_chunk", lambda **kw: None)
+    if failure:
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+            updater.update_weights()
+    else:
+        updater.update_weights()
+    assert completed
+
+
+@pytest.mark.parametrize(
+    "dtype,layout,shareable",
+    [
+        (torch.bfloat16, "full", True),
+        (torch.float32, "offset", True),
+        (torch.bfloat16, "full", False),
+        (torch.float32, "transpose", True),
+        (torch.bfloat16, "legacy", True),
+    ],
+)
+def test_singleton_ipc_reuses_only_compatible_storage_and_roundtrips(monkeypatch, dtype, layout, shareable):
+    tensor = torch.arange(24, dtype=dtype).reshape(6, 4)
+    if layout == "offset":
+        tensor = tensor[1:5]
+    elif layout == "transpose":
+        tensor = tensor.T
+    elif layout == "legacy":
+        monkeypatch.setattr(sync.FlattenedTensorBucket, "supports_multi_dtypes", False)
+    allocator = SimpleNamespace(can_share=lambda _: shareable, allocation=nullcontext)
+    expected = tensor.clone()
+    payload = sync._flattened_ipc_payload([("weight", tensor)], allocator, 16)
+    reused = shareable and layout not in ("transpose", "legacy")
+    assert (payload["flattened_tensor"].data_ptr() == tensor.data_ptr()) is reused
+    restored = sync.MultiprocessingSerializer.deserialize(
+        sync.MultiprocessingSerializer.serialize(payload, output_str=True)
+    )
+    named = sync.FlattenedTensorBucket(**restored).reconstruct_tensors()
+    assert named[0][0] == "weight"
+    assert named[0][1].dtype == dtype
+    torch.testing.assert_close(named[0][1], expected)
 
 
 @pytest.mark.parametrize("kind", ["replicated", "duplicated", "buffer", "sharded"])

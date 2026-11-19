@@ -3298,16 +3298,21 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return rollout_only, actor_fwd_only
 
-    def _wait_for_previous_eval(self, max_wait_seconds: int = 1800) -> None:
+    def _wait_for_previous_eval(self, max_wait_seconds: float | None = None) -> None:
         """Block until the rollout service's previous evaluation has finished.
 
         Only rank 0 polls the rollout HTTP endpoint; all ranks synchronise via
         a barrier afterwards so they proceed together.
         Args:
             max_wait_seconds: Maximum time (in seconds) to wait for eval
-                completion before giving up and proceeding. Defaults to 300.
+                completion before giving up and proceeding. Uses
+                final_eval_wait_timeout from custom config, or 1800 seconds.
         """
-        if dist.get_rank() == 0:
+        if max_wait_seconds is None:
+            configured_timeout = getattr(self.args, "final_eval_wait_timeout", None)
+            max_wait_seconds = float(1800 if configured_timeout is None else configured_timeout)
+        process_group = get_gloo_group()
+        if dist.get_rank(group=process_group) == 0:
             try:
                 rollout_serve_url = get_serve_url("rollout")
                 start_time = time.monotonic()
@@ -3327,7 +3332,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     time.sleep(10)
             except Exception as e:
                 logger.warning(f"Error checking eval status: {e}, proceeding with weight update.")
-        dist.barrier(group=get_gloo_group())
+        dist.barrier(group=process_group)
 
     @timer
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:

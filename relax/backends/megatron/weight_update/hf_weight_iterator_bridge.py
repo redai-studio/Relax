@@ -1160,6 +1160,7 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
 
                 bucket.extend(pair)
                 bucket_size += pair_size
+                del pair, partner_tensor
             else:
                 pending_pairs[pair_key] = (name, tensor)
         else:
@@ -1171,6 +1172,14 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
 
             bucket.append((name, tensor))
             bucket_size += obj_size
+
+        # A single embedding or fused pair can exceed the budget. Send it
+        # before requesting the next parameter, which may itself be large.
+        if bucket_size >= chunk_size:
+            yield bucket
+            bucket = []
+            bucket_size = 0
+        del tensor
 
     for pair_key, (name, tensor) in pending_pairs.items():
         if dist.get_rank() == 0:

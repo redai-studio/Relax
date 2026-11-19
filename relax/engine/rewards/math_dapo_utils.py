@@ -2,6 +2,44 @@
 
 import re
 import signal
+from typing import Any
+
+
+def compute_completed_math_score(args: Any, sample: Any, **kwargs: Any) -> dict[str, Any]:
+    """Score completed integer answers outside reasoning for a custom RM.
+
+    Unlike the original DAPO reward, accept both Answer: and boxed answers,
+    selecting the latest marker without consulting the label. Truncated or
+    unfinished reasoning receives no correctness credit.
+    """
+    response = sample.response
+    status = getattr(sample.status, "value", sample.status)
+    prompt = sample.prompt if isinstance(sample.prompt, str) else ""
+    reasoning_open = prompt.rfind("<think>") > prompt.rfind("</think>")
+    complete = status == "completed"
+    if response.rfind("<think>") > response.rfind("</think>"):
+        complete = False
+    if reasoning_open and "</think>" not in response:
+        complete = False
+    final = response.rsplit("</think>", 1)[-1] if complete else ""
+    final = re.sub(r"(?:<\|(?:user|observation|endoftext|im_end)\|>\s*)+$", "", final)
+    answers = list(re.finditer(r"(?i)Answer\s*:", final))
+    answer_pos = answers[-1].start() if answers else -1
+    boxed = last_boxed_only_string(final)
+    box_pos = final.rfind("\\boxed{")
+    if answer_pos > box_pos:
+        candidate = final[answer_pos:]
+    elif boxed is not None:
+        candidate = "Answer: " + remove_boxed(boxed)
+    else:
+        candidate = ""
+    correct, predicted = is_correct_minerva(candidate, str(sample.label))
+    return {
+        "score": 1.0 if correct else -1.0,
+        "acc": float(correct),
+        "pred": predicted,
+        "completed_final": float(complete),
+    }
 
 
 def last_boxed_only_string(string: str) -> str | None:

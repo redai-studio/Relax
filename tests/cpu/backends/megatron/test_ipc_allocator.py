@@ -155,6 +155,16 @@ def test_missing_effective_state_fails_explicitly(monkeypatch):
         module.IpcBucketAllocator(SimpleNamespace(type="cuda"))
 
 
+@pytest.mark.parametrize("expandable,pointer,expected", [(False, 128, True), (True, 128, False), (False, 300, False)])
+def test_source_storage_decides_ipc_reuse_even_after_disabling_expandable(monkeypatch, expandable, pointer, expected):
+    allocator, scope = make(monkeypatch, "expandable_segments:False", False)
+    allocator.torch.cuda.memory_snapshot = lambda: [{"address": 100, "total_size": 100, "is_expandable": expandable}]
+    tensor = SimpleNamespace(
+        device=SimpleNamespace(type="cuda"), untyped_storage=lambda: SimpleNamespace(data_ptr=lambda: pointer)
+    )
+    assert scope.can_share(tensor) is expected
+
+
 @pytest.mark.skipif(
     module.torch.version.cuda is None or module.torch.version.hip is not None,
     reason="native allocator parser requires a CUDA-enabled PyTorch build (no GPU needed)",
