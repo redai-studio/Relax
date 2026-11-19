@@ -106,6 +106,12 @@ class TestDataSourceIntegration:
             n_samples_per_prompt=2,
             save=str(tmp_path),
             load=str(tmp_path),
+            custom_prompt_path=None,
+            sampling_config=None,
+            streaming_buffer_size=10000,
+            prefetch_chunk_size=32,
+            prefetch_max_cached=256,
+            prefetch_num_workers=1,
         )
         original = data_source_module.RolloutDataSource(args)
         original.get_samples(1)
@@ -134,7 +140,7 @@ class TestDataSourceIntegration:
         self, tmp_path, data_source_module, monkeypatch, failure
     ):
         source = object.__new__(data_source_module.RolloutDataSource)
-        source.args = Namespace(rollout_global_dataset=True, save=str(tmp_path))
+        source.args = Namespace(rollout_global_dataset=True, save=str(tmp_path), sampling_config=None)
         source.sample_offset = 8
         source.epoch_id = 1
         source.sample_group_index = 8
