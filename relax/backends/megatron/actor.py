@@ -3932,7 +3932,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "returns",
             "opd_reverse_kl",
         }
-        if self.args.dynamic_context_parallel:
+        if getattr(self.args, "dynamic_context_parallel", False):
             # forward_only already restored these responses in their original sample order.
             token_fields -= {"log_probs", "ref_log_probs"}
         fields_to_gather = [
