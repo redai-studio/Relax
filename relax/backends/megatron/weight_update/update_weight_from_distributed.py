@@ -1,8 +1,4 @@
-import os
 import socket
-import subprocess
-import sys
-import tempfile
 import time
 import uuid
 from argparse import Namespace
@@ -17,6 +13,7 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 from tqdm import tqdm
 
+from relax.backends.sglang._scale_weight_sync_precheck import launch_probe, transport_fingerprint
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
@@ -278,128 +275,75 @@ class UpdateWeightFromDistributed:
 
 
 def precheck_colocate_receiver(
-    engines: list, gpu_counts: list[int], timeout: float
-) -> tuple[bool, bool, bool, tuple[ObjectRef, ...]]:
-    """Probe the actual sender GPU and all receiver TP ranks in subprocesses.
+    engines: list, local_gpu_count: int, timeout: float
+) -> tuple[bool, bool, tuple[ObjectRef, ...]]:
+    """Verify sender-to-candidate NCCL.
 
-    Return connectivity, exit confirmation for the sender and completed
-    receivers, and any outstanding receiver refs. Late calls cannot launch
-    after the deadline.
+    Return any receiver probes still needing an exit ACK.
     """
-    if timeout <= 5 or not engines or device_utils.get_dist_backend() != "nccl":
-        return False, True, True, ()
+    if timeout <= 5 or not engines:
+        return False, True, ()
     deadline = time.monotonic() + timeout
+    refs = []
+    process = None
+    success = False
     try:
+        if device_utils.get_dist_backend() != "nccl":
+            return False, True, ()
         device = torch.cuda.current_device()
         if torch.cuda.mem_get_info(device)[0] < Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES:
             logger.warning("[Colocate FULL] Insufficient GPU memory on the NCCL probe sender")
-            return False, True, True, ()
-        sender_fingerprint = {
-            f"nccl_{name}": os.environ.get(f"NCCL_{name.upper()}")
-            for name in ("ib_disable", "socket_ifname", "ib_hca", "ib_gid_index")
-        }
-        fingerprints = ray.get(
-            [engine.get_scale_weight_sync_transport_fingerprint.remote() for engine in engines],
-            timeout=min(5, timeout - 5),
-        )
-        for fingerprint in fingerprints:
-            ok, mismatch = scale_utils._scale_weight_sync_precheck_fingerprints_match(
-                {"fingerprint": sender_fingerprint}, {"fingerprint": fingerprint}
-            )
-            if not ok:
-                logger.warning("[Colocate FULL] Incompatible NCCL probe settings: %s", mismatch)
-                return False, True, True, ()
-    except Exception:
-        logger.exception("[Colocate FULL] Could not inspect NCCL probe participants")
-        return False, True, True, ()
-
-    timeout = deadline - time.monotonic()
-    if timeout <= 5:
-        return False, True, True, ()
-    probe_timeout = timeout - 4
-    expires_at = time.time() + probe_timeout
-    try:
+            return False, True, ()
         address = _wrap_ipv6(ray._private.services.get_node_ip_address())
         with socket.socket() as sock:
             sock.bind(("", 0))
             port = str(sock.getsockname()[1])
-        log = tempfile.TemporaryFile()
-    except Exception:
-        logger.exception("[Colocate FULL] Could not prepare NCCL probe")
-        return False, True, True, ()
-    token = f"colocate-precheck-{uuid.uuid4().hex}"
-    world_size = 1 + sum(gpu_counts)
-    command = [
-        sys.executable,
-        "-m",
-        "relax.backends.sglang._scale_weight_sync_precheck",
-        "--master-address",
-        address,
-        "--master-port",
-        port,
-        "--rank",
-        "0",
-        "--world-size",
-        str(world_size),
-        "--device-id",
-        str(device),
-        "--timeout-secs",
-        str(probe_timeout),
-        "--run-token",
-        token,
-    ]
-    refs = []
-    with log:
-        try:
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        except OSError:
-            logger.exception("[Colocate FULL] Could not launch sender probe %s", token)
-            return False, True, True, ()
-        ok = False
-        try:
-            rank = 1
-            for engine, count in zip(engines, gpu_counts, strict=True):
-                refs.append(
-                    engine.run_scale_weight_sync_precheck.remote(
-                        master_address=address,
-                        ports=",".join([port] * count),
-                        group_rank=rank,
-                        run_token=token,
-                        tp_size=count,
-                        timeout_secs=probe_timeout,
-                        world_size=world_size,
-                        expires_at=expires_at,
-                    )
+        token = f"colocate-precheck-{uuid.uuid4().hex}"
+        world_size = 1 + len(engines) * local_gpu_count
+        probe_timeout = deadline - time.monotonic() - 4  # reserve time for child exit ACKs
+        if probe_timeout <= 0:
+            return False, True, ()
+        expires_at = time.time() + probe_timeout
+        process = launch_probe(address, port, 0, world_size, device, probe_timeout, token)
+        for i, engine in enumerate(engines):
+            refs.append(
+                engine.run_scale_weight_sync_precheck.remote(
+                    master_address=address,
+                    ports=",".join([port] * local_gpu_count),
+                    group_rank=1 + i * local_gpu_count,
+                    run_token=token,
+                    tp_size=local_gpu_count,
+                    timeout_secs=probe_timeout,
+                    world_size=world_size,
+                    expires_at=expires_at,
                 )
-                rank += count
-            ok = process.wait(timeout=max(0, deadline - time.monotonic() - 4)) == 0
-        except Exception:
-            logger.exception("[Colocate FULL] Sender probe %s failed", token)
-        finally:
-            scale_utils._terminate_probe_process(process, grace_secs=0.5)
-        if not ok:
-            log.seek(0)
-            logger.warning("[Colocate FULL] Sender probe %s: %s", token, log.read()[-2000:].decode(errors="replace"))
-
-    sender_stopped = process.poll() is not None
-    if not refs:
-        return False, sender_stopped, True, ()
-    try:
-        ready, remaining = ray.wait(refs, num_returns=len(refs), timeout=max(0, deadline - time.monotonic()))
+            )
+        success = process.wait(timeout=max(0, deadline - time.monotonic() - 4)) == 0
     except Exception:
-        logger.exception("[Colocate FULL] Could not collect receiver probes %s", token)
-        return False, sender_stopped, True, tuple(refs)
-    receivers_stopped = True
-    for ref in ready:
+        logger.exception("[Colocate FULL] NCCL precheck failed")
+    finally:
+        sender_stopped = process is None
+        if process is not None:
+            try:
+                scale_utils._terminate_probe_process(process, grace_secs=0.5)
+                sender_stopped = process.poll() is not None
+            except OSError:
+                logger.exception("[Colocate FULL] Could not stop the sender probe")
+    if refs:
         try:
-            result = ray.get(ref)
-            receivers_stopped = receivers_stopped and result.get("stopped", True)
-            ok = ok and result.get("success") is True
+            replies = ray.get(refs, timeout=max(0, deadline - time.monotonic()))
+            if all(reply.get("stopped", True) for reply in replies):
+                sender = {"fingerprint": transport_fingerprint()}
+                compatible = all(
+                    reply.get("success")
+                    and isinstance(reply.get("fingerprint"), dict)
+                    and scale_utils._scale_weight_sync_precheck_fingerprints_match(sender, reply)[0]
+                    for reply in replies
+                )
+                return success and sender_stopped and compatible, sender_stopped, ()
         except Exception:
-            logger.exception("[Colocate FULL] Receiver probe %s did not acknowledge exit", token)
-            receivers_stopped = False
-    success = ok and sender_stopped and receivers_stopped and not remaining and len(refs) == len(engines)
-    return success, sender_stopped, receivers_stopped, tuple(remaining)
+            logger.exception("[Colocate FULL] Receiver probes did not confirm exit before the deadline")
+    return False, sender_stopped, tuple(refs)
 
 
 def connect_rollout_engines_from_distributed(
