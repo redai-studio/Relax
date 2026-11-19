@@ -149,10 +149,159 @@ index faa198b..73e0daf 100644
                  return result
              if output_gate:
 diff --git a/megatron/bridge/models/glm5next/glm53flash_bridge.py b/megatron/bridge/models/glm5next/glm53flash_bridge.py
-index 902588e..54fa050 100644
+index 902588e..d8a9c25 100644
 --- a/megatron/bridge/models/glm5next/glm53flash_bridge.py
 +++ b/megatron/bridge/models/glm5next/glm53flash_bridge.py
-@@ -716,7 +716,16 @@ class GLM53FlashBridge(MegatronModelBridge):
+@@ -49,6 +49,7 @@ from megatron.core.transformer.enums import AttnBackend
+ from megatron.core.transformer.module import MegatronModule
+ from torch import Tensor, nn
+ from torch.distributed._tensor import DTensor
++from torch.nn import functional as F
+ from transformers import Glm5NextForConditionalGeneration
+
+ from megatron.bridge.models.conversion import quantization_utils
+@@ -153,13 +154,23 @@ def _is_keep_mask(attention_mask: Optional[Tensor], input_ids: Tensor) -> bool:
+     return attention_mask is not None and attention_mask.dim() == 2 and attention_mask.shape == input_ids.shape
+
+
+-def _packed_position_ids(packed_seq_params: "PackedSeqParams", total_tokens: int, device: torch.device) -> Tensor:
+-    """Return per-sequence positions ``[1, total_tokens]`` for a packed THD stream.
++def _packed_position_ids(
++    packed_seq_params: "PackedSeqParams",
++    total_tokens: int,
++    device: torch.device,
++    cp_index: Optional[Tensor] = None,
++) -> Tensor:
++    """Return per-sequence positions for this rank's part of a packed THD stream.
+
+     Positions restart at each physical sequence start; tokens past the last boundary get 0.
+     """
+     _, cu_seqlens = get_packed_seq_q_cu_seqlens(packed_seq_params)
+     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long)
++    if cp_index is not None:
++        sequence = torch.bucketize(cp_index, cu_seqlens[1:], right=True)
++        positions = cp_index - cu_seqlens.index_select(0, sequence)
++        return torch.where(cp_index < cu_seqlens[-1], positions, 0).unsqueeze(0)
++
+     starts = torch.repeat_interleave(cu_seqlens[:-1], cu_seqlens.diff())
+     positions = torch.zeros(total_tokens, dtype=torch.long, device=device)
+     covered = min(starts.numel(), total_tokens)
+@@ -358,7 +369,7 @@ class GLM53FlashModelProvider(HybridMLAModelProvider, KDALayerConfig):
+     # Vision configuration (HF Glm5NextVisionConfig object, stored as-is).
+     vision_config: Any = None
+     spatial_merge_size: int = 2
+-    # Inject vision features before scattering the full sequence across TP ranks.
++    # Insert vision features before scattering the residual stream across TP ranks.
+     scatter_embedding_sequence_parallel: bool = False
+     # Required by HF's can_return_tuple-decorated feature extraction methods.
+     return_dict: bool = True
+@@ -519,8 +530,8 @@ class GLM53FlashModel(MegatronModule):
+
+         The language model applies no positional embedding, so ``position_ids`` is not
+         read; per-sequence positions in the packed layout are derived for MTP instead.
+-        Placeholder masks need whole sequences, so vision features are inserted before
+-        packing or context-parallel selection; sequence-parallel scattering comes last.
++        Packed inputs use global placeholder order to insert vision features into
++        CP-local embeddings. Sequence-parallel scattering comes after feature insertion.
+         Only the pre-process stage embeds tokens and runs the vision tower. Later stages
+         read activations from ``set_input_tensor`` and use token IDs only for layout.
+         """
+@@ -544,9 +555,7 @@ class GLM53FlashModel(MegatronModule):
+                 )
+             cp_index = self._packed_cp_index(packed_seq_params, input_ids)
+             lm_input_ids = _select_tokens(input_ids, cp_index)
+-            lm_position_ids = _select_tokens(
+-                _packed_position_ids(packed_seq_params, input_ids.size(1), input_ids.device), cp_index
+-            )
++            lm_position_ids = _packed_position_ids(packed_seq_params, input_ids.size(1), input_ids.device, cp_index)
+             if cp_index is not None:
+                 labels = _select_tokens(labels, cp_index)
+                 if loss_mask is not None:
+@@ -569,21 +578,24 @@ class GLM53FlashModel(MegatronModule):
+         decoder_input = None
+         if self.pre_process:
+             if inputs_embeds is None:
++                embedding_ids = lm_input_ids if cp_index is not None else input_ids
+                 # [seq, batch, hidden], not yet scattered for SP -> HF's [batch, seq, hidden].
+-                inputs_embeds = self.language_model.embedding(input_ids=input_ids, position_ids=None)
++                inputs_embeds = self.language_model.embedding(input_ids=embedding_ids, position_ids=None)
+                 inputs_embeds = inputs_embeds.transpose(0, 1).contiguous()
+-            inputs_embeds = self._insert_vision_features(
+-                input_ids,
+-                inputs_embeds,
++            else:
++                inputs_embeds = _select_tokens(inputs_embeds, cp_index)
++            vision_inputs = dict(
+                 pixel_values=pixel_values,
+                 image_grid_thw=image_grid_thw,
+                 pixel_values_videos=pixel_values_videos,
+                 video_grid_thw=video_grid_thw,
+             )
+-            if already_packed:
+-                decoder_input = _select_tokens(inputs_embeds, cp_index)
++            if cp_index is not None:
++                decoder_input = self._insert_cp_vision_features(input_ids, inputs_embeds, cp_index, **vision_inputs)
+             else:
+-                decoder_input = self._pack_rows(inputs_embeds, keep_mask)[0]
++                decoder_input = self._insert_vision_features(input_ids, inputs_embeds, **vision_inputs)
++            if not already_packed:
++                decoder_input = self._pack_rows(decoder_input, keep_mask)[0]
+             # Megatron expects [seq, batch, hidden]; THD uses batch 1.
+             decoder_input = decoder_input.transpose(0, 1).contiguous()
+             if self.config.sequence_parallel:
+@@ -633,6 +645,51 @@ class GLM53FlashModel(MegatronModule):
+             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+         return inputs_embeds
+
++    def _insert_cp_vision_features(
++        self,
++        input_ids: Tensor,
++        inputs_embeds: Tensor,
++        cp_index: Tensor,
++        *,
++        pixel_values: Optional[Tensor],
++        image_grid_thw: Optional[Tensor],
++        pixel_values_videos: Optional[Tensor],
++        video_grid_thw: Optional[Tensor],
++    ) -> Tensor:
++        if pixel_values is None and pixel_values_videos is None:
++            return inputs_embeds
++        # GLM distinguishes image and video placeholders using the surrounding
++        # video span. Use HF's global masks before selecting the local shard.
++        image_mask, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
++        if pixel_values is not None:
++            # The HF feature helper splits by image on the host. Packed SFT
++            # consumes the original pooled rows in order, so skip split/concat.
++            image_features = self.visual(pixel_values.type(self.visual.dtype), grid_thw=image_grid_thw).pooler_output
++            inputs_embeds = self._insert_local_vision_features(image_mask, inputs_embeds, image_features, cp_index)
++        if pixel_values_videos is not None:
++            video_features = self.get_video_features(pixel_values_videos, video_grid_thw).pooler_output
++            inputs_embeds = self._insert_local_vision_features(
++                video_mask, inputs_embeds, torch.cat(video_features, dim=0), cp_index
++            )
++        return inputs_embeds
++
++    @staticmethod
++    def _insert_local_vision_features(
++        placeholders: Tensor, inputs_embeds: Tensor, features: Tensor, cp_index: Tensor
++    ) -> Tensor:
++        # Media rows follow global placeholder order, including media that span CP shards.
++        placeholders = placeholders.squeeze(-1)
++        features = features.to(inputs_embeds.device, inputs_embeds.dtype)
++        torch._assert_async(placeholders.sum() == features.size(0), "Vision feature and placeholder counts differ.")
++        local_mask = placeholders.index_select(1, cp_index)
++        ordinals = placeholders.cumsum(dim=1, dtype=torch.long).index_select(1, cp_index)
++        # Row 0 represents text and is skipped by embedding backward. A shard
++        # with no placeholders still participates in the vision gradient graph.
++        indices = torch.where(local_mask, ordinals, 0)
++        table = torch.cat((features.new_zeros((1, features.size(-1))), features), dim=0)
++        local_features = F.embedding(indices, table, padding_idx=0)
++        return torch.where(local_mask.unsqueeze(-1), local_features, inputs_embeds)
++
+     def _pack_rows(self, tensor: Tensor, keep_mask: Tensor) -> tuple[Tensor, "PackedSeqParams"]:
+         """Pack the kept tokens of dense rows into this rank's TP/CP/FP8-aligned THD stream."""
+         return preprocess_packed_seqs(
+@@ -716,7 +773,16 @@ class GLM53FlashBridge(MegatronModelBridge):
          main_pattern, moe_layer_freq = _glm5next_hybrid_layout(hf_config)
          lin = text_config.linear_attn_config
          num_mtp = int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)
@@ -167,7 +316,7 @@ index 902588e..54fa050 100644
 +                rope["rope_type"] = "axial"
 +                rope.setdefault("rope_theta", 10000.0)
 +                vision_config.rope_parameters = rope
- 
+
          config_kwargs.update(
              normalization="RMSNorm",
 diff --git a/megatron/bridge/models/kimi/kimi_k3_layers.py b/megatron/bridge/models/kimi/kimi_k3_layers.py
@@ -3837,15 +3986,20 @@ index 38c274c..a181fbb 100755
              ("megatron.core.safe_globals", "safe_load_from_bytes"),
              ("numpy._core.multiarray", "_reconstruct"),
 diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
-index 4b28b6a..ba6d63e 100644
+index 4b28b6a..30e10ba 100644
 --- a/megatron/core/ssm/gated_delta_net/common.py
 +++ b/megatron/core/ssm/gated_delta_net/common.py
-@@ -12,6 +12,7 @@ from typing import Optional, Protocol, Union
- 
+@@ -8,10 +8,11 @@
+ from contextlib import nullcontext
+ from dataclasses import dataclass
+ from functools import lru_cache
+-from typing import Optional, Protocol, Union
++from typing import Callable, Optional, Protocol, Union
+
  import torch
  import torch.nn as nn
 +import torch.nn.functional as F
- 
+
  from megatron.core import tensor_parallel
  from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 @@ -256,6 +257,19 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
@@ -3871,7 +4025,7 @@ index 4b28b6a..ba6d63e 100644
 @@ -332,6 +346,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
          self.conv_dim = self.qk_dim * 2 + self.v_dim
          self.conv_dim_local_tp = self.conv_dim // self.tp_size
- 
+
 +        parameter_device = "cpu" if config.use_cpu_initialization else torch.cuda.current_device()
          self.conv1d = nn.Conv1d(
              in_channels=self.conv_dim_local_tp,
@@ -3913,7 +4067,7 @@ index 4b28b6a..ba6d63e 100644
 +            device=self.dt_bias.device,
              out=self.dt_bias.data,
          )
- 
+
      def reset_parameters(self):
          """Reset the parameters."""
          if self.config.perform_initialization:
@@ -3931,15 +4085,22 @@ index 4b28b6a..ba6d63e 100644
 +        y = y * self.gate_act_fn(gate.float())
          y = y.to(x_dtype)
          return y
- 
-@@ -642,6 +658,65 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
+
+@@ -642,6 +658,75 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
          """
          raise NotImplementedError
- 
-+    def _resolve_thd_cu_seqlens(self, packed_seq_params, seq_len_global, cp_size):
+
++    def _resolve_thd_cu_seqlens(
++        self,
++        packed_seq_params: PackedSeqParams,
++        seq_len_global: int,
++        cp_size: int,
++        *,
++        validate_boundaries: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
 +        """Resolve and validate this micro-batch's global THD boundaries, once.
 +
-+        Every GDN layer is handed the same ``PackedSeqParams``, so the checks below --
++        Every packed linear-attention layer is handed the same ``PackedSeqParams``, so the checks below --
 +        each of which reads a device tensor from Python and therefore stalls on the
 +        GPU -- only need to run for the first layer that asks. The result is cached on
 +        the ``PackedSeqParams`` instance and reused while it still describes the very
@@ -3960,11 +4121,12 @@ index 4b28b6a..ba6d63e 100644
 +        )
 +        cacheable = all(t is None or not t.is_inference() for t in sources)
 +        versions = tuple(None if t is None or t.is_inference() else t._version for t in sources)
++        cache_key = (seq_len_global, cp_size, validate_boundaries)
 +        cached = getattr(packed_seq_params, "_gdn_resolved_cu_seqlens", None)
 +        if cacheable and cached is not None:
 +            cached_meta, cached_sources, cached_versions, cached_value = cached
 +            if (
-+                cached_meta == (seq_len_global, cp_size)
++                cached_meta == cache_key
 +                and all(a is b for a, b in zip(cached_sources, sources))
 +                and cached_versions == versions
 +            ):
@@ -3976,19 +4138,21 @@ index 4b28b6a..ba6d63e 100644
 +        cu_seqlens_kv = self._resolve_cu_seqlens(
 +            sources[2], sources[3], seq_len_global, "cu_seqlens_kv", cp_size=cp_size
 +        )
-+        assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-+            "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-+            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-+        )
-+        num_packed_seqs = cu_seqlens_q.shape[0] - 1
-+        assert num_packed_seqs > 0, (
-+            "Number of packed sequences must be greater than 0, "
-+            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-+        )
++        if validate_boundaries is not None:
++            validate_boundaries(cu_seqlens_q, cu_seqlens_kv)
++        else:
++            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
++                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
++                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++            )
++            assert cu_seqlens_q.shape[0] > 1, (
++                "Number of packed sequences must be greater than 0, "
++                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++            )
 +
 +        resolved = (cu_seqlens_q, cu_seqlens_kv)
 +        packed_seq_params._gdn_resolved_cu_seqlens = (
-+            (seq_len_global, cp_size),
++            cache_key,
 +            sources,
 +            versions,
 +            resolved,
@@ -3998,15 +4162,45 @@ index 4b28b6a..ba6d63e 100644
      def _resolve_cu_seqlens(
          self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
      ) -> torch.Tensor:
-@@ -869,7 +944,7 @@ def get_parameter_local_cp(
+@@ -869,7 +954,7 @@ def get_parameter_local_cp(
      slices = [slice(None)] * param.dim()
      dim_size = param.size(dim=dim)
      slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
 -    param = param[slices]
 +    param = param[tuple(slices)]
      return param
- 
- 
+
+
+diff --git a/megatron/core/ssm/gated_delta_net/kda.py b/megatron/core/ssm/gated_delta_net/kda.py
+index 38531a0..66dee14 100644
+--- a/megatron/core/ssm/gated_delta_net/kda.py
++++ b/megatron/core/ssm/gated_delta_net/kda.py
+@@ -370,21 +370,12 @@ class KimiDeltaAttention(_GDNBase):
+                     "Packed KDA requires causal_conv1d and deterministic_mode=False. "
+                     "The convolution fallback does not support sequence boundaries."
+                 )
+-            cu_seqlens_q = self._resolve_cu_seqlens(
+-                packed_seq_params.cu_seqlens_q_padded,
+-                packed_seq_params.cu_seqlens_q,
+-                seq_len_global,
+-                "cu_seqlens_q",
+-                cp_size=cp_size_runtime,
+-            )
+-            cu_seqlens_kv = self._resolve_cu_seqlens(
+-                packed_seq_params.cu_seqlens_kv_padded,
+-                packed_seq_params.cu_seqlens_kv,
++            cu_seqlens_q, _ = self._resolve_thd_cu_seqlens(
++                packed_seq_params,
+                 seq_len_global,
+-                "cu_seqlens_kv",
+-                cp_size=cp_size_runtime,
++                cp_size_runtime,
++                validate_boundaries=self._validate_packed_cu_seqlens,
+             )
+-            self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
+         else:
+             cu_seqlens_q = None
+
 diff --git a/megatron/core/ssm/gated_delta_net/gdn.py b/megatron/core/ssm/gated_delta_net/gdn.py
 index 6c66153..eccf722 100644
 --- a/megatron/core/ssm/gated_delta_net/gdn.py
