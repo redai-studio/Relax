@@ -97,7 +97,7 @@ def validate_args(args: Namespace) -> None:
             "--use-chunkflow does not support sequence/batch-level objectives (GSPO/OPSM/M2PO): "
             "chunk-local statistics cannot replace full-response or batch reductions."
         )
-    if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
+    if args.fully_async and getattr(args, "use_dynamic_batch_size", False):
         raise ValueError(
             "--use-chunkflow does not support --fully-async with --use-dynamic-batch-size: "
             "streaming iterators have an unknown micro-batch count, but ChunkFlow requires a fixed plan. "

@@ -3239,7 +3239,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         raise ValueError("--colocate-expert-weight-routing requires colocated Megatron Bridge training")
 
     # Only fully-async mode relies on the newer TransferQueue streaming sampler.
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         check_transfer_queue_version()
 
     return args
@@ -3400,11 +3400,11 @@ def _normalize_mtp_only_training_args(args) -> None:
         conflicts.append("--freeze-params-name-list")
     if getattr(args, "lora_rank", 0) > 0:
         conflicts.append("--lora-rank")
-    if getattr(args, "sft_chunked_logits", False):
+    if args.sft_chunked_logits:
         conflicts.append("--sft-chunked-logits")
     if getattr(args, "overlap_moe_expert_parallel_comm", False):
         conflicts.append("--overlap-moe-expert-parallel-comm")
-    if getattr(args, "fully_async", False):
+    if args.fully_async:
         conflicts.append("--fully-async")
     if getattr(args, "hybrid", False):
         conflicts.append("--hybrid")
@@ -3637,7 +3637,7 @@ def _validate_reinforce_plus_plus_args(args, is_offline: bool) -> None:
 
     if not getattr(args, "normalize_advantages", False):
         raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
-    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+    if args.fully_async or getattr(args, "hybrid", False):
         raise ValueError(
             f"--advantage-estimator {estimator} supports synchronous colocate training only; "
             "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
@@ -3768,11 +3768,7 @@ def validate_kl_coefficients(args: argparse.Namespace) -> None:
 
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
-    is_sync_ppo = (
-        getattr(args, "use_critic", False)
-        and not getattr(args, "fully_async", False)
-        and not getattr(args, "hybrid", False)
-    )
+    is_sync_ppo = getattr(args, "use_critic", False) and not args.fully_async and not getattr(args, "hybrid", False)
     if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
         return False
 
@@ -4837,7 +4833,7 @@ def relax_validate_args(args):
 
     if (
         args.over_sampling_batch_size > args.rollout_batch_size
-        and not getattr(args, "fully_async", False)
+        and not args.fully_async
         and not getattr(args, "partial_rollout", False)
     ):
         # Without fully_async/partial_rollout there is no next-step carry path for the
@@ -4869,7 +4865,7 @@ def relax_validate_args(args):
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
     # This is a hard assert — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
-    if getattr(args, "sft_chunked_logits", False):
+    if args.sft_chunked_logits:
         # Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked

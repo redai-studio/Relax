@@ -635,7 +635,7 @@ def validate_generative_config(args: Namespace) -> None:
     # with an opaque AttributeError / NotImplementedError.
     _fail(
         errors,
-        bool(getattr(args, "fully_async", False)),
+        bool(args.fully_async),
         "fully_async is not supported for train_backend=fsdp (generative RL is synchronous colocate only in this release).",
     )
     _fail(

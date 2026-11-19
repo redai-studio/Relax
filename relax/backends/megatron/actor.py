@@ -2558,7 +2558,7 @@ class MegatronTrainRayActor(TrainRayActor):
         has no pipelined meta tracking across stages.
         """
         return (
-            getattr(self.args, "fully_async", False)
+            self.args.fully_async
             and getattr(self.args, "use_dynamic_batch_size", False)
             and mpu.get_pipeline_model_parallel_world_size() == 1
             and (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) == 1
