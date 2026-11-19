@@ -10,7 +10,6 @@ on:
       - 'scripts/tools/generate_openapi.py'
       - '.github/workflows/deploy-docs.yml'
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
