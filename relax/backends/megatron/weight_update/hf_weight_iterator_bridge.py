@@ -399,7 +399,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 router.replicated_bytes,
             )
 
-    def get_hf_weight_chunks(self, megatron_local_weights):
+    def get_hf_weight_chunks(self, megatron_local_weights, *, retained_ordinary_ipc: bool = False):
         if self._bf16_expert_buckets is not None:
             if self._packed_expert_sync:
                 yield from _chunk_with_mla_pairing(
@@ -417,8 +417,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         if self._expert_router is not None:
             yield from self._iter_routed_expert_chunks(megatron_local_weights)
         yield from _chunk_with_mla_pairing(
-            self._iter_hf_params(megatron_local_weights, include_experts=self._expert_router is None),
+            self._iter_hf_params(
+                megatron_local_weights,
+                include_experts=self._expert_router is None,
+                retained_ordinary_ipc=retained_ordinary_ipc,
+            ),
             chunk_size=self.args.update_weight_buffer_size,
+            yield_full_buckets=retained_ordinary_ipc,
         )
 
     def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
@@ -449,7 +454,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             yield gathered
             del gathered
 
-    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
+    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True, retained_ordinary_ipc: bool = False):
         """Yield individual (name, tensor) pairs for all params.
 
         Expert weights: load → TP gather + convert (src_rank only) →
@@ -469,6 +474,18 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         full_device_sync = device.type != "cpu" and any(
             weight.device.type == "cpu" for weight in megatron_local_weights.values()
         )
+        gather_options = {}
+        if retained_ordinary_ipc and self._async_weight_gather:
+            gather_options["contiguous_output_min_bytes"] = self.args.update_weight_buffer_size
+        if (
+            gather_options
+            and device.type == "cuda"
+            and torch.version.hip is None
+            and torch.cuda.memory.get_allocator_backend() == "native"
+        ):
+            trim_tp_size = mpu.get_tensor_model_parallel_world_size()
+        else:
+            trim_tp_size = 1
         # Eagerly init bridge converter so all ranks are ready before broadcast.
         self._bridge_converter.init_tasks()
         self._bridge_converter.broadcast_and_apply_configs()
@@ -515,6 +532,18 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
         # --- Non-expert weights: original path ---
         for bucket_infos in self._non_expert_buckets:
+            if trim_tp_size > 1 and len(bucket_infos) == 1:
+                info = bucket_infos[0]
+                if (
+                    not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
+                    and info.attrs.get("tensor_model_parallel", False)
+                    and info.attrs.get("parallel_mode") != "duplicated"
+                    and info.size * trim_tp_size > self.args.update_weight_buffer_size
+                ):
+                    # Return unused segments before the first oversized TP output is allocated.
+                    # The previous bucket's refs and read completion remain owned by the updater.
+                    trim_tp_size = 1
+                    torch.cuda.empty_cache()
             t_b0 = time.monotonic()
             params = _load_and_broadcast(
                 bucket_infos,
@@ -539,6 +568,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                             if not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
                         ],
                         gdn_split_sizes=self._gdn_split_sizes,
+                        **gather_options,
                     )
                 )
                 t_gather_total += time.monotonic() - t_g0
@@ -1164,7 +1194,7 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group,
     return result
 
 
-def _chunk_with_mla_pairing(named_params, chunk_size):
+def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=False):
     """Chunk weights by size while keeping fused weight pairs together.
 
     SGLang fuses ``q_a_proj`` + ``kv_a_proj_with_mqa`` into
@@ -1197,6 +1227,8 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
 
                 bucket.extend(pair)
                 bucket_size += pair_size
+                if yield_full_buckets:
+                    del pair, partner_tensor
             else:
                 pending_pairs[pair_key] = (name, tensor)
         else:
@@ -1208,6 +1240,14 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
 
             bucket.append((name, tensor))
             bucket_size += obj_size
+
+        if yield_full_buckets:
+            # A full bucket would be flushed before any following tensor or pair.
+            if bucket and bucket_size >= chunk_size:
+                yield bucket
+                bucket = []
+                bucket_size = 0
+            del tensor
 
     for pair_key, (name, tensor) in pending_pairs.items():
         if dist.get_rank() == 0:

@@ -212,6 +212,93 @@ def test_retained_sync_fences_before_closing_receiver_session(module):
     assert events[3][1]["load_format"] == module.NATIVE_SYNC_FENCE_LOADER
 
 
+@pytest.mark.parametrize("mode", ["retained", "noop_gpu", "bf16_expert_hf"])
+def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch, mode):
+    from types import SimpleNamespace
+
+    import torch
+
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+
+    events = []
+    budget = 8
+    cuda = torch.device("cuda", 0)
+    info = [
+        SimpleNamespace(name=name, attrs={"tensor_model_parallel": True}, size=8) for name in ("embedding", "head")
+    ]
+    standalone = mode == "bf16_expert_hf"
+    iterator = object.__new__(bridge.HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace(colocate=True, update_weight_buffer_size=budget)
+    iterator._expert_router = iterator._direct_expert_layout = None
+    iterator._bf16_expert_buckets = [[info[0]]] if standalone else None
+    iterator._packed_expert_sync = iterator.lora_merge_mode = False
+    iterator._expert_buckets = iterator._expert_broadcast_caches = []
+    iterator._vanilla_key_map = iterator._gdn_split_sizes = {}
+    iterator._non_expert_buckets = [[item] for item in info]
+    iterator._async_weight_gather = True
+    iterator._iter_bf16_expert_chunks = lambda _: iter([[("experts.weight", torch.zeros(4))]])
+    iterator._bridge_converter = SimpleNamespace(
+        init_tasks=lambda: None,
+        broadcast_and_apply_configs=lambda: None,
+        convert=lambda name, value: [(name, value)],
+    )
+
+    def gather(pairs, *, gdn_split_sizes, contiguous_output_min_bytes=None):
+        ((param, _),) = pairs
+        events.append(("gather", param.name, contiguous_output_min_bytes))
+        return [torch.zeros(4)]
+
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater._hf_weight_iterator = iterator
+    updater._route_experts = updater.use_distribute = updater.lora_enabled = False
+    updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = mode != "noop_gpu"
+    updater.quantization_config = None
+    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
+    updater.weights_getter = lambda: {"backing": SimpleNamespace(device=cuda)}
+    updater.rollout_engines = updater.distributed_rollout_engines = []
+    updater.weight_version = 0
+    updater._routed_engine_call = Mock()
+    updater._wait_for_ipc = Mock()
+
+    def send(chunk, *, dispatch_errors):
+        events.append(("send", *(name for name, _ in chunk)))
+        return [], None
+
+    updater._send_hf_params = send
+    monkeypatch.setenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", "1")
+    monkeypatch.setattr(module.ray, "get", lambda refs: refs)
+    monkeypatch.setattr(module.dist, "barrier", Mock())
+    monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(module.device_utils, "maybe_backend_barrier_on_weight_chunk", Mock())
+    monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", Mock(return_value="fence"))
+    monkeypatch.setattr(bridge.device_utils, "make_current_torch_device", lambda: cuda)
+    monkeypatch.setattr(bridge.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(bridge, "_load_and_broadcast", lambda *args, **kwargs: [torch.zeros(2)])
+    monkeypatch.setattr(bridge, "all_gather_params_async", gather)
+    monkeypatch.setattr(torch.cuda.memory, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append(("trim",)))
+
+    updater.update_weights()
+
+    if mode == "retained":
+        assert events == [
+            ("trim",),
+            ("gather", "embedding", budget),
+            ("send", "embedding"),
+            ("gather", "head", budget),
+            ("send", "head"),
+        ]
+    else:
+        assert events[:4] == [
+            ("gather", "embedding", None),
+            ("gather", "head", None),
+            ("send", "embedding"),
+            ("send", "head"),
+        ]
+        assert events[4:] == ([("send", "experts.weight")] if standalone else [])
+
+
 @pytest.mark.parametrize("version", [None, 3])
 def test_routed_ipc_payload_omits_uncommitted_version(module, version):
     import torch

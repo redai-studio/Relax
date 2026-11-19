@@ -568,6 +568,19 @@ class UpdateWeightFromTensor:
         else:
             export_ctx = nullcontext()
 
+        iterator = self._hf_weight_iterator
+        retained_ordinary_ipc = False
+        if self._has_retained_actor_weights() and not self._route_experts:
+            from .hf_weight_iterator_bridge import HfWeightIteratorBridge
+
+            retained_ordinary_ipc = (
+                isinstance(iterator, HfWeightIteratorBridge)
+                and not self.use_distribute
+                and getattr(self, "_direct_expert_layout", None) is None
+                and iterator._bf16_expert_buckets is None
+                and iterator._expert_router is None
+            )
+
         # Pipeline: when chunk N's IPC refs are in-flight on the engine,
         # chunk N+1's HF conversion + serialize + gather can proceed in
         # parallel.  We defer ``ray.get`` to the *next* iteration so the
@@ -578,7 +591,12 @@ class UpdateWeightFromTensor:
         long_lived_tensors = None
         try:
             with export_ctx:
-                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                hf_chunks = (
+                    iterator.get_hf_weight_chunks(megatron_local_weights, retained_ordinary_ipc=True)
+                    if retained_ordinary_ipc
+                    else iterator.get_hf_weight_chunks(megatron_local_weights)
+                )
+                for hf_named_tensors in hf_chunks:
                     dispatch_errors = []
                     current_refs, long_lived_tensors = self._send_hf_params(
                         hf_named_tensors, dispatch_errors=dispatch_errors
@@ -601,6 +619,8 @@ class UpdateWeightFromTensor:
                     prev_refs, current_refs = current_refs, []
                     if self._route_experts:
                         prev_long_lived_tensors = long_lived_tensors = None
+                    if self._route_experts or retained_ordinary_ipc:
+                        # Ordinary IPC owns the flattened copy in prev_long_lived_tensors.
                         del hf_named_tensors
                     device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
                 self._wait_for_ipc(prev_refs)
