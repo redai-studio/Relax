@@ -148,20 +148,20 @@ Minimal row shape:
 
 ### Literal image tags in text
 
-With `--multimodal-keys '{"image":"images"}'`, string content containing `<image>` requires matching image data by default. A missing, null, or empty `images` field does not prove that the row is text-only: the image data may have been lost.
-
-For message-list SFT data, explicitly mark known text as a structured `text` item. This preserves literal tags, including CLI arguments such as `emu <image>`, without a new flag or metadata field:
+With `--multimodal-keys '{"image":"images"}'`, SFT preserves literal `<image>` strings as text when the row's `images` field is missing, null, or an empty list. This allows text examples such as CLI arguments to share a training file with image examples, without rewriting the original data or adding a flag:
 
 ```json
 {
   "messages": [
-    {"role": "user", "content": [{"type": "text", "text": "Explain emu <image>."}]},
-    {"role": "assistant", "content": [{"type": "text", "text": "<image> is the input file argument."}]}
+    {"role": "user", "content": "Explain emu <image>."},
+    {"role": "assistant", "content": "<image> is the input file argument."}
   ]
 }
 ```
 
-Only apply this representation when the source identifies the content as text. Do not convert a genuine missing-image placeholder to text just to pass validation. Structured `image`/`image_url` items still require an image source, and image counts must still match for string placeholders. Explicit text items can coexist with valid structured images in the same conversation.
+When the mapped image field contains entries, string placeholders must still match those entries. Structured `image`/`image_url` items always require an inline or mapped image source; valid inline images can coexist with literal text. Audio and video validation is unchanged. The rule uses the field configured in `--multimodal-keys`, including custom column names.
+
+This compatibility rule cannot distinguish literal text from a row whose entire image field was lost. Such a row can also be accepted as text, so acceptance does not establish data completeness. Invalid structured images and partially missing mapped images still fail validation.
 
 ### Verify Data Files
 

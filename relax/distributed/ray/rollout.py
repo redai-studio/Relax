@@ -4988,6 +4988,8 @@ def _start_router(
         router_args.host = bind_ip
         router_args.port = router_port
         router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+        while router_args.prometheus_port == router_port:
+            router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
         router_args.log_level = "warn"
         router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 

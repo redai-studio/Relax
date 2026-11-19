@@ -177,6 +177,29 @@ def test_external_router_is_reused_without_static_mutation(rollout_module):
     assert not rollout_module._LAUNCHED_ROUTER_PROCESSES
 
 
+@pytest.mark.parametrize("configured_port", [None, 4273])
+def test_router_startup_uses_distinct_http_and_metrics_ports(monkeypatch, rollout_module, configured_port):
+    from sglang_router.launch_router import RouterArgs
+
+    args = _router_args()
+    args.sglang_router_port = configured_port
+    monkeypatch.setattr(rollout_module, "get_host_info", lambda: ("host", "192.0.2.1"))
+    monkeypatch.setattr(rollout_module, "Envs", SimpleNamespace(SLIME_HOST_IP=None))
+    candidates = [4273, 4273, 5001] if configured_port is None else [4273, 5001]
+    monkeypatch.setattr(rollout_module, "find_available_port", Mock(side_effect=candidates))
+    process = Mock()
+    process.is_alive.return_value = True
+    constructor = Mock(return_value=process)
+    monkeypatch.setattr(rollout_module.multiprocessing, "Process", constructor)
+    monkeypatch.setattr(RouterArgs, "from_cli_args", lambda *a, **k: SimpleNamespace())
+
+    assert rollout_module._start_router(args) == ("192.0.2.1", 4273)
+    launched_args = constructor.call_args.kwargs["args"][0]
+    assert launched_args.port == 4273
+    assert launched_args.prometheus_port == 5001
+    process.start.assert_called_once()
+
+
 def test_managed_pd_adopts_registry_before_publishing_groups(monkeypatch, rollout_module):
     entries = []
     for spec in _specs():

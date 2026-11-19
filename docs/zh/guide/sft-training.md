@@ -148,20 +148,20 @@ PROMPT_DATA="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
 ### 正文中的字面量图片标签
 
-配置 `--multimodal-keys '{"image":"images"}'` 后，字符串正文中的 `<image>` 默认必须有对应图片。`images` 字段缺失、为 null 或为空列表，都不能证明样本是纯文本，因为图片数据也可能已经丢失。
-
-对于消息列表格式的 SFT 数据，可将已确认的文字明确写成结构化 `text` 项。这样可以保留 `emu <image>` 等命令行参数中的字面量标签，无需新增开关或 metadata 字段：
+配置 `--multimodal-keys '{"image":"images"}'` 后，如果样本的 `images` 字段缺失、为 null 或为空列表，SFT 会把字符串正文中的 `<image>` 原样保留为文字。这样，命令行参数等纯文本样本可以和图片样本放在同一个文件中混合训练，无需改写原始数据或增加开关：
 
 ```json
 {
   "messages": [
-    {"role": "user", "content": [{"type": "text", "text": "Explain emu <image>."}]},
-    {"role": "assistant", "content": [{"type": "text", "text": "<image> is the input file argument."}]}
+    {"role": "user", "content": "Explain emu <image>."},
+    {"role": "assistant", "content": "<image> is the input file argument."}
   ]
 }
 ```
 
-只有数据来源明确说明内容是文字时才应采用这种表示；不能为了通过校验，把真正缺图的占位符转成文本。结构化 `image`/`image_url` 项仍必须提供图片来源，字符串占位符与图片的数量也仍需匹配。显式 `text` 项可以和有效的结构化图片共存于同一段对话中。
+当映射的图片字段中有数据时，字符串占位符与图片的数量仍须匹配。结构化 `image`/`image_url` 项始终需要内联或映射字段中的图片来源；有效的内联图片可以与字面量正文共存。音频、视频的校验保持不变。该规则以 `--multimodal-keys` 配置的字段为准，也支持自定义列名。
+
+这项兼容规则无法区分字面量文本与整个图片字段丢失的样本，后者也可能被当作文本放行，因此通过校验不代表数据完整。结构化图片无效、映射图片仅部分缺失的情况仍会校验失败。
 
 ### 验证数据文件
 
