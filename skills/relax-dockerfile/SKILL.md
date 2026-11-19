@@ -13,14 +13,18 @@ Dockerfile 里的框架运行时 patch 通常改得比工具链和原生依赖�
 
 - 固定版本源码的获取可以单独缓存。无关的运行时 patch 放在原生扩展和内核编译之后，应用完再执行相关的轻量校验。编译实际读取的源码 patch 留在其编译步骤之前。
 - 昂贵的原生扩展优先拆成独立 wheel stage，从最终目标使用的同一 `TRAIN_IMAGE` 派生，沿用 Python、libc、Torch、CUDA 和编译器 ABI，保留原来的源码 pin、架构与编译参数。只让需要这个扩展的目标消费该 stage。
-- wheel stage 只读取编译所需的源码、patch 与环境约束。应用层依赖安装、框架适配和运行时指纹校验留给最终阶段。需要清除训练环境的 `LD_PRELOAD` 时，将作用域限在编译进程树。
-- 最终阶段通过 `RUN --mount=type=bind,from=...` 安装 wheel。父镜像可能存在同版本旧包时，用 `--force-reinstall` 确保安装本次产物。运行依赖已由镜像锁定时，用 `--no-deps` 避免重新解析。保留原有的导入、指纹和 cubin 校验。
+- wheel stage 只读取编译所需的源码、patch 与环境约束。应用层依赖安装、框架适配和运行时校验留给最终阶段。需要清除训练环境的 `LD_PRELOAD` 时，将作用域限在编译进程树。
+- 最终阶段通过 `RUN --mount=type=bind,from=...` 安装 wheel。父镜像可能存在同版本旧包时，用 `--force-reinstall` 确保安装本次产物。运行依赖已由镜像锁定时，用 `--no-deps` 避免重新解析。保留原生扩展所需的导入和 cubin 校验。
+
+参考 [#665 Hopper FA3 wheel 独立编译](https://github.com/redai-studio/Relax/pull/665)。
 
 ## 控制最终镜像层数
 
 - 传统 Docker 镜像存储的层链上限为 **125 层**。计算层预算时计入基础镜像，并给 QS 等下游封装和后续依赖留余量。对 dev 和下游交付镜像，分别用 `docker image inspect --format '{{len .RootFS.Layers}}' <image>` 检查实际层数。Dockerfile 指令数可用来估算改动。
 - 临时 patch、脚本和 wheel 按需用只读 bind mount，优先逐文件挂载，减少无关文件对缓存的影响。单独 `COPY` 后再删除，文件字节仍留在旧层中。仅通过 bind mount 消费的 builder 层在最终镜像的继承链之外。
 - 把用途相同的下载、安装和清理合在同一个 `RUN`。为固定源码获取、昂贵的内核编译和易变的校验脚本保留有用的缓存边界。使用带锁的编译缓存时，把持锁范围限制在实际编译的 `RUN`，按架构隔离缓存目录。
+
+参考 [#528 CUDA 13 运行时镜像减层与冷拉取](https://github.com/redai-studio/Relax/pull/528)。
 
 ## 管理依赖 patch
 
@@ -34,9 +38,3 @@ Dockerfile 里的框架运行时 patch 通常改得比工具链和原生依赖�
 ## 验证与记录
 
 - 验证缓存时使用同一 builder 和 `TRAIN_IMAGE`，只改变要测试的 patch 或运行时输入，确认实际构建了新的最终镜像，并从日志检查耗时编译步骤是否为 `CACHED`。
-- 镜像接近层上限或继承链发生变化时，记录受影响产物的前后层数，并在干净的镜像存储中验证冷拉取。说明实际完成的验证范围，包括静态检查、完整构建、缓存复用、冷拉取和 GPU 运行。
-
-## 参考
-
-- [#528 CUDA 13 运行时镜像减层与冷拉取](https://github.com/redai-studio/Relax/pull/528)
-- [#665 Hopper FA3 wheel 独立编译](https://github.com/redai-studio/Relax/pull/665)

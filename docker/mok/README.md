@@ -13,7 +13,7 @@ docker build -f docker/Dockerfile.cu13 --build-arg GPU_ARCH=blackwell \
 
 构建上下文为仓库根目录。MoK 使用主镜像的 Python 3.12、Torch `2.13.0+cu130`、CUDA 13.0 NVCC 和 TE 2.18；构建不升级这些依赖。Megatron 路径为 `/root/Megatron-LM`，目标架构为 Blackwell `SM103`。Hopper 和 CUDA 12 不构建这个后端。
 
-Megatron 适配由主补丁 `docker/patch/latest/megatron.patch` 的 Blackwell 段安装。最终镜像在安装 wheel 后按 `runtime-manifest.json` 检查 Megatron 适配涉及的 8 个文件及 TE 补丁的最终 SHA256。更新这些文件时，同步审查其中的指纹。
+Megatron 适配由主补丁 `docker/patch/latest/megatron.patch` 的 Blackwell 段安装。
 
 ## 来源与补丁
 
@@ -25,9 +25,9 @@ Megatron 适配由主补丁 `docker/patch/latest/megatron.patch` 的 Blackwell �
 | ThunderKittens     | `HazyResearch/ThunderKittens@1c3920d993404dd49a6d4c7267ea11d583bd5c68`                              | `tcgen05.cuh` MN-major 修复                                                  |
 | Transformer Engine | 基底 TE 2.18                                                                                        | bounded Adam 修复，限制临时 tensor 句柄数量                                  |
 
-补丁顺序及目标文件 SHA256 见 `manifest.json`。MoK 尾块和调度器改动合并在 `patches/mok.patch`；ThunderKittens 保持独立补丁。TE bounded Adam 修复已合入主镜像的 TE 2.18 补丁，MoK 构建只检查最终源码。
+MoK 和 ThunderKittens 的补丁顺序及目标文件 SHA256 见 `manifest.json`。MoK 尾块和调度器改动合并在 `patches/mok.patch`；ThunderKittens 保持独立补丁。TE bounded Adam 修复已合入主镜像的 TE 2.18 补丁。
 
-`mok_builder` 从同一 `TRAIN_IMAGE` 派生，用 `pip wheel --no-deps --no-build-isolation` 编译 MoK 并记录编译清单的 SHA256。单独改动 Megatron 或 TE 补丁及对应的运行时指纹，可复用已有 wheel 缓存。最终 Blackwell 镜像安装 wheel，再检查源码、安装路径及 SM103 cubin。CUDA driver stub 仅用于链接。普通 `docker build` 不需要 GPU。
+`mok_builder` 从同一 `TRAIN_IMAGE` 派生，用 `pip wheel --no-deps --no-build-isolation` 编译 MoK 并记录编译清单的 SHA256。在相同 `TRAIN_IMAGE` 下，单独改动 Megatron 或 TE 的运行时补丁可复用已有 wheel 缓存。最终 Blackwell 镜像安装 wheel，再检查 MoK 和 ThunderKittens 源码指纹、MoK 安装路径及 SM103 cubin。CUDA driver stub 仅用于链接。普通 `docker build` 不需要 GPU。
 
 ## 运行检查
 
