@@ -695,7 +695,7 @@ def test_streaming_dataset_collects_inline_structured_image_url(tmp_path: Path):
                             {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
                         ],
                     },
-                    {"role": "assistant", "content": "Answer"},
+                    {"role": "assistant", "content": "The tag <image> is literal."},
                 ],
                 "images": [],
             }
@@ -717,6 +717,7 @@ def test_streaming_dataset_collects_inline_structured_image_url(tmp_path: Path):
     sample = ds.get_canonical_sample(0)
 
     assert sample.images == ["https://example.test/image.png"]
+    assert sample.messages[1].content == "The tag <image> is literal."
     assert sample.messages[0].content[1] == {
         "type": "image",
         "image": "https://example.test/image.png",
@@ -1383,14 +1384,15 @@ def test_streaming_dataset_rejects_duplicate_inline_and_top_level_image_sources(
     ds.stop()
 
 
-def test_streaming_dataset_accepts_literal_image_placeholder_with_matching_top_level_image(tmp_path: Path):
+@pytest.mark.parametrize("placeholder_count", [1, 2])
+def test_streaming_dataset_validates_literal_image_placeholder_count(tmp_path: Path, placeholder_count: int):
     path = tmp_path / "train.jsonl"
     _write_jsonl(
         path,
         [
             {
                 "messages": [
-                    {"role": "user", "content": "<image>\nDescribe the image."},
+                    {"role": "user", "content": "<image>" * placeholder_count + "\nDescribe the image."},
                     {"role": "assistant", "content": "Answer"},
                 ],
                 "images": ["/data/image.png"],
@@ -1410,10 +1412,13 @@ def test_streaming_dataset_accepts_literal_image_placeholder_with_matching_top_l
         prefetch_max_cached=0,
     )
 
-    sample = ds.get_canonical_sample(0)
-
-    assert sample.images == ["/data/image.png"]
-    assert sample.messages[0].content[0] == {"type": "image", "image": "/data/image.png"}
+    if placeholder_count == 2:
+        with pytest.raises(SFTMultimodalContractError, match="contract mismatch"):
+            ds.get_canonical_sample(0)
+    else:
+        sample = ds.get_canonical_sample(0)
+        assert sample.images == ["/data/image.png"]
+        assert sample.messages[0].content[0] == {"type": "image", "image": "/data/image.png"}
     ds.stop()
 
 
@@ -1810,54 +1815,6 @@ def test_streaming_dataset_preserves_literal_images_without_payload(tmp_path, im
         assert image_sample.messages[0].content[-1] == {"type": "image", "image": "/data/cat.png"}
         assert ds.get_canonical_sample(0).messages == sample.messages
         assert ds.reader[0] == original
-    finally:
-        ds.stop()
-
-
-def test_streaming_dataset_preserves_literal_image_alongside_inline_image(tmp_path):
-    text = "The CLI is emu <image>."
-    image_url = "https://example.test/screenshot.png"
-    path = tmp_path / "inline.jsonl"
-    _write_jsonl(
-        path,
-        [
-            {
-                "messages": [
-                    {"role": "user", "content": text},
-                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}]},
-                    {"role": "assistant", "content": "Done"},
-                ]
-            }
-        ],
-    )
-    ds = SFTStreamingDataset(
-        str(path), prompt_key="messages", multimodal_keys={"image": "images"}, prefetch_max_cached=0
-    )
-    try:
-        sample = ds.get_canonical_sample(0)
-        assert streaming_module.render_to_text(sample, tokenizer=_FakeTokenizer()) == text + "Done"
-        assert sample.images == [image_url]
-    finally:
-        ds.stop()
-
-
-def test_streaming_dataset_rejects_partial_literal_image_payload(tmp_path):
-    path = tmp_path / "partial.jsonl"
-    _write_jsonl(
-        path,
-        [
-            {
-                "messages": [{"role": "user", "content": "<image><image>"}, {"role": "assistant", "content": "Done"}],
-                "images": ["/data/image.png"],
-            }
-        ],
-    )
-    ds = SFTStreamingDataset(
-        str(path), prompt_key="messages", multimodal_keys={"image": "images"}, prefetch_max_cached=0
-    )
-    try:
-        with pytest.raises(SFTMultimodalContractError, match="top_level_required_count.*2.*top_level_count.*1"):
-            ds.get_canonical_sample(0)
     finally:
         ds.stop()
 

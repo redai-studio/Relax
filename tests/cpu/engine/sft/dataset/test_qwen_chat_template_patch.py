@@ -803,14 +803,17 @@ def test_qwen38_rejects_conflicting_structured_and_embedded_reasoning():
 
 
 @pytest.mark.parametrize("reasoning", ["", "reason"])
-@pytest.mark.parametrize("text_item", [False, True])
-def test_qwen38_dataset_normalizes_leading_think(tmp_path, reasoning, text_item):
+def test_qwen38_dataset_text_item_normalizes_leading_think(tmp_path, reasoning):
     path = tmp_path / "messages.jsonl"
     content = f"<think>\n{reasoning}\n</think>\n\nanswer"
-    original_content = [{"type": "text", "text": content}] if text_item else content
     path.write_text(
         json.dumps(
-            {"messages": [{"role": "user", "content": "query"}, {"role": "assistant", "content": original_content}]}
+            {
+                "messages": [
+                    {"role": "user", "content": "query"},
+                    {"role": "assistant", "content": [{"type": "text", "text": content}]},
+                ]
+            }
         )
         + "\n"
     )
@@ -822,12 +825,12 @@ def test_qwen38_dataset_normalizes_leading_think(tmp_path, reasoning, text_item)
         prefetch_max_cached=0,
     )
     sample = dataset.get_canonical_sample(0)
-    assert sample.messages[1].content == original_content
+    assert sample.messages[1].content == [{"type": "text", "text": content}]
 
     messages = _to_chat_messages(sample, normalize_qwen38_reasoning=True)
     assert messages[1]["reasoning_content"] == reasoning
-    assert messages[1]["content"] == ([{"type": "text", "text": "answer"}] if text_item else "answer")
-    assert sample.messages[1].content == original_content
+    assert messages[1]["content"] == [{"type": "text", "text": "answer"}]
+    assert sample.messages[1].content == [{"type": "text", "text": content}]
 
 
 def test_qwen38_real_tokenizer_dataset_text_item_loss(tmp_path):

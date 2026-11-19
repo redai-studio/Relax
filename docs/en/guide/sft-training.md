@@ -146,23 +146,6 @@ Minimal row shape:
 }
 ```
 
-### Literal image tags in text
-
-With `--multimodal-keys '{"image":"images"}'`, SFT preserves literal `<image>` strings as text when the row's `images` field is missing, null, or an empty list. This allows text examples such as CLI arguments to share a training file with image examples, without rewriting the original data or adding a flag:
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "Explain emu <image>."},
-    {"role": "assistant", "content": "<image> is the input file argument."}
-  ]
-}
-```
-
-When the mapped image field contains entries, string placeholders must still match those entries. Structured `image`/`image_url` items always require an inline or mapped image source; valid inline images can coexist with literal text. Audio and video validation is unchanged. The rule uses the field configured in `--multimodal-keys`, including custom column names.
-
-This compatibility rule cannot distinguish literal text from a row whose entire image field was lost. Such a row can also be accepted as text, so acceptance does not establish data completeness. Invalid structured images and partially missing mapped images still fail validation.
-
 ### Verify Data Files
 
 Run this before launching to catch missing files or wrong columns:
