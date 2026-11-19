@@ -604,6 +604,9 @@ def get_model_provider_func(
         if is_glm53_flash:
             packed_cp = provider.context_parallel_size > 1
             packed = getattr(args, "qkv_format", "thd") == "thd"
+            args.glm53_vision_dp = (
+                getattr(provider, "vision_dp_when_tp", False) and provider.tensor_model_parallel_size > 1
+            )
             if (packed_cp or getattr(args, "loss_type", None) == "sft") and not packed:
                 raise ValueError("GLM-5.3-Flash SFT and CP require packed THD batches.")
             if getattr(args, "dynamic_context_parallel", False):

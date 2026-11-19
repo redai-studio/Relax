@@ -566,11 +566,14 @@ def get_log_probs_and_entropy(
             selected_rows = None
             if Envs.RELAX_SFT_SELECTIVE_LOGITS and selective_logit_rows is not None:
                 cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
-                if cp_size == 1:
+                if cp_size == 1 or cp_output_is_zigzag:
                     expected_rows, indices = selective_logit_rows[sample_idx]
                     if expected_rows != full_rows:
                         raise ValueError("Selective logits metadata does not match response length")
-                    # Keep the original head/collective path for all-zero masks.
+                    # Keep a head row for all-zero CP shards so the head and
+                    # its TP collectives still participate. The reducer masks it.
+                    if cp_size > 1 and full_rows > 0 and indices.numel() == 0:
+                        indices = indices.new_zeros(1)
                     if 0 < indices.numel() < full_rows:
                         selected_rows = indices
                         hidden = hidden.index_select(0, indices)
@@ -1781,8 +1784,18 @@ def sft_loss_function_chunked(
     if plans and Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS:
         # Compare the CPU-built plan against the actual supervision mask
         # after multimodal expansion and alignment.
+        local_masks = get_cp_local_loss_masks(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            args.qkv_format,
+            batch.get("max_seq_lens"),
+            batch.get("padded_total_lengths"),
+            dynamic_cp_size=batch.get("dynamic_cp_size"),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank"),
+        )
         coverage = []
-        for mask, (full_rows, indices) in zip(batch["loss_masks"], plans, strict=True):
+        for mask, (full_rows, indices) in zip(local_masks, plans, strict=True):
             flat = mask.reshape(-1)
             if flat.numel() != full_rows or flat.device != indices.device:
                 raise ValueError("Selective SFT logits metadata does not match the loss mask")

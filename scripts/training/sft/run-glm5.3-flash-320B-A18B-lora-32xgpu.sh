@@ -21,8 +21,8 @@ MODEL_NAME="${MODEL_NAME:-GLM-5.3-Flash}"
 HF_CHECKPOINT="${MODEL_DIR}/${MODEL_NAME}"
 ACTOR_GPUS="${ACTOR_GPUS:-32}"
 TP_SIZE="${TP_SIZE:-4}"
-PP_SIZE="${PP_SIZE:-2}"
-CP_SIZE="${CP_SIZE:-4}"
+PP_SIZE="${PP_SIZE:-4}"
+CP_SIZE="${CP_SIZE:-2}"
 # Shard the experts across the GPUs in each pipeline stage.
 EP_SIZE="${EP_SIZE:-$((ACTOR_GPUS / PP_SIZE))}"
 RESOURCE="{\"actor\": [1, ${ACTOR_GPUS}], \"sft\": [1, 0]}"
@@ -30,8 +30,8 @@ TRAIN_FILE="${TRAIN_FILE:-train.jsonl}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/glm5.3-flash}"
 EXP_NAME="${EXP_NAME:-glm5.3-flash-multimodal-lora-32xgpu}"
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
-# CP4 gives a 128K packed-token budget with 32K tokens per CP rank.
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-32768}"
+# Keep a 128K packed-token budget when changing the CP size.
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((131072 / CP_SIZE))}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
 now=$(date "+%Y%m%d-%H%M%S")
 
@@ -75,6 +75,9 @@ LORA_ARGS=(
     --lora-target-modules in_proj beta_proj f_a_proj f_b_proj g_a_proj g_b_proj out_proj linear_q_down_proj linear_q_up_proj linear_kv_down_proj linear_kv_up_proj linear_proj linear_fc1 linear_fc2
     --freeze-vision-model
 )
+if [[ "${VISION_DP_WHEN_TP:-1}" == 1 ]]; then
+    LORA_ARGS+=(--vision-dp-when-tp)
+fi
 
 TRAIN_LENGTH_ARGS=(--num-epoch "${NUM_EPOCH:-2}")
 if [[ -n "${NUM_ROLLOUT:-}" ]]; then
@@ -118,25 +121,37 @@ if (( CP_SIZE > 1 )); then
     CP_ARGS+=(--cp-comm-type allgather)
 fi
 
+MOE_TOKEN_DISPATCHER_TYPE="${MOE_TOKEN_DISPATCHER_TYPE:-flex}"
+MOE_ARGS=(--moe-token-dispatcher-type "${MOE_TOKEN_DISPATCHER_TYPE}")
+if [[ "${MOE_TOKEN_DISPATCHER_TYPE}" == flex ]]; then
+    MOE_ARGS+=(
+        --moe-flex-dispatcher-backend "${MOE_FLEX_DISPATCHER_BACKEND:-deepep}"
+        --moe-flex-dispatcher-num-sms "${MOE_FLEX_DISPATCHER_NUM_SMS:-24}"
+    )
+    if [[ "${MOE_SHARED_EXPERT_OVERLAP:-1}" == 1 ]]; then
+        MOE_ARGS+=(--moe-shared-expert-overlap)
+    fi
+fi
+
 PERF_ARGS=(
     --tensor-model-parallel-size "${TP_SIZE}"
     --sequence-parallel
     --pipeline-model-parallel-size "${PP_SIZE}"
     "${PIPELINE_ARGS[@]}"
     "${CP_ARGS[@]}"
-    --linear-cp-mode headwise
+    --linear-cp-mode "${LINEAR_CP_MODE:-headwise}"
     --expert-model-parallel-size "${EP_SIZE}"
     --expert-tensor-parallel-size 1
-    --moe-token-dispatcher-type alltoall
+    "${MOE_ARGS[@]}"
     --moe-router-load-balancing-type aux_loss
     --moe-aux-loss-coeff 1e-6
     --recompute-granularity full
     --recompute-method uniform
-    --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-4}"
+    --recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-1}"
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     --disable-weights-backuper
-    --train-env-vars "{\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"CUDA_MODULE_LOADING\":\"${CUDA_MODULE_LOADING:-EAGER}\"}"
+    --train-env-vars "{\"PYTORCH_CUDA_ALLOC_CONF\":\"expandable_segments:True\",\"CUDA_MODULE_LOADING\":\"${CUDA_MODULE_LOADING:-EAGER}\",\"RELAX_SFT_SELECTIVE_LOGITS\":\"${RELAX_SFT_SELECTIVE_LOGITS:-1}\",\"RELAX_QWEN38_FLA_CONV_CACHE_REUSE\":\"${RELAX_QWEN38_FLA_CONV_CACHE_REUSE:-1}\"}"
     --calculate-per-token-loss
     --empty-unused-memory-level "${EMPTY_UNUSED_MEMORY_LEVEL:-1}"
     --attention-backend flash

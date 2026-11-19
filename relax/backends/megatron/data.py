@@ -583,6 +583,8 @@ def get_batch(
         packed_seq_params.cu_seqlens_q_cpu = offsets
         packed_seq_params.valid_seqlens_q_cpu = valid_lengths
         packed_seq_params.num_valid_tokens = sum(valid_lengths)
+        if getattr(get_args(), "linear_cp_mode", None) == "chunkwise" and not use_dynamic_context_parallel:
+            _prebuild_cp_route(packed_seq_params, offsets, cp_size, cp_rank, batch_device)
         batch["unsplit_tokens"] = torch.cat(padded_tokens).unsqueeze(0)
         batch["vlm_packed_seq_params"] = packed_seq_params
         batch["padded_total_lengths"] = padded_lengths
@@ -904,6 +906,10 @@ def get_batch(
                     multimodal_data[key] = torch.cat(tensor_list, dim=0)
                 multimodal_num_items[key] = [t.size(0) for t in tensor_list]
 
+        if getattr(get_args(), "glm53_vision_dp", False):
+            grid = multimodal_data.get("image_grid_thw")
+            if grid is not None and grid.device.type == "cpu":
+                multimodal_data["image_grid_thw_cpu"] = grid.tolist()
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
@@ -950,20 +956,26 @@ def get_batch(
 
     if (
         Envs.RELAX_SFT_SELECTIVE_LOGITS
-        and cp_size == 1
-        and qkv_format == "thd"
-        and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
-        and "unsplit_tokens" not in batch
-        and "vlm_packed_seq_params" not in batch
         and getattr(get_args(), "loss_type", None) == "sft"
         and getattr(get_args(), "sft_chunked_logits", False)
     ):
-        from .selective_logits import prepare_selective_logits, prepare_selective_logits_from_cpu_masks
+        if glm53_packed_cp:
+            from .selective_logits import prepare_glm53_cp_selective_logits
 
-        if batch_device.type == "cpu":
-            prepare_selective_logits(batch, get_args())
-        elif batch.get("selective_loss_masks_cpu") is not None:
-            prepare_selective_logits_from_cpu_masks(batch, get_args())
+            prepare_glm53_cp_selective_logits(batch, cp_size, cp_rank)
+        elif (
+            cp_size == 1
+            and qkv_format == "thd"
+            and (not has_mm_inputs or Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS)
+            and "unsplit_tokens" not in batch
+            and "vlm_packed_seq_params" not in batch
+        ):
+            from .selective_logits import prepare_selective_logits, prepare_selective_logits_from_cpu_masks
+
+            if batch_device.type == "cpu":
+                prepare_selective_logits(batch, get_args())
+            elif batch.get("selective_loss_masks_cpu") is not None:
+                prepare_selective_logits_from_cpu_masks(batch, get_args())
 
     if (
         batch.get("selective_logit_rows") is not None
