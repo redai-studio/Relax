@@ -316,10 +316,18 @@ index 3ff370f74..21858ea6a 100644
  except ImportError:
      HAVE_TORCH_MEMORY_SAVER = False
 diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
-index 19de0ed52..fefbb7378 100644
+index 19de0ed52..52156a2f8 100644
 --- a/megatron/core/models/gpt/gpt_model.py
 +++ b/megatron/core/models/gpt/gpt_model.py
-@@ -506,6 +506,7 @@ class GPTModel(LanguageModule):
+@@ -31,6 +31,7 @@ from megatron.core.transformer.multi_token_prediction import (
+     MultiTokenPredictionBlock,
+     mtp_on_this_rank,
+     process_mtp_loss,
++    roll_tensor,
+ )
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_block import TransformerBlock
+@@ -506,6 +507,7 @@ class GPTModel(LanguageModule):
          loss_mask: Optional[Tensor] = None,
          padding_mask: Optional[Tensor] = None,
          is_spec_decode: Optional[bool] = None,
@@ -327,7 +335,7 @@ index 19de0ed52..fefbb7378 100644
      ) -> Tensor:
          """Forward function of the GPT Model This function passes the input tensors
          through the embedding layer, and then the decoder and finally into the post
-@@ -585,6 +586,7 @@ class GPTModel(LanguageModule):
+@@ -585,6 +587,7 @@ class GPTModel(LanguageModule):
              extra_block_kwargs=extra_block_kwargs,
              inference_context=inference_context,
              is_spec_decode=is_spec_decode,
@@ -335,7 +343,7 @@ index 19de0ed52..fefbb7378 100644
          )
  
      def _postprocess(
-@@ -607,6 +609,7 @@ class GPTModel(LanguageModule):
+@@ -607,6 +610,7 @@ class GPTModel(LanguageModule):
          extra_block_kwargs=None,
          inference_context=None,
          is_spec_decode=None,
@@ -343,6 +351,44 @@ index 19de0ed52..fefbb7378 100644
      ):
          """Postprocesses decoder hidden states to generate logits or compute loss.
  
+@@ -631,7 +635,27 @@ class GPTModel(LanguageModule):
+         output_weight = None
+         if self.share_embeddings_and_output_weights:
+             output_weight = self.shared_embedding_or_output_weight()
+-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
++            if output_weight is not None:
++                output_weight = output_weight.detach()
++        mtp_labels = labels
++        if mtp_kwargs is not None and mtp_kwargs.get("mtp_labels", None) is not None:
++            mtp_labels = mtp_kwargs["mtp_labels"]
++            mtp_labels, _ = roll_tensor(
++                mtp_labels,
++                shifts=-1,
++                dims=-1,
++                cp_group=self.pg_collection.cp,
++                packed_seq_params=packed_seq_params,
++            )
++            if loss_mask is not None:
++                loss_mask, _ = roll_tensor(
++                    loss_mask,
++                    shifts=-1,
++                    dims=-1,
++                    cp_group=self.pg_collection.cp,
++                    packed_seq_params=packed_seq_params,
++                )
++        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode) and mtp_labels is not None:
+             hidden_states = self.mtp(
+                 input_ids=input_ids,
+                 position_ids=position_ids,
+@@ -660,7 +684,7 @@ class GPTModel(LanguageModule):
+                 # In training/eval, use the utility function for processing MTP loss/scaling.
+                 hidden_states = process_mtp_loss(
+                     hidden_states=hidden_states,
+-                    labels=labels,
++                    labels=mtp_labels,
+                     loss_mask=loss_mask,
+                     output_layer=self.output_layer,
+                     output_weight=output_weight,
 diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
 index 4430a8c84..084389b27 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py

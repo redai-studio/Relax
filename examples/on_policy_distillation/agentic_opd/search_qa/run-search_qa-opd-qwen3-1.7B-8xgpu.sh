@@ -115,7 +115,7 @@ ROLLOUT_ARGS=(
 
    --custom-rm-path examples.on_policy_distillation.agentic_opd.search_qa.reward_search.reward_func
    --use-agentic-rollout
-   --agent-command ". ${APP_DIR}/run_agent_app.sh"
+   --agent-command "bash ${APP_DIR}/run_agent_app.sh"
    --agent-cwd "${APP_DIR}"
 
    --agent-env

@@ -6,7 +6,7 @@ This is a behavioral probe, not a checksum of every weight tensor.
 Usage (run inside the training cluster's network namespace):
 
     python probe_weight_fingerprint.py --engine-urls http://h1:30001,http://h2:30002 \
-        --model /data/relax/Qwen3-4B --out /tmp/fingerprint_t0.json
+        --model /path/to/Qwen3-4B --out /tmp/fingerprint_t0.json
 
 Compare two runs:
 
@@ -82,7 +82,7 @@ def compare(fp_a: dict, fp_b: dict) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine-urls", help="comma-separated engine base URLs")
-    ap.add_argument("--model", default="/data/relax/Qwen3-4B", help="tokenizer path")
+    ap.add_argument("--model", default="/path/to/Qwen3-4B", help="tokenizer path")
     ap.add_argument("--out", help="write fingerprints to this json file")
     ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"), help="compare two fingerprint files")
     args = ap.parse_args()

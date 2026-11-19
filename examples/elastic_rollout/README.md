@@ -60,7 +60,11 @@ later returns to four without stopping.
 Hybrid-mode variant: `run-qwen3-4B-8xgpu-elastic-hybrid.sh` runs the same
 recipe with `--hybrid` — scaled-out engines
 register with DCS and receive weights on every per-step broadcast, just like
-the fully-async baseline.
+the fully-async baseline. Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` before launching
+this variant. It saves every 100 updates under `${SAVE_DIR}/${EXP_NAME}`, keeps
+two checkpoints, and resumes from the same directory on restart. Change `EXP_NAME`
+(default: `qwen3-4b-grpo-8xgpu-elastic-hybrid`) for a new experiment. ClearML and
+metrics are enabled; the Ray submission waits by default (`RAY_NO_WAIT=1` opts out).
 
 Relax does not create nodes or install `preStop`; the platform must provide
 capacity and deliver graceful `SIGTERM` eviction with enough time to drain.
@@ -122,6 +126,10 @@ bash scripts/entrypoint/ray-job.sh \
 Hybrid 模式变体：`run-qwen3-4B-8xgpu-elastic-hybrid.sh` 以
 `--hybrid` 运行同一 recipe——扩出的引擎注册到
 DCS 后，随每步广播获得最新权重，与 fully-async 基线行为一致。
+启动该变体前设置 `MODEL_DIR`、`DATA_DIR` 和 `SAVE_DIR`。脚本每 100 次更新
+保存到 `${SAVE_DIR}/${EXP_NAME}`，保留 2 个 checkpoint，重启时从相同目录恢复。
+新实验需更换 `EXP_NAME`（默认 `qwen3-4b-grpo-8xgpu-elastic-hybrid`）。默认启用
+ClearML 和 metrics，Ray 提交阻塞等待；需要非阻塞时设置 `RAY_NO_WAIT=1`。
 
 Relax 不创建节点，也不安装 `preStop`；外围平台需要提供资源，并用有足够排空
 时间的 `SIGTERM` 实现优雅抢占。继续阅读[完整 recipe 说明](../../docs/zh/examples/elastic-rollout.md)

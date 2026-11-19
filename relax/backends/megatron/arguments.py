@@ -175,23 +175,33 @@ def validate_args(args):
     if getattr(args, "dynamic_context_parallel", False):
         _validate_dynamic_context_parallel(args)
 
-    if not device_utils.is_available():
-        from unittest.mock import patch
+    epoch_intervals = {
+        name: "epoch" for name in ("save_interval", "eval_interval") if getattr(args, name, None) == "epoch"
+    }
+    # Megatron validates numeric intervals, but Relax owns the training loop.
+    for name in epoch_intervals:
+        setattr(args, name, 1)
+    try:
+        if not device_utils.is_available():
+            from unittest.mock import patch
 
-        class _DeviceProperty:
-            major = 9
-            minor = 0
+            class _DeviceProperty:
+                major = 9
+                minor = 0
 
-        # Megatron internally calls torch.cuda.get_device_properties / get_device_capability.
-        # When no real device is available, device_utils.get_device_name() returns "cpu",
-        # so we must patch torch.cuda specifically — that's what Megatron actually invokes.
-        with (
-            patch("torch.cuda.get_device_properties", return_value=_DeviceProperty()),
-            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
-        ):
+            # Megatron internally calls torch.cuda.get_device_properties / get_device_capability.
+            # When no real device is available, device_utils.get_device_name() returns "cpu",
+            # so we must patch torch.cuda specifically — that's what Megatron actually invokes.
+            with (
+                patch("torch.cuda.get_device_properties", return_value=_DeviceProperty()),
+                patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            ):
+                _megatron_validate_args(args)
+        else:
             _megatron_validate_args(args)
-    else:
-        _megatron_validate_args(args)
+    finally:
+        for name, interval in epoch_intervals.items():
+            setattr(args, name, interval)
 
     # always use varlen
     args.variable_seq_lengths = True
@@ -306,8 +316,8 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    # Megatron DistributedOptimizer supports Adam, but not SGD.
+    args.use_distributed_optimizer = getattr(args, "optimizer", "adam") != "sgd"
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     _resolve_optimizer_precision_args(args)

@@ -103,7 +103,7 @@ Relax 支持加载 `.jsonl` 和 `.parquet` 格式文件。以 `.jsonl` 为例，
 ```bash
 python scripts/tools/process_openr1.py \
   --input-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001.parquet \
-  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001-test.parquet
+  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
 
 # --md-dir 指向 image 和 audio 文件目录所在路径，
 # 用于将相对路径拼接为绝对路径，若不传则使用相对路径。

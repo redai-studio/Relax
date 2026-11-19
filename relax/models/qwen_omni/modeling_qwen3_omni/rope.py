@@ -41,3 +41,13 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(Qwen3OmniMoeThinkerTextRotaryEmbedd
         emb = torch.cat((freqs, freqs), dim=-1)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
         return emb
+
+    def apply_interleaved_mrope(self, freqs: Tensor, mrope_section: List[int]) -> Tensor:
+        """Interleave T/H/W frequencies; transformers>=5.19 no longer provides
+        this method."""
+        freqs_t = freqs[0]  # just overwrite the first dimension T
+        for dim, offset in enumerate((1, 2), start=1):  # H, W
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t

@@ -24,6 +24,7 @@ import torch
 
 from relax.agentic import AGENTIC_CHAT_API_SERVICE_NAME, format_agentic_status
 from relax.agentic.decision_hidden import enabled as decision_hidden_enabled
+from relax.agentic.inventory import InventoryRecorder
 from relax.agentic.pipeline import (
     GroupExport,
     GroupInput,
@@ -37,11 +38,19 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.engine.rollout import on_policy_distillation as opd
+from relax.utils.agentic_obs.records import utc_now
 from relax.utils.env import Envs
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import (
+    configure_score_centering_request,
+    parse_score_centering_response,
+    resolve_score_centering_vocab_size,
+    score_centering_enabled,
+)
 from relax.utils.types import Sample
 
 
@@ -80,6 +89,7 @@ def _cast_pixel_values(mm: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
 
 
 logger = get_logger(__name__)
+_CLEANUP_GRACE_S = 5.0
 
 
 # Compiler calibration messages used to measure the chat-template prefix. Their
@@ -215,6 +225,9 @@ class BackendGenerateResult:
     finish_type: str
     meta_info: dict[str, Any]
     elapsed: float
+    new_topk_token_ids: np.ndarray | None = None
+    new_topk_log_probs: np.ndarray | None = None
+    new_topk_support_complete: np.ndarray | None = None
 
 
 class BackendContextLengthExceededError(RuntimeError):
@@ -595,11 +608,18 @@ class SGLangBackendAdapter:
         init_http_client(args)
         self._args = args
         self._resources = load_agentic_compiler_resources(args)
+        if score_centering_enabled(args):
+            resolve_score_centering_vocab_size(args)
         if decision_hidden_enabled() and any(
             getattr(args, name, False) for name in ("partial_rollout", "fully_async", "agentic_prelaunch")
         ):
             raise ValueError("Decision hidden collection does not support partial/async/prelaunch rollout")
         self._session_lifecycle = args.agentic_session_lifecycle
+        self._request_endpoints: dict[str, str] = {}
+        self._session_endpoints: dict[str, set[str]] = {}
+        self._session_requests: dict[str, set[str]] = {}
+        # The shared request permit already bounds concurrency.
+        self._managed_http = httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None))
         self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
             tokenizer=self._resources.tokenizer,
@@ -626,9 +646,14 @@ class SGLangBackendAdapter:
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
         return_logprob: bool = True,
+        collect_score_centering: bool = True,
         fail_fast_no_workers: bool = False,
+        lora_path: str | None = None,
+        engine_url: str | None = None,
         hidden_context: dict[str, Any] | None = None,
     ) -> BackendGenerateResult:
+        if (lora_path is None) != (engine_url is None):
+            raise ValueError("managed generation requires both a version and an engine endpoint")
         if decision_hidden_enabled() and (not hidden_context or not session_id):
             raise ValueError("Decision hidden collection requires OSWorld task/turn context and session_id")
         payload = {
@@ -637,6 +662,11 @@ class SGLangBackendAdapter:
             "rid": request_id,
             "return_logprob": return_logprob,
         }
+        sc_sampling_mode = (
+            configure_score_centering_request(self._args, payload)
+            if return_logprob and collect_score_centering
+            else None
+        )
         if decision_hidden_enabled():
             payload["sampling_params"] = {
                 **sampling_params,
@@ -661,13 +691,20 @@ class SGLangBackendAdapter:
             # The full input_ids remain authoritative; session_id only tags
             # the resulting radix leaves for terminal cleanup.
             payload["session_id"] = session_id
+        if lora_path is not None:
+            payload["lora_path"] = lora_path
+            self._request_endpoints[request_id] = engine_url
+            if session_id:
+                self._session_endpoints.setdefault(session_id, set()).add(engine_url)
+                self._session_requests.setdefault(session_id, set()).add(request_id)
         headers = None
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(
-                f"{self._router_url}/generate",
+            send = self._managed_post if engine_url else post
+            output = await send(
+                f"{engine_url or self._router_url}/generate",
                 payload,
                 headers=headers,
                 fail_fast_no_workers=fail_fast_no_workers,
@@ -696,26 +733,55 @@ class SGLangBackendAdapter:
 
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
+        sampled_logprobs = [float(item[0]) for item in token_logprobs]
+        topk_token_ids = topk_log_probs = support_complete = None
+        if sc_sampling_mode is not None:
+            sc_result = parse_score_centering_response(
+                meta_info,
+                self._args.rollout_top_logprobs_num,
+                sampling_mode=sc_sampling_mode,
+                expected_tokens=tokens,
+                vocab_size=self._args.score_centering_vocab_size,
+                return_support_complete=True,
+            )
+            tokens, sampled_logprobs, topk_token_ids, topk_log_probs, support_complete = sc_result
+        sanitized_tokens = _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
+        if sc_sampling_mode is not None and sanitized_tokens != tokens:
+            raise ValueError(
+                "Score Centering requires the original sampled token IDs; token sanitization changed them."
+            )
         return BackendGenerateResult(
-            new_tokens=_sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor),
-            new_log_probs=[float(item[0]) for item in token_logprobs],
+            new_tokens=sanitized_tokens,
+            new_log_probs=sampled_logprobs,
             finish_type=str(meta_info["finish_reason"]["type"]),
             meta_info=meta_info,
             elapsed=elapsed,
+            new_topk_token_ids=topk_token_ids,
+            new_topk_log_probs=topk_log_probs,
+            new_topk_support_complete=support_complete,
         )
 
+    async def _managed_post(self, url: str, payload: dict, *, headers: dict | None, **_kwargs: Any) -> dict:
+        # The general post helper may resend through a local client after a
+        # distributed transport error. That is ambiguous for generation.
+        response = await self._managed_http.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
     async def abort_request(self, request_id: str) -> None:
-        urls = await self._worker_urls()
+        endpoint = self._request_endpoints.get(request_id)
+        urls = [endpoint] if endpoint else await self._worker_urls()
         await asyncio.gather(*(post(f"{url}/abort_request", {"rid": request_id}) for url in urls))
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""
 
         if not self._session_lifecycle:
+            self._forget_session_endpoints(session_id)
             return True
 
         async def close_all_workers() -> list[Any]:
-            urls = await self._worker_urls()
+            urls = self._session_endpoints.get(session_id) or await self._worker_urls()
             return await asyncio.gather(
                 *(post(f"{url}/close_session", {"session_id": session_id}) for url in urls),
                 return_exceptions=True,
@@ -725,7 +791,16 @@ class SGLangBackendAdapter:
             outcomes = await asyncio.wait_for(close_all_workers(), timeout=timeout_s)
         except Exception:
             return False
+        finally:
+            # Cache cleanup is best effort at Session termination. There is no
+            # later cache-close owner; do not retain per-request routing tables.
+            self._forget_session_endpoints(session_id)
         return all(not isinstance(outcome, BaseException) for outcome in outcomes)
+
+    def _forget_session_endpoints(self, session_id: str) -> None:
+        self._session_endpoints.pop(session_id, None)
+        for request_id in self._session_requests.pop(session_id, ()):
+            self._request_endpoints.pop(request_id, None)
 
     async def _worker_urls(self) -> list[str]:
         try:
@@ -746,6 +821,7 @@ class SGLangBackendAdapter:
         return router_worker_base_urls(response["urls"])
 
     async def shutdown(self) -> None:
+        await self._managed_http.aclose()
         self._resources.shutdown()
 
 
@@ -887,6 +963,8 @@ class RuntimeGroupStream:
     session_results: Tuple[_SessionResultRef, ...]
     interrupted: bool = False
     protected: bool = False
+    dropping: bool = False
+    stop_reason: tuple[str, str, str] | None = None
 
 
 def agentic_eval_concurrency_from_args(args: Namespace, eval_group_size: int) -> int:
@@ -911,12 +989,15 @@ class RuntimeDomain:
     ) -> None:
         self.args = args
         self.rollout_mode = rollout_mode
+        self.teacher_routing_enabled = rollout_mode == "train" and opd.is_teacher_routing_enabled(args)
         self._shards = shards
         self.concurrency = concurrency
         self._admission_coordinator = admission_coordinator
         self._resident_group_permits = asyncio.Semaphore(concurrency)
         self._progress_callback: Callable[[], None] = lambda: None
         self._state_changed = asyncio.Event()
+        self._inventory = InventoryRecorder(args, rollout_mode)
+        self._cleanup_tasks: set[asyncio.Future[Any]] = set()
 
     def set_progress_callback(self, callback: Callable[[], None]) -> None:
         """Connect actor-local changes to the resident control loop."""
@@ -954,6 +1035,29 @@ class RuntimeDomain:
 
         return sum(len(shard.group_streams) for shard in self._shards)
 
+    async def bind_router(self, router_ip: str, router_port: int) -> None:
+        """Wait until all Session owners can use the verified endpoint."""
+        handles = [shard.handle for shard in self._shards]
+        if self._admission_coordinator is not None:
+            handles.append(self._admission_coordinator)
+        await asyncio.wait_for(
+            asyncio.gather(*(handle.set_router_address.remote(router_ip, router_port) for handle in handles)),
+            timeout=getattr(self.args, "rollout_engine_init_timeout", 3600.0),
+        )
+
+    async def bind_lora_runtime(self, handle: Any) -> None:
+        """Configure the shared train/Eval Session owners before launch."""
+        outcomes = await asyncio.gather(
+            *(shard.handle.set_lora_runtime.remote(handle, shard.actor_name) for shard in self._shards),
+            return_exceptions=True,
+        )
+        if any(isinstance(outcome, BaseException) for outcome in outcomes):
+            # A mixed fleet must never accept a group on the unmanaged path.
+            await asyncio.gather(*(shard.handle.shutdown.remote() for shard in self._shards), return_exceptions=True)
+            raise RuntimeError("failed to configure the managed LoRA Session fleet") from next(
+                outcome for outcome in outcomes if isinstance(outcome, BaseException)
+            )
+
     @property
     def interrupted_group_ids(self) -> Tuple[str, ...]:
         """Derive close credit from current handles and Shard tokens."""
@@ -967,19 +1071,28 @@ class RuntimeDomain:
         group_input: GroupInput,
         launch_decision: Optional[asyncio.Future[bool]] = None,
     ) -> Optional[RuntimeGroupStream]:
-        """Start one group on a Shard and wait for its first-IR barrier.
+        """Register every member and return a leaseable Group capability.
 
-        Session launch and progress observation share one Shard event stream. A
-        controlled drop before the barrier resolves this operation without a
-        Runtime capability.
+        Members may reach their first IR independently after registration.
         """
 
-        await self._resident_group_permits.acquire()
+        prepare_started_at = time.monotonic()
+        prepare_started_at_utc = utc_now()
+        group_id = group_input.group_id
+        shard = self._shards[zlib.crc32(group_id.encode("utf-8")) % len(self._shards)]
+        session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
+        try:
+            if self.teacher_routing_enabled:
+                for sample in group_input.samples:
+                    opd.bind_teacher(self.args, sample)
+            self._inventory.record_group(group_id, group_input.samples)
+            await self._resident_group_permits.acquire()
+        except BaseException as error:
+            self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)
+            self._inventory.preparation_failed(group_id, session_ids, error, started_at=prepare_started_at)
+            raise
         try:
             self._start_shard_observers()
-            group_id = group_input.group_id
-            shard = self._shards[zlib.crc32(group_id.encode("utf-8")) % len(self._shards)]
-            session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
             loop = asyncio.get_running_loop()
             session_specs = await loop.run_in_executor(
                 None,
@@ -1010,15 +1123,24 @@ class RuntimeDomain:
             # one Shard binding for this stable Group token.
             if group_id in shard.group_streams:
                 raise RuntimeGroupError(f"group token is already resident: {group_id}")
-        except BaseException:
+        except BaseException as error:
             self._resident_group_permits.release()
+            self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)
+            self._inventory.preparation_failed(group_id, session_ids, error, started_at=prepare_started_at)
             raise
+        self._inventory.record_group(group_id, group_input.samples, session_ids, started_at=prepare_started_at_utc)
+        for spec in session_specs:
+            spec.observation_stage_id = f"session:{spec.session_id}:rollout"
+            spec.observation_started_at = prepare_started_at_utc
         shard.group_streams[group_id] = stream
         try:
             registration = asyncio.ensure_future(
                 shard.handle.start_group.remote(self.rollout_mode, group_id, session_specs)
             )
-        except BaseException:
+        except BaseException as error:
+            self._inventory.preparation_failed(
+                group_id, session_ids, error, uncertain=True, started_at=prepare_started_at
+            )
             await finish_before_cancellation(
                 self._release_shard_group(stream),
                 f"start-group-submit-cleanup:{group_id}",
@@ -1029,27 +1151,25 @@ class RuntimeDomain:
                 registration,
                 f"start-group:{group_id}",
             )
-        except BaseException:
+        except BaseException as error:
             if registration.cancelled() or registration.exception() is not None:
+                self._inventory.preparation_failed(
+                    group_id, session_ids, error, uncertain=True, started_at=prepare_started_at
+                )
                 await self._release_shard_group(stream)
+                self._schedule_group_cleanup(stream, drop=True)
             else:
+                if isinstance(error, asyncio.CancelledError):
+                    stream.stop_reason = ("prepare_cancelled", "selection", "session preparation cancelled")
                 await self._drop_prepared_group(stream, f"prepare-group-cleanup:{group_id}")
             raise
 
-        # Registration copied every launch field into the Shard. Drop the
-        # driver-side source and transport payloads before the first-IR wait.
-        del group_input, session_specs, registration, session_ids
-        try:
-            ready_for_lease = await asyncio.shield(stream.first_request_barrier)
-            if not ready_for_lease:
-                logger.warning("Dropping group %s because an agent exited before every first IR existed", group_id)
-                logger.info(format_agentic_status("Dropped 1 group"))
-                await self._drop_prepared_group(stream, f"prepare-group-drop:{group_id}")
-                return None
-        except BaseException:
-            await self._drop_prepared_group(stream, f"prepare-group-cleanup:{group_id}")
-            raise
         return stream
+
+    def observe_group_input(self, group_input: GroupInput) -> None:
+        """Keep fetched Groups visible even if shutdown precedes
+        preparation."""
+        self._inventory.record_group(group_input.group_id, group_input.samples)
 
     async def lease_group(self, stream: RuntimeGroupStream, rollout_id: int) -> None:
         """Move one prepared group into Runtime and release its IR gate."""
@@ -1135,12 +1255,14 @@ class RuntimeDomain:
             stream = shard.group_streams.get(group_progress.group_id)
             if stream is None:
                 continue
-            # RuntimeDomain.prepare_group() owns the first-IR readiness waiter.
-            if group_progress.ready_for_lease and not stream.first_request_barrier.done():
-                stream.first_request_barrier.set_result(True)
             # The step close predicate reads interrupted Group IDs as Fully-async credit.
             stream.interrupted = group_progress.interrupted
             stream.protected = group_progress.protected
+            if stream.dropping:
+                continue
+            # Preserve the first-IR milestone independently of the lease gate.
+            if group_progress.all_first_ir_arrived and not stream.first_request_barrier.done():
+                stream.first_request_barrier.set_result(True)
             # Group execution and ordinary RM await these terminal Session refs.
             results = []
             takeable_session_ids = set(group_progress.takeable_session_ids)
@@ -1234,9 +1356,9 @@ class RuntimeDomain:
                 outcomes = [session_export_ref.result() for session_export_ref in done]
                 if any(outcome is None for outcome in outcomes):
                     logger.info(format_agentic_status("Dropped 1 group"))
+                    await self.drop_group(stream)
                     return None
 
-            await stream.shard.handle.release_group.remote(stream.group_id)
             group = GroupExport(
                 group_id=stream.group_id,
                 sessions=tuple(
@@ -1244,6 +1366,7 @@ class RuntimeDomain:
                 ),
             )
             await self._release_shard_group(stream)
+            self._schedule_group_cleanup(stream, drop=False)
             return group
         except BaseException:
             await finish_before_cancellation(
@@ -1257,13 +1380,56 @@ class RuntimeDomain:
 
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return
-        await stream.shard.handle.drop_group.remote(stream.group_id)
+        await finish_before_cancellation(self._drop_group_and_release(stream), f"runtime-drop:{stream.group_id}")
+
+    async def _drop_group_and_release(self, stream: RuntimeGroupStream) -> None:
+        stream.dropping = True
+        # Keep announced exports attributable while their logical transfer ends.
+        # Capacity is released before joining these driver-local transfers.
+        if stream.shard.group_streams.get(stream.group_id) is stream:
+            stream.shard.group_streams.pop(stream.group_id)
+            self._resident_group_permits.release()
+            self._state_changed.set()
+        take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
+        if take_tasks:
+            await asyncio.wait(take_tasks, timeout=_CLEANUP_GRACE_S)
         if not stream.first_request_barrier.done():
             stream.first_request_barrier.set_result(False)
         for result in stream.session_results:
             if not result.completion.done():
                 result.completion.set_result(None)
         await self._release_shard_group(stream)
+        self._schedule_group_cleanup(stream, drop=True)
+
+    def _schedule_cleanup(self, work: Awaitable[Any], name: str) -> None:
+        task = asyncio.ensure_future(work)
+        if isinstance(task, asyncio.Task):
+            task.set_name(name)
+        self._cleanup_tasks.add(task)
+
+        def completed(finished: asyncio.Future[Any]) -> None:
+            self._cleanup_tasks.discard(finished)
+            if not finished.cancelled() and (error := finished.exception()) is not None:
+                logger.warning("Agentic cleanup failed task=%s: %s", name, error)
+
+        task.add_done_callback(completed)
+
+    def _schedule_group_cleanup(self, stream: RuntimeGroupStream, *, drop: bool) -> None:
+        self._schedule_cleanup(self._cleanup_group_rpc(stream, drop=drop), f"group-cleanup:{stream.group_id}")
+
+    async def _cleanup_group_rpc(self, stream: RuntimeGroupStream, *, drop: bool) -> None:
+        """Best-effort remote retirement after releasing the local Group
+        slot."""
+
+        try:
+            ref = (
+                stream.shard.handle.drop_group.remote(stream.group_id, reason=stream.stop_reason)
+                if drop
+                else stream.shard.handle.release_group.remote(stream.group_id)
+            )
+            await ref
+        except Exception as error:
+            logger.warning("Remote Group cleanup failed for group_id=%s: %s", stream.group_id, error)
 
     async def trim_memory(self) -> None:
         """Run allocator maintenance on every borrowed SessionShard."""
@@ -1276,9 +1442,7 @@ class RuntimeDomain:
     async def debug_state(self) -> dict[str, Any]:
         """Project Shard refs into one debug dictionary."""
 
-        shard_snapshots = tuple(
-            await asyncio.gather(*(shard.handle.debug_state.remote(sample_limit=8) for shard in self._shards))
-        )
+        shard_snapshots = tuple(await asyncio.gather(*(shard.handle.debug_state.remote() for shard in self._shards)))
         return {
             "shards": shard_snapshots,
             "group_count": sum(snapshot["group_count"] for snapshot in shard_snapshots),
@@ -1314,42 +1478,44 @@ class RuntimeDomain:
         return {f"agentic_kv/{key}": value for key, value in metrics.items()}
 
     async def shutdown(self) -> None:
-        """Join every Ray owner and raise the first cleanup failure."""
+        """Release local ownership and give remote cleanup a bounded grace."""
 
-        first_error: Optional[BaseException] = None
         try:
-            await self._stop_shard_observers()
-        except BaseException as error:
-            first_error = error
+            await self._shutdown_runtime()
+        finally:
+            await finish_before_cancellation(self._inventory.aclose(), "agentic-inventory-close")
 
+    async def _shutdown_runtime(self) -> None:
+        self._schedule_cleanup(self._stop_shard_observers(), "shard-observer-stop")
         streams = tuple(stream for shard in self._shards for stream in shard.group_streams.values())
-        drop_outcomes = await asyncio.gather(
-            *(stream.shard.handle.drop_group.remote(stream.group_id) for stream in streams),
-            return_exceptions=True,
-        )
-        for outcome in drop_outcomes:
-            if first_error is None and isinstance(outcome, BaseException):
-                first_error = outcome
         for stream in streams:
+            if stream.stop_reason is None:
+                stream.stop_reason = ("shutdown", "selection", "runtime shut down")
+        for stream in streams:
+            stream.dropping = True
             await self._release_shard_group(stream)
-
-        await self.trim_memory()
-
-        # Shards belong to the Serve deployment lifecycle. Runtime releases its
-        # borrowed handles after every owned Group has completed cleanup.
+            self._schedule_group_cleanup(stream, drop=True)
+        self._schedule_cleanup(self.trim_memory(), "shard-trim-memory")
+        if self._cleanup_tasks:
+            _, pending = await asyncio.wait(tuple(self._cleanup_tasks), timeout=_CLEANUP_GRACE_S)
+            for task in pending:
+                task.cancel()
+            if pending:
+                logger.warning("Runtime shutdown leaving %s unfinished cleanup tasks", len(pending))
         self._shards.clear()
-        if first_error is not None:
-            raise first_error
 
     async def _release_shard_group(self, stream: RuntimeGroupStream) -> None:
         """Release driver refs after Shard export/drop commits."""
 
+        if stream.shard.group_streams.get(stream.group_id) is stream:
+            stream.shard.group_streams.pop(stream.group_id)
+            self._resident_group_permits.release()
+            self._state_changed.set()
         take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
         for task in take_tasks:
             if not task.done():
                 task.cancel()
-        if take_tasks:
-            await asyncio.gather(*take_tasks, return_exceptions=True)
+            self._schedule_cleanup(task, f"session-result-take-cleanup:{stream.group_id}")
         local_refs = (
             stream.first_request_barrier,
             *(result.completion for result in stream.session_results),
@@ -1358,24 +1524,13 @@ class RuntimeDomain:
             if not local_ref.done():
                 local_ref.cancel()
         await asyncio.gather(*local_refs, return_exceptions=True)
-        # Remote cleanup can commit before cancellation reaches this driver ref.
-        group_id = stream.group_id
-        if stream.shard.group_streams.get(group_id) is stream:
-            stream.shard.group_streams.pop(group_id)
-            self._resident_group_permits.release()
 
     async def _drop_prepared_group(self, stream: RuntimeGroupStream, task_name: str) -> None:
         """Drop a registered Prepare group and release its local stream."""
 
         if stream.shard.group_streams.get(stream.group_id) is not stream:
             return
-        try:
-            await finish_before_cancellation(
-                stream.shard.handle.drop_group.remote(stream.group_id),
-                task_name,
-            )
-        finally:
-            await self._release_shard_group(stream)
+        await finish_before_cancellation(self._drop_group_and_release(stream), task_name)
 
 
 async def _take_session_results(
@@ -1387,8 +1542,30 @@ async def _take_session_results(
     session_ids = tuple(result.session_id for result in results)
     try:
         session_results = await stream.shard.handle.take_session_results.remote(stream.group_id, session_ids)
-        for result, session_result in zip(results, session_results, strict=True):
-            _resolve_session_export(stream, result, session_result)
+        result_pairs = tuple(zip(results, session_results, strict=True))
+        group_error = next(
+            (
+                session_result
+                for _result, session_result in result_pairs
+                if isinstance(session_result, RuntimeGroupError)
+            ),
+            None,
+        )
+        export_error: Exception | None = None
+        for result, session_result in result_pairs:
+            try:
+                _resolve_session_export(result, session_result)
+            except Exception as error:
+                result.completion.set_exception(error)
+                if export_error is None:
+                    export_error = error
+        if not stream.first_request_barrier.done():
+            if group_error is not None:
+                stream.first_request_barrier.set_exception(group_error)
+            elif export_error is not None:
+                stream.first_request_barrier.set_exception(export_error)
+            elif any(session_result is None for _result, session_result in result_pairs):
+                stream.first_request_barrier.set_result(False)
     except Exception as error:
         for result in results:
             completion = result.completion
@@ -1399,7 +1576,6 @@ async def _take_session_results(
 
 
 def _resolve_session_export(
-    stream: RuntimeGroupStream,
     result: _SessionResultRef,
     session_result: SessionExportTransport | RuntimeGroupError | None,
 ) -> None:
@@ -1410,13 +1586,9 @@ def _resolve_session_export(
         return
     if isinstance(session_result, RuntimeGroupError):
         completion.set_exception(session_result)
-        if not stream.first_request_barrier.done():
-            stream.first_request_barrier.set_exception(session_result)
         return
     if session_result is None:
         completion.set_result(None)
-        if not stream.first_request_barrier.done():
-            stream.first_request_barrier.set_result(False)
         return
     exports = []
     for export_payload in session_result.exports:

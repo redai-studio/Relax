@@ -21,10 +21,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.models.common.lora import resolve_lora_targets
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -42,7 +44,7 @@ from relax.utils.megatron_peft_utils import (
     scope_target_modules_to_region,
     summarize_lora_modules,
 )
-from relax.utils.misc import load_function
+from relax.utils.misc import load_function, resolve_is_vl_model
 from relax.utils.multimodal.vision_feature_cache import install_train_vision_cache
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
@@ -58,18 +60,40 @@ from .conditional_branch_sync import install_conditional_branch_sync
 logger = get_logger(__name__)
 
 
+def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
+    """Preserve GDN A_log precision before Float16Module, DDP and HF
+    loading."""
+    for module in model.modules():
+        # MCore and MindSpeed-Bridge both expose A_log on their GDN layers.
+        if not any(cls.__name__ == "GatedDeltaNet" for cls in type(module).__mro__):
+            continue
+        from megatron.core.transformer.module import mark_keep_in_fp32
+
+        # Preserve Parameter identity and TP metadata before mixed precision wrapping.
+        module.A_log.data = module.A_log.data.float()
+        mark_keep_in_fp32(module.A_log)
+
+
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
     """Propagate MTP detach-path settings to every Megatron model config."""
     detach_paths = frozenset(getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head")))
+    detach_all_paths = {"embedding", "backbone", "lm-head"}.issubset(detach_paths)
     seen_configs: set[int] = set()
     for module in model.modules():
         config = getattr(module, "config", None)
-        if config is None or id(config) in seen_configs:
-            continue
-        setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
-        setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
-        setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
-        seen_configs.add(id(config))
+        if config is not None and id(config) not in seen_configs:
+            setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
+            setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
+            setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
+            setattr(config, "mtp_detach_heads", detach_all_paths)
+            seen_configs.add(id(config))
+
+        if isinstance(module, MultiTokenPredictionBlock):
+            for param in module.parameters():
+                if detach_all_paths:
+                    param.grad_norm_group = "mtp"
+                elif getattr(param, "grad_norm_group", None) == "mtp":
+                    del param.grad_norm_group
 
 
 def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
@@ -167,6 +191,9 @@ def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module
     cu_seqlens instead of the pre-split + cp-multiplied form, and by model.py
     to route those through the forward.
     """
+    if getattr(model, "uses_unsplit_forward", False):
+        args.uses_unsplit_forward = True
+        return
     try:
         from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     except ImportError:
@@ -268,6 +295,25 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    from relax.models.qwen3_5.recipe import enabled as optimized_recipe
+
+    args._relax_qwen35_optimized = optimized_recipe(args)
+    if args._relax_qwen35_optimized:
+        assert not getattr(args, "sft_async_prepack", False), "Qwen optimization recipe requires foreground packing"
+        from relax.models.qwen3_5.deepep_backend import ensure_backend
+
+        ensure_backend(args)
+
+    provider = None
+    if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
+    # Resolve once, after provider selection and before model/data setup. A VL
+    # checkpoint can produce a text-only provider despite its processor files.
+    args.is_vl_model = resolve_is_vl_model(provider, getattr(args, "hf_checkpoint", None))
+
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -285,6 +331,7 @@ def get_model_provider_func(
             for module in model.modules():
                 if getattr(module, "config", None) is not None:
                     _validate_linear_cp_mode(args, module.config)
+            configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
@@ -302,10 +349,6 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        provider = bridge.to_megatron_provider(load_weights=False)
         is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
         if is_kimi_k3:
             from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
@@ -324,12 +367,17 @@ def get_model_provider_func(
             # layout arguments"); drop those flags in the script when using a layout.
             "pipeline_model_parallel_layout",
             "context_parallel_size",
+            "cp_comm_type",
             "cp_partition_mode",
             "sequence_packing_scheduler",
+            "max_seqlen_per_dp_cp_rank",
+            "pad_packed_seq_alignment",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",
             "dsa_indexer_loss_coeff",
+            "qsa_indexer_loss_coeff",
+            "qsa_force_sparse",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
             # Bridge mode bypasses core_transformer_config_from_args(), so FP8
@@ -345,13 +393,27 @@ def get_model_provider_func(
             "recompute_num_layers",
             "recompute_modules",
             "distribute_saved_activations",
+            "fine_grained_activation_offloading",
+            "offload_modules",
+            "min_offloaded_tensor_size",
+            "activation_offload_fraction",
+            "delta_offload_bytes_across_pp_ranks",
+            "delay_offload_until_cuda_graph",
+            "fine_grained_offloading_max_inflight_offloads",
             "moe_router_load_balancing_type",
             "moe_router_dtype",
+            "moe_router_fusion",
+            "overlap_dispatch_backward_with_experts_wgrad",
+            "_relax_qwen35_optimized",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
+            "moe_megakernel_backend",
+            "moe_megakernel_backend_config",
             "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",
+            "moe_flex_dispatcher_num_sms",
+            "moe_hybridep_pad_variable_tokens",
             "use_audio_in_video",
             "freeze_language_model",
             "freeze_vision_model",
@@ -402,6 +464,8 @@ def get_model_provider_func(
             # Dynamic CP related args
             "dynamic_context_parallel",
             "linear_cp_mode",
+            "gdn_pre_gated_delta_rule_fusion",
+            "gdn_conv_pad_alignment",
         ]
 
         args_dict = vars(args)
@@ -411,12 +475,24 @@ def get_model_provider_func(
                     continue
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
+                if attr == "cp_comm_type" and isinstance(new_val, list) and len(new_val) == 1:
+                    new_val = new_val[0]
                 if getattr(args, "dynamic_context_parallel", False):
                     if attr == "dynamic_context_parallel":
                         new_val = False
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        # Match MCore's CLI conversion: interleaved P2P overlap and batched
+        # communication are mutually exclusive. Parser validation already
+        # disables overlap for schedules without virtual pipeline stages.
+        if getattr(args, "overlap_p2p_comm", None) is not None:
+            provider.overlap_p2p_comm = args.overlap_p2p_comm
+            provider.batch_p2p_comm = not args.overlap_p2p_comm
+
+        if callable(getattr(provider, "configure_runtime", None)):
+            provider.configure_runtime(args)
 
         if is_kimi_k3:
             configure_runtime(provider, args)
@@ -497,22 +573,22 @@ def get_model_provider_func(
                 provider.num_layers_in_first_pipeline_stage = None
                 provider.num_layers_in_last_pipeline_stage = None
 
-        # Fused DSA kernels (FlashMLA forward + cuDNN DSA backward). Deliberately NOT in
-        # bridge_keys: that loop assigns unconditionally, so every bridge-mode model would
-        # get this field set. Only csa.py (DSv4-only) and the dsv4_hybrid branch of
-        # TransformerConfig.__post_init__ read it today, but gating here makes the blast
-        # radius structural rather than an argument about current mcore internals.
-        #
-        # Note the arg polarity: mcore auto-generates only `--no-dsa-kernel-fusion`
-        # (store_false, dest=apply_dsa_kernel_fusion, default True), so args say True
-        # unless the user opts out -- while the TransformerConfig field defaults to False
-        # and DeepSeekV4Bridge sets it False on SM < 10.0. Taking args as authoritative
-        # turns fusion ON for DSv4 by default; without it the CSA layers fall back to the
-        # unfused reference path whose gather backward is quadratic in sequence length
-        # (82GB at 8K tokens). If flash_mla / cuDNN DSA are missing, mcore raises a clear
-        # ValueError naming --no-dsa-kernel-fusion as the escape hatch.
+        # Preserve the provider default unless the launch explicitly selects a
+        # backend for models with provider-owned DSA defaults.
+        if getattr(args, "dsa_kernel_backend", None) is not None:
+            provider.dsa_kernel_backend = args.dsa_kernel_backend
+
+        # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
+        # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
+        # fusion flag defaults to None. Let finalize() validate explicit backend/flag conflicts.
         if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
-            want_fusion = bool(getattr(args, "apply_dsa_kernel_fusion", False))
+            want_fusion = getattr(args, "apply_dsa_kernel_fusion", None)
+            if hasattr(provider, "dsa_kernel_backend"):
+                provider.dsa_kernel_backend = getattr(args, "dsa_kernel_backend", None) or (
+                    "cudnn" if want_fusion is None else "none"
+                )
+            else:
+                want_fusion = want_fusion is not False
             if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
                 logger.info(
                     "Override provider.apply_dsa_kernel_fusion: "
@@ -539,6 +615,7 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
+            configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
@@ -674,6 +751,7 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        configure_gdn_a_log_fp32(model)
         configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
         install_reward_model_head_in_provider(model, args, role, post_process)
@@ -737,12 +815,13 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
+            peft.target_modules = resolve_lora_targets(model, list(peft.target_modules), args)
             # Restrict adapter injection to the requested model region (e.g. language-only
             # for VL models). Overriding target_modules post-construction is supported:
             # PEFT.__call__ rebuilds its matcher state from the current target_modules.
             scope = getattr(args, "lora_scope", "all")
             if scope != "all":
-                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+                peft.target_modules = scope_target_modules_to_region(model, list(peft.target_modules), scope)
             if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
                 peft.target_modules = exclude_frozen_lora_target_modules(
                     model, list(peft.target_modules), args.freeze_params_name_list
@@ -812,6 +891,10 @@ def wrap_model_provider_with_freeze(original_provider, args):
         )
 
         freeze_model_params(model, args)
+        if getattr(args, "task_type", "causal_lm") == "embedding":
+            from relax.utils.training.embedding import freeze_embedding_unused_heads
+
+            freeze_embedding_unused_heads(model)
         ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
         return model

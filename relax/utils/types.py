@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID
+
 
 _SPEC_TOKEN_COUNT_KEYS = (
     ("spec_num_correct_drafts", "spec_num_proposed_drafts"),
@@ -44,6 +46,9 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
+    rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
+    rollout_topk_support_complete: np.ndarray | None = None  # [response_length], bool; verified sampler coverage
     rollout_routed_experts: np.ndarray | None = None  # [seq_len - 1, num_layers, topk]
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
@@ -64,10 +69,9 @@ class Sample:
     teacher_prompt: str | list[dict[str, str]] | None = None
     teacher_multimodal_inputs: dict[str, Any] | None = None
     teacher_tokens: list[int] | None = None  # expanded teacher_prompt_tokens + response_tokens
+    teacher_rollout_tokens: list[int] | None = None  # collapsed teacher prompt + the same response tokens
     teacher_prompt_length: int | None = None  # number of teacher prompt tokens in teacher_tokens (expanded)
     teacher_image_data: dict[str, list] | None = None  # base64-encoded teacher media for SGLang payload
-    teacher_image_b64_list: list[str] | None = None  # raw base64-PNG list for OPD pre-expanded teacher path
-    teacher_image_grid_thw: Any = None  # HF processor image_grid_thw, [[t, h, w], ...]
 
     class Status(Enum):
         PENDING = "pending"
@@ -89,7 +93,22 @@ class Sample:
     # Session ID for consistent hashing routing (used when router policy is consistent_hashing)
     session_id: str | None = None
 
+    # Join key for agentic observability: stamped by the owning SessionShard at
+    # export time and carried unchanged through reward, transfer and training so
+    # the JSONL streams under --dump-agentic-obs can be joined. -1 means
+    # "not an agentic export" (see relax.utils.agentic_obs.records).
+    sample_export_id: int = UNASSIGNED_SAMPLE_EXPORT_ID
+    agentic_group_id: str | None = None
+    agentic_event_seq: int = 0
+    agentic_terminal: bool = False
+    # Immutable source snapshot shared by replicas; never sent through TQ.
+    agentic_prompt_source: dict[str, Any] | None = None
+
     non_generation_time: float = 0.0  # time spent in non-generation steps
+
+    @property
+    def response_key(self) -> int | str | None:
+        return self.index if self.index is not None else self.session_id
 
     @dataclass
     class SpecInfo:

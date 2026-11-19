@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import functools
 import importlib
 import ipaddress
 import json
@@ -58,6 +59,8 @@ class RouterWorkerCleanup:
     actor_id: str
     worker_id: str | None = None
     delete_requested: bool = False
+    pd_worker_type: str | None = None
+    bootstrap_port: int | None = None
 
 
 def remove_dead_router_worker(
@@ -84,6 +87,21 @@ def remove_dead_router_worker(
             raise ValueError("invalid Router worker list")
         return rows
 
+    def owns_worker(row: dict) -> bool:
+        if row.get("url") != worker_url or not row.get("id"):
+            return False
+        if cleanup.pd_worker_type is not None:
+            # The manager retained this exact static registration before the
+            # actor died. Router health may lag behind confirmed actor death.
+            if row.get("worker_type") != cleanup.pd_worker_type or (
+                cleanup.pd_worker_type == "prefill" and row.get("bootstrap_port") != cleanup.bootstrap_port
+            ):
+                return False
+            if cleanup.worker_id is not None:
+                return str(row["id"]) == cleanup.worker_id
+            return row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+        return row.get("is_healthy") is False and row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+
     try:
         rows = workers()
         matches = [row for row in rows if router_worker_base_url(row.get("url", "")) == worker_url]
@@ -93,22 +111,19 @@ def remove_dead_router_worker(
             if len(matches) != 1 or matches[0].get("url") != worker_url:
                 return False  # DP rank URLs or ambiguous ownership.
             candidate = matches[0]
-            if (
-                candidate.get("is_healthy") is not False
-                or not candidate.get("id")
-                or candidate.get("metadata", {}).get("relax_actor_id") != cleanup.actor_id
-            ):
+            if not owns_worker(candidate):
                 return False
             cleanup.worker_id = str(candidate["id"])
         # Never target another generation even if it now occupies the same URL.
         owned = [row for row in rows if str(row.get("id", "")) == cleanup.worker_id]
         if owned:
-            if (
-                len(owned) != 1
-                or owned[0].get("url") != worker_url
-                or owned[0].get("is_healthy") is not False
-                or owned[0].get("metadata", {}).get("relax_actor_id") != cleanup.actor_id
+            if cleanup.pd_worker_type is not None and (
+                len(matches) != 1
+                or matches[0].get("url") != worker_url
+                or str(matches[0].get("id", "")) != cleanup.worker_id
             ):
+                return False  # Router removal is URL-based even at its ID endpoint.
+            if len(owned) != 1 or not owns_worker(owned[0]):
                 return False
             if not cleanup.delete_requested:
                 detail = requests.get(f"{router_url}/workers/{quote(cleanup.worker_id, safe='')}", timeout=remaining())
@@ -275,12 +290,10 @@ _MAX_CONSECUTIVE_CONNECT_ERRORS = 3
 
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
-    if args.colocate:
-        start_index = (rank * num_gpus) % args.num_gpus_per_node
-    else:
-        num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
-        start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
-    return start_index
+    start_index = rank * num_gpus
+    if not args.colocate and not args.debug_rollout_only:
+        start_index += args.actor_num_gpus_per_node * args.actor_num_nodes
+    return start_index % args.num_gpus_per_node
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
@@ -319,17 +332,21 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs):
+def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     """Top-level picklable ``multiprocessing.Process`` target that applies the
     SGLang patches, each gated by its own env flag so any combination is valid:
 
-    - main process: OPD pre-expanded multimodal patch
-      (``RELAX_OPD_PREEXPANDED_PATCH=1``).
     - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
       and decision hidden collection (``RELAX_DECISION_HIDDEN_DIR``).
     """
     from sglang.srt.entrypoints.http_server import launch_server
+    from sglang.srt.utils import kill_itself_when_parent_died
 
+    # A wedged actor cannot run shutdown(). Keep its server tied to its lifetime,
+    # including when the actor exits before the child installs this guard.
+    kill_itself_when_parent_died()
+    if os.getppid() != parent_pid:
+        return
     if getattr(server_args, "tokenizer_worker_num", 1) > 1:
         # uvicorn multi-worker mode (tokenizer_worker_num > 1) passes
         # sys.stdin.fileno() to every worker and re-opens it there.  Under
@@ -348,11 +365,6 @@ def _launch_server_with_patches(server_args: ServerArgs):
             _sys.stdin = open(0, "r", closefd=False)
         except OSError:
             _sys.stdin = None
-
-    if Envs.RELAX_OPD_PREEXPANDED_PATCH:
-        from relax.utils.opd.opd_sglang_patch import apply_opd_preexpanded_patch
-
-        apply_opd_preexpanded_patch()
 
     if os.environ.get("RELAX_DECISION_HIDDEN_DIR"):
         backend = importlib.import_module(
@@ -401,21 +413,19 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     # independently (see ``_launch_server_with_patches`` and
     # ``_patched_run_scheduler_process``); any combination is valid:
     #   - RELAX_OPTIMIZE_ROUTING_REPLAY : async D→H routing-replay patch (runtime)
-    #   - RELAX_OPD_PREEXPANDED_PATCH   : OPD pre-expanded multimodal patch (runtime)
     #   - RELAX_OPD_PER_POS_TOKEN_IDS   : OPD per-position token_ids logprob;
     optimize = Envs.RELAX_OPTIMIZE_ROUTING_REPLAY
-    opd_patch = Envs.RELAX_OPD_PREEXPANDED_PATCH
     per_pos = Envs.RELAX_OPD_PER_POS_TOKEN_IDS
     logger.info(
         "Launching SGLang server with independently-gated patches: "
-        f"routing_replay={optimize}, opd_preexpanded={opd_patch}, per_pos_token_ids={per_pos}"
+        f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
     p.start()
 
     if server_args.node_rank != 0:
-        return
+        return p
 
     _wait_server_healthy(
         base_url=server_args.url(),
@@ -506,6 +516,7 @@ class SGLangEngine(RayActor):
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._sync_nextn_draft = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -539,6 +550,7 @@ class SGLangEngine(RayActor):
         init_external_kwargs: Optional[dict] = None,
         skip_dcs_registration: bool = False,
         skip_router_registration: bool = False,
+        require_router_registration: bool = False,
     ) -> dict[str, str | int | None]:
         """Initialize the SGLang engine.
 
@@ -551,6 +563,7 @@ class SGLangEngine(RayActor):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
         self._skip_router_registration = skip_router_registration
+        self._require_router_registration = require_router_registration
 
         host = host or get_host_info()[1]
 
@@ -596,6 +609,9 @@ class SGLangEngine(RayActor):
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
+            self._sync_nextn_draft = server_args_dict.get(
+                "speculative_algorithm"
+            ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
             self._init_normal(server_args_dict)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
@@ -620,6 +636,7 @@ class SGLangEngine(RayActor):
                     metadata={
                         "num_gpus_per_engine": effective_num_gpus,
                         "actor_id": ray.get_runtime_context().get_actor_id(),
+                        "sync_nextn_draft": self._sync_nextn_draft,
                     },
                 )
             )
@@ -648,6 +665,14 @@ class SGLangEngine(RayActor):
         )
         actual_server_args = _get_actual_server_args()
         _sanity_check_server_args(actual_server_args, expect_server_args)
+        # SGLang may report NEXTN as EAGLE after resolving the server args.
+        self._sync_nextn_draft = (
+            expect_server_args.get("speculative_algorithm") == "NEXTN"
+            and actual_server_args.get("speculative_algorithm") in ("NEXTN", "EAGLE")
+            and "model_path" in actual_server_args
+            and "speculative_draft_model_path" in actual_server_args
+            and _uses_target_checkpoint_for_draft(actual_server_args)
+        )
 
         if not self._skip_router_registration:
             self.register_to_router()
@@ -664,12 +689,9 @@ class SGLangEngine(RayActor):
 
         if Envs.RELAX_OPD_PER_POS_TOKEN_IDS:
             os.environ["RELAX_FORCE_LOGPROBS_BASE64"] = "1"
-            top_k = getattr(self.args, "opd_log_prob_top_k", 0)
-            if top_k:
-                os.environ["RELAX_OPD_TOKEN_IDS_LOGPROB_K"] = str(top_k)
             logger.info(
-                "Set RELAX_FORCE_LOGPROBS_BASE64=1, RELAX_OPD_TOKEN_IDS_LOGPROB_K=%s (topk enabled)",
-                Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
+                "Set RELAX_FORCE_LOGPROBS_BASE64=1 (opd_log_prob_top_k=%s; query K is sent per request)",
+                getattr(self.args, "opd_log_prob_top_k", 0),
             )
 
         # Set SGLang external model/processor package env vars so the spawned
@@ -696,14 +718,19 @@ class SGLangEngine(RayActor):
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
-
-        bootstrap_port = (
-            server_args_dict.get("disaggregation_bootstrap_port") if self.worker_type == "prefill" else None
+        server_args = ServerArgs(**server_args_dict)
+        self._router_bootstrap_port = (
+            server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
+        self._router_dp_size = server_args.dp_size
+        self.process = launch_server_process(server_args)
+
+        bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
         if not self._skip_router_registration:
-            self.register_to_router(bootstrap_port=bootstrap_port)
+            registered = self.register_to_router(bootstrap_port=bootstrap_port)
+            if getattr(self, "_require_router_registration", False) and self.node_rank == 0 and not registered:
+                raise RuntimeError("Required PD router registration failed")
 
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
@@ -786,32 +813,92 @@ class SGLangEngine(RayActor):
         )
 
     def get_expert_weight_sync_layout(self) -> dict:
-        """Return resolved layout settings for opt-in colocated expert
-        routing."""
+        """Return resolved layout settings for opt-in colocated expert routing
+        and direct BF16 loading."""
         from relax.utils.misc import get_hf_config
 
         if self.node_rank != 0 or self.worker_type != "regular":
             raise ValueError("Expert routing requires a regular node-0 rollout engine")
-        response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
-        response.raise_for_status()
-        info = response.json()
+        for _ in range(2):
+            response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
+            response.raise_for_status()
+            info = response.json()
+            # /server_info can time out fetching scheduler state while still
+            # returning HTTP 200. Retry once before rejecting an unknown auto layout.
+            if info.get("internal_states") or info.get("moe_runner_backend") != "auto":
+                break
         keys = (
+            "model_path",
+            "device",
             "tp_size",
             "ep_size",
             "pp_size",
             "moe_dp_size",
+            "dwdp_size",
             "enable_eplb",
             "ep_num_redundant_experts",
             "init_expert_location",
             "ep_join_mode",
+            "elastic_ep_backend",
             "speculative_algorithm",
+            "speculative_draft_model_path",
             "moe_runner_backend",
+            "moe_a2a_backend",
             "json_model_override_args",
+            "dtype",
+            "quantization",
+            "enable_lora",
+            "disable_shared_experts_fusion",
+            "enforce_shared_experts_fusion",
+            "kt_weight_path",
+            "custom_weight_loader",
         )
         layout = {key: info[key] for key in keys if key in info}
-        config = get_hf_config(info["model_path"])
-        text_config = getattr(config, "text_config", None) or config
-        layout["num_experts"] = getattr(text_config, "num_experts", None)
+        # Scheduler-side load-time overrides may differ from the HTTP process's
+        # startup config. Never infer the native layout from a stale "auto".
+        states = info.get("internal_states") or []
+        if states:
+            layouts = [{**layout, **{key: state[key] for key in keys if key in state}} for state in states]
+            if any(candidate != layouts[0] for candidate in layouts[1:]):
+                raise ValueError("Rollout schedulers disagree on the expert weight layout")
+            layout = layouts[0]
+        # ROCm also reports device="cuda". The local platform probe only describes
+        # receivers spawned here, not an externally managed HTTP engine.
+        layout["is_cuda"] = (
+            getattr(self, "process", None) is not None
+            and layout.get("device") == "cuda"
+            and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
+        )
+        config = get_hf_config(layout["model_path"])
+        text_config = (
+            getattr(config, "text_config", None)
+            or getattr(getattr(config, "thinker_config", None), "text_config", None)
+            or config
+        )
+        if "dtype" in layout:
+            from sglang.srt.configs.model_config import _get_and_verify_dtype
+
+            layout["dtype"] = str(_get_and_verify_dtype(text_config, layout["dtype"])).removeprefix("torch.")
+        if (
+            states
+            and all("moe_runner_backend" in state for state in states)
+            and layout.get("moe_runner_backend") == "auto"
+            and layout["is_cuda"]
+        ):
+            # Unquantized CUDA FusedMoE uses the standard Triton layout for auto.
+            # Quantization, remapping and fused shared experts are still checked
+            # by DirectExpertLayout; this does not change the engine's settings.
+            layout["moe_runner_backend"] = "triton"
+        layout["num_experts"] = getattr(text_config, "num_experts", None) or getattr(
+            text_config, "n_routed_experts", None
+        )
+        layout["num_shared_experts"] = (
+            getattr(text_config, "n_shared_experts", None)
+            or getattr(text_config, "num_shared_experts", None)
+            or int(bool(getattr(text_config, "shared_expert_intermediate_size", 0)))
+        )
+        for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
+            layout[key] = getattr(text_config, key, None)
         return layout
 
     def load_lora_adapter_from_tensors(
@@ -988,10 +1075,12 @@ class SGLangEngine(RayActor):
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        self.unregister_from_router()
-        # external rollout has no process
-        if hasattr(self, "process"):
-            kill_process_tree(self.process.pid)
+        try:
+            self.unregister_from_router(timeout=5.0)
+        finally:
+            process = getattr(self, "process", None)
+            if process is not None:
+                kill_process_tree(process.pid)
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -1015,6 +1104,74 @@ class SGLangEngine(RayActor):
             return None
         return f"http://{self.server_host}:{self.server_port}"
 
+    def get_pd_router_worker_spec(self) -> dict | None:
+        """Describe a healthy node-0 engine for managed static PD startup."""
+        if self.node_rank != 0:
+            return None
+        if self.worker_type not in {"prefill", "decode"} or getattr(self, "_router_dp_size", None) != 1:
+            raise ValueError("Managed static PD startup requires a P/D engine with dp_size=1")
+        bootstrap_port = getattr(self, "_router_bootstrap_port", None)
+        if self.worker_type == "prefill" and (type(bootstrap_port) is not int or not 1 <= bootstrap_port <= 65535):
+            raise ValueError("Prefill bootstrap port is unavailable")
+        return {"url": self.get_url(), "worker_type": self.worker_type, "bootstrap_port": bootstrap_port}
+
+    def bind_registered_pd_worker(self, router_ip: str, router_port: int, worker: dict) -> bool:
+        """Adopt an existing static worker without issuing a second POST."""
+        if not router_ip or type(router_port) is not int or not 1 <= router_port <= 65535:
+            raise ValueError("A reachable router endpoint is required")
+        expected = self.get_pd_router_worker_spec()
+        if expected is None:
+            raise ValueError("Only node-0 engines may adopt a router worker")
+        worker_id = worker.get("id")
+        if (
+            worker.get("url", "").rstrip("/") != expected["url"].rstrip("/")
+            or worker.get("worker_type") != expected["worker_type"]
+            or worker.get("is_healthy") is not True
+            or not isinstance(worker_id, str)
+            or not worker_id
+            or "@" in worker_id
+            or (self.worker_type == "prefill" and worker.get("bootstrap_port") != expected["bootstrap_port"])
+        ):
+            raise ValueError("Router worker does not match the initialized PD engine")
+        self.router_ip, self.router_port = router_ip, router_port
+        self._router_worker_id = worker_id
+        self._router_unregister_submitted = False
+        self._skip_router_registration = False
+        return True
+
+    def _wait_for_registered_pd_worker(self, timeout: float = 60.0) -> None:
+        """Recovery must reach a healthy registry entry before init
+        succeeds."""
+        deadline = time.monotonic() + timeout
+        expected = self.get_pd_router_worker_spec()
+        if expected is None:
+            return
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    timeout=min(5.0, max(0.1, deadline - time.monotonic())),
+                )
+                response.raise_for_status()
+                matches = [
+                    worker
+                    for worker in response.json().get("workers", [])
+                    if worker.get("url", "").rstrip("/") == expected["url"].rstrip("/")
+                ]
+                if len(matches) > 1:
+                    raise ValueError("Duplicate PD worker URL in router registry")
+                if len(matches) == 1 and matches[0].get("is_healthy") is True:
+                    registered_id = self._router_worker_id
+                    if registered_id is not None and matches[0].get("id") != registered_id:
+                        raise ValueError("PD worker registration ID changed before readiness")
+                    self.bind_registered_pd_worker(self.router_ip, self.router_port, matches[0])
+                    return
+            except requests.RequestException as error:
+                last_error = type(error).__name__
+            time.sleep(0.25)
+        raise TimeoutError(f"PD worker did not become ready in the router: {last_error}")
+
     def get_pid_and_node_id(self) -> dict:
         """Return the PID and Ray node ID of this engine.
 
@@ -1029,13 +1186,27 @@ class SGLangEngine(RayActor):
         return {"pid": os.getpid(), "node_id": node_id}
 
     def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
-        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+        required = getattr(self, "_require_router_registration", False)
+        if self.node_rank != 0:
             return True
+        if not self.router_ip or not self.router_port:
+            return not required
         if self.is_evicted():
             return False
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
         try:
+            if required and (
+                getattr(self, "_router_registration_pending", False)
+                or (self._router_worker_id is not None and not self._router_unregister_submitted)
+            ):
+                # A POST may be accepted before health registration completes.
+                # Retry its readiness check, not the mutation that creates a worker.
+                self._wait_for_registered_pd_worker()
+                self._router_registration_pending = False
+                return True
+            if required and self.worker_type == "prefill" and bootstrap_port is None:
+                bootstrap_port = self._router_bootstrap_port
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
                 if self.worker_type != "regular":
                     msg = "pd disaggregation is not supported in old router or slime router."
@@ -1052,15 +1223,44 @@ class SGLangEngine(RayActor):
                     "url": worker_url,
                     "worker_type": self.worker_type,
                 }
-                if getattr(self, "_is_scaled_out", False) and parse(sglang_router.__version__) >= parse("0.3.0"):
+                if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
+                    "0.3.0"
+                ):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    json=payload,
-                    timeout=30,
-                )
+                if required:
+                    # The router may accept the worker before its HTTP response
+                    # is lost. Reconcile that mutation instead of posting twice.
+                    self._router_registration_pending = True
+                    self._router_worker_id = None
+                try:
+                    response = requests.post(
+                        f"http://{self.router_ip}:{self.router_port}/workers",
+                        json=payload,
+                        timeout=30,
+                    )
+                except ConnectTimeout:
+                    if required:
+                        self._router_registration_pending = False
+                    raise
+                if required and response.status_code >= 400:
+                    # Client rejections and the router's queue errors prove
+                    # that no registration was submitted. A gateway timeout
+                    # or an unrecognized server error can still hide acceptance.
+                    rejected = 400 <= response.status_code < 500 and response.status_code != 408
+                    if response.status_code == 500:
+                        try:
+                            body = response.json()
+                        except ValueError:
+                            body = None
+                        rejected = (
+                            isinstance(body, dict)
+                            and body.get("code") == "INTERNAL_SERVER_ERROR"
+                            and isinstance(body.get("error"), str)
+                        )
+                    if rejected:
+                        self._router_registration_pending = False
             response.raise_for_status()
             self._router_worker_id = None
             if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:
@@ -1086,6 +1286,10 @@ class SGLangEngine(RayActor):
                 if self._router_worker_id is None:
                     logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
             self._router_unregister_submitted = False
+            if required:
+                self._router_registration_pending = True
+                self._wait_for_registered_pd_worker()
+                self._router_registration_pending = False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
@@ -1135,22 +1339,22 @@ class SGLangEngine(RayActor):
             if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             elif router_version < parse("0.3.0"):
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(worker_url, safe='')}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             elif self._router_worker_id is not None:
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(self._router_worker_id, safe='')}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             else:
                 workers_response = requests.get(
                     f"http://{self.router_ip}:{self.router_port}/workers",
-                    timeout=30,
+                    timeout=timeout,
                 )
                 workers_response.raise_for_status()
                 all_workers = workers_response.json().get("workers", [])
@@ -1182,7 +1386,7 @@ class SGLangEngine(RayActor):
                     return False
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(str(worker_id), safe='')}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             if response.status_code != 404:
                 response.raise_for_status()
@@ -1261,6 +1465,8 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if self._sync_nextn_draft:
+            payload["selector"] = "all"
         return self._make_request(
             "update_weights_from_distributed",
             payload,
@@ -1558,6 +1764,25 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
+    def begin_weight_update(self):
+        """Open a weight-update session; newer SGLang rejects weight loads
+        outside one.
+
+        No-op on older SGLang.
+        """
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("begin_weight_update", {})
+
+    def end_weight_update(self):
+        """Close the session opened by ``begin_weight_update``.
+
+        No-op on older SGLang.
+        """
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("end_weight_update", {})
+
     def post_process_weights(
         self,
         restore_weights_before_load: bool = False,
@@ -1730,6 +1955,13 @@ class GenRMEngine(SGLangEngine):
             logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
 
+def _uses_target_checkpoint_for_draft(server_args: dict) -> bool:
+    draft_path = server_args.get("speculative_draft_model_path")
+    draft_revision = server_args.get("speculative_draft_model_revision") or "main"
+    target_revision = server_args.get("revision") or "main"
+    return draft_path is None or (draft_path == server_args["model_path"] and draft_revision == target_revision)
+
+
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
     if getattr(args, "enable_mtp_training", False):
         return False
@@ -1738,6 +1970,33 @@ def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None)
     if sglang_overrides and "speculative_algorithm" in sglang_overrides:
         speculative_algorithm = sglang_overrides["speculative_algorithm"]
     return speculative_algorithm is not None
+
+
+@functools.lru_cache(maxsize=None)
+def _sglang_has_weight_update_session() -> bool:
+    """Probe lazily: this module is imported by every process that parses args,
+    and importing ``io_struct`` there can pull torch_npu's torchair
+    ``all_reduce`` patch into train actors on Ascend, which rejects float64."""
+    try:
+        from sglang.srt.managers.io_struct import BeginWeightUpdateReqInput  # noqa: F401
+    except ImportError:
+        # SGLang < 0.5.21 accepts weight loads without an explicit update session.
+        # Weight-update sessions were added in 0.5.21 (sgl-project/sglang#40777).
+        return False
+    return True
+
+
+def _server_arg_field_names() -> tuple[str, ...]:
+    """Return ServerArgs field names; newer SGLang defines it as a msgspec
+    Struct instead of a dataclass."""
+    # SGLang < 0.5.20 defines ServerArgs as a dataclass; 0.5.20 switched it to
+    # a msgspec.Struct (sgl-project/sglang#38753).
+    if dataclasses.is_dataclass(ServerArgs):
+        return tuple(field.name for field in dataclasses.fields(ServerArgs))
+
+    import msgspec
+
+    return tuple(field.name for field in msgspec.structs.fields(ServerArgs))
 
 
 def _compute_genrm_server_args(
@@ -1826,18 +2085,18 @@ def _compute_genrm_server_args(
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
     unused_keys = set(kwargs.keys())
-    for attr in dataclasses.fields(ServerArgs):
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+    for name in _server_arg_field_names():
+        if worker_type == "decode" and name == "enable_hierarchical_cache":
             continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
+        if hasattr(args, f"sglang_{name}") and name not in kwargs:
+            kwargs[name] = getattr(args, f"sglang_{name}")
+        unused_keys.discard(name)
 
     # Per-genrm overrides from --genrm-engine-config. Applied after base args
     # and sglang_* defaults so user-supplied keys take highest priority. Keys
     # not recognized by the installed SGLang ServerArgs are dropped with a
     # warning rather than causing a TypeError at ServerArgs(**kwargs).
-    server_arg_fields = {f.name for f in dataclasses.fields(ServerArgs)}
+    server_arg_fields = set(_server_arg_field_names())
     for key, value in (args.genrm_engine_config or {}).items():
         if key not in server_arg_fields:
             logger.info(
@@ -1849,6 +2108,26 @@ def _compute_genrm_server_args(
             logger.info(f"genrm_engine_config: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
         kwargs[key] = value
         unused_keys.discard(key)
+
+    # CUDA IPC cannot cross nodes, and SGLang rejects it on ROCm. Resolve the default
+    # after GenRM's own topology and overrides; an explicit None retains SGLang's
+    # automatic selection.
+    if (
+        "mm_feature_transport" in server_arg_fields
+        and "mm_feature_transport" not in (args.genrm_engine_config or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
+
+    if (
+        "cuda_graph_backend_prefill" in server_arg_fields
+        and kwargs.get("enable_memory_saver")
+        and kwargs.get("cuda_graph_backend_prefill") is None
+    ):
+        # Match policy engines: the default breakable prefill backend is incompatible with memory saver mode.
+        kwargs["cuda_graph_backend_prefill"] = "disabled"
 
     # for compatibility with old args
     if len(unused_keys) > 0:
@@ -1945,15 +2224,14 @@ def _compute_server_args(
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    server_arg_fields = dataclasses.fields(ServerArgs)
-    server_arg_field_names = {attr.name for attr in server_arg_fields}
+    server_arg_field_names = _server_arg_field_names()
     unused_keys = set(kwargs.keys())
-    for attr in server_arg_fields:
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+    for name in server_arg_field_names:
+        if worker_type == "decode" and name == "enable_hierarchical_cache":
             continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
+        if hasattr(args, f"sglang_{name}") and name not in kwargs:
+            kwargs[name] = getattr(args, f"sglang_{name}")
+        unused_keys.discard(name)
 
     # Per-engine-group overrides from --sglang-config YAML.
     # Applied after base args so they take highest priority.
@@ -1963,6 +2241,37 @@ def _compute_server_args(
                 logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
             kwargs[key] = value
             unused_keys.discard(key)
+
+    # Use CUDA IPC only for engines confined to one node; multi-node engines
+    # retain SGLang's auto policy, including CUDA VMM where supported. SGLang
+    # rejects CUDA IPC on ROCm, so ROCm engines always keep the auto policy.
+    if (
+        "mm_feature_transport" in server_arg_field_names
+        and "mm_feature_transport" not in (sglang_overrides or {})
+        and kwargs.get("mm_feature_transport") is None
+        and kwargs["nnodes"] == 1
+        and not device_utils.is_rocm
+    ):
+        kwargs["mm_feature_transport"] = "cuda_ipc"
+
+    # Repeated policy updates benefit from keeping shared and routed experts
+    # separate. Explicit per-engine settings or enforced fusion take precedence.
+    if (
+        "disable_shared_experts_fusion" in server_arg_field_names
+        and "disable_shared_experts_fusion" not in (sglang_overrides or {})
+        and not kwargs.get("enforce_shared_experts_fusion", False)
+    ):
+        kwargs["disable_shared_experts_fusion"] = True
+
+    if "custom_weight_loader" in server_arg_field_names:
+        from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
+
+        # Register alongside user loaders. The sender negotiates this exact
+        # capability from server_info before emitting partial native tensors.
+        loaders = list(kwargs.get("custom_weight_loader") or [])
+        if EXPERT_SLICE_LOADER not in loaders:
+            loaders.append(EXPERT_SLICE_LOADER)
+        kwargs["custom_weight_loader"] = loaders
 
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names

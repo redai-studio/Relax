@@ -25,7 +25,7 @@ set -ex
 set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
-export RELAX_OPD_PREEXPANDED_PATCH=1
+export SGLANG_MM_AVOID_RETOKENIZE=true
 # The OPD teacher needs a logprob at every response position, and
 # logits_processor.py:471 materializes [N, vocab] (fp32) in one shot by default.
 # N reaches tens of thousands, i.e. an 8-16 GiB single allocation -- exactly where
@@ -35,7 +35,7 @@ export RELAX_OPD_PREEXPANDED_PATCH=1
 # decoupling logits memory from the prefill chunk size.
 export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1
 export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=8192
-export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH,SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
+export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}SGLANG_MM_AVOID_RETOKENIZE,SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 

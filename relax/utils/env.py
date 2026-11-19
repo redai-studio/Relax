@@ -58,7 +58,7 @@ _FALSE_VALUES = frozenset({"0", "f", "false", "n", "no", "off"})
 
 # A variable whose name contains one of these has its value masked in
 # diagnostics. Substring matching, deliberately over-inclusive: masking a
-# non-secret (`RELAX_OPD_TOKEN_IDS_LOGPROB_K` is a top-k count, not a
+# non-secret (`RELAX_KERNEL_CACHE_KEY` is a cache identifier, not a
 # credential) only costs a line of diagnostic output, while missing a real
 # credential writes it to the log verbatim.
 _SENSITIVE_ENV_MARKERS: Tuple[str, ...] = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PASSWD", "AUTH")
@@ -109,8 +109,7 @@ class EnvProperty:
 
     Resolution is lazy on purpose: several call sites write to ``os.environ``
     and read the value back later in the same process (``LOCAL_RANK`` in
-    ``distributed/ray/train_actor.py``, ``RELAX_OPD_TOKEN_IDS_LOGPROB_K`` in
-    ``backends/sglang/sglang_engine.py``), so values must not be frozen at
+    ``distributed/ray/train_actor.py``), so values must not be frozen at
     import time. An unset *or empty* variable resolves to ``default``; a set but
     unparseable one raises ``ValueError``.
 
@@ -152,6 +151,19 @@ class EnvProperty:
 
     def __get__(self, instance: Any, owner: type) -> Any:
         return self.resolve()
+
+
+class _QSAFusedAttentionProperty(EnvProperty):
+    """Keep the boolean switch compatible while allowing explicit versioned
+    backends."""
+
+    def parse(self, raw: Optional[str]) -> Any:
+        value = raw.strip().lower() if raw is not None else ""
+        if value in ("triton_v2", "triton_v3"):
+            return value
+        if value == "triton":
+            return True
+        return super().parse(raw)
 
 
 class _EnvsMeta(type):
@@ -200,11 +212,69 @@ class Envs(metaclass=_EnvsMeta):
     LOGNAME = EnvProperty("LOGNAME", str, None)
 
     # ------------- OPD / SGLang patches -------------
-    RELAX_OPD_PREEXPANDED_PATCH = EnvProperty("RELAX_OPD_PREEXPANDED_PATCH", bool, False)
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
-    RELAX_OPD_TOKEN_IDS_LOGPROB_K = EnvProperty("RELAX_OPD_TOKEN_IDS_LOGPROB_K", str, "0")
     RELAX_OPTIMIZE_ROUTING_REPLAY = EnvProperty("RELAX_OPTIMIZE_ROUTING_REPLAY", bool, False)
     RELAX_FORCE_LOGPROBS_BASE64 = EnvProperty("RELAX_FORCE_LOGPROBS_BASE64", bool, False)
+
+    # Qwen model compatibility and optional training kernels.
+    RELAX_LOGPROB_FAST_PATH = EnvProperty("RELAX_LOGPROB_FAST_PATH", bool, False)
+    RELAX_SFT_RESIDENT_PARAM_OVERLAP = EnvProperty("RELAX_SFT_RESIDENT_PARAM_OVERLAP", bool, False)
+    RELAX_PROFILE_RANKS = EnvProperty("RELAX_PROFILE_RANKS", str, None)
+    RELAX_PROFILE_GZIP_LEVEL = EnvProperty("RELAX_PROFILE_GZIP_LEVEL", int, None)
+    RELAX_QWEN38_HC_FUSED_MIX = EnvProperty("RELAX_QWEN38_HC_FUSED_MIX", bool, True)
+    RELAX_QWEN38_HC_FUSED_COMBINE = EnvProperty("RELAX_QWEN38_HC_FUSED_COMBINE", bool, False)
+    RELAX_QWEN38_PLE_FUSED_CONV = EnvProperty("RELAX_QWEN38_PLE_FUSED_CONV", bool, False)
+    RELAX_QWEN38_PLE_CP_FUSED_CONV = EnvProperty("RELAX_QWEN38_PLE_CP_FUSED_CONV", bool, False)
+    RELAX_QWEN38_QSA_CP_TP_SELECTOR = EnvProperty("RELAX_QWEN38_QSA_CP_TP_SELECTOR", bool, False)
+    RELAX_SFT_FUSED_LINEAR_CE = EnvProperty("RELAX_SFT_FUSED_LINEAR_CE", bool, False)
+    # Independent opt-ins for K3 training operator benchmarks and deployment.
+    RELAX_KIMI_K3_EXPERT_SPLIT = EnvProperty("RELAX_KIMI_K3_EXPERT_SPLIT", bool, False)
+    RELAX_KIMI_K3_FUSED_SITU = EnvProperty("RELAX_KIMI_K3_FUSED_SITU", bool, False)
+    RELAX_KIMI_K3_FUSED_ATTN_RES = EnvProperty("RELAX_KIMI_K3_FUSED_ATTN_RES", bool, False)
+    RELAX_KIMI_K31_EXPANDED_DSA_BACKEND = EnvProperty("RELAX_KIMI_K31_EXPANDED_DSA_BACKEND", str, None)
+    RELAX_KIMI_K31_DSA_SELECTION_REUSE = EnvProperty("RELAX_KIMI_K31_DSA_SELECTION_REUSE", bool, False)
+    RELAX_KIMI_K31_DSA_FUSED_INDEXER = EnvProperty("RELAX_KIMI_K31_DSA_FUSED_INDEXER", bool, False)
+    RELAX_KIMI_K31_DSA_QUERY_CHUNK_SIZE = EnvProperty("RELAX_KIMI_K31_DSA_QUERY_CHUNK_SIZE", int, 8192)
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN = EnvProperty("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", str, "")
+    RELAX_QWEN38_RETAIN_QSA_ATTENTION = EnvProperty("RELAX_QWEN38_RETAIN_QSA_ATTENTION", bool, False)
+    RELAX_QWEN38_QSA_RETENTION_POLICY = EnvProperty("RELAX_QWEN38_QSA_RETENTION_POLICY", str, None)
+    # Compatibility with the earlier 128K SFT recipe.
+    AIO_TUNE_PP7_RETAIN = EnvProperty("AIO_TUNE_PP7_RETAIN", str, None)
+    AIO_TUNE_PP7_FULL_LAYER = EnvProperty("AIO_TUNE_PP7_FULL_LAYER", str, None)
+    AIO_TUNE_PP7_FULL_SCOPE = EnvProperty("AIO_TUNE_PP7_FULL_SCOPE", str, None)
+    RELAX_QWEN38_ROUTER_SORTED_REPLAY = EnvProperty("RELAX_QWEN38_ROUTER_SORTED_REPLAY", bool, False)
+    RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG = EnvProperty("RELAX_QWEN38_GDN_OUTPUT_SAFE_CONFIG", bool, False)
+    RELAX_QWEN38_QSA_FIXED_POOL = EnvProperty("RELAX_QWEN38_QSA_FIXED_POOL", bool, False)
+    RELAX_QWEN38_FLA_CONV_CACHE_REUSE = EnvProperty("RELAX_QWEN38_FLA_CONV_CACHE_REUSE", bool, False)
+    RELAX_QWEN38_PLE_STREAMED = EnvProperty("RELAX_QWEN38_PLE_STREAMED", bool, False)
+    RELAX_QWEN38_QSA_FUSED_ATTENTION = _QSAFusedAttentionProperty("RELAX_QWEN38_QSA_FUSED_ATTENTION", bool, False)
+    RELAX_QWEN38_QSA_COMMUNITY_BACKEND = EnvProperty("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", str, "")
+    RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN = EnvProperty("RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN", int, 16384)
+    RELAX_QWEN38_QSA_MIXED_LONG_BACKEND = EnvProperty("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", str, "grouped")
+    RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN = EnvProperty("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", int, -1)
+    RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS = EnvProperty("RELAX_QWEN38_QSA_NV_MAX_PACK_TOKENS", int, 0)
+    RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES = EnvProperty("RELAX_QWEN38_QSA_GROUPED_BACKWARD_STAGES", int, 1)
+    RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K = EnvProperty("RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K", int, 64)
+    RELAX_QWEN38_QSA_SELECTOR_COMPILE = EnvProperty("RELAX_QWEN38_QSA_SELECTOR_COMPILE", bool, False)
+    RELAX_QWEN38_QSA_SELECTOR_BACKEND = EnvProperty("RELAX_QWEN38_QSA_SELECTOR_BACKEND", str, "torch")
+    RELAX_QWEN38_QSA_CP = EnvProperty("RELAX_QWEN38_QSA_CP", bool, False)
+    RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE = EnvProperty("RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE", bool, False)
+    RELAX_QWEN38_QSA_CPU_LAYOUT = EnvProperty("RELAX_QWEN38_QSA_CPU_LAYOUT", bool, False)
+    RELAX_QWEN38_QSA_FUSED_SELECTOR = EnvProperty("RELAX_QWEN38_QSA_FUSED_SELECTOR", bool, False)
+    RELAX_QWEN38_QSA_SELECTOR_TILE_MIB = EnvProperty("RELAX_QWEN38_QSA_SELECTOR_TILE_MIB", int, None)
+    RELAX_QWEN38_QSA_LOCAL_QUERY = EnvProperty("RELAX_QWEN38_QSA_LOCAL_QUERY", bool, False)
+    RELAX_QWEN38_QSA_RECOMPUTE_REPLAY = EnvProperty("RELAX_QWEN38_QSA_RECOMPUTE_REPLAY", bool, False)
+    RELAX_QWEN38_QSA_ROUTED_QKV = EnvProperty("RELAX_QWEN38_QSA_ROUTED_QKV", bool, False)
+    RELAX_QWEN38_QSA_TP_SELECTOR = EnvProperty("RELAX_QWEN38_QSA_TP_SELECTOR", bool, False)
+    RELAX_QWEN38_QSA_SPARSE_BLOCKMASK = EnvProperty("RELAX_QWEN38_QSA_SPARSE_BLOCKMASK", bool, False)
+    RELAX_SFT_SELECTIVE_LOGITS = EnvProperty("RELAX_SFT_SELECTIVE_LOGITS", bool, False)
+    RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS = EnvProperty("RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS", bool, False)
+    RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT = EnvProperty("RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT", bool, False)
+    RELAX_LOGPROB_CE_IMPL = EnvProperty("RELAX_LOGPROB_CE_IMPL", str, "native")
+    RELAX_MTP_CE_IMPL = EnvProperty("RELAX_MTP_CE_IMPL", str, "native")
+    RELAX_SFT_MTP_ACCEPTANCE_METRICS = EnvProperty("RELAX_SFT_MTP_ACCEPTANCE_METRICS", bool, True)
+    RELAX_SFT_PRE_SHIFTED_LABELS = EnvProperty("RELAX_SFT_PRE_SHIFTED_LABELS", bool, False)
+    RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS = EnvProperty("RELAX_MEGATRON_WEIGHT_DECAY_ALL_PARAMS", bool, False)
 
     # ------------- Telemetry / Log -------------
     RELAX_TELEMETRY_HOOK = EnvProperty("RELAX_TELEMETRY_HOOK", str, None)
@@ -218,9 +288,29 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_EMPTY_POLL_SLEEP_MS = EnvProperty("RELAX_EMPTY_POLL_SLEEP_MS", float, 50.0)
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
     RELAX_SFT_TQ_SHARDS = EnvProperty("RELAX_SFT_TQ_SHARDS", int, 1)
+    RELAX_GEMMA4_FORCE_FLEX_GLOBAL = EnvProperty("RELAX_GEMMA4_FORCE_FLEX_GLOBAL", bool, False)
+    RELAX_JSONL_INDEX_WORKERS = EnvProperty("RELAX_JSONL_INDEX_WORKERS", int, 16)
+    RELAX_PROCESSOR_POOL_SIZE = EnvProperty("RELAX_PROCESSOR_POOL_SIZE", int, None)
     RELAX_LORA_A_INIT_METHOD = EnvProperty("RELAX_LORA_A_INIT_METHOD", str, "")
     RELAX_LORA_EXCLUDE_FROZEN_MODULES = EnvProperty("RELAX_LORA_EXCLUDE_FROZEN_MODULES", bool, False)
     RELAX_LORA_SHARE_EXPERT_ADAPTERS = EnvProperty("RELAX_LORA_SHARE_EXPERT_ADAPTERS", bool, None)
+
+    # ------------- Straggler profiler (relax/utils/straggler) -------------
+    RELAX_STRAGGLER_PROFILER = EnvProperty("RELAX_STRAGGLER_PROFILER", bool, False)
+    RELAX_STRAGGLER_REPORT_INTERVAL = EnvProperty("RELAX_STRAGGLER_REPORT_INTERVAL", int, 10)
+    RELAX_STRAGGLER_Z_THRESHOLD = EnvProperty("RELAX_STRAGGLER_Z_THRESHOLD", float, 3.0)
+    RELAX_STRAGGLER_REL_THRESHOLD = EnvProperty("RELAX_STRAGGLER_REL_THRESHOLD", float, 0.10)
+    RELAX_STRAGGLER_PERSIST_WINDOWS = EnvProperty("RELAX_STRAGGLER_PERSIST_WINDOWS", int, 3)
+    RELAX_STRAGGLER_RECOVER_WINDOWS = EnvProperty("RELAX_STRAGGLER_RECOVER_WINDOWS", int, 2)
+    RELAX_STRAGGLER_GATHER_TIMEOUT_S = EnvProperty("RELAX_STRAGGLER_GATHER_TIMEOUT_S", float, 60.0)
+    # Sampled-step traces: written by the primary rank (default: straggler/ under --timeline-dump-dir,
+    # off without either), newest TRACE_KEEP files kept.
+    RELAX_STRAGGLER_TRACE_DIR = EnvProperty("RELAX_STRAGGLER_TRACE_DIR", str, "")
+    RELAX_STRAGGLER_TRACE_KEEP = EnvProperty("RELAX_STRAGGLER_TRACE_KEEP", int, 50)
+    # Level at start (0 paused, 1 coarse, 2 detail, 3 modules; -1: detail with a trace directory, else
+    # coarse), and how often the primary rank polls the metrics service for a level change.
+    RELAX_STRAGGLER_LEVEL = EnvProperty("RELAX_STRAGGLER_LEVEL", int, -1)
+    RELAX_STRAGGLER_CONTROL_POLL_S = EnvProperty("RELAX_STRAGGLER_CONTROL_POLL_S", float, 5.0)
 
     # ------------- DeepSeek-V4 MXFP4 QAT -------------
     # Used only by relax.models.deepseek_v4.provider.model_provider;
@@ -264,6 +354,7 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Extra Modules -------------
     RELAX_EXTRA_MODULES = EnvProperty("RELAX_EXTRA_MODULES", str, "")
     RELAX_PROPAGATE_ENV_VARS = EnvProperty("RELAX_PROPAGATE_ENV_VARS", str, "")
+    RELAX_SKIP_NONFINITE_GRAD = EnvProperty("RELAX_SKIP_NONFINITE_GRAD", bool, False)
 
     # ------------- Env validation -------------
     RELAX_STRICT_ENV = EnvProperty("RELAX_STRICT_ENV", bool, False)
@@ -444,8 +535,7 @@ def validate_env(extra_env: Optional[Mapping[str, str]] = None) -> None:
 
     1. A *declared* variable whose value cannot be parsed raises. Resolution is
        lazy, so a bad value would otherwise surface at an arbitrary later point
-       — inside a hot loop, or at the import of
-       ``utils/opd/opd_sglang_patch.py`` — rather than at startup. This one is
+       — inside a hot loop or a worker import — rather than at startup. This one is
        fatal because the run will genuinely misbehave: ``RELAX_TGD_PROFILE=ture``
        is not profiling anything.
     2. A variable under :data:`OWNED_ENV_PREFIXES` that no :class:`EnvProperty`

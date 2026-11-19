@@ -4,19 +4,25 @@ import os
 import threading
 import time
 from argparse import Namespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import ray
 import requests
 from ray import serve
-from ray.util.placement_group import placement_group, remove_placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.placement_group import remove_placement_group
 
-from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.distributed.ray.placement_group import InfoActor, sort_key
-from relax.utils import device as device_utils
+from relax.core.node_group_affinity import require_control_plane_resource_on_node, with_control_plane_affinity
+from relax.distributed.ray.placement_group import (
+    _require_node_group_markers,
+    create_placement_group,
+)
+from relax.utils.fault_events.models import RecoveryEvidence
+from relax.utils.fault_events.recovery import observe_recovery
 from relax.utils.logging_utils import get_logger
-from relax.utils.utils import get_ray_accelerator_kwargs, get_serve_url, recovery_load_path
+from relax.utils.utils import get_serve_url, recovery_load_path
+
+
+__all__ = ["Service", "_require_node_group_markers", "create_placement_group"]
 
 
 logger = get_logger(__name__)
@@ -120,6 +126,20 @@ class Service:
             self.config,
             {"runtime_env": self.runtime_env},
         )
+        data_node_ip = os.environ.get("RELAX_SFT_DATA_NODE_IP", "").strip()
+        if self.role == "sft" and data_node_ip:
+            resource = f"node:{data_node_ip}"
+            node = next(
+                (node for node in ray.nodes() if node.get("Alive") and node.get("NodeManagerAddress") == data_node_ip),
+                None,
+            )
+            if node is None or node.get("Resources", {}).get(resource, 0) < 0.001:
+                raise ValueError(f"SFT data node is not available: {data_node_ip}")
+            require_control_plane_resource_on_node(self.config, node["NodeID"])
+            ray_actor_options["resources"] = {
+                **ray_actor_options.get("resources", {}),
+                resource: 0.001,
+            }
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
@@ -232,16 +252,23 @@ class Service:
         """
         await self.handle.train.remote(step, clear_data=clear_data)
 
-    async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False):
+    async def update_weights_fully_async(
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        recovery_token: dict | None = None,
+    ):
         """Trigger a fully asynchronous weight update for Actor service."""
-        return self.handle.update_weights_fully_async.remote(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        return await self.handle.update_weights_fully_async.remote(
+            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, recovery_token=recovery_token
+        )
 
-    async def recv_weight_fully_async(self):
+    async def recv_weight_fully_async(self, recovery_token: dict | None = None):
         """Trigger a fully asynchronous weight receive for Actor FWD
         service."""
-        return self.handle.recv_weight_fully_async.remote()
+        return await self.handle.recv_weight_fully_async.remote(recovery_token=recovery_token)
 
-    def restart(self) -> None:
+    def restart(self, fault_observer: Callable[..., None] | None = None) -> None:
         """Restart this service in-place: reuse placement groups and dynamic
         state.
 
@@ -279,6 +306,7 @@ class Service:
 
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
         self._deploy(pgs)
+        observe_recovery(fault_observer, observed=RecoveryEvidence.DEPLOYED)
         logger.info(f"[{self.role}] Service redeployed successfully")
 
         current_step = 0
@@ -292,11 +320,15 @@ class Service:
         try:
             self._http_call(self.role, "/set_step", method="POST", params={"step": current_step})
             logger.info(f"[{self.role}] Restored step to {current_step}")
+            observe_recovery(fault_observer, observed=RecoveryEvidence.STEP_RESTORED)
         except Exception as e:
+            observe_recovery(fault_observer, failed=RecoveryEvidence.STEP_RESTORED)
             logger.warning(f"[{self.role}] Failed to restore step: {e}")
 
         self._task_ref = None
         task_ref = self.run()
+        if task_ref is not None:
+            observe_recovery(fault_observer, observed=RecoveryEvidence.TASK_SUBMITTED)
         logger.info(f"[{self.role}] Service task re-launched after restart, task_ref={task_ref}")
 
     def _ensure_placement_group(self) -> Optional[Any]:
@@ -345,77 +377,3 @@ class Service:
         self.pgs = new_pgs
         logger.info(f"[{self.role}] New placement group created")
         return new_pgs
-
-
-def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: float = 2.0) -> None:
-    """Raise if the node-group marker resources remain unavailable."""
-    required = {f"{node_group}_gpu", f"{node_group}_cpu"}
-    last_available: dict = {}
-    for attempt in range(retries):
-        cluster_resources = ray.cluster_resources()
-        last_available = cluster_resources
-        missing = {r for r in required if cluster_resources.get(r, 0) <= 0}
-        if not missing:
-            return
-        if attempt < retries - 1:
-            logger.warning(
-                f"[Affinity] Node-group marker resources {sorted(missing)} not yet present "
-                f"(attempt {attempt + 1}/{retries}); retrying in {retry_delay}s..."
-            )
-            time.sleep(retry_delay)
-
-    missing = sorted(r for r in required if last_available.get(r, 0) <= 0)
-    raise RuntimeError(
-        f"Node-group affinity is enabled (RELAX_INITIAL_NODE_GROUP='{node_group}'), but the "
-        f"required custom marker resources {missing} are not declared anywhere in this cluster. "
-        f"Baseline placement groups would hang forever waiting for them. This usually means the "
-        f"cluster has no '{node_group}' worker-group declaring '{node_group}_gpu'/'{node_group}_cpu' "
-        f"custom resources. Please check your cluster environment; if this cluster intentionally has "
-        f"no such marker resources, disable affinity by passing --no-enable-affinity."
-    )
-
-
-def create_placement_group(num_gpus, node_group_affinity=True):
-    """Create a packed GPU placement group with optional node-group
-    affinity."""
-    accel_resource = device_utils.get_ray_accelerator_name()
-    base_bundle = {accel_resource: 1, "CPU": 1}
-    node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
-    if node_group_affinity and node_group:
-        _require_node_group_markers(node_group)
-        base_bundle = {**base_bundle, f"{node_group}_gpu": 1, f"{node_group}_cpu": 1}
-    bundles = [dict(base_bundle) for _ in range(num_gpus)]
-    pg = placement_group(bundles, strategy="PACK")
-    num_bundles = len(bundles)
-    ray.get(pg.ready())
-    # use info actor to get the GPU id
-    info_actors = []
-    accelerator_kwargs = get_ray_accelerator_kwargs(1)
-    for i in range(num_bundles):
-        info_actors.append(
-            InfoActor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-                **accelerator_kwargs,
-            ).remote()
-        )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
-
-    bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
-    pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
-    # Map from logical index -> physical GPU ID
-    pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
-
-    for i in range(num_bundles):
-        actual_bundle_index = pg_reordered_bundle_indices[i]
-        logger.info(
-            f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, "
-            f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
-        )
-
-    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids

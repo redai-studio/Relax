@@ -7,8 +7,7 @@ description: Upgrade the sglang version used by Relax's training Docker image. U
 
 把 Relax 训练镜像依赖的 sglang 升级到新版本。最大的工作量永远是 **rebase `docker/patch/latest/sglang.patch`**;核心方法是 **以 THUDM/slime 已 rebase 好的同版本 patch 为骨架,只 port Relax 真正私有且未被上游吸收的改动**。
 
-升级时建议维护一份 `docs/draft/sglang-<ver>-upgrade-plan.md` 决策日志(见第 8 节),
-记录本次保留/丢弃的私有改动与验证清单,可作为下次升级的模板。
+升级时建议维护一份 `docs/draft/sglang-<ver>-upgrade-plan.md` 决策日志(见第 8 节),记录本次保留/丢弃的私有改动与验证清单,可作为下次升级的模板。
 
 ## 0. 先搞清楚版本是怎么定的(关键前提)
 
@@ -46,8 +45,7 @@ git diff <slime_old> <slime_new> -- docker/Dockerfile
 git show <slime_new>:docker/patch/<NEW_TAG>/sglang.patch > /tmp/slime_skeleton.patch
 ```
 
-判断 Relax 当前 patch 最接近哪个 slime 版本(差异最小的即 fork 起点),用
-`scripts/classify_patch.sh` 对比(见第 4 节)。
+判断 Relax 当前 patch 最接近哪个 slime 版本(差异最小的即 fork 起点),用 `scripts/classify_patch.sh` 对比(见第 4 节)。
 
 ## 3. 准备目标源码树(让 patch 可验证,别盲改)
 
@@ -119,7 +117,7 @@ cp /tmp/relax_new.patch /root/data/Relax/docker/patch/latest/sglang.patch
 - `torch_memory_saver`:跟进 slime 的 `TMS_CUDA_MAJOR` **自动探测**写法 `$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')`;commit 取 redai-studio fork 的 HEAD(先确认比 slime 用的新,别降级)。
 - `docker/Dockerfile.npu` 的 `git clone -b <tag>` 同步。
 
-`requirements.txt`(属 CLAUDE.md "Ask First",改前确认):
+`requirements.txt`(属 AGENTS.md "Ask First",改前确认):
 - `transformers`:**不固定版本**(与 slime 一致),由基线镜像提供;否则 `pip install -r` 会把镜像自带的版本降级造成冲突。
 - 复核 `sglang-router`、`huggingface_hub` 与新版兼容。
 - `pip install --ignore-installed PyJWT`:slime 加的防御行(规避 distutils 装的 PyJWT 无法卸载报错)。**先不加,构建真撞到再补**。

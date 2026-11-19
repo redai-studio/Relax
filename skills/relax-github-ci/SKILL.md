@@ -16,11 +16,15 @@ gh pr checks <PR> --repo redai-studio/Relax --required
 
 Read `.github/ci/config.json` for workflow/job targets. Match runs to the PR, head SHA, workflow and head repository; an old run can have a recent update time after a rerun. Inspect logs for failed required or specifically requested checks.
 
-Use exact target keys: a workflow name such as `ci`, or `workflow/job` such as `ci/pre-commit` or `integration/gpu-async`. `ci` selects the pre-commit/CPU workflow; `all` selects every configured workflow. Job targets have no unqualified aliases.
+Use exact target keys: a workflow name such as `ci`, or `workflow/job` such as `ci/pre-commit` or `integration/gpu-async`. `ci` selects the pre-commit workflow; `all` selects every configured workflow. Job targets have no unqualified aliases.
 
 For the selected workflow on the current head, prefer an active run, then a non-cancelled run; use a cancelled run only when none survive. Within each group, choose the highest run number. Concurrency can cancel a higher-numbered duplicate while a lower-numbered run continues. For fork runs with an empty `pull_requests` array, match both head branch and head repository. Deployment workflows are outside the configured CI targets.
 
 ## Choose the operation
+
+Read failed logs before deciding whether a retry can help. A deterministic code or configuration error needs a fix; evidence of an infrastructure failure or a flaky test can justify a retry. Prefer failed-job or specific-job reruns over restarting unrelated successful work.
+
+Track retries of the same failure on the same PR head. If more than three reruns still fail, stop retrying, collect the head SHA, affected workflow/job, attempt URLs and representative logs, and report the issue to SigureMo for maintainer investigation; send a message only within the user's authorization. Reclassify the failure after a code change rather than treating the old retries as validation of the new head.
 
 Prefer `gh run` or the REST API when the authenticated credential has Actions write access. See [rerun operations](references/rerun.md) for retrying failed jobs, workflows or individual jobs. To cancel a workflow, use `gh run cancel <RUN_ID> --repo redai-studio/Relax` or `POST repos/redai-studio/Relax/actions/runs/<RUN_ID>/cancel`.
 
@@ -30,7 +34,7 @@ For an explicitly requested exemption, read [bypass and CI maintenance](referenc
 
 ## PR comment interface
 
-Use comment commands when direct Actions access is unavailable and the actor is eligible. Rerun/cancel comments are available to the PR author and users with repository write/maintain/admin permission. The command action silently ignores `/rerun`, `/cancel`, and `/help` comments whose GitHub `user.type` is `Bot`, without replying. Put a command on the first line of a new PR comment; later lines are ordinary comment text.
+Use comment commands when direct Actions access is unavailable and the actor is eligible. Rerun/cancel comments are available to the PR author and users with repository write/maintain/admin permission. The command action silently ignores `/rerun`, `/cancel`, `/help`, and `/cherry-pick` comments whose GitHub `user.type` is `Bot`, without replying. Put a command on the first line of a new PR comment; later lines are ordinary comment text.
 
 | Command | Scope |
 | --- | --- |
@@ -39,7 +43,10 @@ Use comment commands when direct Actions access is unavailable and the actor is 
 | `/rerun all` | All completed workflows from the configured targets |
 | `/cancel <workflow>` or `/cancel all` | Whole active workflows, including their matrix jobs |
 | `/help` | Contributor commands and targets |
+| `/cherry-pick <branch>` | Request a cherry-pick of a PR already merged into `main`, using the existing label-driven bot |
 | `/review` | Nyanpasu review request |
+
+`/cherry-pick` is available to contributors who can comment on the source PR; it does not require repository write access or PR authorship. Its single argument must be an existing short branch name other than `main`, using letters, digits, `.`, `_`, `-`, and `/`, starting with a letter or digit and fitting a 50-character `cherry-pick: <branch>` label. Invalid ref components and shell/glob syntax are rejected. The corresponding repository label must already exist with exactly the requested capitalization. The command assigns it with `CHERRY_PICK_BOT_TOKEN`, because `GITHUB_TOKEN` label writes do not start another workflow; it does not create branches or repository labels. The reply confirms only the request, not the resulting cherry-pick PR. This path becomes available after the command action and bot workflow are merged into the default branch.
 
 Targets with a `job` field support rerun only. Use a prepared body file with `gh pr comment <PR> --repo redai-studio/Relax --body-file <FILE>` and retain the returned URL. Editing a comment does not execute rerun/cancel/help again. The command action records source comment IDs to prevent duplicate execution.
 

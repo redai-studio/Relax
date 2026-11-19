@@ -2,13 +2,20 @@
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 import aiohttp
 import numpy as np
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
+from relax.utils.opd.opd_multimodal import (
+    encode_image_inputs,
+    get_image_token_id,
+    image_inputs,
+    validate_image_input_ids,
+)
 from relax.utils.types import Sample
 
 
@@ -83,6 +90,10 @@ def is_opd_enabled(args, evaluation: bool = False) -> bool:
     return not evaluation and getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
 
 
+def is_teacher_routing_enabled(args, evaluation: bool = False) -> bool:
+    return is_opd_enabled(args, evaluation=evaluation) and bool(getattr(args, "opd_teacher_routes_map", None))
+
+
 def _create_teacher_client_session(args) -> aiohttp.ClientSession:
     connector_limit = int(getattr(args, "opd_teacher_connector_limit", 256))
     connector = aiohttp.TCPConnector(limit=connector_limit)
@@ -93,7 +104,7 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
 # --- Teacher URL selection: MOPD routing (by data_source) x replica round-robin ---
 # Two layers:
 #   1. Routing (MOPD): when ``args.opd_teacher_routes_map`` is set, pick the
-#      teacher for this sample by ``sample.metadata[args.opd_teacher_key]``.
+#      teacher bound before generation in ``sample.metadata["teacher_id"]``.
 #      Each route value is a LIST of that teacher's replica URLs.
 #   2. Replica round-robin: spread requests across a teacher's replicas with a
 #      per-teacher in-process counter (single-threaded asyncio makes ``+= 1`` safe).
@@ -115,11 +126,11 @@ def _round_robin(urls: list[str], key: str) -> str:
     return urls[i % len(urls)]
 
 
-def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
+def _pick_replica(replicas: list[str], sample: Sample, rr_key: str) -> str:
     """Load-balance across ONE teacher's replicas at GRPO-group granularity.
 
     ``rr_key`` already identifies the teacher — the caller resolved
-    ``data_source`` to a replica list first — so this only decides which copy of
+    the replica list first — so this only decides which copy of
     that same model serves the request. Text/VL teacher routing is unaffected.
 
     The ``n_samples_per_prompt`` samples of a prompt share ``group_index``
@@ -137,7 +148,7 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     """
     if len(replicas) == 1:
         return replicas[0]
-    group_index = getattr(sample, "group_index", None) if sample is not None else None
+    group_index = sample.group_index
     if group_index is None:
         return _round_robin(replicas, rr_key)
     key = (rr_key, int(group_index))
@@ -151,26 +162,19 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     return replicas[idx % len(replicas)]
 
 
-def _pick_teacher_url(args, sample=None) -> str:
+def bind_teacher(args, sample: Sample) -> None:
+    field = args.opd_teacher_key
+    teacher_id = sample.metadata[field]
+    if not args.opd_teacher_routes_map.get(teacher_id):
+        raise KeyError(f"MOPD routing: no teacher route for {field}={teacher_id!r}.")
+    sample.metadata["teacher_id"] = teacher_id
+
+
+def _pick_teacher_url(args, sample: Sample) -> str:
     routes_map = getattr(args, "opd_teacher_routes_map", None)
-    if routes_map and sample is not None:
-        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
-        metadata = getattr(sample, "metadata", None) or {}
-        routing_value = metadata.get(key_field)
-        if routing_value is None:
-            raise ValueError(
-                f"MOPD routing: sample missing key '{key_field}' in metadata. "
-                f"Available metadata keys: {list(metadata.keys())}. "
-                f"Ensure the dataset has a '{key_field}' column and it is surfaced "
-                "via --metadata-key or the data pipeline."
-            )
-        replicas = routes_map.get(routing_value)
-        if not replicas:
-            raise KeyError(
-                f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
-                f"Available routes: {list(routes_map.keys())}."
-            )
-        return _pick_replica(replicas, sample, routing_value)
+    if routes_map:
+        teacher_id = sample.metadata["teacher_id"]
+        return _pick_replica(routes_map[teacher_id], sample, teacher_id)
     # Single-teacher path: round-robin over replicas if configured.
     urls = getattr(args, "opd_teacher_urls", None)
     if urls and len(urls) > 1:
@@ -178,9 +182,43 @@ def _pick_teacher_url(args, sample=None) -> str:
     return args.opd_teacher_url
 
 
+class TeacherResponseStats:
+    """Track each Student response once per rollout window, including those
+    still awaiting Teacher submission."""
+
+    def __init__(self, teacher_ids: Iterable[str]) -> None:
+        self._teacher_ids = tuple(teacher_ids)
+        self._teacher_by_response: dict[int | str, str] = {}
+        self._awaiting_submission: set[int | str] = set()
+
+    def admit(self, key: int | str | None, teacher_id: str) -> None:
+        if key is None:
+            raise ValueError("A response must have an index or session_id before admission.")
+        self._teacher_by_response[key] = teacher_id
+        self._awaiting_submission.add(key)
+
+    def finish(self, key: int | str | None) -> None:
+        self._awaiting_submission.discard(key)
+
+    def new_window(self) -> None:
+        self._teacher_by_response = {key: self._teacher_by_response[key] for key in self._awaiting_submission}
+
+    def metrics(self) -> dict[str, int]:
+        responses = Counter(self._teacher_by_response.values())
+        awaiting = Counter(self._teacher_by_response[key] for key in self._awaiting_submission)
+        metrics = {}
+        for teacher_id in self._teacher_ids:
+            prefix = f"mopd/by_teacher/{teacher_id}"
+            metrics[f"{prefix}/responses"] = responses[teacher_id]
+            metrics[f"{prefix}/awaiting_submission"] = awaiting[teacher_id]
+        return metrics
+
+
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        routes = args.opd_teacher_routes_map
+        self.response_stats = TeacherResponseStats(routes) if routes else None
         self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
         self.teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
         self.teacher_response_prefix_token_ids = tuple(
@@ -250,8 +288,6 @@ class OpdManager:
             payload.update(fields)
 
     def parse_rollout_logprobs(self, meta_info: dict, tokens: list, log_probs: list) -> tuple[list, list]:
-        if self.topk_worker is None:
-            return tokens, log_probs
         val_b64 = meta_info.get("output_token_logprobs_val_b64")
         if val_b64 is None:
             return tokens, log_probs
@@ -271,9 +307,29 @@ class OpdManager:
         return out_tokens, out_log_probs
 
     def after_rollout(self, sample: Sample, output: dict) -> None:
-        if self.topk_worker is None:
+        native = bool(image_inputs(sample.multimodal_inputs) or image_inputs(sample.teacher_multimodal_inputs))
+        response_ids = output.get("output_ids")
+        if native:
+            if response_ids is None:
+                raise ValueError("Native image OPD requires output_ids from student rollout.")
+            n_new = len(response_ids)
+            if n_new and (
+                sample.tokens[-n_new:] != response_ids
+                or sample.rollout_tokens[-n_new:] != response_ids
+                or len(sample.rollout_log_probs or []) != sample.response_length
+                or not np.isfinite(sample.rollout_log_probs[-n_new:]).all()
+            ):
+                raise ValueError("Native image OPD student rollout IDs/logprobs do not match the sampled response.")
+            if not n_new:
+                return
+        if self.topk_worker is None or not self.topk_worker.spec.student_self_topk:
             return
-        pair = opd_main_worker.LogprobResponse(output).self_topk("rollout", self.topk_worker.top_k)
+        response = opd_main_worker.LogprobResponse(output)
+        pair = (
+            response.strict_topk("output_top_logprobs", len(response_ids), self.topk_worker.top_k)
+            if native
+            else response.self_topk("rollout", self.topk_worker.top_k)
+        )
         if pair is None:
             return
         token_ids, log_probs = pair
@@ -295,8 +351,8 @@ class OpdManager:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
         async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, fetch_results)
+            successes = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
+            self._raise_if_all_failed(sample_list, successes)
 
             if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
                 await asyncio.gather(
@@ -312,6 +368,7 @@ class OpdManager:
         payload: dict,
         sample: Sample,
         err_tag: str,
+        expected_input_ids: list[int] | None = None,
     ) -> opd_main_worker.LogprobResponse | None:
         try:
             async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
@@ -327,41 +384,85 @@ class OpdManager:
                 getattr(sample, "index", None),
                 f"{type(exc).__name__}: {str(exc)[:256]}",
             )
+            if expected_input_ids is not None:
+                raise RuntimeError(f"Native image OPD {err_tag} failed for sample_index={sample.index}") from exc
             return None
 
-        return opd_main_worker.LogprobResponse(data)
+        response = opd_main_worker.LogprobResponse(data)
+        if expected_input_ids is not None:
+            response.validate_native_prefill(expected_input_ids, int(sample.response_length))
+        return response
+
+    def _validate_image_request(
+        self, input_ids: list[int], expanded_ids: list[int], response_length: int, images: list
+    ) -> None:
+        if not images:
+            return
+        from relax.engine.rollout.sglang_rollout import GenerateState
+
+        state = GenerateState(self.args)
+        validate_image_input_ids(
+            input_ids,
+            expanded_ids,
+            response_length,
+            len(images),
+            get_image_token_id(state.processor, state.tokenizer),
+        )
+
+    def _validate_query_ids(self, ids: np.ndarray | None, response_length: int) -> None:
+        if ids is None or ids.shape != (response_length, self.topk_worker.top_k) or np.any(ids < 0):
+            raise ValueError("Native image OPD requires complete R x K query IDs before cross-topk prefill.")
 
     async def _teacher_prefill(self, sample: Sample, session: aiohttp.ClientSession) -> bool:
-        from relax.utils.opd.opd_utils import build_teacher_preexpanded_image_data
+        if self.response_stats is not None:
+            self.response_stats.finish(sample.response_key)
 
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
             return True
 
-        # OPSD: expanded teacher_tokens + image_data；
+        teacher_mm = sample.teacher_multimodal_inputs
+        if teacher_mm is None:
+            teacher_mm = sample.multimodal_inputs
+        images = image_inputs(teacher_mm)
+        native = bool(images or image_inputs(sample.multimodal_inputs))
+        expanded_ids = list(sample.teacher_tokens if sample.teacher_tokens is not None else sample.tokens)
         if self.opsd_worker is not None:
-            image_data = await build_teacher_preexpanded_image_data(sample)
             teacher_input_ids = self.opsd_worker.teacher_input_ids(sample, response_length)
             prompt_length = self.opsd_worker.teacher_prompt_len(sample, response_length)
         else:
-            image_data = None
             prompt_length = len(sample.tokens) - response_length
+            collapsed_ids = sample.rollout_tokens or ([] if images else sample.tokens)
             teacher_input_ids = _replace_response_eos_for_teacher(
-                sample.rollout_tokens or sample.tokens,
-                prompt_length=prompt_length,
+                collapsed_ids,
+                prompt_length=len(collapsed_ids) - response_length,
                 response_length=response_length,
                 student_eos_token_id=self.student_eos_token_id,
                 teacher_eos_token_id=self.teacher_eos_token_id,
             )
-            teacher_input_ids, prompt_length = _insert_teacher_response_prefix(
+            if native and teacher_input_ids[-response_length:] != sample.tokens[-response_length:]:
+                raise ValueError(
+                    "Native image OPD requires identical response token IDs; EOS remapping is unsupported."
+                )
+            teacher_input_ids, _ = _insert_teacher_response_prefix(
                 teacher_input_ids,
+                prompt_length=len(teacher_input_ids) - response_length,
+                prefix_token_ids=self.teacher_response_prefix_token_ids,
+            )
+            expanded_ids, prompt_length = _insert_teacher_response_prefix(
+                expanded_ids,
                 prompt_length=prompt_length,
                 prefix_token_ids=self.teacher_response_prefix_token_ids,
             )
+        if native and (prompt_length <= 0 or prompt_length != len(expanded_ids) - response_length):
+            raise ValueError("Native image OPD requires a nonempty, correctly measured expanded teacher prompt.")
+        self._validate_image_request(teacher_input_ids, expanded_ids, response_length, images)
         logprob_start_len = max(prompt_length - 1, 0)
 
-        mm_fields = {"image_data": image_data} if image_data is not None else None
+        mm_fields = await encode_image_inputs(teacher_mm)
         if self.topk_worker is not None:
+            if native and self.topk_worker.spec.teacher_at_student:
+                self._validate_query_ids(sample.student_topk_token_ids, response_length)
             payload = self.topk_worker.build_teacher_payload(
                 input_ids=teacher_input_ids,
                 logprob_start_len=logprob_start_len,
@@ -373,9 +474,13 @@ class OpdManager:
             payload = opd_main_worker.build_prefill_payload_base(teacher_input_ids, logprob_start_len)
             if mm_fields:
                 payload.update(mm_fields)
+        if native:
+            payload["return_prompt_token_ids"] = True
 
         teacher_url = _pick_teacher_url(self.args, sample)
-        resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
+        resp_obj = await self._post_logprob(
+            session, teacher_url, payload, sample, "teacher prefill", expanded_ids if native else None
+        )
         if resp_obj is None:
             return False
 
@@ -396,18 +501,31 @@ class OpdManager:
             )
             return False
 
+        fields = {}
         if self.sampled_worker is not None:
-            sample.teacher_log_probs = [float(v) for v in token_logprobs[1 : 1 + response_length]]
-
+            fields["teacher_log_probs"] = [float(v) for v in token_logprobs[1 : 1 + response_length]]
         if self.topk_worker is not None:
             if self.topk_worker.spec.teacher_self_topk:
-                pair = self.topk_worker.parse_prefill_self_topk(resp_obj, response_length)
-                sample.teacher_topk_token_ids = pair[0] if pair else None
-                sample.teacher_topk_log_probs = pair[1] if pair else None
-            if self.topk_worker.spec.teacher_at_student:
-                sample.teacher_at_student_topk_log_probs = self.topk_worker.parse_prefill_other_topk(
-                    resp_obj, response_length
+                pair = (
+                    resp_obj.strict_topk("input_top_logprobs", response_length, self.topk_worker.top_k)
+                    if native
+                    else self.topk_worker.parse_prefill_self_topk(resp_obj, response_length)
                 )
+                fields["teacher_topk_token_ids"] = pair[0] if pair else None
+                fields["teacher_topk_log_probs"] = pair[1] if pair else None
+            if self.topk_worker.spec.teacher_at_student:
+                fields["teacher_at_student_topk_log_probs"] = (
+                    resp_obj.strict_topk(
+                        "input_token_ids_logprobs",
+                        response_length,
+                        self.topk_worker.top_k,
+                        sample.student_topk_token_ids,
+                    )[1]
+                    if native
+                    else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
+                )
+        for name, value in fields.items():
+            setattr(sample, name, value)
 
         return True
 
@@ -415,23 +533,21 @@ class OpdManager:
         self, sample: Sample, session: aiohttp.ClientSession, encode_mm_fn: EncodeMultimodalInputs | None
     ) -> None:
 
-        from relax.utils.opd.opd_utils import build_student_preexpanded_image_data
-
         response_length = int(sample.response_length or 0)
+        if response_length <= 0:
+            return
         teacher_topk_ids = sample.teacher_topk_token_ids
 
         prompt_length = len(sample.tokens) - response_length
         logprob_start_len = max(prompt_length - 1, 0)
 
-        preexpanded_image_data = await build_student_preexpanded_image_data(sample)
-        if preexpanded_image_data is not None:
-            student_input_ids = sample.tokens
-            mm_fields = {"image_data": preexpanded_image_data}
-        else:
-            student_input_ids = sample.rollout_tokens or sample.tokens
-            mm_fields = None
-            if encode_mm_fn is not None and sample.multimodal_inputs and sample.multimodal_inputs.get("images"):
-                mm_fields, _ = await encode_mm_fn(sample.multimodal_inputs)
+        images = image_inputs(sample.multimodal_inputs)
+        native = bool(images or image_inputs(sample.teacher_multimodal_inputs))
+        student_input_ids = sample.rollout_tokens or ([] if images else sample.tokens)
+        self._validate_image_request(student_input_ids, sample.tokens, response_length, images)
+        mm_fields = await encode_image_inputs(sample.multimodal_inputs)
+        if native:
+            self._validate_query_ids(teacher_topk_ids, response_length)
 
         payload = self.topk_worker.build_student_payload(
             input_ids=student_input_ids,
@@ -440,12 +556,22 @@ class OpdManager:
             response_length=response_length,
             mm_fields=mm_fields,
         )
+        if native:
+            payload["return_prompt_token_ids"] = True
 
         student_url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
-        resp_obj = await self._post_logprob(session, student_url, payload, sample, "student-at-teacher-topk")
+        resp_obj = await self._post_logprob(
+            session, student_url, payload, sample, "student-at-teacher-topk", sample.tokens if native else None
+        )
         if resp_obj is None:
             return
-        sample.student_at_teacher_topk_log_probs = self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
+        sample.student_at_teacher_topk_log_probs = (
+            resp_obj.strict_topk(
+                "input_token_ids_logprobs", response_length, self.topk_worker.top_k, teacher_topk_ids
+            )[1]
+            if native
+            else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
+        )
 
     def _assemble_transfer(self, samples: list[Sample]) -> None:
         if self.topk_worker is None:

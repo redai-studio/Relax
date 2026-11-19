@@ -31,8 +31,6 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
    --ref-load ${MODEL_DIR}/Qwen3.5-9B
-   # --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct
-   # --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct
    --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save-interval 100
@@ -66,11 +64,9 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 3
-   # --decoder-last-pipeline-num-layers
-   --decoder-first-pipeline-num-layers 8
+   --pipeline-model-parallel-size 1
 
    --context-parallel-size 1
 
@@ -130,7 +126,7 @@ MISC_ARGS=(
 )
 
 RAY_RESOURCE_ARGS=(
-   --resource '{"actor": [1, 6], "rollout": [1, 2], "advantages": [1, 0]}'
+   --resource '{"actor":[1, 4],"rollout":[1, 4],"advantages":[1, 0]}'
    --max-staleness 2
    --num-data-storage-units 1
    --num-iters-per-train-update 16

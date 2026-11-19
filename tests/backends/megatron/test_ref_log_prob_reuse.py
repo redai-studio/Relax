@@ -26,9 +26,12 @@ def actor_harness():
         "_switch_model",
         "_can_reuse_actor_ref_log_probs",
         "_update_actor_weight_backups",
+        "_backup_actor_weights_after_train",
         "load_other_checkpoint",
     }
     methods = [node for node in actor_class.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    for node in methods:
+        node.decorator_list = []
     timer = SimpleNamespace(add=Mock())
     namespace = {
         "torch": torch,
@@ -36,6 +39,11 @@ def actor_harness():
         "inverse_timer": lambda *args: nullcontext(),
         "Timer": lambda: timer,
         "is_offline_mode": lambda args: args.offline,
+        "is_sft_mode": lambda args: False,
+        "can_reuse_colocate_log_probs": lambda *args, **kwargs: False,
+        "clear_train_vision_cache": lambda *args, **kwargs: None,
+        "_has_image_inputs": lambda inputs: False,
+        "should_save_checkpoint": lambda args, step: False,
         "is_preference_mode": lambda args: False,
         "is_lora_enabled": lambda args: args.lora,
         "algorithm_needs_critic": lambda args: False,
@@ -107,6 +115,9 @@ def actor_harness():
     instance.opt_param_scheduler = None
     instance._active_model_tag = "actor"
     instance._ref_actor_weights_synced = False
+    instance._resident_sft_params_pending = False
+    instance._resident_sft_overlap_enabled = lambda: False
+    instance._flush_resident_sft_parameters = Mock()
     instance._is_standard_dpo = lambda: False
     instance._per_step_rollout = False
     instance._run_step_evaluation = Mock()
@@ -116,7 +127,7 @@ def actor_harness():
     instance.flops_counter = None
     snapshots = {}
 
-    def backup(tag):
+    def backup(tag, *, on_device=False):
         snapshots[tag] = instance.model.weight.detach().clone()
 
     def restore(tag):

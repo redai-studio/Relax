@@ -24,8 +24,10 @@ from tqdm import tqdm
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
+from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -47,8 +49,21 @@ from relax.utils.http_utils import (
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
+from relax.utils.opd.opd_multimodal import (
+    get_image_token_id,
+    image_inputs,
+    validate_image_input_ids,
+    validate_prompt_token_ids,
+)
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import (
+    append_score_centering_candidates,
+    configure_score_centering_request,
+    parse_score_centering_response,
+    resolve_score_centering_vocab_size,
+    score_centering_enabled,
+)
 from relax.utils.timer import Timer
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
@@ -89,6 +104,8 @@ class GenerateState(metaclass=SingletonMeta):
         prepare_model_maybe_update_args(args, completeness="metadata")
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+        if score_centering_enabled(args):
+            resolve_score_centering_vocab_size(args)
 
         # OPD manager (singleton — one OpdManager per GenerateState)
         self.opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
@@ -96,13 +113,13 @@ class GenerateState(metaclass=SingletonMeta):
         # Media-encoding thread pool for this rollout worker process, sized by
         # --encode-max-workers (falls back to $RELAX_ENCODE_MAX_WORKERS, then an
         # affinity-aware default). Held on state so consumers use it explicitly.
-        self.encode_executor = configure_encode_executor(getattr(args, "encode_max_workers", None))
+        self.encode_executor = configure_encode_executor(args.encode_max_workers)
 
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
         self.processor_pool = None
         if self.processor is not None:
-            pool_size = getattr(args, "mm_processor_pool_size", 0)
+            pool_size = args.mm_processor_pool_size
             if pool_size > 0:
                 try:
                     self.processor_pool = ProcessorPool(
@@ -131,7 +148,7 @@ class GenerateState(metaclass=SingletonMeta):
             spaces_between_special_tokens=False,
         )
 
-        if getattr(args, "sglang_enable_deterministic_inference", False):
+        if args.sglang_enable_deterministic_inference:
             sampling_seed_base = args.rollout_seed
             self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
 
@@ -139,6 +156,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_counts = [0] * (args.sglang_dp_size or 1)
         self.dp_rank = 0
 
+        self.partial_genrm = PartialGenRM.from_args(args, self)
         self.reset()
 
     @contextmanager
@@ -182,6 +200,8 @@ class GenerateState(metaclass=SingletonMeta):
         )  # tasks that should not be aborted (abort_count >= partial_rollout_max_aborted_count)
         self.aborted = False
         self.abort_event = asyncio.Event()
+        if self.partial_genrm is not None:
+            self.partial_genrm.reset_step()
         self.evaluating = getattr(self, "evaluating", 0)  # preserve eval state across resets
         # Pre-fetched data ObjectRef for cross-step overlap.
         # Persisted across reset() calls so the ref submitted at the end of
@@ -222,6 +242,9 @@ async def _run_image_processor(
     elapsed_seconds)."""
     t_start = monotonic()
     loop = asyncio.get_running_loop()
+    # The shared media may already hold the OPD transport cache. It is not an
+    # HF processor input and must not cross the processor worker boundary.
+    multimodal_inputs = {key: value for key, value in multimodal_inputs.items() if key != "_opd_image_b64_cache"}
 
     if state.processor_pool is not None:
         mm_inputs_ipc = prepare_mm_inputs_for_ipc(multimodal_inputs)
@@ -366,6 +389,7 @@ async def generate(
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
+    opd_enabled = opd.is_opd_enabled(args, evaluation=evaluation)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, (
@@ -381,6 +405,16 @@ async def generate(
     _has_media = sample.multimodal_inputs is not None and any(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
+    native_image_opd = opd_enabled and _has_media
+    if native_image_opd:
+        image_inputs(sample.multimodal_inputs)
+    if (
+        opd_enabled
+        and args.use_slime_router
+        and "RadixTreeMiddleware" in args.slime_router_middleware_paths
+        and (_has_media or image_inputs(sample.teacher_multimodal_inputs))
+    ):
+        raise ValueError("Native image OPD requires token-preserving routing; RadixTreeMiddleware uses text lookup.")
     from relax.utils.data.kimi_k3 import encode_kimi_k3_rollout_prompt, is_kimi_k3_tokenizer
 
     if is_kimi_k3_tokenizer(state.tokenizer):
@@ -414,15 +448,16 @@ async def generate(
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
-    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+    if args.use_rollout_indexer_replay and not evaluation:
         payload["return_indexer_topk"] = True
 
-    if state.opd_manager and not evaluation:
+    if opd_enabled:
         state.opd_manager.before_rollout(payload)
+    sc_sampling_mode = configure_score_centering_request(args, payload) if not evaluation else None
     # LoRA adapter mode: route generation through the trained adapter registered on the engine
     # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
     # base model only and rollouts would not reflect the trained policy.
-    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+    if args.lora_rank > 0 and args.lora_adapter_mode:
         from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
 
         payload["lora_path"] = LORA_ADAPTER_NAME
@@ -452,12 +487,22 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
+    if native_image_opd:
+        validate_image_input_ids(
+            payload["input_ids"],
+            sample.tokens,
+            sample.response_length,
+            len(image_inputs(sample.multimodal_inputs)),
+            get_image_token_id(state.processor, state.tokenizer),
+        )
+        payload["return_prompt_token_ids"] = True
+
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
     if args.sglang_router_policy == "consistent_hashing" and sample.session_id:
         headers = {"X-SMG-Routing-Key": sample.session_id}
-    elif getattr(args, "slime_router_sticky", False) and sample.group_index is not None:
+    elif args.slime_router_sticky and sample.group_index is not None:
         # Pin all samples of one prompt group to the same engine so the shared prompt
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
@@ -466,11 +511,44 @@ async def generate(
     output = await _post_generation(args, state, url, payload, headers, evaluation)
     _t_generate = monotonic() - _t_generate_start
 
+    # Interrupted requests may have incomplete replay/logprob metadata. Handle
+    # them like pre-dispatch 499s before mutating the cached sample prefix.
+    if (
+        not evaluation
+        and args.use_rollout_routing_replay
+        and output["meta_info"].get("finish_reason", {}).get("type") == "abort"
+    ):
+        raise GenerationAborted
+
+    sc_result = None
+    if sc_sampling_mode is not None:
+        sc_result = parse_score_centering_response(
+            output["meta_info"],
+            args.rollout_top_logprobs_num,
+            sampling_mode=sc_sampling_mode,
+            expected_tokens=output.get("output_ids"),
+            vocab_size=resolve_score_centering_vocab_size(args),
+            return_support_complete=True,
+        )
+    if native_image_opd:
+        validate_prompt_token_ids(output, sample.tokens)
+
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
         from relax.engine.router.middleware.radix_tree_middleware import postprocess_sample_with_radix_tree
 
         sample = await postprocess_sample_with_radix_tree(args, sample, output)
+        if sc_result is not None:
+            sc_tokens, sc_sampled, sc_ids, sc_logprobs, sc_complete = sc_result
+            response_tokens = sample.tokens[-sample.response_length :] if sample.response_length else []
+            if response_tokens != sc_tokens:
+                raise ValueError(
+                    "Score Centering cannot align generation-time candidates with the radix-tree retrieved trajectory"
+                )
+            sample.rollout_log_probs = sc_sampled
+            sample.rollout_topk_token_ids = sc_ids
+            sample.rollout_topk_log_probs = sc_logprobs
+            sample.rollout_topk_support_complete = sc_complete
     else:
         if "output_token_logprobs" in output["meta_info"]:
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -479,10 +557,23 @@ async def generate(
             new_response_tokens = output["output_ids"]
             new_response_log_probs = []
 
-        if state.opd_manager and not evaluation:
+        if opd_enabled:
             new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
                 output["meta_info"], new_response_tokens, new_response_log_probs
             )
+
+        if sc_result is not None:
+            new_response_tokens, new_response_log_probs, *_ = sc_result
+            # Keep an independent copy to detect in-place token sanitization.
+            sc_tokens_before_sanitization = list(new_response_tokens)
+
+        if native_image_opd:
+            media_token_ids = {
+                getattr(state.tokenizer, name, None) for name in ("image_token_id", "audio_token_id", "video_token_id")
+            }
+            media_token_ids.add(get_image_token_id(state.processor, state.tokenizer))
+            if any(token in media_token_ids for token in new_response_tokens):
+                raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
 
         while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
             index = new_response_tokens.index(state.tokenizer.image_token_id)
@@ -523,6 +614,10 @@ async def generate(
                 new_response_tokens = sanitized
 
         # Update sample with tokens directly - avoiding re-tokenization
+        if sc_result is not None and new_response_tokens != sc_tokens_before_sanitization:
+            raise ValueError(
+                "Score Centering requires unchanged generated token IDs to preserve behavior probabilities"
+            )
         sample.tokens = sample.tokens + new_response_tokens
         sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
@@ -536,21 +631,29 @@ async def generate(
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = []
         sample.rollout_log_probs += new_response_log_probs
+        if sc_result is not None:
+            append_score_centering_candidates(sample, *sc_result[2:])
 
-        if state.opd_manager and not evaluation:
+        if opd_enabled:
             state.opd_manager.after_rollout(sample, output)
 
     if "routed_experts" in output["meta_info"]:
-        sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
+        routed_experts = np.frombuffer(
+            pybase64.b64decode(output["meta_info"]["routed_experts"], validate=True),
             dtype=np.int32,
-        ).reshape(
-            len(sample.tokens) - 1,
-            args.num_layers,
-            args.moe_router_topk,
         )
+        expected_shape = (len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
+        if routed_experts.size != expected_shape[0] * expected_shape[1] * expected_shape[2]:
+            meta = output["meta_info"]
+            raise ValueError(
+                f"Routed-expert alignment mismatch: {routed_experts.size=} {expected_shape=}, "
+                f"finish_reason={meta.get('finish_reason')}, prompt_tokens={meta.get('prompt_tokens')}, "
+                f"completion_tokens={meta.get('completion_tokens')}, output_ids={len(output.get('output_ids', []))}, "
+                f"output_logprobs={len(meta.get('output_token_logprobs', []))}"
+            )
+        sample.rollout_routed_experts = routed_experts.reshape(expected_shape)
 
-    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+    if args.use_rollout_indexer_replay and not evaluation:
         setattr(
             sample,
             "rollout_indexer_topk",
@@ -580,22 +683,12 @@ async def _dispatch_generate(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
-    """Resolve the generate function and run it under the correct permit scope.
+    """Run the selected generator with an inference permit.
 
-    Touches only ``state.aborted`` / ``state.dp_rank_context`` / ``state.semaphore``
-    so it can be unit-tested with a lightweight stub state (no GenerateState).
-
-    - Default (built-in ``generate`` or a custom function without the opt-in flag):
-      hold the session-level lock for the whole call, exactly as before.
-    - Opt-in (custom function with ``manages_inference_permit = True``): do NOT
-      hold the session lock; the function acquires a per-request permit per turn
-      via ``state.post_generate``/``state.inference_permit``.
-
-    ``GenerationAborted`` must never escape this function: ``generate_and_rm_group``
-    runs the per-sample tasks through ``asyncio.gather`` *without*
-    ``return_exceptions=True``, and no existing abort path raises -- so a leaked
-    exception would crash the whole rollout step. It is contained here and mapped
-    to an ABORTED sample (mirroring the legacy in-lock abort check).
+    By default, hold a permit until generation returns. Custom generators with
+    manages_inference_permit=True manage permits for individual requests.
+    Return an ABORTED sample on GenerationAborted so callers can handle an
+    unfinished response without failing the group call.
     """
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
@@ -606,12 +699,11 @@ async def _dispatch_generate(
             sample.status = Sample.Status.ABORTED
             return sample
         with state.dp_rank_context() as _:
-            if custom_generate_func is not None:
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                return await custom_generate_func(args, sample, sampling_params)
-            return await generate(args, sample, sampling_params, evaluation=evaluation)
+            if custom_generate_func is None:
+                return await generate(args, sample, sampling_params, evaluation=evaluation)
+            if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+            return await custom_generate_func(args, sample, sampling_params)
 
     try:
         if manages_permit:
@@ -629,7 +721,7 @@ async def _dispatch_generate(
 
 async def generate_and_rm(
     args: Namespace,
-    sample: Sample | list[Sample],
+    sample: Sample,
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
@@ -637,50 +729,58 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
-    # For samples with existing response, check if they're complete
-    if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
+    state = GenerateState(args)
+    partial_genrm = getattr(state, "partial_genrm", None)
+    resume_judge_only = partial_genrm is not None and not evaluation and partial_genrm.restore(sample)
+    if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) and not resume_judge_only:
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
         return sample
 
-    state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled and not args.group_rm:
+        state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
 
-    # Resolve the generate function and run it under the right permit scope
-    # (session-level lock by default; per-request permits for opt-in functions).
-    sample = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
-
-    # for the rm that need the whole group, we will not do the rm here
+    generated = (
+        sample
+        if resume_judge_only
+        else await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    )
+    # Group reward and Teacher scoring run in generate_and_rm_group.
     if args.group_rm:
-        return sample
+        return generated
 
-    # multi samples
-    if isinstance(sample, list):
-        samples = sample
-        if any(sample.status == Sample.Status.ABORTED for sample in samples):
-            return samples
+    results = generated if isinstance(generated, list) else [generated]
+    if any(result.status == Sample.Status.ABORTED for result in results):
+        if teacher_routing_enabled:
+            state.opd_manager.response_stats.finish(sample.response_key)
+        return generated
 
-        # for multi agent system, the reward of some sample is calculated during generation.
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+    # Custom generation may already have assigned rewards to some outputs.
+    if isinstance(generated, list):
+        samples_need_reward = [sample for sample in generated if sample.reward is None]
+        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
+    elif generated.reward is None:
+        reward_kwargs = {"evaluation": evaluation}
+        if partial_genrm is not None and not evaluation:
+            reward_kwargs["genrm_generate"] = partial_genrm.bind(generated)
+        try:
+            generated.reward = await async_rm(args, generated, **reward_kwargs)
+        except PartialGenRMAborted:
+            generated.status = Sample.Status.ABORTED
+            if teacher_routing_enabled:
+                state.opd_manager.response_stats.finish(sample.response_key)
+            return generated
+        if partial_genrm is not None:
+            partial_genrm.clear(generated)
 
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
+    if opd.is_opd_enabled(args, evaluation=evaluation):
+        await state.opd_manager.prefill(generated, _encode_multimodal_inputs)
 
-        return samples
-    else:
-        if sample.status == Sample.Status.ABORTED:
-            return sample
-        # for multi-turn environment, a reward could be assigned to the agent.
-        if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
-
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
-
-    return sample
+    return generated
 
 
 def _collect_timing_from_samples(samples: list[Sample]) -> dict[str, list[float]]:
@@ -739,10 +839,19 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args, evaluation=evaluation)
+    if teacher_routing_enabled:
+        for sample in group:
+            opd.bind_teacher(args, sample)
+
+    if teacher_routing_enabled and args.group_rm:
+        for sample in group:
+            state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
+
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
-        if getattr(args, "sglang_enable_deterministic_inference", False):
+        if args.sglang_enable_deterministic_inference:
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
         tasks.append(
@@ -753,13 +862,20 @@ async def generate_and_rm_group(
 
     # Group rewards require complete trajectories, including during evaluation.
     group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
-    if (not state.aborted or evaluation) and args.group_rm and not group_aborted:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+    if not args.group_rm:
+        return group
+    if (state.aborted and not evaluation) or group_aborted:
+        if teacher_routing_enabled:
+            for sample in group:
+                state.opd_manager.response_stats.finish(sample.response_key)
+        return group
 
-        if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+    rewards = await batched_async_rm(args, group, evaluation=evaluation)
+    for sample, reward in zip(group, rewards, strict=False):
+        sample.reward = reward
+
+    if opd.is_opd_enabled(args, evaluation=evaluation):
+        await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
 
@@ -812,10 +928,15 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     urls = router_worker_base_urls(urls)
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    partial_genrm = getattr(state, "partial_genrm", None)
+    if partial_genrm is not None:
+        abort_tasks.append(asyncio.wait_for(partial_genrm.abort_engines(), timeout=60))
     abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
     for url, result in zip(urls, abort_results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(f"Failed to abort worker at {url}: {result}")
+    if partial_genrm is not None and isinstance(abort_results[-1], BaseException):
+        raise abort_results[-1]
 
     # make sure all the pending tasks are finished
     count = 0
@@ -845,6 +966,18 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    """Generate a rollout and release Judge HTTP resources on every exit."""
+    state = GenerateState(args)
+    try:
+        return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
+    finally:
+        if (partial_genrm := getattr(state, "partial_genrm", None)) is not None:
+            await partial_genrm.aclose()
+
+
+async def _generate_rollout_async(
+    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]], data_system_client: Any
+) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based
     rm rollout generation.
 
@@ -864,6 +997,9 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    teacher_routing_enabled = opd.is_teacher_routing_enabled(args)
+    if teacher_routing_enabled:
+        state.opd_manager.response_stats.new_window()
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -882,7 +1018,7 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
-    strict_fill_current = args.fully_async and getattr(args, "max_staleness", 1) == 0
+    strict_fill_current = args.fully_async and args.max_staleness == 0
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -907,8 +1043,8 @@ async def generate_rollout_async(
     transfer_tasks = []
     batch_to_transfer = []
     aborted_samples = []
-    # Completed groups beyond target_data_size (over-sampling surplus). Carried back to
-    # the buffer for the next step instead of being dropped, so no samples are lost.
+    # Collect completed surplus until this step ends. Plain synchronous mode
+    # discards it before the next weight update; off-policy modes may carry it.
     oversample_surplus = []
     total_transfer_samples = 0
     get_samples_times: list[float] = []
@@ -979,8 +1115,8 @@ async def generate_rollout_async(
 
             # An aborted group (e.g. a weight-sync pre-dispatch 499) is incomplete:
             # recognize it BEFORE the dynamic filter so it is never dropped as
-            # "filtered out" and lost. It is carried to the resume buffer below and
-            # finished under the next weight version. Only completed groups are filtered.
+            # "filtered out". Explicit off-policy modes retain partial groups;
+            # plain synchronous mode replaces them within the current step.
             group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
             if not group_aborted:
                 dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
@@ -989,10 +1125,8 @@ async def generate_rollout_async(
                     state.remaining_batch_size -= 1
                     continue
 
-            # Classify each finished group. Nothing is dropped: aborted groups carry to
-            # the buffer for partial resume; completed groups beyond target_data_size are
-            # over-sampling surplus carried to the buffer (reused next step); completed
-            # groups within target are committed to the transfer queue.
+            # Commit completed groups up to the target. Surplus and aborted
+            # groups may survive this step only in explicit off-policy modes.
             should_commit = (
                 total_transfer_samples < target_data_size
                 if is_final_backfill or strict_fill_current
@@ -1004,17 +1138,17 @@ async def generate_rollout_async(
                         sample.abort_count += 1
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
-                aborted_samples.append(group)
+                if args.fully_async or args.partial_rollout:
+                    aborted_samples.append(group)
                 state.remaining_batch_size -= 1
             elif should_commit:
                 batch_to_transfer.append(group)
                 total_transfer_samples += 1
             else:
-                # Over-sampling surplus: target already met. Keep it for the next step
-                # (added back to the buffer after this step) instead of dropping it.
+                # Apply the mode-specific carry/discard policy after draining tasks.
                 oversample_surplus.append(group)
 
-            if is_final_backfill or strict_fill_current:
+            if not args.fully_async or is_final_backfill or strict_fill_current:
                 append_to_data = should_commit and not group_aborted
             else:
                 append_to_data = len(data) < target_data_size
@@ -1167,7 +1301,7 @@ async def generate_rollout_async(
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
     new_aborted, completed_protected = await abort(args, rollout_id)
-    for group in new_aborted + completed_protected:
+    for group in (new_aborted + completed_protected) if args.fully_async or args.partial_rollout else []:
         # Groups completed during abort have not passed the main-loop filter.
         if (
             args.partial_rollout
@@ -1197,14 +1331,16 @@ async def generate_rollout_async(
     else:
         state.last_step_current_deficit = 0
 
-    # Carry over-sampling surplus back to the buffer (reused next step, committed first
-    # via the completed-group fast path in generate_and_rm_group). Surplus groups are
-    # complete (length == n_samples_per_prompt), satisfying add_samples' assertion.
-    aborted_samples.extend(oversample_surplus)
+    # Plain synchronous updates must generate every batch with the current
+    # weights. Only explicitly off-policy modes may reuse completed surplus.
+    carried_surplus = oversample_surplus if args.fully_async or args.partial_rollout else []
+    aborted_samples.extend(carried_surplus)
     logger.info(
         f"Rollout step {rollout_id} carry-over: committed_current={committed_current} "
         f"next_step_deficit={state.last_step_current_deficit} "
-        f"oversample_surplus={len(oversample_surplus)} aborted={len(aborted_samples) - len(oversample_surplus)}"
+        f"oversample_surplus={len(carried_surplus)} "
+        f"discarded_surplus={len(oversample_surplus) - len(carried_surplus)} "
+        f"aborted={len(aborted_samples) - len(carried_surplus)}"
     )
 
     # When dynamic global batch size is enabled, extract fully-completed groups
@@ -1236,6 +1372,8 @@ async def generate_rollout_async(
 
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()
+    if teacher_routing_enabled:
+        filter_metrics.update(state.opd_manager.response_stats.metrics())
     if CURRENT_ROLLOUT_BATCH:
         save_debug_rollout_data(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
@@ -1342,7 +1480,7 @@ async def eval_rollout_single_dataset(
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 group.append(sample)
             sampling_params = base_sampling_params
-            if getattr(args, "sglang_enable_deterministic_inference", False):
+            if args.sglang_enable_deterministic_inference:
                 sampling_params = base_sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed
             tasks.append(
@@ -1377,7 +1515,7 @@ async def eval_rollout_single_dataset(
                 sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
                 sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
                 sampling_params = base_sampling_params
-                if getattr(args, "sglang_enable_deterministic_inference", False):
+                if args.sglang_enable_deterministic_inference:
                     sampling_params = base_sampling_params.copy()
                     sampling_params["sampling_seed"] = args.rollout_seed + j
                 tasks.append(
@@ -1417,7 +1555,11 @@ async def eval_rollout_single_dataset(
         if (
             0 <= prompt_index < len(dataset.samples)
             and [sample.index for sample in group] == list(expected_indices)
-            and all(sample.reward is not None and sample.status != Sample.Status.ABORTED for sample in group)
+            and all(
+                (sample.reward is not None or is_eval_reward_pending(sample))
+                and sample.status != Sample.Status.ABORTED
+                for sample in group
+            )
         ):
             valid_data.extend(group)
     num_valid_prompts = len(valid_data) // group_size
@@ -1430,7 +1572,10 @@ async def eval_rollout_single_dataset(
     data = valid_data
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [
+                sample.reward if not reward_key or sample.reward is None else sample.reward[reward_key]
+                for sample in data
+            ],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
             "group_size": group_size,
@@ -1467,8 +1612,15 @@ def generate_rollout(
     # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
     # prefetched generation is almost always aborted by the next step's pause_generation and its
     # truncated samples would pollute the next rollout. Other modes keep the optimization.
-    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
-    if not args.fully_async and not _lora_adapter_mode:
+    _lora_adapter_mode = args.lora_rank > 0 and args.lora_adapter_mode
+    # Match Rollout._maybe_save_data: prefetch advances the saved data cursor, but its
+    # ObjectRef is not checkpointed. Leave the next batch unread at save boundaries.
+    _save_data = (
+        args.save is not None
+        and args.save_interval is not None
+        and (args.rotate_ckpt or (rollout_id + 1) % args.save_interval == 0 or rollout_id + 1 == args.num_rollout)
+    )
+    if not args.fully_async and not _lora_adapter_mode and not _save_data:
         state = GenerateState(args)
         state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")

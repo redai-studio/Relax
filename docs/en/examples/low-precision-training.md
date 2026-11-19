@@ -219,7 +219,7 @@ The FP8 recipe additionally needs a TransformerEngine build with FP8 blockwise s
 
 INT4 fake-QAT requires `--no-gradient-accumulation-fusion`: the STE replaces weight tensors, while TE fused weight-gradient accumulation requires attributes on the original tensors. This disables the fused optimization while retaining gradient accumulation. The Qwen3 and Kimi INT4 scripts already include this flag; keep it when adapting them.
 
-#### Build the int4_qat kernel
+#### Build the int4_qat kernel {#build-int4-qat-kernel}
 
 ```bash
 cd relax/backends/megatron/kernels/int4_qat

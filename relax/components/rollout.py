@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -19,8 +18,10 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 _EVAL_ON_EPOCH_BOUNDARY = os.environ.get("RELAX_EVAL_ON_EPOCH_BOUNDARY", "1") == "1"
@@ -340,8 +341,10 @@ class Rollout(Base):
         self.config = config
         self.healthy = healthy
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role="rollout",
+        )
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env
         )
@@ -390,6 +393,11 @@ class Rollout(Base):
                 await self.rollout_manager.load.remote(self.step - 1)
             except Exception as e:
                 self._logger.exception(f"Failed to load global dataset: {e}")
+                if (
+                    isinstance(e, DatasetStateMismatchError)
+                    or (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art"
+                ):
+                    raise
 
         self._run_task = asyncio.ensure_future(self._async_run())
         await self._run_task
@@ -533,6 +541,13 @@ class Rollout(Base):
 
     async def _maybe_save_data(self, local_step) -> None:
         if self.config.save is None or self.config.save_interval is None:
+            return
+
+        if (
+            getattr(self.config, "train_backend", None) == "fsdp"
+            and (getattr(self.config, "sampling_config", None) or {}).get("algorithm") == "art"
+        ):
+            # The ART actor saves this cursor before committing its checkpoint.
             return
 
         is_save_step = (local_step + 1) % self.config.save_interval == 0

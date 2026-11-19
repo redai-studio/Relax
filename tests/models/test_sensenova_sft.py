@@ -25,6 +25,7 @@ from relax.models.sensenova.adapter import flow_matching_loss
     ],
 )
 def test_abs_positions_honors_requested_device(device):
+    pytest.importorskip("torchvision")
     from relax.models.sensenova.processing import build_abs_positions_from_grid_hw
 
     grid = torch.tensor([[2, 2], [1, 3]], device="cpu")
@@ -48,6 +49,7 @@ def test_abs_positions_honors_requested_device(device):
     ],
 )
 def test_fixed_tier_image_keeps_at_least_one_patch(tmp_path, size, budget, expected):
+    pytest.importorskip("torchvision")
     from PIL import Image
 
     from relax.models.sensenova.adapter import SenseNovaSFTAdapter
@@ -60,6 +62,7 @@ def test_fixed_tier_image_keeps_at_least_one_patch(tmp_path, size, budget, expec
 
 
 def test_image_without_fixed_tier_still_rejects_subpatch_size(tmp_path):
+    pytest.importorskip("torchvision")
     from PIL import Image
 
     from relax.models.sensenova.adapter import SenseNovaSFTAdapter
@@ -119,6 +122,7 @@ def test_flow_matching_loss_and_gradient() -> None:
 
 
 def test_full_sft_keeps_conditioning_gradient(monkeypatch) -> None:
+    pytest.importorskip("torchvision")
     from relax.models.sensenova import adapter as sft
 
     prefix_weight = torch.nn.Parameter(torch.tensor(2.0))
@@ -138,6 +142,7 @@ def test_full_sft_keeps_conditioning_gradient(monkeypatch) -> None:
 
 
 def test_sensenova_uses_decoder_layers_as_fsdp_boundaries() -> None:
+    pytest.importorskip("torchvision")
     from relax.backends.fsdp.runtime import resolve_block_classes, resolve_fine_grained_modules
     from relax.models.sensenova.adapter import SenseNovaSFTModel
     from relax.models.sensenova.model import SenseNovaU1DecoderLayer, SenseNovaU1ForCausalLM
@@ -173,6 +178,7 @@ def test_sensenova_uses_decoder_layers_as_fsdp_boundaries() -> None:
 
 
 def test_sensenova_fsdp_wraps_fine_grained_modules_before_decoder(monkeypatch) -> None:
+    pytest.importorskip("torchvision")
     from relax.backends.fsdp.runtime import fsdp2_wrap
     from relax.models.sensenova.adapter import SenseNovaSFTModel
     from relax.models.sensenova.model import SenseNovaU1DecoderLayer
@@ -198,6 +204,7 @@ def test_sensenova_fsdp_wraps_fine_grained_modules_before_decoder(monkeypatch) -
 
 
 def test_prefix_cache_tensors_are_decoder_outputs() -> None:
+    pytest.importorskip("torchvision")
     from relax.models.sensenova.adapter import configure_attention
     from relax.models.sensenova.model import SenseNovaU1Model
 

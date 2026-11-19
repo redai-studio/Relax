@@ -1,0 +1,19 @@
+{
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Hello"
+        },
+        {
+          "type": "input_text",
+          "text": ", world!"
+        }
+      ]
+    }
+  ],
+  "max_output_tokens": 32
+}

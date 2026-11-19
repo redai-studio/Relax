@@ -42,7 +42,15 @@ OPD 支持四种 token-selection 策略，决定在哪些 token 上计算 KL 散
 | `teacher_topk` | — | ✅ | — | ✅ | 在教师 top-K token 集合上计算 KL |
 | `union` | ✅ | ✅ | ✅ | ✅ | 在学生和教师 top-K 的并集上计算 KL，覆盖最全面 |
 
-通过 `--opd-token-selection` 指定模式，`--opd-log-prob-top-k` 指定 top-K 大小。除 `student_sampled` 外，其余模式需要设置环境变量 `RELAX_OPD_PER_POS_TOKEN_IDS=1`。
+通过 `--opd-token-selection` 指定模式，`--opd-log-prob-top-k` 指定 top-K 大小。top-K 训练可设置 `RELAX_OPD_PER_POS_TOKEN_IDS=1`，使用紧凑的 base64 传输。跨模型查询需要 Relax 的独立逐位置 SGLang 补丁，v0.5.17 训练镜像已包含该补丁；原生 SGLang 在每个位置查询的是同一组 token IDs。
+
+## 原生图像请求
+
+图像 OPD、OPSD 和 MOPD 使用 SGLang v0.5.17，并设置 `SGLANG_MM_AVOID_RETOKENIZE=true`。请求发送未展开的 prompt IDs、保持原样的采样 response IDs 和标准图片数据；客户端 processor 计算展开后的 prompt 长度，用于选取 response logprob。学生和教师必须使用兼容的 tokenizer、图像 processor 及图片缩放设置。该路径支持图片，遇到音频或视频输入会报错。
+
+OPSD 仅覆盖教师 prompt、未覆盖教师媒体时，会复用学生图片；显式空的教师媒体映射表示教师使用纯文本输入。学生的交叉 top-K prefill 始终使用学生图片。
+
+教师直连 endpoint 和学生 router 均须保留 `return_prompt_token_ids`。Relax 会先比较完整展开序列，以及返回的 response/query IDs，再使用 logprob；缺失或错位会导致请求失败。该路径不支持按文本查找的 `RadixTreeMiddleware`。图像请求不能映射 response EOS ID，也不能替换采样出的媒体 token；需要时请配置媒体 stop token。独立 top-K 补丁与环境设置见 [OPD 示例说明](https://github.com/redai-studio/Relax/tree/main/examples/on_policy_distillation)。
 
 ## 两种应用方式：adv 与 loss
 

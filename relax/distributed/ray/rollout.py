@@ -3,6 +3,7 @@
 # pyright: reportMissingTypeArgument=false, reportCallIssue=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportUninitializedInstanceVariable=false, reportOptionalIterable=false, reportFunctionMemberAccess=false, reportPossiblyUnboundVariable=false, reportOperatorIssue=false, reportIndexIssue=false, reportReturnType=false
 
 import asyncio
+import copy
 import dataclasses
 import enum
 import logging
@@ -14,10 +15,8 @@ import time
 import uuid
 from typing import Any, Optional
 
-import numpy as np
 import ray
 import sglang_router
-import transfer_queue as tq
 import yaml
 from packaging.version import parse
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -25,8 +24,16 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.rollout_scale_types import (
+    ScaleInRequest,
+    ScaleInStatus,
+    ScaleOutMode,  # noqa: F401 - keep the existing import path
+    ScaleOutRequest,
+    ScaleOutStatus,
+)
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
-from relax.engine.rollout.base_types import call_rollout_fn
+from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
+from relax.engine.rollout.base_types import DatasetStateMismatchError, call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -42,23 +49,20 @@ from relax.utils.http_utils import (
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
-from relax.utils.metrics.metric_utils import (
-    compute_pass_rate,
-    compute_rollout_reward_metrics,
-    compute_rollout_step,
-    compute_statistics,
-    dict_add_prefix,
-    has_repetition,
+from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step, dict_add_prefix
+from relax.utils.metrics.rollout_metrics import (
+    compute_metrics_from_samples,
+    compute_mopd_metrics,  # noqa: F401 - keep the existing import path
+    compute_perf_metrics_from_samples,
 )
-from relax.utils.misc import group_by, load_function
-from relax.utils.multimodal.stats import get_sample_multimodal_stats
-from relax.utils.opd.opd_utils import compute_mopd_metrics
+from relax.utils.misc import load_function
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.s3_model_loader import (
     build_runai_streamer_env_for_load,
     prepare_model_maybe_update_args,
 )
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -243,185 +247,6 @@ class SglangConfig:
         return sum(m.total_num_gpus for m in self.models)
 
 
-class ScaleOutStatus(str, enum.Enum):
-    """Status states for scale-out requests."""
-
-    PENDING = "PENDING"  # Request received, waiting to process
-    CREATING = "CREATING"  # (ray_native) Creating Ray actors and starting SGLang
-    CONNECTING = "CONNECTING"  # (external) Connecting to external engines
-    HEALTH_CHECKING = "HEALTH_CHECKING"  # Engines started, running health checks
-    WEIGHT_SYNCING = "WEIGHT_SYNCING"  # Engines healthy, syncing weights
-    READY = "READY"  # Weight sync complete, can accept requests
-    ACTIVE = "ACTIVE"  # Registered to router, processing requests
-    PARTIAL = "PARTIAL"  # Partial success: some replicas scaled, others timed out
-    FAILED = "FAILED"  # Scale-out failed
-    REMOVING = "REMOVING"  # Being removed (scale-in or rollback)
-    CANCELLED = "CANCELLED"  # Request cancelled by user
-
-
-class ScaleOutMode(str, enum.Enum):
-    """Scale-out mode."""
-
-    RAY_NATIVE = "ray_native"  # Create new engines in the same Ray cluster
-    EXTERNAL = "external"  # Connect to pre-existing external engines
-
-
-@dataclasses.dataclass
-class ScaleOutRequest:
-    """Represents a scale-out request and its state.
-
-    State Machine:
-        PENDING → CREATING/CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY → ACTIVE
-            ↓            ↓                    ↓                ↓           ↓
-        CANCELLED    CANCELLED/FAILED      FAILED           FAILED      REMOVING
-
-    PENDING and CREATING states can be cancelled (e.g. when waiting for Ray
-    autoscaler to provision resources).  FAILED state can retry with a new
-    request.
-
-    Mode is auto-detected: if num_replicas > 0, it's ray_native; if engine_urls is provided, it's external.
-    """
-
-    request_id: str  # UUID, unique identifier
-    status: ScaleOutStatus  # Current state in state machine
-    model_name: str = "default"  # Target model name
-
-    # ray_native mode parameters — num_replicas is the *effective* delta to create
-    # (after idempotency filtering: target_total - effective_current)
-    num_replicas: int = 0  # Number of engines to actually create (post-idempotency delta)
-
-    # external mode parameters — URLs already filtered for idempotency
-    engine_urls: list[str] = dataclasses.field(default_factory=list)  # External engine URLs
-
-    # Timeout settings
-    timeout_secs: float = 600.0  # Total timeout for the scale-out operation
-
-    # Metadata
-    created_at: float = 0.0  # Creation timestamp
-    updated_at: float = 0.0  # Last update timestamp
-
-    # Tracking information
-    engine_ids: list[str] = dataclasses.field(default_factory=list)  # Created/connected engine IDs
-    failed_engines: list[str] = dataclasses.field(default_factory=list)  # Failed engine IDs
-    error_message: Optional[str] = None  # Error details if failed
-    weight_version: Optional[str] = None  # Weight version after sync
-    # Deduped category names (e.g. "PROVISION_TIMEOUT") for the monitor to bucket.
-    failure_categories: list[str] = dataclasses.field(default_factory=list)
-
-    def __post_init__(self):
-        if not self.request_id:
-            self.request_id = str(uuid.uuid4())
-        if self.created_at == 0.0:
-            self.created_at = time.time()
-        if self.updated_at == 0.0:
-            self.updated_at = self.created_at
-
-    def update_status(self, status: ScaleOutStatus, error_message: Optional[str] = None) -> None:
-        """Update the status and timestamp."""
-        self.status = status
-        self.updated_at = time.time()
-        if error_message:
-            self.error_message = error_message
-
-    def is_terminal(self) -> bool:
-        """Check if the request is in a terminal state."""
-        return self.status in (
-            ScaleOutStatus.FAILED,
-            ScaleOutStatus.ACTIVE,
-            ScaleOutStatus.PARTIAL,
-            ScaleOutStatus.CANCELLED,
-        )
-
-    def can_cancel(self) -> bool:
-        """Check if the request can be cancelled.
-
-        Cancellation is allowed in PENDING and CREATING states.  During
-        CREATING, the request may be waiting for Ray to schedule a placement
-        group (e.g. waiting for cluster auto-scaling).  Setting the status to
-        CANCELLED will be detected by the polling loop in
-        ``_scale_out_ray_native`` which will then clean up and abort.
-        """
-        return self.status in (ScaleOutStatus.PENDING, ScaleOutStatus.CREATING)
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for API responses."""
-        return {
-            "request_id": self.request_id,
-            "status": self.status.value,
-            "model_name": self.model_name,
-            "num_replicas": self.num_replicas,
-            "engine_urls": self.engine_urls,
-            "engine_ids": self.engine_ids,
-            "failed_engines": self.failed_engines,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "error_message": self.error_message,
-            "weight_version": self.weight_version,
-            "failure_categories": self.failure_categories,
-        }
-
-
-class ScaleInStatus(str, enum.Enum):
-    PENDING = "PENDING"
-    DRAINING = "DRAINING"
-    REMOVING = "REMOVING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-
-
-@dataclasses.dataclass
-class ScaleInRequest:
-    request_id: str
-    status: ScaleInStatus
-    model_name: str = "default"
-    num_replicas: int = 0
-    engine_urls: list[str] = dataclasses.field(default_factory=list)
-    timeout_secs: float = 120.0
-    force: bool = False
-    dry_run: bool = False
-    created_at: float = 0.0
-    updated_at: float = 0.0
-    selected_engines: list[str] = dataclasses.field(default_factory=list)
-    removed_engines: list[str] = dataclasses.field(default_factory=list)
-    failed_engines: list[str] = dataclasses.field(default_factory=list)
-    error_message: Optional[str] = None
-
-    def __post_init__(self):
-        if not self.request_id:
-            self.request_id = str(uuid.uuid4())
-        if self.created_at == 0.0:
-            self.created_at = time.time()
-        if self.updated_at == 0.0:
-            self.updated_at = self.created_at
-
-    def update_status(self, status: ScaleInStatus, error_message: Optional[str] = None) -> None:
-        self.status = status
-        self.updated_at = time.time()
-        if error_message:
-            self.error_message = error_message
-
-    def is_terminal(self) -> bool:
-        return self.status in (ScaleInStatus.COMPLETED, ScaleInStatus.FAILED)
-
-    def to_dict(self) -> dict:
-        return {
-            "request_id": self.request_id,
-            "status": self.status.value,
-            "model_name": self.model_name,
-            "num_replicas": self.num_replicas,
-            "engine_urls": self.engine_urls,
-            "timeout_secs": self.timeout_secs,
-            "force": self.force,
-            "dry_run": self.dry_run,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "selected_engines": self.selected_engines,
-            "removed_engines": self.removed_engines,
-            "failed_engines": self.failed_engines,
-            "error_message": self.error_message,
-        }
-
-
 class EngineGroupLifecycle(str, enum.Enum):
     ACTIVE = "ACTIVE"
     DRAINING = "DRAINING"
@@ -546,6 +371,7 @@ class EngineGroup:
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
+    require_router_registration: bool = False  # Verify managed PD registration before publication
     engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
 
     @property
@@ -557,12 +383,12 @@ class EngineGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
-    def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
+    def start_engines(self, port_cursors: dict[str, int] | None = None) -> tuple[list, dict[str, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()``
         without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
-        of Ray ObjectRefs and *port_cursors* maps node index → next free port.
+        of Ray ObjectRefs and *port_cursors* maps node IP → next free port.
         The caller should ``ray.get()`` on the handles to block until the
         engines are healthy, and pass *port_cursors* to the next engine group
         so that different groups on the same node don't race for ports.
@@ -617,15 +443,16 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                    # Mooncake's default 15000-17000 overlaps allocated HTTP ports
+                    # before they bind. Use the upper range reserved by ray-job.sh.
+                    "MC_MIN_RPC_PORT": "65001",
+                    "MC_MAX_RPC_PORT": "65500",
                     # OPD per-position token_ids logprob patch: default off, enabled
                     # via env (affects the student engine too, like the teacher).
                     "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
-                    # OPD pre-expanded multimodal patch: passed through to the
-                    # student engine too, because advantage mode sends
-                    # opd_preexpanded_raw requests to the student (student-at-
-                    # teacher-topk prefill).  The patch makes the student SGLang
-                    # skip retokenize/detokenize for expanded input_ids + image_data.
-                    "RELAX_OPD_PREEXPANDED_PATCH": "0",
+                    # Native image OPD preserves sampled response IDs through
+                    # SGLang's processor; returned IDs are checked per request.
+                    "SGLANG_MM_AVOID_RETOKENIZE": "true",
                     # The TP memory-imbalance check is overly conservative under
                     # colocate (the actor occupies GPUs at engine init and is
                     # offloaded before rollout), so disable it. Recent SGLang reads
@@ -710,6 +537,7 @@ class EngineGroup:
                 router_port=self.router_port,
                 skip_dcs_registration=self.skip_dcs_registration,
                 skip_router_registration=self.skip_router_registration,
+                **({"require_router_registration": True} if self.require_router_registration else {}),
             )
             self.engine_init_records[rank - self.rank_offset] = _EngineInitRecord(
                 init_ref,
@@ -719,7 +547,11 @@ class EngineGroup:
                     if "host" in engine_addr and "port" in engine_addr
                     else None
                 ),
-                router_cleanup=RouterWorkerCleanup(engine._actor_id.hex()),
+                router_cleanup=RouterWorkerCleanup(
+                    engine._actor_id.hex(),
+                    pd_worker_type=self.worker_type if self.require_router_registration else None,
+                    bootstrap_port=engine_addr.get("disaggregation_bootstrap_port"),
+                ),
             )
             init_handles.append(init_ref)
         return init_handles, port_cursors
@@ -876,6 +708,28 @@ class RolloutServer:
         groups = list(self.engine_groups)
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
 
+        # Managed PD retains static IDs outside the engine actor. Confirm old
+        # registrations are gone before replacements can reuse their endpoints.
+        for group, dead_indices in zip(groups, dead_per_group, strict=True):
+            if not group.require_router_registration:
+                continue
+            for slot in dead_indices:
+                if slot % group.nodes_per_engine:
+                    continue
+                record = group.engine_init_records.get(slot)
+                if (
+                    record is None
+                    or not record.router_url
+                    or record.router_cleanup is None
+                    or not remove_dead_router_worker(
+                        f"http://{group.router_ip}:{group.router_port}",
+                        record.router_url,
+                        record.router_cleanup,
+                    )
+                ):
+                    self.num_new_engines = 0
+                    raise RuntimeError("Cannot recreate PD engine before its old router registration is removed")
+
         # FullyAsync can keep updating surviving DCS recipients while cleanup
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
@@ -929,7 +783,7 @@ class RolloutServer:
                 )
 
         all_handles = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
         groups_to_remove = []
 
         for g_idx, g in enumerate(groups):
@@ -963,7 +817,19 @@ class RolloutServer:
             logger.info(f"Removed dead external engine group {g_idx}")
 
         if all_handles:
-            ray.get(all_handles)
+            try:
+                ray.get(all_handles)
+            except Exception:
+                # init() may fail after the server is healthy but before its
+                # required router registration is ready. Retire the entire
+                # replacement batch, including pending multi-node peers, so
+                # the next recovery cannot mistake those handles for ready
+                # engines. Keep the new generation's records for route cleanup.
+                for group, dead_indices in zip(groups, dead_per_group, strict=True):
+                    if group.pg is not None and dead_indices:
+                        group.shutdown_engines(set(dead_indices))
+                self.num_new_engines = 0
+                raise
 
         release_handles = []
         new_engines_all = []
@@ -1025,10 +891,12 @@ def get_local_rollout_manager() -> "RolloutManager":
 @ray.remote(
     concurrency_groups={
         "health_monitoring": 1,
+        "reload": 1,
         "scale_out": 8,
         "scale_in": 8,
         "scale_coordination": 1,
         "recover_rollout_engines": 1,
+        "lora_publication": 1,
     }
 )
 class RolloutManager(ReloadableMixin):
@@ -1052,13 +920,23 @@ class RolloutManager(ReloadableMixin):
         self.args = args
         self._engine_actor_states = _get_engine_actor_states()
         self._dynamic_global_batch_size = None
+        self._eval_judge = None
+        self._eval_judge_init_lock = asyncio.Lock()
+        self._eval_judge_tasks: set[asyncio.Task] = set()
+        self._eval_judge_errors: list[str] = []
+        self._lora_runtime = None
+        self._lora_configuring = False
+        self._lora_training_config = None
+        self._generation_started = False
 
         init_tracking(args, primary=False)
 
         self.data_source = data_source
 
-        tq.init(self.args.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.args.tq_config,
+            role="rollout_worker",
+        )
 
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
@@ -1121,7 +999,7 @@ class RolloutManager(ReloadableMixin):
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
-        self._port_cursors: dict[int, int] = {}
+        self._port_cursors: dict[str, int] = {}
 
         # Elastic scale-in tracking
         self._scale_in_requests: dict[str, ScaleInRequest] = {}
@@ -1145,6 +1023,25 @@ class RolloutManager(ReloadableMixin):
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
 
+    # A slow judge may finish before reload can proceed. Keep these synchronous
+    # RPCs serialized without blocking the generation/health event loop.
+    @ray.method(concurrency_group="reload")
+    def reload_function_by_name(self, module_name: str) -> dict[str, Any]:
+        return super().reload_function_by_name(module_name)
+
+    @ray.method(concurrency_group="reload")
+    def reload_module(self, module_name: str, module_path: str | None = None) -> dict[str, Any]:
+        return super().reload_module(module_name, module_path)
+
+    @ray.method(concurrency_group="reload")
+    def reload_all_functions(self) -> dict[str, Any]:
+        return super().reload_all_functions()
+
+    def _on_custom_reward_reloaded(self, module_path: str) -> None:
+        """Wait for this manager's background judge to refresh as well."""
+        if self._eval_judge is not None:
+            ray.get(self._eval_judge.reload_custom_reward.remote(module_path))
+
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
         reused."""
@@ -1152,6 +1049,11 @@ class RolloutManager(ReloadableMixin):
             rank_offset = ((self._next_engine_rank + alignment - 1) // alignment) * alignment
             self._next_engine_rank = rank_offset + count
             return rank_offset
+
+    @property
+    def training_weight_updating(self) -> bool:
+        with self._engine_lifecycle_lock:
+            return self._training_weight_updating
 
     @property
     def _is_weight_updating(self) -> bool:
@@ -1180,11 +1082,233 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
-    def dispose(self):
+    @ray.method(concurrency_group="lora_publication")
+    def configure_lora_training(
+        self,
+        artifact_dir: str,
+        base_fingerprint: str,
+        probe_input_ids: list[int],
+        max_versions: int = 2,
+        reconcile_interval_s: float = 1.0,
+    ) -> Any:
+        """Prepare automatic publication before assigning this manager to
+        trainers.
+
+        The directory must be shared by the publisher and every engine and
+        isolated to this training run. The fingerprint identifies the actual
+        frozen base contents. Initial publication follows the first base sync.
+        """
+        from relax.engine.lora_versions.training import LoRATrainingConfig
+        from relax.utils.megatron_peft_utils import is_lora_adapter_mode
+
+        with self._engine_lifecycle_lock:
+            engines = [engine for server in self.servers.values() for engine in server.engines]
+            if not engines or any(engine is None for engine in engines):
+                raise ValueError("training publication requires a complete engine pool")
+            config = LoRATrainingConfig(
+                artifact_dir,
+                base_fingerprint,
+                tuple(probe_input_ids),
+                max_versions,
+                reconcile_interval_s,
+                tuple(engine._actor_id.hex() for engine in engines),
+            )
+            previous = getattr(self, "_lora_training_config", None)
+            if previous is not None:
+                if previous == config:
+                    return previous
+                raise RuntimeError("Cannot replace a training publication configuration")
+            if (
+                not self.args.fully_async
+                or getattr(self.args, "train_backend", "megatron") != "megatron"
+                or getattr(self.args, "hybrid", False)
+                or self.args.colocate
+                or self.args.offload_rollout
+                or not self.args.use_agentic_rollout
+                or not is_lora_adapter_mode(self.args)
+                or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
+                or len(self.servers) != 1
+            ):
+                raise ValueError(
+                    "automatic LoRA publication requires fully-async Megatron Agentic adapter mode, "
+                    "a fixed single-model pool, and no rollout offload or automatic recovery"
+                )
+            if (
+                self._lora_runtime is not None
+                or self._lora_configuring
+                or getattr(self, "_lora_configuration_failed", False)
+                or self._generation_started
+                or self._find_active_scale_request() is not None
+            ):
+                raise RuntimeError("training publication must be configured on a fresh, idle rollout pool")
+            self._lora_training_config = config
         self._stop_eviction_monitor()
-        for monitor in self._health_monitors:
-            monitor.stop()
-        self._shutdown_all_engines()
+        return config
+
+    def get_lora_training_config(self) -> Any:
+        return self._lora_training_config
+
+    @ray.method(concurrency_group="lora_publication")
+    def publish_training_lora(self, artifact_path: str) -> dict[str, Any]:
+        """Bootstrap after base sync, then publish without pausing Sessions."""
+        # Blocking control-plane RPCs must not occupy generate's event loop.
+        config = self._lora_training_config
+        if config is None:
+            return {"status": "failed", "error": "training publication is not configured"}
+        if getattr(self, "_lora_configuration_failed", False):
+            return {"status": "failed", "error": "initial LoRA configuration failed"}
+        if self._lora_configuring:
+            return {"status": "unconfirmed", "error": "initial LoRA configuration is still running"}
+        if self._lora_runtime is None:
+            try:
+                self._configure_lora_version_runtime(
+                    artifact_path, list(config.probe_input_ids), config.max_versions, config.reconcile_interval_s
+                )
+            except Exception as error:
+                return {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+            return {"status": "published", "version_id": self._lora_initial_publication.identity.version_id}
+        return ray.get(self._lora_runtime.publish_for_training.remote(artifact_path))
+
+    @ray.method(concurrency_group="lora_publication")
+    def configure_lora_versions(
+        self,
+        initial_artifact_path: str,
+        probe_input_ids: list[int],
+        max_versions: int = 2,
+        reconcile_interval_s: float = 1.0,
+    ) -> Any:
+        """Opt into immutable versions before starting any resident groups.
+
+        Requires a fixed single-model engine pool configured with managed LoRA
+        capacity. The initial artifact is published before Session injection;
+        subsequent artifacts can be published through the returned actor.
+        """
+        if getattr(self, "_lora_training_config", None) is not None:
+            raise RuntimeError("automatic training publication owns the initial LoRA bootstrap")
+        return self._configure_lora_version_runtime(
+            initial_artifact_path, probe_input_ids, max_versions, reconcile_interval_s
+        )
+
+    def _configure_lora_version_runtime(
+        self,
+        initial_artifact_path: str,
+        probe_input_ids: list[int],
+        max_versions: int,
+        reconcile_interval_s: float,
+    ) -> Any:
+        from relax.agentic.rollout import bind_agentic_lora_runtime
+        from relax.engine.lora_versions.runtime import LoRAVersionRuntime
+
+        with self._engine_lifecycle_lock:
+            if (
+                self._lora_runtime is not None
+                or self._lora_configuring
+                or getattr(self, "_lora_configuration_failed", False)
+            ):
+                raise RuntimeError("LoRA versions are already configured or being configured")
+            if (
+                not self.args.use_agentic_rollout
+                or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
+                or len(self.servers) != 1
+            ):
+                raise ValueError("managed LoRA requires Agentic rollout, one model, and disabled automatic recovery")
+            if getattr(self, "_generation_started", False):
+                raise RuntimeError("LoRA versions must be configured before generation starts")
+            if self._find_active_scale_request() is not None:
+                raise RuntimeError("cannot configure LoRA during an engine pool transition")
+            self._lora_configuring = True
+        try:
+            # Stop automatic eviction before capturing the fixed engine pool.
+            self._stop_eviction_monitor()
+            host = LoRAVersionRuntime.options(
+                **with_control_plane_affinity(self.args, {"num_cpus": 0, "num_gpus": 0})
+            ).remote()
+            self._lora_runtime = host
+            engines = next(iter(self.servers.values())).engines
+            if not engines or any(engine is None for engine in engines):
+                raise ValueError("managed LoRA requires a complete ready engine pool")
+            urls = ray.get([engine.get_url.remote() for engine in engines])
+            if any(not url for url in urls) or len(set(urls)) != len(urls):
+                raise ValueError("managed LoRA requires unique engine endpoints")
+            ray.get(
+                host.start.remote(
+                    dict(zip(map(str, range(len(urls))), urls)), probe_input_ids, max_versions, reconcile_interval_s
+                )
+            )
+            self._lora_initial_publication = ray.get(host.publish.remote(initial_artifact_path))
+            bind_agentic_lora_runtime(host)
+            return host
+        except BaseException:
+            # A partially published/configured pool must not resume unmanaged
+            # operation. Retain its owner for reconciliation and disposal.
+            self._lora_configuration_failed = True
+            raise
+        finally:
+            self._lora_configuring = False
+
+    def get_lora_version_runtime(self) -> Any:
+        return self._lora_runtime
+
+    def _require_unmanaged_engine_pool(self) -> None:
+        if (
+            getattr(self, "_lora_runtime", None) is not None
+            or getattr(self, "_lora_configuring", False)
+            or getattr(self, "_lora_configuration_failed", False)
+            or getattr(self, "_lora_training_config", None) is not None
+        ):
+            raise RuntimeError("managed LoRA currently requires a fixed engine pool")
+
+    def _begin_generation(self) -> None:
+        with self._engine_lifecycle_lock:
+            if getattr(self, "_lora_configuring", False) or getattr(self, "_lora_configuration_failed", False):
+                raise RuntimeError("LoRA configuration is incomplete")
+            if getattr(self, "_lora_training_config", None) is not None and self._lora_runtime is None:
+                raise RuntimeError("initial training LoRA publication has not completed")
+            self._generation_started = True
+
+    @ray.method(concurrency_group="lora_publication")
+    def dispose(self):
+        try:
+            # Signal every monitor before bounded joins so a stalled health
+            # RPC cannot consume the driver's entire shutdown budget.
+            self._stop_eviction_monitor(timeout=0.0)
+            for monitor in self._health_monitors:
+                monitor.stop(timeout=0.0)
+            deadline = time.monotonic() + 5.0
+            self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
+            for monitor in self._health_monitors:
+                monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
+            # Normal completion drains before shutdown; this also cleans up on
+            # failure without waiting indefinitely for a remote judge.
+            if self._eval_judge is not None:
+                try:
+                    ray.get(self._eval_judge.close.remote(), timeout=10)
+                except Exception:
+                    logger.exception("Failed to close the eval judge pool")
+                finally:
+                    try:
+                        ray.kill(self._eval_judge)
+                    except Exception:
+                        logger.exception("Failed to terminate the eval judge owner")
+                    self._eval_judge = None
+            host = getattr(self, "_lora_runtime", None)
+            if host is not None:
+                ray.get(host.close.remote())
+                ray.kill(host)
+                self._lora_runtime = None
+            self._shutdown_all_engines()
+        finally:
+            try:
+                # Deregister the worker's Mooncake segment before a fast restart.
+                if getattr(self, "data_system_client", None) is not None:
+                    detach_tq_client()
+            finally:
+                self.data_system_client = None
+                # Routers are child processes of this Ray actor, so its process
+                # owns the registry; the Controller driver's registry is separate.
+                stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
@@ -1218,10 +1342,12 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"[Shutdown] Failed to call shutdown on engine: {e}")
 
-        # Wait for shutdown calls to complete with a timeout
+        # Bound the whole batch so router cleanup can finish before the driver's
+        # signal-exit watchdog, even when every engine is unresponsive.
+        deadline = time.monotonic() + timeout
         for engine, ref in shutdown_refs:
             try:
-                ray.get(ref, timeout=timeout)
+                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
             except Exception as e:
                 logger.warning(f"[Shutdown] Engine shutdown timed out or failed: {e}")
                 # Force-kill the Ray actor as a fallback
@@ -1286,6 +1412,7 @@ class RolloutManager(ReloadableMixin):
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
 
     async def generate(self, rollout_id):
+        self._begin_generation()
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
@@ -1305,26 +1432,75 @@ class RolloutManager(ReloadableMixin):
             )
 
     async def eval(self, rollout_id):
+        self._begin_generation()
         self.health_monitoring_resume()
 
         # TODO: add fault tolerance to eval
-        result = await asyncio.to_thread(
-            call_rollout_fn,
+        result, pending = await asyncio.to_thread(
+            call_eval_with_deferred_rewards,
             self.eval_generate_rollout,
             self.args,
             rollout_id,
             self.data_source,
             self.data_system_client,
-            evaluation=True,
         )
+        await self.submit_eval_result(rollout_id, result, pending)
+
+    async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
+        """Record inline scores or enqueue captured judges from RL or SFT."""
+        if pending:
+            async with self._eval_judge_init_lock:
+                if self._eval_judge is None:
+                    self._eval_judge = await asyncio.to_thread(
+                        lambda: EvalJudgeWorker.options(**with_control_plane_affinity(self.args)).remote(self.args)
+                    )
+            # Ray serializes the snapshot before returning the ObjectRef. Keep
+            # result + pending together to preserve their shared Sample refs.
+            ref = await asyncio.to_thread(self._eval_judge.score.remote, self.args, (result, pending))
+            task = asyncio.create_task(self._finish_eval_judge(rollout_id, ref))
+            self._eval_judge_tasks.add(task)
+            task.add_done_callback(self._eval_judge_tasks.discard)
+            logger.info(
+                "Queued eval judge for rollout %s (%d pending evaluations)", rollout_id, len(self._eval_judge_tasks)
+            )
+            return
+        self._record_eval_result(rollout_id, result)
+
+    def _record_eval_result(self, rollout_id: int, result: Any) -> None:
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        args = self.args
+        if getattr(args, "loss_type", None) == "sft":
+            # SFT already supplies completed training steps, not RL batch IDs.
+            args = copy.copy(args)
+            args.wandb_always_use_train_step = False
+            args.reward_key = args.eval_reward_key or args.reward_key
+            args.n_samples_per_prompt = 1
+        _log_eval_rollout_data(rollout_id, args, data, result.metrics)
+
+    async def _finish_eval_judge(self, rollout_id: int, ref: Any) -> None:
+        start = time.monotonic()
+        try:
+            result = await ref
+            result.metrics = dict(result.metrics or {})
+            result.metrics.update({"eval/async_judge": 1, "eval/async_judge_seconds": time.monotonic() - start})
+            await asyncio.to_thread(self._record_eval_result, rollout_id, result)
+        except Exception as exc:
+            self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
+            logger.exception("Background eval judge failed for rollout %s", rollout_id)
+
+    async def drain_eval_judges(self) -> None:
+        """Finish scoring and reporting before the normal job shutdown."""
+        while self._eval_judge_tasks:
+            logger.info("Waiting for %d pending eval judges at training completion", len(self._eval_judge_tasks))
+            await asyncio.gather(*tuple(self._eval_judge_tasks))
+        if self._eval_judge_errors:
+            raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
 
     async def run_predict(self, train_step: int) -> None:
         """Periodic SFT predict pass entry point.
 
-        Ensures KV/cuda-graph is onloaded (no-op if already on), then delegates
+        Restores KV/cuda-graph when rollout offloading is enabled, then delegates
         to ``run_predict_loop`` which renders the eval set, batches calls to
         ``self.generate_predict``, and writes
         ``<args.save>/predict/predictions_step_<train_step>.jsonl``.
@@ -1335,13 +1511,16 @@ class RolloutManager(ReloadableMixin):
         """
         from relax.engine.sft.predict.loop import run_predict_loop
 
-        await self.onload_kv()
+        if self.args.offload_rollout:
+            await self.onload_kv()
         await run_predict_loop(self, self.args, train_step)
 
     async def generate_predict(
         self,
         prompts: list[str],
         multimodal_inputs_list: list[dict | None] | None = None,
+        *,
+        samples: list[Sample] | None = None,
     ) -> list[str]:
         """Generate completions for ``prompts`` concurrently.
 
@@ -1386,23 +1565,56 @@ class RolloutManager(ReloadableMixin):
         }
         if multimodal_inputs_list is None:
             multimodal_inputs_list = [None] * len(prompts)
+        if samples is not None and len(samples) != len(prompts):
+            raise ValueError("SFT predict samples must align with prompts")
 
         async def _one(idx: int, prompt: str, mm: dict | None) -> str:
             url = f"{worker_urls[idx % len(worker_urls)]}/generate"
             payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
+            if getattr(self.args, "lora_rank", 0) > 0 and getattr(self.args, "lora_adapter_mode", False):
+                from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
+
+                payload["lora_path"] = LORA_ADAPTER_NAME
+            if samples is not None:
+                # Preserve actual generated token IDs for custom eval rewards.
+                payload["return_logprob"] = True
+                payload["logprob_start_len"] = -1
             if mm:
                 encoded_mm, _ = await _encode_multimodal_inputs(mm)
                 payload.update(encoded_mm)
             output = await post(url, payload)
+            if samples is not None:
+                sample = samples[idx]
+                sample.response = output["text"]
+                meta_info = output["meta_info"]
+                token_logprobs = meta_info.get("output_token_logprobs")
+                if token_logprobs is not None:
+                    response_tokens = [item[1] for item in token_logprobs]
+                    sample.rollout_log_probs = [item[0] for item in token_logprobs]
+                else:
+                    response_tokens = output["output_ids"]
+                sample.tokens.extend(response_tokens)
+                sample.rollout_tokens = list(sample.tokens)
+                sample.response_length = len(response_tokens)
+                sample.update_from_meta_info(self.args, meta_info)
+                if sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
+                    raise RuntimeError(f"SFT predict sample {sample.index} did not complete: {sample.status}")
             if isinstance(output, dict) and "text" in output:
                 return output["text"]
             if isinstance(output, str):
                 return output
             return str(output)
 
-        return await asyncio.gather(
-            *[_one(i, p, m) for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))]
-        )
+        tasks = [
+            asyncio.create_task(_one(i, p, m))
+            for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def save(self, rollout_id):
         await self.data_source.save.remote(rollout_id)
@@ -1412,6 +1624,11 @@ class RolloutManager(ReloadableMixin):
             await self.data_source.load.remote(rollout_id)
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
+            if (
+                isinstance(e, DatasetStateMismatchError)
+                or (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
+            ):
+                raise
 
     async def offload(self):
         self._offload_local()
@@ -1454,6 +1671,7 @@ class RolloutManager(ReloadableMixin):
     def recover_rollout_engines(self, model_name: str | None = None):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
+        self._require_unmanaged_engine_pool()
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
         if self.rollout_id == -1 or srv is None:
@@ -1759,6 +1977,7 @@ class RolloutManager(ReloadableMixin):
         Returns:
             Dict with request_id and initial status (or NOOP if idempotent no-op)
         """
+        self._require_unmanaged_engine_pool()
         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
         if num_replicas > 0:
             scale_mode = ScaleOutMode.RAY_NATIVE
@@ -1873,6 +2092,7 @@ class RolloutManager(ReloadableMixin):
         # eviction claims.  Validation above may be slow enough for eviction
         # to win after the initial fast-path check.
         with self._engine_lifecycle_lock:
+            self._require_unmanaged_engine_pool()
             active = self._find_active_scale_request()
             if active is not None:
                 return {
@@ -2245,10 +2465,11 @@ class RolloutManager(ReloadableMixin):
                     srv.engine_groups[0],
                 ),
             )
+            actors_per_replica = max(1, gpus_per_engine // self.args.num_gpus_per_node)
             new_group = EngineGroup(
                 args=self.args,
                 pg=pg_tuple,
-                all_engines=[None],  # Single engine per replica
+                all_engines=[None] * actors_per_replica,
                 num_gpus_per_engine=gpus_per_engine,
                 num_new_engines=0,
                 worker_type="regular",
@@ -3852,6 +4073,7 @@ class RolloutManager(ReloadableMixin):
         force: bool = False,
         dry_run: bool = False,
     ) -> dict:
+        self._require_unmanaged_engine_pool()
         # Mutual exclusion: reject if any scale operation is in progress
         active = self._find_active_scale_request()
         if active is not None:
@@ -3915,6 +4137,7 @@ class RolloutManager(ReloadableMixin):
         )
         # Recheck and insert atomically against graceful eviction claims.
         with self._engine_lifecycle_lock:
+            self._require_unmanaged_engine_pool()
             active = self._find_active_scale_request()
             if active is not None:
                 return {
@@ -4433,14 +4656,16 @@ class RolloutManager(ReloadableMixin):
         self._eviction_monitor_thread.start()
         logger.info("[Eviction] Eviction monitor started (interval=%.1fs)", self._eviction_check_interval)
 
-    def _stop_eviction_monitor(self):
+    def _stop_eviction_monitor(self, timeout: float | None = None):
         """Stop the eviction monitor thread."""
         if self._eviction_monitor_thread is None:
             return
         self._eviction_monitor_stop.set()
-        self._eviction_monitor_thread.join(timeout=self._eviction_check_interval + 5)
+        self._eviction_monitor_thread.join(timeout=self._eviction_check_interval + 5 if timeout is None else timeout)
         if self._eviction_monitor_thread.is_alive():
-            logger.warning("[Eviction] Eviction monitor thread did not terminate in time")
+            if timeout != 0:
+                logger.warning("[Eviction] Eviction monitor thread did not terminate in time")
+            return
         self._eviction_monitor_thread = None
         logger.info("[Eviction] Eviction monitor stopped")
 
@@ -4510,6 +4735,7 @@ class RolloutManager(ReloadableMixin):
         """Fence a ready eviction batch before performing one live removal."""
         claimed = []
         with self._engine_lifecycle_lock:
+            self._require_unmanaged_engine_pool()
             for srv_name, group, node0_idx in eviction_infos:
                 srv = self.servers.get(srv_name)
                 if (
@@ -4635,95 +4861,89 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     rank_offset=0,
     base_port=15000,
 ):
-    # get ports
-    # there are 4 ports we need to allocate
-    # 1. server port
-    # 2. nccl port
-    # 3. dist_init_addr port
-    # 4. other ports for dp_attention, which is of size 4 + dp_size
-    _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
+    gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
+    nodes_per_engine = max(1, gpus_per_engine // args.num_gpus_per_node)
     addr_and_ports: dict[int, dict] = {}
 
-    # Track per-node port cursors so that different engine groups (called
-    # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
+    genrm_instances = getattr(args, "_genrm_instances_resolved", None)
+    if genrm_instances is None:
+        genrm_instances = getattr(args, "genrm_instances", None)
+    genrm_count = (
+        len(genrm_instances) if genrm_instances is not None else int(bool(getattr(args, "genrm_model_path", None)))
+    )
+    genrm_ports = None
+    if genrm_count:
+        from .genrm import _GENRM_PORT_BASE, _GENRM_PORT_WINDOW_SIZE
 
-    visited_nodes = set()
-    for rank, engine in rollout_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_engines_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
+        genrm_ports = (_GENRM_PORT_BASE, _GENRM_PORT_BASE + genrm_count * _GENRM_PORT_WINDOW_SIZE)
 
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+    node_port_cursor: dict[str, int] = {}
 
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
-                )
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
+    def allocate_port(engine, host: str, consecutive: int = 1) -> int:
+        start = node_port_cursor.get(host, base_port)
+        while True:
+            _, port = ray.get(
+                engine._get_current_node_ip_and_free_port.remote(start_port=start, consecutive=consecutive)
+            )
+            # GenRM can reserve a window before it binds any of its ports.
+            if genrm_ports and port < genrm_ports[1] and port + consecutive > genrm_ports[0]:
+                start = genrm_ports[1]
+                continue
+            node_port_cursor[host] = port + consecutive
+            return port
 
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
+    for rank, engine in sorted(rollout_engines, key=lambda item: item[0]):
+        host, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
+        ports = dict(host=host, port=allocate_port(engine, host), nccl_port=allocate_port(engine, host))
+        if worker_type == "prefill":
+            ports["disaggregation_bootstrap_port"] = allocate_port(engine, host)
 
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-            if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
-
-        if _gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
-                # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
+        # Only the distributed rendezvous belongs to the TP group's head.
+        head_rank = rank - (rank - rank_offset) % nodes_per_engine
+        if rank == head_rank:
+            ports["dist_init_addr"] = f"{host}:{allocate_port(engine, host, 30 + args.sglang_dp_size)}"
         else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
-    for i, _ in rollout_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
-        logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
+            ports["dist_init_addr"] = addr_and_ports[head_rank]["dist_init_addr"]
+        addr_and_ports[rank] = ports
+        logger.info(f"Ports for engine {rank}: {ports}")
 
     return addr_and_ports, node_port_cursor
 
 
-def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
+def _start_router(
+    args,
+    *,
+    has_pd_disaggregation: bool = False,
+    force_new: bool = False,
+    initial_pd_workers: list[dict] | None = None,
+) -> tuple[str | None, int | None]:
     """Start sgl router or slime router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values. When
-    ``force_new`` is True (multi-model), always allocate a fresh port.
+    ``force_new`` is True (multi-model), always allocate a fresh port. Managed
+    P2C startup returns ``(None, None)`` until initial workers exist.
     """
-    if not force_new and args.sglang_router_ip is not None:
+    endpoint = (args.sglang_router_ip, args.sglang_router_port)
+    owns_endpoint = getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
+    if not force_new and args.sglang_router_ip is not None and not owns_endpoint:
+        if initial_pd_workers is not None:
+            raise ValueError("Cannot initialize static workers on an external router")
         return args.sglang_router_ip, args.sglang_router_port
+    if not force_new and owns_endpoint and any(proc.is_alive() for proc in _LAUNCHED_ROUTER_PROCESSES):
+        raise RuntimeError("A managed PD router is already running; reconcile it before another startup")
+
+    if (
+        initial_pd_workers is None
+        and not force_new
+        and has_pd_disaggregation
+        and not args.use_slime_router
+        and not getattr(args, "debug_train_only", False)
+        and getattr(args, "router_decode_policy", None) == "power_of_two"
+    ):
+        # The owner chooses and binds the endpoint after engines are ready.
+        # SessionShards receive it only after the registry has been verified.
+        return None, None
 
     # Determine the bind address (can be 0.0.0.0 / wildcard) and the connection
     # address (must be a reachable IP for engines).  When SLIME_HOST_IP is set
@@ -4776,6 +4996,18 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
         if has_pd_disaggregation:
             router_args.pd_disaggregation = True
+        if initial_pd_workers is not None:
+            if not has_pd_disaggregation:
+                raise ValueError("Initial PD workers require PD disaggregation")
+            _validate_initial_pd_workers(initial_pd_workers)
+            router_args.prefill_urls = [
+                (worker["url"], worker["bootstrap_port"])
+                for worker in initial_pd_workers
+                if worker["worker_type"] == "prefill"
+            ]
+            router_args.decode_urls = [
+                worker["url"] for worker in initial_pd_workers if worker["worker_type"] == "decode"
+            ]
 
         logger.info(f"Launch router with args: {router_args}")
 
@@ -4785,23 +5017,126 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     )
     process.daemon = True
     process.start()
+    _LAUNCHED_ROUTER_PROCESSES.append(process)
     time.sleep(3)
     assert process.is_alive()
-    _LAUNCHED_ROUTER_PROCESSES.append(process)
+    if initial_pd_workers is not None and not force_new:
+        args._relax_managed_pd_router_endpoint = (router_ip, router_port)
     logger.info(f"Router launched locally at {bind_ip}:{router_port} (connection address: {router_ip})")
 
     return router_ip, router_port
 
 
-# Router processes launched via `_start_router`. Retained so
-# `Controller._global_restart` can terminate them before re-initializing —
+def _validate_initial_pd_workers(workers: list[dict]) -> None:
+    urls = [worker.get("url") for worker in workers]
+    if any(not isinstance(url, str) or not url.startswith(("http://", "https://")) for url in urls):
+        raise ValueError("Initial PD workers require real HTTP URLs")
+    if len({url.rstrip("/") for url in urls}) != len(urls):
+        raise ValueError("Initial PD worker URLs must be unique")
+    if any(worker.get("worker_type") not in {"prefill", "decode"} for worker in workers):
+        raise ValueError("Only P/D workers may enter the initial PD registry")
+    prefill = [worker for worker in workers if worker["worker_type"] == "prefill"]
+    decode = [worker for worker in workers if worker["worker_type"] == "decode"]
+    if not prefill or len(decode) < 2:
+        raise ValueError("Managed power-of-two startup needs a P and at least two real D engines")
+    if any(
+        type(worker.get("bootstrap_port")) is not int or not 1 <= worker["bootstrap_port"] <= 65535
+        for worker in prefill
+    ):
+        raise ValueError("Every initial P needs its effective bootstrap port")
+
+
+def _wait_pd_router_workers(router_ip: str, router_port: int, expected: list[dict], timeout: float = 60.0) -> dict:
+    """Return an exact, healthy static registry before publishing the
+    server."""
+    import requests
+
+    _validate_initial_pd_workers(expected)
+    specs = {worker["url"].rstrip("/"): worker for worker in expected}
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(
+                f"http://{router_ip}:{router_port}/workers",
+                timeout=min(5.0, max(0.1, deadline - time.monotonic())),
+            )
+            response.raise_for_status()
+            workers = response.json().get("workers", [])
+            registry = {worker.get("url", "").rstrip("/"): worker for worker in workers}
+            if len(registry) != len(workers) or set(registry) - specs.keys():
+                raise ValueError("Static PD registry contains duplicate or unexpected workers")
+            if registry.keys() == specs.keys() and all(worker.get("is_healthy") is True for worker in workers):
+                for url, worker in registry.items():
+                    spec = specs[url]
+                    if (
+                        worker.get("worker_type") != spec["worker_type"]
+                        or not isinstance(worker.get("id"), str)
+                        or not worker["id"]
+                        or "@" in worker["id"]
+                        or (
+                            spec["worker_type"] == "prefill" and worker.get("bootstrap_port") != spec["bootstrap_port"]
+                        )
+                    ):
+                        raise ValueError("Static PD registry identity or bootstrap mismatch")
+                return registry
+        except requests.RequestException as error:
+            last_error = type(error).__name__
+        time.sleep(0.25)
+    raise TimeoutError(f"Static PD router workers did not become ready: {last_error}")
+
+
+def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_new: bool) -> tuple[str, int]:
+    entries = [(group, engine) for group in engine_groups for engine in group.engines if engine is not None]
+    specs = ray.get([engine.get_pd_router_worker_spec.remote() for _, engine in entries])
+    if any(
+        spec is None or spec["worker_type"] != group.worker_type
+        for (group, _), spec in zip(entries, specs, strict=True)
+    ):
+        raise ValueError("Initialized engines do not match the configured PD groups")
+    _validate_initial_pd_workers(specs)
+    router_ip, router_port = _start_router(
+        args,
+        has_pd_disaggregation=True,
+        force_new=force_new,
+        initial_pd_workers=specs,
+    )
+    registry = _wait_pd_router_workers(router_ip, router_port, specs)
+    results = ray.get(
+        [
+            engine.bind_registered_pd_worker.remote(
+                router_ip,
+                router_port,
+                registry[spec["url"].rstrip("/")],
+            )
+            for (_, engine), spec in zip(entries, specs, strict=True)
+        ]
+    )
+    if not all(result is True for result in results):
+        raise RuntimeError("An initialized PD engine did not adopt its static registration")
+    for (group, engine), spec in zip(entries, specs, strict=True):
+        slot = next(index for index, current in enumerate(group.all_engines) if current is engine)
+        record = group.engine_init_records[slot]
+        worker = registry[spec["url"].rstrip("/")]
+        record.router_url = spec["url"]
+        record.router_cleanup.worker_id = worker["id"]
+        record.router_cleanup.pd_worker_type = spec["worker_type"]
+        record.router_cleanup.bootstrap_port = spec["bootstrap_port"]
+    for group in engine_groups:
+        group.router_ip, group.router_port = router_ip, router_port
+        group.skip_router_registration = False
+    return router_ip, router_port
+
+
+# Router processes launched via `_start_router`, tracked per calling process.
+# Retained so RolloutManager can terminate its Routers before re-initializing —
 # otherwise the daemon router survives with stale pre-restart engine URLs and
 # spams "Connection refused" health-check WARNs against dead ports forever.
 _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
 
 
 def stop_launched_routers() -> int:
-    """Terminate every router process launched in this Controller lifetime.
+    """Terminate router processes owned by this process.
 
     Returns the number of processes that were alive and successfully killed —
     callers use this to decide whether to reset cached router endpoint state.
@@ -4826,6 +5161,7 @@ def stop_launched_routers() -> int:
                 killed += 1
         except Exception as e:
             logger.warning(f"Failed to terminate router pid={getattr(proc, 'pid', None)}: {e}")
+            survivors.append(proc)  # Retain ownership when cleanup could not be verified.
     _LAUNCHED_ROUTER_PROCESSES = survivors
     return killed
 
@@ -4882,7 +5218,43 @@ def _wait_engine_init_with_progress(
     logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
 
 
+def _rollback_rollout_startup(groups: list[EngineGroup], routers_before: tuple) -> None:
+    """Close only native engine groups and routers created by this
+    invocation."""
+    global _LAUNCHED_ROUTER_PROCESSES
+    for group in reversed(groups):
+        if group.args.rollout_external:
+            continue
+        try:
+            group.shutdown_engines(set(range(len(group.all_engines))))
+        except Exception as error:
+            logger.warning("Failed to roll back engine group %s: %s", group.rank_offset, error)
+    created = [process for process in _LAUNCHED_ROUTER_PROCESSES if process not in routers_before]
+    previous = [process for process in _LAUNCHED_ROUTER_PROCESSES if process in routers_before]
+    _LAUNCHED_ROUTER_PROCESSES = created
+    try:
+        stop_launched_routers()
+    finally:
+        _LAUNCHED_ROUTER_PROCESSES = previous + _LAUNCHED_ROUTER_PROCESSES
+
+
 def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+    """Start the deployment atomically, retaining ownership on failure."""
+    groups: list[EngineGroup] = []
+    routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
+    try:
+        servers = _start_rollout_servers_impl(args, pg, groups)
+        if getattr(args, "use_agentic_rollout", False):
+            from relax.agentic.rollout import bind_agentic_router
+
+            bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)
+        return servers
+    except Exception:
+        _rollback_rollout_startup(groups, routers_before)
+        raise
+
+
+def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Each model defined in the sglang config gets its own router and set
@@ -4905,16 +5277,49 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+        endpoint = (args.sglang_router_ip, args.sglang_router_port)
+        managed = (
+            model_idx > 0
+            or args.sglang_router_ip is None
+            or getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
+        )
+        defer_router = (
+            has_pd
+            and managed
+            and not args.use_slime_router
+            and getattr(args, "router_decode_policy", None) == "power_of_two"
+            and not args.debug_train_only
+        )
+        if defer_router:
+            if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
+                raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
+            if getattr(args, "router_dp_aware", False):
+                raise ValueError("Managed static PD startup does not support DP-aware worker identities")
+            decode_count = sum(
+                group.num_gpus // group.num_gpus_per_engine
+                for group in model_cfg.engine_groups
+                if group.worker_type == "decode"
+            )
+            if decode_count < 2 or any(group.worker_type == "regular" for group in model_cfg.engine_groups):
+                raise ValueError("Managed power-of-two startup requires at least two D engines and only PD groups")
+            if any(
+                group.overrides.get("dp_size", getattr(args, "sglang_dp_size", 1)) != 1
+                for group in model_cfg.engine_groups
+                if group.worker_type != "placeholder"
+            ):
+                raise ValueError("Managed static PD startup currently requires dp_size=1")
+            router_ip, router_port = None, None
+        else:
+            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
         # Write back for backward compat (first model only).
-        if model_idx == 0:
+        if model_idx == 0 and not defer_router:
             args.sglang_router_ip = router_ip
             args.sglang_router_port = router_port
 
         engine_groups: list[EngineGroup] = []
         all_init_handles: list = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
 
         for group_cfg in model_cfg.engine_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine
@@ -4933,7 +5338,10 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 sglang_overrides=group_cfg.overrides,
                 router_ip=router_ip,
                 router_port=router_port,
+                skip_router_registration=defer_router,
+                require_router_registration=defer_router,
             )
+            started_groups.append(group)
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)
             engine_groups.append(group)
@@ -4948,6 +5356,11 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
                 log_interval=60.0,
             )
+
+        if defer_router:
+            router_ip, router_port = _start_managed_pd_router(args, engine_groups, force_new=(model_idx > 0))
+            if model_idx == 0:
+                args.sglang_router_ip, args.sglang_router_port = router_ip, router_port
 
         servers[model_cfg.name] = RolloutServer(
             engine_groups=engine_groups,
@@ -5070,141 +5483,3 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
     tracking_utils.flush_metrics(args, step)
-
-
-def compute_metrics_from_samples(
-    args,
-    samples,
-    *,
-    rollout_id: int | None = None,
-    include_rloo_diagnostics: bool = True,
-):
-    rewarded_samples = [sample for sample in samples if sample.reward is not None]
-    reward_cat_key = args.log_reward_category
-    reward_category_samples = (
-        [sample for sample in rewarded_samples if isinstance(sample.reward, dict) and reward_cat_key in sample.reward]
-        if reward_cat_key is not None
-        else rewarded_samples
-    )
-    response_lengths = [sample.effective_response_length for sample in samples]
-    multimodal_stats = [get_sample_multimodal_stats(sample) for sample in samples]
-
-    log_dict = {}
-    log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
-    log_dict |= _compute_min_mean_max_stats([s["image_count"] for s in multimodal_stats], "image_count/")
-    log_dict |= _compute_min_mean_max_stats(
-        [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
-    )
-    log_dict |= compute_rollout_reward_metrics(
-        args,
-        rewarded_samples,
-        include_rloo_diagnostics=include_rloo_diagnostics,
-    )
-    log_dict |= _compute_zero_std_metrics(args, rewarded_samples)
-    log_dict |= _compute_spec_metrics(args, samples)
-    log_dict |= _compute_prefix_cache_metrics(args, samples)
-    log_dict |= _compute_reward_cat_metrics(args, reward_category_samples)
-    log_dict |= compute_mopd_metrics(args, rewarded_samples)
-    log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
-    log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
-    log_dict["num_turn/mean"] = np.mean([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    if rollout_id is not None and args.partial_rollout and not args.fully_async:
-        staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
-        log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
-        log_dict["staleness/max"] = np.max(staleness_gaps).item()
-        log_dict["staleness/min"] = np.min(staleness_gaps).item()
-        log_dict["global_batch_size"] = len({sample.index for sample in samples})
-    return log_dict
-
-
-def _compute_min_mean_max_stats(values: list[int], prefix: str) -> dict[str, float]:
-    if not values:
-        return {}
-    return {
-        f"{prefix}mean": np.mean(values).item(),
-        f"{prefix}max": np.max(values).item(),
-        f"{prefix}min": np.min(values).item(),
-    }
-
-
-def compute_perf_metrics_from_samples(args, samples, rollout_time):
-    non_generation_time = [sample.non_generation_time for sample in samples]
-
-    log_dict = {}
-    log_dict["rollout_time"] = rollout_time
-    if max(non_generation_time) > 0:
-        log_dict |= dict_add_prefix(compute_statistics(non_generation_time), "non_generation_time/")
-
-    def token_perf(response_lengths, non_generation_time, key=""):
-        max_response_length = max(response_lengths)
-        if args.rollout_num_gpus:
-            log_dict[f"{key}tokens_per_gpu_per_sec"] = sum(response_lengths) / rollout_time / args.rollout_num_gpus
-        log_dict[f"longest_{key}sample_tokens_per_sec"] = max_response_length / rollout_time
-
-        if max(non_generation_time) == 0:
-            return
-
-        non_generation_time = [
-            t for t, length in zip(non_generation_time, response_lengths, strict=True) if length == max_response_length
-        ]
-        mean_non_generation_time = sum(non_generation_time) / len(non_generation_time)
-
-        log_dict[f"longest_{key}sample_non_generation_time"] = mean_non_generation_time
-        log_dict[f"longest_{key}sample_tokens_per_sec_without_non_generation"] = max_response_length / (
-            rollout_time - mean_non_generation_time
-        )
-
-    token_perf([sample.response_length for sample in samples], non_generation_time, key="")
-    token_perf([sample.effective_response_length for sample in samples], non_generation_time, key="effective_")
-
-    return log_dict
-
-
-def _compute_zero_std_metrics(args, all_samples: list[Sample]):
-    # only compute in GRPO-like algorithms where one prompt has multiple responses
-    if args.advantage_estimator == "ppo":
-        return {}
-
-    def _is_zero_std(samples: list[Sample]):
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
-
-    all_sample_groups = group_by(all_samples, lambda s: s.group_index)
-    interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
-
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
-
-    return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
-
-
-def _compute_spec_metrics(args, all_samples: list[Sample]):
-    if getattr(args, "sglang_speculative_algorithm", None) is None:
-        return {}
-    num_samples = len(all_samples)
-    metrics = {}
-    metrics["spec_accept_rate"] = sum(sample.spec_info.spec_accept_rate for sample in all_samples) / num_samples
-    metrics["spec_accept_length"] = sum(sample.spec_info.spec_accept_length for sample in all_samples) / num_samples
-    return metrics
-
-
-def _compute_prefix_cache_metrics(args, all_samples: list[Sample]):
-    num_samples = len(all_samples)
-    metrics = {}
-    total_cached_tokens = sum(sample.prefix_cache_info.cached_tokens for sample in all_samples)
-    total_prompt_tokens = sum(sample.prefix_cache_info.total_prompt_tokens for sample in all_samples)
-
-    metrics["prefix_cache_hit_rate"] = total_cached_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0
-    metrics["avg_cached_tokens_per_sample"] = total_cached_tokens / num_samples
-    return metrics
-
-
-def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
-    reward_cat_key = args.log_reward_category
-    if reward_cat_key is None:
-        return {}
-
-    samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
-
-    return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}

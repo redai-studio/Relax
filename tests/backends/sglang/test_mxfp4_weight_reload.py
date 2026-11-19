@@ -2,21 +2,28 @@
 
 """Exercise the shipped reload hooks without importing SGLang's GPU kernels."""
 
-from pathlib import Path
+import ast
 from types import SimpleNamespace
 
 import pytest
 
+from tests.backends.sglang.source_utils import sglang_source_path
+
 
 torch = pytest.importorskip("torch")
-PATCH = Path(__file__).resolve().parents[3] / "docker/patch/sglang/v0.5.17.patch"
 
 
 def _method(backend: str):
-    patch = PATCH.read_text().rsplit("diff --git a/python/sglang/srt/layers/quantization/mxfp4.py", 1)[1]
-    source = "\n".join(line[1:] for line in patch.splitlines() if line.startswith(("+", " ")))
-    source = source[source.index("    @torch.no_grad()") :]
-    source = source.split("    def _process_mxfp4_weights_after_loading")[0]
+    tree = ast.parse(sglang_source_path("srt/layers/quantization/mxfp4.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Mxfp4MoEMethod")
+    hooks = {
+        "restore_weights_before_loading",
+        "_copy_mxfp4_runtime_tensor",
+        "_reuse_mxfp4_loading_storage",
+        "process_weights_after_loading",
+    }
+    cls.bases = []
+    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in hooks]
     namespace = {
         "torch": torch,
         "Parameter": torch.nn.Parameter,
@@ -25,8 +32,9 @@ def _method(backend: str):
         "_flashinfer_mxfp4_permute_indices_device_cache": {},
         "get_moe_a2a_backend": lambda: SimpleNamespace(is_megamoe=lambda: backend == "megamoe"),
     }
-    exec("class ReloadHooks:\n" + source, namespace)
-    method = namespace["ReloadHooks"]()
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "<sglang-mxfp4-hooks>", "exec"), namespace)
+    method = namespace["Mxfp4MoEMethod"]()
+    method.use_mega_moe = backend == "megamoe"
     method.use_deep_gemm = backend in ("deep_gemm", "megamoe")
     method.use_triton_kernels = backend == "triton"
     method.use_flashinfer = backend == "sm90"

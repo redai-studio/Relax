@@ -62,9 +62,12 @@ def _wait_for_eval_plan(actor, rollout_id: int) -> tuple[int, int]:
                 break
             time.sleep(1)
     n_t = torch.tensor([n, pair_count], device=device_utils.make_current_torch_device(), dtype=torch.long)
-    dist.broadcast(n_t, group=mpu.get_context_parallel_group(), group_src=0)
-    dist.broadcast(n_t, group=mpu.get_tensor_model_parallel_group(), group_src=0)
-    dist.broadcast(n_t, group=mpu.get_pipeline_model_parallel_group(), group_src=0)
+    if mpu.get_context_parallel_world_size() > 1:
+        dist.broadcast(n_t, group=mpu.get_context_parallel_group(), group_src=0)
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        dist.broadcast(n_t, group=mpu.get_tensor_model_parallel_group(), group_src=0)
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        dist.broadcast(n_t, group=mpu.get_pipeline_model_parallel_group(), group_src=0)
     return int(n_t[0].item()), int(n_t[1].item())
 
 
@@ -188,13 +191,15 @@ def run_sft_eval(actor, rollout_id: int) -> None:
         agg = torch.tensor([local_neg_log_prob, float(local_num_tokens)], device=device, dtype=torch.float64)
     # Only the last PP stage holds non-zero values; SUM across PP propagates
     # them to every PP rank without needing a global src rank lookup.
-    dist.all_reduce(agg, op=dist.ReduceOp.SUM, group=mpu.get_pipeline_model_parallel_group())
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        dist.all_reduce(agg, op=dist.ReduceOp.SUM, group=mpu.get_pipeline_model_parallel_group())
     # DP+CP all-reduce: each CP rank holds a partial sum over its zigzag
     # slice (callback uses the chunked loss mask for both numerator and
     # denominator), so we must include CP in the reduce to recover the
-    # full-sequence totals; with_context_parallel=True is a no-op when
-    # CP == 1.
-    dist.all_reduce(agg, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    # full-sequence totals. With CP == 1, this is the ordinary DP group.
+    dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+    if dist.get_world_size(dp_cp_group) > 1:
+        dist.all_reduce(agg, op=dist.ReduceOp.SUM, group=dp_cp_group)
 
     if is_classification:
         totals = {key: float(agg[i].item()) for i, key in enumerate(stat_keys)}
@@ -322,8 +327,11 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
             if dist.get_rank() == 0:
                 run(actor.data_system_client.async_clear_partition(partition_id=partition_id))
 
-    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_pipeline_model_parallel_group())
-    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_pipeline_model_parallel_group())
+    dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+    if dist.get_world_size(dp_cp_group) > 1:
+        dist.all_reduce(local, op=dist.ReduceOp.SUM, group=dp_cp_group)
     metrics = finalize_pair_metrics(local, prefix="dpo" if is_dpo_mode(args) else "rm")
     metrics["perf/preference_eval_time"] = time.monotonic() - started
     if is_megatron_main_rank():

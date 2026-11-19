@@ -14,7 +14,7 @@
 set -ex
 set -o pipefail
 
-now=$(date "+%Y-%m-%d-%H:%M:%S")
+now=$(date "+%Y%m%d-%H%M%S")
 echo "Current time: $now"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -24,9 +24,11 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/examples/qwen3-4b-elastic-hybrid}"
-EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../exps}"
-MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
-DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
+EXP_NAME="${EXP_NAME:-qwen3-4b-grpo-8xgpu-elastic-hybrid}"
+: "${MODEL_DIR:?Set MODEL_DIR to the model root}"
+: "${DATA_DIR:?Set DATA_DIR to the dataset root}"
+: "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
+export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 AUTOSCALER_CONFIG="${AUTOSCALER_CONFIG:-examples/elastic_rollout/autoscaler.yaml}"
@@ -46,8 +48,10 @@ CKPT_ARGS=(
    --ref-load "${MODEL_DIR}/Qwen3-4B/"
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
-   --save "${EXP_DIR}/Qwen3-4B_mcore_8xgpu_elastic_hybrid/"
+   --load "${SAVE_DIR}/${EXP_NAME}"
+   --save "${SAVE_DIR}/${EXP_NAME}"
    --save-interval 100
+   --max-actor-ckpt-to-keep 2
 )
 
 PROMPT_SET="${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl"
@@ -118,9 +122,10 @@ SGLANG_ARGS=(
 )
 
 METRICS_ARGS=(
+   --use-clearml
    --use-metrics-service
    --tb-project-name "${PROJECT_NAME}"
-   --tb-experiment-name "qwen3-4b-GRPO-gpu8-elastic-hybrid-${now}"
+   --tb-experiment-name "${EXP_NAME}-${now}"
 )
 
 MISC_ARGS=(
@@ -141,7 +146,7 @@ PIPELINE_ARGS=(
    --num-iters-per-train-update 1
 )
 
-mkdir -p log
+mkdir -p "${SCRIPT_DIR}/log"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD_ADDRESS}" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -157,4 +162,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD_ADDRESS}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${ELASTIC_ARGS[@]}" \
-   "${MISC_ARGS[@]}" 2>&1 | tee "log/qwen3-4b-GRPO-gpu8-elastic-hybrid-${now}.log"
+   "${MISC_ARGS[@]}" 2>&1 | tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"

@@ -1,6 +1,6 @@
 # External Model Integration
 
-This guide covers the minimum path for adding an external model to Relax with SGLang rollout and Megatron training. Use the current dots.mcore / dots.mocr support as the reference implementation.
+This guide covers the minimum path for adding an external model to Relax with SGLang rollout and Megatron training. Use the current dots.mocr support as the reference implementation.
 
 ## Overview
 
@@ -137,7 +137,7 @@ Common alignment failures:
 - Missing Bridge mappings for fused qkv, fused MLP, or vision tower weights.
 - SGLang `load_weights()` not accepting the exported HF names.
 
-## dots.mcore / dots.mocr Reference
+## dots.mocr Reference
 
 Model checkpoint:
 

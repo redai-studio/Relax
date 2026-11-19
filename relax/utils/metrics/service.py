@@ -23,11 +23,13 @@ from relax.utils.metrics.adapters.tensorboard import _TensorboardAdapter
 from relax.utils.metrics.adapters.wandb import _is_offline_mode
 from relax.utils.metrics.sglang_exporter import SGLangMetricsExporter
 from relax.utils.metrics.timeline_trace import TimelineTraceAdapter
+from relax.utils.straggler.control_routes import router as straggler_router
 
 
 logger = get_logger(__name__)
 
 app = FastAPI()
+app.include_router(straggler_router)
 
 
 @app.middleware("http")
@@ -132,6 +134,7 @@ class MetricsService:
         self._rollout_handle_task: asyncio.Task[Any] | None = None
         self._sglang_exporter = SGLangMetricsExporter(self._discover_sglang_engines)
         self._adapters = {}
+        self._tracking_finish_task: Optional[asyncio.Task] = None
         self._finished = False
 
         if getattr(config, "use_tensorboard", False):
@@ -156,6 +159,7 @@ class MetricsService:
                 logger.error(f"Failed to initialize Apprise adapter: {e}")
 
         self._use_wandb = getattr(config, "use_wandb", False)
+        self._wandb_async_steps = False
         if self._use_wandb:
             try:
                 self._init_wandb(config)
@@ -301,7 +305,22 @@ class MetricsService:
 
                 if self._use_wandb:
                     try:
-                        wandb.log(metrics_dict, step=step)
+                        self._wandb_async_steps = self._wandb_async_steps or bool(metrics_dict.get("eval/async_judge"))
+                        if self._wandb_async_steps:
+                            # Late eval results cannot use W&B's monotonic history
+                            # step. Keep all subsequent reports on custom axes too.
+                            wandb_metrics = metrics_dict.copy()
+                            for prefix, step_key in (
+                                ("train/", "train/step"),
+                                ("rollout/", "rollout/step"),
+                                ("eval/", "eval/step"),
+                                ("perf/", "rollout/step"),
+                            ):
+                                if any(name.startswith(prefix) for name in metrics_dict):
+                                    wandb_metrics.setdefault(step_key, step)
+                            wandb.log(wandb_metrics)
+                        else:
+                            wandb.log(metrics_dict, step=step)
                         report_results["wandb"] = "success"
                         logger.debug(f"Reported {len(metrics_dict)} metrics to W&B for step {step}")
                     except Exception as e:
@@ -389,6 +408,46 @@ class MetricsService:
         format."""
         body = await self._sglang_exporter.scrape()
         return Response(content=body, headers={"Content-Type": CONTENT_TYPE_LATEST})
+
+    async def finish_tracking(self) -> Dict[str, Any]:
+        """Persist queued tracking events after successful training, before
+        Serve exits.
+
+        Called through the deployment handle after training services have
+        stopped. This is deliberately separate from replica destruction: a
+        replica may also be removed during a failed run or a global restart.
+        """
+        if self._tracking_finish_task is None:
+
+            def close_backends() -> Dict[str, str]:
+                results = {}
+                for name in ("tensorboard", "clearml"):
+                    if name not in self._adapters:
+                        continue
+                    try:
+                        self._adapters[name].finish()
+                        results[name] = "success"
+                    except Exception as error:
+                        results[name] = f"error: {error}"
+                        logger.exception(f"Failed to finish tracking backend {name}")
+                if self._use_wandb:
+                    try:
+                        wandb.finish()
+                        results["wandb"] = "success"
+                    except Exception as error:
+                        results["wandb"] = f"error: {error}"
+                        logger.exception("Failed to finish tracking backend wandb")
+                return results
+
+            # Keep the replica event loop responsive to health checks while an
+            # asynchronous reporter drains. Concurrent/retried calls share the
+            # same operation, even if an individual request is cancelled.
+            self._tracking_finish_task = asyncio.create_task(asyncio.to_thread(close_backends))
+        results = dict(await asyncio.shield(self._tracking_finish_task))
+        return {
+            "status": "success" if all(value == "success" for value in results.values()) else "error",
+            "results": results,
+        }
 
     @app.get("/health")
     async def health(self) -> Dict[str, Any]:

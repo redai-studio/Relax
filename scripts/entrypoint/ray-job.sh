@@ -67,6 +67,8 @@ source "${DIR}/kernel-cache.sh"
 # SIGKILLed `/usr/bin/python3 ... ray start --head` on the head node → GCS reset → jobs
 # vanished + SSH/dashboard flapped (see project memory "ray-job.sh kills head"). The new
 # script is structurally incapable of hitting a ray daemon, so it is safe to run clusterwide.
+# Fresh/dedicated clusters can preserve all existing jobs and placements.
+if [[ "${RELAX_SKIP_CLUSTER_CLEANUP:-0}" != 1 ]]; then
 echo "=== Cleaning up residual Relax/SGLang worker processes ==="
 python ${DIR}/../tools/run_on_each_ray_node.py ${DIR}/../tools/kill_for_ray.sh || echo "failed"
 
@@ -150,6 +152,10 @@ finally:
     ray.shutdown()
 PY
 
+else
+    echo "=== Skipping cluster cleanup (RELAX_SKIP_CLUSTER_CLEANUP=1) ==="
+fi
+
 set -x
 
 # ── environment setup ───────────────────────────────────────────────────────
@@ -230,6 +236,9 @@ export RUNTIME_ENV_JSON="{
 }"
 
 relax_kernel_cache_inject_runtime_env
+
+# Enforce terminal success for every local Ray submission from the launcher.
+source "${DIR}/ray-status.sh"
 
 echo "=== Ray-job environment ready ==="
 

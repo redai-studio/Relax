@@ -75,7 +75,9 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 | `style:`    | Code style (formatting, no logic change) |
 | `refactor:` | Code refactoring                         |
 | `test:`     | Adding or updating tests                 |
-| `chore:`    | Maintenance, CI, build changes           |
+| `ci:`       | CI configuration and workflow changes    |
+| `build:`    | Build system or dependency changes       |
+| `chore:`    | Other maintenance tasks                  |
 | `perf:`     | Performance improvements                 |
 
 Example:

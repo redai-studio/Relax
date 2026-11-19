@@ -218,7 +218,7 @@ FP8 配方额外需要一个支持 FP8 blockwise scaling 的 TransformerEngine �
 
 INT4 fake-QAT 必须配置 `--no-gradient-accumulation-fusion`：STE 会替换权重张量，而 TE 融合权重梯度累积依赖原始张量上的属性。此参数关闭融合优化，仍保留梯度累积。Qwen3 和 Kimi 的 INT4 脚本已包含该参数，改写脚本时请保留。
 
-#### 编译 int4_qat kernel
+#### 编译 int4_qat kernel {#build-int4-qat-kernel}
 
 ```bash
 cd relax/backends/megatron/kernels/int4_qat

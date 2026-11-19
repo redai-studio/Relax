@@ -4,7 +4,9 @@ import logging
 import pickle
 import time
 from argparse import Namespace
+from concurrent.futures import CancelledError
 from functools import partial
+from threading import Event
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -327,8 +329,7 @@ class MicroBatchListIterator:
         return out, meta
 
     def get_buffer(self) -> List[Tuple[Dict[str, Any], Any]]:
-        """Return the full mb list — used by actor for end-of-rollout
-        logging."""
+        """Return cached batches, including VPP alignment padding."""
         return self.mbs
 
     def step(self, partition_id: str) -> None:  # noqa: ARG002
@@ -401,9 +402,9 @@ def _broadcast_routed_experts(
     PP step (among tp_rank==0 peers) fans to all PP stages, and finally
     the TP step fans from tp_rank==0 to the remaining TP ranks.
 
-    Using ``dist.broadcast`` on contiguous GPU tensors is orders of magnitude
-    faster than ``broadcast_object_list`` which pickles everything (~14 s for
-    377 MB vs sub-second via NCCL).
+    CPU-resident results use a bounded CUDA staging buffer, so a long batch
+    does not require a full-batch allocation on every model-parallel rank.
+    ``keep_on_gpu`` retains the direct GPU path for indexer replay.
     """
 
     def _bcast_tensor(tensor, is_sender, dtype):
@@ -416,8 +417,7 @@ def _broadcast_routed_experts(
         def _bcast_unknown_shape(t, has_data, src_global, group):
             """Broadcast a tensor whose shape is unknown to receivers.
 
-            Broadcasts ndim -> shape -> data in three NCCL calls. Returns the
-            broadcast tensor on *cuda_dev* with *dtype*.
+            Broadcast ndim and shape, then stream the payload through NCCL.
             """
             if has_data and t is not None:
                 ndim_t = torch.tensor([t.ndim], dtype=torch.long, device=cuda_dev)
@@ -433,12 +433,33 @@ def _broadcast_routed_experts(
             dist.broadcast(shape_t, src=src_global, group=group)
             shape = torch.Size(shape_t.tolist())
 
+            if keep_on_gpu:
+                if has_data and t is not None:
+                    buf = t.to(dtype=dtype, device=cuda_dev).contiguous()
+                else:
+                    buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+                dist.broadcast(buf, src=src_global, group=group)
+                return buf
+
             if has_data and t is not None:
-                buf = t.to(dtype=dtype, device=cuda_dev).contiguous()
+                result = t.to(dtype=dtype, device="cpu").contiguous()
             else:
-                buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
-            dist.broadcast(buf, src=src_global, group=group)
-            return buf
+                result = torch.empty(shape, dtype=dtype, device="cpu")
+            flat = result.view(-1)
+            # Reuse one buffer; neither source nor receiver stages the full
+            # batch on GPU. Blocking copies keep it safe to reuse across chunks
+            # and across the following CP -> PP -> TP broadcasts.
+            chunk_elements = max(1, (64 * 1024 * 1024) // result.element_size())
+            staging = torch.empty(min(flat.numel(), chunk_elements), dtype=dtype, device=cuda_dev)
+            for start in range(0, flat.numel(), chunk_elements):
+                end = min(start + chunk_elements, flat.numel())
+                chunk = staging[: end - start]
+                if has_data:
+                    chunk.copy_(flat[start:end])
+                dist.broadcast(chunk, src=src_global, group=group)
+                if not has_data:
+                    flat[start:end].copy_(chunk)
+            return result
 
         # Short-circuit: when CP, TP and PP groups are all trivial (size 1),
         # skip the GPU round-trip entirely and return the source tensor.
@@ -487,9 +508,8 @@ def _broadcast_routed_experts(
     offsets_out = _bcast_tensor(offsets, is_src, torch.long)
 
     if keep_on_gpu:
-        # When optimize_routing_replay is enabled, keep tensors on GPU to
-        # avoid a redundant GPU→CPU→GPU round-trip.  fill_routing_replay's
-        # RoutingReplay.record() handles GPU→CPU-pinned copy automatically.
+        # Indexer replay consumes GPU tensors. MoE routing replay instead packs
+        # CPU inputs into per-layer, per-microbatch pinned buffers.
         # _bcast_tensor may short-circuit and return CPU tensors when all
         # groups are trivial (size 1); ensure GPU residency in that case.
         if not values_out.is_cuda:
@@ -498,7 +518,7 @@ def _broadcast_routed_experts(
             offsets_out = offsets_out.to(device=cuda_dev)
         return values_out, offsets_out
 
-    # Move back to CPU for downstream consumption (fill_routing_replay etc.)
+    # Chunked broadcasts already return CPU tensors.
     return values_out.cpu(), offsets_out.cpu()
 
 
@@ -557,10 +577,11 @@ def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
             return tensor.to(dtype=dtype).contiguous()
         return torch.empty(shape, dtype=dtype)
 
-    # --- Step 1: CP broadcast (CP=0 -> other CP ranks of TP=0/PP=0) ---
-    # Only the global source's CP group has real data on its rank-0; the rest
-    # broadcast a placeholder that the TP / PP stages below overwrite.
-    if not cp_trivial:
+    # --- Step 1: CP broadcast among TP=0 peers ---
+    # TP is constant within a CP group. Other TP ranks receive real data in
+    # step 2, so their CP placeholders are unnecessary. Keep every PP stage:
+    # with broadcast_pp=False, each stage has its own (TP=0, CP=0) source.
+    if not cp_trivial and mpu.get_tensor_model_parallel_rank() == 0:
         tensor = _bcast(tensor, is_src, mpu.get_context_parallel_group())
 
     # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
@@ -702,6 +723,53 @@ def fetch_data_from_transfer_queue(
     if batch_meta.size == 0:
         return [None, batch_meta], time.perf_counter() - start
     return [tq_client.get_data(batch_meta), batch_meta], time.perf_counter() - start
+
+
+def _prefetch_data_from_transfer_queue(
+    tq_client,
+    data_fields: list[str],
+    batch_size: int,
+    partition_id: str,
+    task_name: str,
+    sampling_config: dict,
+    batch_index: int,
+    *,
+    cancel_event: Event,
+    poll_interval: float = 0.05,
+    timeout: float = 300.0,
+    fetch_data: Callable | None = None,
+) -> tuple[list, float]:
+    """Wait for one raw CPU batch without abandoning an empty partition.
+
+    Only empty metadata is retried, using the same sampler replay key. Once
+    metadata is nonempty, the payload is fetched exactly once, even if a stop
+    arrives during the RPC. The local deadline bounds empty polling; in-flight
+    RPCs retain the TransferQueue client's own timeout. Report only RPC time,
+    excluding polling sleeps, for the existing data-fetch metric.
+    """
+    deadline = time.monotonic() + timeout
+    fetch_seconds = 0.0
+    while True:
+        if cancel_event.is_set():
+            raise CancelledError("SFT train-data prefetch stopped")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"SFT train-data prefetch timed out waiting for partition {partition_id}")
+        fetch = fetch_data if fetch_data is not None else fetch_data_from_transfer_queue
+        client_kwargs = {} if fetch_data is not None else {"tq_client": tq_client}
+        payload, elapsed = fetch(
+            **client_kwargs,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+        )
+        fetch_seconds += elapsed
+        if payload[1].size > 0:
+            return payload, fetch_seconds
+        # An interruptible wait lets shutdown stop polling without a new RPC.
+        cancel_event.wait(min(max(poll_interval, 0.001), max(0.0, deadline - time.monotonic())))
 
 
 def get_data_from_transfer_queue(
@@ -990,13 +1058,14 @@ def get_data_from_transfer_queue(
     # per-sample list happens below.
     if has_routed_experts and not per_rank_fetch:
         with timer("tgd_bcast_rexp"):
+            # Even with inference-side optimize_routing_replay enabled, keep
+            # training inputs on CPU until CP/TP slicing and PP layer selection.
             routed_experts_values, routed_experts_offsets = _broadcast_routed_experts(
                 routed_experts_values,
                 routed_experts_offsets,
                 should_fetch,
                 cuda_dev,
                 broadcast_pp,
-                keep_on_gpu=getattr(args, "optimize_routing_replay", False),
             )
 
     if has_indexer_topk and not per_rank_fetch:
@@ -1018,7 +1087,15 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Keep scalar metadata as Python values across the TensorDict boundary,
             # including NestedTensor values reconstructed by TransferQueue.
-            if "lengths" in k or "reward" in k or k in ("sample_index_mask_sums", "sample_indices"):
+            if k == "agentic_group_ids":
+                from relax.utils.agentic_obs.records import decode_group_ids
+
+                new_rollout_data[k] = decode_group_ids(v)
+            elif (
+                "lengths" in k
+                or "reward" in k
+                or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids", "sample_indices"}
+            ):
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path
@@ -1107,6 +1184,14 @@ def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> Non
 
 
 def post_process_rollout_data(args, rollout_data):
+    from relax.engine.sft.runtime import is_embedding_sft_mode
+
+    if is_embedding_sft_mode(args):
+        from relax.utils.training.embedding import expand_embedding_pairs
+
+        expanded = expand_embedding_pairs(rollout_data)
+        rollout_data.clear()
+        rollout_data.update(expanded)
     _add_sft_token_lengths(args, rollout_data)
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
@@ -1122,12 +1207,23 @@ def post_process_rollout_data(args, rollout_data):
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
     from relax.utils.training.prefix_runtime import record_host_prefix_inputs
 
+    if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
+        masks = rollout_data["loss_masks"]
+        # Per-rank fetch supplies CPU masks. Never copy CUDA masks back in the
+        # training path; unsupported producers simply retain the original head.
+        if all(not isinstance(mask, torch.Tensor) or mask.device.type == "cpu" for mask in masks):
+            rollout_data["selective_loss_masks_cpu"] = [torch.as_tensor(mask, dtype=torch.int) for mask in masks]
+
     record_host_prefix_inputs(rollout_data)
     cuda_dev = device_utils.make_current_torch_device()
     rollout_data["tokens"] = [torch.as_tensor(t, dtype=torch.long, device=cuda_dev) for t in rollout_data["tokens"]]
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
+    if "pre_shifted_labels" in rollout_data:
+        rollout_data["pre_shifted_labels"] = [
+            torch.as_tensor(label, dtype=torch.long, device=cuda_dev) for label in rollout_data["pre_shifted_labels"]
+        ]
     if "classification_labels" in rollout_data:
         label_dtype = (
             torch.long
@@ -1171,15 +1267,26 @@ def post_process_rollout_data(args, rollout_data):
         "values",
         *iter_opd_cp_float_fields(),
     ]
+    response_field_dtypes = dict.fromkeys(response_float_fields, torch.float32)
+    response_field_dtypes["rollout_topk_support_complete"] = torch.bool
+    for key, dtype in (("rollout_topk_token_ids", torch.long), ("rollout_topk_log_probs", torch.float32)):
+        if key in rollout_data:
+            rollout_data[key] = [
+                torch.as_tensor(row, device=cuda_dev, dtype=dtype).reshape(
+                    response_length, args.rollout_top_logprobs_num
+                )
+                for row, response_length in zip(rollout_data[key], rollout_data["response_lengths"], strict=True)
+            ]
+            response_field_dtypes[key] = dtype
     rewards = rollout_data.get("rewards", [])
     if rewards and isinstance(rewards[0], list):
         rollout_data["rewards"] = [
             row * response_length if len(row) == 1 else row
             for row, response_length in zip(rewards, rollout_data["response_lengths"], strict=True)
         ]
-        response_float_fields.append("rewards")
+        response_field_dtypes["rewards"] = torch.float32
 
-    for key in response_float_fields:
+    for key, dtype in response_field_dtypes.items():
         if key not in rollout_data:
             continue
         # Dynamic CP: keep per-sample log-prob fields FULL-length at ingestion.
@@ -1191,7 +1298,7 @@ def post_process_rollout_data(args, rollout_data):
         # forward, but rollout_log_probs is not, so it would reach logging CP-split.
         if getattr(args, "dynamic_context_parallel", False):
             rollout_data[key] = [
-                torch.as_tensor(log_prob, device=cuda_dev, dtype=torch.float32) for log_prob in rollout_data[key]
+                torch.as_tensor(log_prob, device=cuda_dev, dtype=dtype) for log_prob in rollout_data[key]
             ]
             continue
         rollout_data[key] = [
@@ -1205,7 +1312,7 @@ def post_process_rollout_data(args, rollout_data):
                     padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
                 ),
                 device=cuda_dev,
-                dtype=torch.float32,
+                dtype=dtype,
             )
             for i, (log_prob, total_length, response_length) in enumerate(
                 zip(
@@ -1225,8 +1332,10 @@ def post_process_rollout_data(args, rollout_data):
     if "rollout_routed_experts" in rollout_data:
         from tensordict.tensorclass import NonTensorData
 
+        # Pack CP/TP slices and PP-local layers on CPU in fill_routing_replay.
+        # Upload and widen indices only when a router consumes its microbatch.
         rollout_data["rollout_routed_experts"] = [
-            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.long, device=cuda_dev)
+            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.int32, device="cpu")
             for r in rollout_data["rollout_routed_experts"]
         ]
 

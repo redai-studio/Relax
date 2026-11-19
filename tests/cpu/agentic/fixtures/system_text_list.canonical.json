@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Rule A\n\nRule B"
+    },
+    {
+      "role": "user",
+      "content": "hi"
+    }
+  ],
+  "tools": [],
+  "chat_template_kwargs": {}
+}

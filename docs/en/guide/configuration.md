@@ -69,6 +69,8 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--critic-load` | str | None | Critic model checkpoint path. When None, equals `--load` |
 | `--critic-save` | str | None | Critic model save path |
 
+When a native Megatron checkpoint is selected, a missing iteration directory is an error rather than a fallback to HF initialization. DCP shard files are checked for missing or truncated storage before loading. A training resume requires optimizer, scheduler, and RNG state unless the corresponding reset is explicit: use `--no-load-optim` to reset the optimizer and scheduler, `--no-load-rng` to reset RNG, or `--finetune` to start a new run from native model weights. These options do not repair damaged shards. Megatron release checkpoints remain weights-only sources. HF weight initialization remains available through an explicit HF source.
+
 ---
 
 ## Data Configuration
@@ -299,7 +301,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--advantage-estimator` | str | grpo | generated from `ALGORITHM_SPECS` in `relax/algorithms/spec.py`; currently `grpo`, `gspo`, `sapo`, `cispo`, `rloo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` | Advantage estimator. `--help` is authoritative: the choices are read from the registry, so a new algorithm appears there without this table being edited. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
+| `--advantage-estimator` | str | grpo | generated from `ALGORITHM_SPECS` in `relax/algorithms/spec.py`; currently `grpo`, `score_centering`, `gspo`, `sapo`, `cispo`, `rloo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` | Advantage estimator. `--help` is authoritative: the choices are read from the registry, so a new algorithm appears there without this table being edited. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
 | `--normalize-advantages` | flag | False | - | Whether to normalize advantages |
 | `--disable-grpo-std-normalization` | flag | - | - | Disable GRPO standard deviation normalization (from [Dr.GRPO](https://arxiv.org/pdf/2503.20783)) |
 | `--disable-rewards-normalization` | flag | - | - | Disable reward normalization |
@@ -476,6 +478,18 @@ How the SFT producer handles samples whose tokenized + media-expanded length exc
 |-----------|------|---------|---------|-------------|
 | `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` drops the sample; `keep` returns it unchanged (may OOM downstream); `truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first `capacity` tokens; `custom` delegates to `--sft-oversize-custom-function-path`. ⚠ Truncating multimodal samples in-place may misalign `multimodal_train_inputs` — use `custom` if you also need to trim media inputs. |
 | `--sft-oversize-custom-function-path` | str | None | - | Required when `--sft-oversize-strategy custom`. Importable path to a function with signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`. Returning `None` is treated as `skip`. |
+
+To keep complete SFT samples above the packing budget but skip samples beyond `--seq-length`, add these options to the training command:
+
+```bash
+--seq-length 262144 \
+--use-dynamic-batch-size \
+--max-tokens-per-gpu 131072 \
+--sft-oversize-strategy custom \
+--sft-oversize-custom-function-path relax.engine.sft.dataset.oversize.keep_within_sequence_limit
+```
+
+This policy reads `--seq-length` directly; no additional environment variable is needed. With CP=1, samples above 131072 and up to 262144 expanded tokens stay intact in their own micro-batches; longer samples are skipped. Keep `0 < max_tokens_per_gpu × context_parallel_size <= seq_length`, because samples within the packing budget bypass the oversize hook. The policy preserves tokens and loss masks; it does not reduce the memory required by a long sample.
 
 Preference training uses these same options after applying `--preference-max-length` and `--preference-max-completion-length`. The capacity counts both branches together: `keep` preserves the pair in its own micro-batch, while `skip` drops the whole pair.
 

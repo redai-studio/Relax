@@ -2,8 +2,11 @@
 
 import argparse
 import json
+import math
 import os
 import sys
+import time
+import uuid
 import warnings
 from typing import Any
 
@@ -21,6 +24,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
+    is_managed_opd_teacher_colocate,
     is_managed_opd_teacher_enabled,
     teacher_sglang_parse_args,
     validate_managed_opd_teacher_colocate_args,
@@ -41,7 +45,7 @@ logger = get_logger(__name__)
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps'
+    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
@@ -79,6 +83,38 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _step_or_epoch_interval(value: str) -> int | str:
+    return "epoch" if value == "epoch" else int(value)
+
+
+def _add_step_or_epoch_interval(parser, name: str) -> None:
+    reset_arg(parser, name, type=_step_or_epoch_interval, default=None)
+    # reset_arg preserves the native Megatron action's type; update it here too.
+    action = parser._option_string_actions[name]
+    action.type = _step_or_epoch_interval
+    action.help = (
+        "Positive step interval, or 'epoch' for native Megatron SFT nominal epochs: "
+        "completed steps * global batch size / unfiltered training split size. "
+        "Skipped samples are replaced and do not advance this counter; with filtering, "
+        "it does not track dataset cursor passes. This interval does not change training length."
+    )
+
+
+def _fault_events_port(value: str) -> int:
+    parsed = int(value)
+    if not 0 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("expected a port from 0 to 65535")
+    return parsed
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    """argparse type for bounded auxiliary-loss coefficients."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a finite non-negative float, got {value!r}")
     return parsed
 
 
@@ -258,6 +294,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=1,
                 help="Fully async pipeline num of iters every global batch.",
             )
+            # ── RDMA transport (MooncakeStore backend) ──────────────────────────
+            # The default selects the existing SimpleStorage data path. These
+            # expose *intent* only; Mooncake internals (endpoint,
+            # buffer, segment, timeout, master strategy) are handled via internal
+            # defaults / deployment environment, not CLI flags.
+            parser.add_argument(
+                "--tq-rdma-mode",
+                choices=["off", "auto", "required"],
+                default="off",
+                help=(
+                    "TransferQueue data-plane transport. 'off' (default) uses "
+                    "SimpleStorage/ZMQ with bounded worker attach and cleanup. "
+                    "'auto' attempts MooncakeStore over host RDMA and falls back "
+                    "to SimpleStorage when it is unavailable (with a WARNING). "
+                    "'required' fails fast instead of falling back."
+                ),
+            )
+            parser.add_argument(
+                "--tq-rdma-device",
+                type=str,
+                default="",
+                help=(
+                    "RDMA device name for MooncakeStore (e.g. mlx5_bond_0). Empty "
+                    "(default) lets Mooncake auto-select. On multi-NIC hosts the "
+                    "auto-selected device may fail cross-node; specify explicitly if "
+                    "needed."
+                ),
+            )
             return parser
 
         def add_cluster_arguments(parser):
@@ -345,6 +409,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="thd",
                 help="The qkv layout for Megatron backend.",
             )
+            qsa_coeff_option = "--qsa-indexer-loss-coeff"
+            if qsa_coeff_option in parser._option_string_actions:
+                # Megatron registers TransformerConfig fields on newer revisions.
+                qsa_coeff_action = parser._option_string_actions[qsa_coeff_option]
+                qsa_coeff_action.type = _nonnegative_finite_float
+                qsa_coeff_action.default = 0.0
+            else:
+                parser.add_argument(
+                    qsa_coeff_option,
+                    type=_nonnegative_finite_float,
+                    default=0.0,
+                    help="QSA Stage-2 indexer KL coefficient; positive values require the opt-in selected-ID sparse backend.",
+                )
             parser.add_argument(
                 "--true-on-policy-mode",
                 action="store_true",
@@ -532,11 +609,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "logits. Default off — legacy external-loss SFT path materializes full logits "
                 "and runs CE externally. Set --sft-chunked-logits to opt in. MTP head calls "
                 "continue to use the real output_layer before the main head is deferred. "
-                "Incompatible when embeddings are tied "
-                "(--untie-embeddings-and-output-weights not set: output_layer is built with "
-                "skip_weight_param_allocation=True so output_layer.weight is None and the "
-                "chunked path's lm_head matmul has nothing to multiply against; tied models "
-                "are small enough that the chunked path's memory win is marginal anyway).",
+                "Tied embeddings reuse the explicit shared weight passed to the main output layer. "
+                "Chunked recomputation with tied embeddings does not support overlapping "
+                "gradient reduction.",
             )
             parser.add_argument(
                 "--only-train-params-name-list",
@@ -654,6 +729,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-wholepack",
+                action="store_true",
+                help="Enable the reviewed 64-GPU Qwen3.5 wholepack scheduling policy explicitly.",
+            )
+            parser.add_argument(
+                "--sft-packing-strategy",
+                choices=["balanced", "binpack"],
+                default="balanced",
+                help="Dynamic SFT microbatch packing algorithm; binpack preserves the archived SFT recipe.",
+            )
+            parser.add_argument(
                 "--sft-max-in-flight-steps",
                 type=int,
                 default=None,
@@ -703,19 +789,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=["sft", "cpt"],
                 default="sft",
                 help=(
-                    "Use cpt for text-only continued pretraining: raw text plus tokenizer EOS, "
+                    "Use cpt for continued pretraining: raw text plus tokenizer EOS, "
                     "no chat template, and a CPT loss mask (see --sft-cpt-template). Requires --loss-type sft. "
                     "Read text from --input-key (or text/messages when the default input key is absent)."
                 ),
             )
             parser.add_argument(
                 "--sft-cpt-template",
-                choices=["raw", "qwen3_5"],
+                choices=["raw", "qwen3_5", "multimodal"],
                 default="raw",
                 help=(
                     "CPT text preprocessing. raw preserves text and supervises all tokens; "
                     "qwen3_5 matches ms-swift Qwen3.5 generation preprocessing and "
-                    "all+ignore_empty_think masks. Requires --sft-training-mode cpt."
+                    "all+ignore_empty_think masks; multimodal preserves the chat/processor layout and supervises text tokens. Requires --sft-training-mode cpt."
                 ),
             )
             parser.add_argument(
@@ -758,6 +844,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-mask-reasoning",
+                action="store_true",
+                default=False,
+                help=(
+                    "Native causal-LM SFT only. Keep reasoning in the rendered model input but exclude "
+                    "complete reasoning blocks and their delimiters from loss. Supports ChatML/Qwen, "
+                    "DeepSeek-V4 and Gemma4 templates. Default off; unlike --sft-ignore-empty-think, "
+                    "also masks nonempty reasoning. Requires a fast tokenizer with offset mappings."
+                ),
+            )
+            parser.add_argument(
                 "--sft-ignore-empty-think",
                 action="store_true",
                 default=False,
@@ -795,9 +892,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "When set under --loss-type sft, every N rollout steps run a predict pass "
-                    "over the eval dataset (--eval-prompt-data/--eval-config or --eval-size) and write "
-                    "completions to <save>/predict/predictions_step_<rollout_id>.jsonl. "
+                    "When set under --loss-type sft, every N completed training steps run a predict pass "
+                    "over the eval dataset (--eval-prompt-data or --eval-size) and write "
+                    "completions to <save>/predict/predictions_step_<train_step>.jsonl. "
+                    "With --custom-rm-path or --rm-type, also score predictions with evaluation=True; "
+                    "eligible judges run asynchronously unless --disable-eval-async-judge is set. "
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
@@ -868,6 +967,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--rollout-top-k", type=int, default=-1, help="the top-k for the inference engine during rollout."
+            )
+            parser.add_argument(
+                "--rollout-top-logprobs-num",
+                type=_positive_int,
+                default=128,
+                help="Number of behavior-policy candidates recorded for score centering; does not change sampling.",
             )
             parser.add_argument(
                 "--rollout-max-context-len",
@@ -1111,6 +1216,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "and triggers automatic restarts (in-place or global) on failure.",
             )
             parser.add_argument(
+                "--fault-events-enabled",
+                action="store_true",
+                default=False,
+                help="Record bounded in-memory fault events in the driver. Requires --use-health-check.",
+            )
+            parser.add_argument(
+                "--fault-events-port",
+                type=_fault_events_port,
+                default=0,
+                help="Loopback fault event query port (0-65535); 0 selects an available port.",
+            )
+            parser.add_argument(
                 "--max-global-restart",
                 type=int,
                 default=3,
@@ -1297,9 +1414,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--task-type",
                 type=str,
-                choices=["causal_lm", "seq_cls"],
+                choices=["causal_lm", "seq_cls", "embedding"],
                 default="causal_lm",
-                help="SFT task type. `seq_cls` replaces the vocabulary head with a classification head.",
+                help=(
+                    "SFT task type. seq_cls installs a classification head; "
+                    "embedding trains pooled sequence representations."
+                ),
+            )
+            parser.add_argument(
+                "--contrastive-temperature",
+                type=float,
+                default=0.05,
+                help="Positive temperature passed to the embedding loss callback.",
             )
             parser.add_argument(
                 "--num-labels",
@@ -1569,10 +1695,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--agent-command",
                 type=str,
                 default=None,
-                help=(
-                    "Managed-command agent entry command for agentic rollout. "
-                    "Required when --use-agentic-rollout is set."
-                ),
+                help="Command to start the agent.",
             )
             parser.add_argument(
                 "--agent-cwd",
@@ -1695,6 +1818,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_eval_arguments(parser):
             parser.add_argument(
+                "--disable-eval-async-judge",
+                action="store_true",
+                help=(
+                    "Disable background eval judging and wait for scoring after trajectory generation. "
+                    "Background judging is enabled by default. "
+                    "Supports remote_rm and custom rewards declaring reward_func.supports_async_eval = True. "
+                    "Uses a separate CPU reward pool; training and other rewards keep their existing behavior. "
+                    "Normal shutdown waits for pending scores."
+                ),
+            )
+            parser.add_argument(
                 "--eval-function-path",
                 type=str,
                 default=None,
@@ -1705,7 +1839,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             # change the default value of eval_interval from Megatron to None
-            reset_arg(parser, "--eval-interval", type=int, default=None)
+            _add_step_or_epoch_interval(parser, "--eval-interval")
 
             parser.add_argument(
                 "--eval-prompt-data",
@@ -1837,7 +1971,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
-            reset_arg(parser, "--save-interval", type=int, default=None)
+            _add_step_or_epoch_interval(parser, "--save-interval")
             reset_arg(parser, "--async-save", action="store_true")
             parser.add_argument(
                 "--save-lora-only",
@@ -1847,6 +1981,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Save a lightweight, resumable actor checkpoint containing LoRA tensors plus optimizer, "
                     "scheduler, RNG, and iteration state. Frozen base weights are restored from --hf-checkpoint. "
                     "The initial implementation supports synchronous BF16 torch_dist checkpoints only. "
+                    "May be combined with --save-hf to also export the full merged HF model. "
                     "When unset, save the regular full distributed checkpoint."
                 ),
             )
@@ -1954,8 +2089,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Path to the custom loss function, if the loss_type is `custom_loss`, "
-                    "we will use this function to calculate the loss. "
+                    "Dotted loss callback path. For embedding SFT this overrides the default InfoNCE loss. The callback receives "
+                    "pooled query and positive tensors, with temperature and process_group as keyword arguments, and returns "
+                    "a scalar mean loss. Top-level custom_loss uses the standard training loss arguments."
                 ),
             )
             parser.add_argument(
@@ -1973,10 +2109,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Advantage estimator to use. The choices come from the algorithm registry in "
                     "relax/algorithms/spec.py. Note: on-policy distillation (OPD) is orthogonal "
-                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator. "
+                    "to most advantage estimators; score_centering cannot be combined with OPD. "
                     "'rloo' uses a leave-one-out baseline with an unclipped REINFORCE loss (sync only)."
                 ),
             )
+            parser.add_argument(
+                "--score-centering-is",
+                choices=["none", "tis", "mis"],
+                default="none",
+                help="Importance weighting applied inside both score-centering terms.",
+            )
+            parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
+            parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
+            parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
             parser.add_argument(
                 "--sapo-tau-pos",
                 type=float,
@@ -2217,7 +2362,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # wandb
         def add_wandb_arguments(parser):
             # wandb parameters
-            parser.add_argument("--use-wandb", action="store_true", default=False)
+            parser.add_argument("--use-wandb", action=argparse.BooleanOptionalAction, default=False)
             parser.add_argument(
                 "--wandb-mode",
                 type=str,
@@ -2298,7 +2443,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_clearml_arguments(parser):
             # TODO(yuetian): Reuse tb-experiment-name --tb-project-name as the ClearML experiment name currently.
             # Need to refactor the experiment management part later.
-            parser.add_argument("--use-clearml", action="store_true", default=False)
+            parser.add_argument("--use-clearml", action=argparse.BooleanOptionalAction, default=False)
 
             return parser
 
@@ -2388,6 +2533,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
             parser.add_argument(
+                "--dump-agentic-obs",
+                type=str,
+                default=None,
+                help=(
+                    "Dump agentic rollout observability to this directory, one wall-clock subdirectory "
+                    "`<dir>/run_YYYYmmdd_HHMMSS/` per run. Holds three JSONL streams joined by "
+                    "sample_export_id: trajectories/ (the exported lineage, written by each SessionShard), "
+                    "stages/ (reward, selection, transfer and optimizer events) "
+                    "and train/ (actual update inputs, response masks and scalars, written by the policy actor). Unset disables "
+                    "every producer. Independent of --dump-details, which dumps whole .pt tensors."
+                ),
+            )
+            parser.add_argument(
+                "--dump-agentic-obs-media",
+                action="store_true",
+                default=False,
+                help=(
+                    "Also write the media bytes referenced by --dump-agentic-obs trajectories to `media/`, "
+                    "content-addressed by sha256. Without it, inline data: URIs are replaced by their digest "
+                    "and the bytes are dropped. Ignored without --dump-agentic-obs."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-result-dir",
                 type=str,
                 default=None,
@@ -2412,6 +2580,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Number of rollout steps after which to dump the memory snapshot. "
                 "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
+            )
+            parser.add_argument(
+                "--profile-output-dir",
+                type=str,
+                default="traces",
+                help="Root directory for profiler outputs. Experiment name and trace type are appended.",
             )
             parser.add_argument(
                 "--profile-target",
@@ -3045,7 +3219,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
-    slime_validate_args(args)
+    relax_validate_args(args)
 
     if args.train_backend == "fsdp":
         from relax.backends.fsdp.arguments import validate_generative_config
@@ -3251,6 +3425,43 @@ def _normalize_mtp_only_training_args(args) -> None:
     args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
+def _validate_sft_epoch_eval_args(args) -> None:
+    epoch_interval = "epoch" in (getattr(args, "save_interval", None), getattr(args, "eval_interval", None))
+    if not epoch_interval:
+        return
+    from relax.engine.sft.runtime import is_i2i_sft
+
+    if not is_sft_mode(args) or is_i2i_sft(args) or getattr(args, "train_backend", "megatron") != "megatron":
+        raise ValueError("Epoch intervals require native Megatron SFT.")
+    if getattr(args, "custom_dataset_class_path", None):
+        raise ValueError("Epoch intervals require the native dataset.")
+    if epoch_interval and getattr(args, "rotate_ckpt", False):
+        raise ValueError("Epoch intervals cannot be combined with --rotate-ckpt.")
+    if epoch_interval and getattr(args, "save_retain_interval", None):
+        raise ValueError("Epoch intervals cannot be combined with --save-retain-interval.")
+    if epoch_interval and getattr(args, "global_batch_size", None) != getattr(args, "rollout_batch_size", None):
+        raise ValueError("Epoch intervals require rollout_batch_size == global_batch_size for SFT.")
+    if (
+        getattr(args, "sft_predict_interval", None)
+        or getattr(args, "debug_train_only", False)
+        or getattr(args, "debug_rollout_only", False)
+        or getattr(args, "load_debug_rollout_data", None) is not None
+    ):
+        raise ValueError("Epoch intervals require offline training without prediction/debug data.")
+
+
+def _validate_sft_mask_reasoning_args(args) -> None:
+    if not getattr(args, "sft_mask_reasoning", False):
+        return
+    if (
+        not is_sft_mode(args)
+        or getattr(args, "task_type", "causal_lm") != "causal_lm"
+        or getattr(args, "sft_training_mode", "sft") != "sft"
+        or getattr(args, "custom_dataset_class_path", None)
+    ):
+        raise ValueError("--sft-mask-reasoning requires native causal-LM SFT without --custom-dataset-class")
+
+
 def _validate_cpt_args(args) -> None:
     if getattr(args, "sft_training_mode", "sft") != "cpt":
         if getattr(args, "sft_cpt_template", "raw") != "raw":
@@ -3269,13 +3480,17 @@ def _validate_cpt_args(args) -> None:
         "--apply-chat-template-kwargs": getattr(args, "apply_chat_template_kwargs", None),
         "--sft-loss-last-turn-only": getattr(args, "sft_loss_last_turn_only", False),
         "--sft-ignore-empty-think": getattr(args, "sft_ignore_empty_think", False),
+        "--sft-mask-reasoning": getattr(args, "sft_mask_reasoning", False),
         "--sft-predict-interval": getattr(args, "sft_predict_interval", None),
         "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
         "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
     }
+    if getattr(args, "sft_cpt_template", "raw") == "multimodal":
+        for name in ("--multimodal-keys", "--conversation-key-map", "--apply-chat-template-kwargs"):
+            incompatible.pop(name)
     enabled = [name for name, value in incompatible.items() if value]
     if enabled:
-        raise ValueError(f"Text-only CPT does not support: {', '.join(enabled)}.")
+        raise ValueError(f"Selected CPT template does not support: {', '.join(enabled)}.")
 
 
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
@@ -3360,8 +3575,6 @@ def validate_save_lora_only_args(args) -> None:
         incompatible.append("--fp8")
     if args.fp16:
         incompatible.append("--fp16")
-    if args.save_hf is not None:
-        incompatible.append("--save-hf")
     if incompatible:
         raise ValueError("--save-lora-only is incompatible with: " + ", ".join(incompatible))
 
@@ -3548,6 +3761,11 @@ def _validate_lora_vision_scope(args) -> None:
     )
 
 
+def validate_kl_coefficients(args: argparse.Namespace) -> None:
+    """Reject simultaneous reward-side and loss-side KL coefficients."""
+    assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -3560,6 +3778,12 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
 
     args.use_kl_loss = False
     args.kl_coef = 0.0
+    logger.warning(
+        "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
+        "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
+        "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
+        "Drop these KL options from the launch script to silence this warning."
+    )
     return True
 
 
@@ -3585,6 +3809,47 @@ def _assert_spec_implementations_resolve(spec) -> None:
             )
 
 
+def _validate_score_centering_args(args: argparse.Namespace) -> None:
+    if args.advantage_estimator != "score_centering":
+        return
+    if args.loss_type != "policy_loss":
+        raise ValueError("score_centering requires --loss-type policy_loss.")
+    if getattr(args, "multimodal_keys", None):
+        raise ValueError("score_centering currently accepts text-only training inputs.")
+    if getattr(args, "train_backend", None) == "fsdp":
+        raise ValueError(
+            "score_centering requires a text token policy-loss backend; the current FSDP backend trains diffusion."
+        )
+    if getattr(args, "use_opd", False) or getattr(args, "opd_fkl_entropy_gate", False):
+        raise ValueError(
+            "score_centering and OPD cannot be enabled together: centering the advantage-injected distillation "
+            "signal can cancel its update. This release also excludes standalone OPD loss and EOPD."
+        )
+    for flag in (
+        "use_tis",
+        "custom_tis_function_path",
+        "use_opsm",
+        "use_unbiased_kl",
+        "custom_pg_loss_reducer_function_path",
+    ):
+        if getattr(args, flag, False):
+            raise ValueError(f"score_centering is incompatible with --{flag.replace('_', '-')}.")
+    if not math.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0:
+        raise ValueError("score_centering requires a finite positive --rollout-temperature.")
+    if not isinstance(args.rollout_top_logprobs_num, int) or args.rollout_top_logprobs_num < 1:
+        raise ValueError("--rollout-top-logprobs-num must be a positive integer.")
+    if args.score_centering_is not in ("none", "tis", "mis"):
+        raise ValueError("--score-centering-is must be none, tis, or mis.")
+    if not math.isfinite(args.score_centering_tis_clip) or args.score_centering_tis_clip <= 0:
+        raise ValueError("--score-centering-tis-clip must be finite and positive.")
+    if not (
+        math.isfinite(args.score_centering_mis_low)
+        and math.isfinite(args.score_centering_mis_high)
+        and 0 < args.score_centering_mis_low <= args.score_centering_mis_high
+    ):
+        raise ValueError("Score-centering MIS bounds must be finite and satisfy 0 < low <= high.")
+
+
 def validate_algorithm_args(args) -> None:
     """Apply the constraints the algorithm registry declares for this run.
 
@@ -3606,6 +3871,7 @@ def validate_algorithm_args(args) -> None:
     _assert_spec_implementations_resolve(spec)
 
     args.use_critic = spec.needs_critic
+    _validate_score_centering_args(args)
 
     if not spec.supports_context_parallel and (
         getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False)
@@ -3790,6 +4056,10 @@ def apply_custom_config_overrides(args) -> None:
             "Pass --loss-type on the command line instead of overriding it from YAML."
         )
 
+    # Check before normalization, as on the CLI path: conflicting coefficients
+    # must not become valid merely because sync PPO later disables reward KL.
+    validate_kl_coefficients(args)
+
     if is_offline_mode(args):
         return
 
@@ -3807,9 +4077,9 @@ def apply_custom_config_overrides(args) -> None:
     # the frozen function owns a constraint the spec deliberately does not
     # restate.
     #
+    # KL coefficient exclusion and sync PPO normalization are also repeated here.
     # What it does NOT cover, and a YAML file can still move: the `--ref-load`
-    # existence check, the `kl_coef`/`kl_loss_coef` exclusion assert,
-    # `_normalize_sync_ppo_kl_args`, the fully-async resource checks, the
+    # existence check, the fully-async resource checks, the
     # `rollout_batch_size` derivation, and the over-sampling assert. All of
     # them run before the merge and none is an algorithm validator. Closing
     # that class properly means merging the YAML *before* validation rather
@@ -3852,6 +4122,7 @@ def apply_custom_config_overrides(args) -> None:
             f"critic setup than the one already derived. Pass --advantage-estimator on the command line instead "
             f"of overriding it from YAML."
         )
+    _normalize_sync_ppo_kl_args(args)
 
 
 def _validate_ref_load(args: argparse.Namespace) -> None:
@@ -3873,7 +4144,20 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
         )
 
 
-def slime_validate_args(args):
+def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
+    if is_managed_opd_teacher_colocate(args):
+        # The configured rollout/teacher split also applies without a training actor.
+        return
+
+    if args.colocate and not args.rollout_num_gpus:
+        args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
+    else:
+        args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
+        args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
+    args.colocate = False
+
+
+def relax_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
@@ -4049,13 +4333,20 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_offline=is_offline, log=logger)
 
+    # ART resolves the committed DCP iteration and next cursor in its backend.
+    sampling_config = getattr(args, "sampling_config", None)
+    native_art = (
+        args.train_backend == "fsdp"
+        and isinstance(sampling_config, dict)
+        and sampling_config.get("algorithm") == "art"
+    )
     if is_i2i_sft(args):
         # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
         if args.train_backend != "fsdp":
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
-    else:
+    elif not native_art:
         if args.megatron_to_hf_mode == "bridge":
             if (
                 args.load is not None
@@ -4124,7 +4415,7 @@ def slime_validate_args(args):
             "(the predict pass reuses the SFT eval data source)."
         )
 
-    assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+    validate_kl_coefficients(args)
 
     _validate_reinforce_plus_plus_args(args, is_offline)
 
@@ -4200,7 +4491,7 @@ def slime_validate_args(args):
         if args.use_rollout_logprobs:
             assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
-        if args.get_mismatch_metrics:
+        if args.get_mismatch_metrics and args.advantage_estimator != "score_centering":
             assert args.custom_tis_function_path is not None, (
                 "custom_tis_function_path must be set when get_mismatch_metrics is set"
             )
@@ -4273,6 +4564,19 @@ def slime_validate_args(args):
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
 
+    if getattr(args, "dump_agentic_obs", None):
+        # Derived rather than parsed, and stamped exactly once here on the
+        # driver, then carried inside the pickled args Namespace to every Ray
+        # actor. Deriving it lazily per actor would give the SessionShards, the
+        # rollout driver and the actors different directories, splitting one
+        # run's streams across many roots. The suffix separates launches
+        # started in the same second, even when they share an output root.
+        args.agentic_obs_run_id = f"{time.strftime('run_%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:12]}"
+    elif getattr(args, "dump_agentic_obs_media", False):
+        # The media flag only modifies a dump that is not happening. Say so,
+        # rather than letting the operator wait for images that never appear.
+        logger.warning("--dump-agentic-obs-media is set but --dump-agentic-obs is not; nothing will be written.")
+
     if args.load_debug_rollout_data is not None:
         logger.info(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
@@ -4281,6 +4585,7 @@ def slime_validate_args(args):
         args.debug_train_only = True
 
     _validate_cpt_args(args)
+    _validate_sft_mask_reasoning_args(args)
 
     if is_offline:
         if not args.custom_dataset_class_path and not args.prompt_data:
@@ -4349,14 +4654,7 @@ def slime_validate_args(args):
     # deploy a separate reference service. Either KL option would make
     # advantages / actor request a field that never arrives and hang in
     # TQ.get_meta, so disable both for the currently supported sync topology.
-    if _normalize_sync_ppo_kl_args(args):
-        logger.warning(
-            "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
-            "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
-            "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
-            "Drop these KL options from the launch script to silence this warning."
-        )
-    elif args.use_critic and args.use_kl_loss:
+    if not _normalize_sync_ppo_kl_args(args) and args.use_critic and args.use_kl_loss:
         # Preserve the existing behavior outside the synchronous topology.
         logger.warning("PPO does not support --use-kl-loss. Auto-disabling --use-kl-loss.")
         args.use_kl_loss = False
@@ -4375,12 +4673,7 @@ def slime_validate_args(args):
     del args.offload
 
     if args.debug_rollout_only:
-        if args.colocate and (not args.rollout_num_gpus):
-            args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-        else:
-            args.actor_num_gpus_per_node = min(8, args.rollout_num_gpus)
-            args.actor_num_nodes = args.rollout_num_gpus // args.actor_num_gpus_per_node
-        args.colocate = False
+        _configure_rollout_only_gpus(args)
         args.offload_train = args.offload_rollout = False
         if args.train_memory_margin_bytes > 0:
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
@@ -4571,27 +4864,13 @@ def slime_validate_args(args):
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
-    # --sft-chunked-logits incompatibilities. Both are flagged here so
+    # --sft-chunked-logits incompatibilities are flagged here so
     # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # Both are hard asserts — the user must remove --sft-chunked-logits
+    # This is a hard assert — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
-        # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
-        #    Output_layer is built with skip_weight_param_allocation=True →
-        #    output_layer.weight is None → chunked path's lm_head matmul
-        #    crashes on NoneType. The chunked memory win is marginal on the
-        #    small models that ship with tied embeddings anyway, so the user
-        #    should just drop the flag.
-        assert getattr(args, "untie_embeddings_and_output_weights", False), (
-            "--sft-chunked-logits is incompatible with tied embeddings "
-            "(HF config.tie_word_embeddings=true → "
-            "--untie-embeddings-and-output-weights not set; output_layer.weight "
-            "is None and the chunked path's lm_head matmul has nothing to "
-            "multiply against). Remove --sft-chunked-logits; the chunked "
-            "memory win is marginal on tied-weight models."
-        )
-        # 2) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        # Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.
@@ -4606,6 +4885,11 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    if args.task_type == "embedding":
+        from relax.utils.training.embedding import validate_embedding_args
+
+        validate_embedding_args(args)
+    _validate_sft_epoch_eval_args(args)
     _normalize_sft_max_in_flight_steps(args, is_offline)
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")

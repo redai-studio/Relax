@@ -1,0 +1,767 @@
+diff --git a/csrc/megakernel/backward.cuh b/csrc/megakernel/backward.cuh
+index f237a88..5365fb9 100644
+--- a/csrc/megakernel/backward.cuh
++++ b/csrc/megakernel/backward.cuh
+@@ -1,8 +1,8 @@
+ template <bool IS_CLAMPED, bool IS_SITU = false>
+ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(const globals_bwd &g) {
+     const int num_local_experts = g.w_routed_gate.depth();
+-    const int intermediate_dim_col_blocks = g.w_routed_gate.rows() / config::MLP_Nb;
+-    const int hidden_dim_col_blocks = g.d_y_shared.cols() / config::MLP_Nb;
++    const int intermediate_dim_col_blocks = config::mlp_col_blocks(g.w_routed_gate.rows());
++    const int hidden_dim_col_blocks = config::mlp_col_blocks(g.d_y_shared.cols());
+ 
+     int cluster_idx = clusterIdx().x;
+     const int cta_rank = cluster_ctarank();
+@@ -570,7 +570,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
+     const int num_macrobatches = (schedule_capacity + macrobatch_size - 1) / macrobatch_size;
+     const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
+     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
+-    const int intermediate_dim_col_blocks = intermediate_dim / config::MLP_Nb;
++    const int intermediate_dim_col_blocks = config::mlp_col_blocks(intermediate_dim);
+     const bool combined_fc1_payload = w_routed_gate.is_same(w_routed_up);
+     const bool combined_fc1_transposed_payload =
+         w_routed_gate_T.is_same(w_routed_up_T);
+@@ -995,7 +995,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
+     const int num_macrobatches = (schedule_capacity + macrobatch_size - 1) / macrobatch_size;
+     const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
+     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
+-    const int intermediate_dim_col_blocks = intermediate_dim / config::MLP_Nb;
++    const int intermediate_dim_col_blocks = config::mlp_col_blocks(intermediate_dim);
+     const bool combined_fc1_payload = w_routed_gate.is_same(w_routed_up);
+     const bool split_weight_storage = w_routed_gate_storage_table.has_value();
+     TORCH_CHECK(
+diff --git a/csrc/megakernel/dispatch_combine.cuh b/csrc/megakernel/dispatch_combine.cuh
+index ab54dc9..8286c38 100644
+--- a/csrc/megakernel/dispatch_combine.cuh
++++ b/csrc/megakernel/dispatch_combine.cuh
+@@ -57,7 +57,7 @@ static __device__ __forceinline__ void dispatch_kernel(
+             if (row_idx < previous_macrobatch_tokens) { // otherwise, previous macrobatch was partial & no need to wait
+                 const int global_minibatch_idx = (previous_macrobatch_offset + row_idx) / minibatch_size;
+                 const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
+-                const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (cols / config::MLP_Nb) * config::CLUSTER_SIZE;
++                const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * config::mlp_col_blocks(cols) * config::CLUSTER_SIZE;
+                 barrier_wait(*transfer_ready, global_minibatch_idx, required_count);
+             }
+         }
+@@ -210,7 +210,7 @@ static __device__ __forceinline__ void combine_kernel(
+         const int last_global_minibatch_idx = (macrobatch_offset + (first_tile_idx + num_valid_tiles - 1) / col_blocks * config::COMBINE_Mb) / minibatch_size;
+         for (int global_minibatch_idx = first_global_minibatch_idx; global_minibatch_idx <= last_global_minibatch_idx; ++global_minibatch_idx) {
+             const int minibatch_rows = min(minibatch_size, num_tokens - global_minibatch_idx * minibatch_size);
+-            const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * (cols / config::MLP_Nb) * config::CLUSTER_SIZE;
++            const int required_count = ((minibatch_rows + config::MLP_Mb - 1) / config::MLP_Mb) * config::mlp_col_blocks(cols) * config::CLUSTER_SIZE;
+             barrier_wait(transfer_ready, global_minibatch_idx, required_count);
+         }
+         #pragma unroll
+diff --git a/csrc/megakernel/forward.cuh b/csrc/megakernel/forward.cuh
+index b3e5bd5..dec820f 100644
+--- a/csrc/megakernel/forward.cuh
++++ b/csrc/megakernel/forward.cuh
+@@ -4,14 +4,14 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_fwd_kernel(co
+     const int cta_rank = cluster_ctarank();
+     const int shared_row_blocks = HAS_SHARED ? (g.x_shared.rows() / config::MLP_Mb) : 0;
+     const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
+-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
+-    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
++    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(g.w_shared_gate.rows()));
++    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (config::mlp_col_blocks(g.w_routed_gate.rows()));
+     const int shared_swiglu_tiles = HAS_SHARED ? ((g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
+     const int minibatch_routed_swiglu_tiles = (g.minibatch_size / config::SWIGLU_Mb) * (g.hidden_fp8_routed.cols() / config::SWIGLU_Nb);
+     const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+     const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+-    const int shared_down_tasks = shared_row_blocks * (g.w_shared_down.rows() / config::MLP_Nb);
+-    const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (g.w_routed_down.rows() / config::MLP_Nb);
++    const int shared_down_tasks = shared_row_blocks * config::mlp_col_blocks(g.w_shared_down.rows());
++    const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * config::mlp_col_blocks(g.w_routed_down.rows());
+     const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
+     const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
+     const int comm_clusters = g.num_comm_sms / config::CLUSTER_SIZE;
+@@ -349,8 +349,8 @@ dispatch_mlp_swiglu_combine_fwd_mxfp8(
+     const int num_global_row_blocks = schedule_capacity / (config::MLP_Mb / config::CLUSTER_SIZE);
+     const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
+     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
+-    const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
+-    const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
++    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(intermediate_dim));
++    const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(intermediate_dim));
+     const bool combined_fc1_payload = w_routed_gate.is_same(w_routed_up);
+     const bool combined_fc1_scale_payload = w_routed_gate_sc.is_same(w_routed_up_sc);
+     const int num_local_experts = tokens_per_expert.size(0);
+@@ -530,8 +530,8 @@ dispatch_mlp_swiglu_combine_fwd_bf16(
+     const int num_global_row_blocks = schedule_capacity / (config::MLP_Mb / config::CLUSTER_SIZE);
+     const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
+     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
+-    const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
+-    const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
++    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(intermediate_dim));
++    const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(intermediate_dim));
+     const bool combined_fc1_payload = w_routed_gate.is_same(w_routed_up);
+     const int num_local_experts = tokens_per_expert.size(0);
+     const bool split_weight_storage = w_routed_gate_storage_table.has_value();
+diff --git a/csrc/megakernel/grouped_gemm.cuh b/csrc/megakernel/grouped_gemm.cuh
+index 07ba154..47429d8 100644
+--- a/csrc/megakernel/grouped_gemm.cuh
++++ b/csrc/megakernel/grouped_gemm.cuh
+@@ -64,7 +64,10 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+     static_assert(sizeof(mlp_fp32_d_tile) <= 2 * sizeof(mlp_bf16_d_tile));
+     static_assert(sizeof(mlp_fp8_d_tile) + 2 * sizeof(mlp_sc_tile) <= sizeof(mlp_bf16_d_tile));
+ 
+-    const int col_blocks = ((IS_WGRAD && !USE_ROUTED_MXFP8) || IS_AB) ? b_gmem.cols() / config::MLP_Nb : b_gmem.rows() / config::MLP_Nb;
++    const int output_rows = IS_WGRAD
++        ? (USE_ROUTED_MXFP8 ? a_gmem.rows() : a_gmem.cols()) : a_gmem.rows();
++    const int output_cols = ((IS_WGRAD && !USE_ROUTED_MXFP8) || IS_AB) ? b_gmem.cols() : b_gmem.rows();
++    const int col_blocks = config::mlp_col_blocks(output_cols);
+     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
+     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::MLP_Mb);
+ 
+@@ -73,7 +76,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+     int k_start = 0, k_end = 0;
+     bool is_first_wgrad_contribution = IS_SHARED;
+     if constexpr (IS_WGRAD) {
+-        const int row_blocks = USE_ROUTED_MXFP8 ? a_gmem.rows() / config::MLP_Mb : a_gmem.cols() / config::MLP_Mb;
++        const int row_blocks = config::mlp_row_blocks(output_rows);
+         const int expert_idx = IS_SHARED ? 0 : task_idx / (row_blocks * col_blocks);
+         if constexpr (IS_SHARED) {
+             k_end = a_gmem.rows();
+@@ -120,6 +123,14 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+         return;
+     }
+ 
++    const int valid_rows = min(config::MLP_Mb, output_rows - tile_coord.x * config::MLP_Mb);
++    const bool cta_has_valid_rows = cta_rank * (config::MLP_Mb / config::CLUSTER_SIZE) < valid_rows;
++    const int valid_cols = min(config::MLP_Nb, output_cols - tile_coord.y * config::MLP_Nb);
++    // A tail tile may have only one valid 128-column half. Both CTAs still
++    // load B scales, so reuse the last valid scale for the absent half;
++    // its output columns are skipped by the epilogue below.
++    const int output_half_blocks = (output_cols + config::MLP_Nb_HALF - 1) / config::MLP_Nb_HALF;
++
+     const int first_gemm_iters = IS_WGRAD ? 0 : a_gmem.cols() / MLP_Kb;
+     const int iters_per_task = IS_WGRAD ? (k_end - k_start) / MLP_Kb
+                                         : first_gemm_iters + (a2_gmem != nullptr ? a2_gmem->cols() / MLP_Kb : 0);
+@@ -210,7 +221,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+                         wait_for_wgrad_operands(idx, k_block * MLP_Kb);
+                         wait(gemm_scales_finished[input_ring], get_phasebit<1>(gemm_bitfield, input_ring));
+                         tma::cluster::load_async(a_sc_smem[input_ring], *a_sc_gmem, {tile_coord.x * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+-                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], *b_sc_gmem, {tile_coord.y * 2 + cta_rank, k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
++                        tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], *b_sc_gmem, {min(tile_coord.y * 2 + cta_rank, output_half_blocks - 1), k_block - macrobatch_k_offset, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                         update_phasebit<1>(gemm_bitfield, input_ring);
+                         input_ring = ring_advance<config::MLP_LOAD_PIPE_DEPTH>(input_ring);
+                     }
+@@ -225,7 +236,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+                         tma::cluster::load_async(a_sc_smem[input_ring], a_sc_curr, {tile_coord.x * 2 + cta_rank, k_block, 0, 0}, gemm_scales_arrived[input_ring], (uint16_t)(1 << cta_rank), 0);
+                         const auto selected_b_sc = b_sc_curr.select_expert(tile_coord.z);
+                         tma::cluster::load_async(b_sc_smem[input_ring][cta_rank], selected_b_sc,
+-                            {b_sc_curr.physical_row_block(tile_coord.z, tile_coord.y * 2 + cta_rank),
++                            {b_sc_curr.physical_row_block(tile_coord.z, min(tile_coord.y * 2 + cta_rank, output_half_blocks - 1)),
+                              b_sc_curr.physical_col_block(k_block), 0, 0},
+                             gemm_scales_arrived[input_ring], (uint16_t)(0b11), 0);
+                         update_phasebit<1>(gemm_bitfield, input_ring);
+@@ -316,6 +327,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+             }
+             #pragma unroll
+             for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
++                if (!cta_has_valid_rows
++                        || i * (config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH) >= valid_cols)
++                    continue;
+                 warpgroup::tma::store_async_read_wait<config::MLP_NUM_BF16_D_TILES - 1>();
+                 warpgroup::sync(1);
+                 warpgroup::store(d_bf16_smem[i % config::MLP_NUM_BF16_D_TILES], d_reg[i]);
+@@ -378,6 +392,7 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+             uint32_t scale_word = 0;
+             #pragma unroll 1
+             for (int i = 0; i < NUM_MXFP8_BLOCKS; ++i) {
++                if (!cta_has_valid_rows || i * 32 >= valid_cols) continue;
+                 float2 tmp[16];
+                 asm volatile(R"(
+                     tcgen05.ld.sync.aligned.32x32b.x32.b32
+@@ -449,6 +464,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+                 rt_fl<config::MLP_Mb / 8, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH> d_reg;
+                 #pragma unroll 1
+                 for (int i = 0; i < config::MLP_EPI_PIPE_DEPTH; ++i) {
++                    if (!cta_has_valid_rows
++                            || i * (config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH) >= valid_cols)
++                        continue;
+                     warpgroup::load_async(d_reg, d_tt.template subtile<tt<float, config::MLP_Mb / 2, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH>>(0, config::MLP_Nb / config::MLP_EPI_PIPE_DEPTH * i));
+                     tensor_load_wait();
+                     warpgroup::sync(1);
+@@ -473,6 +491,9 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
+                             {d_gmem.physical_expert(tile_coord.z), row_tile, col_tile});
+                     }
+                 }
++                // Empty tail CTAs must let every consumer observe completion before acknowledging it.
++                if (!cta_has_valid_rows)
++                    warpgroup::sync(1);
+                 warpgroup::tma::cluster::arrive(gemm_outputs_finished, 0);
+                 warpgroup::tma::store_async_read_wait();
+             } else {
+diff --git a/csrc/megakernel/recompute_forward_context.cuh b/csrc/megakernel/recompute_forward_context.cuh
+index 57c2c6f..ac6f5d9 100644
+--- a/csrc/megakernel/recompute_forward_context.cuh
++++ b/csrc/megakernel/recompute_forward_context.cuh
+@@ -4,8 +4,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
+     const int cta_rank = cluster_ctarank();
+     const int shared_row_blocks = HAS_SHARED ? (g.x_shared.rows() / config::MLP_Mb) : 0;
+     const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
+-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
+-    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
++    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(g.w_shared_gate.rows()));
++    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (config::mlp_col_blocks(g.w_routed_gate.rows()));
+     const int shared_swiglu_tiles = HAS_SHARED ? ((g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
+     const int minibatch_routed_swiglu_tiles = (g.minibatch_size / config::SWIGLU_Mb) * (g.hidden_fp8_routed.cols() / config::SWIGLU_Nb);
+     const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+@@ -261,8 +261,8 @@ recompute_forward_context_mxfp8(
+     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
+     const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
+     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
+-    const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
+-    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / config::MLP_Nb);
++    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(intermediate_dim));
++    const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(w_routed_gate.size(1)));
+ 
+     activation_bf16_pgl x_routed_send_buffer_data;
+     for (int i = 0; i < NUM_DEVICES; ++i)
+@@ -378,8 +378,8 @@ recompute_forward_context_bf16(
+     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
+     const int shared_row_blocks = HAS_SHARED ? (num_local_tokens / config::MLP_Mb) : 0;
+     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
+-    const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
+-    const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
++    const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(intermediate_dim));
++    const int routed_gate_up_tasks = routed_row_blocks * (config::mlp_col_blocks(intermediate_dim));
+ 
+     activation_bf16_pgl x_routed_send_buffer_data;
+     for (int i = 0; i < NUM_DEVICES; ++i)
+diff --git a/csrc/megakernel/swiglu.cuh b/csrc/megakernel/swiglu.cuh
+index 8d05fd7..b566e84 100644
+--- a/csrc/megakernel/swiglu.cuh
++++ b/csrc/megakernel/swiglu.cuh
+@@ -38,6 +38,11 @@ static __device__ __forceinline__ float2 swiglu_bwd_pair(
+     }
+     uint32_t clamp_grad_mask;
+     if constexpr (IS_CLAMPED) {
++        // Keep MOK's inclusive clamp subgradient: 1 at gate == limit and
++        // up == +/-limit, and 0 strictly outside the respective bounds.
++        // This is an operator contract, not the installed PyTorch default:
++        // scalar torch.clamp in PyTorch 2.14 uses 0 at equality instead.
++        // tests/utils.py::run_swiglu_reference encodes this contract explicitly.
+         clamp_grad_mask = static_cast<uint32_t>(gate.x <= limit)
+                           | static_cast<uint32_t>(gate.y <= limit) << 1
+                           | static_cast<uint32_t>(up.x >= -limit && up.x <= limit) << 2
+@@ -96,7 +101,7 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
+     auto (&up_smem)[config::SWIGLU_FWD_PIPE_DEPTH]   = *reinterpret_cast<input_bf16_tile (*)[config::SWIGLU_FWD_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&gate_smem) + sizeof(gate_smem));
+     auto &hidden_smem                                = *reinterpret_cast<output_bf16_tile *>(reinterpret_cast<uint64_t>(&up_smem) + sizeof(up_smem));
+ 
+-    const int intermediate_dim_col_blocks = hidden_gmem.cols() / config::MLP_Nb;
++    const int intermediate_dim_col_blocks = config::mlp_col_blocks(hidden_gmem.cols());
+     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
+     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::SWIGLU_Mb);
+ 
+@@ -309,7 +314,7 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
+         : reinterpret_cast<uint64_t>(&up_smem) + sizeof(up_smem);
+     auto &router_smem    = *reinterpret_cast<float (*)[config::SWIGLU_BWD_PIPE_DEPTH][config::SWIGLU_Mb]>(router_smem_addr);
+ 
+-    const int intermediate_dim_col_blocks = gate_gmem.cols() / config::MLP_Nb;
++    const int intermediate_dim_col_blocks = config::mlp_col_blocks(gate_gmem.cols());
+     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
+     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::SWIGLU_Mb);
+ 
+diff --git a/csrc/megakernel/types.cuh b/csrc/megakernel/types.cuh
+index 677d1ae..d31eb2d 100644
+--- a/csrc/megakernel/types.cuh
++++ b/csrc/megakernel/types.cuh
+@@ -5,6 +5,13 @@ struct config {
+     // Grouped GEMM
+     static constexpr int MLP_Mb = 256;
+     static constexpr int MLP_Nb = 256;
++    static constexpr int MLP_Nb_HALF = MLP_Nb / 2;
++    __host__ __device__ static constexpr int mlp_col_blocks(int cols) {
++        return (cols + MLP_Nb - 1) / MLP_Nb;
++    }
++    __host__ __device__ static constexpr int mlp_row_blocks(int rows) {
++        return (rows + MLP_Mb - 1) / MLP_Mb;
++    }
+     static constexpr int MLP_FP8_Kb = 128;
+     static constexpr int MLP_BF16_Kb = 64;
+     static constexpr int MLP_WEIGHT_ROWS_PER_CTA = MLP_Nb / CLUSTER_SIZE;
+@@ -403,14 +410,14 @@ struct globals_fwd {
+         const int num_minibatches = (schedule_peer_rank.cols() + minibatch_size - 1) / minibatch_size; // across all macrobatches
+         const int shared_row_blocks = HAS_SHARED ? (x_shared.rows() / config::MLP_Mb) : 0;
+         const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
+-        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
+-        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
++        const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(w_shared_gate.rows()));
++        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (config::mlp_col_blocks(w_routed_gate.rows()));
+         const int shared_swiglu_tiles = HAS_SHARED ? ((hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
+         const int minibatch_routed_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
+         const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+         const int minibatch_routed_swiglu_tasks = (minibatch_routed_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+-        const int shared_down_tasks = shared_row_blocks * (w_shared_down.rows() / config::MLP_Nb);
+-        const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * (w_routed_down.rows() / config::MLP_Nb);
++        const int shared_down_tasks = shared_row_blocks * config::mlp_col_blocks(w_shared_down.rows());
++        const int minibatch_routed_down_tasks = minibatch_routed_row_blocks * config::mlp_col_blocks(w_routed_down.rows());
+         const int shared_tasks = 2 * shared_gate_up_tasks + shared_swiglu_tasks + shared_down_tasks;
+         const int minibatch_tasks = 2 * minibatch_routed_gate_up_tasks + minibatch_routed_swiglu_tasks + minibatch_routed_down_tasks;
+         return dim3(config::CLUSTER_SIZE * (shared_tasks + num_minibatches * minibatch_tasks) + num_comm_sms);
+@@ -524,8 +531,8 @@ struct globals_bwd {
+         const int num_macrobatches = (capacity + macrobatch_size - 1) / macrobatch_size;
+         const int shared_row_blocks = HAS_SHARED ? (d_y_shared.rows() / config::MLP_Mb) : 0;
+         const int minibatch_row_blocks = minibatch_size / config::MLP_Mb;
+-        const int intermediate_dim_col_blocks = w_routed_gate.rows() / config::MLP_Nb;
+-        const int hidden_dim_col_blocks = d_y_shared.cols() / config::MLP_Nb;
++        const int intermediate_dim_col_blocks = config::mlp_col_blocks(w_routed_gate.rows());
++        const int hidden_dim_col_blocks = config::mlp_col_blocks(d_y_shared.cols());
+         const int shared_swiglu_bwd_tiles = HAS_SHARED ? ((hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
+         const int minibatch_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
+         const int shared_swiglu_bwd_tasks = (shared_swiglu_bwd_tiles + config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_BWD_PIPE_DEPTH);
+@@ -595,8 +602,8 @@ struct globals_recompute_forward_context {
+         const int num_minibatches = (routed_capacity + minibatch_size - 1) / minibatch_size;
+         const int shared_row_blocks = HAS_SHARED ? (x_shared.rows() / config::MLP_Mb) : 0;
+         const int minibatch_routed_row_blocks = minibatch_size / config::MLP_Mb;
+-        const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.rows() / config::MLP_Nb);
+-        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (w_routed_gate.rows() / config::MLP_Nb);
++        const int shared_gate_up_tasks = shared_row_blocks * (config::mlp_col_blocks(w_shared_gate.rows()));
++        const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (config::mlp_col_blocks(w_routed_gate.rows()));
+         const int shared_swiglu_tiles = HAS_SHARED ? ((hidden_shared.rows() / config::SWIGLU_Mb) * (hidden_shared.cols() / config::SWIGLU_Nb)) : 0;
+         const int minibatch_routed_swiglu_tiles = (minibatch_size / config::SWIGLU_Mb) * (hidden_fp8_routed.cols() / config::SWIGLU_Nb);
+         const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
+diff --git a/csrc/scheduler.cuh b/csrc/scheduler.cuh
+index c3ca5e3..8d5c051 100644
+--- a/csrc/scheduler.cuh
++++ b/csrc/scheduler.cuh
+@@ -15,6 +15,8 @@ struct config {
+     static constexpr int CLUSTER_SIZE = 1;
+     static constexpr int NUM_THREADS = 1024;
+     static constexpr int NUM_WARPS = NUM_THREADS / WARP_THREADS;
++    static constexpr int ROUTE_BLOCK_THREADS = 256;
++    static constexpr int ROUTE_BLOCKS_PER_PEER = NUM_THREADS / ROUTE_BLOCK_THREADS;
+ };
+ 
+ struct globals {
+@@ -24,57 +26,97 @@ struct globals {
+     topk_gl topk;                        // (world_size, num_local_tokens, topk)
+     index_gl schedule_peer_rank;         // (schedule_capacity,) must be initialized to -1
+     index_gl schedule_peer_token_idx;    // (schedule_capacity,) original_token_idx * topk + k
+-    index_gl num_tokens;                 // (1,) total padded token count, must be zero-initialized
++    index_gl num_tokens;                 // (1,) total padded token count
+     index_gl tokens_per_expert;          // (num_local_experts,) padded per-expert token counts
+-    index_gl tokens_per_expert_and_peer; // (num_local_experts * world_size,) per-(local_expert, peer_rank) token counts, must be zero-initialized
++    index_gl tokens_per_expert_and_peer; // (num_local_experts * world_size,) per-(local_expert, peer_rank) token counts
++    index_gl expert_offsets;             // (num_local_experts,) base of each expert's padded segment
++    index_gl thread_offsets;             // (num_local_experts * world_size * NUM_THREADS,) zero-initialized per-scheduler-thread offsets
+ 
+     int rank;                            // this (destination) rank
+ };
+ 
+-// Stage 1: Count the number of tokens routed from each peer rank to each local expert
++// Stage 1: Count routes by local expert, peer rank, and scheduler thread. Every
++// counter has one writer, so the result is deterministic without atomics.
+ static __device__ __forceinline__ void count_kernel(const globals &G) {
+     const int world_size = G.topk.depth();
+     const int num_local_tokens = G.topk.rows();
+     const int topk = G.topk.cols();
+     const int rank_stride = num_local_tokens * topk;
+-    const int num_global_tokens = world_size * rank_stride;
+     const int num_local_experts = G.tokens_per_expert.cols();
+     const int first_expert = G.rank * num_local_experts;
+     const int last_expert = first_expert + num_local_experts;
++    const int block_idx = static_cast<int>(blockIdx.x);
++    const int peer_rank = block_idx / config::ROUTE_BLOCKS_PER_PEER;
++    const int thread_group = block_idx % config::ROUTE_BLOCKS_PER_PEER;
++    const int tid = thread_group * config::ROUTE_BLOCK_THREADS + threadIdx.x;
++
++    for (int peer_token_idx = tid; peer_token_idx < rank_stride; peer_token_idx += config::NUM_THREADS) {
++        const int expert_idx = G.topk.raw_ptr[peer_rank * rank_stride + peer_token_idx];
++        if (expert_idx >= first_expert && expert_idx < last_expert) {
++            const int idx = ((expert_idx - first_expert) * world_size + peer_rank) * config::NUM_THREADS + tid;
++            ++G.thread_offsets.raw_ptr[idx];
++        }
++    }
++}
++
++// Stage 2: Turn the per-thread counts into exclusive offsets. These offsets
++// reproduce the old thread-major route order without rescanning for each expert.
++static __device__ __forceinline__ void prefix_kernel(const globals &G) {
++    const int tid = threadIdx.x;
++    const int expert_peer_idx = static_cast<int>(blockIdx.x);
++    const int idx = expert_peer_idx * config::NUM_THREADS + tid;
++    const int count = G.thread_offsets[{idx}];
++    int inclusive = count;
++
++    // Step 2.1: Compute inclusive route counts within each warp.
++    #pragma unroll
++    for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
++        const int n = __shfl_up_sync(0xffffffff, inclusive, offset);
++        if (warp::laneid() >= offset) inclusive += n;
++    }
+ 
+-    extern __shared__ int tokens_per_expert_and_peer[]; // (num_local_experts, world_size)
+-    for (int i = threadIdx.x; i < G.tokens_per_expert_and_peer.cols(); i += blockDim.x)
+-        tokens_per_expert_and_peer[i] = 0;
++    __shared__ int warp_totals[config::NUM_WARPS];
++    if (warp::laneid() == WARP_THREADS - 1) warp_totals[warpid()] = inclusive;
+     __syncthreads();
+ 
+-    const int grid_stride = gridDim.x * blockDim.x;
+-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_global_tokens; idx += grid_stride) {
+-        const int peer_rank = idx / rank_stride;
+-        const int peer_token_idx = idx - peer_rank * rank_stride;
+-        const int expert_idx = G.topk[{peer_rank, peer_token_idx / topk, peer_token_idx % topk}];
+-        if (expert_idx >= first_expert && expert_idx < last_expert)
+-            atomicAdd(&tokens_per_expert_and_peer[(expert_idx - first_expert) * world_size + peer_rank], 1);
++    // Step 2.2: Compute inclusive totals across warps.
++    if (warpid() == 0) {
++        int warp_total = warp::laneid() < config::NUM_WARPS ? warp_totals[warp::laneid()] : 0;
++        #pragma unroll
++        for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
++            const int n = __shfl_up_sync(0xffffffff, warp_total, offset);
++            if (warp::laneid() >= offset) warp_total += n;
++        }
++        if (warp::laneid() < config::NUM_WARPS) warp_totals[warp::laneid()] = warp_total;
+     }
+     __syncthreads();
+ 
+-    for (int i = threadIdx.x; i < G.tokens_per_expert_and_peer.cols(); i += blockDim.x)
+-        if (tokens_per_expert_and_peer[i] != 0)
+-            atomicAdd(&G.tokens_per_expert_and_peer[{i}], tokens_per_expert_and_peer[i]);
++    // Step 2.3: Store each thread's exclusive offset and the expert/peer total.
++    const int thread_offset = inclusive - count + (warpid() == 0 ? 0 : warp_totals[warpid() - 1]);
++    G.thread_offsets[{idx}] = thread_offset;
++    if (tid == config::NUM_THREADS - 1)
++        G.tokens_per_expert_and_peer[{expert_peer_idx}] = thread_offset + count;
+ }
+ 
+-// Stage 2: Pad each expert's total token count by EXPERT_PADDING and accumulate the total count
+-static __device__ __forceinline__ void pad_kernel(const globals &G) {
+-    const int local_expert = blockIdx.x;
++// Stage 3: Pad expert segments and compute their offsets.
++static __device__ __forceinline__ void finalize_kernel(const globals &G) {
+     const int world_size = G.topk.depth();
+-    int num_tokens = 0;
+-    for (int peer_rank = 0; peer_rank < world_size; ++peer_rank)
+-        num_tokens += G.tokens_per_expert_and_peer[{local_expert * world_size + peer_rank}];
+-    const int padded_num_tokens = (num_tokens + config::EXPERT_PADDING - 1) / config::EXPERT_PADDING * config::EXPERT_PADDING;
+-    G.tokens_per_expert[{local_expert}] = padded_num_tokens;
+-    atomicAdd(&G.num_tokens[{0}], padded_num_tokens);
++    const int num_local_experts = G.tokens_per_expert.cols();
++    int expert_offset = 0;
++    // Preserve expert order while accumulating padded segment bases.
++    for (int local_expert = 0; local_expert < num_local_experts; ++local_expert) {
++        int expert_tokens = 0;
++        for (int peer_rank = 0; peer_rank < world_size; ++peer_rank)
++            expert_tokens += G.tokens_per_expert_and_peer[{local_expert * world_size + peer_rank}];
++        const int padded_tokens = (expert_tokens + config::EXPERT_PADDING - 1) / config::EXPERT_PADDING * config::EXPERT_PADDING;
++        G.expert_offsets[{local_expert}] = expert_offset;
++        G.tokens_per_expert[{local_expert}] = padded_tokens;
++        expert_offset += padded_tokens;
++    }
++    G.num_tokens[{0}] = expert_offset;
+ }
+ 
+-// Stage 3: Schedule each token into its expert's 256-padded segment
++// Stage 4: Visit every route once and place local routes into their padded expert segments.
+ static __device__ __forceinline__ void schedule_kernel(const globals &G) {
+     const int world_size = G.topk.depth();
+     const int num_local_tokens = G.topk.rows();
+@@ -82,67 +124,40 @@ static __device__ __forceinline__ void schedule_kernel(const globals &G) {
+     const int rank_stride = num_local_tokens * topk;
+     const int num_local_experts = G.tokens_per_expert.cols();
+     const int first_expert = G.rank * num_local_experts;
++    const int last_expert = first_expert + num_local_experts;
++    const int block_idx = static_cast<int>(blockIdx.x);
++    const int peer_rank = block_idx / config::ROUTE_BLOCKS_PER_PEER;
++    const int thread_group = block_idx % config::ROUTE_BLOCKS_PER_PEER;
++    const int tid = thread_group * config::ROUTE_BLOCK_THREADS + threadIdx.x;
+ 
+     if (G.num_tokens[{0}] > G.schedule_peer_rank.cols()) asm volatile("{trap;}");
+ 
+-    extern __shared__ int tokens_per_peer_rank[]; // (world_size,) this expert's per-peer-rank counts
+-    __shared__ int cumulative_tokens_from_peer_rank[config::NUM_WARPS];
+-
+-    for (int idx = blockIdx.x; idx < num_local_experts * world_size; idx += gridDim.x) {
+-        const int local_expert = idx / world_size;
+-        const int peer_rank = idx % world_size;
+-
+-        // Base row of this expert's padded segment
+-        int expert_base = 0;
+-        for (int expert_idx = 0; expert_idx < local_expert; ++expert_idx) 
+-            expert_base += G.tokens_per_expert[{expert_idx}];
+-
+-        for (int rank = threadIdx.x; rank < world_size; rank += blockDim.x)
+-            tokens_per_peer_rank[rank] = G.tokens_per_expert_and_peer[{local_expert * world_size + rank}];
+-        __syncthreads();
++    extern __shared__ int metadata[];
++    int *tokens_per_expert_and_peer = metadata;
++    int *expert_offsets = metadata + num_local_experts * world_size;
++    // Cache the Stage 2 counts and Stage 3 expert bases once per route block.
++    for (int idx = threadIdx.x; idx < num_local_experts * world_size; idx += config::ROUTE_BLOCK_THREADS)
++        tokens_per_expert_and_peer[idx] = G.tokens_per_expert_and_peer[{idx}];
++    for (int idx = threadIdx.x; idx < num_local_experts; idx += config::ROUTE_BLOCK_THREADS)
++        expert_offsets[idx] = G.expert_offsets[{idx}];
++    __syncthreads();
+ 
+-        // Step 1. Count the number of tokens routed from this peer rank to this expert
+-        int _tokens_from_peer_rank = 0;
+-        for (int peer_token_idx = threadIdx.x; peer_token_idx < rank_stride; peer_token_idx += blockDim.x) {
+-            const int expert_idx = G.topk[{peer_rank, peer_token_idx / topk, peer_token_idx % topk}];
+-            _tokens_from_peer_rank += (expert_idx - first_expert == local_expert) ? 1 : 0;
+-        }
+-        // Step 2. Cumulative sum within a warp: thread i's `inclusive` will have the sum from thread 0 to thread i
+-        int inclusive = _tokens_from_peer_rank;
+-        for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
+-            const int n = __shfl_up_sync(0xffffffff, inclusive, offset);
+-            if (warp::laneid() >= offset) inclusive += n;
+-        }
+-        if (warp::laneid() == WARP_THREADS - 1) cumulative_tokens_from_peer_rank[warpid()] = inclusive;
+-        __syncthreads();
+-        // Step 3: Cumulative sum across warps
+-        if (warpid() == 0) {
+-            int warp_total = (warp::laneid() < config::NUM_WARPS) ? cumulative_tokens_from_peer_rank[warp::laneid()] : 0;
+-            for (int offset = 1; offset < WARP_THREADS; offset *= 2) {
+-                const int n = __shfl_up_sync(0xffffffff, warp_total, offset);
+-                if (warp::laneid() >= offset) warp_total += n;
+-            }
+-            if (warp::laneid() < config::NUM_WARPS) cumulative_tokens_from_peer_rank[warp::laneid()] = warp_total;
+-        }
+-        __syncthreads();
+-        int j = (warpid() == 0 ? 0 : cumulative_tokens_from_peer_rank[warpid() - 1]) + inclusive - _tokens_from_peer_rank;
+-
+-        for (int peer_token_idx = threadIdx.x; peer_token_idx < rank_stride; peer_token_idx += blockDim.x) {
+-            const int orig_token_idx = peer_token_idx / topk;
+-            const int expert_idx = G.topk[{peer_rank, orig_token_idx, peer_token_idx % topk}];
+-            if (expert_idx - first_expert == local_expert) {
+-                int dst_token_idx = expert_base;
+-                for (int rank = 0; rank < world_size; ++rank) {
+-                    const int num_tokens = tokens_per_peer_rank[rank];
+-                    dst_token_idx += min(num_tokens, j);
+-                    dst_token_idx += (rank < peer_rank && num_tokens > j) ? 1 : 0;
+-                }
+-                G.schedule_peer_rank[{dst_token_idx}] = peer_rank;
+-                G.schedule_peer_token_idx[{dst_token_idx}] = peer_token_idx; // original_token_idx * topk + k
+-                ++j;
++    for (int peer_token_idx = tid; peer_token_idx < rank_stride; peer_token_idx += config::NUM_THREADS) {
++        const int expert_idx = G.topk.raw_ptr[peer_rank * rank_stride + peer_token_idx];
++        if (expert_idx >= first_expert && expert_idx < last_expert) {
++            const int local_expert = expert_idx - first_expert;
++            const int offset_idx = (local_expert * world_size + peer_rank) * config::NUM_THREADS + tid;
++            const int j = G.thread_offsets.raw_ptr[offset_idx]++;
++            int dst_token_idx = expert_offsets[local_expert];
++            // Insert this peer's j-th route after the complete round-robin layers [0, j).
++            for (int rank = 0; rank < world_size; ++rank) {
++                const int peer_tokens = tokens_per_expert_and_peer[local_expert * world_size + rank];
++                dst_token_idx += min(peer_tokens, j);
++                dst_token_idx += (rank < peer_rank && peer_tokens > j) ? 1 : 0;
+             }
++            G.schedule_peer_rank[{dst_token_idx}] = peer_rank;
++            G.schedule_peer_token_idx[{dst_token_idx}] = peer_token_idx; // original_token_idx * topk + k
+         }
+-        __syncthreads(); // before the next iteration reuses cumulative_tokens_from_peer_rank
+     }
+ }
+ 
+@@ -153,12 +168,15 @@ static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> sched
+     const int rank
+ ) {
+     const int world_size = static_cast<int>(topk_all.size(0));
++    const int64_t num_thread_offsets = static_cast<int64_t>(num_local_experts) * world_size * config::NUM_THREADS;
+ 
+     at::Tensor schedule_peer_rank = at::empty({schedule_capacity}, topk_all.options().dtype(at::kInt));
+     at::Tensor schedule_peer_token_idx = at::empty({schedule_capacity}, topk_all.options().dtype(at::kInt));
+-    at::Tensor num_tokens = at::zeros({1}, topk_all.options().dtype(at::kInt));
++    at::Tensor num_tokens = at::empty({1}, topk_all.options().dtype(at::kInt));
+     at::Tensor tokens_per_expert = at::empty({num_local_experts}, topk_all.options().dtype(at::kInt));
+-    at::Tensor tokens_per_expert_and_peer = at::zeros({num_local_experts * world_size}, topk_all.options().dtype(at::kInt));
++    at::Tensor tokens_per_expert_and_peer = at::empty({num_local_experts * world_size}, topk_all.options().dtype(at::kInt));
++    at::Tensor expert_offsets = at::empty({num_local_experts}, topk_all.options().dtype(at::kInt));
++    at::Tensor thread_offsets = at::zeros({num_thread_offsets}, topk_all.options().dtype(at::kInt));
+     schedule_peer_rank.fill_(-1);
+ 
+     globals G {
+@@ -167,17 +185,22 @@ static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> sched
+         .schedule_peer_token_idx = kittens::py::tensor_to_gl<globals::index_gl>(schedule_peer_token_idx),
+         .num_tokens = kittens::py::tensor_to_gl<globals::index_gl>(num_tokens),
+         .tokens_per_expert = kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_expert),
+-        .tokens_per_expert_and_peer =kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_expert_and_peer),
++        .tokens_per_expert_and_peer = kittens::py::tensor_to_gl<globals::index_gl>(tokens_per_expert_and_peer),
++        .expert_offsets = kittens::py::tensor_to_gl<globals::index_gl>(expert_offsets),
++        .thread_offsets = kittens::py::tensor_to_gl<globals::index_gl>(thread_offsets),
+         .rank = rank,
+     };
+ 
+     auto stream = at::cuda::getCurrentCUDAStream();
+     kittens::py::global_kernel<config, globals, scheduler::count_kernel>
+-        <<<(G.topk.numel() + config::NUM_THREADS - 1) / config::NUM_THREADS, config::NUM_THREADS, num_local_experts * world_size * sizeof(int), stream>>>(G);
+-    kittens::py::global_kernel<config, globals, scheduler::pad_kernel>
+-        <<<num_local_experts, 1, 0, stream>>>(G);
++        <<<world_size * config::ROUTE_BLOCKS_PER_PEER, config::ROUTE_BLOCK_THREADS, 0, stream>>>(G);
++    kittens::py::global_kernel<config, globals, scheduler::prefix_kernel>
++        <<<num_local_experts * world_size, config::NUM_THREADS, 0, stream>>>(G);
++    kittens::py::global_kernel<config, globals, scheduler::finalize_kernel>
++        <<<1, 1, 0, stream>>>(G);
+     kittens::py::global_kernel<config, globals, scheduler::schedule_kernel>
+-        <<<num_local_experts * world_size, config::NUM_THREADS, world_size * sizeof(int), stream>>>(G);
++        <<<world_size * config::ROUTE_BLOCKS_PER_PEER, config::ROUTE_BLOCK_THREADS,
++           num_local_experts * (world_size + 1) * sizeof(int), stream>>>(G);
+ 
+     return {schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert};
+ }
+diff --git a/mok/functional.py b/mok/functional.py
+index fce3dce..589d854 100644
+--- a/mok/functional.py
++++ b/mok/functional.py
+@@ -225,8 +225,8 @@ def validate_workspace_args(
+         raise ValueError("num_local_tokens must be divisible by 256")
+     if type(hidden_size) is not int or hidden_size <= 0:
+         raise ValueError("hidden_size must be a positive integer")
+-    if hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if type(topk) is not int or not 0 < topk <= 255:
+         raise ValueError("topk must be an integer in [1, 255]")
+     fwd_epilogue_smem_bytes = 2 * ((topk + 1) * 2048 + 2 * topk * 4) + 1024
+diff --git a/mok/ops.py b/mok/ops.py
+index 6487580..a861ad7 100644
+--- a/mok/ops.py
++++ b/mok/ops.py
+@@ -405,8 +405,8 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
+     num_local_tokens, hidden_size = x.shape
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if type(topk) is not int or not 0 < topk <= 255:
+         raise ValueError("topk must be an integer in [1, 255]")
+     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
+@@ -433,8 +433,8 @@ def dispatch_mlp_swiglu_combine_fwd_mxfp8(
+     if w_shared_gate is not None and w_shared_gate.ndim != 2:
+         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
+     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
+-        raise ValueError("intermediate_size must be positive and divisible by 256")
++    if intermediate_size < 256 or intermediate_size % 128 != 0:
++        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+     split_storage = w_routed_gate_storage_table is not None
+     if (
+         split_storage != (w_routed_up_storage_table is not None)
+@@ -664,13 +664,13 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
+     num_local_tokens, hidden_size = x.shape
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
+         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
+     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
+-        raise ValueError("intermediate_size must be positive and divisible by 256")
++    if intermediate_size < 256 or intermediate_size % 128 != 0:
++        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+     split_storage = w_routed_gate_storage_table is not None
+     if (
+         split_storage != (w_routed_up_storage_table is not None)
+@@ -867,8 +867,8 @@ def recompute_forward_context_mxfp8(
+     num_local_tokens, hidden_size = x.shape
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if type(topk) is not int or not 0 < topk <= 255:
+         raise ValueError("topk must be an integer in [1, 255]")
+     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
+@@ -887,8 +887,8 @@ def recompute_forward_context_mxfp8(
+     if w_shared_gate is not None and w_shared_gate.ndim != 2:
+         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
+     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
+-        raise ValueError("intermediate_size must be positive and divisible by 256")
++    if intermediate_size < 256 or intermediate_size % 128 != 0:
++        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
+         raise ValueError("w_routed_gate must have shape "
+                          "(num_local_experts, intermediate_size, hidden_size)")
+@@ -1008,13 +1008,13 @@ def recompute_forward_context_bf16(
+     num_local_tokens, hidden_size = x.shape
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
+         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
+     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
+-        raise ValueError("intermediate_size must be positive and divisible by 256")
++    if intermediate_size < 256 or intermediate_size % 128 != 0:
++        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
+         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
+     num_local_experts = w_routed_gate.shape[0]
+@@ -1230,8 +1230,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
+     num_local_tokens, hidden_size = x.shape
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if type(topk) is not int or not 0 < topk <= 255:
+         raise ValueError("topk must be an integer in [1, 255]")
+     if swiglu_limit is not None and (type(swiglu_limit) not in (int, float) or swiglu_limit < 0):
+@@ -1272,8 +1272,8 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
+     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
+         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
+     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
+-        raise ValueError("intermediate_size must be positive and divisible by 256")
++    if intermediate_size < 256 or intermediate_size % 128 != 0:
++        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
+         raise ValueError("w_routed_gate must have shape "
+                          "(num_local_experts, intermediate_size, hidden_size)")
+@@ -1661,13 +1661,13 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
+     num_local_tokens, hidden_size = x.shape
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if w_shared_gate is not None and (w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size):
+         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
+     intermediate_size = w_routed_gate.shape[-2] // (2 if w_routed_gate is w_routed_up else 1)
+-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
+-        raise ValueError("intermediate_size must be positive and divisible by 256")
++    if intermediate_size < 256 or intermediate_size % 128 != 0:
++        raise ValueError("intermediate_size must be at least 256 and divisible by 128")
+     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
+         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
+     num_local_experts = w_routed_gate.shape[0]
+@@ -1873,8 +1873,8 @@ def fwd_epilogue(
+         raise ValueError("y_shared shape must match routed output")
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if (topk_weights.device != combine_buffer.device
+             or top_experts.device != combine_buffer.device
+             or (y_shared is not None and y_shared.device != combine_buffer.device)):
+@@ -1932,8 +1932,8 @@ def bwd_epilogue(
+         raise ValueError("d_x_shared shape must match routed input gradient")
+     if num_local_tokens < 512 or num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be at least 512 and divisible by 256")
+-    if hidden_size <= 0 or hidden_size % 256 != 0:
+-        raise ValueError("hidden_size must be positive and divisible by 256")
++    if hidden_size < 256 or hidden_size % 128 != 0:
++        raise ValueError("hidden_size must be at least 256 and divisible by 128")
+     if (top_experts.device != d_x_routed_buffer.device
+             or (d_x_shared is not None and d_x_shared.device != d_x_routed_buffer.device)):
+         raise ValueError("all tensors must be on the same CUDA device")

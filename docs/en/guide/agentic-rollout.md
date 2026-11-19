@@ -331,12 +331,27 @@ python -m my_agent \
     --output-json "${RELAX_OUTPUT_JSON}"
 ```
 
-Relax manages the process group created for the launcher. A shell wrapper may use `exec` to simplify its process tree,
-but `exec` is not required. Pass application settings with `--agent-env`:
+`--agent-command` names an executable and its arguments, with shell-style quoting. Relax starts it directly without a
+login shell. Put environment activation, variable expansion, pipelines and redirection in an explicit script, launched
+as `bash run_agent_app.sh`.
+
+Pass application settings with `--agent-env`:
 
 ```bash
 --agent-env FOO=bar BAZ=qux
 ```
+
+### Cleanup ownership
+
+When an agent times out or its Group is dropped, Relax sends SIGTERM to the still-running root process started by
+`--agent-command`. If it has not exited after the grace period, Relax sends SIGKILL to that root process.
+A normal partial-rollout pause leaves the agent process running.
+
+Whether it exits naturally or is terminated by Relax, `agent-command` is responsible for cleaning up its tools,
+subprocesses, containers, and remote jobs.
+
+After the root exits, Relax makes a best-effort attempt to clean up remaining local processes. Cleanup failures produce
+warnings and do not block training.
 
 ### Launch Training
 
@@ -348,7 +363,33 @@ Add these options to a working Relax training command:
 --agent-command "bash run_agent_app.sh"
 ```
 
-Use a recipe under `examples/` for model, data, parallelism, and algorithm settings.
+### Build a Recipe
+
+Start from a working recipe with the same model and training mode. `examples/search_r1/run_search_r1.sh` is a local
+tool-agent example; `examples/deepeyes_agentic/run_deepeyes_agentic.sh` adds images;
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh` uses an external sandbox service with fully async 4-GPU
+training and 4-GPU PD + HiCache rollout. Hardware settings in an example are recipe choices, not framework defaults.
+
+1. Map the task dataset with `--prompt-data`, `--input-key`, `--metadata-key`, and, when needed, `--multimodal-keys`.
+   Let the adapter read `RELAX_INPUT_JSON`; keep environment servers and retrievers outside the per-Session command.
+2. Add an agent entry point that reads the injected endpoint and Session credential, preserves the existing tool loop,
+   and sends complete histories. Configure reasoning/tool parsers for the actual model and allow model requests to
+   survive the selected cross-step waits. The command, working directory, and dependencies must exist on every node
+   that can host a SessionShard.
+3. Choose the output contract: a linear trajectory can write `reward`/metadata or use `--custom-rm-path`; selected
+   branches and multi-context training need explicit exports and the applicable custom-advantage configuration below.
+4. Ensure the launched `--agent-command` cleans up its resources on natural exit and on SIGTERM from Relax, then
+   configure Group concurrency and external executor quotas using
+   [Configure Runtime Behavior](#configure-runtime-behavior). `--use-agentic-rollout` selects Agentic generation for
+   both train and Eval; a configured `--custom-generate-function-path` is ignored on this path.
+5. Run a complete Group through model calls, tools, reward, export, and cleanup before scaling up. Then check a real
+   optimizer update and the configured pause/resume or prelaunch lifecycle; a single successful model call proves only
+   API connectivity.
+
+For a single-node run, check whether local Ray is running; if it is not, use a recipe that sources
+`scripts/entrypoint/local.sh` and run it with Bash. Use `scripts/entrypoint/ray-job.sh` when submitting to an existing
+cluster. Keep model/data paths and deployment settings in the recipe; no custom rollout loop is needed for this adapter
+path.
 
 ### Verify the First Rollout
 
@@ -521,61 +562,100 @@ selects that value. Leave reward unset on sibling contexts. Put any outcome need
 metadata. In multi-context training, reward reports the task outcome and custom advantage determines each export's
 advantage.
 
-## Configure Runtime Behavior
+### Background Eval Judging
 
-::: danger Required external-agent capacity
-When agents run on a centralized remote platform with a hard concurrency limit, calculate the train limit and each Eval
-dataset's limit:
+The built-in Agentic and standard SGLang eval paths can run expensive judges in the background after generating
+trajectories. Background judging is enabled by default without any flag; pass `--disable-eval-async-judge` to disable it
+and wait for scoring. This works with both colocated and separate training/rollout GPUs. Generating eval trajectories still uses
+the existing policy inference resources, and background scoring must not continue to depend on those resources.
 
-```text
-T = agentic_concurrency * n_samples_per_prompt
-G_d = dataset d's n_samples_per_eval_prompt
-C_d = explicit agentic_eval_concurrency or ceil(T / G_d)
-E_d = C_d * G_d
-E_peak = max(E_d across Eval datasets)
+The independent HTTP reward `remote_rm` uses this mechanism automatically. A custom `--custom-rm-path` must declare
+support explicitly. For example, with existing `train_reward` and `eval_reward` implementations, the entry point can
+remain a synchronous function:
+
+```python
+def reward_func(args, sample, *, evaluation=False, **kwargs):
+    if evaluation:
+        return eval_reward(args, sample)
+    return train_reward(args, sample)
+
+
+reward_func.supports_async_eval = True
 ```
 
-Eval datasets run serially, so their combined peak is `E_peak`, not the sum of all `E_d` values.
+Synchronous `def` functions still run in the Ray reward process pool; `async def` functions can also declare support.
+The built-in Agentic and standard SGLang rollout paths pass `evaluation=False` during training and `evaluation=True`
+during evaluation, for both inline and background scoring. Functions accepting an `evaluation` keyword or `**kwargs`
+receive the argument; existing strict two-argument functions receive no extra argument. If you implement a complete
+rollout or eval function, explicitly pass `evaluation` when calling `async_rm` / `batched_async_rm`; Relax does not infer
+the phase from shared `args` or metadata. You do not need metadata phase markers or an extra YAML file to distinguish
+the phases. Configure the evaluation data directly through the CLI:
 
-When `--agentic-prelaunch`, `--partial-rollout`, or `--fully-async` is enabled, select **Yes** in the
-**Train sessions remain resident during Eval** column. Prelaunch shares the training resident capacity, so the train limit
-stays `T`; it makes `T` overlap with `E_peak`.
+```bash
+--eval-prompt-data agent_eval "<eval-data-path>"
+```
 
-Then use the matching row for an executor shared by train and Eval:
+You can still use `--eval-config` for dataset-specific sampling parameters or metadata.
 
-| Eval enabled | Train sessions remain resident during Eval | Required slots |
-| --- | --- | --- |
-| No | — | `external_slots >= T` |
-| Yes | No | `external_slots >= max(T, E_peak)` |
-| Yes | Yes | `external_slots >= T + E_peak` |
+Declaring `supports_async_eval` means eval scoring only needs the exported Sample snapshot, persistent artifacts, and
+independent CPU or remote judge resources. Export the actions, tool results, and intermediate traces needed for scoring
+before the Session ends. The scorer must not depend on a live Session, temporary files, or a colocated model that may
+be offloaded. Return the final real reward; do not submit a background job yourself and return its ID or a placeholder
+score. The complete-list input and corresponding-list output contract for `group_rm` is unchanged.
 
-Fewer slots can deadlock Group startup at the all-session first-request barrier. Check this table before starting a run.
-:::
+Relax uses a CPU reward pool separate from training scoring, then records metrics and dumps under the original eval
+iteration once the real scores arrive. Ordinary rule rewards, custom rewards without the declaration, managed
+`dapo-genrm`, and native image scoring keep their existing paths. Training rewards are also unaffected by this option.
+In ordinary RM mode, a reward already supplied by the Agent is reused without another scoring call.
 
-| Goal | Option | Behavior |
-| --- | --- | --- |
-| Limit resident training Groups | `--agentic-concurrency` | Shared capacity for Prepare and Runtime |
-| Set resident Eval Groups | `--agentic-eval-concurrency` | Logical Eval prompt-Group capacity derived from training capacity when unset |
-| Start agents early | `--agentic-prelaunch` | Starts processes while resident capacity is free |
-| Reuse unfinished samples | `--partial-rollout` | Aborts and resumes backend attempts across steps |
-| Run asynchronous rollout and training | `--fully-async` | Keeps unfinished sessions while partitions advance |
-| Limit partial aborts | `--partial-rollout-max-aborted-count` | Protects a repeatedly aborted attempt |
-| Stop an agent that runs too long | `--agent-timeout` | Terminates the agent process when its Runtime active-time budget expires |
+The eval pool for synchronous judges uses `--reward-num-workers` and `--reward-max-concurrency` independently of the
+training pool. Reserve CPU resources for the additional scoring processes.
 
-`--agent-timeout` starts after a Session enters Runtime. It stops an agent that remains active for too long, for example
-because its loop or a tool call is stuck. A prelaunched Session waiting for Runtime does not consume this budget. The
-budget also pauses when partial rollout or fully async pauses a Session between steps.
+Normal training completion waits for pending judges and records their results. Background scoring failures are logged
+and raised during this final drain. This is not a durable job queue that survives the training job: failures or forced
+shutdown can interrupt scoring. Judges that consistently run slower than eval submission will accumulate a backlog,
+so set timeouts on remote calls and provision enough scoring capacity. Separate worker pools do not remove contention
+at a shared remote judge service.
 
-`--agentic-concurrency` defaults to `--over-sampling-batch-size`, which defaults to `--rollout-batch-size`.
-`--agentic-eval-concurrency` is derived separately for each Eval dataset from `T` and that dataset's Group size when
-unset. Both options count logical prompt Groups. Dataset `d` owns `E_d` sessions with either ordinary RM or Group RM;
-ordinary RM uses singleton Runtime Groups internally without changing that total. Eval datasets run serially, so with
-dedicated train and Eval executors, provision `T` and `E_peak` separately.
+## Configure Runtime Behavior
 
-Start retrievers, environment servers, and other cross-session services outside the per-session agent command.
+### Group concurrency and independent Session generation
 
-Session KV lifecycle and program-aware admission are optional controls for long-running workloads. See
-[Agentic KV Scheduling](./agentic-kv-scheduling.md).
+`--agentic-concurrency` limits resident training Groups across Prepare and Runtime. Its default is
+`--over-sampling-batch-size`, which defaults to `--rollout-batch-size`. Each Group starts all
+`--n-samples-per-prompt` original Sessions on one Shard.
+
+A registered Group can receive its Runtime lease before every member reaches its first model request. Each leased
+member generates when its own request is ready and the generation gate is open. Complete-Group reward, filtering,
+export, and replenishment still wait for the original Group. Oversampling determines the legal Group launch demand.
+
+Prelaunch retains its existing Group budget. Unleased members wait for lease; ordinary paused members wait for resume.
+`--agent-timeout` begins for each member after its first request is ready and its leased generation gate opens. Protected
+Sessions keep their active timer during a partial-rollout pause. The model client's wall-clock timeout continues while
+requests wait. Partial rollout, fully async, and dynamic global batch size retain their existing mode constraints.
+
+### External executors and Eval
+
+Each Session has 1800 seconds from scheduling its agent process task to issue its first valid inference request,
+including time spent waiting for an external executor. Receiving that request stops the startup timer, even before the
+Group is leased; generation still waits for its gate to open. Exiting before the first request or exceeding this deadline
+drops the whole Group and triggers replenishment. This startup timer is independent of `--agent-timeout`.
+
+Logical train demand is `L = agentic_concurrency * n_samples_per_prompt`. For each Eval dataset, let
+`G_d = n_samples_per_eval_prompt`; Eval Group concurrency is the explicit `--agentic-eval-concurrency`, or
+`ceil(L / G_d)` by default. Its Session ceiling is `E_d = C_d * G_d`. Eval datasets run serially.
+
+Eval members also generate independently after lease. Ordinary RM uses singleton Runtime Groups; Group RM keeps the
+sampled Group size. Both preserve their existing complete export and reward semantics.
+
+For a shared executor, budget at least `max(L, max(E_d))` available task slots when training resources are gone before
+Eval. When prelaunch, partial rollout, or fully async retains training resources during Eval, budget `L + max(E_d)`.
+Dedicated pools need separate train and Eval budgets. These are logical demand estimates: background cleanup and other
+jobs can keep additional external resources alive. The external service enforces its physical quotas.
+
+Independent member generation allows ready members to make progress when an executor queues their siblings. It does
+not resolve application dependencies on work waiting in the same saturated pool. KV controls address another resource;
+see [Agentic KV Scheduling](./agentic-kv-scheduling.md).
 
 ## Understand How Agentic Rollout Works
 
@@ -667,7 +747,8 @@ aligned rollout logprobs. An exported lineage must contain at least one committe
 #### Resident Capacity
 
 Prepare and Runtime share the resident Group capacity. Reward work is outside this capacity. A completed or dropped
-Runtime Group frees a slot. A filtered Group creates new demand.
+Runtime Group releases its logical slot before best-effort physical cleanup. Filtering creates new Group demand.
+Tests and rewards run inside the agent belong to its Session lifecycle and differ from the pipeline's Reward stage.
 
 ![Shared resident capacity and prelaunch](/agentic/resident_capacity.svg)
 
@@ -698,14 +779,248 @@ radix-cache entries when a session ends. See [Agentic KV Scheduling](./agentic-k
 
 ### Metrics and Dumps
 
+Logical Group counts describe scheduling residency. Inspect the agent or executor's own state for physical process,
+container, and remote-task occupancy; background cleanup can outlive logical retirement.
+
 Set `--save-debug-rollout-data <path-with-{rollout_id}>` to save complete metadata, SessionForest state hashes, terminal
 status, turn count, request timing, abort count, and weight-version information.
+
+### Agentic Observability JSONL
+
+Set `--dump-agentic-obs <directory>` to write `manifest.json` and sharded JSONL
+under a generated `run_*` directory. Collect files from every producing node,
+or use a shared output directory. Each JSONL row carries `schema_version` and
+`run_id`; `sample_export_id` is a decimal string, including inside `samples[]`.
+
+| Stream | Records and join keys |
+| --- | --- |
+| `prompts/*.jsonl` | Original source row, `prompt_id`, dataset provenance, raw `input_payload`, optional reference, and text preview. |
+| `groups/*.jsonl` | Runtime Group creation, `group_id`, `group_index`, `prompt_id`, expected Session count, mode, and creation time. |
+| `sessions/*.jsonl` | `session_id`, `group_id`, `prompt_id`, sample/replicate indices, expected Group size, and merged sampling defaults. |
+| `trajectories/*.jsonl` | Exported lineage, `sample_export_id`, `session_id`, runtime `group_id`, `sample_index`, and `exported_at`. Multiple exports share a sample index but have distinct export IDs. |
+| `stages/*.jsonl` | Paired stage boundaries with `stage_id`, `record_id`, `scope`, `event_seq`, `occurred_at`, and `is_terminal`. Trajectory stages describe reward, filter and transfer; rollout/update events carry `group_ids` and `groups_finalized`. |
+| `train/*.jsonl` | One DP fragment per actual policy update: `update_id`, `train_generation_id`, `stage_id`, `capture_phase=training_input`, `samples[]`, `dp_rank`, `dp_world_size`, and `input_complete`. |
+
+The current train producer covers the Megatron policy actor. An update ID is
+`actor:<rollout_id>:<step_id>`, scoped by `(run_id, train_generation_id)`; one rollout
+may contain several updates. Inputs are captured as micro-batches are consumed, before packing or
+dynamic CP splitting. Dummy batches are omitted, but real samples with zero
+loss masks remain. Each sample includes lengths, effective tokens, and masked
+advantage/return statistics. Train records with schema `4.0.0` encode
+`loss_mask.ranges` as zero-based, half-open `[start, end, value]` intervals over
+the response. Fill uncovered positions with zero up to `response_length`.
+For example, `[1, 1, 0, 1]` becomes `{"ranges": [[0, 2, 1], [3, 4, 1]]}`.
+Train records with schema `3.0.0` store `loss_mask` as a per-token array.
+Static CP statistics are `null`; dynamic CP captures full sequences before
+splitting. The mask describes training input before loss-local TIS/OPSM filtering.
+
+Identify each DP fragment by `(run_id, train_generation_id, update_id, dp_rank)`
+and join by `(run_id, train_generation_id, update_id)`. The actor-group initializer
+assigns one shared generation ID to a copy of its worker arguments; reinitialization
+gets a new ID without changing training settings or adding a collective. Input
+fragments must also match their DP boundary's `stage_id`, so replayed updates cannot
+reuse an earlier attempt's input. Missing generation IDs mean unknown.
+Each DP owner emits paired `scope=update_fragment` boundaries into
+`stages/actor_<rollout_id>_dp_<rank>.jsonl`, including `dp_world_size`, `step_id`,
+`train_generation_id`, `update_sequence`, and its local `optimizer_successful` result. No observability
+collective runs in training. A training exception records failed/cancelled with
+unknown optimizer outcome and incomplete membership.
+
+Use `relax.utils.agentic_obs.merge_train_updates(stage_records, train_records)`
+on the reader side. It reports `committed` only when every expected DP owner has
+one consistent start/end pair and all optimizer results succeeded. Missing or
+conflicting evidence means `unknown`; missing train input fragments independently
+make `input_complete=false`. It preserves legacy `scope=update` records unchanged.
+`optimizer_step` counts successful updates within each actor-group generation, starting at 1;
+skipped updates do not increment it. A gap or conflict in the per-DP sequence makes
+this count null from that point. `groups_finalized=true` closes membership, not
+sample success. Runtime `group_id` and reward-normalization `group_index` differ.
+
+Custom converters should return aligned CPU int64 `sample_export_ids`. Missing or
+invalid identities produce aligned `-1` IDs and empty group IDs, without changing
+training rows or omitting the TQ observation columns; downstream membership and
+input completeness remain false. IDs are never inferred from input order.
+
+Reward completion and transfer acknowledgement are nonterminal. A TQ RPC failure
+after submission has `reason_code=transfer_outcome_unknown` and
+`is_terminal=false`, since the remote write may have succeeded. Selection
+failures and completed Eval exports are terminal. Deduplicate stage events by
+`record_id` and order within their scope identity by `event_seq`, rather than
+using file order across shards.
+
+The training driver writes its lifecycle to `stages/run.jsonl`, using
+`scope=run, stage=execution`. A `start` is followed by a terminal `completed`,
+`failed`, or `cancelled` with the same `stage_id` and `event_seq=2`.
+The terminal `occurred_at` is the training end time; `operation` identifies
+`startup`, `training`, or a known `checkpoint` failure. `reason_code` is
+`run_failed` or `run_cancelled`, and `reason` retains the exception type and
+message or the received signal. Megatron annotates checkpoint errors, including
+asynchronous save finalization, before they cross Ray. Unmarked failures retain
+the driver's broader phase; the observer does not guess a phase or quota error
+from traceback text. The first outcome wins, so a cleanup signal cannot overwrite
+a completed or failed Run. Existing `scope=run, stage=startup` records describe
+the resolved schedule and are not Run outcomes.
+
+Platform consumers should keep three independent states:
+
+| Display | Evidence |
+| --- | --- |
+| Training Run | The terminal Run execution event; fall back to the authoritative Trial terminal status when it is absent. |
+| Collection freshness | The collector's last successful collection time and its configured freshness threshold. |
+| Session | That Session's own execution events, independently of the Run and collector. |
+
+Registration-time `Running` is not a permanent status. Without a Run outcome or
+an authoritative Trial result, stale collection means **status awaiting
+confirmation**; it cannot establish success, failure, or cancellation. A Run
+outcome does not prove that all producer files have been collected. `SIGTERM`
+and `SIGINT` record cancellation before remote cleanup; `SIGKILL`, node loss,
+and an unwritable observation directory can leave only a start. An ordinary
+process exit without a recorded result also leaves the outcome unknown.
+Argument parsing precedes the Run start. Place observation files on storage
+with independent available quota when checkpoint storage may fill up.
+
+Keep training progress when a Run fails: count distinct committed `(train_generation_id, update_id)` pairs
+within the Run, and find participating Sessions by joining their DP input
+`sample_export_id`s to trajectory `session_id`s, deduplicated across updates.
+Group membership alone does not prove Session consumption. If DP fragments or
+trajectories are missing, report an observed lower bound or unknown membership,
+not an exact Session total. This lets a platform display a checkpoint failure
+alongside its already committed updates and participating Sessions.
+
+Dumps are best-effort. Producers snapshot and enqueue without waiting for disk.
+Daemon queues bound both items and bytes, including in-flight work. Closure has a
+one-second total drain budget per recorder/process close, including flush/status;
+expired or cancelled closes discard pending items. Only the in-flight write retains
+its resources. At most 16 observation workers can run per process, so repeated
+recorder creation against a stalled disk cannot accumulate unlimited threads.
+Observation persistence never shields cancellation or adds a training collective.
+
+Producer `*.status.json` files expose write/drop counts when writable. Input
+saturation retains small local optimizer facts through a separate bounded queue;
+whole-writer failure or abrupt process death can still lose records. Require all DP
+input fragments with `input_complete=true` before declaring a complete input set.
+Missing records, missing log files, unacknowledged export delivery, and partial JSONL
+tails mean **unknown**, never proof of a pending or rejected training update.
+Managed logs snapshot the final 1 MiB locally before temporary-directory cleanup;
+`log_ref` names an accepted background write, so readers must check file availability.
+The manifest uses `record_format=agentic-observability-full-v3` and schema `3.0.0`.
+Its `train_schema_version` identifies the train stream's schema. Readers merge
+DP facts to determine the update outcome.
+
+Eager and streaming readers preserve source identity before custom prompt processing,
+templating, filtering, shuffling, or replication. `source_row_id` is the zero-based
+physical JSONL line or Parquet row, including sliced/multi-file datasets.
+`dataset_id` defaults to the resolved source path; metadata can supply `dataset_id`,
+`dataset_version`, and `split`. Unknown versions remain `null`. Prompt IDs hash source
+provenance and original content: resampling a row preserves identity, while equal
+content in distinct rows or modified unversioned content produces different IDs.
+Train and Eval splits have separate identities.
+
+Custom sources can populate `Sample.agentic_prompt_source` with these provenance and
+payload fields. Otherwise `identity_kind=content_fallback` uses a content digest with
+null dataset/row fields; identical custom inputs cannot be distinguished as separate
+source rows. Deduplicate prompt and Group inventories by ID within a run. Each driver
+instance writes separate producer files.
+
+Groups are recorded when fetched, including those waiting for preparation. Session
+inventory is emitted after launch is accepted, before Shard registration; actual
+preparation failures also retain their inventory. Deferring a Group to the next step
+creates neither failed Sessions nor extra replicas. In Eval without group reward,
+each single-Session runtime Group has `expected_group_size=1`, although the algorithm's
+`group_index` can be shared. `sampling_config` holds merged Session defaults and
+overrides; the terminal `llm_calls` list carries actual request overrides and context caps.
+
+Scoped intervals use one `start` and one
+outcome with the same `stage_id`; their `occurred_at` values are its boundaries.
+`record_id` deduplicates events. `event_seq` increases across stages for the same
+scope owner. `is_terminal` closes the owner lifecycle, independently of closing a stage.
+
+| Scope / stage | Start boundary | End results |
+| --- | --- | --- |
+| run / execution | Training driver begins startup | completed / failed / cancelled for the whole training Run |
+| rollout / execution | A train or Eval scheduling batch begins | completed / failed / cancelled after batch cleanup |
+| session / rollout | Driver begins preparation of an accepted Session | completed / failed / cancelled after Shard cleanup |
+| trajectory / reward | RM or acceptance of an agent-provided reward begins | completed / failed / cancelled |
+| trajectory / filter | A selection or custom advantage decision begins | passed / filtered / failed / cancelled |
+| trajectory / transfer | Conversion and queue submission begin | queued_for_train / failed / cancelled |
+| update_fragment / train | This DP owner begins the update | completed / failed / cancelled; reader derives global committed/failed/unknown |
+
+Successful transfer uses `status=queued_for_train`. Earlier dumps used `completed`
+for the same acknowledgement; readers can accept that legacy value when
+`stage=transfer`. Neither value proves that an optimizer update committed.
+
+`filter.operation` distinguishes `dynamic_filter`, `custom_advantage`, `oversampling`,
+`shutdown`, `execution` (group disposal), `export_delivery`, and `eval` (accepting the
+Eval result). These are real selection decisions; an instantaneous decision can have
+zero duration. A provided reward uses `reward.operation=provided_reward`; a custom
+advantage path without a reward does not manufacture an RM interval or a zero reward.
+A shared `transfer_batch_id` groups the exports submitted in one batch. Unknown queue
+acknowledgements remain nonterminal and are never automatically retried by the observer.
+`retry_of_stage_id` is reserved for explicit business retries; the observer does not add retries.
+
+**Session writes only start and its final rollout result: no progress field, phase
+field, request event, or pause/resume event.** Driver owns start; Shard owns the end
+once registration is attempted. A proven local preparation failure has a paired end
+and an empty call list. An unknown registration outcome is logged and leaves start
+open until the Shard supplies an end; the driver does not manufacture a failed end.
+
+| Terminal field | Meaning |
+| --- | --- |
+| `wall_ms` / `active_ms` | Wall time from Driver preparation / managed process active-budget time excluding pauses. Clock synchronization is required across producers. |
+| `llm_calls` / `llm_calls_complete` | Every admitted logical request, including rejected, failed, cancelled and unexported calls; completeness describes captured call/attempt boundaries. |
+| `request_count` / `attempt_count` | Distinct logical requests / entries into backend.generate. Internal HTTP retries are not separate runtime attempts. |
+| `generated_tokens` / `token_count_complete` | Sum of returned deltas, including aborted prefixes and cleanup results. Tokens are null when generation results or internal retries are unobservable. |
+| `export_ids` | Published export IDs as decimal strings; empty when no export exists. |
+| `diagnostics` / `log_ref` | Soft cleanup diagnostics / relative queued agent log path, nullable; existence must be checked. |
+
+A call carries `request_id`, zero-based `call_index`, `started_at`, `finished_at`,
+`status`, `parent_state_hash`, `resp_state_hash`, and `attempts`. Runtime attempts carry
+zero-based `attempt_index`, `rollout_id`, both timestamps and status. An aborted partial
+attempt and a resumed attempt share the logical request ID, even across rollouts.
+A separately submitted agent request receives a new ID; similarity is not evidence
+of a retry. Requests rejected before generation have `attempts=[]`. A length-limited
+response is a completed call with `finish_reason=length`, not a failed call.
+
+Request failure does not force Session failure if the agent recovers. Terminal causes
+include `agent_timeout`, `agent_exit_nonzero`, `agent_output_invalid`,
+`export_validation_failed`, `session_prepare_failed`, `session_infra_failed`, and
+`session_cleanup_failed`. Unfinished siblings and explicit disposal are cancelled with
+category `selection`; an already completed Session is never rewritten by later filtering.
+
+To build a Session timeline on the platform:
+
+1. Load Session, Group and Prompt by their IDs within `run_id`; collect all Session exports.
+2. Expand every DP fragment of `train.samples` and join by export ID to find actual update
+   membership. Group membership alone never proves training consumption.
+3. Collect Session, export and consumed-update stage events; deduplicate by `record_id`,
+   then pair by `stage_id`, verifying scope/owner/stage. Conflicting duplicates or multiple
+   ends are data errors. File order is not event order.
+4. Read calls only from the unique Session end; without it, calls are unknown. Draw each
+   logical call once, nesting attempts and linking `(session_id, request_id)` to export
+   `agentic_trace.turns`, then `resp_state_hash` to lineage. Unexported calls remain visible.
+5. Draw reward/filter/transfer per export; draw each consumed update once. Use
+   `transfer_batch_id` for batch grouping and attempt rollout IDs for batch background,
+   scoped by the Session's `rollout_mode` to separate train and Eval.
+6. Derive durations only from complete, ordered boundaries. Missing ends remain open;
+   a snapshot time is a display limit, never an observed end. Flag clock inversions.
+   Gaps between LLM calls do not establish tool execution times. Only a committed update
+   proves successful training; require all DP fragments to claim complete inputs.
+
+`--dump-agentic-obs-media` additionally saves content-addressed media bytes. Without
+it, data URIs and raw binary payloads in prompts/trajectories become digest/size
+references. Logs are copied before temporary agent directories are removed; abrupt
+Shard death can still prevent the final copy. `tokens.jsonl` remains deferred by
+the current design.
 
 ### Common Problems
 
 - **The agent does not start or exits with an error:** check `--agent-cwd` and `--agent-command`, then inspect `run.log`.
   Relax adds a bounded tail of the agent's stdout and stderr to `AgentExecutionError`.
-- **The first request waits:** it is held until the Group receives a Runtime lease. Use a long client timeout.
+- **The first request waits:** check the Runtime lease, generation pause, backend permits, and executor queue. Use a
+  client timeout that covers these waits. Siblings reaching their first request later do not gate a ready leased member.
+- **External resources remain after a task ends:** check that `agent-command` cleans up on natural exit and on SIGTERM
+  from Relax, and inspect executor state. Relax's fallback cleanup logs warnings independently of logical Group capacity.
+
 - **Explicit export does not match:** preserve the exact normalized `messages`, `tools`, and `chat_template_kwargs` used
   during generation.
 - **Implicit export is ambiguous:** write named explicit records for the contexts selected for training.

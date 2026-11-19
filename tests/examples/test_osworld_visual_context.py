@@ -113,6 +113,9 @@ class MockBackend:
         self.forest = SessionForest.create_empty(session_id="session", group_index=7, index=42)
         self.shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
         self.shard.args = SimpleNamespace(use_rollout_routing_replay=False)
+        from relax.agentic.observability import ShardTrajectoryRecorder
+
+        self.shard._trajectory_recorder = ShardTrajectoryRecorder(self.shard.args, shard_ordinal=0)
         self.shard._generation_backend = SimpleNamespace(compiler=self, tokenizer=self)
         self.shard._raise_if_observation_exceeds_context = lambda **kwargs: None
         monkeypatch.setattr(hybrid.httpx, "post", self.post)
@@ -184,11 +187,15 @@ class MockBackend:
         )
 
     def export(self, rows):
+        from relax.agentic.runner.ipc import _normalize_session_output_record
+
         transport = self.shard._build_session_export_transport(
-            session=SimpleNamespace(forest=self.forest, group=SimpleNamespace(rollout_mode="train")),
+            session=SimpleNamespace(
+                forest=self.forest, group=SimpleNamespace(rollout_mode="train", group_id="group"), observation=None
+            ),
             reward=None,
             metadata={},
-            output_records=tuple(rows),
+            output_records=tuple(_normalize_session_output_record(row) for row in rows),
             finalize_events={},
         )
         return [TrainingFieldArtifact(sample_payload=e["sample_payload"]).to_sample() for e in transport.exports]

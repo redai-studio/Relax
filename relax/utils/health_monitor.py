@@ -65,7 +65,7 @@ class RolloutHealthMonitor:
         logger.info("RolloutHealthMonitor started (in paused state).")
         return True
 
-    def stop(self) -> None:
+    def stop(self, timeout: float | None = None) -> None:
         """Stop the health monitor thread completely.
 
         Called during dispose.
@@ -79,10 +79,14 @@ class RolloutHealthMonitor:
         # Also clear pause to let the thread exit
         if self._pause_event:
             self._pause_event.clear()
-        timeout = self._check_timeout + self._check_interval + 5
+        self._is_checking_enabled = False
+        if timeout is None:
+            timeout = self._check_timeout + self._check_interval + 5
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
-            logger.warning("Rollout health monitor thread did not terminate within %.1fs", timeout)
+            if timeout > 0:
+                logger.warning("Rollout health monitor thread did not terminate within %.1fs", timeout)
+            return  # Keep its stop event and handle until the thread actually exits.
         else:
             logger.info("RolloutHealthMonitor stopped.")
 

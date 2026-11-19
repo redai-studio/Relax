@@ -1,11 +1,14 @@
 name: Welcome contributors
-description: Post one expandable welcome comment using the configured bot account
+description: Update one welcome comment with current merge requirements using the configured bot account
 inputs:
   bot-token:
     description: Token belonging to the welcome bot
     required: true
   bot-login:
     description: Expected GitHub login of the welcome bot
+    required: true
+  pr-number:
+    description: Pull request whose welcome and merge status should be updated
     required: true
   docs-url:
     description: Published Relax documentation URL
@@ -18,9 +21,10 @@ runs:
         PR_WELCOME_PATH: ${{ github.action_path }}
         WELCOME_BOT_LOGIN: ${{ inputs.bot-login }}
         DOCS_URL: ${{ inputs.docs-url }}
+        PR_NUMBER: ${{ inputs.pr-number }}
       with:
         github-token: ${{ inputs.bot-token }}
         retries: 0
         script: |
           const { run } = await import(`${process.env.PR_WELCOME_PATH}/index.mjs`);
-          await run({ github, context, botLogin: process.env.WELCOME_BOT_LOGIN, docsUrl: process.env.DOCS_URL });
+          await run({ github, context, botLogin: process.env.WELCOME_BOT_LOGIN, docsUrl: process.env.DOCS_URL, number: Number(process.env.PR_NUMBER) });

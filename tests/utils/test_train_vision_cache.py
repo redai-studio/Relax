@@ -365,7 +365,7 @@ def test_microbatch_packing_preserves_image_identity_order(enabled, monkeypatch,
     from pathlib import Path
     from types import ModuleType
 
-    from tests.backends.megatron.test_data_vpp import _load_data_module
+    from tests.cpu.backends.megatron.test_data_vpp import _load_data_module
 
     # Import data.py with existing CPU stubs, without executing GPU backend patches.
     parent = ModuleType("relax.backends.megatron")

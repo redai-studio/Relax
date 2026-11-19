@@ -46,6 +46,8 @@ class Dataset(BaseDataset):
         custom_prompt_func=None,
         teacher_prompt_key=None,
         teacher_multimodal_keys=None,
+        record_source: bool = False,
+        source_split: str = "train",
     ):
         # Initialize base class
         super().__init__(
@@ -69,8 +71,9 @@ class Dataset(BaseDataset):
         )
 
         # Load all samples into memory
+        self.source_split = source_split
         origin_samples = []
-        for data in read_file(path):
+        for data in read_file(path, with_source=record_source):
             sample = self._process_data(data)
             origin_samples.append(sample)
 
@@ -113,15 +116,22 @@ class Dataset(BaseDataset):
         return len(self.samples)
 
 
-def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
-    # use first fit to get the number of micro batches
-    batches = []
-    for length in total_lengths:
+def get_first_fit_partitions(total_lengths: list[int], max_tokens_per_gpu: int) -> list[list[int]]:
+    """Pack indices in input order; oversized samples get their own bin."""
+    batches: list[int] = []
+    partitions: list[list[int]] = []
+    for index, length in enumerate(total_lengths):
         for i in range(len(batches)):
             if batches[i] + length <= max_tokens_per_gpu:
                 batches[i] += length
+                partitions[i].append(index)
                 break
         else:
             batches.append(length)
+            partitions.append([index])
 
-    return len(batches)
+    return partitions
+
+
+def get_minimum_num_micro_batch_size(total_lengths: list[int], max_tokens_per_gpu: int) -> int:
+    return len(get_first_fit_partitions(total_lengths, max_tokens_per_gpu))

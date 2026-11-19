@@ -22,7 +22,7 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-0}"
-PROJECT_NAME="${PROJECT_NAME:-Relax/dev/wulumeng/search-r1}"
+PROJECT_NAME="${PROJECT_NAME:-Relax/dev/search-r1}"
 EXP_NAME="${EXP_NAME:-qwen25-7b-base-search-r1-${SEARCH_R1_MODE}-${TIMESTAMP}}"
 
 TRAIN_DATA="${SEARCH_R1_DATA_ROOT}/qa/nq_hotpotqa_train_relax/train.parquet"
@@ -40,7 +40,7 @@ ROLLOUT_ARGS=(
     --input-key prompt
     --metadata-key extra_info
     --use-agentic-rollout
-    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-command "bash ${SCRIPT_DIR}/run_agent_app.sh"
     --agent-cwd "${SCRIPT_DIR}"
     --agent-env
         "SEARCH_R1_MODE=${SEARCH_R1_MODE}"

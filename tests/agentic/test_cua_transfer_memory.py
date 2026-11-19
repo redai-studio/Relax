@@ -115,7 +115,7 @@ def test_pixels_release_only_after_successful_queue_write(monkeypatch, outcome):
             transfer._transfer_batch_to_data_system(
                 args=args,
                 batch_samples=[[sample]],
-                rollout_id=3,
+                partition_id=3,
                 data_system_client=SimpleNamespace(async_put=put),
             )
         )
