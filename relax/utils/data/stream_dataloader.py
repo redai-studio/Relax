@@ -1454,6 +1454,7 @@ class StreamingTQIterator:
         # all-reduce stays in lockstep.  After real data is exhausted, the
         # iterator MAX-reduces its real mb count across DP and yields dummy
         # mbs (tagged __is_dummy__, zero gradient) up to that maximum.
+        self._last_batch: Optional[Tuple[Dict[str, Any], Any]] = None
         self._dummies_remaining: Optional[int] = None  # computed at end-of-stream
 
         # ── tail prefetch ────────────────────────────────────────────────
@@ -1549,7 +1550,7 @@ class StreamingTQIterator:
         """Build a dummy micro-batch from the last real one, tagged so the loss
         contributes zero gradient (keeps all DP ranks at the same micro-batch
         count)."""
-        if not self._buffer:
+        if self._last_batch is None:
             # A dp asked to emit a dummy before ever seeing a real batch = it got
             # ZERO samples this window. With the fair per-window quota
             # (mini_global_samples % dp_size == 0) every dp normally gets >= 1
@@ -1560,7 +1561,7 @@ class StreamingTQIterator:
                 f"dp={self.dp_rank} must emit a dummy micro-batch but received zero real samples "
                 "this window (no template to build a dummy from)."
             )
-        data, meta = self._buffer[-1]
+        data, meta = self._last_batch
         dummy = dict(data)
         dummy["__is_dummy__"] = True
         dummy["__loss_scale__"] = self.loss_scale
@@ -1609,7 +1610,7 @@ class StreamingTQIterator:
             reason,
         )
         pad = k_global - k_real
-        if pad > 0 and not self._buffer:
+        if pad > 0 and self._last_batch is None:
             self._shutdown_prefetch()
             raise RuntimeError(
                 f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
@@ -1636,6 +1637,18 @@ class StreamingTQIterator:
         data["__loss_scale__"] = self.loss_scale
         self._sample_count += n_samples
         self._buffer.append((data, meta))
+        # Snapshot for dummy padding.  ``get_batch`` mutates the batch
+        # dict IN PLACE (e.g. reassigns ``batch["tokens"]`` to the
+        # concatenated+padded packed tensor), and the schedule passes
+        # this very ``data`` object to ``get_batch``.  If we kept a
+        # reference to it, a later ``_make_dummy_batch`` would copy the
+        # ALREADY-PACKED ``tokens`` while ``loss_masks`` / ``total_lengths``
+        # stay per-sample lists → loss_mask/token shape mismatch in
+        # ``get_batch`` (tok length = sum of two samples).  Store a
+        # shallow dict copy (new top-level dict, same per-sample list
+        # values, which get_batch does not mutate) so the dummy always
+        # rebuilds from the pristine raw fields.
+        self._last_batch = (dict(data), meta)
         self._batch_index += 1
         self._mb_count += 1
 
@@ -1676,9 +1689,7 @@ class StreamingTQIterator:
         # Warm the controller cache for the next mb while the trainer
         # computes this one (tail prefetch; meta-only).
         self._warm_next_batch_index(self._batch_index)
-        # get_batch repacks tokens and replaces other top-level fields during training.
-        # A shallow copy keeps the original rows intact for metrics and dummy padding.
-        return dict(data), meta
+        return data, meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
         # Dummy-padding phase: real data exhausted, emit dummies up to k_global.

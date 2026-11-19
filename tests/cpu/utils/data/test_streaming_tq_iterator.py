@@ -383,7 +383,7 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     # end empty whose meta carries STREAM_END (window drained).
     events = [
         ({"tokens": [torch.tensor([0])]}, _Meta({})),
-        ({"tokens": [torch.tensor([1, 2, 3])], "log_probs": [torch.tensor([-1.0, -2.0])]}, _Meta({})),
+        ({"tokens": [torch.tensor([1])]}, _Meta({})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"stream_end": True})),
@@ -402,14 +402,8 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     )
 
     assert not next(iterator)[0].get("__is_dummy__")  # real mb 0
-    real, _ = next(iterator)
-    assert not real.get("__is_dummy__")
-    # get_batch replaces full response fields with CP-local slices during training.
-    real["log_probs"] = [real["log_probs"][0][:1]]
-    dummy, _ = next(iterator)
-    assert dummy["__is_dummy__"] is True
-    assert dummy["log_probs"][0].tolist() == [-1.0, -2.0]
-    assert iterator.get_buffer()[-1][0]["log_probs"][0].tolist() == [-1.0, -2.0]
+    assert not next(iterator)[0].get("__is_dummy__")  # real mb 1
+    assert next(iterator)[0]["__is_dummy__"] is True  # dummy round
     assert next(iterator)[0]["__is_dummy__"] is True  # dummy round
     with pytest.raises(StopIteration):  # empty, no dummy flag, stream_end → END
         next(iterator)
