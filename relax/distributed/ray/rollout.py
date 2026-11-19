@@ -734,7 +734,7 @@ class RolloutServer:
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
             if not (
-                getattr(group.args, "fully_async", False)
+                group.args.fully_async
                 and group.is_scaled_out
                 and group.pg is not None
                 and group.skip_router_registration

@@ -507,7 +507,7 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     buckets."""
     if not (
         getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_chunked_logits", False)
+        and args.sft_chunked_logits
         and getattr(args, "recompute_loss_function", False)
         and getattr(args, "overlap_grad_reduce", False)
     ):
@@ -1507,13 +1507,13 @@ def train_one_step(
                 fused_linear = (
                     head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
                 )
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
+                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                if args.sft_chunked_logits and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
@@ -1566,7 +1566,7 @@ def train_one_step(
     # Forward pass.
     use_streaming = (
         getattr(args, "use_dynamic_batch_size", False)
-        and getattr(args, "fully_async", False)
+        and args.fully_async
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )

@@ -96,7 +96,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces
         # ``advantages``/``returns``, actor just pulls the finished tensors.
-        if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+        if args.fully_async and not getattr(args, "hybrid", False):
             fields.extend(["advantages", "returns"])
         else:
             fields.append("values")
