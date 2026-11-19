@@ -669,6 +669,9 @@ class _WeightSyncTimeoutError(TimeoutError):
     """A remote weight-sync operation timed out and must not be retried."""
 
 
+_COLOCATE_SHUTDOWN_RESERVE = 8.0  # Confirm engine exit and abort the sender.
+
+
 @dataclasses.dataclass
 class RolloutServer:
     """A model served behind a shared router, with one or more engine groups.
@@ -1038,6 +1041,7 @@ class RolloutManager(ReloadableMixin):
         self._colocate_remote_group: tuple[str, tuple[str, ...]] | None = None
         self._colocate_retiring: str | None = None
         self._colocate_disposing = False
+        self._colocate_dispose_deadline: float | None = None
         self._colocate_failure: str | None = None
         self._colocate_shutdown_pgs: set[ray.PlacementGroupID] = set()
         self._colocate_pending_pgs: dict[ray.PlacementGroupID, Any] = {}
@@ -1344,6 +1348,7 @@ class RolloutManager(ReloadableMixin):
             if _synchronous_colocate(getattr(self, "args", None)):
                 raw_pg_error = None
                 with self._engine_lifecycle_lock:
+                    self._colocate_dispose_deadline = dispose_deadline
                     self._colocate_disposing = True
                     # These PGs have no engine or outstanding GPU transfer.
                     for pg in list(self._colocate_pending_pgs.values()):
@@ -1381,7 +1386,7 @@ class RolloutManager(ReloadableMixin):
                     try:
                         ray.get(
                             source.disconnect_colocate_weight_group.remote(current[0]),
-                            timeout=max(0.0, dispose_deadline - time.monotonic() - 8),
+                            timeout=max(0.0, dispose_deadline - time.monotonic() - _COLOCATE_SHUTDOWN_RESERVE),
                         )
                     except Exception:
                         self.fail_colocate_full(current[0])
@@ -1697,7 +1702,8 @@ class RolloutManager(ReloadableMixin):
                         evictions = await asyncio.wait_for(
                             asyncio.gather(*(engine.is_evicted.remote() for engine in group.all_engines)), timeout=5
                         )
-                        eligible = not any(evictions)
+                        with self._engine_lifecycle_lock:
+                            eligible = candidate.eligible() and not self._colocate_disposing and not any(evictions)
                 if eligible:
                     attempted_registration = True
                     registered = await asyncio.wait_for(
@@ -1735,15 +1741,7 @@ class RolloutManager(ReloadableMixin):
             if candidate.result is not None:
                 continue
             if attempted_registration:
-                # A failed registration response can leave a live Router entry.
-                _, failed = await self._drain_engines(
-                    [(group, idx) for idx in range(len(engines))],
-                    timeout=getattr(self.args, "scale_in_drain_timeout", 30.0),
-                    force=False,
-                    allow_already_absent=True,
-                )
-                if failed:
-                    raise RuntimeError("Could not confirm removal of a rejected colocate candidate")
+                await self._rollback_colocate_registration(group, len(engines))
             rejected = True
             with self._engine_lifecycle_lock:
                 if candidate.failure is None:
@@ -1751,6 +1749,32 @@ class RolloutManager(ReloadableMixin):
 
         with self._engine_lifecycle_lock:
             return self._colocate_remote_group[0] if rejected else None
+
+    async def _rollback_colocate_registration(self, group: EngineGroup, num_engines: int) -> None:
+        # A failed registration response can leave a live Router entry.
+        drain_time = getattr(self.args, "scale_in_drain_timeout", 30.0)
+        removal = asyncio.create_task(
+            self._drain_engines(
+                [(group, idx) for idx in range(num_engines)], timeout=drain_time, force=True, allow_already_absent=True
+            )
+        )
+        try:
+            while not removal.done():
+                deadline = self._colocate_dispose_deadline
+                if deadline is not None and time.monotonic() >= deadline - _COLOCATE_SHUTDOWN_RESERVE:
+                    self.fail_colocate_full(self._colocate_remote_group[0])
+                    raise TimeoutError("Router removal unconfirmed within the colocate shutdown budget")
+                await asyncio.wait({removal}, timeout=0.2)
+        finally:
+            if not removal.done():
+                removal.cancel()
+        _, failed = removal.result()
+        if failed:
+            raise RuntimeError("Could not confirm removal of a rejected colocate candidate")
+
+        deadline = time.monotonic() + drain_time
+        while not self._colocate_disposing and (remaining := deadline - time.monotonic()) > 0:
+            await asyncio.sleep(min(0.2, remaining))
 
     @ray.method(concurrency_group="scale_in")
     def release_colocate_full(self) -> None:
