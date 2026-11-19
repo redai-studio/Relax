@@ -50,6 +50,7 @@ async def test_genrm_session_scores_before_publish_and_reuses_processed_reward(m
         _genrm_colocate_with_rollout=True,
         custom_reward_post_process_path="test.hook",
         reward_key=None,
+        _inference_phase_coordinator=object(),
     )
     events = []
 
@@ -133,3 +134,86 @@ def test_deferred_topk_uses_model_vocabulary_without_mutating_training_args(monk
     )
     assert session.executor.args.vocab_size == 17
     assert args.vocab_size == 32
+
+
+@pytest.mark.asyncio
+async def test_teacher_failure_with_valid_stale_target_prevents_publication(monkeypatch):
+    from relax.engine.rollout import deferred_opd
+
+    monkeypatch.setattr(deferred_opd, "deferred_opd_active", lambda args: True)
+    switch = AsyncMock()
+    args = SimpleNamespace(
+        _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=switch)),
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="teacher",
+        colocate=True,
+        resource={"actor": [1, 1], "rollout": [1, 1], "teacher": [1, 1]},
+    )
+    manager = SimpleNamespace(
+        schema_opd_transfer_data=lambda: ["teacher_log_probs"],
+        prepare_teacher_inputs=AsyncMock(),
+        score_teacher=AsyncMock(return_value=[False]),
+        needs_student_prefill=True,
+        score_student_at_teacher=AsyncMock(),
+    )
+    sample = Sample(index=1, tokens=[1, 2], response_length=1, teacher_log_probs=[-0.1])
+    publish = AsyncMock()
+    session = DeferredOpdSession.maybe_create(args, 0, None, manager, publish=publish)
+    await session.transfer(args, [[sample]], 0, 0, None, is_last=True)
+    with pytest.raises(RuntimeError, match=r"1 sample\(s\) were not scored"):
+        await session.flush()
+    manager.score_teacher.assert_awaited_once_with([sample])
+    manager.score_student_at_teacher.assert_not_awaited()
+    publish.assert_not_awaited()
+    assert [call.args for call in switch.await_args_list] == [("teacher",), ("inference",)]
+
+
+@pytest.mark.parametrize("distributed_post", [False, True])
+def test_legacy_genrm_hook_keeps_local_swap(monkeypatch, distributed_post):
+    import ray
+
+    from examples.generate_reward_model import post_process_genrm_swap
+    from relax.distributed.ray import rollout
+    from relax.distributed.ray.inference_handle import use_managed_rollout
+    from relax.utils import misc
+    from relax.utils.utils import post_process_rewards
+
+    events = []
+
+    async def score(samples):
+        events.append("score")
+        return [0.75]
+
+    def legacy_hook(args, samples):
+        return post_process_genrm_swap.custom_reward_post_process(args, samples)
+
+    judge = SimpleNamespace(
+        onload=SimpleNamespace(remote=lambda: events.append("judge onload")),
+        offload=SimpleNamespace(remote=lambda: events.append("judge offload")),
+    )
+    monkeypatch.setattr(ray, "get", lambda value: value)
+    monkeypatch.setattr(ray, "get_actor", lambda name: judge)
+    monkeypatch.setattr(
+        rollout,
+        "get_local_rollout_manager",
+        lambda: SimpleNamespace(
+            _offload_local=lambda: events.append("rollout offload"),
+        ),
+    )
+    monkeypatch.setattr(post_process_genrm_swap, "_score_all", score)
+    monkeypatch.setattr(misc, "load_function", lambda path: legacy_hook)
+    monkeypatch.setattr("relax.utils.utils.load_function", lambda path: legacy_hook)
+    args = SimpleNamespace(
+        _genrm_instances_resolved={"__default__": {}},
+        _genrm_colocate_with_rollout=True,
+        defer_reward_to_post_process=True,
+        custom_reward_post_process_path="test.legacy_hook",
+        use_distributed_post=distributed_post,
+        advantage_estimator="grpo",
+        rewards_normalization=False,
+    )
+    assert not use_managed_rollout(args)
+    assert DeferredOpdSession.maybe_create(args, 0, None, None, publish=None) is None
+    assert post_process_rewards(args, [Sample(response_length=1)]) == [0.75]
+    assert events == ["rollout offload", "judge onload", "score", "judge offload"]

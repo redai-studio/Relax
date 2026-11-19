@@ -60,13 +60,19 @@ class _PoolCall:
 def use_managed_rollout(args: Any) -> bool:
     """Select engine ownership for the complete task, including auxiliary
     roles."""
-    from relax.engine.inference.phase_plans import genrm_shares_rollout_bundles
+    from relax.engine.inference.phase_plans import (
+        deferred_genrm_enabled,
+        genrm_shares_rollout_bundles,
+        uses_managed_genrm_hook,
+    )
     from relax.engine.sft.runtime import is_offline_mode
     from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
 
     if getattr(args, "colocate", False) and getattr(args, "use_opd", False):
         if not is_managed_opd_teacher_enabled(args):
             return False
+    if deferred_genrm_enabled(args) and not uses_managed_genrm_hook(args):
+        return False
     standard = "relax.engine.rollout.sglang_rollout.generate_rollout"
     return not (
         is_offline_mode(args)

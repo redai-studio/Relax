@@ -43,6 +43,12 @@ def deferred_opd_active(args: Any) -> bool:
     return deferred_opd_enabled(args)
 
 
+def _managed_genrm_scoring(args: Any) -> bool:
+    from relax.engine.inference.phase_plans import deferred_genrm_enabled
+
+    return getattr(args, "_inference_phase_coordinator", None) is not None and deferred_genrm_enabled(args)
+
+
 def required_scoring_fields(opd_manager: Any) -> tuple[str, ...]:
     """The training fields the scorer must produce for every eligible
     sample."""
@@ -96,9 +102,7 @@ class DeferredOpdSession:
         publish: Any,
         encode_multimodal_inputs: Any = None,
     ) -> "DeferredOpdSession | None":
-        from relax.engine.inference.phase_plans import deferred_genrm_enabled
-
-        if not deferred_genrm_enabled(args) and (opd_manager is None or not deferred_opd_active(args)):
+        if not _managed_genrm_scoring(args) and (opd_manager is None or not deferred_opd_active(args)):
             return None
         logger.info(f"Deferred OPD scoring active for rollout {rollout_id}: batches publish after scoring")
         return cls(
@@ -247,10 +251,10 @@ class DeferredOpdSession:
 
     async def _score_batch(self, samples: list[Sample], identities: tuple[Any, ...]) -> tuple[Any, ...]:
         """Score one batch: teacher stage, optional student stage, assemble."""
-        from relax.engine.inference.phase_plans import PHASE_GENRM, PHASE_TEACHER, deferred_genrm_enabled
-        from relax.engine.rollout.scoring_phase import async_reactivate_generation, async_scoring_phase
+        from relax.engine.inference.phase_plans import PHASE_GENRM, PHASE_TEACHER
+        from relax.engine.rollout.scoring_phase import async_scoring_phase
 
-        if deferred_genrm_enabled(self.args):
+        if _managed_genrm_scoring(self.args):
             from relax.utils.misc import load_function
 
             path = getattr(self.args, "custom_reward_post_process_path", None)
@@ -294,9 +298,7 @@ class DeferredOpdSession:
             # move memory around for nothing.
             return failures
         if self.opd_manager.needs_student_prefill:
-            # The student was offloaded for the teacher, so this selection needs
-            # its own activation stage before the second pass.
-            await async_reactivate_generation(self.args)
+            # The Teacher phase has already restored generation.
             await self.opd_manager.score_student_at_teacher(samples, None, self._encode_multimodal_inputs)
         self.opd_manager.assemble_transfer(samples)
         return ()

@@ -2280,6 +2280,14 @@ def _compute_server_args(
             kwargs[key] = value
             unused_keys.discard(key)
 
+    from relax.engine.inference.phase_plans import deferred_opd_enabled, genrm_shares_rollout_bundles
+
+    if genrm_shares_rollout_bundles(args) or deferred_opd_enabled(args):
+        # Scoring handoffs restore the current policy without another Actor push.
+        if not kwargs.get("enable_memory_saver") or "enable_weights_cpu_backup" not in server_arg_field_names:
+            raise ValueError("Shared scoring requires SGLang memory saver with policy weight CPU backup")
+        kwargs["enable_weights_cpu_backup"] = True
+
     # Use CUDA IPC only for engines confined to one node; multi-node engines
     # retain SGLang's auto policy, including CUDA VMM where supported. SGLang
     # rejects CUDA IPC on ROCm, so ROCm engines always keep the auto policy.

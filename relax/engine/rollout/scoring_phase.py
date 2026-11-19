@@ -46,8 +46,3 @@ async def async_scoring_phase(args: Any, phase: str) -> AsyncIterator[bool]:
         yield True
     finally:
         await _switch(args, PHASE_GENERATE)
-
-
-async def async_reactivate_generation(args: Any) -> None:
-    if deferred_opd_enabled(args):
-        await _switch(args, PHASE_GENERATE)

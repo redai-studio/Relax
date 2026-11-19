@@ -186,6 +186,17 @@ def test_full_gpu_genrm_accepts_manual_or_deferred_scoring(_arguments_module, de
     assert args._genrm_colocate_with_rollout
 
 
+def test_full_gpu_genrm_rejects_inline_dapo_scoring(_arguments_module):
+    args = SimpleNamespace(
+        rollout_num_gpus=8,
+        _genrm_instances_resolved={"judge": {"num_gpus": 8}},
+        defer_reward_to_post_process=False,
+        rm_type="dapo-genrm",
+    )
+    with pytest.raises(ValueError, match="Inline dapo-genrm"):
+        _arguments_module._resolve_genrm_colocate_layout(args, 8)
+
+
 def test_split_genrm_preserves_concurrent_layout(_arguments_module):
     args = SimpleNamespace(
         rollout_num_gpus=4,

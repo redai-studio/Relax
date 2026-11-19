@@ -12,8 +12,8 @@ Wire-up (in the training script):
   --defer-reward-to-post-process         # actor.update_weights skips GenRM onload
   --custom-reward-post-process-path <path to this file>
 
-The task inference coordinator owns memory transitions. This hook only scores;
-call it through deferred scoring, not through a named manager actor.
+The task coordinator handles memory transitions in managed rollout. The legacy
+RolloutManager path swaps GPU residency before scoring each batch.
 """
 
 import asyncio
@@ -126,29 +126,34 @@ def _grpo_normalize(args, raw_rewards):
 
 
 def custom_reward_post_process(args, samples):
-    """Sync entry called by relax.utils.utils.post_process_rewards.
-
-    Flow (one call per rollout batch):
-      1. Offload rollout (in-process direct call — same actor).
-      2. Onload GenRM (Ray handle — different actor).
-      3. Batch-score every sample via GenRM HTTP.
-      4. Offload GenRM.
-      5. Return normalized rewards — leave rollout offloaded (update_weights
-         re-onloads it next iteration; skipping the redundant onload here
-         saves one full weights+KV round trip).
-    """
+    """Score and normalize a rollout batch in the active GenRM phase."""
     # Flatten if grouped
     if samples and isinstance(samples[0], list):
         flat_samples = [s for group in samples for s in group]
     else:
         flat_samples = list(samples)
 
-    if not getattr(args, "_managed_genrm_scoring_phase", False):
-        raise RuntimeError("GenRM batch scoring must run inside the task inference scoring phase")
-    raw_rewards = _run_async(_score_all(flat_samples))
+    if getattr(args, "_managed_genrm_scoring_phase", False):
+        raw_rewards = _run_async(_score_all(flat_samples))
+    else:
+        import ray
+
+        from relax.distributed.ray.rollout import get_local_rollout_manager
+
+        get_local_rollout_manager()._offload_local()
+        genrm = ray.get_actor("relax_genrm_manager")
+        ray.get(genrm.onload.remote())
+        try:
+            raw_rewards = _run_async(_score_all(flat_samples))
+        finally:
+            ray.get(genrm.offload.remote())
 
     reward_key = getattr(args, "reward_key", None)
     for sample, score in zip(flat_samples, raw_rewards, strict=True):
         sample.reward = {reward_key: score} if reward_key else score
 
     return _grpo_normalize(args, raw_rewards)
+
+
+# Opt into coordinator-owned memory transitions for deferred scoring.
+custom_reward_post_process.managed_genrm_scoring = True

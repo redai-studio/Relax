@@ -28,6 +28,15 @@ def deferred_genrm_enabled(args: Any) -> bool:
     return genrm_shares_rollout_bundles(args) and bool(getattr(args, "defer_reward_to_post_process", False))
 
 
+def uses_managed_genrm_hook(args: Any) -> bool:
+    """An opted-in hook scores samples while the coordinator owns GPU
+    residency."""
+    from relax.utils.misc import load_function
+
+    path = getattr(args, "custom_reward_post_process_path", None)
+    return bool(path and getattr(load_function(path), "managed_genrm_scoring", False))
+
+
 def deferred_opd_enabled(args: Any) -> bool:
     """Whether the managed OPD teacher scores in its own stage.
 

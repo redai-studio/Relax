@@ -107,6 +107,7 @@ class InferenceManager:
         self._topology: Any = None
         self.state = LifecycleState.STARTING
         self.memory_ready = False
+        self._weights_resident = False
         self._transition = asyncio.Lock()
         self._updates: dict[str, str] = {}
         self._disposed = False
@@ -347,8 +348,14 @@ class InferenceManager:
                         self.state = LifecycleState.DEAD
                         raise
                     self.memory_ready = False
+                    self._weights_resident = False
                     self.state = LifecycleState.SLEEPING
                 else:
+                    if method == "onload" and not args and not kwargs and self.role is Role.ROLLOUT:
+                        if self.state is LifecycleState.READY and self.memory_ready:
+                            return None
+                        if self.state is LifecycleState.SLEEPING and self._weights_resident:
+                            method = "onload_kv"
                     # Close admission before even a partial memory transition.
                     await self.ledger.drain("memory", timeout=120)
                     self.state = LifecycleState.ONLOADING
@@ -361,6 +368,7 @@ class InferenceManager:
                     self.memory_ready = method == "onload_kv" or (
                         method == "onload" and (tags is None or "kv_cache" in tags)
                     )
+                    self._weights_resident = self._weights_resident or method == "onload_weights"
                     self.state = LifecycleState.READY if self.memory_ready else LifecycleState.SLEEPING
                     if self.memory_ready:
                         self.ledger.fences.discard("memory")

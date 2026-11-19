@@ -98,6 +98,46 @@ async def test_drain_closes_admission_but_allows_completions():
 
 
 @pytest.mark.asyncio
+async def test_weight_sync_and_generation_handoff_resume_policy_tags_once():
+    from relax.engine.inference.phases import PhaseCoordinator
+
+    owner = manager()
+    allocated = {"weights", "kv"}
+    events = []
+
+    def resume(tags):
+        assert not allocated.intersection(tags)
+        allocated.update(tags)
+
+    def activate_judge():
+        events.append("judge onload")
+
+    owner.pool.backend.offload = allocated.clear
+    owner.pool.backend.onload_weights = lambda: resume({"weights"})
+    owner.pool.backend.onload_kv = lambda: resume({"kv"})
+    owner.pool.backend.onload = lambda: resume({"weights", "kv"})
+    judge = SimpleNamespace(onload=activate_judge, offload=lambda: events.append("judge offload"))
+
+    async def call(target, method):
+        if target is owner:
+            await getattr(owner, method)()
+        else:
+            getattr(target, method)()
+
+    coordinator = PhaseCoordinator({"startup": (), "inference": (owner, judge)}, "startup", call)
+    await owner.offload()
+    for _ in range(2):
+        await owner.pool_call("onload_weights")
+        assert allocated == {"weights"}
+        await owner.pool_call("onload_kv")
+        await coordinator.switch("inference")
+        assert allocated == {"weights", "kv"}
+        await coordinator.switch("startup")
+        assert not allocated
+    assert events == ["judge onload", "judge offload"] * 2
+
+
+@pytest.mark.asyncio
 async def test_offload_failure_keeps_admission_closed():
     owner = manager()
     owner.pool.backend.fail_offload = True

@@ -4092,6 +4092,13 @@ def _resolve_genrm_colocate_layout(args: Any, actor_total_gpus: int) -> None:
         args._genrm_colocate_with_rollout = False
         logger.info(f"GenRM split bundles: rollout={rollout_g}, genrm={genrm_g}, actor={actor_total_gpus}")
     elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
+        if (getattr(args, "rm_type", None) or "").strip().removeprefix("boxed_") == "dapo-genrm" and not getattr(
+            args, "custom_rm_path", None
+        ):
+            raise ValueError(
+                "Inline dapo-genrm scoring cannot run while GenRM shares the rollout GPUs. "
+                "Use split bundles, or use --rm-type dummy with --defer-reward-to-post-process and a scoring hook."
+            )
         args._genrm_colocate_with_rollout = True
         logger.info(f"GenRM phase-shared bundles: rollout=genrm={actor_total_gpus}")
     else:
