@@ -465,6 +465,10 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         t_start = time.monotonic()
         device = device_utils.make_current_torch_device()
         rank = dist.get_rank()
+        # Inspect the shared source once, including ranks with no owned weights in a bucket.
+        full_device_sync = device.type != "cpu" and any(
+            weight.device.type == "cpu" for weight in megatron_local_weights.values()
+        )
         # Eagerly init bridge converter so all ranks are ready before broadcast.
         self._bridge_converter.init_tasks()
         self._bridge_converter.broadcast_and_apply_configs()
@@ -483,7 +487,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
-                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+                bucket_infos,
+                megatron_local_weights,
+                self._vanilla_key_map,
+                device,
+                rank,
+                full_device_sync=full_device_sync,
+                merge_fn=merge_fn,
             )
             all_converted = []
             for info, param in zip(bucket_infos, params, strict=True):
@@ -507,7 +517,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         for bucket_infos in self._non_expert_buckets:
             t_b0 = time.monotonic()
             params = _load_and_broadcast(
-                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+                bucket_infos,
+                megatron_local_weights,
+                self._vanilla_key_map,
+                device,
+                rank,
+                full_device_sync=full_device_sync,
+                merge_fn=merge_fn,
             )
             t_b1 = time.monotonic()
             t_bcast_total += t_b1 - t_b0
@@ -804,7 +820,9 @@ def _bucket_by_size(infos, args, *, buffer_size: int | None = None):
     return buckets
 
 
-def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
+def _load_to_gpu(
+    bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, *, full_device_sync: bool, merge_fn=None
+):
     """Load params from CPU dict to GPU.
 
     No broadcast. When ``merge_fn`` is given (LoRA merge mode), each owned
@@ -828,7 +846,7 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
     # CPU snapshots retain the native full-device fence on every rank.
     # Retained GPU sources only wait for export preparation, leaving D2H backup in flight.
     if device.type != "cpu":
-        if any(value.device.type == "cpu" for value in megatron_local_weights.values()):
+        if full_device_sync:
             device_module.synchronize()
         else:
             device_module.current_stream().synchronize()
@@ -867,7 +885,9 @@ def _ep_broadcast(bucket_infos, params):
         handle.wait()
 
 
-def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
+def _load_and_broadcast(
+    bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, *, full_device_sync: bool, merge_fn=None
+):
     """Load params from CPU dict, PP-broadcast, EP-broadcast.
 
     After this call every rank holds all params from all PP stages and all EP
@@ -877,7 +897,15 @@ def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, d
     LoRA adapters are merged at load time (before broadcast) so the merged base
     weight is what propagates to the non-owning PP/EP ranks.
     """
-    params = _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=merge_fn)
+    params = _load_to_gpu(
+        bucket_infos,
+        megatron_local_weights,
+        vanilla_key_map,
+        device,
+        rank,
+        full_device_sync=full_device_sync,
+        merge_fn=merge_fn,
+    )
     _pp_broadcast(bucket_infos, params)
     _ep_broadcast(bucket_infos, params)
     return params

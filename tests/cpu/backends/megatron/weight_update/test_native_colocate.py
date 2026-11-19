@@ -2,6 +2,7 @@
 """Overlap contracts: published backing, reader completion, and safe
 rejection."""
 
+from collections import UserDict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -80,26 +81,45 @@ def test_native_receiver_fence_rejects_payload_and_waits_all_streams(monkeypatch
     assert flat.untyped_storage().nbytes() == 0 and not offloader._actor_weights_pending_release
 
 
-@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
-def test_bridge_export_synchronizes_for_source_device(monkeypatch, source_device):
+@pytest.mark.parametrize(
+    ("source_device", "export_device", "device_waits", "stream_waits"),
+    [("cpu", "cuda", 2, 0), ("cuda", "cuda", 0, 2), ("cpu", "cpu", 0, 0)],
+)
+def test_bridge_export_reuses_source_device_across_buckets(
+    monkeypatch, source_device, export_device, device_waits, stream_waits
+):
     pytest.importorskip("megatron.core", reason="Bridge export requires Megatron Core", exc_type=ImportError)
     from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
 
     stream = Mock()
     device_sync = Mock()
+    monkeypatch.setattr(bridge.device_utils, "make_current_torch_device", lambda: torch.device(export_device))
     monkeypatch.setattr(bridge.device_module, "current_stream", Mock(return_value=stream))
     monkeypatch.setattr(bridge.device_module, "synchronize", device_sync)
+    monkeypatch.setattr(bridge.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(bridge.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge, "all_gather_param", lambda args, name, param: param)
+
     info = SimpleNamespace(name="model.weight", src_rank=0, shape=(2, 2), dtype=torch.float32, attrs={})
     source = SimpleNamespace(device=torch.device(source_device), to=Mock(return_value=torch.ones(2, 2)))
-    params = bridge._load_to_gpu([info], {"weight": source}, {"model.weight": "weight"}, torch.device("cuda"), rank=0)
-    assert torch.equal(params[0], torch.ones(2, 2))
-    assert stream.synchronize.call_count == int(source_device == "cuda")
-    assert device_sync.call_count == int(source_device == "cpu")
-    stream.reset_mock()
-    device_sync.reset_mock()
-    bridge._load_to_gpu([info], {"weight": torch.ones(2, 2)}, {"model.weight": "weight"}, torch.device("cpu"), rank=0)
-    stream.synchronize.assert_not_called()
-    device_sync.assert_not_called()
+
+    weights = UserDict(weight=source)
+    weights.values = Mock(wraps=weights.values)
+    iterator = bridge.HfWeightIteratorBridge.__new__(bridge.HfWeightIteratorBridge)
+    iterator.args = SimpleNamespace()
+    iterator.lora_merge_mode = iterator._async_weight_gather = False
+    iterator._vanilla_key_map = {info.name: "weight"}
+    iterator._bridge_converter = Mock(convert=lambda name, tensor: [(name, tensor)])
+    iterator._expert_buckets = [[info]]
+    iterator._expert_broadcast_caches = [None]
+    iterator._non_expert_buckets = [[info]]
+
+    exported = list(iterator._iter_hf_params(weights))
+    assert len(exported) == 2 and all(torch.equal(tensor, torch.ones(2, 2)) for _, tensor in exported)
+    assert weights.values.call_count == int(export_device != "cpu")
+    assert device_sync.call_count == device_waits
+    assert stream.synchronize.call_count == stream_waits
 
 
 def test_actor_snapshot_is_unreadable_until_complete_backing_is_adopted():
