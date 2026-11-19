@@ -116,12 +116,25 @@ def validate_lightning_opd_args(args: Namespace) -> None:
         raise ValueError("lightning_opd requires the Megatron causal LM backend")
     if args.advantage_estimator != "grpo" or args.rollout_temperature != 1 or args.n_samples_per_prompt != 1:
         raise ValueError("lightning_opd uses the clipped policy loss with temperature 1 and one response per row")
-    if args.rollout_batch_size is not None and args.rollout_batch_size != args.global_batch_size:
+    steps_per_rollout = getattr(args, "num_steps_per_rollout", None)
+    global_batch_size = args.global_batch_size
+    if global_batch_size is None and steps_per_rollout and args.rollout_batch_size is not None:
+        # This check runs before relax_validate_args derives --global-batch-size from these options.
+        global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // steps_per_rollout
+    if (
+        args.rollout_batch_size is not None
+        and global_batch_size is not None
+        and args.rollout_batch_size != global_batch_size
+    ):
         raise ValueError("lightning_opd requires one global batch per offline update")
-    if getattr(args, "num_steps_per_rollout", None) not in (None, 1):
+    if steps_per_rollout not in (None, 1):
         raise ValueError("lightning_opd requires one optimizer step per offline batch")
     if getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False):
         raise ValueError("lightning_opd uses per-sample reduction and requires context parallel size 1")
+    if getattr(args, "sft_oversize_strategy", "keep") != "keep":
+        raise ValueError(
+            "lightning_opd rejects over-length trajectories while loading and does not support --sft-oversize-strategy"
+        )
     conflicts = (
         "use_opd",
         "opd_type",
@@ -138,6 +151,8 @@ def validate_lightning_opd_args(args: Namespace) -> None:
         "use_opsm",
         "get_mismatch_metrics",
         "use_kl_loss",
+        "use_routing_replay",
+        "use_rollout_routing_replay",
         "kl_coef",
         "kl_loss_coef",
         "entropy_coef",

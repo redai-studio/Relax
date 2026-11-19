@@ -21,7 +21,7 @@ Use `--loss-type lightning_opd` to train a Megatron student from a [Lightning-OP
 --global-batch-size 8 --micro-batch-size 1 --num-rollout 1
 ```
 
-Each row contains a rendered `prompt` and a `metadata` struct with `response_tokens`, `loss_mask`, and `teacher_log_probs` of equal length. Set `--seq-length` to cover the longest prompt plus response. The CPU producer preserves the sampled IDs and the complete response context, including masked positions. The actor recomputes student log probabilities before each update and uses their difference from the cached teacher values as the detached advantage for clipped policy gradients. Only the actor needs GPUs. The current objective supports synchronous text training, per-sample reduction and context parallel size 1.
+Each row contains a rendered `prompt` and a `metadata` struct with `response_tokens`, `loss_mask`, and `teacher_log_probs` of equal length. The longest prompt plus response must fit in `--max-tokens-per-gpu` with `--use-dynamic-batch-size`, or in `--seq-length` with fixed micro-batches. The CPU producer preserves the sampled IDs and the complete response context, including masked positions. The actor recomputes student log probabilities before each update and uses their difference from the cached teacher values as the detached advantage for clipped policy gradients. Only the actor needs GPUs. The current objective supports synchronous text training, per-sample reduction and context parallel size 1.
 
 ## Token-Selection Modes
 

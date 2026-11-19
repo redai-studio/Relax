@@ -64,6 +64,10 @@ class LightningOPDDataset:
     async def get_batch_async(self, n: int) -> tuple[list[ProcessedSample], bool]:
         return await asyncio.to_thread(self.get_batch, n)
 
+    def stop(self) -> None:
+        # No prefetch workers; SFT.stop() calls this on every dataset during shutdown.
+        self._cached_group = None
+
     def get_batch_by_indices(self, indices: Sequence[int]) -> list[ProcessedSample]:
         # Keep at most one Arrow row group resident across updates.
         grouped = defaultdict(list)

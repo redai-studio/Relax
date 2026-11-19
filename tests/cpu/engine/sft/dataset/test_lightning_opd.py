@@ -74,3 +74,55 @@ def test_checkpoint_restores_next_offline_batch_across_epoch(tmp_path):
     actual, crossed = resumed.get_batch(2)
     assert crossed
     assert [s.source_idx for s in actual] == [s.source_idx for s in expected]
+
+
+def test_lightning_opd_dynamic_batch_capacity_is_not_capped_by_seq_length(tmp_path):
+    from relax.components.sft import _create_sft_train_dataset
+
+    path = tmp_path / "long.parquet"
+    long_row = {
+        "prompt": "ab",
+        "metadata": {"response_tokens": [5] * 6, "loss_mask": [1] * 6, "teacher_log_probs": [-1.0] * 6},
+    }
+    pq.write_table(pa.Table.from_pylist([long_row]), path)
+    # Megatron fills an unset --seq-length with a 4096 placeholder; dynamic batching bounds sequences by
+    # --max-tokens-per-gpu (the capacity passed in), as in SFT.
+    config = Namespace(
+        loss_type="lightning_opd",
+        prompt_data=str(path),
+        input_key="prompt",
+        metadata_key="metadata",
+        seq_length=4,
+        seed=42,
+    )
+
+    def build(capacity):
+        return _create_sft_train_dataset(
+            config,
+            tokenizer=Tokenizer(),
+            processor_pool=None,
+            capacity=capacity,
+            prefetch_buffer_size=1,
+            prefetch_chunk_size=1,
+            prefetch_num_workers=1,
+            pad_token_ids=frozenset(),
+            oversize_strategy="keep",
+            oversize_custom_fn=None,
+            invalid_multimodal_strategy="error",
+            task_type="causal_lm",
+            classification_sentinel_token_id=None,
+        )
+
+    [sample], _ = build(16).get_batch(1)
+    assert sample.total_length == 8
+    with pytest.raises(ValueError, match="exceeds training capacity"):
+        build(7).get_batch(1)
+
+
+def test_lightning_opd_dataset_supports_sft_shutdown(tmp_path):
+    path = tmp_path / "train.parquet"
+    pq.write_table(pa.Table.from_pylist([row("a"), row("ab")]), path)
+    dataset = LightningOPDDataset(str(path), tokenizer=Tokenizer())
+    dataset.get_batch(1)
+    dataset.stop()
+    dataset.stop()
