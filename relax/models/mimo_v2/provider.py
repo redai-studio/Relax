@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+from argparse import Namespace
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -41,6 +42,24 @@ class MiMoV2ModelProvider(GPTModelProvider):
     full_attention_sink: bool = False
     swa_attention_sink: bool = True
 
+    hf_model_path: str | None = None
+    vision_config: dict | None = None
+    image_token_id: int | None = None
+    enable_image_inputs: bool = False
+    freeze_language_model: bool = False
+    freeze_vision_model: bool = False
+    freeze_vision_projection: bool = False
+
+    def configure_runtime(self, args: Namespace) -> None:
+        self.enable_image_inputs = "image" in (getattr(args, "multimodal_keys", None) or {})
+        if self.enable_image_inputs:
+            if not self.hf_model_path or not self.vision_config or self.image_token_id is None:
+                raise ValueError(
+                    "MiMo image SFT requires a trusted HF checkpoint with its vision config and model code."
+                )
+            # Insert image features before sequence parallelism partitions the embeddings.
+            self.scatter_embedding_sequence_parallel = False
+
     def get_config_for_layer(self, layer_number: int) -> MiMoV2ModelProvider:
         """Shallow copy with the KV heads and attention sink of global layer
         ``layer_number`` (1-indexed)."""
@@ -57,4 +76,13 @@ class MiMoV2ModelProvider(GPTModelProvider):
             "MiMo-V2 needs TP <= the smallest per-layer KV head count"
         )
         assert self.context_parallel_size == 1, "MiMo-V2 attention does not support context parallelism yet"
-        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        model = super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        if self.enable_image_inputs:
+            from .vision import MiMoV2ImageModel
+
+            model.__class__ = MiMoV2ImageModel
+            if self.freeze_language_model:
+                model.requires_grad_(False)
+            if model.pre_process:
+                model.build_visual()
+        return model

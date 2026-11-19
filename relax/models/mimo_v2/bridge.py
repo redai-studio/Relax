@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
+from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping, ReplicatedMapping
 from megatron.bridge.models.mimo_v2_flash.mimo_v2_flash_bridge import MiMoV2FlashQKVMapping
 from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -26,9 +26,7 @@ class MiMoV2Bridge(MegatronModelBridge):
     def provider_bridge(self, hf_pretrained) -> MiMoV2ModelProvider:
         hf = hf_pretrained.config
         if getattr(hf, "attention_projection_layout", "split") != "split" or getattr(hf, "quantization_config", None):
-            raise ValueError(
-                "MiMo-V2 requires a BF16 text checkpoint with separate q_proj, k_proj and v_proj weights."
-            )
+            raise ValueError("MiMo-V2 requires a BF16 checkpoint with separate q_proj, k_proj and v_proj weights.")
         for swa_key, full_key in (
             ("swa_num_attention_heads", "num_attention_heads"),
             ("swa_head_dim", "head_dim"),
@@ -37,6 +35,11 @@ class MiMoV2Bridge(MegatronModelBridge):
             assert getattr(hf, swa_key) == getattr(hf, full_key), f"{swa_key} must equal {full_key}"
 
         provider = super().provider_bridge(hf_pretrained)
+        if getattr(hf_pretrained, "trust_remote_code", False):
+            provider.hf_model_path = hf_pretrained.model_name_or_path
+        vision = getattr(hf, "vision_config", None)
+        provider.vision_config = vision.to_dict() if hasattr(vision, "to_dict") else vision
+        provider.image_token_id = getattr(hf, "image_token_id", None)
         pattern = [int(p) for p in hf.hybrid_layer_pattern]
         provider.hybrid_attention_pattern = pattern
         # A SWA layer attends the query plus sliding_window_size previous keys, like SGLang's
@@ -99,6 +102,7 @@ class MiMoV2Bridge(MegatronModelBridge):
             "decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight": "model.layers.*.mlp.experts.*",
         }
         mappings = [AutoMapping(megatron_param=m, hf_param=h) for m, h in direct.items()]
+        mappings.append(ReplicatedMapping("visual.**", "visual.**"))
         mappings += [
             GatedMLPMapping(megatron_param=m, gate=f"{h}.gate_proj.weight", up=f"{h}.up_proj.weight")
             for m, h in gated.items()

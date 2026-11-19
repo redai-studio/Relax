@@ -3,7 +3,7 @@
 # Copyright 2025-2026 RadixArk, Inc. Miles includes software developed from Slime,
 # Copyright 2025 Zhipu AI, licensed under Apache-2.0.
 
-"""Megatron Bridge support for the MiMo-V2 text decoder."""
+"""Megatron Bridge support for MiMo-V2 text and image SFT."""
 
 from .attention import MiMoV2SelfAttention, MiMoV2TEDotProductAttention
 from .bridge import MiMoV2Bridge
