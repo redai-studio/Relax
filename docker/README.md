@@ -86,12 +86,11 @@ See the [English installation guide](../docs/en/guide/installation.md) or [ä¸­æ–
 ### CUDA Patches and MoK
 
 CUDA and ROCm builds use `patch/latest/megatron.patch`, a symlink to
-`patch/megatron/20260915-4a4de8657.patch`. This versioned file contains the complete
+`patch/megatron/20261104-f78809f6.patch`. This versioned file contains the complete
 Bridge/MCore changes, with `common`, `cu13`, and `blackwell` sections selected in
 order. ROCm retains its existing Kimi/checkpoint fixes by applying `common` and
 `cu13`; the section name does not install CUDA dependencies. Keep new Megatron
-changes in this file rather than adding feature patches. Historical versioned
-Megatron and SGLang patches remain available.
+changes in this file. Versioned SGLang patches remain available.
 
 `PATCH_VERSION` defaults to `latest` and continues to select
 `patch/${PATCH_VERSION}/megatron.patch`. Custom patch sets must supply the
