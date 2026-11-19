@@ -29,7 +29,7 @@ def single_rank_collective(monkeypatch):
     monkeypatch.setattr(client_module.dist, "get_world_size", lambda **kwargs: 1)
     monkeypatch.setattr(client_module.dist, "broadcast_object_list", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        client_module.dist, "all_gather_object", lambda output, value, **kwargs: output.__setitem__(0, value)
+        client_module.dist, "all_gather_object", MagicMock(side_effect=AssertionError("duplicate recipient gather"))
     )
 
 
@@ -96,68 +96,40 @@ def test_recovery_router_failure_remains_retryable(failure, patch_ray_get):
     assert not record.pending_router_registration
 
 
-def make_client(*, rank=0, fail=False):
+def make_client(*, rank=0, fail=False, recipients=None):
     client = object.__new__(CheckpointEngineClient)
     client.role_info = SimpleNamespace(rank=rank)
     client.coordinator_url = "http://coordinator"
     response = MagicMock()
     response.json.return_value = {"nodes": {"rollout": {"4": {}, "5": {}}}}
     client._http_client = SimpleNamespace(get=AsyncMock(return_value=response))
-    backend = MagicMock()
-    backend._is_pp_src_rank = True
-    backend._lora_adapter_mode = False
-    # Model a rank pruned by backend health checks; the coordinator still lists it.
-    backend.rollout_topology = {"4": {"metadata": {"actor_id": "actor-b"}}}
+    backend = MagicMock(spec=["init_process_group_for_rollout", "update_weights_for_rollout"])
+    backend.update_weights_for_rollout.return_value = ["actor-b"] if recipients is None else recipients
     if fail:
         backend.update_weights_for_rollout.side_effect = RuntimeError("weight transfer failed")
     client._backend = backend
     return client
 
 
-def test_success_returns_only_actual_weight_recipient_generations():
-    client = make_client()
-    assert asyncio.run(client.update_weights_for_rollout()) == ["actor-b"]
-
-
-def test_publication_requires_all_pipeline_stages(monkeypatch):
-    client = make_client()
-    client._backend.rollout_topology["5"] = {"metadata": {"actor_id": "actor-shared"}}
-
-    def gather(output, value, **kwargs):
-        assert value == {"actor-b", "actor-shared"}
-        # Another PP stage pruned B; non-source ranks must not empty the intersection.
-        output[:] = [value, None, {"actor-shared"}, None]
-
-    monkeypatch.setattr(client_module.dist, "all_gather_object", gather)
-    assert asyncio.run(client.update_weights_for_rollout()) == ["actor-shared"]
-
-
-def test_non_source_rank_still_participates_without_claiming_recipients(monkeypatch):
-    client = make_client(rank=1)
-    client._backend._is_pp_src_rank = False
-    gather = MagicMock(side_effect=lambda output, value, **kwargs: output.__setitem__(0, value))
-    monkeypatch.setattr(client_module.dist, "all_gather_object", gather)
-    assert asyncio.run(client.update_weights_for_rollout()) == []
-    assert gather.call_args.args[1] is None
-
-
-@pytest.mark.parametrize("rank,actor_fwd_only", [(0, True), (1, False)])
-def test_skipped_rollout_or_nonzero_rank_does_not_publish(rank, actor_fwd_only):
-    client = make_client(rank=rank)
-    assert asyncio.run(client.update_weights_for_rollout(actor_fwd_only=actor_fwd_only)) == []
+@pytest.mark.parametrize(
+    "recipients,rollout_only,actor_fwd_only",
+    [(["actor-b"], False, False), (["actor-shared"], True, False), ([], False, False), ([], False, True)],
+)
+def test_client_returns_backend_confirmed_recipients(recipients, rollout_only, actor_fwd_only):
+    # PP agreement and adapter skips are covered by test_weight_sync_lifecycle;
+    # the client must preserve the backend's confirmed receiver snapshot.
+    client = make_client(recipients=recipients)
+    expected = list(recipients)
+    result = asyncio.run(client.update_weights_for_rollout(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only))
+    assert result is recipients
+    assert result == expected
+    client._backend.update_weights_for_rollout.assert_called_once_with(rollout_only, actor_fwd_only)
 
 
 def test_failed_weight_update_does_not_return_publishable_ids():
     client = make_client(fail=True)
     with pytest.raises(RuntimeError, match="weight transfer failed"):
         asyncio.run(client.update_weights_for_rollout())
-
-
-def test_adapter_delta_skip_is_not_full_weight_recovery_evidence():
-    client = make_client()
-    client._backend._lora_adapter_mode = True
-    assert asyncio.run(client.update_weights_for_rollout()) == []
-    client._backend.update_weights_for_rollout.assert_called_once()
 
 
 def test_same_endpoint_replacement_invalidates_weight_group_cache():
