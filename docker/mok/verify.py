@@ -11,7 +11,7 @@ import subprocess
 from importlib import metadata
 from pathlib import Path
 
-from build import PACKAGE, check_files, check_megatron, digest
+from build import PACKAGE, check_files, digest
 
 
 def main() -> None:
@@ -21,17 +21,18 @@ def main() -> None:
     )
     args = parser.parse_args()
     manifest = json.loads((PACKAGE / "manifest.json").read_text())
+    runtime_manifest = json.loads((PACKAGE / "runtime-manifest.json").read_text())
     result = json.loads((PACKAGE / "build-result.json").read_text())
     if digest(PACKAGE / "manifest.json") != result["manifest_sha256"]:
         raise RuntimeError("The build manifest has changed")
     if metadata.version("torch") != result["torch"]:
         raise RuntimeError("The installed Torch version differs from the MoK wheel build")
-    megatron = Path(os.environ.get("RELAX_MEGATRON_ROOT", result["megatron_root"]))
+    megatron = Path(os.environ.get("RELAX_MEGATRON_ROOT", "/root/Megatron-LM"))
     mok_source = Path(os.environ.get("RELAX_MOK_SOURCE_ROOT", result["mok_root"]))
-    check_megatron(megatron, manifest["megatron"], "after")
+    check_files(megatron, runtime_manifest["megatron"]["after_sha256"])
     check_files(mok_source, manifest["mok"]["after_sha256"])
     check_files(mok_source / "third_party/ThunderKittens", manifest["thunderkittens"]["after_sha256"])
-    te = manifest["transformer_engine"]
+    te = runtime_manifest["transformer_engine"]
     if metadata.version(te["distribution"]) != te["version"]:
         raise RuntimeError("Transformer Engine changed after the image was built")
     check_files(Path(metadata.distribution(te["distribution"]).locate_file("")), {te["path"]: te["after_sha256"]})
