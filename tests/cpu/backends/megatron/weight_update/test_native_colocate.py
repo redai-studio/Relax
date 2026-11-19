@@ -80,21 +80,26 @@ def test_native_receiver_fence_rejects_payload_and_waits_all_streams(monkeypatch
     assert flat.untyped_storage().nbytes() == 0 and not offloader._actor_weights_pending_release
 
 
-def test_bridge_export_waits_only_for_its_preparation_stream(monkeypatch):
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_bridge_export_synchronizes_for_source_device(monkeypatch, source_device):
     pytest.importorskip("megatron.core", reason="Bridge export requires Megatron Core", exc_type=ImportError)
     from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
 
     stream = Mock()
+    device_sync = Mock()
     monkeypatch.setattr(bridge.device_module, "current_stream", Mock(return_value=stream))
-    monkeypatch.setattr(bridge.device_module, "synchronize", Mock(side_effect=AssertionError("waited for D2H backup")))
+    monkeypatch.setattr(bridge.device_module, "synchronize", device_sync)
     info = SimpleNamespace(name="model.weight", src_rank=0, shape=(2, 2), dtype=torch.float32, attrs={})
-    source = SimpleNamespace(to=Mock(return_value=torch.ones(2, 2)))
+    source = SimpleNamespace(device=torch.device(source_device), to=Mock(return_value=torch.ones(2, 2)))
     params = bridge._load_to_gpu([info], {"weight": source}, {"model.weight": "weight"}, torch.device("cuda"), rank=0)
     assert torch.equal(params[0], torch.ones(2, 2))
-    stream.synchronize.assert_called_once_with()
+    assert stream.synchronize.call_count == int(source_device == "cuda")
+    assert device_sync.call_count == int(source_device == "cpu")
     stream.reset_mock()
+    device_sync.reset_mock()
     bridge._load_to_gpu([info], {"weight": torch.ones(2, 2)}, {"model.weight": "weight"}, torch.device("cpu"), rank=0)
     stream.synchronize.assert_not_called()
+    device_sync.assert_not_called()
 
 
 def test_actor_snapshot_is_unreadable_until_complete_backing_is_adopted():
