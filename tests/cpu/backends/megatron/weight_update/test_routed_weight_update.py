@@ -276,6 +276,7 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
     monkeypatch.setattr(bridge.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(bridge, "_load_and_broadcast", lambda *args, **kwargs: [torch.zeros(2)])
     monkeypatch.setattr(bridge, "all_gather_params_async", gather)
+    monkeypatch.setattr(torch.version, "hip", None)
     monkeypatch.setattr(torch.cuda.memory, "get_allocator_backend", lambda: "native")
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append(("trim",)))
 
