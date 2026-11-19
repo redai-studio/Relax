@@ -627,6 +627,7 @@ class EngineFinalizeResult:
     success: bool
     group: "EngineGroup | None" = None
     reason: "ScaleOutFailure | None" = None
+    cleanup_deferred: bool = False
 
 
 @dataclasses.dataclass
@@ -636,6 +637,7 @@ class ScaleResult:
 
     success: bool
     reason: "ScaleOutFailure | None" = None
+    cleanup_deferred: bool = False
 
 
 @dataclasses.dataclass
@@ -647,6 +649,7 @@ class _ColocateCandidate:
     prechecking: bool = False
     prechecked: bool = False
     pending_probe_refs: tuple[ray.ObjectRef, ...] | None = None  # None until the sender returns
+    probe_cleanup: asyncio.Task | None = None
     failure: ScaleOutFailure | None = None
     result: EngineFinalizeResult | None = None
 
@@ -1366,13 +1369,8 @@ class RolloutManager(ReloadableMixin):
                             pending_groups = [
                                 candidate.group
                                 for candidate in self._colocate_candidates.values()
-                                if candidate.result is None
+                                if candidate.result is None or candidate.prechecking
                             ]
-                            unconfirmed_probes = {
-                                id(candidate.group)
-                                for candidate in self._colocate_candidates.values()
-                                if candidate.prechecking
-                            }
                             current = self._colocate_remote_group
                             source = self._colocate_source
                             break
@@ -1409,9 +1407,15 @@ class RolloutManager(ReloadableMixin):
                                 logger.exception("[Colocate FULL] Failed to abort the sender's group during shutdown")
                 else:
                     self._shutdown_all_engines(extra_groups=pending_groups)
-                for group in [*elastic_groups, *pending_groups]:
-                    if id(group) not in unconfirmed_probes:
-                        self._submit_colocate_pg_removal(group.pg[0], self._colocate_shutdown_pgs)
+                with self._engine_lifecycle_lock:
+                    unconfirmed_probes = {
+                        id(candidate.group)
+                        for candidate in self._colocate_candidates.values()
+                        if candidate.prechecking and candidate.pending_probe_refs != ()
+                    }
+                    for group in [*elastic_groups, *pending_groups]:
+                        if id(group) not in unconfirmed_probes:
+                            self._submit_colocate_pg_removal(group.pg[0], self._colocate_shutdown_pgs)
                 if failed:
                     with self._engine_lifecycle_lock:
                         self._training_weight_updating = False
@@ -1801,13 +1805,40 @@ class RolloutManager(ReloadableMixin):
                     return result
                 probe_refs = candidate.pending_probe_refs
             if probe_refs:
-                replies = await asyncio.gather(*probe_refs, return_exceptions=True)
+                candidate.probe_cleanup = asyncio.create_task(
+                    self._finish_colocate_probe_cleanup(candidate, probe_refs)
+                )
+                await asyncio.wait({candidate.probe_cleanup}, timeout=max(0, candidate.deadline - time.monotonic()))
                 with self._engine_lifecycle_lock:
-                    candidate.pending_probe_refs = ()
-                    candidate.prechecking = not all(
-                        isinstance(reply, dict) and reply.get("stopped", True) for reply in replies
-                    )
+                    if candidate.prechecking:
+                        candidate.result = EngineFinalizeResult(False, reason=candidate.failure, cleanup_deferred=True)
+                        return candidate.result
             await asyncio.sleep(0.2)
+
+    async def _finish_colocate_probe_cleanup(
+        self, candidate: _ColocateCandidate, refs: tuple[ray.ObjectRef, ...]
+    ) -> None:
+        replies = await asyncio.gather(*refs, return_exceptions=True)
+        if not all(isinstance(reply, dict) and reply.get("stopped", True) for reply in replies):
+            logger.warning(
+                "[Colocate FULL] Retaining PG for replica %s with unconfirmed probe exit", candidate.group.rank_offset
+            )
+            return
+        with self._engine_lifecycle_lock:
+            candidate.pending_probe_refs = ()
+            if candidate.result is None:
+                candidate.prechecking = False
+                return
+        # The scale-out request has already handed this PG off to the waiter.
+        group = candidate.group
+        try:
+            await self._rollback_engines(group)
+            self._submit_colocate_pg_removal(group.pg[0], self._colocate_shutdown_pgs)
+        except Exception:
+            logger.exception("[Colocate FULL] Deferred cleanup failed for replica %s", group.rank_offset)
+        else:
+            with self._engine_lifecycle_lock:
+                self._colocate_candidates.pop(group.rank_offset, None)
 
     async def _disconnect_colocate_group_for_removal(self, engine_ids: set[str], timeout: float) -> None:
         with self._engine_lifecycle_lock:
@@ -2658,6 +2689,7 @@ class RolloutManager(ReloadableMixin):
             return
 
         per_replica_pgs = []
+        deferred_pg_ids = set()
         removal_submitted: set[ray.PlacementGroupID] | None = set() if _synchronous_colocate(self.args) else None
 
         def try_remove_replica_pg(idx: int) -> None:
@@ -2665,10 +2697,15 @@ class RolloutManager(ReloadableMixin):
             try:
                 if removal_submitted is None:
                     ray.util.remove_placement_group(pg)
-                else:
+                elif pg.id not in deferred_pg_ids:
                     self._submit_colocate_pg_removal(pg, removal_submitted)
             except Exception:
                 return
+
+        async def confirm_unused_pgs() -> None:
+            if removal_submitted is not None:
+                pgs = [pg for pg in per_replica_pgs if pg.id not in deferred_pg_ids]
+                await self._confirm_unused_colocate_pgs(srv, pgs, removal_submitted)
 
         try:
             # Step 1: Update status
@@ -2804,6 +2841,8 @@ class RolloutManager(ReloadableMixin):
                             sort_key=sort_key,
                             InfoActor=InfoActor,
                         )
+                        if r.cleanup_deferred:
+                            deferred_pg_ids.add(per_replica_pgs[idx].id)
                         return (idx, r.success, r.reason, replica_offsets[idx])
 
                     results = await asyncio.gather(
@@ -2851,8 +2890,7 @@ class RolloutManager(ReloadableMixin):
                 try_remove_replica_pg(idx)
 
             # Phase C: Determine final status
-            if removal_submitted is not None:
-                await self._confirm_unused_colocate_pgs(srv, per_replica_pgs, removal_submitted)
+            await confirm_unused_pgs()
             with self._engine_lifecycle_lock:
                 if not request.is_terminal():
                     self._update_scale_out_final_status(
@@ -2860,8 +2898,7 @@ class RolloutManager(ReloadableMixin):
                     )
 
         except Exception as e:
-            if removal_submitted is not None:
-                await self._confirm_unused_colocate_pgs(srv, per_replica_pgs, removal_submitted)
+            await confirm_unused_pgs()
             # Surface only the exception type, never its args (may leak); full exc logged below.
             failure = ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, type(e).__name__)
             request.failure_categories = scale_utils._scale_out_failure_categories([failure])
@@ -3050,10 +3087,14 @@ class RolloutManager(ReloadableMixin):
             if not result.success:
                 # Keep the pre-created group: the finalizer returns None on
                 # failure, but these engine actors still require rollback.
-                if not (_synchronous_colocate(self.args) and pg.id in self._colocate_shutdown_pgs):
+                if not result.cleanup_deferred and not (
+                    _synchronous_colocate(self.args) and pg.id in self._colocate_shutdown_pgs
+                ):
                     await self._rollback_engines(new_group)
                 return ScaleResult(
-                    False, result.reason or ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, "finalize failed")
+                    False,
+                    result.reason or ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, "finalize failed"),
+                    cleanup_deferred=result.cleanup_deferred,
                 )
             new_group = result.group
 

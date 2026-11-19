@@ -700,6 +700,23 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
+        if (
+            self._is_scaled_out
+            and getattr(self.args, "colocate", False)
+            and not getattr(self.args, "hybrid", False)
+            and not getattr(self.args, "fully_async", False)
+        ):
+            # SGLang sets this inside the server process. The colocate probe
+            # runs from this wrapper and must use the same cuMem mode.
+            cumem = os.getenv("NCCL_CUMEM_ENABLE")
+            if server_args.enable_symm_mem:
+                cumem = "1"
+            elif cumem is None and server_args.nnodes > 1:
+                from sglang.srt import utils
+
+                if getattr(utils, "is_mnnvl_fabric_device", lambda: False)():
+                    cumem = "1"
+            self._colocate_probe_cumem = "0" if cumem is None else cumem
         self.process = launch_server_process(server_args)
 
         bootstrap_port = self._router_bootstrap_port
@@ -1625,6 +1642,8 @@ class SGLangEngine(RayActor):
         env["NCCL_DEBUG"] = "INFO"
         env["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
         env.pop("NCCL_DEBUG_FILE", None)
+        if world_size is not None:
+            env["NCCL_CUMEM_ENABLE"] = self._colocate_probe_cumem
 
         # Each probe creates a CUDA context next to the live ModelRunner. Check
         # every assigned device before launching any child so low headroom
@@ -1674,7 +1693,11 @@ class SGLangEngine(RayActor):
         if world_size is not None:
             terminate = functools.partial(terminate, grace_secs=0.1)
         processes = []
-        log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
+        try:
+            log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
+        except OSError:
+            logger.exception("Could not create the NCCL probe log directory")
+            return {"success": False, "stopped": True, "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value}
         for local_rank, port in enumerate(port_list):
             try:
                 log_path = os.path.join(log_directory.name, f"rank-{local_rank}.log")

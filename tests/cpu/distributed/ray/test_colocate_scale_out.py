@@ -213,6 +213,74 @@ async def test_late_receiver_probe_ack_does_not_interrupt_baseline_full(
                 await waiter
 
 
+@pytest.mark.parametrize("outcome", ["rpc_error", "late_ack", "dispose"])
+@pytest.mark.asyncio
+async def test_unconfirmed_probe_finishes_request_without_releasing_pg(pool, monkeypatch, patch_ray_get, outcome):
+    from relax.distributed.ray import rollout
+
+    manager, _, _ = pool
+    manager.args.scale_weight_sync_precheck = True
+    request_id = manager.create_scale_out_request(num_replicas=2)["request_id"]
+    ready = asyncio.get_running_loop().create_future()
+    ready.set_result(None)
+    pg = SimpleNamespace(id="probe-pg", ready=lambda: ready)
+    monkeypatch.setattr(rollout.ray.util, "placement_group", Mock(return_value=pg))
+    remove_pg = Mock()
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+    rollback = AsyncMock()
+    monkeypatch.setattr(manager, "_rollback_engines", rollback)
+    manager._eval_judge = None
+    probe = asyncio.get_running_loop().create_future()
+    registered = asyncio.Event()
+
+    async def bring_up(**kwargs):
+        group = make_engine_group(args=manager.args, is_scaled_out=True, rank_offset=4)
+        group.pg = (pg, [0, 1], [4, 5])
+        group.all_engines = [make_mock_engine(weight_version="4")]
+        registered.set()
+        result = await manager._wait_for_colocate_full(kwargs["request"], group)
+        return rollout.ScaleResult(result.success, result.reason, cleanup_deferred=result.cleanup_deferred)
+
+    monkeypatch.setattr(manager, "_bring_up_single_replica", bring_up)
+    request_task = asyncio.create_task(manager.execute_scale_out(request_id))
+    await asyncio.wait_for(registered.wait(), timeout=3)
+    candidate = manager._colocate_candidates[4]
+    source = object()
+    assert manager.acquire_colocate_full(source)[0]["precheck"][0] == 4
+    manager.acquire_colocate_full(source, (4, False, True, (probe,)))
+    if outcome != "rpc_error":
+        candidate.deadline = time.monotonic()
+    else:
+        probe.set_exception(OSError("probe RPC failed"))
+
+    await asyncio.wait_for(request_task, timeout=3)
+    assert manager.get_scale_out_status(request_id)["status"] == "FAILED"
+    assert manager._find_active_scale_request() is None
+    remove_pg.assert_not_called()
+    rollback.assert_not_awaited()
+
+    if outcome != "rpc_error":
+        stopping, resume = asyncio.Event(), asyncio.Event()
+
+        async def delayed_rollback(_group):
+            stopping.set()
+            await resume.wait()
+
+        if outcome == "dispose":
+            rollback.side_effect = delayed_rollback
+        probe.set_result({"success": False, "stopped": True})
+        if outcome == "dispose":
+            await asyncio.wait_for(stopping.wait(), timeout=3)
+            manager.dispose()
+            resume.set()
+        await asyncio.wait_for(candidate.probe_cleanup, timeout=3)
+        remove_pg.assert_called_once_with(pg)
+        rollback.assert_awaited_once_with(candidate.group)
+        assert 4 not in manager._colocate_candidates
+    else:
+        assert manager._colocate_candidates[4] is candidate
+
+
 def test_pure_baseline_full_does_not_fence_shutdown(pool, patch_ray_get):
     manager, _, baseline = pool
     manager._eval_judge = None

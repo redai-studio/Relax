@@ -334,13 +334,23 @@ def precheck_colocate_receiver(
             replies = ray.get(refs, timeout=max(0, deadline - time.monotonic()))
             if all(reply.get("stopped", True) for reply in replies):
                 sender = {"fingerprint": transport_fingerprint()}
-                compatible = all(
-                    reply.get("success")
-                    and isinstance(reply.get("fingerprint"), dict)
-                    and scale_utils._scale_weight_sync_precheck_fingerprints_match(sender, reply)[0]
-                    for reply in replies
-                )
-                return success and sender_stopped and compatible, sender_stopped, ()
+                for reply in replies:
+                    if not reply.get("success") or not isinstance(reply.get("fingerprint"), dict):
+                        failed_rank = next((rank for rank in reply.get("results", []) if not rank["success"]), {})
+                        logger.warning(
+                            "[Colocate FULL] Receiver probe %s failed: category=%s rank=%s exit=%s error=%s",
+                            token,
+                            reply.get("category"),
+                            failed_rank.get("local_rank"),
+                            failed_rank.get("returncode"),
+                            (failed_rank.get("log_tail") or "")[-1000:],
+                        )
+                        return False, sender_stopped, ()
+                    compatible, reason = scale_utils._scale_weight_sync_precheck_fingerprints_match(sender, reply)
+                    if not compatible:
+                        logger.warning("[Colocate FULL] Receiver probe %s transport mismatch: %s", token, reason)
+                        return False, sender_stopped, ()
+                return success and sender_stopped, sender_stopped, ()
         except Exception:
             logger.exception("[Colocate FULL] Receiver probes did not confirm exit before the deadline")
     return False, sender_stopped, tuple(refs)
