@@ -257,7 +257,7 @@ def _worker(rank: int, dtype_name: str, rendezvous: str, directory: str) -> None
     from megatron.core import parallel_state
     from megatron.core.ssm.mamba_context_parallel import split_tensor_cp
     from megatron.core.tensor_parallel import random as tp_random
-    from megatron.training.global_vars import set_args
+    from megatron.training.global_vars import set_run_config
 
     from relax.models.qwen3_8.lora import _PLE_LORA_RNG_NAME, PLE_TARGETS, validate_qwen38_lora
     from relax.utils.distributed_utils import init_gloo_group
@@ -268,7 +268,7 @@ def _worker(rank: int, dtype_name: str, rendezvous: str, directory: str) -> None
     torch.backends.cuda.matmul.allow_tf32 = False
     dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=180))
     try:
-        set_args(Namespace(data_parallel_random_init=True))
+        set_run_config(Namespace(rng=Namespace(data_parallel_random_init=True)))
         init_gloo_group(distributed_timeout_minutes=3)
         dtype = getattr(torch, dtype_name)
         tolerance = 1e-4 if dtype == torch.float32 else 0.04

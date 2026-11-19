@@ -46,7 +46,13 @@ def _expert_adapter_worker(rank: int, rendezvous: str) -> None:
                     self.weight.main_grad.mul_(scale)
 
             chunk = Chunk(2, 1, bias=False)
-            chunk.config = SimpleNamespace(moe_router_enable_expert_bias=False, moe_router_load_balancing_type="none")
+            chunk.config = SimpleNamespace(
+                moe_router_enable_expert_bias=False,
+                moe_router_load_balancing_type="none",
+                gtp_weight_remat_size=1,
+                expert_gtp_weight_remat_size=1,
+                calculate_per_token_loss=True,
+            )
             param = chunk.weight
             with torch.no_grad():
                 param.fill_(1)

@@ -144,7 +144,10 @@ def test_main_hybridep_padding_growth_and_combine_gradients(monkeypatch, dense):
         num_experts=4,
         router_topk=2,
         drop_and_pad=False,
+        capacity_factor=None,
         moe_expert_rank_capacity_factor=None,
+        use_dense_routing_for_bool_map=dense,
+        dense_routing_supported=dense,
         num_permuted_tokens=None,
         pad_multiple=None,
         config=SimpleNamespace(
