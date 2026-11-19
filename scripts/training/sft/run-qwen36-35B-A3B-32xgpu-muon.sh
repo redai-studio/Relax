@@ -47,6 +47,7 @@ TRAIN_STEPS="${TRAIN_STEPS:-200}"
 ENV_JSON="$(python3 - "$MULTIMODAL" <<'PYENV'
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -58,6 +59,11 @@ def build_environment() -> dict[str, str]:
     site = Path(sysconfig.get_paths()["purelib"])
     nccl = site / "nvidia/nccl"
     cublas = Path("/opt/relax/cublas13.3/nvidia/cu13/lib")
+    # DeepEP 2.1 invokes NVCC via a shell. Keep training preloads, but isolate
+    # its compiler subprocess even when the image NVCC is not wrapped.
+    nvcc_wrapper = Path(os.environ["RELAX"]) / "scripts/tools/nvcc-without-preload.sh"
+    if shlex.quote(str(nvcc_wrapper)) != str(nvcc_wrapper):
+        raise ValueError("DeepEP requires a Relax checkout path without shell-special characters")
     kept = [
         p
         for p in os.environ.get("LD_PRELOAD", "").replace(":", " ").split()
@@ -84,7 +90,9 @@ def build_environment() -> dict[str, str]:
             ),
             "RELAX_FLA_CONV_NB_MODE": "none",
             "EP_NCCL_ROOT_DIR": str(nccl),
-            "EP_JIT_CACHE_DIR": f"/tmp/relax-qwen35-{os.getuid()}/deepep",
+            "EP_JIT_CACHE_DIR": os.environ.get("EP_JIT_CACHE_DIR") or f"/tmp/relax-qwen35-{os.getuid()}/deepep",
+            "EP_JIT_NVCC_COMPILER": str(nvcc_wrapper),
+            "EP_JIT_PRINT_COMPILER_COMMAND": os.environ.get("EP_JIT_PRINT_COMPILER_COMMAND", "1"),
         }
     )
     env.update(
@@ -121,6 +129,11 @@ def build_environment() -> dict[str, str]:
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
+    if compiler := os.environ.get("EP_JIT_NVCC_COMPILER"):
+        target = Path(compiler).absolute()
+        if target.resolve() == nvcc_wrapper.resolve():
+            raise ValueError("EP_JIT_NVCC_COMPILER must point to the original compiler")
+        env["RELAX_DEEPEP_NVCC"] = str(target)
     data_node = os.environ.get("RELAX_SFT_DATA_NODE_IP") or os.environ.get("MASTER_ADDR")
     if data_node:
         env["RELAX_SFT_DATA_NODE_IP"] = data_node
@@ -128,6 +141,7 @@ def build_environment() -> dict[str, str]:
         raise RuntimeError("The standard Ray entrypoint must resolve MASTER_ADDR before submission")
     for key in (
         "CUDA_HOME",
+        "CUDA_PATH",
         "CPATH",
         "TRITON_PTXAS_PATH",
         "TRITON_CACHE_DIR",
