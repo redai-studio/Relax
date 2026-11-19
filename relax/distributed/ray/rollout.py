@@ -1645,7 +1645,11 @@ class RolloutManager(ReloadableMixin):
             if self._colocate_disposing or not candidate.eligible():
                 return EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
             self._colocate_candidates[key] = candidate
-            if request.status != ScaleOutStatus.WEIGHT_SYNCING:
+            syncing = any(
+                other.request is request and other.claimed and other.result is None
+                for other in self._colocate_candidates.values()
+            )
+            if not syncing:
                 request.update_status(ScaleOutStatus.WAITING_FOR_WEIGHT_SYNC)
         logger.info("[Colocate FULL] Replica %s waiting in request %s", key, request.request_id)
         while True:
