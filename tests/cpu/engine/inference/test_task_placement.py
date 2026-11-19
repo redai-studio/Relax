@@ -12,7 +12,7 @@ from relax.engine.inference.types import DeploymentMode, Role, RoutingSpec, Work
 
 @pytest.mark.parametrize("phase,offset,allowed", [("genrm", 0, True), ("inference", 0, False), ("inference", 2, True)])
 def test_task_plan_checks_cross_role_overlap_before_startup(monkeypatch, phase, offset, allowed):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     monkeypatch.setattr(
         rollout,
@@ -57,7 +57,7 @@ def test_task_plan_checks_cross_role_overlap_before_startup(monkeypatch, phase, 
 
 @pytest.mark.parametrize("teacher_phase,allowed", [("inference", False), ("teacher", True)])
 def test_task_plan_checks_teacher_and_genrm_against_each_other(monkeypatch, teacher_phase, allowed):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     model = InferenceModelSpec(
         "policy", model_path="policy", num_gpus_per_engine=2, engine_groups=[EngineGroupSpec("regular", 2, 2, {})]

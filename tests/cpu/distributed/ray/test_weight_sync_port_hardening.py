@@ -12,8 +12,8 @@ Covers the two fixes for the observed 35B elastic regression
 3. Fail-closed result validation (only ``success is True`` passes).
 
 These tests deliberately drive the REAL code paths (``get_free_port`` bounding,
-``RolloutManager._allocate_weight_sync_ports`` rotation, and
-``RolloutManager._sync_single_engine_weights`` retry loop) rather than mocks that
+``PolicyEnginePool._allocate_weight_sync_ports`` rotation, and
+``PolicyEnginePool._sync_single_engine_weights`` retry loop) rather than mocks that
 trivially pass.
 """
 
@@ -25,7 +25,7 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import ScaleOutStatus  # noqa: F401
+    from relax.distributed.ray.policy_engine_pool import ScaleOutStatus  # noqa: F401
     from relax.utils import misc
 
     HAS_DEPS = True

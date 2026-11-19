@@ -26,7 +26,7 @@ from ray.core.generated.gcs_pb2 import ActorTableData
 
 
 ActorState = ActorTableData.ActorState
-rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
+rollout = pytest.importorskip("relax.distributed.ray.policy_engine_pool", exc_type=ModuleNotFoundError)
 
 
 def wait_until(predicate, *, timeout=15.0, description):
@@ -164,7 +164,7 @@ def make_manager(engine, init_ref=None):
         num_new_engines=0,
         engine_init_records=records,
     )
-    manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
+    manager = object.__new__(rollout.PolicyEnginePool)
     manager.servers = {"actor": rollout.RolloutServer(engine_groups=[group], model_name="actor")}
     manager._engine_actor_states = rollout._get_engine_actor_states()
     assert manager._engine_actor_states is not None, f"Local actor state API missing in Ray {ray.__version__}"

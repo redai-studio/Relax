@@ -6,16 +6,10 @@ import time
 
 import ray
 from ray.util.placement_group import PlacementGroup, placement_group
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from relax.core.node_group_affinity import (
-    require_control_plane_resource_on_node,
-    with_control_plane_affinity,
-)
 from relax.engine.inference.placement import ProbedPlacementGroup
-from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
-from relax.utils.agentic_obs.startup import record_run_startup
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -191,226 +185,24 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
 
 
 def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
-    from .inference_handle import use_managed_rollout
-    from .rollout import RolloutManager
+    """Deploy a CPU workload worker attached to the task engine owner."""
+    from .inference_manager import create_managed_rollout
 
-    if use_managed_rollout(args) and isinstance(pg, ProbedPlacementGroup):
-        from .inference_manager import create_managed_rollout
-
-        return create_managed_rollout(args, pg, data_source, runtime_env)
-
-    # Get the head node ID to ensure RolloutManager runs on the head node
-    # This is critical because the Router binds to the SLIME_HOST_IP address,
-    # and other components expect the router to be accessible at the head node's IP
-    head_node_id = _get_head_node_id()
-    logger.info(f"Scheduling RolloutManager on head node: {head_node_id}")
-    require_control_plane_resource_on_node(args, head_node_id)
-
-    rollout_manager = RolloutManager.options(
-        **with_control_plane_affinity(
-            args,
-            {
-                "num_cpus": 1,
-                "num_gpus": 0,
-                "runtime_env": runtime_env,
-                "scheduling_strategy": NodeAffinitySchedulingStrategy(
-                    node_id=head_node_id,
-                    soft=False,  # Hard constraint: must run on the specified node
-                ),
-            },
-        )
-    ).remote(args, pg, data_source=data_source)
-
-    # Add timeout protection to prevent indefinite blocking during initialization
-    # The timeout is set to 120 seconds to allow sufficient time for:
-
-    # Resolve num_rollout. Semantics:
-    #   - both set         -> min(num_rollout, num_epoch * rollout_per_epoch)
-    #   - only num_epoch   -> num_epoch * rollout_per_epoch
-    #   - only num_rollout -> use as-is
-    # Offline training pre-resolves num_rollout and num_rollout_per_epoch from its
-    # dataset in controller.py before any role is launched; the injected Rollout
-    # has no RL global dataset, so trust those values and skip the RL-side
-    # computation (which would assert on rollout_global_dataset).
-    if is_offline_mode(args):
-        num_rollout_per_epoch = getattr(args, "num_rollout_per_epoch", None)
-        logger.info(
-            f"RolloutManager initialized successfully (offline mode). "
-            f"num_rollout_per_epoch={num_rollout_per_epoch} (pre-resolved by controller)."
-        )
-    else:
-        num_rollout_per_epoch = ray.get(
-            rollout_manager.get_num_rollout_per_epoch.remote(),
-        )
-        logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
-
-        args.num_rollout_per_epoch = num_rollout_per_epoch
-        if args.num_epoch is not None:
-            epoch_rollout = num_rollout_per_epoch * args.num_epoch
-            args.num_rollout = min(args.num_rollout, epoch_rollout) if args.num_rollout is not None else epoch_rollout
-        evaluation_only = (
-            args.num_rollout == 0
-            and args.debug_rollout_only
-            and args.eval_interval is not None
-            and not args.skip_eval_before_train
-        )
-        assert args.num_rollout is not None and (args.num_rollout > 0 or evaluation_only), (
-            f"num_rollout resolved to {args.num_rollout}; "
-            f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
-        )
-
-    record_run_startup(args)
-
-    if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
-        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
-
-    if args.offload_rollout:
-        ray.get(rollout_manager.offload.remote())
-
-    return rollout_manager, num_rollout_per_epoch
+    return create_managed_rollout(args, pg, data_source, runtime_env)
 
 
 def create_genrm_manager(args, pg, runtime_env=None):
-    """Create and initialize a single GenRM manager (legacy single-instance
-    path).
-
-    Args:
-        args: Argument namespace containing genRM configuration
-        pg: Placement group for resource allocation
-        runtime_env: Optional runtime environment configuration
-
-    Returns:
-        Initialized GenRM manager
-    """
-    from .inference_handle import use_managed_auxiliary
-
-    if use_managed_auxiliary(args):
-        return create_genrm_managers(args, pg, runtime_env)["__default__"]
-
-    from .genrm import GenRMManager
-
-    # `name` (with no explicit namespace) lets user code inside other actors of
-    # the same Ray job look this up via ray.get_actor("relax_genrm_manager").
-    # Used by custom_reward_post_process_path when GenRM lifecycle is managed
-    # from userland. Only safe as a fixed, well-known name because this path
-    # is exclusively for the single-instance case (see create_genrm_managers).
-    genrm_manager = GenRMManager.options(
-        **with_control_plane_affinity(
-            args,
-            {
-                "name": "relax_genrm_manager",
-                "num_cpus": 1,
-                "num_gpus": 0,
-                "runtime_env": runtime_env,
-            },
-        )
-    ).remote(args, pg)
-
-    logger.info("GenRMManager initialized successfully")
-
-    # Offload if requested (for colocated mode)
-    if args.offload_rollout:
-        logger.info("Offloading GenRM engines (colocated mode)")
-        ray.get(genrm_manager.offload.remote())
-
-    return genrm_manager
+    """Return the task-owned default model routing handle."""
+    managers = create_genrm_managers(args, pg, runtime_env)
+    if len(managers) != 1:
+        raise ValueError("A single GenRM handle requires exactly one model")
+    return next(iter(managers.values()))
 
 
 def create_genrm_managers(args, pg, runtime_env=None):
-    """Create and initialize the GenRM manager(s) declared by
-    ``args._genrm_instances_resolved``.
-
-    Single-instance configs (the legacy --genrm-model-path path, normalized to
-    the sentinel key "__default__") go through ``create_genrm_manager`` so the
-    well-known Ray actor name "relax_genrm_manager" keeps working for userland
-    lookups. Multi-instance configs (--genrm-instances) launch one manager per
-    route key, sharing ``pg`` at non-overlapping GPU offsets, named
-    "relax_genrm_manager_{key}" -- there is no single well-known name to
-    preserve once more than one instance exists.
-
-    Returns:
-        ``{route_key: manager_handle}``.
-    """
+    """Services consume role routes; only Controller creates task engine
+    pools."""
     prepared = getattr(args, "_genrm_managers", None)
-    if prepared is not None:
-        return prepared
-
-    import copy
-
-    from .genrm import GenRMManager
-    from .inference_handle import use_managed_auxiliary
-    from .multi_instance_orchestrator import start_multi_instance_managers
-
-    if use_managed_auxiliary(args):
-        from .inference_manager import create_static_inference_manager, rollback_static_inference_manager
-
-        managers = {}
-        offset = 0
-        try:
-            for index, (key, spec) in enumerate(args._genrm_instances_resolved.items()):
-                instance_args = copy.copy(args)
-                for field in ("model_path", "num_gpus", "num_gpus_per_engine", "engine_config", "sampling_config"):
-                    setattr(instance_args, f"genrm_{field}", spec[field])
-                name = "relax_genrm_manager" if key == "__default__" else f"relax_genrm_manager_{key}"
-                managers[key] = create_static_inference_manager(
-                    instance_args,
-                    "genrm",
-                    pg,
-                    runtime_env=runtime_env,
-                    name=name,
-                    model_id=key,
-                    bundle_offset=offset,
-                    port_window_index=index,
-                )
-                offset += spec["num_gpus"]
-            return managers
-        except BaseException:
-            for manager in managers.values():
-                try:
-                    rollback_static_inference_manager(manager)
-                except Exception:
-                    logger.exception("GenRM startup rollback could not confirm cleanup; owner retained")
-            raise
-
-    instance_specs = args._genrm_instances_resolved
-    if list(instance_specs.keys()) == ["__default__"]:
-        return {"__default__": create_genrm_manager(args, pg, runtime_env=runtime_env)}
-    port_window_indices = {key: index for index, key in enumerate(instance_specs)}
-
-    def _build_genrm_manager_args(base_args, key, spec):
-        instance_args = copy.copy(base_args)
-        instance_args.genrm_model_path = spec["model_path"]
-        instance_args.genrm_num_gpus = spec["num_gpus"]
-        instance_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
-        instance_args.genrm_engine_config = spec["engine_config"]
-        instance_args.genrm_sampling_config = spec["sampling_config"]
-        return instance_args
-
-    def _spawn_genrm_manager(key, instance_args, bundle_offset, spec):
-        return GenRMManager.options(
-            **with_control_plane_affinity(
-                instance_args,
-                {
-                    "name": f"relax_genrm_manager_{key}",
-                    "num_cpus": 1,
-                    "num_gpus": 0,
-                    "runtime_env": runtime_env,
-                },
-            )
-        ).remote(
-            instance_args,
-            pg,
-            bundle_offset=bundle_offset,
-            port_window_index=port_window_indices[key],
-        )
-
-    managers = start_multi_instance_managers(
-        args=args,
-        instance_specs=instance_specs,
-        build_manager_args=_build_genrm_manager_args,
-        spawn_manager=_spawn_genrm_manager,
-        region_offset=0,
-    )
-    logger.info(f"GenRM managers initialized successfully: instances={list(managers.keys())}")
-    return managers
+    if prepared is None:
+        raise RuntimeError("GenRM models must be registered in the task InferenceManager before deployment")
+    return prepared

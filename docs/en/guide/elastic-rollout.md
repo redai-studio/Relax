@@ -63,7 +63,7 @@ ______________________________________________________________________
                                        │ HTTP REST API
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              Rollout Service (relax/components/rollout.py)          │
+│              Role Gateway (components/inference_gateway.py)         │
 │                    Ray Serve Ingress + FastAPI                      │
 │                                                                     │
 │    POST /scale_out        GET /engines       POST /scale_in         │
@@ -73,7 +73,7 @@ ______________________________________________________________________
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│      RolloutManager (relax/distributed/ray/rollout.py)              │
+│      Task InferenceManager -> PolicyEnginePool                      │
 │                  Ray Actor                                          │
 │                                                                     │
 │    scale_out()          scale_in()          get_engines_info()      │
@@ -99,8 +99,8 @@ ______________________________________________________________________
 
 | Component           | Responsibility                                                                                |
 |---------------------|-----------------------------------------------------------------------------------------------|
-| **Rollout Service** | FastAPI layer — receives HTTP requests and forwards to RolloutManager                         |
-| **RolloutManager**  | Core execution layer — manages engine lifecycle, weight sync, and state machine               |
+| **Rollout Service** | Shared Gateway receives HTTP; task Manager owns admission and delegates scaling                         |
+| **Task InferenceManager / PolicyEnginePool**  | Single task control plane; ordinary pool executes engine lifecycle, weight sync and scaling               |
 | **SGLang Router**   | Request routing layer — distributes inference requests to engines (cache-aware policy)        |
 | **SGLang Engine**   | Inference engine — executes LLM generation tasks                                              |
 | **DCS Coordinator** | Weight distribution service — manages topology and weight broadcasts for initial engines only |
@@ -266,8 +266,8 @@ New engines must sync the latest model weights before they can receive inference
 **Workflow**:
 
 1. **Skip DCS registration on startup**: Scaled-out engines set `skip_dcs_registration=True` and do not register with the DCS Coordinator
-2. **Immediate Router registration**: After health check passes, engines immediately register with the SGLang Router and can start receiving requests (with old weights)
-3. **Actor triggers weight sync**: After Actor's `update_weights_fully_async()` completes, it calls `RolloutManager.sync_weights_for_scaled_out_engines()`
+2. **Immediate Router registration**: Health checks and Router registration are prerequisites; task admission remains closed until every node of the replica confirms the required weight version
+3. **Actor triggers weight sync**: After Actor's `update_weights_fully_async()` completes, it calls `sync_weights_for_scaled_out_engines()` through the task Manager handle
 4. **Weight sync**: Weights are transferred directly from a seed engine (initial engine) via NCCL Broadcast
 
 **Prerequisites**:

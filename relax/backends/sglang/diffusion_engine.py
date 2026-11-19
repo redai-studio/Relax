@@ -267,6 +267,9 @@ class SGLangNativeGenerationEngine(RayActor):
     """Ray actor driving SGLang's diffusion rollout + weight-update HTTP
     API."""
 
+    # Explicit backend capability: native generation serves its own protocol.
+    route_mode = "direct"
+
     def __init__(
         self,
         args,

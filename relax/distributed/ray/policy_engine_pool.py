@@ -3,10 +3,8 @@
 # pyright: reportMissingTypeArgument=false, reportCallIssue=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportUninitializedInstanceVariable=false, reportOptionalIterable=false, reportFunctionMemberAccess=false, reportPossiblyUnboundVariable=false, reportOperatorIssue=false, reportIndexIssue=false, reportReturnType=false
 
 import asyncio
-import copy
 import dataclasses
 import enum
-import logging
 import multiprocessing
 import os
 import random
@@ -32,8 +30,6 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
-from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker, call_eval_with_deferred_rewards
-from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -41,14 +37,10 @@ from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
     _wrap_ipv6,
     find_available_port,
-    get,
     get_host_info,
     init_http_client,
-    post,
-    router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
-from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step, dict_add_prefix
 from relax.utils.metrics.rollout_metrics import (
     compute_metrics_from_samples,
@@ -56,27 +48,19 @@ from relax.utils.metrics.rollout_metrics import (
     compute_perf_metrics_from_samples,
 )
 from relax.utils.misc import load_function
-from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.s3_model_loader import (
     build_runai_streamer_env_for_load,
-    prepare_model_maybe_update_args,
 )
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
-from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
-    save_debug_rollout_data,
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
 )
-from relax.utils.types import Sample
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
 
@@ -884,48 +868,8 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
 
-# In-process singleton set inside RolloutManager.__init__. Only meaningful
-# from code running inside the RolloutManager actor's own process (e.g., a
-# custom_reward_post_process function loaded there). Cross-process access
-# must go through the Ray handle.
-_LOCAL_ROLLOUT_MANAGER: "RolloutManager | None" = None
-
-
-def get_local_rollout_manager() -> "RolloutManager":
-    # Read via sys.modules to defend against the case where an importer of
-    # this module gets a different module-object namespace than the one
-    # RolloutManager.__init__ wrote into (cloudpickle can create parallel
-    # namespaces when materializing @ray.remote classes in workers).
-    import sys as _sys
-
-    mgr = getattr(_sys.modules[__name__], "_LOCAL_ROLLOUT_MANAGER", None)
-    if mgr is None:
-        raise RuntimeError(
-            "get_local_rollout_manager() called outside the RolloutManager "
-            "actor process, or before it finished __init__. "
-            f"module_id={id(_sys.modules[__name__])}, pid={os.getpid()}"
-        )
-    return mgr
-
-
-@ray.remote(
-    concurrency_groups={
-        "health_monitoring": 1,
-        "reload": 1,
-        "scale_out": 8,
-        "scale_in": 8,
-        "scale_coordination": 1,
-        "recover_rollout_engines": 1,
-        "lora_publication": 1,
-    }
-)
-class RolloutManager(ReloadableMixin):
-    """The class to run rollout and convert rollout data to training data.
-
-    Inherits ReloadableMixin to provide hot-reload capabilities, supporting:
-    - reload_module(module_name): Reload the specified module
-    - get_loaded_modules(): Retrieve information about loaded modules
-    """
+class PolicyEnginePool:
+    """Engine-only policy pool hosted inside the task InferenceManager."""
 
     # Scale-out weight-sync tunables; see relax.utils.env.Envs for semantics/defaults.
     _WEIGHT_SYNC_PORT_BASE = Envs.RELAX_WEIGHT_SYNC_PORT_BASE
@@ -935,10 +879,12 @@ class RolloutManager(ReloadableMixin):
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, data_source=None, *, inference_only: bool = False):
+    def __init__(self, args, pg):
         self.pg = pg
         self.args = args
+        self.route_mode = getattr(_resolve_rollout_engine_class(args), "route_mode", "router")
         self._engine_actor_states = _get_engine_actor_states()
+        self._seed_sync_receipts: dict[str, tuple[tuple[str, ...], str]] = {}
         self._dynamic_global_batch_size = None
         # Disposal must remain usable if startup fails before creating locks or monitors.
         self.servers = {}
@@ -948,43 +894,8 @@ class RolloutManager(ReloadableMixin):
         # Kept for the legacy colocated Megatron LoRA handshake. Managed
         # independent pools expose this query through InferenceManager.
         self._lora_training_config = None
-        self._eval_judge = None
-        self._eval_judge_init_lock = asyncio.Lock()
-        self._eval_judge_tasks: set[asyncio.Task] = set()
-        self._eval_judge_errors: list[str] = []
-        self._lora_runtime = None
-        self._lora_configuring = False
-        self._generation_started = False
 
         init_tracking(args, primary=False)
-
-        self.data_source = data_source
-
-        self.data_system_client = None
-        if not inference_only:
-            self.data_system_client = attach_tq_client(
-                self.args.tq_config,
-                role="rollout_worker",
-            )
-
-        if not inference_only:
-            logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
-            logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
-            self.generate_rollout = load_function(self.args.rollout_function_path)
-            self.eval_generate_rollout = load_function(self.args.eval_function_path)
-            self.custom_reward_post_process_func = None
-            if self.args.custom_reward_post_process_path is not None:
-                self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
-            self.custom_convert_samples_to_train_data_func = None
-            if self.args.custom_convert_samples_to_train_data_path is not None:
-                self.custom_convert_samples_to_train_data_func = load_function(
-                    self.args.custom_convert_samples_to_train_data_path
-                )
-
-        if self.args.use_agentic_rollout and not inference_only:
-            from relax.agentic.rollout import init_agentic_resident_pipeline
-
-            init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
 
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
@@ -995,8 +906,6 @@ class RolloutManager(ReloadableMixin):
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
         self.rollout_id = -1
-        self._metric_checker = MetricChecker.maybe_create(args)
-        self._tokenizer = None  # Lazy-initialized tokenizer for debug data saving
         self._engine_lifecycle_lock = threading.RLock()
         existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
         self._next_engine_rank = max(
@@ -1013,20 +922,6 @@ class RolloutManager(ReloadableMixin):
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
         self.status = None
-
-        # In-process singleton so user code running inside this actor (notably
-        # custom_reward_post_process_func loaded and invoked on the rollout
-        # actor's event loop) can call offload()/onload() directly without a
-        # self-remote call that would deadlock.
-        # We must write into sys.modules[__name__] explicitly: when Ray/cloudpickle
-        # reconstructs the @ray.remote class in the worker, __init__.__globals__
-        # can be a namespace distinct from sys.modules['relax.distributed.ray.rollout'],
-        # so a plain `global _LOCAL_ROLLOUT_MANAGER` write becomes invisible to
-        # any code that imports the module the normal way.
-        import sys as _sys
-
-        if not inference_only:
-            _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
@@ -1054,25 +949,6 @@ class RolloutManager(ReloadableMixin):
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
 
-    # Keep synchronous reload RPCs serialized without blocking generation or
-    # health-monitoring calls. Deferred judge workers must reload as well.
-    @ray.method(concurrency_group="reload")
-    def reload_function_by_name(self, module_name: str) -> dict[str, Any]:
-        return super().reload_function_by_name(module_name)
-
-    @ray.method(concurrency_group="reload")
-    def reload_module(self, module_name: str, module_path: str | None = None) -> dict[str, Any]:
-        return super().reload_module(module_name, module_path)
-
-    @ray.method(concurrency_group="reload")
-    def reload_all_functions(self) -> dict[str, Any]:
-        return super().reload_all_functions()
-
-    def _on_custom_reward_reloaded(self, module_path: str) -> None:
-        eval_judge = getattr(self, "_eval_judge", None)
-        if eval_judge is not None:
-            ray.get(eval_judge.reload_custom_reward.remote(module_path))
-
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
         reused."""
@@ -1080,6 +956,9 @@ class RolloutManager(ReloadableMixin):
             rank_offset = ((self._next_engine_rank + alignment - 1) // alignment) * alignment
             self._next_engine_rank = rank_offset + count
             return rank_offset
+
+    def get_training_weight_updating(self) -> bool:
+        return self.training_weight_updating
 
     @property
     def training_weight_updating(self) -> bool:
@@ -1090,192 +969,6 @@ class RolloutManager(ReloadableMixin):
     def _is_weight_updating(self) -> bool:
         with self._engine_lifecycle_lock:
             return self._training_weight_updating or self._scale_out_weight_updating
-
-    @ray.method(concurrency_group="lora_publication")
-    def configure_lora_training(
-        self,
-        artifact_dir: str,
-        base_fingerprint: str,
-        probe_input_ids: list[int],
-        max_versions: int = 2,
-        reconcile_interval_s: float = 1.0,
-    ) -> Any:
-        """Prepare automatic publication before assigning this manager to
-        trainers.
-
-        The directory must be shared by the publisher and every engine and
-        isolated to this training run. The fingerprint identifies the actual
-        frozen base contents. Initial publication follows the first base sync.
-        """
-        from relax.engine.lora_versions.training import LoRATrainingConfig
-        from relax.utils.megatron_peft_utils import is_lora_adapter_mode
-
-        with self._engine_lifecycle_lock:
-            engines = [engine for server in self.servers.values() for engine in server.engines]
-            if not engines or any(engine is None for engine in engines):
-                raise ValueError("training publication requires a complete engine pool")
-            config = LoRATrainingConfig(
-                artifact_dir,
-                base_fingerprint,
-                tuple(probe_input_ids),
-                max_versions,
-                reconcile_interval_s,
-                tuple(engine._actor_id.hex() for engine in engines),
-            )
-            previous = getattr(self, "_lora_training_config", None)
-            if previous is not None:
-                if previous == config:
-                    return previous
-                raise RuntimeError("Cannot replace a training publication configuration")
-            if (
-                not self.args.fully_async
-                or getattr(self.args, "train_backend", "megatron") != "megatron"
-                or getattr(self.args, "hybrid", False)
-                or self.args.colocate
-                or self.args.offload_rollout
-                or not self.args.use_agentic_rollout
-                or not is_lora_adapter_mode(self.args)
-                or self.args.use_fault_tolerance
-                or getattr(self.args, "use_health_check", False)
-                or len(self.servers) != 1
-            ):
-                raise ValueError(
-                    "automatic LoRA publication requires fully-async Megatron Agentic adapter mode, "
-                    "a fixed single-model pool, and no rollout offload or automatic recovery"
-                )
-            if (
-                self._lora_runtime is not None
-                or self._lora_configuring
-                or getattr(self, "_lora_configuration_failed", False)
-                or self._generation_started
-                or self._find_active_scale_request() is not None
-            ):
-                raise RuntimeError("training publication must be configured on a fresh, idle rollout pool")
-            self._lora_training_config = config
-        self._stop_eviction_monitor()
-        return config
-
-    def get_lora_training_config(self) -> Any:
-        return self._lora_training_config
-
-    @ray.method(concurrency_group="lora_publication")
-    def publish_training_lora(self, artifact_path: str) -> dict[str, Any]:
-        """Bootstrap after base sync, then publish without pausing Sessions."""
-        # Blocking control-plane RPCs must not occupy generate's event loop.
-        config = self._lora_training_config
-        if config is None:
-            return {"status": "failed", "error": "training publication is not configured"}
-        if getattr(self, "_lora_configuration_failed", False):
-            return {"status": "failed", "error": "initial LoRA configuration failed"}
-        if self._lora_configuring:
-            return {"status": "unconfirmed", "error": "initial LoRA configuration is still running"}
-        if self._lora_runtime is None:
-            try:
-                self._configure_lora_version_runtime(
-                    artifact_path, list(config.probe_input_ids), config.max_versions, config.reconcile_interval_s
-                )
-            except Exception as error:
-                return {"status": "failed", "error": f"{type(error).__name__}: {error}"}
-            return {"status": "published", "version_id": self._lora_initial_publication.identity.version_id}
-        return ray.get(self._lora_runtime.publish_for_training.remote(artifact_path))
-
-    @ray.method(concurrency_group="lora_publication")
-    def configure_lora_versions(
-        self,
-        initial_artifact_path: str,
-        probe_input_ids: list[int],
-        max_versions: int = 2,
-        reconcile_interval_s: float = 1.0,
-    ) -> Any:
-        """Opt into immutable versions before starting any resident groups.
-
-        Requires a fixed single-model engine pool configured with managed LoRA
-        capacity. The initial artifact is published before Session injection;
-        subsequent artifacts can be published through the returned actor.
-        """
-        if getattr(self, "_lora_training_config", None) is not None:
-            raise RuntimeError("automatic training publication owns the initial LoRA bootstrap")
-        return self._configure_lora_version_runtime(
-            initial_artifact_path, probe_input_ids, max_versions, reconcile_interval_s
-        )
-
-    def _configure_lora_version_runtime(
-        self,
-        initial_artifact_path: str,
-        probe_input_ids: list[int],
-        max_versions: int,
-        reconcile_interval_s: float,
-    ) -> Any:
-        from relax.agentic.rollout import bind_agentic_lora_runtime
-        from relax.engine.lora_versions.runtime import LoRAVersionRuntime
-
-        with self._engine_lifecycle_lock:
-            if (
-                self._lora_runtime is not None
-                or self._lora_configuring
-                or getattr(self, "_lora_configuration_failed", False)
-            ):
-                raise RuntimeError("LoRA versions are already configured or being configured")
-            if (
-                not self.args.use_agentic_rollout
-                or self.args.use_fault_tolerance
-                or getattr(self.args, "use_health_check", False)
-                or len(self.servers) != 1
-            ):
-                raise ValueError("managed LoRA requires Agentic rollout, one model, and disabled automatic recovery")
-            if getattr(self, "_generation_started", False):
-                raise RuntimeError("LoRA versions must be configured before generation starts")
-            if self._find_active_scale_request() is not None:
-                raise RuntimeError("cannot configure LoRA during an engine pool transition")
-            self._lora_configuring = True
-        try:
-            # Stop automatic eviction before capturing the fixed engine pool.
-            self._stop_eviction_monitor()
-            host = LoRAVersionRuntime.options(
-                **with_control_plane_affinity(self.args, {"num_cpus": 0, "num_gpus": 0})
-            ).remote()
-            self._lora_runtime = host
-            engines = next(iter(self.servers.values())).engines
-            if not engines or any(engine is None for engine in engines):
-                raise ValueError("managed LoRA requires a complete ready engine pool")
-            urls = ray.get([engine.get_url.remote() for engine in engines])
-            if any(not url for url in urls) or len(set(urls)) != len(urls):
-                raise ValueError("managed LoRA requires unique engine endpoints")
-            ray.get(
-                host.start.remote(
-                    dict(zip(map(str, range(len(urls))), urls)), probe_input_ids, max_versions, reconcile_interval_s
-                )
-            )
-            self._lora_initial_publication = ray.get(host.publish.remote(initial_artifact_path))
-            bind_agentic_lora_runtime(host)
-            return host
-        except BaseException:
-            # A partially published/configured pool must not resume unmanaged
-            # operation. Retain its owner for reconciliation and disposal.
-            self._lora_configuration_failed = True
-            raise
-        finally:
-            self._lora_configuring = False
-
-    def get_lora_version_runtime(self) -> Any:
-        return self._lora_runtime
-
-    def _require_unmanaged_engine_pool(self) -> None:
-        if (
-            getattr(self, "_lora_runtime", None) is not None
-            or getattr(self, "_lora_configuring", False)
-            or getattr(self, "_lora_configuration_failed", False)
-            or getattr(self, "_lora_training_config", None) is not None
-        ):
-            raise RuntimeError("managed LoRA currently requires a fixed engine pool")
-
-    def _begin_generation(self) -> None:
-        with self._engine_lifecycle_lock:
-            if getattr(self, "_lora_configuring", False) or getattr(self, "_lora_configuration_failed", False):
-                raise RuntimeError("LoRA configuration is incomplete")
-            if getattr(self, "_lora_training_config", None) is not None and self._lora_runtime is None:
-                raise RuntimeError("initial training LoRA publication has not completed")
-            self._generation_started = True
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is
@@ -1299,7 +992,6 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
-    @ray.method(concurrency_group="lora_publication")
     def dispose(self):
         try:
             # Signal every monitor before bounded joins so a stalled health
@@ -1311,35 +1003,10 @@ class RolloutManager(ReloadableMixin):
             self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
             for monitor in self._health_monitors:
                 monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
-            # Normal completion drains before shutdown; this also cleans up on
-            # failure without waiting indefinitely for a remote judge.
-            if self._eval_judge is not None:
-                try:
-                    ray.get(self._eval_judge.close.remote(), timeout=10)
-                except Exception:
-                    logger.exception("Failed to close the eval judge pool")
-                finally:
-                    try:
-                        ray.kill(self._eval_judge)
-                    except Exception:
-                        logger.exception("Failed to terminate the eval judge owner")
-                    self._eval_judge = None
-            host = getattr(self, "_lora_runtime", None)
-            if host is not None:
-                ray.get(host.close.remote())
-                ray.kill(host)
-                self._lora_runtime = None
             self._shutdown_all_engines()
         finally:
-            try:
-                # Deregister the worker's Mooncake segment before a fast restart.
-                if getattr(self, "data_system_client", None) is not None:
-                    detach_tq_client()
-            finally:
-                self.data_system_client = None
-                # Routers are child processes of this Ray actor, so its process
-                # owns the registry; the Controller driver's registry is separate.
-                stop_launched_routers()
+            # Routers are children of the task Manager process.
+            stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
@@ -1423,234 +1090,8 @@ class RolloutManager(ReloadableMixin):
         """
         return self._weight_sync_lock
 
-    def get_dynamic_global_batch_size(self):
-        """Return the actual sample count from the last rollout step.
-
-        Used by training side to compute correct batch_size for TQ fetch when
-        use_dynamic_global_batch_size is enabled.
-        """
-        assert self._dynamic_global_batch_size is not None, (
-            "get_dynamic_global_batch_size called before first generate()"
-        )
-        return self._dynamic_global_batch_size
-
-    def get_num_rollout_per_epoch(self):
-        assert self.args.rollout_global_dataset
-        return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
-
-    async def generate(self, rollout_id):
-        self._begin_generation()
-        self.rollout_id = rollout_id
-        self.health_monitoring_resume()
-        if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
-            self._try_ci_fault_injection()
-        output = await asyncio.to_thread(
-            call_rollout_fn,
-            self.generate_rollout,
-            self.args,
-            rollout_id,
-            self.data_source,
-            self.data_system_client,
-            evaluation=False,
-        )
-        if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
-            self._dynamic_global_batch_size = len(
-                {sample.index for sample_group in output.samples for sample in sample_group}
-            )
-
-    async def eval(self, rollout_id):
-        self._begin_generation()
-        self.health_monitoring_resume()
-
-        # TODO: add fault tolerance to eval
-        result, pending = await asyncio.to_thread(
-            call_eval_with_deferred_rewards,
-            self.eval_generate_rollout,
-            self.args,
-            rollout_id,
-            self.data_source,
-            self.data_system_client,
-        )
-        await self.submit_eval_result(rollout_id, result, pending)
-
-    async def submit_eval_result(self, rollout_id: int, result: Any, pending: list[DeferredReward]) -> None:
-        """Record inline scores or enqueue captured judges from RL or SFT."""
-        if pending:
-            async with self._eval_judge_init_lock:
-                if self._eval_judge is None:
-                    self._eval_judge = await asyncio.to_thread(
-                        lambda: EvalJudgeWorker.options(**with_control_plane_affinity(self.args)).remote(self.args)
-                    )
-            # Ray serializes the snapshot before returning the ObjectRef. Keep
-            # result + pending together to preserve their shared Sample refs.
-            ref = await asyncio.to_thread(self._eval_judge.score.remote, self.args, (result, pending))
-            task = asyncio.create_task(self._finish_eval_judge(rollout_id, ref))
-            self._eval_judge_tasks.add(task)
-            task.add_done_callback(self._eval_judge_tasks.discard)
-            logger.info(
-                "Queued eval judge for rollout %s (%d pending evaluations)", rollout_id, len(self._eval_judge_tasks)
-            )
-            return
-        self._record_eval_result(rollout_id, result)
-
-    def _record_eval_result(self, rollout_id: int, result: Any) -> None:
-        data = result.data
-        self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        args = self.args
-        if getattr(args, "loss_type", None) == "sft":
-            # SFT already supplies completed training steps, not RL batch IDs.
-            args = copy.copy(args)
-            args.wandb_always_use_train_step = False
-            args.reward_key = args.eval_reward_key or args.reward_key
-            args.n_samples_per_prompt = 1
-        _log_eval_rollout_data(rollout_id, args, data, result.metrics)
-
-    async def _finish_eval_judge(self, rollout_id: int, ref: Any) -> None:
-        start = time.monotonic()
-        try:
-            result = await ref
-            result.metrics = dict(result.metrics or {})
-            result.metrics.update({"eval/async_judge": 1, "eval/async_judge_seconds": time.monotonic() - start})
-            await asyncio.to_thread(self._record_eval_result, rollout_id, result)
-        except Exception as exc:
-            self._eval_judge_errors.append(f"rollout {rollout_id}: {exc}")
-            logger.exception("Background eval judge failed for rollout %s", rollout_id)
-
-    async def drain_eval_judges(self) -> None:
-        """Finish scoring and reporting before the normal job shutdown."""
-        while self._eval_judge_tasks:
-            logger.info("Waiting for %d pending eval judges at training completion", len(self._eval_judge_tasks))
-            await asyncio.gather(*tuple(self._eval_judge_tasks))
-        if self._eval_judge_errors:
-            raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
-
-    async def run_predict(self, train_step: int) -> None:
-        """Periodic SFT predict pass entry point.
-
-        Ensures KV/cuda-graph is onloaded (no-op if already on), then delegates
-        to ``run_predict_loop`` which renders the eval set, batches calls to
-        ``self.generate_predict``, and writes
-        ``<args.save>/predict/predictions_step_<train_step>.jsonl``.
-
-        Mirrors the ``eval`` method: does NOT proactively offload afterward —
-        the next training step's actor↔rollout coordination drives state
-        transitions, same as PPL eval.
-        """
-        from relax.engine.sft.predict.loop import run_predict_loop
-
-        if self.args.offload_rollout:
-            await self.onload_kv()
-        await run_predict_loop(self, self.args, train_step)
-
-    async def generate_predict(
-        self,
-        prompts: list[str],
-        multimodal_inputs_list: list[dict | None] | None = None,
-        *,
-        samples: list[Sample] | None = None,
-    ) -> list[str]:
-        """Generate completions for ``prompts`` concurrently.
-
-        POSTs all prompts at once in round-robin order directly to engine
-        workers, bypassing the router. Predict prompts share a long fixed
-        prefix (``<|vision_start|><|image_pad|><|vision_end|>...``); cache-
-        aware routing would pin every request to the engine that first
-        cached the prefix, defeating multi-engine throughput.
-
-        ``multimodal_inputs_list`` is a parallel list of dicts (or ``None``)
-        carrying images/videos/audio for each prompt; encoded inline and
-        merged into the payload, mirroring the RL ``generate()`` path.
-        """
-        import sglang_router
-        from packaging.version import parse
-
-        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
-
-        self.health_monitoring_resume()
-
-        router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
-        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
-            response = await get(f"{router_base}/list_workers")
-            worker_urls = response["urls"]
-        else:
-            response = await get(f"{router_base}/workers")
-            worker_urls = [w["url"] for w in response["workers"]]
-        worker_urls = router_worker_base_urls(worker_urls)
-        if not worker_urls:
-            worker_urls = [router_base]
-
-        # Reuse the shared --eval-* sampling args (no SFT-predict-specific
-        # flags). Defaults preserve the original SFT predict behaviour
-        # (greedy, max_new_tokens=512) when --eval-* is not provided.
-        eval_temperature = getattr(self.args, "eval_temperature", None)
-        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
-        eval_top_p = getattr(self.args, "eval_top_p", None)
-        sampling_params = {
-            "temperature": 0.0 if eval_temperature is None else eval_temperature,
-            "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
-            "top_p": 1.0 if eval_top_p is None else eval_top_p,
-        }
-        if multimodal_inputs_list is None:
-            multimodal_inputs_list = [None] * len(prompts)
-        if samples is not None and len(samples) != len(prompts):
-            raise ValueError("SFT predict samples must align with prompts")
-
-        async def _one(idx: int, prompt: str, mm: dict | None) -> str:
-            url = f"{worker_urls[idx % len(worker_urls)]}/generate"
-            payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
-            if getattr(self.args, "lora_rank", 0) > 0 and getattr(self.args, "lora_adapter_mode", False):
-                from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
-
-                payload["lora_path"] = LORA_ADAPTER_NAME
-            if samples is not None:
-                # Preserve actual generated token IDs for custom eval rewards.
-                payload["return_logprob"] = True
-                payload["logprob_start_len"] = -1
-            if mm:
-                encoded_mm, _ = await _encode_multimodal_inputs(mm)
-                payload.update(encoded_mm)
-            output = await post(url, payload)
-            if samples is not None:
-                sample = samples[idx]
-                sample.response = output["text"]
-                meta_info = output["meta_info"]
-                token_logprobs = meta_info.get("output_token_logprobs")
-                if token_logprobs is not None:
-                    response_tokens = [item[1] for item in token_logprobs]
-                    sample.rollout_log_probs = [item[0] for item in token_logprobs]
-                else:
-                    response_tokens = output["output_ids"]
-                sample.tokens.extend(response_tokens)
-                sample.rollout_tokens = list(sample.tokens)
-                sample.response_length = len(response_tokens)
-                sample.update_from_meta_info(self.args, meta_info)
-                if sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
-                    raise RuntimeError(f"SFT predict sample {sample.index} did not complete: {sample.status}")
-            if isinstance(output, dict) and "text" in output:
-                return output["text"]
-            if isinstance(output, str):
-                return output
-            return str(output)
-
-        tasks = [
-            asyncio.create_task(_one(i, p, m))
-            for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))
-        ]
-        try:
-            return await asyncio.gather(*tasks)
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def save(self, rollout_id):
-        await self.data_source.save.remote(rollout_id)
-
-    async def load(self, rollout_id=None):
-        try:
-            await self.data_source.load.remote(rollout_id)
-        except Exception as e:
-            logger.warning(f"Failed to load data source: {e}")
+    def get_lora_training_config(self) -> Any:
+        return self._lora_training_config
 
     async def offload(self):
         self._offload_local()
@@ -1672,12 +1113,14 @@ class RolloutManager(ReloadableMixin):
     def _onload_local(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
+        # Record possible residency before the first fallible load so cleanup
+        # still runs when a later server fails after an earlier one loaded.
+        self.status = "partial"
         for srv in self.servers.values():
             srv.onload(tags)
-        # Full onload transitions status; per-tag calls leave status for the
-        # dedicated wrappers below (onload_weights / onload_kv).
-        if tags is None:
-            self.status = "onload"
+        # Partial loads also hold GPU memory. Do not let a later offload
+        # short-circuit merely because the last full state was sleeping.
+        self.status = "onload" if tags is None else "partial"
 
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
@@ -1689,11 +1132,9 @@ class RolloutManager(ReloadableMixin):
     def get_status(self):
         return self.status
 
-    @ray.method(concurrency_group="recover_rollout_engines")
     def recover_rollout_engines(self, model_name: str | None = None):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
-        self._require_unmanaged_engine_pool()
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
         if self.rollout_id == -1 or srv is None:
@@ -1711,7 +1152,6 @@ class RolloutManager(ReloadableMixin):
             srv.engine_gpu_offsets,
         )
 
-    @ray.method(concurrency_group="recover_rollout_engines")
     def register_recovered_engines(self, synced_actor_ids: list[str]) -> None:
         """Publish only current recovered generations that completed weight
         sync."""
@@ -1767,12 +1207,10 @@ class RolloutManager(ReloadableMixin):
         if srv:
             srv.num_new_engines = 0
 
-    @ray.method(concurrency_group="health_monitoring")
     def health_monitoring_pause(self) -> None:
         for monitor in self._health_monitors:
             monitor.pause()
 
-    @ray.method(concurrency_group="health_monitoring")
     def health_monitoring_resume(self) -> None:
         for monitor in self._health_monitors:
             monitor.resume()
@@ -1781,7 +1219,6 @@ class RolloutManager(ReloadableMixin):
         refs = [engine.check_weights.remote(action=action) for engine in self.rollout_engines]
         return await asyncio.gather(*refs)
 
-    @ray.method(concurrency_group="health_monitoring")
     def set_force_unhealthy(self, engine_id: int) -> None:
         """Set ``_force_unhealthy`` on a specific rollout engine for debug.
 
@@ -1796,27 +1233,6 @@ class RolloutManager(ReloadableMixin):
             raise ValueError(f"Engine {engine_id} is already None (dead)")
         ray.get(engine.set_force_unhealthy.remote(True))
         logger.info(f"set_force_unhealthy: engine {engine_id} marked as unhealthy")
-
-    @property
-    def tokenizer(self):
-        """Lazy-initialized tokenizer for debug data saving."""
-        if self._tokenizer is None:
-            try:
-                from relax.utils.data.processing_utils import load_tokenizer
-
-                prepare_model_maybe_update_args(self.args, completeness="metadata")
-                self._tokenizer = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True)
-                logger.info(f"Loaded tokenizer from {self.args.hf_checkpoint}")
-            except Exception as e:
-                logger.warning(f"Failed to load tokenizer: {e}")
-        return self._tokenizer
-
-    def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
-        """Save debug rollout data using shared utility function."""
-        save_debug_rollout_data(self.args, data, rollout_id, evaluation, tokenizer=self.tokenizer)
-
-    def set_train_parallel_config(self, config: dict):
-        self.train_parallel_config = config
 
     # ===================== Elastic Rollout Scale-Out Methods =====================
 
@@ -1873,7 +1289,7 @@ class RolloutManager(ReloadableMixin):
             ValueError: If the address format is invalid
         """
         # Strip scheme prefix so callers can pass full URLs
-        addr = RolloutManager._normalize_engine_addr(addr)
+        addr = PolicyEnginePool._normalize_engine_addr(addr)
         if addr.startswith("["):
             # IPv6 bracket notation: [::1]:8000
             bracket_end = addr.find("]")
@@ -1969,7 +1385,6 @@ class RolloutManager(ReloadableMixin):
                         }
         return None
 
-    @ray.method(concurrency_group="scale_coordination")
     def create_scale_out_request(
         self,
         model_name: str = "default",
@@ -1999,7 +1414,6 @@ class RolloutManager(ReloadableMixin):
         Returns:
             Dict with request_id and initial status (or NOOP if idempotent no-op)
         """
-        self._require_unmanaged_engine_pool()
         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
         if num_replicas > 0:
             scale_mode = ScaleOutMode.RAY_NATIVE
@@ -2082,7 +1496,6 @@ class RolloutManager(ReloadableMixin):
             # Idempotency: filter out URLs already in the system or in-flight
             # (_collect_existing/in_flight already return normalized addrs)
             existing_urls = self._collect_existing_engine_addrs(srv)
-            self._require_unmanaged_engine_pool()
             in_flight_urls = self._collect_in_flight_engine_addrs(model_name)
             already_known = existing_urls | in_flight_urls
 
@@ -2115,7 +1528,6 @@ class RolloutManager(ReloadableMixin):
         # eviction claims.  Validation above may be slow enough for eviction
         # to win after the initial fast-path check.
         with self._engine_lifecycle_lock:
-            self._require_unmanaged_engine_pool()
             active = self._find_active_scale_request()
             if active is not None:
                 return {
@@ -2130,9 +1542,7 @@ class RolloutManager(ReloadableMixin):
             self._gc_terminal_requests()
         return request.to_dict()
 
-    @ray.method(concurrency_group="scale_out")
     async def execute_scale_out(self, request_id: str) -> None:
-        self._require_unmanaged_engine_pool()
         """Execute a previously created scale-out request. Meant to be called
         via .remote() (fire-and-forget).
 
@@ -2776,8 +2186,19 @@ class RolloutManager(ReloadableMixin):
         logger.info(f"{log_prefix} {replica_str}: starting weight sync from seed engine...")
         sync_timeout = max(30.0, request.timeout_secs - (time.time() - request.created_at))
         sync_reasons: list[ScaleOutFailure] = []
+        initial_generations = {}
+        if engine_group is not None:
+            for first in range(0, len(engine_group.all_engines), engine_group.nodes_per_engine):
+                slots = tuple(engine_group.all_engines[first : first + engine_group.nodes_per_engine])
+                if len(slots) == engine_group.nodes_per_engine and all(engine is not None for engine in slots):
+                    initial_generations[slots[0]._actor_id.hex()] = tuple(engine._actor_id.hex() for engine in slots)
+        else:
+            initial_generations = {
+                engine._actor_id.hex(): (engine._actor_id.hex(),) for engine in engines if engine is not None
+            }
         sync_ok = await self._sync_weights_from_seed_engine(
             engines,
+            replica_generations=initial_generations,
             timeout=sync_timeout,
             model_name=request.model_name,
             run_precheck=(engine_group is not None and getattr(self.args, "scale_weight_sync_precheck", True)),
@@ -3388,10 +2809,28 @@ class RolloutManager(ReloadableMixin):
         model_name: str = "default",
         run_precheck: bool = False,
         reason_sink: list[ScaleOutFailure] | None = None,
+        replica_generations: dict[str, tuple[str, ...]] | None = None,
     ) -> bool:
         if not new_engines:
             logger.info("[ScaleOut][WeightSync] No new engines to sync")
             return True
+
+        # Receipts describe the exact full replica before transport starts.
+        # A healthy, versioned head cannot prove that a replacement follower
+        # participated in an earlier successful sync.
+        generations = dict(replica_generations or {})
+        with self._engine_lifecycle_lock:
+            for server in self.servers.values():
+                for group in server.engine_groups:
+                    for first in range(0, len(group.all_engines), group.nodes_per_engine):
+                        slots = tuple(group.all_engines[first : first + group.nodes_per_engine])
+                        if len(slots) == group.nodes_per_engine and all(engine is not None for engine in slots):
+                            generations[slots[0]._actor_id.hex()] = tuple(engine._actor_id.hex() for engine in slots)
+        if not hasattr(self, "_seed_sync_receipts"):
+            self._seed_sync_receipts = {}
+        for engine in new_engines:
+            if engine is not None:
+                self._seed_sync_receipts.pop(engine._actor_id.hex(), None)
 
         def _record(failure: ScaleOutFailure) -> None:
             if reason_sink is not None:
@@ -3570,6 +3009,9 @@ class RolloutManager(ReloadableMixin):
                         next_pending.append((i, e))
                     else:
                         synced_indices.add(i)
+                        identity = e._actor_id.hex()
+                        if identity in generations:
+                            self._seed_sync_receipts[identity] = (generations[identity], str(seed_weight_version))
                 pending_engines = next_pending
 
                 if pending_engines:
@@ -3697,7 +3139,6 @@ class RolloutManager(ReloadableMixin):
         if failures:
             raise RuntimeError(f"Rollback resource release is unconfirmed: {failures}") from failures[0]
 
-    @ray.method(concurrency_group="scale_out")
     def get_scale_out_status(self, request_id: str) -> Optional[dict]:
         """Get the status of a scale-out request.
 
@@ -3710,7 +3151,6 @@ class RolloutManager(ReloadableMixin):
         request = self._scale_out_requests.get(request_id)
         return request.to_dict() if request else None
 
-    @ray.method(concurrency_group="scale_out")
     def cancel_scale_out(self, request_id: str) -> Optional[dict]:
         """Cancel a scale-out request.
 
@@ -3741,7 +3181,6 @@ class RolloutManager(ReloadableMixin):
             return {"router_ip": None, "router_port": None}
         return {"router_ip": srv.router_ip, "router_port": srv.router_port}
 
-    @ray.method(concurrency_group="scale_out")
     def get_engines_info(self, model_name: Optional[str] = None) -> dict:
         """Get information about all engines.
 
@@ -3802,7 +3241,6 @@ class RolloutManager(ReloadableMixin):
         result["observation"]["complete"] = not issues
         return result
 
-    @ray.method(concurrency_group="scale_out")
     def list_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> list[dict]:
@@ -3869,7 +3307,6 @@ class RolloutManager(ReloadableMixin):
 
         return [r.to_dict() for r in requests]
 
-    @ray.method(concurrency_group="scale_out")
     async def cancel_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None, dry_run: bool = False
     ) -> dict:
@@ -3977,7 +3414,6 @@ class RolloutManager(ReloadableMixin):
 
         return result
 
-    @ray.method(concurrency_group="scale_in")
     def set_weight_updating(self, is_updating: bool) -> bool:
         """Acquire or release the fully-async topology lease.
 
@@ -3995,7 +3431,6 @@ class RolloutManager(ReloadableMixin):
             self._training_weight_updating = is_updating
             return True
 
-    @ray.method(concurrency_group="scale_in")
     async def sync_weights_for_scaled_out_engines(
         self,
         model_name: str = "default",
@@ -4085,7 +3520,6 @@ class RolloutManager(ReloadableMixin):
                 "error_message": str(e),
             }
 
-    @ray.method(concurrency_group="scale_coordination")
     def create_scale_in_request(
         self,
         model_name: str = "default",
@@ -4095,7 +3529,6 @@ class RolloutManager(ReloadableMixin):
         force: bool = False,
         dry_run: bool = False,
     ) -> dict:
-        self._require_unmanaged_engine_pool()
         # Mutual exclusion: reject if any scale operation is in progress
         active = self._find_active_scale_request()
         if active is not None:
@@ -4159,7 +3592,6 @@ class RolloutManager(ReloadableMixin):
         )
         # Recheck and insert atomically against graceful eviction claims.
         with self._engine_lifecycle_lock:
-            self._require_unmanaged_engine_pool()
             active = self._find_active_scale_request()
             if active is not None:
                 return {
@@ -4174,9 +3606,7 @@ class RolloutManager(ReloadableMixin):
             self._gc_terminal_requests()
         return request.to_dict()
 
-    @ray.method(concurrency_group="scale_in")
     async def execute_scale_in(self, request_id: str) -> None:
-        self._require_unmanaged_engine_pool()
         request = self._scale_in_requests.get(request_id)
         if request is None:
             logger.error(f"Scale-in request {request_id} not found")
@@ -4589,12 +4019,10 @@ class RolloutManager(ReloadableMixin):
         if groups_to_remove:
             logger.info(f"[ScaleIn] Cleaned up {len(groups_to_remove)} empty engine groups")
 
-    @ray.method(concurrency_group="scale_in")
     def get_scale_in_status(self, request_id: str) -> Optional[dict]:
         request = self._scale_in_requests.get(request_id)
         return request.to_dict() if request else None
 
-    @ray.method(concurrency_group="scale_in")
     def list_all_scale_in_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> list[dict]:
@@ -4756,7 +4184,6 @@ class RolloutManager(ReloadableMixin):
         """Fence a ready eviction batch before performing one live removal."""
         claimed = []
         with self._engine_lifecycle_lock:
-            self._require_unmanaged_engine_pool()
             for srv_name, group, node0_idx in eviction_infos:
                 srv = self.servers.get(srv_name)
                 if (
@@ -4892,18 +4319,6 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
 
-    genrm_instances = getattr(args, "_genrm_instances_resolved", None)
-    if genrm_instances is None:
-        genrm_instances = getattr(args, "genrm_instances", None)
-    genrm_count = (
-        len(genrm_instances) if genrm_instances is not None else int(bool(getattr(args, "genrm_model_path", None)))
-    )
-    genrm_ports = None
-    if genrm_count:
-        from .genrm import _GENRM_PORT_BASE, _GENRM_PORT_WINDOW_SIZE
-
-        genrm_ports = (_GENRM_PORT_BASE, _GENRM_PORT_BASE + genrm_count * _GENRM_PORT_WINDOW_SIZE)
-
     # Track per-node port cursors so that different engine groups (called
     # sequentially) never race for the same ports on a given node.
     node_port_cursor: dict[int, int] = {}
@@ -4926,17 +4341,12 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
             def port(consecutive=1):
                 nonlocal start_port
-                while True:
-                    _, port = ray.get(
-                        engine._get_current_node_ip_and_free_port.remote(
-                            start_port=start_port,
-                            consecutive=consecutive,
-                        )
+                _, port = ray.get(
+                    engine._get_current_node_ip_and_free_port.remote(
+                        start_port=start_port,
+                        consecutive=consecutive,
                     )
-                    if genrm_ports and port < genrm_ports[1] and port + consecutive > genrm_ports[0]:
-                        start_port = genrm_ports[1]
-                        continue
-                    break
+                )
                 start_port = port + consecutive
                 node_port_cursor[node_idx] = start_port
                 return port
@@ -5232,6 +4642,8 @@ def stop_launched_routers() -> int:
             logger.warning(f"Failed to terminate router pid={getattr(proc, 'pid', None)}: {e}")
             survivors.append(proc)  # Retain ownership when cleanup could not be verified.
     _LAUNCHED_ROUTER_PROCESSES = survivors
+    if survivors:
+        raise RuntimeError("Router process exit is unconfirmed; retain the task owner for cleanup retry")
     return killed
 
 
@@ -5337,6 +4749,10 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
     as the HTTP client is shared across all servers.
     """
     config = _resolve_sglang_config(args)
+    route_mode = getattr(_resolve_rollout_engine_class(args), "route_mode", "sglang_router")
+    if route_mode not in {"direct", "sglang_router"}:
+        raise ValueError(f"Unsupported engine routing capability: {route_mode}")
+    direct = route_mode == "direct"
 
     servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
@@ -5346,6 +4762,8 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
+        if direct and has_pd:
+            raise ValueError("Direct engine backends do not support PD router groups")
         endpoint = (args.sglang_router_ip, args.sglang_router_port)
         managed = (
             model_idx > 0
@@ -5359,7 +4777,9 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
             and getattr(args, "router_decode_policy", None) == "power_of_two"
             and not args.debug_train_only
         )
-        if defer_router:
+        if direct:
+            router_ip, router_port = None, None
+        elif defer_router:
             if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
                 raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
             if getattr(args, "router_dp_aware", False):
@@ -5407,7 +4827,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
                 sglang_overrides=group_cfg.overrides,
                 router_ip=router_ip,
                 router_port=router_port,
-                skip_router_registration=defer_router,
+                skip_router_registration=defer_router or direct,
                 require_router_registration=defer_router,
             )
             started_groups.append(group)
@@ -5426,7 +4846,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
                 log_interval=60.0,
             )
 
-        if defer_router:
+        if defer_router and not direct:
             router_ip, router_port = _start_managed_pd_router(args, engine_groups, force_new=(model_idx > 0))
             if model_idx == 0:
                 args.sglang_router_ip, args.sglang_router_port = router_ip, router_port

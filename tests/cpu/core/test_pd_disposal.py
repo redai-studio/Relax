@@ -56,7 +56,7 @@ def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_modu
     monkeypatch.setattr(controller_module, "shutdown_managed_opd_teacher", lambda _: events.append("teacher"))
     monkeypatch.setitem(
         sys.modules,
-        "relax.distributed.ray.rollout",
+        "relax.distributed.ray.policy_engine_pool",
         SimpleNamespace(stop_launched_routers=lambda: events.append("routers") or 0),
     )
 

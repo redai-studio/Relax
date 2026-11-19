@@ -10,7 +10,7 @@ The Rollout service generates training samples using SGLang engines. It is deplo
 
 | Property | Value |
 |----------|-------|
-| **Module** | `relax.components.rollout` |
+| **Module** | `relax.components.inference_gateway` |
 | **Deployment** | `@serve.deployment` |
 | **Ingress** | FastAPI |
 
@@ -18,8 +18,8 @@ The Rollout service generates training samples using SGLang engines. It is deplo
 
 The Rollout runs a background loop that:
 
-1. Generates samples via `RolloutManager.generate()` using SGLang engines
-2. Computes rewards via pluggable reward functions (`rm_hub/`)
+1. Uses `RolloutWorker.generate()` and `RolloutWorkload` to generate samples through the task Manager and admitted engine requests
+2. Computes rewards via pluggable reward functions (`relax/engine/rewards/`)
 3. Publishes data to `TransferQueue` for the Actor to consume
 4. Optionally triggers evaluation at configured intervals
 5. Manages staleness bounds to avoid data drift

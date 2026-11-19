@@ -10,7 +10,7 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import EngineFinalizeResult, ScaleOutRequest, ScaleOutStatus
+    from relax.distributed.ray.policy_engine_pool import EngineFinalizeResult, ScaleOutRequest, ScaleOutStatus
     from relax.utils.scale_utils import ScaleOutFailure, ScaleOutFailureCategory
 
     HAS_DEPS = True
@@ -71,8 +71,8 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
     info_actor_class.options.return_value.remote.return_value = info_actor
 
     with (
-        patch("relax.distributed.ray.rollout.EngineGroup", return_value=group),
-        patch("relax.distributed.ray.rollout.ray.kill"),
+        patch("relax.distributed.ray.policy_engine_pool.EngineGroup", return_value=group),
+        patch("relax.distributed.ray.policy_engine_pool.ray.kill"),
     ):
         result = await manager._bring_up_single_replica(
             request=request,
@@ -116,8 +116,8 @@ async def test_ray_native_multinode_replica_allocates_one_slot_per_actor():
     info_actor_class.options.return_value.remote.return_value = info_actor
 
     with (
-        patch("relax.distributed.ray.rollout.EngineGroup", side_effect=capture_group),
-        patch("relax.distributed.ray.rollout.ray.kill"),
+        patch("relax.distributed.ray.policy_engine_pool.EngineGroup", side_effect=capture_group),
+        patch("relax.distributed.ray.policy_engine_pool.ray.kill"),
     ):
         result = await manager._bring_up_single_replica(
             request=request,
@@ -168,8 +168,8 @@ async def test_ray_native_scale_out_inherits_canonical_model_override():
     info_actor_class.options.return_value.remote.return_value = info_actor
 
     with (
-        patch("relax.distributed.ray.rollout.EngineGroup", return_value=group) as engine_group_cls,
-        patch("relax.distributed.ray.rollout.ray.kill"),
+        patch("relax.distributed.ray.policy_engine_pool.EngineGroup", return_value=group) as engine_group_cls,
+        patch("relax.distributed.ray.policy_engine_pool.ray.kill"),
     ):
         await manager._bring_up_single_replica(
             request=request,
@@ -299,9 +299,9 @@ async def test_engine_init_timeout_propagates_as_provision_timeout():
         raise asyncio.TimeoutError()
 
     with (
-        patch("relax.distributed.ray.rollout.EngineGroup", return_value=group),
-        patch("relax.distributed.ray.rollout.ray.kill"),
-        patch("relax.distributed.ray.rollout.asyncio.wait_for", side_effect=_raise_timeout),
+        patch("relax.distributed.ray.policy_engine_pool.EngineGroup", return_value=group),
+        patch("relax.distributed.ray.policy_engine_pool.ray.kill"),
+        patch("relax.distributed.ray.policy_engine_pool.asyncio.wait_for", side_effect=_raise_timeout),
     ):
         result = await manager._bring_up_single_replica(
             request=request,

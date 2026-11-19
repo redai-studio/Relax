@@ -10,7 +10,7 @@ Rollout 服务通过 SGLang 引擎生成训练样本。它以 Ray Serve 部署�
 
 | 属性 | 值 |
 |------|---|
-| **模块** | `relax.components.rollout` |
+| **模块** | `relax.components.inference_gateway` |
 | **部署方式** | `@serve.deployment` |
 | **入口** | FastAPI |
 
@@ -18,8 +18,8 @@ Rollout 服务通过 SGLang 引擎生成训练样本。它以 Ray Serve 部署�
 
 Rollout 运行后台循环：
 
-1. 通过 `RolloutManager.generate()` 使用 SGLang 引擎生成样本
-2. 通过可插拔的奖励函数（`rm_hub/`）计算奖励
+1. 由 `RolloutWorker.generate()` 与 `RolloutWorkload` 执行业务，通过任务 Manager 准入的引擎请求生成样本
+2. 通过可插拔的奖励函数（`relax/engine/rewards/`）计算奖励
 3. 将数据发布到 `TransferQueue` 供 Actor 消费
 4. 可选地按配置的间隔触发评估
 5. 管理过期边界以避免数据漂移

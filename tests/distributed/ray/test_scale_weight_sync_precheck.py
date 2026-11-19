@@ -622,7 +622,7 @@ async def test_probe_failure_logs_full_detail_to_stable_log():
     )
     manager = create_test_manager()
 
-    with patch("relax.distributed.ray.rollout.logger") as mock_logger:
+    with patch("relax.distributed.ray.policy_engine_pool.logger") as mock_logger:
         result = await manager._run_scale_weight_sync_precheck(
             seed, [new], master_address="10.0.0.1", tp_size=1, timeout=60
         )

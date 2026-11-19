@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang depende
 
 
 def test_recovery_removes_dead_route_before_creating_same_endpoint(monkeypatch):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     old_url = "http://worker:15000"
     group = make_engine_group(engines=[None], is_scaled_out=True)
@@ -45,7 +45,7 @@ def test_recovery_removes_dead_route_before_creating_same_endpoint(monkeypatch):
 
 
 def test_recovery_cleanup_failure_preserves_generation_and_retries(monkeypatch):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     group = make_engine_group(engines=[None], is_scaled_out=True)
     group.skip_router_registration = True
@@ -84,7 +84,7 @@ def test_recovery_cleanup_failure_preserves_generation_and_retries(monkeypatch):
 
 
 def test_recovery_retries_after_replacement_dies_during_init(monkeypatch):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     group = make_engine_group(engines=[None], is_scaled_out=True)
     group.args.fully_async = True
@@ -119,7 +119,7 @@ def test_recovery_retries_after_replacement_dies_during_init(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["sync", "dp", "legacy_router", "slime_router"])
 def test_recovery_cleanup_leaves_other_protocols_unchanged(monkeypatch, mode):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     group = make_engine_group(engines=[None], is_scaled_out=True)
     group.args.fully_async = mode != "sync"

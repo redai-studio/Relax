@@ -3831,7 +3831,7 @@ def deploy_agentic_chat_api_services(
     Request and Serve capacities are derived from the Agentic configuration.
     """
 
-    from relax.distributed.ray.rollout import _resolve_sglang_config, _start_router
+    from relax.distributed.ray.policy_engine_pool import _resolve_sglang_config, _start_router
 
     resolved_config = _resolve_sglang_config(config)
     router_ip, router_port = _start_router(

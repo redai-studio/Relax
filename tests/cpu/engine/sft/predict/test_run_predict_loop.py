@@ -142,7 +142,7 @@ def test_render_eval_prompts_uses_seeded_random_eval_rows(monkeypatch, scoring):
             assert sample.metadata is not canonical.metadata
 
 
-class _FakeRolloutManager:
+class _FakePolicyEnginePool:
     def __init__(self, completion_factory=None):
         self.calls: list[list[str]] = []
         self.submitted = []
@@ -166,7 +166,7 @@ class _FakeRolloutManager:
 
 @pytest.mark.asyncio
 async def test_generate_and_write_predictions_writes_jsonl_with_three_fields(tmp_path: Path):
-    rm = _FakeRolloutManager()
+    rm = _FakePolicyEnginePool()
     prompts_and_refs = [(f"p{i}", f"r{i}", None) for i in range(5)]
     out_path = tmp_path / "predict" / "predictions_step_42.jsonl"
 
@@ -184,7 +184,7 @@ async def test_generate_and_write_predictions_writes_jsonl_with_three_fields(tmp
 
 @pytest.mark.asyncio
 async def test_generate_and_write_predictions_fires_all_in_one_call(tmp_path: Path):
-    rm = _FakeRolloutManager()
+    rm = _FakePolicyEnginePool()
     prompts_and_refs = [(f"p{i}", "ref", None) for i in range(7)]
     out_path = tmp_path / "predictions.jsonl"
 
@@ -197,7 +197,7 @@ async def test_generate_and_write_predictions_fires_all_in_one_call(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_generate_and_write_predictions_pads_short_completion_list(tmp_path: Path):
-    rm = _FakeRolloutManager(completion_factory=lambda prompts: ["only_one"])
+    rm = _FakePolicyEnginePool(completion_factory=lambda prompts: ["only_one"])
     prompts_and_refs = [("p0", "r0", None), ("p1", "r1", None)]
     out_path = tmp_path / "out.jsonl"
 
@@ -210,7 +210,7 @@ async def test_generate_and_write_predictions_pads_short_completion_list(tmp_pat
 
 @pytest.mark.asyncio
 async def test_run_predict_loop_writes_to_save_predict_dir(tmp_path: Path, monkeypatch):
-    rm = _FakeRolloutManager()
+    rm = _FakePolicyEnginePool()
     config = SimpleNamespace(save=str(tmp_path))
     monkeypatch.setattr(
         predict_loop,
@@ -233,7 +233,7 @@ async def test_run_predict_loop_writes_to_save_predict_dir(tmp_path: Path, monke
 
 @pytest.mark.asyncio
 async def test_run_predict_loop_skips_when_no_prompts(tmp_path: Path, monkeypatch):
-    rm = _FakeRolloutManager()
+    rm = _FakePolicyEnginePool()
     config = SimpleNamespace(save=str(tmp_path))
     monkeypatch.setattr(predict_loop, "render_eval_prompts", lambda cfg: [])
 
@@ -249,7 +249,7 @@ async def test_run_predict_loop_overwrites_existing_file(tmp_path: Path, monkeyp
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("stale content from previous round\n")
 
-    rm = _FakeRolloutManager()
+    rm = _FakePolicyEnginePool()
     config = SimpleNamespace(save=str(tmp_path))
     monkeypatch.setattr(predict_loop, "render_eval_prompts", lambda cfg: [("p", "r", None)])
 
@@ -268,7 +268,7 @@ async def test_run_predict_loop_overwrites_existing_file(tmp_path: Path, monkeyp
 async def test_run_predict_loop_submits_eval_rewards(tmp_path, monkeypatch, group_rm, disable_async, deferrable):
     from relax.engine.rewards.async_eval import defer_eval_reward, eval_reward_deferral_enabled
 
-    rm = _FakeRolloutManager()
+    rm = _FakePolicyEnginePool()
     config = SimpleNamespace(
         save=str(tmp_path),
         custom_rm_path="example.reward_func",
@@ -340,7 +340,7 @@ async def test_run_predict_loop_submits_eval_rewards(tmp_path, monkeypatch, grou
 async def test_score_predictions_propagates_errors_and_cancels_siblings(monkeypatch):
     from relax.engine.rewards.async_eval import eval_reward_deferral_enabled
 
-    rm = _FakeRolloutManager()
+    rm = _FakePolicyEnginePool()
     started = asyncio.Event()
     cancelled = asyncio.Event()
 
@@ -368,7 +368,7 @@ async def test_score_predictions_propagates_errors_and_cancels_siblings(monkeypa
 
 @pytest.mark.asyncio
 async def test_generate_and_write_predictions_rejects_missing_scored_completions(tmp_path):
-    rm = _FakeRolloutManager(completion_factory=lambda prompts: ["only_one"])
+    rm = _FakePolicyEnginePool(completion_factory=lambda prompts: ["only_one"])
     out_path = tmp_path / "out.jsonl"
 
     with pytest.raises(ValueError, match="one completion per prompt"):
@@ -377,3 +377,75 @@ async def test_generate_and_write_predictions_rejects_missing_scored_completions
         )
 
     assert not out_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_predict_workload_uses_managed_admission_and_returns_permits(monkeypatch):
+    import httpx
+
+    from relax.engine.inference.lifecycle import AdmissionLedger
+    from relax.engine.inference.types import (
+        LifecycleState,
+        ModelSnapshot,
+        ReplicaSnapshot,
+        Role,
+        RoleSnapshot,
+        RoutingSpec,
+    )
+    from relax.engine.rollout.workload import RolloutWorkload
+    from relax.utils import http_utils
+
+    ledger = AdmissionLedger()
+    snapshot = RoleSnapshot(
+        Role.ROLLOUT,
+        "task-epoch",
+        models=(
+            ModelSnapshot(
+                "default",
+                (ReplicaSnapshot("replica", LifecycleState.READY, "http://engine", direct_eligible=True),),
+                state=LifecycleState.READY,
+                admission=True,
+            ),
+        ),
+        routing=RoutingSpec(default_model="default"),
+    )
+
+    async def observe(*args):
+        return snapshot
+
+    async def admit(role, model, trace):
+        return ledger.admit(model)
+
+    async def complete(permit, *args):
+        await ledger.complete(permit)
+
+    async def ready(*args):
+        return None
+
+    owner = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=method)
+            for name, method in {
+                "snapshot": observe,
+                "admit_request": admit,
+                "complete_request": complete,
+                "wait_ready": ready,
+            }.items()
+        }
+    )
+    requests = []
+
+    def backend(request):
+        assert ledger.permits
+        payload = json.loads(request.content)
+        requests.append(payload)
+        return httpx.Response(200, json={"text": payload["text"] + " done"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        workload = RolloutWorkload.__new__(RolloutWorkload)
+        workload.args = SimpleNamespace(_inference_manager_handle=owner)
+        workload.inference = SimpleNamespace(resume_health_monitoring=ready)
+        assert await workload.generate_predict(["one", "two"]) == ["one done", "two done"]
+    assert not ledger.permits
+    assert all(request["sampling_params"]["max_new_tokens"] == 512 for request in requests)

@@ -11,6 +11,7 @@ from uuid import uuid4
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from ray import serve
 from starlette.types import Receive, Scope, Send
 
 from relax.engine.inference.executor import AdmittedRequest, InferenceRequestExecutor, assign_backend_rids
@@ -137,9 +138,12 @@ class InferenceGateway:
         if schema_version not in (None, 1, 2):
             raise HTTPException(status_code=400, detail=f"Unsupported discovery schema_version {schema_version}")
         snapshot = await self._snapshot()
-        if schema_version == 1:
-            return snapshot.to_legacy_dict(status_filter)
-        return snapshot.to_dict(status_filter)
+        try:
+            if schema_version == 1:
+                return snapshot.to_legacy_dict(status_filter)
+            return snapshot.to_dict(status_filter)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     async def health(self) -> JSONResponse:
         """Report gateway liveness separately from model readiness."""
@@ -322,3 +326,226 @@ class InferenceGateway:
                 await asyncio.gather(*self._stream_cleanups)
         finally:
             await self._client.aclose()
+
+
+# All public role ingresses use this deployment; role-specific code remains
+# payload/workload adaptation and never grants admission itself.
+app = FastAPI()
+
+
+class _LocalGenRMAdapter:
+    def __init__(self, gateway: Any) -> None:
+        self.prepare_generate_payload = _LocalAdapterMethod(gateway.prepare_generate_payload)
+
+
+class _LocalAdapterMethod:
+    def __init__(self, method: Any) -> None:
+        self.remote = method
+
+
+@serve.deployment(name="InferenceGateway")
+@serve.ingress(app)
+class InferenceGatewayService(InferenceGateway):
+    def __init__(
+        self,
+        healthy: Any,
+        pg: Any,
+        num_gpus: int,
+        config: Any,
+        role: str,
+        runtime_env: Any = None,
+        data_source: Any = None,
+    ) -> None:
+        manager = config._rollout_engine_manager
+        super().__init__(role, manager_handle=manager)
+        self.config = config
+        self._workload = None
+        self._healthy = True
+        self.step = 0
+        self._tokenizers: dict[str, Any] = {}
+        if self.role is Role.ROLLOUT:
+            from relax.components.rollout import RolloutWorkload
+
+            self._workload = RolloutWorkload(healthy, pg, config, data_source, runtime_env)
+        elif self.role is Role.GENRM:
+            from relax.utils.data.processing_utils import load_tokenizer
+
+            self._tokenizers = {
+                key: load_tokenizer(spec["model_path"], trust_remote_code=True)
+                for key, spec in config._genrm_instances_resolved.items()
+            }
+            self.genrm_backend_handle = _LocalGenRMAdapter(self)
+
+    def get_genrm_manager(self, route_key: str | None = None) -> Any:
+        managers = self.config._genrm_managers
+        if route_key is None and len(managers) == 1:
+            return next(iter(managers.values()))
+        return managers[route_key or "__default__"]
+
+    def set_barriers(self, *args: Any, **kwargs: Any) -> Any:
+        return self._workload.set_barriers(*args, **kwargs)
+
+    @app.get("/evaluate")
+    async def evaluate(self, train_step: int) -> Any:
+        return await self._workload.evaluate(train_step)
+
+    @app.get("/predict")
+    async def predict(self, train_step: int) -> Any:
+        return await self._workload.predict(train_step)
+
+    @app.get("/can_do_update_weight_for_async")
+    async def can_do_update_weight_for_async(self) -> Any:
+        return await self._workload.can_do_update_weight_for_async()
+
+    @app.get("/end_update_weight")
+    async def end_update_weight(self) -> Any:
+        return await self._workload.end_update_weight()
+
+    @app.get("/is_eval_done")
+    async def is_eval_done(self) -> Any:
+        return await self._workload.is_eval_done()
+
+    async def prepare_generate_payload(self, model: str, messages: list, sampling: dict | None) -> dict:
+        spec = self.config._genrm_instances_resolved[model]
+        defaults = spec.get("sampling_config", {})
+        tokens = await asyncio.to_thread(
+            self._tokenizers[model].apply_chat_template,
+            messages,
+            return_dict=False,
+            tokenize=True,
+            add_generation_prompt=True,
+            **(defaults.get("chat_template_kwargs") or {}),
+        )
+        params = {
+            "temperature": defaults.get("temperature", 0.2),
+            "top_p": defaults.get("top_p", 1.0),
+            "top_k": defaults.get("top_k", -1),
+            "max_new_tokens": defaults.get("max_response_len", 1024),
+        }
+        params.update(sampling or {})
+        return {"input_ids": list(tokens), "sampling_params": params}
+
+    async def run(self) -> Any:
+        if self._workload is not None:
+            return await self._workload.run()
+        return None
+
+    async def stop(self) -> None:
+        if self._workload is not None:
+            await self._workload.stop()
+
+    def get_step(self) -> int:
+        return self.step if self._workload is None else self._workload.get_step()
+
+    def set_step(self, step: int) -> None:
+        self.step = step
+        if self._workload is not None:
+            self._workload.set_step(step)
+
+    def is_healthy(self) -> bool:
+        return self._healthy if self._workload is None else self._workload._healthy
+
+    def get_rollout_manager(self) -> Any:
+        if self._workload is None:
+            raise RuntimeError("Only Rollout owns a workload")
+        return self._workload.get_rollout_manager()
+
+    async def close(self) -> None:
+        await self.stop()
+        await super().close()
+
+    @app.get("/get_step")
+    def http_get_step(self) -> dict:
+        return {"step": self.get_step()}
+
+    @app.post("/set_step")
+    def http_set_step(self, step: int) -> dict:
+        self.set_step(step)
+        return {"status": "ok"}
+
+    @app.post("/stop_service")
+    async def http_stop(self) -> dict:
+        await self.stop()
+        return {"status": "ok"}
+
+    @app.post("/scale_out")
+    async def scale_out(self, request: Request) -> Any:
+        from relax.components.rollout import ScaleOutAPIRequest
+
+        return await self._workload.scale_out(ScaleOutAPIRequest(**await request.json()))
+
+    @app.post("/scale_in")
+    async def scale_in(self, request: Request) -> Any:
+        from relax.components.rollout import ScaleInAPIRequest
+
+        return await self._workload.scale_in(ScaleInAPIRequest(**await request.json()))
+
+    @app.get("/scale_out/{request_id}")
+    async def scale_out_status(self, request_id: str) -> Any:
+        return await self._workload.get_scale_out_status(request_id)
+
+    @app.get("/scale_in/{request_id}")
+    async def scale_in_status(self, request_id: str) -> Any:
+        return await self._workload.get_scale_in_status(request_id)
+
+    @app.get("/scale_out")
+    async def list_scale_out_requests(self, model_name: str | None = None, status: str | None = None) -> Any:
+        return await self._workload.list_scale_out_requests(model_name, status)
+
+    @app.get("/scale_in")
+    async def list_scale_in_requests(self, model_name: str | None = None, status: str | None = None) -> Any:
+        return await self._workload.list_scale_in_requests(model_name, status)
+
+    @app.post("/scale_out/{request_id}/cancel")
+    async def cancel_scale_out(self, request_id: str) -> Any:
+        return await self._workload.cancel_scale_out(request_id)
+
+    @app.post("/scale_out_cancel")
+    async def cancel_all_scale_out_requests(self, request: Request) -> Any:
+        from relax.components.rollout import CancelAllScaleOutRequestsRequest
+
+        return await self._workload.cancel_all_scale_out_requests(
+            CancelAllScaleOutRequestsRequest(**await request.json())
+        )
+
+    @app.get("/recover_rollout_engines")
+    async def recover_rollout_engines(self) -> Any:
+        return await self._workload.recover_rollout_engines()
+
+    @app.get("/engines")
+    async def get_engines(self, schema_version: int = 2, status_filter: str | None = None) -> Any:
+        return await self.engines(schema_version, status_filter)
+
+    @app.get("/health")
+    async def get_health(self) -> JSONResponse:
+        return await self.health()
+
+    @app.get("/metrics")
+    async def metrics(self) -> dict[str, Any]:
+        snapshot = await self._snapshot()
+        return {
+            "role": self.role.value,
+            "manager_epoch": snapshot.manager_epoch,
+            "topology_revision": snapshot.topology_revision,
+            "models": {
+                model.model_id: {
+                    "num_engines": len(model.replicas),
+                    "admission": model.admission,
+                    "state": model.state.value if model.state else "unknown",
+                }
+                for model in snapshot.models
+            },
+        }
+
+    @app.get("/v1/models")
+    async def get_models(self) -> dict:
+        return await self.models()
+
+    @app.post("/generate")
+    async def generate(self, request: Request) -> Response:
+        return await self.proxy(request, "generate")
+
+    @app.post("/chat/completions")
+    @app.post("/v1/chat/completions")
+    async def chat_completions(self, request: Request) -> Response:
+        return await self.proxy(request, "v1/chat/completions")

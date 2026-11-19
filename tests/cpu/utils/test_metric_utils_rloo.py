@@ -109,7 +109,7 @@ def test_eval_logger_disables_training_rloo_diagnostics(monkeypatch):
     except ImportError as exc:
         pytest.skip(f"SGLang server dependencies are unavailable: {exc}")
 
-    import relax.distributed.ray.rollout as rollout_module
+    import relax.distributed.ray.policy_engine_pool as rollout_module
 
     calls = []
     monkeypatch.setattr(rollout_module, "save_eval_summary_jsonl", lambda *_args, **_kwargs: None)
@@ -135,7 +135,7 @@ def test_eval_logger_disables_training_rloo_diagnostics(monkeypatch):
 
 @pytest.mark.parametrize("rewards", [[0.0, 1.0], []])
 def test_eval_logger_reports_partial_coverage_and_dataset_group_size(monkeypatch, rewards):
-    import relax.distributed.ray.rollout as rollout_module
+    import relax.distributed.ray.policy_engine_pool as rollout_module
 
     monkeypatch.setattr(rollout_module, "save_eval_summary_jsonl", lambda *_a: None)
     monkeypatch.setattr(rollout_module, "compute_rollout_step", lambda *_a: 0)

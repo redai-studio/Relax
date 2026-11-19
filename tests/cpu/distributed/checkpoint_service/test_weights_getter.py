@@ -172,6 +172,9 @@ def test_rollout_only_skips_actor_fwd_group_init(monkeypatch):
 
     actor = actor_mod.MegatronTrainRayActor.__new__(actor_mod.MegatronTrainRayActor)
     actor._weight_sync_lock = None
+    actor.args = Namespace(rollout_http_timeout=120)
+    actor.rollout_manager = MagicMock()
+    actor.rollout_manager.sync_weights_for_scaled_out_engines.remote.return_value = {"success": True}
     client = MagicMock()
     actor.checkpoint_engine_client = client
 
@@ -183,6 +186,7 @@ def test_rollout_only_skips_actor_fwd_group_init(monkeypatch):
     monkeypatch.setattr(actor_mod, "run", fake_run)
     monkeypatch.setattr(actor_mod, "print_memory", lambda *args, **kwargs: None)
     monkeypatch.setattr(actor_mod, "get_gloo_group", lambda: None)
+    monkeypatch.setattr(actor_mod.ray, "get", lambda ref, **kwargs: ref)
     monkeypatch.setattr(dist, "barrier", lambda *args, **kwargs: None)
     monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
 

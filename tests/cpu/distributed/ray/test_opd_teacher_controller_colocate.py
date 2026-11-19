@@ -2,22 +2,31 @@
 
 import sys
 from argparse import Namespace
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 
-def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
+def test_managed_teacher_colocate_registers_in_task_on_full_shared_pg(monkeypatch):
+    from relax.distributed.ray import shared_task_startup
+
     full_pg = ("pg", list(range(8)), list(range(8)))
+    teacher = SimpleNamespace(
+        snapshot=SimpleNamespace(
+            remote=lambda role: SimpleNamespace(
+                models=[SimpleNamespace(replicas=[SimpleNamespace(base_url="http://teacher")])]
+            )
+        )
+    )
+    task = object()
+    captured = []
 
-    core_service = ModuleType("relax.core.service")
-    core_service.create_placement_group = lambda *args, **kwargs: full_pg
-    monkeypatch.setitem(sys.modules, "relax.core.service", core_service)
+    def start(args, binding, static, create, **kwargs):
+        assert binding is full_pg
+        captured.extend(static)
+        return task, (teacher,), task
 
-    from relax.utils.opd import opd_utils
-
-    create_teacher = Mock(return_value=("teacher-manager-handle", ["http://teacher/generate"]))
-    monkeypatch.setattr(opd_utils, "create_managed_opd_teacher_manager", create_teacher)
-
+    monkeypatch.setattr(shared_task_startup, "start_shared_task", start)
+    monkeypatch.setattr(shared_task_startup.ray, "get", lambda value: value)
     config = Namespace(
         use_opd=True,
         opd_type="sglang",
@@ -26,16 +35,18 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         debug_train_only=False,
         resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]},
         teacher_hf_checkpoint="/teacher",
+        rollout_num_gpus=4,
+        num_gpus_per_node=8,
+        use_critic=False,
     )
-
-    runtime_env = {"env_vars": {"A": "B"}}
-    shared_pg, teacher_manager = opd_utils.maybe_start_managed_opd_teacher(config, runtime_env=runtime_env)
-
-    assert shared_pg == full_pg
-    assert teacher_manager == "teacher-manager-handle"
-    create_teacher.assert_called_once_with(
-        config, num_replicas=1, gpus_per_replica=4, pg=full_pg, shared_pg=True, runtime_env=runtime_env
-    )
+    result = shared_task_startup.prepare_shared_task(config, full_pg)
+    assert result is teacher
+    assert config._rollout_engine_manager is task
+    assert config._inference_phase_coordinator is task
+    assert captured[0].placement.binding is full_pg
+    assert captured[0].placement.bundle_offset == 4
+    assert captured[0].options["num_replicas"] == 1
+    assert captured[0].options["gpus_per_replica"] == 4
     assert config.opd_teacher_url == "http://teacher/generate"
 
 
@@ -49,6 +60,10 @@ def test_rollout_only_reuses_teacher_placement_group(monkeypatch) -> None:
         colocate=True,
         hybrid=False,
         fully_async=False,
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="/teacher",
+        enable_affinity=False,
         num_rollout=1,
         advantage_estimator="grpo",
         data_source_path="relax.engine.rollout.data_source.RolloutDataSource",
@@ -59,16 +74,17 @@ def test_rollout_only_reuses_teacher_placement_group(monkeypatch) -> None:
     instance._health_manager = Mock()
     instance._validate_gpu_resources = Mock()
     teacher_pg = object()
-    monkeypatch.setattr(controller, "maybe_start_managed_opd_teacher", Mock(return_value=(teacher_pg, [])))
+    allocate_pg = Mock(return_value=teacher_pg)
+    monkeypatch.setattr(controller, "create_placement_group", allocate_pg)
     registry = SimpleNamespace(resolve_algorithm=lambda _: controller.ALGOS["grpo"].copy())
     monkeypatch.setitem(sys.modules, "relax.core.registry", registry)
     monkeypatch.setattr(controller, "create_data_source_actor", Mock())
-    service = Mock()
-    monkeypatch.setattr(controller, "Service", service)
+    prepared = []
+    instance._start_services = lambda service_args: prepared.extend(service_args) or []
 
     instance.register_all_serve()
 
-    service.assert_called_once()
-    assert service.call_args.kwargs["role"] == "rollout"
-    assert service.call_args.kwargs["num_gpus"] == 4
-    assert service.call_args.kwargs["actor_rollout_pgs"] is teacher_pg
+    allocate_pg.assert_called_once_with(num_gpus=8, node_group_affinity=False)
+    assert {str(item[0]) for item in prepared} == {"rollout", "teacher"}
+    assert all(item[4] is teacher_pg for item in prepared)
+    assert all("teacher" in item[5] for item in prepared)

@@ -1,11 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Core lifecycle behavior of ``MultiEngineManager``, exercised without a Ray
+"""Core lifecycle behavior of ``EnginePool``, exercised without a Ray
 cluster: fake engine handles stand in for Ray ObjectRefs, and ``ray.get``/
 ``ray.kill`` are patched onto the module directly.
 
-This is the shared skeleton behind both ``GenRMManager`` and
-``TeacherManager``, so a regression here silently breaks both judge serving
+This is the shared skeleton behind both static judge and teacher pools, so a regression here silently breaks both judge serving
 and OPD teacher recovery/offload-onload.
 """
 
@@ -20,7 +19,7 @@ import pytest
 try:
     import ray  # noqa: F401
 
-    from relax.distributed.ray.multi_engine_manager import MultiEngineManager
+    from relax.distributed.ray.engine_pool import EnginePool
 
     HAS_DEPS = True
 except ImportError:
@@ -53,18 +52,19 @@ class _FakeEngine:
         return _RemoteCall(self, method)
 
 
-class _FakeManager(MultiEngineManager):
+class _FakeManager(EnginePool):
     """A minimal concrete manager: one engine per rank, no placement group
     (hooks return sentinel values that the test never inspects)."""
 
     def __init__(
         self, num_slots: int, *, nodes_per_engine: int = 1, owns_pg: bool = False, log_prefix: str = "[fake]"
     ):
+        self.role = "genrm"
         self._made: list[_FakeEngine] = []
         self._dead_at_init: set[int] = set()
         self._removed_pg = False
         self._instance_owns_pg = owns_pg
-        super().__init__(
+        self._initialize(
             SimpleNamespace(),
             num_slots=num_slots,
             nodes_per_engine=nodes_per_engine,
@@ -96,7 +96,7 @@ def _patch_ray(monkeypatch):
     our fake class into something whose ``.options().remote()`` returns a
     _FakeEngine; ``ray.get`` resolves _RemoteCall tokens; ``ray.kill`` is a no-
     op recorder."""
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     created: list[_FakeEngine] = []
     killed: list[_FakeEngine] = []
@@ -158,7 +158,7 @@ def test_fanout_isolates_one_dead_engine_from_the_rest(_patch_ray):
 
 
 def test_fanout_reraises_non_dead_exceptions(_patch_ray, monkeypatch):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     manager = _FakeManager(num_slots=1)
 
@@ -223,7 +223,7 @@ def test_recover_rebuilds_only_the_dead_slot(_patch_ray):
 
 
 def test_recover_raises_on_total_wipeout(_patch_ray, monkeypatch):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     manager = _FakeManager(num_slots=1)
     manager._retire_engines([0])
@@ -325,7 +325,7 @@ def test_multinode_shutdown_stops_followers_before_removing_owned_group(_patch_r
 
 @pytest.mark.parametrize("failure", ["actor_creation", "address", "init"])
 def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_patch_ray, monkeypatch, failure):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     manager = _FakeManager(num_slots=4, nodes_per_engine=2)
     healthy_engines = manager.all_engines[2:]
@@ -375,7 +375,7 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
 @pytest.mark.parametrize("operation", ["shutdown", "offload"])
 @pytest.mark.parametrize("failure", ["unavailable", "timeout"])
 def test_unknown_release_preserves_slot_and_placement(_patch_ray, monkeypatch, operation, failure):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     manager = _FakeManager(num_slots=1, owns_pg=True)
     engine = manager.all_engines[0]
@@ -452,8 +452,8 @@ def test_dead_actor_without_process_receipt_keeps_ownership(_patch_ray, monkeypa
 
 @pytest.mark.parametrize("failure", ["address", "init"])
 def test_recovery_init_and_cleanup_failure_never_marks_slot_ready(_patch_ray, monkeypatch, failure):
-    import relax.distributed.ray.multi_engine_manager as mem
-    from relax.distributed.ray.genrm import GenRMManager
+    import relax.distributed.ray.engine_pool as mem
+    from relax.distributed.ray.engine_pool import EnginePool
 
     manager = _FakeManager(num_slots=2)
     manager.all_engines[0].dead_methods = frozenset({"release_memory_occupation"})
@@ -483,9 +483,7 @@ def test_recovery_init_and_cleanup_failure_never_marks_slot_ready(_patch_ray, mo
     assert manager.engines[0] is None
     # Even a stale cached address cannot make the unfinished slot routable.
     manager._engine_addr_and_ports[0] = {"host": "stale", "port": 123}
-    implementation = (
-        GenRMManager.__ray_metadata__.modified_class if hasattr(GenRMManager, "__ray_metadata__") else GenRMManager
-    )
+    implementation = EnginePool
     addresses = implementation.get_engine_hosts_ports(manager)
     assert ("stale", 123) not in addresses
     with pytest.raises(RuntimeError, match="release is unconfirmed"):
@@ -502,7 +500,7 @@ def test_recovery_init_and_cleanup_failure_never_marks_slot_ready(_patch_ray, mo
 
 
 def test_failed_retirement_invalidates_whole_batch(_patch_ray, monkeypatch):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     manager = _FakeManager(num_slots=2)
     first, second = manager.all_engines
@@ -520,3 +518,41 @@ def test_failed_retirement_invalidates_whole_batch(_patch_ray, monkeypatch):
     assert manager.all_engines == [first, None]
     assert "shutdown" in second.calls
     assert manager.engines == [None, None]
+
+
+def test_static_router_withdrawal_precedes_release_and_registration_follows_resume(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    trace = []
+
+    def withdraw(engines):
+        assert "release_memory_occupation" not in engine.calls
+        trace.append("withdraw")
+
+    def activate(engines):
+        assert "resume_memory_occupation" in engine.calls
+        trace.append("register")
+
+    def close():
+        assert engine in _patch_ray.killed
+        trace.append("router exit")
+
+    manager.router = SimpleNamespace(withdraw=withdraw, activate=activate, close=close)
+    manager.offload()
+    manager.onload()
+    manager.shutdown()
+    assert trace == ["withdraw", "register", "router exit"]
+
+
+def test_static_router_unknown_withdrawal_does_not_release_memory(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+
+    def fail(engines):
+        raise TimeoutError("Router withdrawal unconfirmed")
+
+    manager.router = SimpleNamespace(withdraw=fail)
+    with pytest.raises(TimeoutError, match="withdrawal unconfirmed"):
+        manager.offload()
+    assert "release_memory_occupation" not in engine.calls
+    assert manager.is_onloaded()

@@ -170,6 +170,8 @@ async def test_image_batch_failure_never_assembles_partial_training_data(process
     with pytest.raises(RuntimeError, match="Native image OPD teacher prefill failed"):
         await manager.prefill([good, bad])
     assert not assembled
+    assert good.teacher_log_probs == pytest.approx([-0.2, -0.3])
+    assert bad.teacher_log_probs is None
 
 
 @pytest.mark.asyncio
@@ -531,3 +533,142 @@ async def test_image_processor_excludes_transport_cache_from_local_and_worker_in
     assert train_inputs is None
     assert received == [["raw-image"]]
     assert media["_opd_image_b64_cache"] == ["encoded-image"]
+
+
+@pytest.mark.asyncio
+async def test_split_teacher_stage_matches_immediate_prefill_at_http_boundary(monkeypatch):
+    import aiohttp
+
+    async def post_logprob(self, session, url, payload, sample, tag, expected_input_ids=None):
+        # Isolate only the remote inference boundary; real payload construction,
+        # response parsing, scoring and transfer assembly remain in use.
+        return LogprobResponse({"meta_info": {"input_token_logprobs": [[None, 2], [-0.2, 10], [-0.3, 11]]}})
+
+    monkeypatch.setattr(OpdManager, "_post_logprob", post_logprob)
+    split_manager = _manager(opd_teacher_timeout_s=2)
+    immediate_manager = _manager(opd_teacher_timeout_s=2)
+    split = Sample(index=1, tokens=[1, 2, 10, 11], response_length=2)
+    immediate = copy.deepcopy(split)
+    await split_manager.prepare_teacher_inputs([split])
+    async with aiohttp.ClientSession() as session:
+        assert await split_manager.score_teacher([split], session) == [True]
+    assert not split_manager.needs_student_prefill
+    await split_manager.score_student_at_teacher([split])
+    split_manager.assemble_transfer([split])
+    await immediate_manager.prefill(immediate)
+    assert split.teacher_log_probs == immediate.teacher_log_probs == pytest.approx([-0.2, -0.3])
+
+
+@pytest.mark.asyncio
+async def test_split_teacher_reports_per_sample_failure_without_losing_success(monkeypatch):
+    async def post_logprob(self, session, url, payload, sample, tag, expected_input_ids=None):
+        if sample.index == 2:
+            return None
+        return LogprobResponse({"meta_info": {"input_token_logprobs": [[None, 2], [-0.2, 10]]}})
+
+    monkeypatch.setattr(OpdManager, "_post_logprob", post_logprob)
+    manager = _manager(opd_teacher_timeout_s=2)
+    samples = [Sample(index=index, tokens=[1, 2, 10], response_length=1) for index in (1, 2)]
+    assert await manager.score_teacher(samples) == [True, False]
+    assert samples[0].teacher_log_probs == pytest.approx([-0.2])
+    assert samples[1].teacher_log_probs is None
+
+
+@pytest.mark.asyncio
+async def test_managed_student_revisit_waits_for_weight_fence_and_resolves_current_router(monkeypatch):
+    from dataclasses import replace
+
+    import httpx
+
+    from relax.utils import http_utils
+    from tests.cpu.engine.inference.test_managed_rollout import manager as make_owner
+
+    owner = make_owner()
+    current = ["http://student-before"]
+    original_observe = owner.pool.observe
+    owner.pool.observe = lambda **kwargs: tuple(
+        replace(model, router_url=current[0]) for model in original_observe(**kwargs)
+    )
+    waiting = asyncio.Event()
+
+    async def wait_ready(*args):
+        waiting.set()
+        return await owner.wait_ready(*args)
+
+    remote = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=getattr(owner, name))
+            for name in ("snapshot", "admit_request", "complete_request")
+        }
+    )
+    remote.wait_ready = SimpleNamespace(remote=wait_ready)
+    worker = _manager(opd_token_selection="teacher_topk", opd_teacher_timeout_s=2, _inference_manager_handle=remote)
+    sample = Sample(
+        tokens=[1, 2, 3],
+        response_length=2,
+        group_index=1,
+        teacher_topk_token_ids=np.array([[4, 5], [6, 7]], dtype=np.int32),
+    )
+    sent = []
+
+    def respond(request):
+        assert owner.requests.permits
+        sent.append(request.url.host)
+        return httpx.Response(
+            200,
+            json={"meta_info": {"input_token_ids_logprobs": [None, [[-0.1, 4], [-0.2, 5]], [[-0.3, 6], [-0.4, 7]]]}},
+        )
+
+    token = await owner.begin_weight_update("test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        task = asyncio.create_task(worker._student_prefill(sample, None, None))
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert not sent and not task.done()
+        current[0] = "http://student-recovered"
+        await owner.end_weight_update(token)
+        await asyncio.wait_for(task, 2)
+    assert sent == ["student-recovered"]
+    np.testing.assert_allclose(sample.student_at_teacher_topk_log_probs, [[-0.1, -0.2], [-0.3, -0.4]])
+    assert not owner.requests.permits
+
+
+@pytest.mark.asyncio
+async def test_managed_student_revisit_cancellation_aborts_and_returns_permit(monkeypatch):
+    import httpx
+
+    from relax.utils import http_utils
+    from tests.cpu.engine.inference.test_managed_rollout import manager as make_owner
+
+    owner = make_owner()
+    remote = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=getattr(owner, name))
+            for name in ("snapshot", "admit_request", "complete_request", "wait_ready")
+        }
+    )
+    worker = _manager(opd_token_selection="teacher_topk", opd_teacher_timeout_s=2, _inference_manager_handle=remote)
+    sample = Sample(tokens=[1, 2], response_length=1, teacher_topk_token_ids=np.array([[4, 5]], dtype=np.int32))
+    dispatched = asyncio.Event()
+    paths = []
+
+    async def respond(request):
+        paths.append(request.url.path)
+        if request.url.path == "/generate":
+            assert owner.requests.permits
+            dispatched.set()
+            await asyncio.Event().wait()
+        if request.url.path == "/workers":
+            return httpx.Response(200, json={"workers": [{"url": "http://student"}]})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        task = asyncio.create_task(worker._student_prefill(sample, None, None))
+        await asyncio.wait_for(dispatched.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+    assert "/abort_request" in paths
+    assert not owner.requests.permits
+    assert sample.student_at_teacher_topk_log_probs is None

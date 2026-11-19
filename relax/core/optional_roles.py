@@ -21,9 +21,9 @@ def register_genrm(config: Namespace, algo: dict) -> list[str]:
     if not getattr(config, "_genrm_instances_resolved", None):
         return []
 
-    from relax.components.genrm import GenRM
+    from relax.components.inference_gateway import InferenceGatewayService
 
-    algo[GENRM_ROLE] = GenRM
+    algo[GENRM_ROLE] = InferenceGatewayService
     return [GENRM_ROLE]
 
 
@@ -53,5 +53,12 @@ def register_extra_roles(config: Namespace, algo: dict) -> list:
     order."""
     extras = []
     extras.extend(register_genrm(config, algo))
+    from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
+
+    if is_managed_opd_teacher_enabled(config):
+        from relax.components.inference_gateway import InferenceGatewayService
+
+        algo["teacher"] = InferenceGatewayService
+        extras.append("teacher")
     extras.extend(register_sft_rollout(config, algo))
     return extras

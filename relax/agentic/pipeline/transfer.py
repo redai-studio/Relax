@@ -15,6 +15,7 @@ from typing import Any, Callable, List, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
+from relax.engine.rollout.deferred import PublicationReceipt
 from relax.utils.types import Sample
 
 
@@ -29,7 +30,8 @@ async def _transfer_batch_to_data_system(
     data_system_client: Any,
     is_last: bool = False,
     on_put_started: Optional[Callable[[], None]] = None,
-) -> None:
+    operation_id: str | None = None,
+) -> PublicationReceipt | None:
     """Convert complete Samples and cross the TQ boundary.
 
     ``partition_id`` is the physical TQ partition, which is not always the
@@ -49,6 +51,17 @@ async def _transfer_batch_to_data_system(
         custom_meta = build_rollout_custom_meta(rollout_batch)
         if on_put_started is not None:
             on_put_started()
+        if operation_id is not None:
+            from relax.utils.tq.publication import publish_confirmed
+
+            return await publish_confirmed(
+                data_system_client,
+                rollout_batch,
+                partition_id=f"train_{partition_id}",
+                operation_id=operation_id,
+                custom_meta=custom_meta,
+                is_last=is_last,
+            )
         await data_system_client.async_put(
             data=rollout_batch,
             partition_id=f"train_{partition_id}",

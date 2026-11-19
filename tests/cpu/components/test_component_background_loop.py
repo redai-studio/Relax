@@ -107,7 +107,11 @@ async def test_component_stop_preserves_timeouts_and_logging(component, joins):
         assert not component._stop_event.is_set()
         return  # Critic inherits the existing no-op stop contract.
     component._loop_runner.join = AsyncMock(side_effect=joins)
-    await component.stop()
+    if component.role == "actor" and not joins[0]:
+        with pytest.raises(RuntimeError, match="Training thread did not exit"):
+            await component.stop()
+    else:
+        await component.stop()
     assert component._stop_event.is_set()
     expected_calls = [call(timeout=5)]
     if component.role == "actor_fwd" and not joins[0]:

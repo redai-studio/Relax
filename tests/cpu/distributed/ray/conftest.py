@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 try:
     import ray
 
-    from relax.distributed.ray.rollout import (
+    from relax.distributed.ray.policy_engine_pool import (
         EngineGroup,
         RolloutServer,
         _get_engine_actor_states,
@@ -29,7 +29,7 @@ try:
 
     # Extract the original Python class from the Ray actor wrapper so we can
     # create lightweight instances without calling the heavy __init__.
-    from relax.distributed.ray.rollout import RolloutManager as _RayRM
+    from relax.distributed.ray.policy_engine_pool import PolicyEnginePool as _RayRM
 
     # Ray's ActorClass stores the original Python class at
     # __ray_metadata__.modified_class (Ray 2.x).
@@ -211,10 +211,10 @@ def make_rollout_server(
 
 
 # ---------------------------------------------------------------------------
-# Testable RolloutManager factory
+# Testable PolicyEnginePool factory
 # ---------------------------------------------------------------------------
 def create_test_manager(args=None, servers=None):
-    """Create a ``RolloutManager`` instance for testing.
+    """Create a ``PolicyEnginePool`` instance for testing.
 
     Bypasses ``__init__`` entirely and sets up the minimal state needed by the
     scaling methods.
@@ -294,7 +294,7 @@ def patch_async_helpers():
         with (
             patch("asyncio.to_thread", side_effect=_mock_to_thread),
             patch(
-                "relax.distributed.ray.rollout.find_available_port",
+                "relax.distributed.ray.policy_engine_pool.find_available_port",
                 return_value=30000,
             ),
         ):

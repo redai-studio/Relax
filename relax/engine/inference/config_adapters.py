@@ -44,7 +44,7 @@ def static_role_spec(role: Role, args: Any, options: dict[str, Any]) -> Inferenc
         num_gpus_per_engine=tp,
         engine_groups=[EngineGroupSpec("regular", total, tp, overrides)],
         weight_source=WeightSource.STATIC,
-        route_mode=RouteMode.DIRECT,
+        route_mode=RouteMode.SGLANG_ROUTER,
         sampling_defaults=sampling,
     ).resolved(args)
     phase = placement_phase(args, role.value)

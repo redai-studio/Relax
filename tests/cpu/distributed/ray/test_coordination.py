@@ -11,7 +11,7 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import (
+    from relax.distributed.ray.policy_engine_pool import (
         EngineGroupLifecycle,
         ScaleInRequest,
         ScaleInStatus,
@@ -239,7 +239,7 @@ class TestCheckAndHandleEvictions:
 
         with (
             patch.object(manager, "_handle_evictions") as mock_handle,
-            patch("relax.distributed.ray.rollout.ray.wait", side_effect=lambda refs, **_kwargs: (refs, [])),
+            patch("relax.distributed.ray.policy_engine_pool.ray.wait", side_effect=lambda refs, **_kwargs: (refs, [])),
         ):
             manager._check_and_handle_evictions()
             mock_handle.assert_called_once()
@@ -267,7 +267,7 @@ class TestCheckAndHandleEvictions:
 
         with (
             patch.object(manager, "_handle_evictions") as handle,
-            patch("relax.distributed.ray.rollout.ray.wait", side_effect=_ready_only),
+            patch("relax.distributed.ray.policy_engine_pool.ray.wait", side_effect=_ready_only),
         ):
             manager._check_and_handle_evictions()
 
@@ -295,7 +295,7 @@ class TestCheckAndHandleEvictions:
 
         with (
             patch.object(manager, "_handle_evictions") as handle,
-            patch("relax.distributed.ray.rollout.ray.wait", side_effect=lambda refs, **_kwargs: (refs, [])),
+            patch("relax.distributed.ray.policy_engine_pool.ray.wait", side_effect=lambda refs, **_kwargs: (refs, [])),
         ):
             manager._check_and_handle_evictions()
 
@@ -319,7 +319,7 @@ class TestHandleEvictions:
             manager._training_weight_updating = False
 
         with (
-            patch("relax.distributed.ray.rollout.time.sleep", side_effect=release_owner) as sleep,
+            patch("relax.distributed.ray.policy_engine_pool.time.sleep", side_effect=release_owner) as sleep,
             patch.object(
                 manager, "_remove_live_engines", new_callable=AsyncMock, return_value=(removed, [])
             ) as remove,
@@ -496,7 +496,7 @@ class TestHandleEvictions:
         manager = create_test_manager(servers={"default": server})
         manager._training_weight_updating = True
 
-        with patch("relax.distributed.ray.rollout.time.monotonic", side_effect=[0.0, 91.0]):
+        with patch("relax.distributed.ray.policy_engine_pool.time.monotonic", side_effect=[0.0, 91.0]):
             manager._handle_evictions([("default", group, 0)])
 
         assert group.lifecycle_status is EngineGroupLifecycle.DRAINING

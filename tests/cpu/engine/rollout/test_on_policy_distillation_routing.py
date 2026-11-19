@@ -139,3 +139,96 @@ def test_bind_teacher_requires_an_available_route(source):
     sample = Sample(metadata={"data_source": source})
     with pytest.raises(KeyError, match=source):
         opd.bind_teacher(args, sample)
+
+
+@pytest.mark.asyncio
+async def test_managed_mopd_real_teacher_caller_routes_each_source_and_refreshes_endpoints(monkeypatch):
+
+    import httpx
+
+    from relax.engine.inference.types import Role
+    from relax.utils import http_utils
+    from tests.cpu.engine.inference.test_static_roles import _owner
+
+    text, text_remote = _owner(Role.TEACHER)
+    vision, vision_remote = _owner(Role.TEACHER)
+    for source, owner in ((TEXT_SOURCE, text), (VL_SOURCE, vision)):
+        owner.pool.model_id = source
+        owner.pool.backend.router.url = "http://text-router" if source == TEXT_SOURCE else "http://vision-router"
+        owner.pool.backend.nodes_per_engine = 1
+        owner.pool.backend._engine_addr_and_ports = {
+            0: {"host": "text" if source == TEXT_SOURCE else "vision", "port": 16000},
+            1: {"host": "text-other" if source == TEXT_SOURCE else "vision-other", "port": 16001},
+        }
+    args = Namespace(
+        opd_token_selection="student_sampled",
+        opd_log_prob_top_k=0,
+        opd_kl_coef=1.0,
+        opd_loss_coef=0.0,
+        opd_teacher_key="data_source",
+        opd_teacher_timeout_s=2,
+        opd_teacher_routes_map={TEXT_SOURCE: ["http://stale-text"], VL_SOURCE: ["http://stale-vision"]},
+        _teacher_inference_managers={TEXT_SOURCE: text_remote, VL_SOURCE: vision_remote},
+    )
+    manager = opd.OpdManager(args)
+    sent = []
+    prefixes = []
+
+    def respond(request):
+        import json
+
+        sent.append(request.url.host)
+        prefixes.append(json.loads(request.content)["input_ids"])
+        return httpx.Response(200, json={"meta_info": {"input_token_logprobs": [[None, 1], [-0.25, 2]]}})
+
+    samples = [
+        Sample(index=i, group_index=1, tokens=[1, 2], response_length=1, metadata={"teacher_id": source})
+        for i, source in enumerate((TEXT_SOURCE, VL_SOURCE, TEXT_SOURCE))
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        assert await manager.score_teacher(samples) == [True, True, True]
+        text.pool.backend.router.url = "http://text-router-recovered"
+        assert await manager.score_teacher([samples[0]]) == [True]
+    assert sent == ["text-router", "vision-router", "text-router", "text-router-recovered"]
+    # Router cache affinity uses the actual input prefix. Same-source/group
+    # samples retain the same prefix and model-specific router; recovery only
+    # changes the current endpoint, never the routed teacher or prompt.
+    assert prefixes[0] == prefixes[2] == prefixes[3] == [1, 2]
+    assert all(sample.teacher_log_probs == [-0.25] for sample in samples)
+    assert set(manager._teacher_executors) == {TEXT_SOURCE, VL_SOURCE}
+    assert not text.ledger.permits and not vision.ledger.permits
+
+
+@pytest.mark.asyncio
+async def test_managed_single_teacher_uses_default_handle_without_source(monkeypatch):
+    import httpx
+
+    from relax.engine.inference.types import Role
+    from relax.utils import http_utils
+    from tests.cpu.engine.inference.test_static_roles import _owner
+
+    owner, remote = _owner(Role.TEACHER)
+    owner.pool.backend.router.url = "http://teacher-router"
+    args = Namespace(
+        opd_token_selection="student_sampled",
+        opd_log_prob_top_k=0,
+        opd_kl_coef=1.0,
+        opd_loss_coef=0.0,
+        opd_teacher_timeout_s=2,
+        opd_teacher_routes_map=None,
+        opd_teacher_url="http://stale",
+        opd_teacher_urls=["http://stale"],
+        _teacher_inference_manager_handle=remote,
+        _teacher_inference_managers={"default": remote},
+    )
+    sample = Sample(index=0, group_index=0, tokens=[1, 2], response_length=1, metadata={})
+
+    def respond(request):
+        assert request.url.host == "teacher-router"
+        return httpx.Response(200, json={"meta_info": {"input_token_logprobs": [[None, 1], [-0.25, 2]]}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        assert await opd.OpdManager(args).score_teacher([sample]) == [True]
+    assert sample.teacher_log_probs == [-0.25]

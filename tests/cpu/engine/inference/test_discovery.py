@@ -3,6 +3,7 @@
 from unittest.mock import Mock
 
 import httpx
+import pytest
 
 from relax.engine.inference.discovery import InferenceDiscoveryClient, role_snapshot_from_dict
 from relax.engine.inference.types import (
@@ -122,3 +123,19 @@ def test_discovery_observation_survives_round_trip_and_ignores_status_filter() -
     assert snapshot.to_legacy_dict()["observation"] == observation
     assert role_snapshot_from_dict(snapshot.to_dict()) == snapshot
     assert _snapshot().to_dict()["observation"] == {"complete": True, "issues": []}
+
+
+@pytest.mark.parametrize("url", ["http://router:3000", "http://[::1]:3001"])
+def test_legacy_projection_exposes_liveness_without_router_or_admission(url):
+    from dataclasses import replace
+
+    snapshot = _snapshot(router_url=url)
+    model = snapshot.models[0]
+    sleeping = replace(model.replicas[0], state=LifecycleState.SLEEPING)
+    dead = replace(model.replicas[0], engine_id="dead", state=LifecycleState.DEAD)
+    snapshot = replace(snapshot, models=(replace(model, replicas=(sleeping, dead)),))
+    active = snapshot.to_legacy_dict("active")
+    projected = active["models"]["teacher"]
+    assert (projected["router_ip"], projected["router_port"]) == (None, None)
+    assert projected["engine_groups"][0]["engines"][0]["status"] == "active"
+    assert active["total_engines"] == snapshot.to_legacy_dict("dead")["total_engines"] == 1

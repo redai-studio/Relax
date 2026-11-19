@@ -411,3 +411,22 @@ def test_multimodal_non_tensor_full_link_is_byte_exact(tq_factory, record_proper
     for position, sample_id in enumerate(sample_ids):
         assert not diff_digests(expected_mm[sample_id], leaf_digests(payload_rows(received[fields[2]])[position]))
         assert not diff_digests(expected_tokens[sample_id], leaf_digests(payload_rows(received[fields[1]])[position]))
+
+
+def test_deferred_publication_confirms_real_tq_visibility_and_stream_end(tq_factory) -> None:
+    import asyncio
+
+    from relax.engine.rollout.deferred import PublicationState
+    from relax.utils.tq.publication import publish_confirmed
+
+    client = tq_factory()
+    payload = _payload(2, ["tokens"], 4, 7)
+    receipt = asyncio.run(
+        publish_confirmed(
+            client, payload, partition_id="confirmed", operation_id="attempt-1:batch-1", is_last=True, timeout_s=20
+        )
+    )
+    assert receipt.state is PublicationState.CONFIRMED
+    assert client.check_production_completed("confirmed")
+    _, received = _get(client, "confirmed", ["tokens"], 2)
+    torch.testing.assert_close(received["tokens"], payload["tokens"])

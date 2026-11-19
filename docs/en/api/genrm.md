@@ -4,13 +4,13 @@ outline: deep
 
 # GenRM Service API
 
-The GenRM (Generative Reward Model) service provides LLM-based response evaluation. It is deployed as a Ray Serve deployment with a FastAPI ingress.
+The GenRM (Generative Reward Model) service provides LLM-based response evaluation through the role-neutral `InferenceGateway` Serve ingress.
 
 ## Overview
 
 | Property | Value |
 |----------|-------|
-| **Module** | `relax.components.genrm` |
+| **Module** | `relax.components.inference_gateway` |
 | **Deployment** | `@serve.deployment(logging_config=...)` |
 | **Ingress** | FastAPI |
 
@@ -27,21 +27,18 @@ The service uses SGLang engines to perform preference evaluation:
 
 ### Dedicated GPU pools
 
-Standard SGLang tasks without `--colocate` use the common inference owner and request executor for GenRM. Each judge keeps its own checkpoint and GPU slice; Actor weight updates do not change judge weights. Requests resolve current replica addresses, so an engine replacement can change its port without leaving the service with a stale address cache. The existing `route_key` and sampling configuration remain applicable.
+One task-level CPU InferenceManager owns Rollout, GenRM and Teacher model pools, admission and lifecycle state. Role handles only forward calls; they do not create independent Managers. Dedicated and colocated GenRM use the same request executor. Each judge keeps its own checkpoint and GPU slice; Actor weight updates do not change judge weights. Requests resolve current replica addresses, so an engine replacement can change its port without leaving the service with a stale address cache. The existing `route_key` and sampling configuration remain applicable. `/genrm/engines` defaults to schema v2; use `?schema_version=1` for the old projection. Messages are adapted locally after Manager admission; no named GenRM actor is required.
 
-Tasks with custom lifecycle or generation hooks, Agentic rollout, or external rollout engines retain their existing orchestration. Colocated tasks also retain their existing offload/onload coordination, including split bundles that the Actor reuses during training.
+### Colocated GPU layouts
 
-### Colocated Mode
+`--colocate` lets Actor reuse inference GPUs during training. A shared placement group does not require Rollout and GenRM to occupy the same bundles:
 
-When colocated with the Actor (sharing GPU resources), GenRM supports offload/onload operations:
+- **Split** (`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`): Rollout and GenRM use disjoint bundles and can score inline. For eight training GPUs, `--resource '{"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]}'` selects a 4+4 split.
+- **Shared** (`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`): Rollout and GenRM reuse the same bundles at different times. Set `--defer-reward-to-post-process` and a compatible `--custom-reward-post-process-path`. Generation must finish and drain before the judge onloads; scoring must finish before publication. Lowering `mem_fraction_static` is not a replacement for this phase ordering.
 
-- **Offload**: Releases GPU memory before Actor training
-- **Onload**: Loads model weights back to GPU before rollout
+In the managed shared path, the phase coordinator owns drain/offload/onload. The example `post_process_genrm_swap.py` requires that phase and performs scoring without its own memory swaps. Judge failures propagate instead of becoming zero rewards. A batch is published only after all required rewards are present and finite; a missing publication acknowledgement fails the attempt without replaying the write.
 
-Two colocate sub-modes are auto-detected from the GPU allocation:
-
-- **Split** (`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`): GenRM and Rollout occupy disjoint bundles.
-- **Shared** (`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`): GenRM and Rollout occupy the same bundles, splitting each GPU's memory via SGLang `mem_fraction_static`. GenRM reads its `mem_fraction_static` from `--genrm-engine-config`. GenRM never sources weights from the Actor; onload only resumes its KV cache and CUDA graphs.
+Custom and external engines use the same task control plane and must meet its admission and confirmed-release contracts. GenRM keeps its own checkpoint and does not receive Actor weights.
 
 See [GenRM example](/en/examples/generative-reward-model) for full configuration.
 
@@ -55,5 +52,5 @@ A single GenRM deployment can host several independent judge models at once (con
 
 ## Source
 
-- Implementation: [`relax/components/genrm.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/genrm.py)
+- Implementation: [`relax/components/inference_gateway.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/inference_gateway.py)
 - Base class: [`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

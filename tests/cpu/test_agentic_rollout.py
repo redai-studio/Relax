@@ -63,7 +63,7 @@ from tests.cpu.engine.lora_versions.test_runtime import host_with_version, remot
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
 # the agentic unit tests collectible in environments without the optional
 # SGLang backend, while avoiding a process-wide stub after this import.
-_rollout_module_name = "relax.distributed.ray.rollout"
+_rollout_module_name = "relax.distributed.ray.policy_engine_pool"
 _existing_rollout_module = sys.modules.get(_rollout_module_name)
 if _existing_rollout_module is None:
     _rollout_module_stub = ModuleType(_rollout_module_name)
@@ -678,18 +678,21 @@ def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     expected: bool,
 ) -> None:
     pipeline = object.__new__(AgenticResidentPipeline)
-    pipeline.args = SimpleNamespace(fully_async=fully_async, max_staleness=max_staleness)
+    pipeline.args = SimpleNamespace(
+        fully_async=fully_async,
+        max_staleness=max_staleness,
+        _inference_manager_handle=SimpleNamespace(pool_call=SimpleNamespace(remote=lambda method: method)),
+    )
     pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
-    manager = SimpleNamespace(training_weight_updating=training_weight_updating)
-    with patch("relax.agentic.rollout.get_local_rollout_manager", return_value=manager) as get_manager:
+    with patch("relax.agentic.rollout.ray.get", return_value=training_weight_updating) as get_manager:
         assert pipeline._step_can_close(_StepContext(rollout_id=3, final_backfill=final_backfill)) is expected
 
     if debt == 0 or not fully_async or final_backfill or max_staleness == 0:
         get_manager.assert_not_called()
     else:
-        get_manager.assert_called_once_with()
+        get_manager.assert_called_once_with("get_training_weight_updating")
 
 
 def test_runtime_gap_counts_current_debt_oversampling_and_resident_tail() -> None:
@@ -1280,7 +1283,7 @@ async def test_runtime_router_publication_waits_for_every_owner(fails) -> None:
 def test_agentic_ingress_keeps_requested_port_while_deferring_router(monkeypatch, first_model_pd) -> None:
     from relax.agentic.session import service
 
-    rollout = ModuleType("relax.distributed.ray.rollout")
+    rollout = ModuleType("relax.distributed.ray.policy_engine_pool")
     rollout._resolve_sglang_config = lambda _args: SimpleNamespace(
         models=[SimpleNamespace(has_pd_disaggregation=first_model_pd), SimpleNamespace(has_pd_disaggregation=True)]
     )

@@ -37,7 +37,7 @@ async def test_managed_workload_drains_background_scores_before_reporting(monkey
         module, "EvalJudgeWorker", SimpleNamespace(options=lambda **kwargs: SimpleNamespace(remote=lambda args: judge))
     )
     monkeypatch.setattr(module.ray, "kill", killed.append)
-    import relax.distributed.ray.rollout as rollout
+    import relax.distributed.ray.policy_engine_pool as rollout
 
     monkeypatch.setattr(rollout, "_log_eval_rollout_data", lambda *args: reported.append(args))
     args = SimpleNamespace(

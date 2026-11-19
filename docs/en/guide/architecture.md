@@ -74,11 +74,11 @@ The components layer contains all RL service components, each deployed as a `@se
 | Component | File | Responsibility |
 |-----------|------|----------------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | Policy training (Megatron backend) |
-| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout service orchestration, manages RolloutManager |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Shared Gateway ingress and RolloutWorker workload orchestration |
 | **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value estimation and clipped value-loss training |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | Forward inference log-prob (fully-async mode) |
 | **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | Advantage computation (PPO/GRPO/GSPO/SAPO/CISPO etc.) |
-| **GenRM** | [`genrm.py`](../../../relax/components/genrm.py) | Generative reward model |
+| **GenRM** | [`inference_gateway.py`](../../../relax/components/inference_gateway.py) | Generative reward model |
 
 The deployed service graph depends on the algorithm and execution mode. Colocate GRPO-like algorithms use Actor + Rollout; synchronous colocate PPO adds Critic + Advantages. For non-PPO algorithms, **fully-async mode** (`--fully-async`) can additionally deploy ActorFwd and Reference services according to the log-probability and KL configuration. Fully-async PPO is not currently supported; see [PPO Training](./ppo-training.md) for the supported data flow.
 
@@ -93,13 +93,11 @@ or weight updates; a weights-only load keeps admission closed until KV cache is
 restored. Actor and Controller calls retain the rollout manager interface
 through a delegating handle.
 
-This path is selected automatically for standard rollout and evaluation
-functions with framework-created placement groups. Tasks using GenRM, OPD,
-Agentic, native/custom engines, external engines, custom generation/dataset or
-post-processing hooks, and offline training retain their complete existing
-orchestration. No new launch flag is required. The existing `/rollout/engines`
-response remains the default; managed tasks additionally expose the Manager's
-discovery snapshot with `?schema_version=2`.
+Each inference task has one CPU InferenceManager that owns all Rollout, GenRM and Teacher pools, requests, placement and lifecycle state. Role handles only forward calls; they do not create another Manager. Dedicated and colocated layouts use the same control plane. Its phase coordinator serializes models that reuse bundles. Split roles can run concurrently in the inference phase; shared GenRM/Teacher scoring follows generation drain and confirmed memory release.
+
+The rollout workload owns sample staging, scoring completeness and TransferQueue publication. The resident Agentic path keeps Groups, Sessions and exported training rows distinct; deferred scoring preserves export identities and physical partition boundaries. Publication requires consumer-visible data and, for streaming tails, terminal-marker confirmation. Unknown acknowledgements fail the attempt without blind replay.
+
+Custom/native engines and external engines also use the unified control plane and must satisfy its engine capability and resource-release contracts. Old role Managers no longer provide a separate orchestration path. Rollout, GenRM and Teacher use the same CPU Gateway deployment class. `/<role>/engines` defaults to discovery schema v2; request `?schema_version=1` explicitly for the legacy projection. Autoscaling reads logical replicas from v2.
 
 The engine layer provides rollout data generation and reward computation:
 
@@ -117,7 +115,7 @@ The backends layer wraps underlying training and inference engines:
 
 ### 6. Distributed Layer
 
-- [**Ray Actor Groups**](../../../relax/distributed/ray/): Manages RolloutManager, GenRMManager, and other Ray Actor groups
+- [**Ray Actor Groups**](../../../relax/distributed/ray/): One task InferenceManager owns all inference pools; RolloutWorker hosts the workload
 - [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/): Distributed weight synchronization service supporting NCCL/GLOO/TCP communication backends
 
 ## Directory Structure
@@ -133,7 +131,7 @@ relax/
 │   ├── actor_fwd.py         Forward inference log-prob
 │   ├── critic.py            Value estimation
 │   ├── advantages.py        Advantage computation
-│   ├── genrm.py             Generative reward model
+│   ├── inference_gateway.py Shared role HTTP ingress
 │   └── rollout.py           Rollout service orchestration
 ├── engine/                  Engine layer
 │   ├── rollout/             Rollout engine implementations
@@ -173,7 +171,7 @@ relax/
 │                                                      │                │
 │                                                      ▼                │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                  RolloutManager.generate()                       │ │
+│  │                  RolloutWorker.generate()                        │ │
 │  │  SGLang engine inference → reward computation → assemble data    │ │
 │  └───────────────────────────┬──────────────────────────────────────┘ │
 │                              │                                        │

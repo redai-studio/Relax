@@ -125,7 +125,7 @@ args = parse_args()
 | `relax.core`                           | Experiment coordination | [Controller API](/en/api/controller)                    |
 | `relax.components.actor`               | Policy training         | [Actor API](/en/api/actor)                              |
 | `relax.components.rollout`             | Sample generation       | [Rollout API](/en/api/rollout)                          |
-| `relax.components.genrm`              | Generative reward model | [GenRM API](/en/api/genrm)                              |
+| `relax.components.inference_gateway`              | Generative reward model | [GenRM API](/en/api/genrm)                              |
 | `relax.components.actor_fwd`          | Log-prob computation    | [ActorFwd API](/en/api/actor-fwd)                       |
 | `relax.distributed.checkpoint_service` | Checkpoint management   | [Checkpoint API](/en/api/checkpoint)                    |
 | `relax.utils.metrics`                 | Metrics collection      | [Metrics API](/en/api/metrics)                          |

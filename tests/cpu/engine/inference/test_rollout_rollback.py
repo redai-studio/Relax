@@ -8,10 +8,10 @@ from relax.distributed.ray import inference_manager as module
 
 
 def test_partial_rollout_cleanup_failure_preserves_locks_and_routers(monkeypatch):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
     from relax.distributed.ray.inference_pool import RolloutPool
 
-    implementation = rollout.RolloutManager.__ray_metadata__.modified_class
+    implementation = rollout.PolicyEnginePool
     lock = object()
     released = []
 
@@ -60,7 +60,7 @@ def test_managed_rollout_disposal_retains_owner_on_failure(monkeypatch):
 
 
 def test_actual_rollout_second_lock_failure_retains_pool_until_shutdown_retry(monkeypatch):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
     from relax.distributed.ray.inference_pool import RolloutPool
 
     lock = object()
@@ -94,7 +94,6 @@ def test_actual_rollout_second_lock_failure_retains_pool_until_shutdown_retry(mo
     monkeypatch.setattr(rollout, "init_http_client", lambda *a: None)
     monkeypatch.setattr(rollout, "start_rollout_servers", lambda *a: {"policy": server})
     monkeypatch.setattr(rollout, "with_control_plane_affinity", lambda args, options: options)
-    monkeypatch.setattr(rollout.MetricChecker, "maybe_create", lambda args: None)
     monkeypatch.setattr(module.ray, "kill", killed.append)
     args = SimpleNamespace(use_agentic_rollout=False, debug_train_only=False, use_fault_tolerance=False)
     pool = RolloutPool.__new__(RolloutPool)

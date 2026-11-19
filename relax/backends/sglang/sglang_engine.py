@@ -388,7 +388,9 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(
+    server_args: ServerArgs, *, owner: Optional["SGLangEngine"] = None
+) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -405,6 +407,10 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
     p.start()
+    if owner is not None:
+        # Health checks can fail while the subprocess is already holding GPUs.
+        # Publish ownership before any fallible wait so shutdown can retry.
+        owner.process = p
 
     if server_args.node_rank != 0:
         return p
@@ -478,6 +484,8 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
 
 
 class SGLangEngine(RayActor):
+    route_mode = "sglang_router"
+
     def __init__(
         self,
         args,
@@ -487,7 +495,11 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        role: str = "rollout",
     ):
+        if role not in {"rollout", "genrm", "teacher"}:
+            raise ValueError(f"Unknown inference engine role: {role}")
+        self.role = role
         self.args = args
         self.rank = rank
         self.worker_type = worker_type
@@ -542,6 +554,12 @@ class SGLangEngine(RayActor):
                 before accepting requests. The caller must call register_to_router()
                 after weight sync completes.
         """
+        if self.role == "genrm":
+            self.checkpoint_engine_client = None
+            return self._init_genrm(dist_init_addr, port, nccl_port, host, disaggregation_bootstrap_port)
+        if self.role == "teacher":
+            skip_dcs_registration = True
+            skip_router_registration = True
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
         self._skip_router_registration = skip_router_registration
@@ -705,7 +723,7 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args)
+        self.process = launch_server_process(server_args, owner=self)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
@@ -1086,24 +1104,30 @@ class SGLangEngine(RayActor):
 
                 # Freeze each parent before enumerating children so no scheduler
                 # can fork an untracked descendant between enumeration and kill.
-                if not hasattr(self, "_shutdown_processes"):
-                    self._shutdown_processes = []
-                    try:
-                        self._shutdown_processes.append(psutil.Process(process.pid))
-                    except psutil.NoSuchProcess:
-                        pass
-                processes = self._shutdown_processes
-                # Reuse psutil's creation-time identity across retries. A fresh
-                # Process(old_pid) could suspend an unrelated reused PID.
+                processes = getattr(self, "_shutdown_processes", None)
+                if processes is None:
+                    processes = self._shutdown_processes = []
+                    # Never resolve an exited child's numeric PID again: it
+                    # may already belong to an unrelated process.
+                    if getattr(process, "exitcode", None) is None:
+                        try:
+                            processes.append(psutil.Process(process.pid))
+                        except psutil.NoSuchProcess:
+                            pass
+                # Retain creation-time identities and descendants across retries.
                 pending = list(processes)
+                visited = set()
                 while pending:
                     current = pending.pop()
+                    if current in visited:
+                        continue
+                    visited.add(current)
                     if not process_is_live(current):
                         continue
+                    if current not in processes:
+                        processes.append(current)
                     try:
                         current.suspend()
-                        if current not in processes:
-                            processes.append(current)
                         pending.extend(current.children())
                     except psutil.NoSuchProcess:
                         continue
@@ -1222,6 +1246,39 @@ class SGLangEngine(RayActor):
         except Exception:
             pass
         return {"pid": os.getpid(), "node_id": node_id}
+
+    def configure_model_router(self, host: str, port: int) -> bool:
+        """Attach a static replica head to its model's task-owned Router."""
+        if self.role not in {"teacher", "genrm"}:
+            raise ValueError("Only static inference roles attach a model Router")
+        self.router_ip, self.router_port = host, port
+        self._skip_router_registration = False
+        self._require_router_registration = True
+        if not self.register_to_router(strict=True):
+            return False
+        # Regular static workers have no PD spec, so the PD readiness helper
+        # cannot confirm their registration. Check the actual model registry.
+        expected = f"http://{self.server_host}:{self.server_port}".rstrip("/")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            response = requests.get(f"http://{host}:{port}/workers", timeout=5)
+            response.raise_for_status()
+            matches = [
+                worker
+                for worker in response.json().get("workers", [])
+                if worker.get("url", "").rstrip("/") == expected
+            ]
+            if len(matches) > 1:
+                raise RuntimeError("Duplicate static replica in model Router")
+            if len(matches) == 1 and matches[0].get("is_healthy") is True:
+                worker_id = matches[0].get("id")
+                if self._router_worker_id is not None and worker_id != self._router_worker_id:
+                    raise RuntimeError("Static Router worker identity changed before readiness")
+                if worker_id is not None:
+                    self._router_worker_id = str(worker_id)
+                return True
+            time.sleep(0.25)
+        raise TimeoutError("Static replica registration did not become healthy")
 
     def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
         required = getattr(self, "_require_router_registration", False)
@@ -1453,15 +1510,17 @@ class SGLangEngine(RayActor):
         return response.json()["weight_version"]
 
     def release_memory_occupation(self):
+        if getattr(self, "role", "rollout") == "genrm":
+            return self._release_genrm_memory()
         self.flush_cache()
         return self._make_request("release_memory_occupation")
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """Available tags for multi-stage resume: weights, kv_cache."""
-        return self._make_request(
-            "resume_memory_occupation",
-            {"tags": tags},
-        )
+        result = self._make_request("resume_memory_occupation", {"tags": tags})
+        if getattr(self, "role", "rollout") == "genrm" and self.node_rank == 0 and not tags:
+            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+        return result
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
@@ -1857,15 +1916,7 @@ class SGLangEngine(RayActor):
             logger.info(f"Unregistering checkpoint engine client for engine {self.server_host}:{self.server_port}...")
             run(self.checkpoint_engine_client.unregister())
 
-
-class GenRMEngine(SGLangEngine):
-    """GenRM Engine for Generative Reward Model.
-
-    Inherits from SGLangEngine and overrides initialization to use genrm-
-    specific arguments (model path, GPU count, sampling parameters, etc.).
-    """
-
-    def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
+    def _init_genrm(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
         """Initialize the genRM engine with genrm-specific arguments."""
         self.router_ip = ""
         self.router_port = 0
@@ -1908,7 +1959,7 @@ class GenRMEngine(SGLangEngine):
         else:
             self._init_normal(server_args_dict, apply_policy_load_plan=False)
 
-    def release_memory_occupation(self):
+    def _release_genrm_memory(self):
         # GenRM is colocated on the training GPUs, so it must offload at the
         # rollout->train transition. Two failure modes are defended against here:
         #
@@ -1966,18 +2017,6 @@ class GenRMEngine(SGLangEngine):
                     logger.info(f"Error flushing GenRM cache: {e}")
                 time.sleep(1)
         return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
-
-    def resume_memory_occupation(self, tags: list[str] = None):
-        result = super().resume_memory_occupation(tags=tags)
-        # Re-open admission that release_memory_occupation closed via
-        # /pause_generation. Only after a full resume (weights + KV cache back):
-        # GenRM always full-resumes, but the ``not tags`` guard prevents
-        # re-enabling generation before KV cache exists if a partial
-        # (weights-only) resume is ever introduced. Not swallowed — if the
-        # engine stays paused, GenRM silently stops serving, so fail loudly.
-        if self.node_rank == 0 and not tags:
-            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
-        return result
 
     def _pause_generation_for_offload(self, deadline: float) -> None:
         """Best-effort /pause_generation (abort mode) before draining for

@@ -4,15 +4,17 @@
 
 ## 独立资源与外部 Teacher
 
-未启用 `--colocate` 的标准 SGLang 任务通过公共推理管理器和请求执行链调用 Relax 管理的单 Teacher。副本恢复后，请求会读取当前端点；`--opd-teacher-timeout-s` 限制包括准入与响应读取在内的 Teacher 请求总时长。Teacher 保持自己的 checkpoint 权重，不接收 Actor 权重更新。自定义生命周期 hook、Agentic 任务以及 colocate Teacher 保留现有编排；托管多 Teacher 路由仍仅支持 colocate。
+未启用 `--colocate` 的标准 SGLang 任务通过公共推理管理器和请求执行链调用 Relax 管理的单 Teacher。副本恢复后，请求会读取当前端点；`--opd-teacher-timeout-s` 限制包括准入与响应读取在内的 Teacher 请求总时长。Teacher 保持自己的 checkpoint 权重，不接收 Actor 权重更新。所有托管角色共用一个任务级 CPU InferenceManager，角色句柄仅是转发视图，不是独立 owner。共置任务遵循下文的阶段顺序，包括 native 和 resident Agentic 工作负载。托管多 Teacher 路由仍仅支持 colocate。
 
 使用 `--opd-teacher-url` 时，Teacher 为外部服务：Relax 发送请求，但不分配其 GPU，也不会在训练结束时关闭外部进程。原有外部 Teacher 路由继续适用。
 
 ## 共置 Teacher 的执行阶段
 
-标准 native SGLang 任务在引擎启动前校验整个共享 GPU 布局。Split Teacher 使用不重叠切片，在线完成评分；与 Rollout 共用 bundles 的 Teacher 在生成排空后评分。阶段协调器串行执行各独立角色 owner 的卸载与加载；token selection 需要额外前向时，再恢复 Student。
+Split Teacher 在 Actor placement group 中使用独立 GPU 切片，在线完成评分。与 Rollout 共享 bundle 的 Teacher 则在生成及 abort/排空完成后延迟评分。托管 phase coordinator 先释放 Rollout 显存，再激活所需 Teacher；当 token selection 需要 student-at-teacher top-K 时，再恢复 Student 完成第二次前向。Teacher 始终保留自己的 checkpoint 权重。
 
-延迟批次保留训练分区和终批标记。所需评分字段必须通过形状、token ID 和有效 loss-mask 位置的数值校验后才可发布，不发布不完整批次的成功子集。原有角色入口及 discovery 默认行为保持不变。Agentic 与自定义生命周期的迁移在后续步骤进行。
+延迟批次保留原训练分区和终批标记。发布前逐项校验所需目标的形状、token ID 以及有效 loss-mask 位置的数值。评分失败不会仅发布成功子集。托管多 Teacher 请求按 sample 已绑定的 Teacher ID 选择 owner，保持 group 亲和性，并在恢复后重新解析副本地址。自定义生命周期扩展必须使用同一控制面；用户提供外部 Teacher URL 时，其外部进程仍不归 Relax 持有。
+
+托管 Teacher 通过统一 Gateway 的 `/teacher` 前缀提供 `/generate`、`/v1/chat/completions`、`/v1/models`、`/health` 和 `/engines`。发现接口默认返回 v2；旧投影需显式请求 `?schema_version=1`。公开请求转发前必须取得任务 Manager 的 permit，仅拿到发现快照不代表已获准推理。
 
 ## 关键参数
 

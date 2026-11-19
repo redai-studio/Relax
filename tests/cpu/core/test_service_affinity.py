@@ -169,31 +169,6 @@ def test_service_forwards_enable_affinity_true():
     mock_cpg.assert_called_once_with(num_gpus=2, node_group_affinity=True)
 
 
-@pytest.mark.parametrize("role", ["rollout", "genrm", "actor"])
-def test_service_startup_failure_preserves_pg_owned_by_shared_inference(monkeypatch, role):
-    from relax.core import service as module
-
-    service = Service.__new__(Service)
-    service.role = role
-    service.config = Namespace(_rollout_engine_manager=object())
-    service.pgs = ("service-pg", [0], [0])
-    service._is_shared_pgs = False
-    service._deployed = False
-    events = []
-
-    def fail(binding):
-        raise RuntimeError("Serve startup failed")
-
-    monkeypatch.setattr(service, "_deploy", fail)
-    monkeypatch.setattr(module.serve, "delete", lambda role: events.append("delete"))
-    monkeypatch.setattr(module, "remove_placement_group", lambda pg: events.append("remove"))
-
-    with pytest.raises(RuntimeError, match="Serve startup"):
-        service.deploy()
-    assert events == (["delete", "remove"] if role == "actor" else [])
-    assert (service.pgs is None) == (role == "actor")
-
-
 @pytest.mark.parametrize("has_data_source", [False, True])
 def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path, has_data_source):
     config_path = tmp_path / "autoscaler.yaml"
@@ -373,3 +348,67 @@ def test_sft_data_node_rejects_unschedulable_affinity(monkeypatch, state):
         with pytest.raises((ValueError, RuntimeError), match="not available|conflicts"):
             service._deploy(None)
     service.cls.options.assert_not_called()
+
+
+def test_task_owned_service_failure_retains_pg_until_controller_cleanup(monkeypatch):
+    from relax.core import service as module
+
+    service = Service.__new__(Service)
+    service.role = "teacher"
+    service.config = Namespace(_rollout_engine_manager=object())
+    service.pgs = ("teacher-pg", [0], [0])
+    service._is_shared_pgs = False
+    service._deployed = False
+    events = []
+
+    def fail(binding):
+        raise RuntimeError("Serve startup failed")
+
+    monkeypatch.setattr(service, "_deploy", fail)
+    monkeypatch.setattr(module.serve, "delete", lambda role: events.append("delete"))
+    monkeypatch.setattr(module, "remove_placement_group", lambda pg: events.append("remove"))
+    with pytest.raises(RuntimeError, match="Serve startup"):
+        service.deploy()
+    assert events == []
+    assert service.pgs[0] == "teacher-pg"
+
+
+def test_retired_service_token_cannot_start_again_under_new_task(monkeypatch):
+    from relax.core import service as module
+
+    service = Service.__new__(Service)
+    service.role = "teacher"
+    service.config = Namespace(_rollout_engine_manager=object(), _inference_startup_token="new")
+    service._inference_task_owner = object()
+    service._inference_deployment_token = "old"
+    service._deployed = False
+    events = []
+    monkeypatch.setattr(service, "_deploy", lambda pgs: events.append("deploy"))
+    monkeypatch.setattr(module.serve, "delete", lambda role: events.append("delete"))
+    monkeypatch.setattr(module, "remove_placement_group", lambda pg: events.append("remove"))
+    with pytest.raises(RuntimeError, match="superseded"):
+        service.deploy()
+    assert events == []
+
+
+def test_training_service_keeps_legacy_owned_pg_cleanup_with_task_inference(monkeypatch):
+    from relax.core import service as module
+
+    service = Service.__new__(Service)
+    service.role = "actor"
+    service.config = Namespace(_rollout_engine_manager=object())
+    service.pgs = ("actor-pg", [0], [0])
+    service._is_shared_pgs = False
+    service._deployed = False
+    events = []
+
+    def fail(binding):
+        raise RuntimeError("training startup failed")
+
+    monkeypatch.setattr(service, "_deploy", fail)
+    monkeypatch.setattr(module.serve, "delete", lambda role: events.append("delete"))
+    monkeypatch.setattr(module, "remove_placement_group", lambda pg: events.append("remove"))
+    with pytest.raises(RuntimeError, match="training startup"):
+        service.deploy()
+    assert events == ["delete", "remove"]
+    assert service.pgs is None

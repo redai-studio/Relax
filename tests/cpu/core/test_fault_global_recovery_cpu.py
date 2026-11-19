@@ -438,9 +438,9 @@ def test_actual_error_return_flows_through_restart_consume_and_training_loop(run
         shutdown_async_loop=lambda: None,
         time=SimpleNamespace(sleep=lambda seconds: None),
     )
-    router = ModuleType("relax.distributed.ray.rollout")
+    router = ModuleType("relax.distributed.ray.policy_engine_pool")
     router.stop_launched_routers = lambda: 0
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", router)
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.policy_engine_pool", router)
     original = RuntimeError("real initializer failed inside production restart")
 
     def fail_init(*args, **kwargs):

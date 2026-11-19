@@ -22,7 +22,7 @@ from ray.exceptions import GetTimeoutError
 
 
 ActorState = ActorTableData.ActorState
-rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
+rollout = pytest.importorskip("relax.distributed.ray.policy_engine_pool", exc_type=ModuleNotFoundError)
 
 
 class InitResult:
@@ -86,7 +86,7 @@ def make_manager(engines, refs):
     )
     group.engine_init_records = {slot: SimpleNamespace(value=ref) for slot, ref in enumerate(refs)}
     server = rollout.RolloutServer(engine_groups=[group], router_ip="127.0.0.1", router_port=3000, model_name="actor")
-    manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
+    manager = object.__new__(rollout.PolicyEnginePool)
     manager._engine_actor_states = ActorState
     manager.servers = {"actor": server}
     manager.args = SimpleNamespace(

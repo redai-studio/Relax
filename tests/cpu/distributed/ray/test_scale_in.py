@@ -4,13 +4,14 @@
 and cleanup."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import (
+    from relax.distributed.ray.policy_engine_pool import (
         EngineGroupLifecycle,
         ScaleInRequest,
         ScaleInStatus,
@@ -594,9 +595,9 @@ async def test_live_removal_orders_router_drain_dcs_shutdown_and_pg(patch_ray_ge
         events.append("drain")
 
     with (
-        patch("relax.distributed.ray.rollout.asyncio.sleep", side_effect=_sleep),
+        patch("relax.distributed.ray.policy_engine_pool.asyncio.sleep", side_effect=_sleep),
         patch(
-            "relax.distributed.ray.rollout.ray.util.remove_placement_group",
+            "relax.distributed.ray.policy_engine_pool.ray.util.remove_placement_group",
             side_effect=lambda _pg: events.append("pg"),
         ),
     ):
@@ -652,9 +653,11 @@ async def test_batch_live_removal_runs_each_phase_concurrently_and_drains_once(p
     async def drain_once(_seconds):
         events.append("drain")
 
+    sleep = AsyncMock(side_effect=drain_once)
+    local_asyncio = SimpleNamespace(**dict(vars(asyncio), sleep=sleep))
     with (
-        patch("relax.distributed.ray.rollout.asyncio.sleep", side_effect=drain_once) as sleep,
-        patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg,
+        patch("relax.distributed.ray.policy_engine_pool.asyncio", local_asyncio),
+        patch("relax.distributed.ray.policy_engine_pool.ray.util.remove_placement_group") as remove_pg,
     ):
         removed, failed = await manager._remove_live_engines(
             server,
@@ -891,7 +894,7 @@ class TestScaleInStatusQueries:
 def test_shutdown_failure_keeps_resource_owner(path):
     from types import SimpleNamespace
 
-    from relax.distributed.ray.rollout import RolloutManager
+    from relax.distributed.ray.policy_engine_pool import PolicyEnginePool
 
     engine = make_mock_engine()
     group = make_engine_group(engines=[engine], is_scaled_out=True)
@@ -902,7 +905,7 @@ def test_shutdown_failure_keeps_resource_owner(path):
         if path == "group":
             group.shutdown_engines({0})
         else:
-            RolloutManager.__ray_metadata__.modified_class._shutdown_all_engines(manager)
+            PolicyEnginePool._shutdown_all_engines(manager)
     assert group.all_engines == [engine]
     kill.assert_not_called()
 

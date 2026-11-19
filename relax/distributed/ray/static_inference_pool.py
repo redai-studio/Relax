@@ -20,10 +20,9 @@ class StaticInferencePool:
     def __init__(self, role: Role, args: Any, binding: Any, options: dict[str, Any]) -> None:
         from relax.engine.inference.config_adapters import static_role_spec
 
+        self.start_sleeping = False
         self.backend: Any = None
         self.spec = static_role_spec(role, args, options)
-        self.role = role
-        self.model_id = self.spec.models[0].model_id
         self.start_sleeping = self.spec.deployment.mode is DeploymentMode.DEFER or (
             self.spec.deployment.mode is DeploymentMode.SPLIT and bool(getattr(args, "offload_rollout", False))
         )
@@ -33,39 +32,31 @@ class StaticInferencePool:
                 args.genrm_engine_config = dict(args.genrm_engine_config or {}, enable_memory_saver=True)
             else:
                 args.teacher_sglang_enable_memory_saver = True
-        shared_teacher = role is Role.TEACHER and self.spec.deployment.mode is not DeploymentMode.DECOUPLED
-        if shared_teacher and self.spec.deployment.mode is DeploymentMode.DEFER:
-            # The legacy TeacherManager adds the rollout slice before its
-            # relative offset; deferred teachers reuse the bundles from zero.
-            args.rollout_num_gpus = 0
-            args._requires_weights_cpu_backup = True
-        if binding is not None:
-            from relax.engine.inference.placement import PlacementPlanner
-            from relax.engine.inference.task_placement import StaticPlacement, plan_static_placement
-
-            offset = options.get("bundle_offset", 0)
-            if shared_teacher:
-                offset += args.rollout_num_gpus
-            plan_static_placement(args, StaticPlacement(self.spec, binding, offset), PlacementPlanner())
+        self.role = role
+        self.model_id = self.spec.models[0].model_id
         if role is Role.GENRM:
-            from relax.distributed.ray.genrm import GenRMManager
-
-            implementation = GenRMManager.__ray_metadata__.modified_class
-            ctor_args = (args, binding)
+            ctor_args = (args,)
             ctor_kwargs = {key: options[key] for key in ("bundle_offset", "port_window_index") if key in options}
-            ctor_kwargs["dedicated_pg"] = True
+            ctor_kwargs["dedicated_pg"] = self.spec.deployment.mode is DeploymentMode.DECOUPLED
         else:
-            from relax.distributed.ray.teacher_manager import TeacherManager
+            ctor_kwargs = {"num_replicas": options["num_replicas"], "gpus_per_replica": options["gpus_per_replica"]}
+            shared = self.spec.deployment.mode is not DeploymentMode.DECOUPLED
+            teacher_args = args
+            if self.spec.deployment.mode is DeploymentMode.DEFER:
+                # The backend indexes the teacher region after rollout. Deferred
+                # scoring reuses that region from bundle zero instead.
+                teacher_args.rollout_num_gpus = 0
+                teacher_args._requires_weights_cpu_backup = True
+            ctor_args = (teacher_args,)
+            ctor_kwargs.update(pg=binding, shared_pg=shared, bundle_offset=options.get("bundle_offset", 0))
+        from relax.distributed.ray.engine_pool import EnginePool
 
-            implementation = TeacherManager.__ray_metadata__.modified_class
-            ctor_args = (args, options["num_replicas"], options["gpus_per_replica"])
-            ctor_kwargs = {}
-            if shared_teacher:
-                ctor_kwargs.update(pg=binding, shared_pg=True, bundle_offset=options.get("bundle_offset", 0))
-        self.backend = implementation.__new__(implementation)
+        self.backend = EnginePool.__new__(EnginePool)
         try:
-            implementation.__init__(self.backend, *ctor_args, **ctor_kwargs)
+            EnginePool.__init__(self.backend, role.value, *ctor_args, binding, ctor_kwargs)
             if self.start_sleeping:
+                # Memory saver enables release; it does not make startup itself
+                # memory-free. The launcher must first release the previous owner.
                 self.backend.offload()
         except BaseException:
             if hasattr(self.backend, "all_engines"):
@@ -76,15 +67,11 @@ class StaticInferencePool:
         from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementRequest
 
         if self.role is Role.GENRM:
-            bindings = [(self.backend.pg, False, self.backend.bundle_offset, self.spec.models[0].total_num_gpus)]
+            _, _, offset = self.backend._resolve_placement(0)
+            bindings = [(self.backend.pg, False, offset, self.spec.models[0].total_num_gpus)]
         else:
             bindings = [
-                (
-                    binding,
-                    owned,
-                    self.backend._resolve_placement(rank)[2] if self.backend._shared_pg else 0,
-                    self.backend.gpus_per_replica,
-                )
+                (binding, owned, self.backend._resolve_placement(rank)[2], self.backend.gpus_per_replica)
                 for rank, (binding, owned) in self.backend._engine_placements.items()
                 if rank % self.backend.nodes_per_engine == 0
             ]
@@ -126,15 +113,18 @@ class StaticInferencePool:
                     f"{self.model_id}/replica-{rank}",
                     LifecycleState.READY if available else state,
                     f"http://{_wrap_ipv6(info['host'])}:{info['port']}" if info else None,
-                    direct_eligible=available,
+                    direct_eligible=False,
                 )
             )
+        router = getattr(self.backend, "router", None)
+        router_ready = ready and router is not None and router.ready
         return (
             ModelSnapshot(
                 self.model_id,
                 tuple(replicas),
+                router_url=router.url if router is not None else None,
                 state=state,
-                admission=any(replica.direct_eligible for replica in replicas),
+                admission=router_ready and any(replica.state is LifecycleState.READY for replica in replicas),
             ),
         )
 
@@ -153,17 +143,12 @@ class StaticInferencePool:
         return dead
 
     def recover(self, dead: list[int]) -> None:
-        from relax.distributed.ray.multi_engine_manager import MultiEngineManager
-
         self.backend._retire_engines(dead)
         # Dedicated teachers can now move: clients resolve a fresh Manager
         # snapshot instead of keeping URLs captured at startup.
-        MultiEngineManager.recover(self.backend)
+        self.backend.recover()
 
     def dispose(self) -> None:
         if self.backend is None:
             return
         self.backend.shutdown()
-        lock = getattr(self.backend, "genrm_engine_lock", None)
-        if lock is not None:
-            ray.kill(lock)

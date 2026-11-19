@@ -661,3 +661,89 @@ async def test_gateway_response_body_failure_returns_502(error):
         assert owner.inflight == set()
     finally:
         await gateway.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [Role.ROLLOUT, Role.GENRM, Role.TEACHER])
+async def test_role_gateway_public_discovery_defaults_v2_and_retains_explicit_v1(role):
+    from fastapi import FastAPI
+
+    from relax.components.inference_gateway import InferenceGatewayService
+
+    gateway = object.__new__(InferenceGatewayService.func_or_class)
+    InferenceGateway.__init__(gateway, role, manager_handle=_Owner(lambda: _snapshot(role=role)))
+    app = FastAPI()
+    app.add_api_route(f"/{role.value}/engines", gateway.get_engines)
+    app.add_api_route(f"/{role.value}/health", gateway.get_health)
+    app.add_api_route(f"/{role.value}/generate", gateway.generate, methods=["POST"])
+    owner = gateway.manager_handle
+
+    def upstream(request):
+        assert owner.inflight
+        return httpx.Response(200, json={"text": "ok"})
+
+    await _use_upstream(gateway, upstream)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://service") as client:
+            default = await client.get(f"/{role.value}/engines")
+            assert default.status_code == 200
+            assert default.json()["schema_version"] == 2
+            assert default.json()["role"] == role.value
+            invalid = await client.get(f"/{role.value}/engines?status_filter=invalid")
+            assert invalid.status_code == 400
+            legacy = await client.get(f"/{role.value}/engines?schema_version=1")
+            assert legacy.status_code == 200
+            assert "engine_groups" in legacy.json()["models"]["model-a"]
+            assert (await client.get(f"/{role.value}/health")).status_code == 200
+            generated = await client.post(f"/{role.value}/generate", json={"model": "model-a", "input_ids": [1]})
+            assert generated.json() == {"text": "ok"}
+            assert len(owner.traces) == 1 and not owner.inflight
+    finally:
+        await InferenceGateway.close(gateway)
+
+
+@pytest.mark.asyncio
+async def test_public_genrm_gateway_adapts_messages_locally_under_task_permit(monkeypatch):
+    from fastapi import FastAPI
+
+    from relax.components.inference_gateway import InferenceGatewayService
+    from relax.utils.data import processing_utils
+
+    def apply_template(messages, *, return_dict=True, **kwargs):
+        tokens = [4, 5]
+        return {"input_ids": tokens, "attention_mask": [1, 1]} if return_dict else tokens
+
+    tokenizer = SimpleNamespace(apply_chat_template=apply_template)
+    monkeypatch.setattr(processing_utils, "load_tokenizer", lambda *args, **kwargs: tokenizer)
+    owner = _Owner(lambda: _snapshot(role=Role.GENRM))
+    config = SimpleNamespace(
+        _rollout_engine_manager=owner,
+        _genrm_instances_resolved={
+            "model-a": {"model_path": "judge", "sampling_config": {"temperature": 0.3, "max_response_len": 16}}
+        },
+    )
+    cls = InferenceGatewayService.func_or_class
+    gateway = object.__new__(cls)
+    # Run the deployment's actual constructor without starting Serve infrastructure.
+    await cls.__init__(gateway, None, None, 0, config, "genrm")
+    payloads = []
+
+    def upstream(request):
+        assert owner.inflight
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json={"text": "  approved  "})
+
+    await _use_upstream(gateway, upstream)
+    app = FastAPI()
+    app.add_api_route("/genrm/generate", gateway.generate, methods=["POST"])
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://service") as client:
+            response = await client.post(
+                "/genrm/generate", json={"model": "model-a", "messages": [], "sampling_params": {"temperature": 0.7}}
+            )
+        assert response.json() == {"response": "approved"}
+        assert payloads[0]["input_ids"] == [4, 5]
+        assert payloads[0]["sampling_params"]["temperature"] == 0.7
+        assert not owner.inflight
+    finally:
+        await InferenceGateway.close(gateway)

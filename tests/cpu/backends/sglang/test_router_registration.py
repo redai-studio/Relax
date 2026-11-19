@@ -850,3 +850,76 @@ def test_external_shutdown_requires_router_removal(monkeypatch, sglang_engine_mo
         with pytest.raises(RuntimeError, match="removal is unconfirmed"):
             engine.shutdown()
     unregister.assert_called_once_with(wait_for_removal=True, timeout=5.0)
+
+
+@pytest.mark.parametrize("exit_known", [False, True])
+def test_shutdown_accepts_already_exited_server(monkeypatch, sglang_engine_module, exit_known):
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=5)
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = False
+    engine.process = SimpleNamespace(pid=child.pid, exitcode=0 if exit_known else None)
+    if exit_known:
+        import psutil
+
+        monkeypatch.setattr(psutil, "Process", lambda pid: pytest.fail("Reaped child PID may already be reused"))
+    monkeypatch.setattr(engine, "unregister_from_router", lambda **kwargs: True)
+    try:
+        engine.shutdown()
+        assert engine._server_exit_confirmed
+        engine.shutdown()
+    finally:
+        engine.process = None
+
+
+def test_shutdown_tolerates_child_exit_during_kill(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    import psutil
+
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = False
+    engine.process = SimpleNamespace(pid=123)
+    parent, child = Mock(pid=123), Mock(pid=124)
+    parent.children.return_value = [child]
+    child.children.return_value = []
+    child.kill.side_effect = psutil.NoSuchProcess(124)
+    monkeypatch.setattr(psutil, "Process", lambda pid: parent)
+    wait = Mock(return_value=([parent, child], []))
+    monkeypatch.setattr(psutil, "wait_procs", wait)
+    monkeypatch.setattr(engine, "unregister_from_router", lambda **kwargs: True)
+    try:
+        engine.shutdown()
+        parent.kill.assert_called_once()
+        child.kill.assert_called_once()
+        assert set(wait.call_args.args[0]) == {parent, child}
+        assert engine._server_exit_confirmed
+    finally:
+        engine.process = None
+
+
+def test_server_health_failure_retains_started_process_on_engine(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    module = sglang_engine_module
+    process = Mock()
+    owner = SimpleNamespace()
+    monkeypatch.setattr(
+        module, "multiprocessing", SimpleNamespace(set_start_method=Mock(), Process=Mock(return_value=process))
+    )
+
+    def fail_health(**kwargs):
+        assert owner.process is process
+        raise TimeoutError("health unavailable")
+
+    monkeypatch.setattr(module, "_wait_server_healthy", fail_health)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    args = SimpleNamespace(node_rank=0, url=lambda: "http://worker:8000", api_key=None)
+    with pytest.raises(TimeoutError, match="health unavailable"):
+        module.launch_server_process(args, owner=owner)
+    assert owner.process is process
+    process.start.assert_called_once()

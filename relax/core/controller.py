@@ -42,7 +42,6 @@ from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
-    maybe_start_managed_opd_teacher,
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
 )
@@ -305,7 +304,7 @@ class Controller:
         if getattr(self.config, "disable_s3_model_cleanup", False):
             logger.info("S3 model SHM cleanup is disabled")
             return
-        if not _uses_s3_model_prefetch(self.config):
+        if not _uses_s3_model_prefetch(self.config) and not getattr(self, "_shared_inference_startup", False):
             return
         if not force and not _can_cleanup_s3_model_weights(self.config, self.serve_dict):
             logger.info("Keeping S3 model weights in SHM because the rollout load plan may retain SHM-backed weights")
@@ -1266,13 +1265,7 @@ class Controller:
         from relax.distributed.ray.inference_handle import shared_task_enabled
 
         self._shared_inference_startup = shared_task_enabled(self.config)
-        if self._shared_inference_startup:
-            teacher_pg, self._teacher_manager = None, None
-        else:
-            teacher_pg, self._teacher_manager = maybe_start_managed_opd_teacher(
-                self.config,
-                runtime_env=self.runtime_env,
-            )
+        self._teacher_manager = None
 
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
@@ -1297,7 +1290,7 @@ class Controller:
             self._shared_inference_startup
             and self.config.colocate
             and "rollout" in role_names
-            and bool(getattr(self.config, "_genrm_instances_resolved", None) or "teacher" in self.config.resource)
+            and bool(role_names & {"teacher", GENRM_ROLE})
         )
         shared_colocate = actor_rollout_colocate or shared_inference_colocate
 
@@ -1329,11 +1322,11 @@ class Controller:
         relax_utils.report_train_start(_build_train_start_config(self.config))
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
+        if self._shared_inference_startup and shared_colocate and "teacher" in self.config.resource:
+            actor_rollout_pg_roles.append("teacher")
         self._validate_gpu_resources(roles_to_create, shared_colocate, actor_rollout_pg_roles)
 
-        if teacher_pg is not None:
-            shared_pg = teacher_pg
-        elif shared_colocate and not self.config.hybrid:
+        if shared_colocate and not self.config.hybrid:
             shared_pg = create_placement_group(
                 num_gpus=self.config.resource["actor"][1],
                 node_group_affinity=self.config.enable_affinity,
@@ -1490,8 +1483,11 @@ class Controller:
             if task_refs:
                 logger.info(f"Started {len(task_refs)} services in parallel: {service_names}")
 
+                # Keep explicit tasks so a failed producer cannot leave sibling
+                # consumers waiting on rows that will never be published.
+                service_tasks = [asyncio.ensure_future(ref) for ref in task_refs]
                 try:
-                    await asyncio.gather(*task_refs)
+                    await asyncio.gather(*service_tasks)
                     if (
                         not getattr(self.config, "disable_eval_async_judge", False)
                         and ROLES.rollout in self.serve_dict
@@ -1504,12 +1500,23 @@ class Controller:
                             self._pending_task_refs.append(drain_future)
                         await asyncio.wrap_future(drain_future)
                     logger.info("Service task completed successfully")
-                except asyncio.CancelledError as e:
-                    if not self._restarting:
-                        raise
-                    raise RuntimeError("Service task cancelled for recovery") from e
-                except Exception as e:
-                    raise RuntimeError(f"Service task failed: {e}")
+                except (Exception, asyncio.CancelledError) as e:
+                    if getattr(self.config, "_inference_phase_coordinator", None) is not None:
+                        for task in service_tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*service_tasks, return_exceptions=True)
+                        # Request cancellation does not join background training
+                        # threads. Explicitly require each deployment to stop.
+                        await asyncio.wait_for(
+                            asyncio.gather(*(service.handle.stop.remote() for service in self.serve_dict.values())),
+                            timeout=30,
+                        )
+                    if isinstance(e, asyncio.CancelledError):
+                        if not self._restarting:
+                            raise
+                        raise RuntimeError("Service task cancelled for recovery") from e
+                    raise RuntimeError(f"Service task failed: {e}") from e
                 finally:
                     with self._pending_task_refs_lock:
                         self._pending_task_refs.clear()
@@ -1579,35 +1586,38 @@ class Controller:
             return False
 
     def _dispose_shared_inference_task(self) -> bool:
-        """Close separate role owners before releasing their borrowed PGs."""
         config = getattr(self, "config", None)
-        if config is None:
-            return False
         if getattr(self, "_inference_cleanup_confirmed", False):
             self._release_pending_inference_services()
             return True
-        owned = any(
-            getattr(config, name, None)
-            for name in (
-                "_inference_phase_coordinator",
-                "_rollout_engine_manager",
-                "_shared_startup_pending_owners",
-            )
-        )
-        if not owned and not getattr(self, "_pending_inference_pg_services", None):
-            return False
-        from relax.distributed.ray.shared_task_startup import shutdown_shared_task
+        coordinator = getattr(config, "_inference_phase_coordinator", None)
+        if coordinator is None:
+            from relax.distributed.ray.shared_task_startup import retry_shared_startup_cleanup
 
-        # Late service deployments must not attach after teardown has started.
-        config._inference_startup_retired = True
-        shutdown_shared_task(config)
+            cleaned = retry_shared_startup_cleanup(config)
+            if cleaned or getattr(self, "_pending_inference_pg_services", None):
+                self._inference_cleanup_confirmed = True
+                config._inference_startup_retired = True
+                vars(self).setdefault("_retired_inference_tokens", set()).add(
+                    getattr(config, "_inference_startup_token", None)
+                )
+                self._release_pending_inference_services()
+                return True
+            return False
+        from relax.distributed.ray.inference_manager import rollback_static_inference_manager
+
+        ray.get(coordinator.switch.remote("startup"), timeout=600)
+        if self.serve_dict.get(ROLES.rollout) is None or not self._dispose_rollout_manager():
+            # A failed deployment may have no usable Serve handle, but its
+            # root task handle remains the authoritative cleanup owner.
+            rollback_static_inference_manager(config._rollout_engine_manager)
         self._inference_cleanup_confirmed = True
+        config._inference_startup_retired = True
         vars(self).setdefault("_retired_inference_tokens", set()).add(
             getattr(config, "_inference_startup_token", None)
         )
         for name in (
             "_rollout_engine_manager",
-            "_rollout_worker",
             "_genrm_managers",
             "_teacher_inference_managers",
             "_teacher_inference_manager_handle",
@@ -1670,7 +1680,7 @@ class Controller:
         # Agentic startup launches its Router in this driver process before
         # creating RolloutManager, so actor-side disposal cannot stop it.
         try:
-            from relax.distributed.ray.rollout import stop_launched_routers
+            from relax.distributed.ray.policy_engine_pool import stop_launched_routers
 
             stopped_routers = stop_launched_routers()
             if stopped_routers > 0:
@@ -1953,7 +1963,7 @@ class Controller:
         # while other locally launched Rollout Routers belong to the Manager.
         driver_stopped_routers = 0
         try:
-            from relax.distributed.ray.rollout import stop_launched_routers
+            from relax.distributed.ray.policy_engine_pool import stop_launched_routers
 
             driver_stopped_routers = stop_launched_routers()
         except Exception as e:

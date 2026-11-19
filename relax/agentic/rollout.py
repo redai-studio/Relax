@@ -20,6 +20,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Deque, List, Optional, Tuple, cast
 
+import ray
 from tqdm import tqdm
 
 from relax.agentic import format_agentic_event
@@ -44,9 +45,12 @@ from relax.agentic.stage_recorder import (
     STAGE_SHUTDOWN,
     StageRecorder,
 )
-from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
+from relax.distributed.ray.policy_engine_pool import _log_rollout_data
+from relax.engine.inference.phase_plans import deferred_genrm_enabled
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.deferred import PublicationReceipt
+from relax.engine.rollout.deferred_opd import DeferredOpdSession, deferred_opd_active
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
@@ -73,6 +77,8 @@ class _StepContext:
 
     rollout_id: int
     final_backfill: bool
+    deferred_session: DeferredOpdSession | None = None
+    staged_batches: list[TransferBatch] = field(default_factory=list)
     output_groups: List[List[Sample]] = field(default_factory=list)
     tq_put_tasks: List[asyncio.Task[None]] = field(default_factory=list)
     progress: Any = None
@@ -223,7 +229,7 @@ async def _run_group(
             if observation is not None:
                 observation.terminal_drop_recorded = True
             return None
-        if opd_manager is None:
+        if opd_manager is None or deferred_opd_active(reward_domain.args):
             return scored_group
         from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
@@ -314,6 +320,33 @@ class AgenticResidentPipeline:
             # following ID to drain physical debt without opening a partition.
             final_backfill=final_backfill,
         )
+
+        async def publish(
+            args: Any,
+            payload: Any,
+            count: int,
+            partition_id: int,
+            client: Any,
+            *,
+            is_last: bool,
+            operation_id: str,
+        ) -> PublicationReceipt | None:
+            batch = context.staged_batches.pop(0)
+            if batch[0] != partition_id or batch[2] != is_last:
+                raise RuntimeError("Deferred Agentic transfer identity changed")
+            return await self._transfer_and_record(context, partition_id, batch[1], is_last, operation_id=operation_id)
+
+        if deferred_genrm_enabled(self.args) or (self._opd_manager is not None and deferred_opd_active(self.args)):
+            from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+
+            context.deferred_session = DeferredOpdSession.maybe_create(
+                self.args,
+                rollout_id,
+                self._data_system_client,
+                self._opd_manager,
+                publish=publish,
+                encode_multimodal_inputs=_encode_multimodal_inputs,
+            )
         self._active_step = context
         if self.runtime_domain.teacher_routing_enabled:
             self._opd_manager.response_stats.new_window()
@@ -546,6 +579,9 @@ class AgenticResidentPipeline:
         partition_id, groups, is_last = batch
         if self._stage_recorder.enabled:
             context.observed_group_ids.update(group.group_id for group in groups)
+        if context.deferred_session is not None:
+            context.staged_batches.append(batch)
+            return
         task = asyncio.create_task(
             self._transfer_and_record(context, partition_id, groups, is_last),
             name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups",
@@ -559,7 +595,8 @@ class AgenticResidentPipeline:
         partition_id: int,
         groups: Tuple[GroupExport, ...],
         is_last: bool,
-    ) -> None:
+        operation_id: str | None = None,
+    ) -> PublicationReceipt | None:
         """Cross the TQ boundary, then record the samples that made it.
 
         The completed boundary is emitted only after ``async_put`` returns: a
@@ -587,13 +624,14 @@ class AgenticResidentPipeline:
             )
             if self._stage_recorder.enabled:
                 await self._record_rollout(context)
-            await _transfer_batch_to_data_system(
+            receipt = await _transfer_batch_to_data_system(
                 args=self.args,
                 batch_samples=[group.samples for group in groups],
                 partition_id=partition_id,
                 data_system_client=self._data_system_client,
                 is_last=is_last,
                 on_put_started=on_put_started,
+                **({"operation_id": operation_id} if operation_id is not None else {}),
             )
         except BaseException as error:
             if put_started:
@@ -617,13 +655,15 @@ class AgenticResidentPipeline:
             await event
             raise
         if not self._stage_recorder.enabled:
-            return
+            return receipt
         await self._stage_recorder.record_queued(
             [sample for group in groups for sample in group.samples],
             rollout_id=context.rollout_id,
             partition_id=partition_id,
             group_ids={sample.sample_export_id: group.group_id for group in groups for sample in group.samples},
         )
+
+        return receipt
 
     async def _await_tq_puts(self, context: _StepContext) -> None:
         """Cross the TQ durability barrier for batches owned by this step."""
@@ -660,7 +700,7 @@ class AgenticResidentPipeline:
         # partition, so it cannot leave debt for that next rollout to fill.
         if self.args.fully_async and self.args.max_staleness > 0 and not context.final_backfill:
             return (
-                get_local_rollout_manager().training_weight_updating
+                ray.get(self.args._inference_manager_handle.pool_call.remote("get_training_weight_updating"))
                 and self.transfer_domain.previous_debt == 0
                 and debt <= len(self.runtime_domain.interrupted_group_ids)
             )
@@ -681,7 +721,8 @@ class AgenticResidentPipeline:
         # Dynamic close has two durability barriers: base writes, then pause,
         # completed aligned surplus, seal, and the remaining writes.
         await self._await_tq_puts(context)
-        self.transfer_domain.release_finished_partitions()
+        if context.deferred_session is None:
+            self.transfer_domain.release_finished_partitions()
 
         await finish_before_cancellation(
             self.runtime_domain.pause_generation(),
@@ -703,6 +744,28 @@ class AgenticResidentPipeline:
             # its remaining TQ batches. Reward-inflight Groups stay resident.
             await self._seal_dynamic_partition(context)
 
+        if context.deferred_session is not None:
+            for partition_id, groups, is_last in tuple(context.staged_batches):
+                await context.deferred_session.transfer(
+                    self.args,
+                    [group.samples for group in groups],
+                    len(groups),
+                    partition_id,
+                    self._data_system_client,
+                    is_last=is_last,
+                    scoring_ids=[
+                        f"{group.group_id}/{session_position}/{export_position}"
+                        for group in groups
+                        for session_position, session in enumerate(group.sessions)
+                        for export_position, _ in enumerate(session.exports)
+                    ],
+                )
+            try:
+                await context.deferred_session.flush()
+            except BaseException:
+                await finish_before_cancellation(context.deferred_session.cancel(), "agentic-deferred-cancel")
+                raise
+            self.transfer_domain.release_finished_partitions()
         await self.runtime_domain.trim_memory()
         return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
 
@@ -725,7 +788,8 @@ class AgenticResidentPipeline:
         for batch in self.transfer_domain.finish_current_partition(surplus):
             self._submit_tq_batch(context, batch)
         await self._await_tq_puts(context)
-        self.transfer_domain.release_finished_partitions()
+        if context.deferred_session is None:
+            self.transfer_domain.release_finished_partitions()
 
     async def _lease_prepared_groups(self, context: _StepContext) -> None:
         """Open generation for the ready FIFO prefix visible at this check.
@@ -790,6 +854,13 @@ class AgenticResidentPipeline:
         context = self._active_step
         tq_put_tasks: Tuple[asyncio.Task[None], ...] = ()
         if context is not None:
+            if context.deferred_session is not None:
+                try:
+                    await context.deferred_session.cancel()
+                except BaseException as error:
+                    first_error = error
+                self._finalized_groups.extend(group for _, groups, _ in context.staged_batches for group in groups)
+                context.staged_batches.clear()
             tq_put_tasks = tuple(context.tq_put_tasks)
         for task in tq_put_tasks:
             task.cancel()

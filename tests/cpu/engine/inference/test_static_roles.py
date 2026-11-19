@@ -3,7 +3,6 @@
 """Auxiliary entry points use real snapshots/executor with HTTP isolated."""
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import httpx
@@ -22,6 +21,7 @@ def _owner(role):
     pool.backend = SimpleNamespace(
         all_engines=[object(), object()],
         nodes_per_engine=2,
+        router=SimpleNamespace(ready=True, url="http://router:3000"),
         _engine_addr_and_ports={0: {"host": "engine", "port": 16000}},
     )
     owner.pool = pool
@@ -39,34 +39,6 @@ def _owner(role):
 
 
 @pytest.mark.asyncio
-async def test_genrm_managed_request_resolves_current_head_and_preserves_sampling():
-    from relax.components.genrm import GenRM
-
-    owner, remote = _owner(Role.GENRM)
-    replica = object.__new__(GenRM.func_or_class)
-    replica._managed = True
-    replica.genrm_managers = {"judge": remote}
-    replica.instance_specs = {"judge": {"sampling_config": {"temperature": 0.4}}}
-    replica.tokenizers = {"judge": SimpleNamespace(apply_chat_template=lambda *a, **k: [1, 2])}
-    sent = []
-
-    def respond(request):
-        sent.append(request)
-        return httpx.Response(200, json={"text": "score"})
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        replica._http_client = client
-        assert await replica._call_engine("judge", [], {"temperature": 0.7}) == {"text": "score"}
-        owner.pool.backend._engine_addr_and_ports[0]["port"] = 16001
-        await replica._call_engine("judge", [])
-    assert [request.url.port for request in sent] == [16000, 16001]
-    assert json.loads(sent[0].content)["sampling_params"]["temperature"] == 0.7
-    assert json.loads(sent[1].content)["sampling_params"]["temperature"] == 0.4
-    assert len((await owner.snapshot(Role.GENRM)).models[0].replicas) == 1
-    assert not owner.ledger.permits
-
-
-@pytest.mark.asyncio
 async def test_managed_teacher_total_timeout_aborts_and_returns_permit(monkeypatch):
     from relax.engine.rollout.on_policy_distillation import OpdManager
     from relax.utils import http_utils
@@ -81,6 +53,8 @@ async def test_managed_teacher_total_timeout_aborts_and_returns_permit(monkeypat
         requests.append(request)
         if request.url.path == "/generate":
             await asyncio.Event().wait()
+        if request.url.path == "/workers":
+            return httpx.Response(200, json={"workers": [{"url": "http://engine:16000"}]})
         return httpx.Response(200, json={})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -92,8 +66,8 @@ async def test_managed_teacher_total_timeout_aborts_and_returns_permit(monkeypat
             2,
         )
     assert result is None
-    assert [request.url.path for request in requests] == ["/generate", "/abort_request"]
-    assert all(request.url.host == "engine" for request in requests)
+    assert [request.url.path for request in requests] == ["/generate", "/workers", "/abort_request"]
+    assert [request.url.host for request in requests] == ["router", "router", "engine"]
     assert not owner.ledger.permits
 
 
@@ -110,7 +84,7 @@ def test_static_genrm_configuration_has_no_policy_weight_receiver():
     model = spec.models[0]
     assert model.weight_source is WeightSource.STATIC
     assert not model.needs_dcs
-    assert model.route_mode is RouteMode.DIRECT
+    assert model.route_mode is RouteMode.SGLANG_ROUTER
     assert len(model.engine_groups[0].topology.replicas) == 2
     args.genrm_num_gpus = 3
     with pytest.raises(ValueError, match="complete replicas"):
@@ -119,7 +93,7 @@ def test_static_genrm_configuration_has_no_policy_weight_receiver():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", [Role.GENRM, Role.TEACHER])
-async def test_static_requests_rotate_across_two_replicas(role):
+async def test_static_requests_use_model_router_for_two_replicas(role):
     from relax.engine.inference.executor import InferenceRequestExecutor
 
     owner, remote = _owner(role)
@@ -135,41 +109,18 @@ async def test_static_requests_rotate_across_two_replicas(role):
         executor = InferenceRequestExecutor(role, remote, client)
         for _ in range(4):
             await executor.generate_json({"input_ids": [1]})
-    assert ports == [16000, 16001, 16000, 16001]
+    assert ports == [3000, 3000, 3000, 3000]
     assert not owner.ledger.permits
 
 
-def test_genrm_factory_assigns_disjoint_unequal_slices_and_rolls_back(monkeypatch):
-    import ray
-
-    import relax.distributed.ray.inference_manager as manager_module
+def test_genrm_factory_consumes_task_routes_and_never_allocates_new_owners():
     from relax.distributed.ray.placement_group import create_genrm_managers
 
-    specs = {
-        key: dict(model_path=key, num_gpus=gpus, num_gpus_per_engine=1, engine_config={}, sampling_config={})
-        for key, gpus in (("a", 1), ("b", 2))
-    }
-    args = SimpleNamespace(colocate=False, _genrm_instances_resolved=specs)
-    launched = []
-    closed = []
-    killed = []
-    first = SimpleNamespace(dispose=SimpleNamespace(remote=lambda: closed.append("a")))
-
-    def allocate(instance_args, role, binding, **options):
-        launched.append((instance_args.genrm_model_path, options["bundle_offset"]))
-        assert role == "genrm"
-        if instance_args.genrm_model_path == "b":
-            raise RuntimeError("second model cannot start")
-        return first
-
-    monkeypatch.setattr(manager_module, "create_static_inference_manager", allocate)
-    monkeypatch.setattr(ray, "get", lambda ref, **kwargs: ref)
-    monkeypatch.setattr(ray, "kill", killed.append)
-    with pytest.raises(RuntimeError, match="second model"):
-        create_genrm_managers(args, "service-pg")
-    assert launched == [("a", 0), ("b", 1)]
-    assert closed == ["a"]
-    assert killed == [first]
+    handles = {"a": object(), "b": object()}
+    args = SimpleNamespace(_genrm_managers=handles)
+    assert create_genrm_managers(args, "service-pg") is handles
+    with pytest.raises(RuntimeError, match="task InferenceManager"):
+        create_genrm_managers(SimpleNamespace(), "service-pg")
 
 
 def test_teacher_factory_injects_public_owner_for_independent_requests(monkeypatch):
@@ -178,10 +129,16 @@ def test_teacher_factory_injects_public_owner_for_independent_requests(monkeypat
     import relax.distributed.ray.inference_manager as manager_module
     from relax.utils.opd.opd_utils import create_managed_opd_teacher_manager
 
-    teacher = SimpleNamespace(get_urls=SimpleNamespace(remote=lambda: ["http://engine/generate"]))
+    teacher = SimpleNamespace(
+        snapshot=SimpleNamespace(
+            remote=lambda role: SimpleNamespace(
+                models=[SimpleNamespace(replicas=[SimpleNamespace(base_url="http://engine")])]
+            )
+        )
+    )
     captured = []
 
-    def allocate(args, role, **options):
+    def allocate(args, role, binding, **options):
         captured.append((role, options["num_replicas"], options["gpus_per_replica"]))
         return teacher
 
@@ -196,10 +153,10 @@ def test_teacher_factory_injects_public_owner_for_independent_requests(monkeypat
 
 @pytest.mark.parametrize("fully_async,sizes", [(False, (2,)), (True, (2,)), (False, (1, 2))])
 def test_dedicated_genrm_engine_placement_matches_recorded_slices(fully_async, sizes):
-    from relax.distributed.ray.genrm import GenRMManager
+    from relax.distributed.ray.engine_pool import EnginePool
     from relax.engine.inference.placement import PlacementGroupView, PlacementOwner, PlacementPlanner
 
-    implementation = GenRMManager.__ray_metadata__.modified_class
+    implementation = EnginePool
     total = sum(sizes)
     binding = ("dedicated-genrm", list(range(total)), list(range(total)))
     planner = PlacementPlanner()
@@ -217,6 +174,7 @@ def test_dedicated_genrm_engine_placement_matches_recorded_slices(fully_async, s
             genrm_sampling_config={},
         )
         backend = implementation.__new__(implementation)
+        backend.role = "genrm"
         backend.args = args
         backend.pg = binding
         backend.bundle_offset = offset
@@ -246,7 +204,7 @@ def test_dedicated_genrm_engine_placement_matches_recorded_slices(fully_async, s
 
 
 @pytest.mark.asyncio
-async def test_managed_teacher_group_affinity_uses_current_replica(monkeypatch):
+async def test_managed_teacher_groups_use_current_model_router(monkeypatch):
     from relax.engine.rollout.on_policy_distillation import OpdManager
     from relax.utils import http_utils
     from relax.utils.types import Sample
@@ -267,7 +225,7 @@ async def test_managed_teacher_group_affinity_uses_current_replica(monkeypatch):
         await worker._post_managed_teacher(remote, {}, Sample(index=1, group_index=1))
         await worker._post_managed_teacher(remote, {}, Sample(index=2, group_index=1))
         await worker._post_managed_teacher(remote, {}, Sample(index=3, group_index=0))
-    assert sent == ["other", "other", "engine"]
+    assert sent == ["router", "router", "router"]
     assert not owner.ledger.permits
 
 
@@ -302,101 +260,3 @@ async def test_policy_abort_cancels_managed_admission_wait(monkeypatch):
             await asyncio.wait_for(task, 2)
     assert not sent
     assert not owner.ledger.permits
-
-
-@pytest.mark.parametrize("role", [Role.GENRM, Role.TEACHER])
-@pytest.mark.parametrize("deferred", [False, True])
-def test_shared_static_pool_borrows_binding_and_records_selected_phase(monkeypatch, role, deferred):
-    from relax.distributed.ray.genrm import GenRMManager
-    from relax.distributed.ray.teacher_manager import TeacherManager
-    from relax.engine.inference.placement import PlacementPlanner, ProbedPlacementGroup
-
-    args = SimpleNamespace(
-        num_gpus_per_node=8,
-        colocate=True,
-        fully_async=False,
-        rollout_num_gpus=8 if deferred else 4,
-        genrm_model_path="judge",
-        genrm_num_gpus_per_engine=2,
-        genrm_num_gpus=2,
-        genrm_engine_config={},
-        genrm_sampling_config={},
-        _genrm_instances_resolved=[{}] if role is Role.GENRM else [],
-        _genrm_colocate_with_rollout=deferred and role is Role.GENRM,
-        defer_reward_to_post_process=deferred,
-        use_opd=True,
-        opd_type="sglang",
-        teacher_hf_checkpoint="teacher",
-        hybrid=False,
-        use_critic=False,
-        resource={"actor": [1, 8], "rollout": [1, 8 if deferred else 4], "teacher": [1, 2]},
-    )
-    binding = ProbedPlacementGroup(
-        SimpleNamespace(bundle_count=8), list(range(8)), list(range(8)), ("node",) * 8, tuple(range(8))
-    )
-    implementation = (GenRMManager if role is Role.GENRM else TeacherManager).__ray_metadata__.modified_class
-    releases = []
-
-    def initialize(backend, backend_args, *unused, **options):
-        backend.args = backend_args
-        if role is Role.GENRM:
-            backend.pg = unused[0]
-            backend.bundle_offset = options.get("bundle_offset", 0)
-            backend.dedicated_pg = options["dedicated_pg"]
-            backend.num_gpu_per_engine = 2
-        else:
-            assert options["shared_pg"]
-            backend._shared_pg = True
-            backend._shared_pg_tuple = options["pg"]
-            backend._bundle_offset = options["bundle_offset"]
-            backend.nodes_per_engine = 1
-            backend.gpus_per_replica = 2
-            backend._engine_placements = {0: (options["pg"], False)}
-
-    monkeypatch.setattr(implementation, "__init__", initialize)
-
-    def offload(backend):
-        if role is Role.TEACHER:
-            from relax.utils.opd.opd_utils import build_teacher_overrides
-
-            overrides = build_teacher_overrides(backend.args, colocate_sync=True)
-            assert overrides["enable_memory_saver"]
-            assert backend.args._requires_weights_cpu_backup
-        releases.append(backend)
-
-    monkeypatch.setattr(implementation, "offload", offload)
-    # GenRM receives an absolute bundle offset; legacy Teacher offsets are
-    # relative to the rollout region, which deferred startup sets to zero.
-    offset = 1 if deferred or role is Role.TEACHER else 5
-    pool = StaticInferencePool(
-        role, args, binding, {"num_replicas": 1, "gpus_per_replica": 2, "bundle_offset": offset}
-    )
-    planner = PlacementPlanner()
-    pool.record_placement(planner)
-    allocation = planner.allocations()[0]
-    assert allocation.bundle_indices == (1 if deferred else 5,)
-    assert allocation.phase == (role.value if deferred else "inference")
-    assert not allocation.owner.removable
-    assert bool(releases) is deferred
-    assert args.rollout_num_gpus == (8 if deferred else 4)
-
-
-@pytest.mark.asyncio
-async def test_static_start_sleeping_keeps_admission_closed_and_skips_health_generation(monkeypatch):
-    def initialize(pool, *args):
-        pool.start_sleeping = True
-
-    def unexpected(*args):
-        pytest.fail("A sleeping static model must not generate or recover during another phase")
-
-    monkeypatch.setattr(StaticInferencePool, "__init__", initialize)
-    monkeypatch.setattr(StaticInferencePool, "record_placement", lambda *args: None)
-    monkeypatch.setattr(StaticInferencePool, "unhealthy_ranks", unexpected)
-    monkeypatch.setattr(StaticInferencePool, "recover", unexpected)
-    owner = InferenceManager.__ray_metadata__.modified_class()
-    await owner.start_static("teacher", None, None, {})
-    assert not owner.memory_ready
-    assert owner.state is LifecycleState.SLEEPING
-    assert "memory" in owner.ledger.fences
-    await owner.recover_static()
-    assert owner.state is LifecycleState.SLEEPING

@@ -62,7 +62,7 @@ ______________________________________________________________________
                                        │ HTTP REST API
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              Rollout Service (relax/components/rollout.py)          │
+│              Role Gateway (components/inference_gateway.py)         │
 │                    Ray Serve Ingress + FastAPI                      │
 │                                                                     │
 │    POST /scale_out        GET /engines       POST /scale_in         │
@@ -72,7 +72,7 @@ ______________________________________________________________________
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│      RolloutManager (relax/distributed/ray/rollout.py)              │
+│      Task InferenceManager -> PolicyEnginePool                      │
 │                  Ray Actor                                          │
 │                                                                     │
 │    scale_out()          scale_in()          get_engines_info()      │
@@ -98,8 +98,8 @@ ______________________________________________________________________
 
 | 组件                | 职责                                                       |
 |---------------------|------------------------------------------------------------|
-| **Rollout Service** | FastAPI 层，接收 HTTP 请求，转发给 RolloutManager          |
-| **RolloutManager**  | 核心执行层，管理引擎生命周期、权重同步、状态机             |
+| **Rollout Service** | 统一 Gateway 接收 HTTP；任务 Manager 持有准入并委托扩缩容          |
+| **Task InferenceManager / PolicyEnginePool**  | 任务唯一控制面；普通池执行引擎生命周期、权重同步与扩缩容             |
 | **SGLang Router**   | 请求路由层，负责将推理请求分发到各引擎（cache-aware 策略） |
 | **SGLang Engine**   | 推理引擎，执行 LLM 生成任务                                |
 | **DCS Coordinator** | 权重分发服务，仅管理初始引擎的拓扑信息和权重广播           |
@@ -244,8 +244,8 @@ curl -X POST http://<rollout-host>/rollout/scale_out_cancel \
 **工作流程**：
 
 1. **引擎启动时跳过 DCS 注册**：Scaled-out 引擎设置 `skip_dcs_registration=True`，不注册到 DCS Coordinator
-2. **引擎立即注册到 Router**：健康检查通过后立即注册到 SGLang Router，可开始接收请求（使用旧权重）
-3. **Actor 触发权重同步**：在 Actor 的 `update_weights_fully_async()` 完成后，调用 `RolloutManager.sync_weights_for_scaled_out_engines()`
+2. **引擎立即注册到 Router**：健康检查及 Router 注册只是前提；副本所有节点确认所需权重版本后，任务控制面才允许推理准入
+3. **Actor 触发权重同步**：在 Actor 的 `update_weights_fully_async()` 完成后，通过任务 Manager 句柄调用 `sync_weights_for_scaled_out_engines()`
 4. **权重同步**：从 seed engine（初始引擎）通过 NCCL Broadcast 直接传输权重到 scaled-out 引擎
 
 **前提条件**：

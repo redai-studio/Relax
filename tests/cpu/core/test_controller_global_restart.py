@@ -127,7 +127,7 @@ def test_global_restart_cleans_both_router_owners(
 
     stop_driver = Mock(side_effect=lambda: events.append("stop driver router") or driver_stopped)
     monkeypatch.setitem(
-        sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_driver)
+        sys.modules, "relax.distributed.ray.policy_engine_pool", SimpleNamespace(stop_launched_routers=stop_driver)
     )
 
     monkeypatch.setattr(controller_module, "recovery_load_path", Mock())

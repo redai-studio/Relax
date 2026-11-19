@@ -489,3 +489,45 @@ def test_real_controller_initialization_wires_health_callback_and_preserves_rest
     assert not done.is_set()
     assert consumed.is_set()
     assert not controller._restarting
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_shared_publication_failure_cancels_and_joins_consumers(cancelled):
+    ctrl = controller_fixture()
+    ctrl.config._inference_phase_coordinator = object()
+    consumer_started = asyncio.Event()
+    consumer_exited = []
+    committed = []
+    stopped = []
+
+    async def consume():
+        consumer_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            consumer_exited.append(True)
+
+    async def publish():
+        await consumer_started.wait()
+        committed.append("consumer-visible")
+        if cancelled:
+            raise asyncio.CancelledError
+        raise RuntimeError("publication outcome unknown")
+
+    async def stop():
+        assert consumer_exited == [True]
+        stopped.append(True)
+
+    handle = SimpleNamespace(stop=SimpleNamespace(remote=stop))
+    ctrl.serve_dict = {
+        "producer": SimpleNamespace(run=publish, role="producer", handle=handle),
+        "consumer": SimpleNamespace(run=consume, role="consumer", handle=handle),
+    }
+    expected = asyncio.CancelledError if cancelled else RuntimeError
+    with pytest.raises(expected):
+        ctrl.training_loop()
+    assert committed == ["consumer-visible"]
+    assert len(stopped) == 2
+    assert consumer_exited == [True]
+    assert ctrl._pending_task_refs == []

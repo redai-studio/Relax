@@ -125,7 +125,7 @@ args = parse_args()
 | `relax.core`                           | 实验协调       | [Controller API](./controller.md)           |
 | `relax.components.actor`               | 策略模型训练   | [Actor API](./actor.md)                     |
 | `relax.components.rollout`             | 样本生成       | [Rollout API](./rollout.md)                 |
-| `relax.components.genrm`              | 生成式奖励模型 | [GenRM API](./genrm.md)                     |
+| `relax.components.inference_gateway`              | 生成式奖励模型 | [GenRM API](./genrm.md)                     |
 | `relax.components.actor_fwd`          | log-prob 计算  | [ActorFwd API](./actor-fwd.md)              |
 | `relax.distributed.checkpoint_service` | 检查点管理     | [Checkpoint API](./checkpoint.md)           |
 | `relax.utils.metrics`                 | 指标收集       | [Metrics API](./metrics.md)                 |

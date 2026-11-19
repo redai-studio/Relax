@@ -537,9 +537,9 @@ def test_actual_global_teardown_retires_old_receiver_even_when_reinit_fails(runt
         shutdown_async_loop=lambda: trace.append("loop_shutdown"),
         time=SimpleNamespace(sleep=lambda seconds: trace.append(("sleep", seconds))),
     )
-    router = ModuleType("relax.distributed.ray.rollout")
+    router = ModuleType("relax.distributed.ray.policy_engine_pool")
     router.stop_launched_routers = lambda: 0
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", router)
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.policy_engine_pool", router)
     controller.restart_serve(Roles.actor)
 
     assert trace.index("ray_shutdown") < trace.index("ray_init")

@@ -8,8 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-
-pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
+from tests.cpu.backends.sglang.test_router_registration import sglang_engine_module as sglang_engine_module
 
 
 @pytest.mark.parametrize("node_rank", [0, 1])
@@ -58,8 +57,6 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     module = sglang_engine_module
     events = []
     http_server = ModuleType("sglang.srt.entrypoints.http_server")
-    session = Mock()
-    monkeypatch.setattr(module.os, "setsid", session)
     http_server.launch_server = Mock(side_effect=lambda *_args, **_kwargs: events.append("launch"))
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
     monkeypatch.setattr(
@@ -77,7 +74,6 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
     server_args = SimpleNamespace()
     module._launch_server_with_patches(server_args, 123)
-    session.assert_called_once_with()
 
     if parent_alive:
         assert events == ["guard", "parent_check", "launch"]
@@ -164,71 +160,6 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
     config.assert_called_once_with("/test/runtime-model")
     get.assert_called_once_with("http://localhost:1234/server_info", timeout=30)
     response.raise_for_status.assert_called_once()
-
-
-@pytest.mark.parametrize(
-    ("algorithm", "draft_model_path", "draft_revision", "external_draft", "selector"),
-    [
-        ("NEXTN", None, None, None, "all"),
-        ("NEXTN", "/policy", None, None, "all"),
-        ("NEXTN", "/policy", "other-revision", None, None),
-        ("NEXTN", "/separate-draft", None, None, None),
-        ("NEXTN", None, None, "/policy", "all"),
-        ("NEXTN", None, None, "/separate-draft", None),
-        ("EAGLE", None, None, None, None),
-        (None, None, None, None, None),
-    ],
-)
-def test_distributed_update_selects_same_checkpoint_nextn_runners(
-    monkeypatch, sglang_engine_module, algorithm, draft_model_path, draft_revision, external_draft, selector
-):
-    module = sglang_engine_module
-    args = SimpleNamespace(
-        rollout_external=external_draft is not None,
-        sglang_router_ip=None,
-        sglang_router_port=None,
-        fully_async=True,
-        rollout_num_gpus_per_engine=1,
-        coordinator_url="http://dcs",
-    )
-    create_client = Mock()
-    monkeypatch.setattr(module, "create_client", create_client)
-    engine = module.SGLangEngine(args, rank=0)
-    server_args = {
-        "node_rank": 0,
-        "host": "127.0.0.1",
-        "port": 5000,
-        "model_path": "/policy",
-        "speculative_algorithm": algorithm,
-        "speculative_draft_model_path": draft_model_path,
-        "speculative_draft_model_revision": draft_revision,
-    }
-    monkeypatch.setattr(module, "_compute_server_args", Mock(return_value=(server_args, [])))
-    monkeypatch.setattr(engine, "_init_normal", Mock())
-    monkeypatch.setattr(engine, "get_pid_and_node_id", Mock(return_value={}), raising=False)
-    if external_draft is not None:
-        actual = {**server_args, "speculative_algorithm": "EAGLE", "speculative_draft_model_path": external_draft}
-        monkeypatch.setattr(module, "_wait_server_healthy", Mock())
-        monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=actual))))
-    engine.init("127.0.0.1:6000", 5000, 6001, host="127.0.0.1", skip_router_registration=True)
-    assert create_client.call_args.kwargs["metadata"]["sync_nextn_draft"] is (selector == "all")
-
-    request = Mock(return_value={"success": True})
-    monkeypatch.setattr(engine, "_make_request", request)
-    engine.update_weights_from_distributed(
-        ["mtp.layers.0.o_proj.weight_scale_inv"], ["torch.float32"], [[1, 1]], "rollout", weight_version="7"
-    )
-    payload = {
-        "names": ["mtp.layers.0.o_proj.weight_scale_inv"],
-        "dtypes": ["float32"],
-        "shapes": [[1, 1]],
-        "group_name": "rollout",
-        "flush_cache": False,
-        "weight_version": "7",
-    }
-    if selector is not None:
-        payload["selector"] = selector
-    request.assert_called_once_with("update_weights_from_distributed", payload)
 
 
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
@@ -534,7 +465,7 @@ def test_policy_pd_routing_replay_accepts_configured_topology(monkeypatch, sglan
     assert result["enable_return_routed_experts"] is True
 
 
-@pytest.mark.parametrize("engine_class,actual_mode", [("SGLangEngine", "prefill"), ("GenRMEngine", "decode")])
+@pytest.mark.parametrize("engine_class,actual_mode", [("SGLangEngine", "prefill"), ("SGLangEngine", "decode")])
 def test_external_pd_routing_replay_registers_native_worker(
     monkeypatch, sglang_engine_module, engine_class, actual_mode
 ):
@@ -670,3 +601,41 @@ def _check_native_transport_validation(monkeypatch, actual, expected):
     else:
         validate_transport(cfg)
         assert cfg.mm_feature_transport == (expected or native_default)
+
+
+def test_genrm_role_initializes_without_policy_router_or_checkpoint_registration(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    args = SimpleNamespace(rollout_external=False)
+    engine = module.SGLangEngine(args, rank=0, role="genrm")
+    server_args = {"node_rank": 0, "host": "localhost", "port": 8000}
+    compute = Mock(return_value=(server_args, []))
+    monkeypatch.setattr(module, "_compute_genrm_server_args", compute)
+    engine._init_normal = Mock()
+    engine.init("localhost:9000", 8000, 9001, host="localhost")
+    compute.assert_called_once()
+    engine._init_normal.assert_called_once_with(server_args, apply_policy_load_plan=False)
+    assert engine.checkpoint_engine_client is None
+    assert engine._skip_router_registration is True
+    assert engine.router_port == 0
+
+
+def test_static_model_router_waits_for_healthy_regular_worker(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    engine = module.SGLangEngine(SimpleNamespace(use_slime_router=False), rank=0, role="teacher")
+    engine.node_rank = 0
+    engine.server_host, engine.server_port = "teacher", 8000
+    engine.worker_type = "regular"
+    engine.is_evicted = Mock(return_value=False)
+    posted = Mock(status_code=200)
+    posted.json.return_value = {"worker_id": "replica"}
+    monkeypatch.setattr(module.requests, "post", Mock(return_value=posted))
+    pending = Mock()
+    pending.json.return_value = {"workers": [{"url": "http://teacher:8000", "id": "replica", "is_healthy": False}]}
+    ready = Mock()
+    ready.json.return_value = {"workers": [{"url": "http://teacher:8000", "id": "replica", "is_healthy": True}]}
+    get = Mock(side_effect=[pending, ready, ready])
+    monkeypatch.setattr(module.requests, "get", get)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    assert engine.configure_model_router("router", 3000) is True
+    assert get.call_count == 3
+    assert engine._router_worker_id == "replica"

@@ -10,7 +10,7 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 
 | 属性 | 值 |
 |------|---|
-| **模块** | `relax.components.genrm` |
+| **模块** | `relax.components.inference_gateway` |
 | **部署方式** | `@serve.deployment(logging_config=...)` |
 | **入口** | FastAPI |
 
@@ -27,21 +27,18 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 
 ### 独立 GPU 资源
 
-未启用 `--colocate` 的标准 SGLang 任务通过公共推理管理器和请求执行链调用 GenRM。每个 judge 使用自己的 checkpoint 与 GPU 切片，Actor 权重更新不改变 judge 权重。请求会读取当前副本地址，因此引擎替换后可以使用新端口，避免服务持续访问旧地址。原有 `route_key` 与采样配置继续适用。
+每个任务只有一个 CPU InferenceManager，统一持有 Rollout、GenRM 和 Teacher 的模型池、准入及生命周期状态。角色句柄仅转发调用，不创建独立 Manager；独立与共置布局使用同一请求执行器。每个 judge 保持自己的 checkpoint 和 GPU 切片，不接收 Actor 权重更新。请求读取当前副本地址，保留 `route_key` 与采样配置。`/genrm/engines` 默认返回 v2，旧投影需显式使用 `?schema_version=1`；消息经 Manager 准入后由 Gateway 本地适配，不依赖命名 GenRM actor。
 
-使用自定义生命周期或生成 hook、Agentic rollout、外部 rollout 引擎的任务保留现有编排。Colocate 任务也继续使用现有 offload/onload 协调，包括训练阶段由 Actor 复用的不同推理切片。
+### 共置 GPU 布局
 
-### 共置模式
+`--colocate` 让 Actor 在训练阶段复用推理 GPU。同一个 placement group 不代表 Rollout 与 GenRM 必须占用相同 bundle：
 
-当与 Actor 共置（共享 GPU 资源）时，GenRM 支持卸载/加载操作：
+- **Split**（`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`）：Rollout 与 GenRM 使用不同 bundle，可以在线评分。八卡训练使用 `--resource '{"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]}'` 可选择 4+4 切分。
+- **Shared**（`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`）：Rollout 与 GenRM 分时复用相同 bundle。需要设置 `--defer-reward-to-post-process` 及兼容的 `--custom-reward-post-process-path`。生成结束且请求排空后才能加载 judge，评分完成后才能发布数据；降低 `mem_fraction_static` 不能替代阶段切换。
 
-- **Offload（卸载）**：在 Actor 训练前释放 GPU 显存
-- **Onload（加载）**：在 rollout 前将模型权重重新加载到 GPU
+托管共享路径由 phase coordinator 负责排空、卸载和加载。示例 `post_process_genrm_swap.py` 要求在该阶段内执行，只评分而不自行切换显存，judge 失败会向上传播，不再降为零奖励。只有整批所需奖励齐全且为有限数值时才发布；缺失发布确认会使本次 attempt 失败，不会重放写入。
 
-根据 GPU 分配，框架会自动识别两种 colocate 子模式：
-
-- **Split**（`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`）：GenRM 与 Rollout 占用不重叠的 bundle。
-- **Shared**（`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`）：GenRM 与 Rollout 占用相同的 bundle，通过 SGLang 的 `mem_fraction_static` 切分每张 GPU 的显存。GenRM 的 `mem_fraction_static` 从 `--genrm-engine-config` 读取。GenRM 不会从 Actor 同步权重，onload 仅恢复 KV cache 和 CUDA graph。
+自定义和外部引擎也使用同一任务控制面，必须满足其准入及确认释放契约。GenRM 保持自己的 checkpoint，不接收 Actor 权重。
 
 完整配置参见 [GenRM 示例](/zh/examples/generative-reward-model)。
 
@@ -55,5 +52,5 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 
 ## 源码
 
-- 实现：[`relax/components/genrm.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/genrm.py)
+- 实现：[`relax/components/inference_gateway.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/inference_gateway.py)
 - 基类：[`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

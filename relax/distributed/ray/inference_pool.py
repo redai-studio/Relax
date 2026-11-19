@@ -16,7 +16,7 @@ from relax.utils.http_utils import _wrap_ipv6
 
 
 def plan_rollout(args: Any, binding: Any, planner: PlacementPlanner) -> None:
-    from relax.distributed.ray.rollout import _resolve_sglang_config
+    from relax.distributed.ray.policy_engine_pool import _resolve_sglang_config
     from relax.engine.inference.config import EngineGroupSpec, InferenceModelSpec
 
     pg, indices, gpu_ids = binding
@@ -59,12 +59,12 @@ def plan_rollout(args: Any, binding: Any, planner: PlacementPlanner) -> None:
 
 class RolloutPool:
     def __init__(self, args: Any, binding: Any) -> None:
-        from relax.distributed.ray.rollout import RolloutManager, stop_launched_routers
+        from relax.distributed.ray.policy_engine_pool import PolicyEnginePool, stop_launched_routers
 
-        implementation = RolloutManager.__ray_metadata__.modified_class
+        implementation = PolicyEnginePool
         self.backend = implementation.__new__(implementation)
         try:
-            implementation.__init__(self.backend, args, binding, inference_only=True)
+            implementation.__init__(self.backend, args, binding)
         except BaseException:
             if hasattr(self.backend, "_eviction_monitor_stop"):
                 self.backend.dispose()
@@ -73,6 +73,8 @@ class RolloutPool:
             stop_launched_routers()
             self._dispose_locks()
             raise
+        self.requires_weight_confirmation = not getattr(args, "debug_rollout_only", False)
+        self.actor_weight_versions: dict[str, str] = {}
         self.synced_actor_ids = {
             engine._actor_id.hex()
             for server in self.backend.servers.values()
@@ -80,13 +82,21 @@ class RolloutPool:
             if engine is not None
         }
 
-    def mark_synced(self, actor_ids: set[str]) -> None:
+    def mark_synced(self, actor_ids: set[str], weight_version: str | None = None) -> None:
         self.synced_actor_ids.update(actor_ids)
+        if weight_version is not None:
+            if not hasattr(self, "actor_weight_versions"):
+                self.actor_weight_versions = {}
+            self.actor_weight_versions.update((actor_id, str(weight_version)) for actor_id in actor_ids)
 
-    def observe(self, *, ready: bool, state: LifecycleState) -> tuple[ModelSnapshot, ...]:
-        from relax.distributed.ray.rollout import EngineGroupLifecycle, _read_engine_metadata
+    def observe(
+        self, *, ready: bool, state: LifecycleState, required_weight_version: str | None = None
+    ) -> tuple[ModelSnapshot, ...]:
+        from relax.distributed.ray.policy_engine_pool import EngineGroupLifecycle, _read_engine_metadata
 
         snapshots = []
+        strict_versions = getattr(self, "requires_weight_confirmation", False)
+        versions = getattr(self, "actor_weight_versions", {})
         # Re-read generation-checked metadata on each snapshot/admission. Health
         # monitors can replace slots independently of explicit Manager calls.
         lock = self.backend._engine_lifecycle_lock
@@ -100,10 +110,12 @@ class RolloutPool:
                 ready and not self.backend._training_weight_updating and not self.backend._scale_out_weight_updating
             )
             for name, server in self.backend.servers.items():
+                direct = getattr(self.backend, "route_mode", "router") == "direct"
                 replicas = []
                 workers = []
                 issues = []
                 available_types = set()
+                router_weights_pending = False
                 for group in list(server.engine_groups):
                     if group.worker_type == "placeholder":
                         continue
@@ -126,6 +138,13 @@ class RolloutPool:
                             and record is not None
                             and not record.pending_router_registration
                             and (group.is_scaled_out or engine._actor_id.hex() in self.synced_actor_ids)
+                            and (
+                                not strict_versions
+                                or (
+                                    required_weight_version is not None
+                                    and versions.get(engine._actor_id.hex()) == str(required_weight_version)
+                                )
+                            )
                             and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
                         )
 
@@ -134,11 +153,23 @@ class RolloutPool:
                         metadata, actor_state, issue = observations[slot]
                         identity = f"{name}/engine-{group.rank_offset + slot}"
                         pending = record is not None and record.pending_router_registration
-                        unsynced = (
-                            engine is not None
-                            and not group.is_scaled_out
-                            and engine._actor_id.hex() not in self.synced_actor_ids
+                        unsynced = engine is not None and (
+                            (not group.is_scaled_out and engine._actor_id.hex() not in self.synced_actor_ids)
+                            or (
+                                strict_versions
+                                and (
+                                    required_weight_version is None
+                                    or versions.get(engine._actor_id.hex()) != str(required_weight_version)
+                                )
+                            )
                         )
+                        if (
+                            strict_versions
+                            and unsynced
+                            and not pending
+                            and group.lifecycle_status is EngineGroupLifecycle.ACTIVE
+                        ):
+                            router_weights_pending = True
                         head = slot - slot % group.nodes_per_engine
                         end = head + group.nodes_per_engine
                         eligible = end <= len(slots) and all(confirmed(index) for index in range(head, end))
@@ -157,6 +188,20 @@ class RolloutPool:
                             identity,
                             replica_state,
                             metadata.get("url") if metadata else None,
+                            weight_version=(
+                                versions.get(engine._actor_id.hex())
+                                if engine is not None
+                                and end <= len(slots)
+                                and len(
+                                    {
+                                        versions.get(node._actor_id.hex()) if node is not None else None
+                                        for node in slots[head:end]
+                                    }
+                                )
+                                == 1
+                                else None
+                            ),
+                            direct_eligible=direct and replica_state is LifecycleState.READY,
                         )
                         if slot % group.nodes_per_engine == 0:
                             if group.worker_type in ("prefill", "decode"):
@@ -169,16 +214,35 @@ class RolloutPool:
                 serves = ready and ({"prefill", "decode"} <= available_types if pd else "regular" in available_types)
                 router = (
                     f"http://{_wrap_ipv6(server.router_ip)}:{server.router_port}"
-                    if server.router_ip and server.router_port
+                    if not direct and server.router_ip and server.router_port
                     else None
                 )
+                available = serves and (router is not None or (direct and not pd))
+                if not direct and router_weights_pending:
+                    available = False  # Router may still list an old-version peer; never route around the gate.
+                if pd:
+                    # PD workers are diagnostics; the routable logical replica
+                    # is the aggregate service and never an individual worker.
+                    replicas = (
+                        [
+                            ReplicaSnapshot(
+                                f"{name}/pd-service",
+                                LifecycleState.READY if available else state,
+                                router,
+                                weight_version=required_weight_version if available else None,
+                            )
+                        ]
+                        if router is not None
+                        else []
+                    )
                 snapshots.append(
                     ModelSnapshot(
                         name,
                         tuple(replicas),
                         router,
-                        LifecycleState.READY if serves and router else state,
-                        admission=bool(serves and router),
+                        LifecycleState.READY if available else state,
+                        admission=bool(available),
+                        required_weight_version=required_weight_version,
                         pd_workers=tuple(workers),
                         issues=tuple(issues),
                     )

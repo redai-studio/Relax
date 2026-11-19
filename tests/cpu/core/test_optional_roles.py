@@ -45,3 +45,20 @@ def test_register_sft_rollout_noop_for_non_sft_algorithms(loss_type):
 
     assert register_sft_rollout(config, algo) == []
     assert algo == {}
+
+
+def test_auxiliary_roles_register_the_same_gateway_class():
+    from relax.components.inference_gateway import InferenceGatewayService
+    from relax.core.optional_roles import register_extra_roles
+
+    config = Namespace(
+        _genrm_instances_resolved={"judge": {}},
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="teacher",
+        resource={"teacher": [1, 2]},
+        loss_type="policy_loss",
+    )
+    roles = {}
+    assert register_extra_roles(config, roles) == ["genrm", "teacher"]
+    assert roles["genrm"] is roles["teacher"] is InferenceGatewayService

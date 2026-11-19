@@ -11,7 +11,7 @@
 | **K8s 资源层** | 根据 SGLang 指标自动扩缩 Pod（GPU 资源） | KEDA ScaledObject + Prometheus |
 | **应用注册层** | Pod ready 后调 `scale_out`(external)，缩容前调 `scale_in` drain | Pod Lifecycle Hooks |
 
-Relax 代码 **零修改**：所有能力（external scale_out/scale_in API、幂等性、权重同步、drain）已在 `relax/components/rollout.py` 和 `relax/distributed/ray/rollout.py` 中实现。
+Relax 代码 **零修改**：所有能力（external scale_out/scale_in API、幂等性、权重同步、drain）已在 `relax/components/inference_gateway.py`、任务级 `relax/distributed/ray/inference_manager.py` 及其普通后端池 `relax/distributed/ray/policy_engine_pool.py` 中实现。
 
 ### 前置条件
 
@@ -381,7 +381,7 @@ K8s 创建 Pod
   → postStart hook 并行启动，轮询等待 /health 就绪
   → SGLang ready
   → postStart 调用 POST /rollout/scale_out {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager 执行:
+  → 任务 InferenceManager 委托 PolicyEnginePool 执行:
       CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY → ACTIVE
   → 引擎接入流量
 ```
@@ -392,7 +392,7 @@ K8s 创建 Pod
 K8s 发送 SIGTERM
   → preStop hook 拦截
   → 调用 POST /rollout/scale_in {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager 执行:
+  → 任务 InferenceManager 委托 PolicyEnginePool 执行:
       PENDING → DRAINING (停止新流量，等待在途请求)
              → REMOVING (注销引擎)
              → COMPLETED

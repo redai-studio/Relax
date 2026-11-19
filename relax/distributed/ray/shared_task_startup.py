@@ -10,7 +10,6 @@ import ray
 
 from relax.distributed.ray.inference_manager import create_static_inference_manager, rollback_static_inference_manager
 from relax.engine.inference.phase_plans import PHASE_GENERATE
-from relax.engine.inference.phases import create_phase_coordinator
 from relax.engine.inference.task_placement import StaticPlacement, plan_task_placement
 from relax.utils.logging_utils import get_logger
 
@@ -56,21 +55,15 @@ def start_shared_task(
         phases: dict[str, tuple[Any, ...]] = {PHASE_GENERATE: (rollout,)}
         for item in static:
             placement = item.placement
-            options = dict(item.options)
-            if placement.spec.role.value == "genrm":
-                options["bundle_offset"] = placement.bundle_offset
-                key = options["model_id"]
-                options["name"] = "relax_genrm_manager" if key == "__default__" else f"relax_genrm_manager_{key}"
             owner = create_static_inference_manager(
                 item.args,
                 placement.spec.role.value,
                 placement.binding,
                 runtime_env=runtime_env,
-                pending_owners=owners,
-                **options,
+                task_manager=rollout,
+                **item.options,
             )
-            if owner not in owners:
-                owners.append(owner)
+            owners.append(owner)
             # Confirm sleep even for split models whose flags keep them resident.
             if shared:
                 ray.get(owner.offload.remote())
@@ -83,16 +76,33 @@ def start_shared_task(
         # No owner is resident. An explicit empty startup phase makes the first
         # generation switch perform onload rather than an idempotent no-op.
         phases["startup"] = ()
-        coordinator = create_phase_coordinator(
-            phases, "startup" if shared or getattr(args, "offload_rollout", False) else PHASE_GENERATE
+        # Ray ActorHandle getattr fabricates ActorMethod objects. The rollout
+        # owner is the task itself, whereas role handles carry real metadata.
+        from relax.distributed.ray.inference_handle import InferenceRoleHandle
+
+        phase_keys = {
+            phase: tuple(
+                (owner.role, owner.model_id) if isinstance(owner, InferenceRoleHandle) else ("rollout", "default")
+                for owner in phase_owners
+            )
+            for phase, phase_owners in phases.items()
+        }
+        ray.get(
+            rollout.configure_phases.remote(
+                phase_keys, "startup" if shared or getattr(args, "offload_rollout", False) else PHASE_GENERATE
+            )
         )
-        if args is not None:
-            args._shared_inference_owners = owners
+        coordinator = rollout
         if args is not None:
             del args._shared_startup_pending_owners
         return rollout, tuple(owners[1:]), coordinator
     except BaseException:
+        from relax.distributed.ray.inference_handle import InferenceRoleHandle
+
         for owner in tuple(reversed(owners)):
+            if isinstance(owner, InferenceRoleHandle):
+                owners.remove(owner)
+                continue
             try:
                 rollback_static_inference_manager(owner)
             except BaseException:
@@ -111,7 +121,12 @@ def retry_shared_startup_cleanup(args: Any) -> bool:
     owners = getattr(args, "_shared_startup_pending_owners", None)
     if owners is None:
         return False
+    from relax.distributed.ray.inference_handle import InferenceRoleHandle
+
     for owner in tuple(reversed(owners)):
+        if isinstance(owner, InferenceRoleHandle):
+            owners.remove(owner)
+            continue
         rollback_static_inference_manager(owner)
         owners.remove(owner)
     del args._shared_startup_pending_owners
@@ -133,6 +148,13 @@ def prepare_shared_task(
 
     if getattr(args, "_shared_startup_pending_owners", None):
         raise RuntimeError("Task startup has unconfirmed cleanup owners")
+    from relax.engine.inference.phase_plans import deferred_genrm_enabled, uses_managed_genrm_hook
+
+    if deferred_genrm_enabled(args) and not uses_managed_genrm_hook(args):
+        raise ValueError(
+            "Shared deferred GenRM requires a scoring-only post-process hook. Remove local memory swapping "
+            "from the hook and set managed_genrm_scoring=True on the hook callable."
+        )
     args._inference_startup_token = uuid4().hex
     bindings = bindings or {}
     static = []
@@ -187,13 +209,13 @@ def prepare_shared_task(
     def create_rollout() -> Any:
         owner = InferenceManager.options(
             **with_control_plane_affinity(args, {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env})
-        ).remote()
+        ).remote(startup_token=args._inference_startup_token)
         # Register before start(): its rollback can fail before the factory
         # returns a usable owner to start_shared_task.
         args._shared_startup_pending_owners.append(owner)
         rollout_args = copy(args)
         del rollout_args._shared_startup_pending_owners
-        ray.get(owner.start.remote(deepcopy(rollout_args), binding))
+        ray.get(owner.start.remote(deepcopy(rollout_args), binding, startup_token=args._inference_startup_token))
         return owner
 
     rollout, owners, coordinator = start_shared_task(args, binding, static, create_rollout, runtime_env=runtime_env)
@@ -214,36 +236,3 @@ def prepare_shared_task(
             args.opd_teacher_url = routes["default"][0]
             args.opd_teacher_urls = routes["default"]
     return list(teachers.values()) if len(teachers) > 1 else next(iter(teachers.values()), None)
-
-
-def shutdown_shared_task(args: Any) -> None:
-    """Release all role owners before Controller releases their borrowed PGs.
-
-    Retain each unconfirmed owner and the coordinator so cleanup can be
-    retried. A worker, when constructed, is disposed with its rollout owner.
-    """
-    owners = getattr(args, "_shared_inference_owners", None)
-    if owners is None:
-        retry_shared_startup_cleanup(args)
-        return
-    errors = []
-    rollout = getattr(args, "_rollout_engine_manager", None)
-    worker = getattr(args, "_rollout_worker", None)
-    for owner in tuple(reversed(owners)):
-        try:
-            if owner == rollout and worker is not None:
-                ray.get(owner.dispose.remote(worker), timeout=120)
-                ray.kill(owner)
-            else:
-                rollback_static_inference_manager(owner)
-        except BaseException as exc:
-            errors.append(exc)
-        else:
-            owners.remove(owner)
-    if errors:
-        raise RuntimeError("Shared inference owner cleanup is unconfirmed") from errors[0]
-    coordinator = getattr(args, "_inference_phase_coordinator", None)
-    if coordinator is not None:
-        ray.kill(coordinator)
-    for field in ("_shared_inference_owners", "_rollout_worker"):
-        vars(args).pop(field, None)

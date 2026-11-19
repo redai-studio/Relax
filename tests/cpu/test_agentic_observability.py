@@ -594,10 +594,10 @@ def rollout_module(monkeypatch):
     import importlib
     from types import ModuleType
 
-    logging_module = ModuleType("relax.distributed.ray.rollout")
+    logging_module = ModuleType("relax.distributed.ray.policy_engine_pool")
     logging_module._log_rollout_data = lambda *args, **kwargs: None
     logging_module.get_local_rollout_manager = lambda: SimpleNamespace(training_weight_updating=False)
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", logging_module)
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.policy_engine_pool", logging_module)
     # Reimporting also replaces the rollout attribute on the parent package.
     monkeypatch.setattr(sys.modules["relax.agentic"], "rollout", None, raising=False)
     monkeypatch.delitem(sys.modules, "relax.agentic.rollout", raising=False)
@@ -2576,3 +2576,110 @@ def test_backend_timing_omits_missing_invalid_and_unrelated_fields():
         },
     )
     assert attempt["backend_timing"] == {"queue_time": 0.0, "forward_entry_time": 10.0}
+
+
+@pytest.mark.parametrize("genrm", [False, True])
+def test_deferred_agentic_close_pauses_before_scoring_and_preserves_transfer_identity(
+    tmp_path, rollout_module, monkeypatch, genrm
+):
+    from contextlib import asynccontextmanager
+
+    from relax.engine.rollout import scoring_phase
+    from relax.engine.rollout.deferred import PublicationReceipt, PublicationState
+    from relax.engine.rollout.deferred_opd import DeferredOpdSession
+
+    args = _obs_args(tmp_path, use_dynamic_global_batch_size=False, partial_rollout=False, fully_async=False)
+    events = []
+
+    @asynccontextmanager
+    async def phase(*args):
+        yield True
+
+    monkeypatch.setattr(scoring_phase, "async_scoring_phase", phase)
+
+    async def scenario():
+        pipeline = _obs_pipeline(rollout_module, args)
+        pipeline._changed = asyncio.Event()
+        group = _group("g", export_ids=[1, 2])
+        for sample in group.samples:
+            sample.index = 4  # Multiple exports legitimately share a training index.
+            sample.response_length = 1
+            sample.tokens = [1, 2]
+        context = pipeline._active_step
+
+        async def pause():
+            events.append("pause")
+
+        async def score(samples):
+            events.append("score")
+            for sample in samples:
+                sample.teacher_log_probs = [-0.2]
+            return [True] * len(samples)
+
+        async def publish(args, payload, count, partition_id, client, *, is_last, operation_id):
+            events.append(("publish", partition_id, is_last))
+            assert payload == [group.samples]
+            return PublicationReceipt(operation_id, PublicationState.CONFIRMED)
+
+        manager = SimpleNamespace(
+            schema_opd_transfer_data=lambda: ["teacher_log_probs"],
+            prepare_teacher_inputs=AsyncMock(),
+            score_teacher=score,
+            needs_student_prefill=False,
+            assemble_transfer=lambda samples: None,
+        )
+        if genrm:
+            from relax.utils import misc
+
+            args._genrm_instances_resolved = {"judge": {}}
+            args._genrm_colocate_with_rollout = True
+            args.defer_reward_to_post_process = True
+            args.custom_reward_post_process_path = "judge.hook"
+
+            def hook(scoring_args, samples):
+                events.append("score")
+                for sample in samples:
+                    sample.reward = 0.75
+                return [0.25] * len(samples)
+
+            monkeypatch.setattr(misc, "load_function", lambda path: hook)
+        if not genrm:
+            monkeypatch.setattr("relax.engine.rollout.deferred_opd.deferred_opd_active", lambda args: True)
+        context.deferred_session = DeferredOpdSession(args, 7, None, None if genrm else manager, publish=publish)
+        pipeline.runtime_domain.pause_generation = pause
+        pipeline._submit_tq_batch(context, (6, (group,), True))
+        assert not events
+        await pipeline._close_rollout_step(context)
+        assert events == ["pause", "score", ("publish", 6, True)]
+        await pipeline._stage_recorder.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_deferred_agentic_publication_records_unknown_after_lost_ack(tmp_path, rollout_module, monkeypatch):
+    args = _obs_args(tmp_path)
+
+    async def lost_ack(**kwargs):
+        kwargs["on_put_started"]()
+        assert kwargs["operation_id"] == "attempt:batch"
+        raise ConnectionError("write accepted but reply lost")
+
+    monkeypatch.setattr(rollout_module, "_transfer_batch_to_data_system", lost_ack)
+
+    async def scenario():
+        pipeline = _obs_pipeline(rollout_module, args)
+        with pytest.raises(ConnectionError, match="reply lost"):
+            await pipeline._transfer_and_record(
+                pipeline._active_step,
+                6,
+                (_group("g", export_ids=[7]),),
+                True,
+                operation_id="attempt:batch",
+            )
+        await pipeline._stage_recorder.aclose()
+
+    asyncio.run(scenario())
+    rows = _read_stage_ends(resolve_agentic_obs_config(args).stage_path(7))
+    assert len(rows) == 1
+    assert rows[0]["reason_code"] == "transfer_outcome_unknown"
+    assert not rows[0]["is_terminal"]

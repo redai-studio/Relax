@@ -321,8 +321,6 @@ def satisfy_staleness(partition_list: Optional[List[str]], current_rollout_id: i
 ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = Envs.ROLLOUT_SERVE_MAX_ONGOING_REQUESTS
 
 
-@serve.deployment(max_ongoing_requests=ROLLOUT_SERVE_MAX_ONGOING_REQUESTS)
-@serve.ingress(app)
 class Rollout(Base):
     """The class to run rollout and convert rollout data to training data."""
 
@@ -829,7 +827,7 @@ class Rollout(Base):
 
     @app.get("/engines")
     async def get_engines(self, model_name: Optional[str] = None, schema_version: Optional[int] = None):
-        if schema_version == 2 and getattr(self, "_inference_gateway", None) is not None:
+        if schema_version in (None, 2) and getattr(self, "_inference_gateway", None) is not None:
             return await self._inference_gateway.engines(schema_version=2)
         if schema_version not in (None, 1):
             raise HTTPException(status_code=400, detail="Unsupported discovery schema_version")
@@ -1025,6 +1023,10 @@ class Rollout(Base):
         except httpx.RequestError as e:
             self._logger.error(f"Failed to proxy model list to SGLang: {e}")
             raise HTTPException(status_code=502, detail=f"Failed to connect to SGLang router: {e}")
+
+
+RolloutWorkload = Rollout
+Rollout = serve.deployment(max_ongoing_requests=ROLLOUT_SERVE_MAX_ONGOING_REQUESTS)(serve.ingress(app)(Rollout))
 
 
 def _make_error_chunk(status_code: int, message: str) -> str:

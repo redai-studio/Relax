@@ -353,8 +353,9 @@ class CheckpointEngineClient:
                     self._backend.init_process_group_for_rollout(data)
         self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
-        # Adapter delta-skip can't confirm a replacement got base+adapter; keep existing behavior.
-        if actor_fwd_only or self._backend._lora_adapter_mode:
+        # The Manager separately distinguishes base+adapter confirmations from
+        # delta-only confirmations; every PP source still reports actual recipients.
+        if actor_fwd_only:
             return []
         # A publishable generation must have received every PP stage (each PP source prunes
         # independently; health checks may prune recipients).

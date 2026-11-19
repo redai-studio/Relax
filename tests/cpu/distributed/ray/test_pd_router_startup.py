@@ -35,7 +35,7 @@ class _Clock:
 
 @pytest.fixture
 def rollout_module(monkeypatch):
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     monkeypatch.setattr(rollout, "_LAUNCHED_ROUTER_PROCESSES", [])
     monkeypatch.setattr(rollout, "time", _Clock())
@@ -343,21 +343,21 @@ def test_router_cleanup_retains_failed_process_for_retry(rollout_module):
     process.is_alive.return_value = True
     process.terminate.side_effect = OSError("temporarily unavailable")
     rollout_module._LAUNCHED_ROUTER_PROCESSES.append(process)
-    assert rollout_module.stop_launched_routers() == 0
+    with pytest.raises(RuntimeError, match="Router process exit is unconfirmed"):
+        rollout_module.stop_launched_routers()
     assert rollout_module._LAUNCHED_ROUTER_PROCESSES == [process]
     process.terminate.side_effect = lambda: setattr(process.is_alive, "return_value", False)
     assert rollout_module.stop_launched_routers() == 1
     assert rollout_module._LAUNCHED_ROUTER_PROCESSES == []
 
 
-@pytest.mark.parametrize("failure", [None, "engine", "detach"])
-def test_rollout_owner_releases_tq_and_router_on_disposal(monkeypatch, rollout_module, failure):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
+@pytest.mark.parametrize("failure", [None, "engine"])
+def test_policy_pool_releases_router_after_engine_disposal(monkeypatch, rollout_module, failure):
+    cls = rollout_module.PolicyEnginePool
     manager = object.__new__(cls)
     manager._eval_judge = None
     manager._stop_eviction_monitor = Mock()
     manager._health_monitors = [Mock()]
-    manager.data_system_client = Mock()
     events = []
 
     def cleanup(stage):
@@ -366,19 +366,17 @@ def test_rollout_owner_releases_tq_and_router_on_disposal(monkeypatch, rollout_m
             raise RuntimeError(f"{stage} shutdown failed")
 
     manager._shutdown_all_engines = lambda: cleanup("engine")
-    monkeypatch.setattr(rollout_module, "detach_tq_client", lambda: cleanup("detach"))
     monkeypatch.setattr(rollout_module, "stop_launched_routers", lambda: cleanup("router"))
     if failure is None:
         manager.dispose()
     else:
         with pytest.raises(RuntimeError, match=f"{failure} shutdown failed"):
             manager.dispose()
-    assert events == ["engine", "detach", "router"]
-    assert manager.data_system_client is None
+    assert events == ["engine", "router"]
 
 
 def test_engine_shutdown_uses_one_deadline_for_all_pd_workers(monkeypatch, rollout_module):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
+    cls = rollout_module.PolicyEnginePool
     manager = object.__new__(cls)
     engines = [make_mock_engine() for _ in range(4)]
     manager.servers = {"default": SimpleNamespace(engine_groups=[SimpleNamespace(all_engines=engines)])}
@@ -532,7 +530,7 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
 
 
 def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_module):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
+    cls = rollout_module.PolicyEnginePool
     manager = object.__new__(cls)
     manager._eval_judge = None
     events = []
@@ -587,3 +585,26 @@ def test_pd_failed_init_cleanup_attempts_every_group(monkeypatch, rollout_module
     assert groups[1].all_engines == [None]
     for engine in engines:
         engine.shutdown.remote.assert_called_once()
+
+
+def test_direct_backend_capability_skips_router_and_registration(monkeypatch, rollout_module):
+    args = _router_args(sglang_hf_checkpoint=None)
+    model = rollout_module.ModelConfig(name="native", engine_groups=[rollout_module.EngineGroupConfig("regular", 2)])
+    monkeypatch.setattr(rollout_module, "_resolve_sglang_config", lambda _: rollout_module.SglangConfig([model]))
+    monkeypatch.setattr(
+        rollout_module, "_resolve_rollout_engine_class", lambda _: SimpleNamespace(route_mode="direct")
+    )
+    router = Mock(side_effect=AssertionError("Direct backend must not launch a Router"))
+    monkeypatch.setattr(rollout_module, "_start_router", router)
+    observed = []
+
+    def start(group, cursors):
+        observed.append(group)
+        return [], cursors
+
+    monkeypatch.setattr(rollout_module.EngineGroup, "start_engines", start)
+    servers = rollout_module._start_rollout_servers_impl(args, object(), [])
+    assert servers["native"].router_ip is None and servers["native"].router_port is None
+    assert observed[0].skip_router_registration is True
+    assert observed[0].require_router_registration is False
+    router.assert_not_called()

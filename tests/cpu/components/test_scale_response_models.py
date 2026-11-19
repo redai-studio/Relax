@@ -15,7 +15,7 @@ import pytest
 
 try:
     from relax.components.rollout import ListScaleOutRequestsResponse, ScaleOutStatusResponse
-    from relax.distributed.ray.rollout import ScaleOutRequest, ScaleOutStatus
+    from relax.distributed.ray.policy_engine_pool import ScaleOutRequest, ScaleOutStatus
 
     HAS_DEPS = True
 except ImportError:

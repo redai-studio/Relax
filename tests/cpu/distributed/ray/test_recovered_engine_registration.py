@@ -34,7 +34,7 @@ def single_rank_collective(monkeypatch):
 
 
 def make_recovery():
-    rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
+    rollout = pytest.importorskip("relax.distributed.ray.policy_engine_pool", exc_type=ModuleNotFoundError)
     if not HAS_DEPS:
         pytest.skip("Requires rollout runtime dependencies for shared Ray test helpers")
     engine = make_mock_engine(url="http://engine-b:30000")
@@ -61,7 +61,7 @@ def test_recovered_engine_registers_once_after_successful_sync(patch_ray_get):
 @pytest.mark.parametrize("reason", ["not_synced", "replacement", "draining", "evicted", "no_lease", "pending"])
 def test_recovery_registration_rejects_unsafe_candidates(reason, patch_ray_get):
     manager, group, engine, record = make_recovery()
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     ids = ["actor-b"]
     if reason == "not_synced":
@@ -106,6 +106,8 @@ def make_client(*, rank=0, fail=False):
     backend = MagicMock()
     backend._is_pp_src_rank = True
     backend._lora_adapter_mode = False
+    backend._lora_skip_rollout_base = False
+    backend.weight_version = 7
     # Model a rank pruned by backend health checks; the coordinator still lists it.
     backend.rollout_topology = {"4": {"metadata": {"actor_id": "actor-b"}}}
     if fail:
@@ -153,10 +155,10 @@ def test_failed_weight_update_does_not_return_publishable_ids():
         asyncio.run(client.update_weights_for_rollout())
 
 
-def test_adapter_delta_skip_is_not_full_weight_recovery_evidence():
+def test_adapter_delta_reports_actual_recipients_for_manager_base_validation():
     client = make_client()
     client._backend._lora_adapter_mode = True
-    assert asyncio.run(client.update_weights_for_rollout()) == []
+    assert asyncio.run(client.update_weights_for_rollout()) == ["actor-b"]
     client._backend.update_weights_for_rollout.assert_called_once()
 
 
@@ -170,14 +172,20 @@ def test_same_endpoint_replacement_invalidates_weight_group_cache():
     ) != DeviceDirectBackend._rollout_topology_signature_of(new)
 
 
-@pytest.mark.parametrize("fail,actor_fwd_only", [(False, False), (True, False), (False, True)])
-def test_actor_publishes_only_after_successful_rollout_update(monkeypatch, fail, actor_fwd_only):
+@pytest.mark.parametrize(
+    "fail,actor_fwd_only,delta_only",
+    [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
+)
+def test_actor_publishes_only_after_successful_rollout_update(monkeypatch, fail, actor_fwd_only, delta_only):
     actor_module = pytest.importorskip("relax.backends.megatron.actor", exc_type=ModuleNotFoundError)
     events = []
     actor = object.__new__(actor_module.MegatronTrainRayActor)
     actor.checkpoint_engine_client = make_client(fail=fail)
+    actor.checkpoint_engine_client.backend._lora_skip_rollout_base = delta_only
     actor.rollout_manager = MagicMock()
-    actor.rollout_manager.register_recovered_engines.remote.side_effect = lambda ids: events.append(("publish", ids))
+    actor.rollout_manager.register_recovered_engines.remote.side_effect = lambda ids, **metadata: events.append(
+        ("publish", ids, metadata)
+    )
     actor._weight_sync_lock = None
     monkeypatch.setattr(actor_module, "get_gloo_group", lambda: "gloo")
     monkeypatch.setattr(actor_module.dist, "barrier", lambda **kwargs: None)
@@ -192,7 +200,11 @@ def test_actor_publishes_only_after_successful_rollout_update(monkeypatch, fail,
             actor.update_weights_fully_async(0, rollout_only=True)
     else:
         actor.update_weights_fully_async(0, rollout_only=True, actor_fwd_only=actor_fwd_only)
-    assert events == ([] if fail or actor_fwd_only else [("publish", ["actor-b"])])
+    assert events == (
+        []
+        if fail or actor_fwd_only
+        else [("publish", ["actor-b"], {"weight_version": "7", "base_weights_confirmed": not delta_only})]
+    )
 
 
 def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
@@ -219,7 +231,7 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
 @pytest.mark.asyncio
 async def test_initial_scaleout_success_clears_pending_without_changing_recovery_flag():
     manager, group, engine, record = make_recovery()
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool as rollout
 
     group.skip_router_registration = True
     server = make_rollout_server(engine_groups=[])
@@ -232,3 +244,29 @@ async def test_initial_scaleout_success_clears_pending_without_changing_recovery
     assert result.success
     assert not record.pending_router_registration
     assert group.skip_router_registration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_previously_confirmed", [False, True])
+async def test_delta_receipt_never_publishes_replacement_without_base(base_previously_confirmed, patch_ray_get):
+    from relax.distributed.ray.inference_manager import InferenceManager
+    from relax.distributed.ray.inference_pool import RolloutPool
+
+    backend, _, engine, record = make_recovery()
+    pool = RolloutPool.__new__(RolloutPool)
+    pool.backend = backend
+    pool.requires_weight_confirmation = True
+    pool.synced_actor_ids = {"actor-b"}
+    pool.actor_weight_versions = {"actor-b": "6"} if base_previously_confirmed else {}
+    owner = InferenceManager.__ray_metadata__.modified_class()
+    owner.pool = pool
+    await owner.begin_weight_update("dcs")
+    await owner.pool_call("register_recovered_engines", ["actor-b"], weight_version="7", base_weights_confirmed=False)
+    if base_previously_confirmed:
+        engine.register_to_router.remote.assert_called_once()
+        assert pool.actor_weight_versions == {"actor-b": "7"}
+        assert not record.pending_router_registration
+    else:
+        engine.register_to_router.remote.assert_not_called()
+        assert pool.actor_weight_versions == {}
+        assert record.pending_router_registration

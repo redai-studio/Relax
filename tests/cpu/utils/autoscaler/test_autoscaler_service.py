@@ -825,3 +825,28 @@ def test_update_config_validate_backstop_rejects_invariant_violation():
     req = ConfigUpdateRequest(metrics_interval_secs=100.0)  # > evaluation_interval_secs
     with pytest.raises(ValueError):
         asyncio.run(svc.update_config(req))
+
+
+def test_fetch_engines_consumes_v2_logical_replicas_and_requests_v2():
+    payload = {
+        "schema_version": 2,
+        "role": "rollout",
+        "manager_epoch": "epoch",
+        "models": {
+            "policy": {
+                "state": "ready",
+                "admission": True,
+                "engines": [
+                    {"engine_id": "policy/replica-0", "base_url": "http://head", "state": "ready"},
+                    {"engine_id": "policy/replica-1", "base_url": "http://sleeping", "state": "sleeping"},
+                ],
+                "pd_workers": [{"engine_id": "rank-1", "base_url": "http://internal", "state": "ready"}],
+            }
+        },
+        "observation": {"complete": True, "issues": []},
+    }
+    session = _FakeSession(get_payload=payload)
+    engines, observation = asyncio.run(_service(session)._fetch_engines())
+    assert engines == [{"id": "policy/replica-0", "url": "http://head", "model_name": "policy", "status": "active"}]
+    assert observation["complete"]
+    assert session.get_urls == ["http://rollout/engines?schema_version=2"]

@@ -74,11 +74,11 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 | 组件 | 文件 | 职责 |
 |------|------|------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | 策略训练（Megatron 后端） |
-| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout 服务编排，管理 RolloutManager |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | 统一 Gateway 入口与 RolloutWorker 工作负载编排 |
 | **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value 估计与裁剪 value loss 训练 |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | 前向推理 log-prob（fully-async 模式） |
 | **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | 优势计算（PPO/GRPO/GSPO/SAPO/CISPO 等） |
-| **GenRM** | [`genrm.py`](../../../relax/components/genrm.py) | 生成式奖励模型 |
+| **GenRM** | [`inference_gateway.py`](../../../relax/components/inference_gateway.py) | 生成式奖励模型 |
 
 实际部署的服务图取决于算法与运行模式。Colocate 的 GRPO-like 算法使用 Actor + Rollout；同步 colocate PPO 会增加 Critic + Advantages。对于非 PPO 算法，**全异步模式**（`--fully-async`）可根据 log-probability 与 KL 配置进一步部署 ActorFwd 和 Reference 服务。暂不支持 fully-async PPO；当前支持的数据流详见 [PPO 训练](./ppo-training.md)。
 
@@ -91,11 +91,11 @@ CPU `RolloutWorker` 执行生成、评估与数据传输。Worker 通过公共�
 准入，需要等 KV cache 恢复后才能继续生成。Actor 和 Controller 通过委托句柄
 继续使用原有的 rollout manager 接口。
 
-使用标准生成、评估函数和框架创建的 placement group 时，框架自动选择此路径。
-GenRM、OPD、Agentic、native/自定义引擎、外部引擎、自定义生成/数据集或后处理
-hook，以及 offline 训练任务仍完整保留原有编排，不需要新增启动参数。
-`/rollout/engines` 默认响应保持原格式；使用新路径的任务还可通过
-`?schema_version=2` 获取 Manager 的发现快照。
+每个推理任务只有一个 CPU InferenceManager，统一持有 Rollout、GenRM 和 Teacher 的模型池、请求登记、placement 与生命周期状态。角色句柄仅转发请求，不创建额外 Manager。独立资源与共置布局都使用同一控制面；Manager 内的 phase 协调器串行交接复用相同 bundle 的模型。Split 角色可在推理阶段并行，共享 GenRM/Teacher 在生成请求排空、显存释放后评分。
+
+Rollout 工作负载负责样本暂存、评分完整性和 TransferQueue 发布。Resident Agentic 路径区分 Group、Session 和导出的训练行；延迟评分保留 export identity 与物理分区边界。发布需确认数据对消费者可见；流式终批还需确认结束标记。确认结果未知会使 attempt 失败，不会盲目重放。
+
+自定义/native 引擎和外部引擎也由统一控制面编排，必须遵守引擎能力及资源释放契约，不再通过旧角色 Manager 管理。Rollout、GenRM 和 Teacher 使用同一 CPU Gateway 部署类。`/<role>/engines` 默认返回 v2 发现协议；旧投影需显式请求 `?schema_version=1`。自动扩缩容从 v2 读取逻辑副本。
 
 引擎层提供 Rollout 数据生成和奖励计算能力：
 
@@ -113,7 +113,7 @@ hook，以及 offline 训练任务仍完整保留原有编排，不需要新增�
 
 ### 6. 分布式层 (Distributed)
 
-- [**Ray Actor 组**](../../../relax/distributed/ray/)：管理 RolloutManager、GenRMManager 等 Ray Actor 组
+- [**Ray Actor 组**](../../../relax/distributed/ray/)：任务唯一 InferenceManager 持有全部推理池；RolloutWorker 承载业务工作负载
 - [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/)：分布式权重同步服务，支持 NCCL/GLOO/TCP 通信后端
 
 ## 目录结构
@@ -129,7 +129,7 @@ relax/
 │   ├── actor_fwd.py         前向推理 log-prob
 │   ├── critic.py            价值估计
 │   ├── advantages.py        优势计算
-│   ├── genrm.py             生成式奖励模型
+│   ├── inference_gateway.py 统一角色 HTTP 入口
 │   └── rollout.py           Rollout 服务编排
 ├── engine/                  引擎层
 │   ├── rollout/             Rollout 引擎实现
@@ -169,7 +169,7 @@ relax/
 │                                                      │                │
 │                                                      ▼                │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                  RolloutManager.generate()                       │ │
+│  │                  RolloutWorker.generate()                        │ │
 │  │  SGLang engine inference → reward computation → assemble data    │ │
 │  └───────────────────────────┬──────────────────────────────────────┘ │
 │                              │                                        │

@@ -21,7 +21,7 @@ import torch
 from packaging.version import parse
 from tqdm import tqdm
 
-from relax.distributed.ray.rollout import _log_rollout_data
+from relax.distributed.ray.policy_engine_pool import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rewards.async_eval import is_eval_reward_pending

@@ -4,15 +4,17 @@ On-Policy Distillation (OPD) enables knowledge transfer from a large teacher mod
 
 ## Dedicated and external teachers
 
-For a standard SGLang task without `--colocate`, a Relax-managed single teacher uses the common inference manager and request executor. Requests resolve current replica endpoints after recovery, and `--opd-teacher-timeout-s` bounds the teacher request including admission and response reading. The teacher keeps checkpoint weights independently of Actor updates. Custom lifecycle hooks, Agentic tasks and colocated teachers retain their existing orchestration. Managed multi-teacher routing remains colocate-only.
+For a standard SGLang task without `--colocate`, a Relax-managed single teacher uses the common inference manager and request executor. Requests resolve current replica endpoints after recovery, and `--opd-teacher-timeout-s` bounds the teacher request including admission and response reading. The teacher keeps checkpoint weights independently of Actor updates. All managed roles share one task-level CPU InferenceManager; role handles are forwarding views, not independent owners. Colocated tasks use the phase ordering below, including native and resident Agentic workloads. Managed multi-teacher routing remains colocate-only.
 
 With `--opd-teacher-url`, the teacher is external: Relax sends requests but does not allocate its GPUs or stop its process when training ends. Existing external teacher routing remains applicable.
 
 ## Colocated teacher phases
 
-Standard native SGLang tasks validate the complete shared GPU layout before engine startup. Split teachers use disjoint slices and score inline; teachers sharing Rollout bundles score after generation has drained. A phase coordinator serializes offload/onload across the separate role owners, then restores the student when a token selection needs another forward pass.
+Split teachers use a disjoint GPU slice in the Actor placement group and score inline. Teachers sharing Rollout bundles instead defer scoring until generation and abort/drain complete. The managed phase coordinator releases Rollout memory, activates each required teacher, and restores the student for token selections that need student-at-teacher top-K. Teacher weights remain checkpoint-owned throughout.
 
-Deferred batches retain their training partition and final-batch marker. Required scoring fields must pass shape, token-ID and effective loss-mask numerical checks before publication; an incomplete batch is not partially published. Existing role entry points and discovery defaults remain unchanged. Agentic and custom lifecycle migration is a separate step.
+Deferred batches keep their physical training partition and final-batch marker. Every required target must pass shape, token-ID and effective loss-mask numerical validation before publication. Failed scoring does not publish a successful subset. Managed multi-teacher requests select the owner from the sample's bound teacher ID, retain group affinity, and resolve current replica endpoints after recovery. Custom lifecycle extensions must use the same control plane; externally supplied Teacher URLs do not transfer ownership of the external process to Relax.
+
+Managed teachers expose the same role-neutral Gateway under `/teacher`: `/generate`, `/v1/chat/completions`, `/v1/models`, `/health`, and `/engines`. Discovery defaults to schema v2; use `?schema_version=1` explicitly for the legacy projection. Public requests take a task Manager permit before forwarding; discovery alone never authorizes inference.
 
 ## Key Parameters
 

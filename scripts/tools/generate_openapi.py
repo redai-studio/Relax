@@ -91,6 +91,7 @@ sys.modules.update(
 for _name in [
     "relax.distributed.ray",
     "relax.distributed.ray.placement_group",
+    "relax.distributed.ray.inference_handle",
     "relax.engine.sft.runtime",
     "relax.utils.async_utils",
     "relax.utils.data.processing_utils",
@@ -189,7 +190,7 @@ SERVICES: list[tuple[str, str, str, str]] = [
         ),
     ),
     (
-        "relax.components.genrm",
+        "relax.components.inference_gateway",
         "genrm",
         "GenRM Service",
         (
@@ -200,6 +201,12 @@ SERVICES: list[tuple[str, str, str, str]] = [
             "GenRM is a passive HTTP service — unlike Actor or Rollout it does not run "
             "a background loop.  It only responds to incoming ``/generate`` requests."
         ),
+    ),
+    (
+        "relax.components.inference_gateway",
+        "teacher",
+        "Teacher Inference Gateway",
+        "Checkpoint-owned teacher inference, task admission and v2 logical-replica discovery.",
     ),
     (
         "relax.components.actor_fwd",

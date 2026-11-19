@@ -10,7 +10,7 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import ScaleOutStatus, _WeightSyncTimeoutError  # noqa
+    from relax.distributed.ray.policy_engine_pool import ScaleOutStatus, _WeightSyncTimeoutError  # noqa
 
     HAS_DEPS = True
 except ImportError:
@@ -581,3 +581,49 @@ class TestSyncWeightsForScaledOutEngines:
         result = await manager.sync_weights_for_scaled_out_engines()
         assert result["success"] is True
         assert result["synced_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_follower", [False, True])
+async def test_seed_transport_receipt_keeps_full_pre_sync_replica_generation(patch_async_helpers, replace_follower):
+    seed = make_mock_engine(weight_version="transport-7")
+    head, follower, replacement = [make_mock_engine() for _ in range(3)]
+    seed._actor_id.hex.return_value = "seed"
+    head._actor_id.hex.return_value = "head"
+    follower._actor_id.hex.return_value = "follower"
+    replacement._actor_id.hex.return_value = "replacement"
+    baseline = make_engine_group(engines=[seed])
+    scaled = make_engine_group(engines=[head, follower], num_gpus_per_engine=16, is_scaled_out=True)
+    assert scaled.nodes_per_engine == 2
+    manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[baseline, scaled])})
+    manager._get_healthy_seed_engines = lambda model: [seed]
+
+    def receive(**kwargs):
+        if replace_follower:
+            scaled.all_engines[1] = replacement
+        return AwaitableValue({"success": True})
+
+    head.send_weights_to_remote_instance.remote.side_effect = receive
+    assert await manager._sync_weights_from_seed_engine([head], timeout=60)
+    # Actual seed init/send orchestration completed, but its receipt is tied to
+    # the captured replica. A new follower must not inherit the head's version.
+    assert manager._seed_sync_receipts["head"] == (("head", "follower"), "transport-7")
+    seed.send_weights_to_remote_instance.remote.assert_called_once()
+    head.send_weights_to_remote_instance.remote.assert_called_once()
+    if replace_follower:
+        assert scaled.all_engines[1] is replacement
+
+
+@pytest.mark.asyncio
+async def test_failed_seed_sync_invalidates_previous_replica_receipt(patch_async_helpers):
+    seed, head, follower = [make_mock_engine() for _ in range(3)]
+    head._actor_id.hex.return_value = "head"
+    follower._actor_id.hex.return_value = "follower"
+    seed.send_weights_to_remote_instance.remote.return_value = AwaitableValue({"success": False})
+    baseline = make_engine_group(engines=[seed])
+    scaled = make_engine_group(engines=[head, follower], num_gpus_per_engine=16, is_scaled_out=True)
+    manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[baseline, scaled])})
+    manager._get_healthy_seed_engines = lambda model: [seed]
+    manager._seed_sync_receipts = {"head": (("head", "follower"), "v1")}
+    assert await manager._sync_weights_from_seed_engine([head], timeout=60) is False
+    assert "head" not in manager._seed_sync_receipts

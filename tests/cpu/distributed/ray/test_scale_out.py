@@ -6,7 +6,7 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import (
+    from relax.distributed.ray.policy_engine_pool import (
         ScaleInRequest,
         ScaleInStatus,
         ScaleOutRequest,

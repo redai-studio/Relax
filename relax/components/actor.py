@@ -388,7 +388,8 @@ class Actor(Base):
         stops.
         """
         self._stop_event.set()
-        await self._loop_runner.join(timeout=5)
+        if not await self._loop_runner.join(timeout=5):
+            raise RuntimeError("Training thread did not exit; attempt cleanup is unconfirmed")
 
     # --- HTTP endpoints for restart / recovery (bypass Ray Serve handle) ---
 

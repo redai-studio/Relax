@@ -380,7 +380,7 @@ class AutoscalerService(Base):
         if self._http_session is None:
             return [], incomplete("discovery_error")
 
-        url = f"{self.config.rollout_service_url}/engines"
+        url = f"{self.config.rollout_service_url}/engines?schema_version=2"
 
         try:
             async with self._http_session.get(url) as response:
@@ -398,7 +398,27 @@ class AutoscalerService(Base):
         try:
             if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
                 raise ValueError("models must be a dict")
-            for model_name, model_info in data["models"].items():
+            if data.get("schema_version") == 2:
+                for model_name, model_info in data["models"].items():
+                    if not isinstance(model_info, dict) or not isinstance(model_info.get("engines"), list):
+                        raise ValueError("engines must be a list")
+                    for engine in model_info["engines"]:
+                        if not isinstance(engine, dict):
+                            raise ValueError("engine must be a dict")
+                        if (
+                            engine.get("state") == "ready"
+                            and isinstance(engine.get("base_url"), str)
+                            and engine["base_url"]
+                        ):
+                            engines.append(
+                                {
+                                    "id": engine["engine_id"],
+                                    "url": engine["base_url"],
+                                    "model_name": model_name,
+                                    "status": "active",
+                                }
+                            )
+            for model_name, model_info in ({} if data.get("schema_version") == 2 else data["models"]).items():
                 if not isinstance(model_info, dict) or not isinstance(model_info.get("engine_groups"), list):
                     raise ValueError("engine_groups must be a list")
                 for group in model_info["engine_groups"]:

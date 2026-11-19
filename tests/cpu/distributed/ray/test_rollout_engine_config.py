@@ -7,7 +7,7 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import EngineGroupConfig, ModelConfig
+    from relax.distributed.ray.policy_engine_pool import EngineGroupConfig, ModelConfig
 
     HAS_DEPS = True
 except ImportError:

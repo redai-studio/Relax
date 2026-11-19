@@ -31,13 +31,7 @@ def test_startup_confirms_release_before_constructing_next_owner(monkeypatch, fa
 
     monkeypatch.setattr(module, "create_static_inference_manager", create)
     phase_config = []
-    coordinator = object()
-
-    def configure(phases, initial):
-        phase_config.append((phases, initial))
-        return coordinator
-
-    monkeypatch.setattr(module, "create_phase_coordinator", configure)
+    rollout.configure_phases = SimpleNamespace(remote=lambda phases, initial: phase_config.append((phases, initial)))
     item = module.SharedStaticOwner(
         None,
         SimpleNamespace(
@@ -56,9 +50,8 @@ def test_startup_confirms_release_before_constructing_next_owner(monkeypatch, fa
             module.start_shared_task(None, None, [item], start_rollout)
         assert trace == ["plan", "rollout construct", "rollout release", "rollback"]
     else:
-        _, _, actual = module.start_shared_task(None, None, [item], start_rollout)
-        assert actual is coordinator
-        assert actual is not rollout
+        _, _, coordinator = module.start_shared_task(None, None, [item], start_rollout)
+        assert coordinator is rollout
         phases, initial = phase_config[0]
         assert trace == ["plan", "rollout construct", "rollout release", "teacher construct", "teacher release"]
         assert initial == "startup" and phases[initial] == ()
@@ -90,6 +83,9 @@ def test_prepare_shared_task_injects_existing_genrm_owner(monkeypatch, defer):
         },
         _genrm_colocate_with_rollout=True,
         defer_reward_to_post_process=defer,
+        custom_reward_post_process_path=(
+            "examples.generate_reward_model.post_process_genrm_swap.custom_reward_post_process"
+        ),
         num_gpus_per_node=4,
         colocate=True,
         use_opd=False,
@@ -186,38 +182,3 @@ def test_partial_startup_retains_owner_on_config_until_cleanup_confirmed(monkeyp
     assert module.retry_shared_startup_cleanup(args)
     assert cleaned == [rollout]
     assert not hasattr(args, "_shared_startup_pending_owners")
-
-
-@pytest.mark.parametrize("fail_static", [False, True])
-def test_shared_shutdown_retains_unconfirmed_owners_and_closes_worker(monkeypatch, fail_static):
-    events = []
-    worker = object()
-    coordinator = object()
-    rollout = SimpleNamespace(dispose=SimpleNamespace(remote=lambda item: events.append(("worker", item))))
-    static = object()
-    args = SimpleNamespace(
-        _shared_inference_owners=[rollout, static],
-        _rollout_engine_manager=rollout,
-        _rollout_worker=worker,
-        _inference_phase_coordinator=coordinator,
-    )
-    monkeypatch.setattr(module.ray, "get", lambda ref, **kwargs: ref)
-    monkeypatch.setattr(module.ray, "kill", lambda owner: events.append(("kill", owner)))
-
-    def release(owner):
-        events.append(("static", owner))
-        if fail_static:
-            raise TimeoutError("release unconfirmed")
-
-    monkeypatch.setattr(module, "rollback_static_inference_manager", release)
-    if fail_static:
-        with pytest.raises(RuntimeError, match="cleanup is unconfirmed"):
-            module.shutdown_shared_task(args)
-        assert args._shared_inference_owners == [static]
-        assert ("kill", coordinator) not in events
-    else:
-        module.shutdown_shared_task(args)
-        assert not hasattr(args, "_shared_inference_owners")
-        assert ("kill", coordinator) in events
-    assert ("worker", worker) in events
-    assert ("kill", rollout) in events

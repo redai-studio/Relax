@@ -11,7 +11,7 @@ This guide shows how to combine Relax's elastic Rollout scaling with Kubernetes 
 | **K8s resource layer** | Scale Pods (GPU resources) based on SGLang metrics | KEDA ScaledObject + Prometheus |
 | **Engine registration layer** | Call `scale_out` in external mode after a Pod is ready, and call `scale_in` to drain traffic before scale-down | Pod Lifecycle Hooks |
 
-**No Relax code changes are required**: the external `scale_out`/`scale_in` APIs, idempotency, weight synchronization, and draining are already implemented in `relax/components/rollout.py` and `relax/distributed/ray/rollout.py`.
+**No Relax code changes are required**: the external `scale_out`/`scale_in` APIs, idempotency, weight synchronization, and draining are already implemented in `relax/components/inference_gateway.py`, the task-level `relax/distributed/ray/inference_manager.py`, and its ordinary `relax/distributed/ray/policy_engine_pool.py`.
 
 ### Prerequisites
 
@@ -381,7 +381,7 @@ K8s creates the Pod
   → The postStart hook starts in parallel and polls /health until it is ready
   → SGLang ready
   → postStart calls POST /rollout/scale_out {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager runs:
+  → Task InferenceManager delegates to PolicyEnginePool:
       CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY → ACTIVE
   → The engine starts receiving traffic
 ```
@@ -392,7 +392,7 @@ K8s creates the Pod
 K8s sends SIGTERM
   → The preStop hook handles the signal
   → Call POST /rollout/scale_in {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager runs:
+  → Task InferenceManager delegates to PolicyEnginePool:
       PENDING → DRAINING (stop new traffic and wait for in-flight requests)
              → REMOVING (deregister the engine)
              → COMPLETED

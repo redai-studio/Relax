@@ -76,13 +76,27 @@ class PhaseCoordinator:
         self._phase = phase
 
 
-async def _call_role_owner(owner: Any, method: str) -> None:
-    await getattr(owner, method).remote()
-
-
 def create_phase_coordinator(phases: Mapping[str, tuple[Any, ...]], initial_phase: str) -> Any:
-    """Keep role owners independent while serializing their GPU handoffs."""
+    """Configure the lifecycle inside an existing task actor; create no
+    actor."""
     import ray
 
-    coordinator = ray.remote(num_cpus=0, num_gpus=0)(PhaseCoordinator)
-    return coordinator.remote(phases, initial_phase, _call_role_owner)
+    from relax.distributed.ray.inference_handle import InferenceRoleHandle
+
+    task = None
+    keys = {}
+    for phase, owners in phases.items():
+        entries = []
+        for owner in owners:
+            candidate = owner.task if isinstance(owner, InferenceRoleHandle) else owner
+            if task is not None and candidate != task:
+                raise ValueError("All inference roles must belong to one task Manager")
+            task = candidate
+            entries.append(
+                (owner.role, owner.model_id) if isinstance(owner, InferenceRoleHandle) else ("rollout", "default")
+            )
+        keys[phase] = tuple(entries)
+    if task is None:
+        raise ValueError("Task phases require an existing inference owner")
+    ray.get(task.configure_phases.remote(keys, initial_phase))
+    return task
