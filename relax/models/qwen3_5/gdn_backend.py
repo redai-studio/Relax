@@ -3,7 +3,12 @@
 workaround."""
 
 import importlib
+import os
 from pathlib import Path
+
+
+def flash_qla_enabled() -> bool:
+    return os.environ.get("FLA_FLASH_QLA") != "0"
 
 
 def _guard_kkt_tma(source: Path) -> None:
@@ -28,8 +33,13 @@ def install_gdn(model: list, source: Path) -> None:
 
 
 def rule(q, k, v, **kw):
-    from flash_qla import chunk_gated_delta_rule
-
     assert kw.pop("cp_context", None) is None
     assert not kw.get("use_qk_l2norm_in_kernel", False)
-    return chunk_gated_delta_rule(q, k, v, auto_cp=True, **kw)
+    if flash_qla_enabled():
+        from flash_qla import chunk_gated_delta_rule
+
+        return chunk_gated_delta_rule(q, k, v, auto_cp=True, **kw)
+
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    return chunk_gated_delta_rule(q, k, v, **kw)

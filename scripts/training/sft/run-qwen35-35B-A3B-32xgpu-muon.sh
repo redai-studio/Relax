@@ -83,6 +83,8 @@ def build_environment() -> dict[str, str]:
                 ]
             ),
             "RELAX_FLA_CONV_NB_MODE": "none",
+            # Use native FLA GDN to avoid the FlashQLA cumsum JIT crash on SM103.
+            "FLA_FLASH_QLA": "0",
             "EP_NCCL_ROOT_DIR": str(nccl),
             "EP_JIT_CACHE_DIR": f"/tmp/relax-qwen35-{os.getuid()}/deepep",
         }
@@ -285,7 +287,6 @@ PERF_ARGS=(
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --max-tokens-per-gpu 262144
-    --custom-megatron-init-path relax.models.qwen3_5.tilelang_nvcc.install
     --custom-megatron-before-train-step-hook-path relax.models.qwen3_5.recipe.before_step
 )
 
