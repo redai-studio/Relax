@@ -188,9 +188,13 @@ def _miles_block_spec(config, **kwargs):
     return spec
 
 
-def _read_metrics(path: Path, steps: int) -> dict[int, dict[str, float]]:
+def _read_metrics(path: Path, steps: int, implementation: str) -> dict[int, dict[str, float]]:
+    log = path.read_text()
+    implementations = set(re.findall(r"MiniMax parity: msa=(\w+) seed=", log))
+    if implementations != {implementation}:
+        raise ValueError(f"{path}: expected MSA implementation {implementation!r}, found {sorted(implementations)}")
     metrics = {}
-    for match in re.finditer(r"step (\d+): (\{[^\n]+\})", path.read_text()):
+    for match in re.finditer(r"step (\d+): (\{[^\n]+\})", log):
         if "'train/loss'" in match[2]:
             values = ast.literal_eval(match[2])
             metrics[int(match[1])] = {
@@ -228,8 +232,11 @@ def compare_runs(logs: list[Path], checkpoints: list[Path], steps: int) -> None:
 
     if steps < 1:
         raise ValueError("Comparison requires at least one step.")
+    if checkpoints[0].resolve() == checkpoints[1].resolve():
+        raise ValueError("Comparison requires separate Relax and Miles checkpoint directories.")
     logger = get_logger(__name__)
-    left_metrics, right_metrics = (_read_metrics(log, steps) for log in logs)
+    left_metrics = _read_metrics(logs[0], steps, "relax")
+    right_metrics = _read_metrics(logs[1], steps, "miles")
     mismatches = []
     for index in range(steps):
         fields = [

@@ -26,7 +26,6 @@ class PackedBlockLayout:
         self.token_start = endpoints[token_document]
         self.token_block_start = block_starts[token_document]
         self.positions = torch.arange(total, device=device) - self.token_start
-        self.token_block = self.token_block_start + self.positions // block_size
         local_block = torch.arange(self.num_blocks, device=device) - block_starts[block_document]
         self.block_first_token = endpoints[block_document] + local_block * block_size
         self.block_last_token = torch.minimum(self.block_first_token + block_size, endpoints[block_document + 1]) - 1

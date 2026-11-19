@@ -15,7 +15,7 @@ from relax.utils.data.image_refs import (
     validate_image_ref_descriptor,
 )
 from relax.utils.data.kimi_k3 import build_kimi_k3_image_features
-from relax.utils.data.minimax import is_minimax_processor
+from relax.utils.data.processing_utils import cast_encoder_input_for_transport
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.image_utils import load_image
 
@@ -70,9 +70,7 @@ def build_hf_image_features(processor: Any, images: list[Image.Image]) -> dict[s
     pixel_values = features["pixel_values"]
     if isinstance(pixel_values, np.ndarray):
         pixel_values = torch.from_numpy(pixel_values)
-    if pixel_values.dtype == torch.float32 and not is_minimax_processor(processor):
-        # Match the producer, which preserves FP32 for MiniMax's patch embed.
-        pixel_values = pixel_values.to(torch.bfloat16)
+    pixel_values = cast_encoder_input_for_transport(processor, "pixel_values", pixel_values)
     return {
         "pixel_values": pixel_values.contiguous(),
         "image_grid_thw": features["image_grid_thw"],

@@ -17,10 +17,23 @@ import soundfile as sf
 import torch
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
+from relax.utils.data.minimax import is_minimax_processor
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+# These large inputs are recast to the encoder weight dtype downstream.
+# Precision-sensitive metadata, such as video_second_per_grid, stays FP32.
+_BF16_DOWNCAST_KEYS = frozenset({"pixel_values", "pixel_values_videos", "input_features"})
+
+
+def cast_encoder_input_for_transport(processor: object, key: str, value: torch.Tensor) -> torch.Tensor:
+    # MiniMax's pretrained patch projection remains FP32 in BF16 training.
+    if key in _BF16_DOWNCAST_KEYS and value.dtype == torch.float32 and not is_minimax_processor(processor):
+        return value.to(torch.bfloat16)
+    return value
+
 
 # Shared thread pool for offloading CPU-intensive media encoding from the asyncio event loop.
 # PNG compression (libpng), H.264 encoding (libx264), and base64 encoding are all C-level

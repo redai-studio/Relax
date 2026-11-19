@@ -57,6 +57,12 @@ def align_minimax_loss_mask(
     replacements."""
     output_ids = expanded_ids.tolist()
     expanded = tokenizer.decode(output_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    # The official tokenizer encodes in NFC. Use its normalization on both
+    # strings before asking for offsets, which are relative to the input text.
+    normalizer = getattr(getattr(tokenizer, "backend_tokenizer", None), "normalizer", None)
+    if normalizer is not None:
+        text = normalizer.normalize_str(text)
+        expanded = normalizer.normalize_str(expanded)
     original_encoding = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     expanded_encoding = tokenizer(expanded, add_special_tokens=False, return_offsets_mapping=True)
     if original_encoding["input_ids"] != short_ids.tolist() or expanded_encoding["input_ids"] != output_ids:

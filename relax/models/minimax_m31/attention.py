@@ -113,10 +113,8 @@ class MiniMaxM3Indexer(MegatronModule):
         return q, k.squeeze(1)
 
     @torch.no_grad()
-    def select(self, q: Tensor, k: Tensor, layout: PackedBlockLayout, bounds: list[int]) -> Tensor:
-        """Selected blocks as packed start positions ``[H, T, topk_blocks]``
-        int64, -1 padded."""
-        T, H = q.shape[:2]
+    def select_flags(self, q: Tensor, k: Tensor, layout: PackedBlockLayout, bounds: list[int]) -> Tensor:
+        """Return selected blocks as packed flags of shape ``[H, T, N]``."""
         positions = layout.positions
         bs = self.block_size
         scores = msa_block_max_scores(q, k, bounds, bs, q.shape[-1] ** -0.5)
@@ -130,16 +128,12 @@ class MiniMaxM3Indexer(MegatronModule):
         scores = torch.where(init, _INIT_BLOCK_SCORE, scores)
         kk = min(self.topk_blocks, scores.shape[-1])
         top_score, top_idx = torch.topk(scores, kk, dim=-1)
-        seq_start = torch.arange(T, device=q.device) - positions.long()
-        selected = torch.full((H, T, self.topk_blocks), -1, dtype=torch.int64, device=q.device)
-        selected[..., :kk] = torch.where(top_score > _INVALID_BLOCK_SCORE, seq_start[None, :, None] + top_idx * bs, -1)
-        return selected
-
-
-def selection_to_flags(selected: Tensor, layout: PackedBlockLayout) -> Tensor:
-    flags = torch.zeros(*selected.shape[:2], layout.num_blocks, dtype=torch.uint8, device=selected.device)
-    block_ids = layout.token_block[selected.clamp_min(0)]
-    return flags.scatter_reduce_(2, block_ids, (selected >= 0).to(torch.uint8), "amax")
+        selected = top_score > _INVALID_BLOCK_SCORE
+        # Invalid top-k entries can exceed the packed block range. Scatter
+        # zero into a safe column without overwriting a valid block's flag.
+        packed_blocks = torch.where(selected, layout.token_block_start[None, :, None] + top_idx, 0)
+        flags = torch.zeros(*top_idx.shape[:2], layout.num_blocks, dtype=torch.uint8, device=q.device)
+        return flags.scatter_reduce_(2, packed_blocks, selected.to(torch.uint8), "amax")
 
 
 class MiniMaxM3SparseCoreAttention(MegatronModule):
@@ -222,10 +216,9 @@ class MiniMaxM31Attention(SelfAttention):
             kv_heads_per_rank = self.config.num_query_groups // tp_size
             local_heads = list(range(tp_rank * kv_heads_per_rank, (tp_rank + 1) * kv_heads_per_rank))
             q, k = self.indexer.project(indexer_states[:, 0], layout.positions, rotary_pos_emb, local_heads)
-            selected = self.indexer.select(q, k, layout, bounds)
             token_start = layout.token_start.to(torch.int32)
             self._msa_block_form = (
-                selection_to_flags(selected, layout),
+                self.indexer.select_flags(q, k, layout, bounds),
                 token_start,
                 torch.arange(seq, dtype=torch.int32, device=hidden_states.device),
                 layout.token_block_start.to(torch.int32),

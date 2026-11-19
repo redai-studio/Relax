@@ -1554,16 +1554,17 @@ def test_gemma4_dataset_aligns_image_wrappers_and_disables_row_token_types(tmp_p
         dataset.stop()
 
 
-def test_minimax_dataset_masks_wrapped_images_and_timestamped_video_frames(tmp_path, monkeypatch):
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+@pytest.mark.parametrize(("prefix", "response"), [("Compare", "Answer."), ("Cafe\u0301", "Re\u0301ponse.")])
+def test_minimax_dataset_masks_wrapped_images_and_timestamped_video_frames(tmp_path, monkeypatch, prefix, response):
+    from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
     from transformers import PreTrainedTokenizerFast
 
     image, video, start, end = "]<]image[>[", "]<]video[>[", "]<]start of image[>[", "]<]end of image[>["
-    response = "Answer."
-    short_text = f"Compare {image} with {video}. {response}"
+    short_text = f"{prefix} {image} with {video}. {response}"
     frames = "".join(f"]<]{timestamp} seconds[>[{start}{video * 2}{end}" for timestamp in ("0.0", "0.5"))
-    expanded_text = f"Compare {start}{image * 2}{end} with {frames}. {response}"
+    expanded_text = f"{prefix} {start}{image * 2}{end} with {frames}. {response}"
     backend = Tokenizer(models.BPE())
+    backend.normalizer = normalizers.NFC()
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     backend.decoder = decoders.ByteLevel()
     special_tokens = [image, video, start, end]

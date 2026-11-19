@@ -30,9 +30,9 @@ from PIL import Image
 
 from relax.utils.data.image_refs import SFT_HF_IMAGE_REBUILD_SUPPORTED
 from relax.utils.data.kimi_k3 import KIMI_K3_SFT_REQUEST, process_kimi_k3_sft_images
-from relax.utils.data.minimax import is_minimax_processor
 from relax.utils.data.processing_utils import (
     adapt_processor_kwargs,
+    cast_encoder_input_for_transport,
     expand_kimi_k25_placeholders,
     load_processor,
     remap_mm_train_inputs,
@@ -44,12 +44,6 @@ from relax.utils.multimodal.image_utils import fetch_image, resize_qwen_vl_extre
 
 
 logger = get_logger(__name__)
-
-# fp32 mm tensors that are safe to downcast to bf16 for the shared-memory IPC + TQ
-# transfer: each is a large encoder input that gets re-cast to its encoder's weight
-# dtype downstream, so the bf16 here is lossless. Do NOT add small fp32 metadata
-# tensors (e.g. video_second_per_grid) — those are consumed at full precision.
-_BF16_DOWNCAST_KEYS = frozenset({"pixel_values", "pixel_values_videos", "input_features"})
 
 # Worker-local processor instance, initialized once per worker via pool initializer.
 _worker_processor = None
@@ -307,8 +301,6 @@ def process_sample_in_worker(
         if isinstance(prompt_ids, torch.Tensor):
             prompt_ids = prompt_ids.tolist()
 
-        # MiniMax's pretrained patch projection is FP32, including in BF16 runs.
-        minimax_pixels = is_minimax_processor(_worker_processor)
         mm_train_inputs = {}
         for k, v in processor_output.items():
             if k in ("input_ids", "attention_mask"):
@@ -316,16 +308,7 @@ def process_sample_in_worker(
             if isinstance(v, np.ndarray):
                 v = torch.from_numpy(v)
             if isinstance(v, torch.Tensor):
-                # Downcast the large fp32 encoder-input tensors to bf16 before the
-                # shared-memory IPC + TQ transfer (halves a ~45 GiB/batch payload).
-                # Only _BF16_DOWNCAST_KEYS are cast: each is re-cast to its encoder's
-                # weight dtype downstream, so this is lossless. It must NOT be a
-                # blanket "all fp32" downcast — small fp32 metadata is consumed at
-                # full precision and would be silently corrupted (e.g. Qwen3-Omni's
-                # `video_second_per_grid` drives mrope position IDs; bf16 rounding
-                # there drifts them irrecoverably).
-                if k in _BF16_DOWNCAST_KEYS and v.dtype == torch.float32 and not minimax_pixels:
-                    v = v.to(torch.bfloat16)
+                v = cast_encoder_input_for_transport(_worker_processor, k, v)
                 # Place in shared memory for zero-copy return via fd-based IPC.
                 # contiguous() is required: share_memory_() does not support non-contiguous storage.
                 mm_train_inputs[k] = v.contiguous().share_memory_()
