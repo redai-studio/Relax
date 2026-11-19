@@ -735,12 +735,13 @@ constraint on clusters without marker resources.
 
 #### Scale-Out Node-Group Affinity
 
-With baseline affinity enabled, each placement-group bundle for a new rollout engine also requests `elastic_gpu: 1`.
-Set `RELAX_ELASTIC_NODE_GROUP` to override the `elastic` prefix. The target Ray worker group must advertise
-`<prefix>_gpu` in its configuration, including when it starts with zero replicas. Set
-`RELAX_ELASTIC_NODE_GROUP=elastic` explicitly to target scale-out on jobs with baseline affinity disabled or on
-manually scaled jobs. Without that constraint, scale-out placement groups can use any eligible capacity. The Ray
-cluster, Kubernetes setup, or resource platform enforces worker-group availability and preemption policy.
+This constraint applies only to placement groups created by Ray-native rollout scale-out in jobs launched with an
+enabled autoscaler config. With baseline affinity enabled, each bundle in these new groups also requests
+`elastic_gpu: 1`. Set `RELAX_ELASTIC_NODE_GROUP` to override the `elastic` prefix, or set it explicitly to opt in
+to targeted scale-out when baseline affinity is disabled. The target Ray worker group must declare `<prefix>_gpu`
+in its configuration, including when it starts with zero replicas. Initial and existing placement groups retain
+their original resource requests. The Ray cluster, Kubernetes setup, or resource platform enforces worker-group
+availability and preemption policy.
 
 #### Configuration File Format
 

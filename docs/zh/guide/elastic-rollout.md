@@ -711,10 +711,11 @@ Relax 会快速失败；没有标记资源的集群可通过 `--no-enable-affini
 
 #### 扩容节点组亲和性
 
-启用基线亲和性的任务会给新增 rollout engine 的每个 PG bundle 额外请求 `elastic_gpu: 1`。
-`RELAX_ELASTIC_NODE_GROUP` 可覆盖 `elastic` 前缀。目标组需在 Ray 的 Worker Group 配置中声明对应的
-`<prefix>_gpu`，配置从 0 个副本起扩时也需要声明。关闭基线亲和性或手动扩容的任务，可以显式设置
-`RELAX_ELASTIC_NODE_GROUP=elastic` 单独启用扩容定向。没有启用此约束时，扩容 PG 可使用任意满足条件的容量。
+此约束仅适用于启动时启用了 autoscaler 配置的任务中，由 Ray-native rollout 扩容新建的 PG。
+启用基线亲和性时，这些新 PG 的每个 bundle 会额外请求 `elastic_gpu: 1`。
+`RELAX_ELASTIC_NODE_GROUP` 可覆盖 `elastic` 前缀。关闭基线亲和性时，可显式设置该变量来启用扩容定向。
+目标组需在 Ray 的 Worker Group 配置中声明对应的 `<prefix>_gpu`，从 0 个副本起扩时也需要声明。
+初始化和已存在的 PG 保持原有资源请求。
 节点组的可用性、稳定性和抢占策略由 Ray 集群、Kubernetes 配置或外部资源平台保障。
 
 #### 配置文件格式

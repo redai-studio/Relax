@@ -14,6 +14,7 @@ logger = get_logger(__name__)
 
 
 _CONTROL_PLANE_NODE_GROUP_ATTR = "_relax_control_plane_node_group"
+_ELASTIC_ROLLOUT_ENABLED_ATTR = "_relax_elastic_rollout_enabled"
 
 
 def _autoscaler_enabled(config_path: str) -> bool:
@@ -30,10 +31,20 @@ def _autoscaler_enabled(config_path: str) -> bool:
         return False
 
 
+def _elastic_rollout_enabled(args: Any) -> bool:
+    enabled = getattr(args, _ELASTIC_ROLLOUT_ENABLED_ATTR, None)
+    if enabled is not None:
+        return enabled
+
+    config_path = getattr(args, "autoscaler_config", None)
+    return bool(config_path and _autoscaler_enabled(config_path))
+
+
 def maybe_pin_baseline_to_stable(args) -> None:
     """Pin an elastic job's baseline roles to the stable worker group."""
-    config_path = getattr(args, "autoscaler_config", None)
-    autoscaler_enabled = bool(config_path and _autoscaler_enabled(config_path))
+    autoscaler_enabled = _elastic_rollout_enabled(args)
+    # Resolve the job's setting before passing args to remote actors.
+    setattr(args, _ELASTIC_ROLLOUT_ENABLED_ATTR, autoscaler_enabled)
     if autoscaler_enabled and not os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip():
         os.environ["RELAX_INITIAL_NODE_GROUP"] = "stable"
 
@@ -51,16 +62,17 @@ def _get_elastic_node_group(args: Any) -> Optional[str]:
     if hasattr(args, _CONTROL_PLANE_NODE_GROUP_ATTR):
         return getattr(args, _CONTROL_PLANE_NODE_GROUP_ATTR) or None
 
-    config_path = getattr(args, "autoscaler_config", None)
-    if not config_path or not _autoscaler_enabled(config_path):
+    if not _elastic_rollout_enabled(args):
         return None
 
     return os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip() or "stable"
 
 
 def get_scale_out_node_group(args: Any) -> Optional[str]:
-    """Resolve the worker group for newly scaled-out rollout engines."""
-    if is_env_set("RELAX_ELASTIC_NODE_GROUP") or _get_elastic_node_group(args) is not None:
+    """Resolve the worker group for new scale-out PGs in an elastic job."""
+    if not _elastic_rollout_enabled(args):
+        return None
+    if is_env_set("RELAX_ELASTIC_NODE_GROUP") or getattr(args, "enable_affinity", True):
         return Envs.RELAX_ELASTIC_NODE_GROUP.strip()
     return None
 
