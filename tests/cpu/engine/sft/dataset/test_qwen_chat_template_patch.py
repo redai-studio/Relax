@@ -807,14 +807,7 @@ def test_qwen38_dataset_text_item_normalizes_leading_think(tmp_path, reasoning):
     path = tmp_path / "messages.jsonl"
     content = f"<think>\n{reasoning}\n</think>\n\nanswer"
     path.write_text(
-        json.dumps(
-            {
-                "messages": [
-                    {"role": "user", "content": "query"},
-                    {"role": "assistant", "content": [{"type": "text", "text": content}]},
-                ]
-            }
-        )
+        json.dumps({"messages": [{"role": "user", "content": "query"}, {"role": "assistant", "content": content}]})
         + "\n"
     )
     dataset = SFTStreamingDataset(
@@ -845,10 +838,7 @@ def test_qwen38_real_tokenizer_dataset_text_item_loss(tmp_path):
             {
                 "messages": [
                     {"role": "user", "content": "query"},
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "<think>\n\n</think>\n\nanswer"}],
-                    },
+                    {"role": "assistant", "content": "<think>\n\n</think>\n\nanswer"},
                 ]
             }
         )

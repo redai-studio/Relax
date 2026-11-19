@@ -649,6 +649,7 @@ def test_sft_independent_eval_propagates_rank_image_preprocessing(monkeypatch, r
     args.eval_prompt_data = "/fake/eval.jsonl"
     args.multimodal_keys = {"image": "images"}
     args.sft_image_preprocess_on_rank = True
+    args.sft_literal_image_tags_as_text = True
     args.sft_mask_reasoning = True
     args.sft_loss_last_turn_only = True
     args.sft_ignore_empty_think = True
@@ -677,6 +678,7 @@ def test_sft_independent_eval_propagates_rank_image_preprocessing(monkeypatch, r
     eval_kwargs = dataset_calls[-1]
     assert eval_kwargs["path"] == ["/fake/eval.jsonl"]
     assert eval_kwargs["image_preprocess_on_rank"] is True
+    assert all(call["literal_image_tags_as_text"] is True for call in dataset_calls)
     assert all(call["loss_mask_reasoning"] is True for call in dataset_calls)
     assert all(call["loss_last_turn_only"] is True for call in dataset_calls)
     assert all(call["loss_ignore_empty_think"] is True for call in dataset_calls)

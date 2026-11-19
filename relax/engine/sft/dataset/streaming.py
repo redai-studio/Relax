@@ -134,7 +134,11 @@ def _assistant_quotes_media_tags(row: dict[str, Any], prompt_key: str, multimoda
     return found
 
 
-def _literal_multimodal_keys(row: dict[str, Any], multimodal_keys: dict[str, str] | None) -> dict[str, str]:
+def _literal_multimodal_keys(
+    row: dict[str, Any], multimodal_keys: dict[str, str] | None, literal_image_tags_as_text: bool
+) -> dict[str, str]:
+    if not literal_image_tags_as_text:
+        return multimodal_keys or {}
     # Text datasets may contain CLI arguments or missing figure labels such as
     # <image>. Only interpret these strings as images when the row supplies them.
     return {
@@ -151,9 +155,10 @@ def _validate_multimodal_contract(
     row_index: int,
     multimodal_keys: dict[str, str] | None,
     source_name: str,
+    literal_image_tags_as_text: bool = False,
 ) -> None:
     message_counts = count_message_multimodal_items(
-        prompt, literal_modalities=set(_literal_multimodal_keys(row, multimodal_keys))
+        prompt, literal_modalities=set(_literal_multimodal_keys(row, multimodal_keys, literal_image_tags_as_text))
     )
     inline_media = collect_message_multimodal_data(prompt)
     mismatches = {}
@@ -381,6 +386,7 @@ def _build_canonical_sample_from_row(
     task_type: str = "causal_lm",
     conversation_key_map: dict[str, str] | None = None,
     assistant_media_tags_as_text: bool = False,
+    literal_image_tags_as_text: bool = False,
 ) -> CanonicalSample:
     prompt = row.get(prompt_key)
     if prompt is None:
@@ -425,9 +431,14 @@ def _build_canonical_sample_from_row(
             row_index=row_index,
             multimodal_keys=multimodal_keys,
             source_name=source_name,
+            literal_image_tags_as_text=literal_image_tags_as_text,
         )
         raw_messages = build_messages(
-            row, prompt_key, system_prompt, True, _literal_multimodal_keys(row, multimodal_keys)
+            row,
+            prompt_key,
+            system_prompt,
+            True,
+            _literal_multimodal_keys(row, multimodal_keys, literal_image_tags_as_text),
         )
     elif task_type == "seq_cls":
         if not isinstance(prompt, (str, list)):
@@ -449,9 +460,14 @@ def _build_canonical_sample_from_row(
             row_index=row_index,
             multimodal_keys=multimodal_keys,
             source_name=source_name,
+            literal_image_tags_as_text=literal_image_tags_as_text,
         )
         raw_messages = build_messages(
-            row, prompt_key, system_prompt, True, _literal_multimodal_keys(row, multimodal_keys)
+            row,
+            prompt_key,
+            system_prompt,
+            True,
+            _literal_multimodal_keys(row, multimodal_keys, literal_image_tags_as_text),
         )
     else:
         if not isinstance(prompt, str):
@@ -467,9 +483,14 @@ def _build_canonical_sample_from_row(
             row_index=row_index,
             multimodal_keys=multimodal_keys,
             source_name=source_name,
+            literal_image_tags_as_text=literal_image_tags_as_text,
         )
         raw_messages = build_messages(
-            row, prompt_key, system_prompt, True, _literal_multimodal_keys(row, multimodal_keys)
+            row,
+            prompt_key,
+            system_prompt,
+            True,
+            _literal_multimodal_keys(row, multimodal_keys, literal_image_tags_as_text),
         )
         raw_messages = list(raw_messages)
         raw_messages.append({"role": "assistant", "content": row[label_key], "learn": True})
@@ -604,6 +625,7 @@ class SFTStreamingDataset:
         oversize_strategy: str = "keep",
         oversize_custom_fn: Callable[..., Optional[tuple[torch.Tensor, torch.Tensor]]] | None = None,
         invalid_multimodal_strategy: str = "error",
+        literal_image_tags_as_text: bool = False,
         apply_chat_template_kwargs: dict | None = None,
         task_type: str = "causal_lm",
         num_labels: int | None = None,
@@ -653,6 +675,7 @@ class SFTStreamingDataset:
         self.prompt_key = prompt_key
         self.label_key = label_key
         self.multimodal_keys = multimodal_keys
+        self.literal_image_tags_as_text = literal_image_tags_as_text
         self.conversation_key_map = conversation_key_map
         self.metadata_key = metadata_key
         self.tool_key = tool_key
@@ -840,6 +863,7 @@ class SFTStreamingDataset:
             prompt_key=self.prompt_key,
             label_key=self.label_key,
             multimodal_keys=self.multimodal_keys,
+            literal_image_tags_as_text=self.literal_image_tags_as_text,
             conversation_key_map=self.conversation_key_map,
             metadata_key=self.metadata_key,
             tool_key=self.tool_key,
