@@ -950,6 +950,20 @@ class Controller:
     def _cleanup_aborted_service(self, role: Any, service: Service, *, deploy: bool) -> None:
         """Release resources for a service that finished after startup
         abort."""
+        inference_role = str(role) in {"rollout", "genrm", "teacher"}
+        config = getattr(self, "config", None)
+        task_owned = getattr(config, "_rollout_engine_manager", None) is not None
+        retired = getattr(config, "_inference_startup_retired", False)
+        if inference_role and (task_owned or retired):
+            pending = vars(self).setdefault("_pending_inference_pg_services", {})
+            token = getattr(service, "_inference_deployment_token", None)
+            current = getattr(config, "_inference_startup_token", None)
+            pending[(token, role) if token is not None and token != current else role] = service
+            if getattr(service, "_deployed", False):
+                self.serve_dict.setdefault(role, service)
+            if retired and getattr(self, "_inference_cleanup_confirmed", False):
+                self._release_pending_inference_services()
+            return
         if deploy:
             try:
                 service._stop_heartbeat_thread()
@@ -984,10 +998,43 @@ class Controller:
         except Exception as e:
             logger.warning(f"[{role}] Failed to release placement group during phase abort: {e}")
 
+    def _release_pending_inference_services(self) -> None:
+        """Release aborted gateway PGs only after the task's engines are
+        gone."""
+        pending = vars(self).setdefault("_pending_inference_pg_services", {})
+        retired = getattr(self, "_retired_inference_tokens", set())
+        current = getattr(self.config, "_inference_startup_token", None)
+        for key, service in tuple(pending.items()):
+            role = key[1] if isinstance(key, tuple) else key
+            token = getattr(service, "_inference_deployment_token", None)
+            if token is not None and token != current:
+                if token not in retired:
+                    raise RuntimeError("Prior inference deployment cleanup is unconfirmed")
+            elif not getattr(self, "_inference_cleanup_confirmed", False):
+                return
+            if hasattr(service, "_stop_heartbeat_thread"):
+                service._stop_heartbeat_thread()
+            if token is None or token == current:
+                serve.delete(role)
+            pgs = getattr(service, "pgs", None)
+            if pgs is not None and not getattr(service, "_is_shared_pgs", False):
+                pg = pgs[0] if isinstance(pgs, tuple) else pgs
+                remove_placement_group(pg)
+                service.pgs = None
+            pending.pop(key, None)
+            if self.serve_dict.get(role) is service:
+                self.serve_dict.pop(role)
+
     def _start_services(self, service_args: list[tuple]) -> list[Any]:
-        """Start services, staging deployment only when S3 prefetch needs
-        placement groups."""
-        if not _uses_s3_model_prefetch(self.config):
+        """Allocate task placements before prefetch and inference startup."""
+        if getattr(self, "_shared_inference_startup", False):
+            if getattr(self, "_pending_inference_pg_services", None):
+                self._release_pending_inference_services()
+            if getattr(self, "_pending_inference_pg_services", None):
+                raise RuntimeError("Task startup has unconfirmed placement cleanup")
+            self._inference_cleanup_confirmed = False
+            self.config._inference_startup_retired = False
+        if not _uses_s3_model_prefetch(self.config) and not getattr(self, "_shared_inference_startup", False):
             services = self._run_service_phase(
                 ServiceStartupPhase.DEPLOY,
                 self._create_service_task,
@@ -1001,14 +1048,42 @@ class Controller:
             partial(self._create_service_task, defer_deploy=True),
             service_args,
         )
-        service_pgs = {role: service.pgs for role, service in prepared_services.items()}
-        model_prefetch_refs = self._start_model_prefetch(service_pgs)
-        services = self._run_service_phase(
-            ServiceStartupPhase.DEPLOY,
-            self._deploy_service_task,
-            list(prepared_services.items()),
-        )
+        if getattr(self, "_shared_inference_startup", False):
+            self._pending_inference_pg_services = {
+                role: service
+                for role, service in prepared_services.items()
+                if str(role) in {"rollout", "genrm", "teacher"}
+            }
+        try:
+            service_pgs = {role: service.pgs for role, service in prepared_services.items()}
+            model_prefetch_refs = self._start_model_prefetch(service_pgs)
+            if getattr(self, "_shared_inference_startup", False):
+                if model_prefetch_refs:
+                    ray.get(model_prefetch_refs)
+                from relax.distributed.ray.shared_task_startup import prepare_shared_task
+
+                self._teacher_manager = prepare_shared_task(
+                    self.config,
+                    service_pgs["rollout"],
+                    runtime_env=self.runtime_env,
+                    bindings=service_pgs,
+                )
+            if getattr(self, "_shared_inference_startup", False):
+                for service in prepared_services.values():
+                    service._inference_task_owner = getattr(self.config, "_rollout_engine_manager", None)
+                    service._inference_deployment_token = getattr(self.config, "_inference_startup_token", None)
+            services = self._run_service_phase(
+                ServiceStartupPhase.DEPLOY,
+                self._deploy_service_task,
+                list(prepared_services.items()),
+            )
+        except BaseException:
+            if getattr(self, "_shared_inference_startup", False):
+                self._dispose_shared_inference_task()
+            raise
         self.serve_dict.update(services)
+        if getattr(self, "_shared_inference_startup", False):
+            self._pending_inference_pg_services.clear()
         return model_prefetch_refs
 
     @staticmethod
@@ -1188,10 +1263,16 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
-        teacher_pg, self._teacher_manager = maybe_start_managed_opd_teacher(
-            self.config,
-            runtime_env=self.runtime_env,
-        )
+        from relax.distributed.ray.inference_handle import shared_task_enabled
+
+        self._shared_inference_startup = shared_task_enabled(self.config)
+        if self._shared_inference_startup:
+            teacher_pg, self._teacher_manager = None, None
+        else:
+            teacher_pg, self._teacher_manager = maybe_start_managed_opd_teacher(
+                self.config,
+                runtime_env=self.runtime_env,
+            )
 
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
@@ -1212,6 +1293,13 @@ class Controller:
         # SFT path returns ROLES_SFT_ONLY (no `rollout` attr); rollout may be
         # injected via extra_roles — gate on the unified name set, not the enum.
         actor_rollout_colocate = self.config.colocate and "rollout" in role_names and "actor" in role_names
+        shared_inference_colocate = (
+            self._shared_inference_startup
+            and self.config.colocate
+            and "rollout" in role_names
+            and bool(getattr(self.config, "_genrm_instances_resolved", None) or "teacher" in self.config.resource)
+        )
+        shared_colocate = actor_rollout_colocate or shared_inference_colocate
 
         roles_to_create = []
         for role in roles_iter:
@@ -1241,13 +1329,13 @@ class Controller:
         relax_utils.report_train_start(_build_train_start_config(self.config))
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
-        self._validate_gpu_resources(roles_to_create, actor_rollout_colocate, actor_rollout_pg_roles)
+        self._validate_gpu_resources(roles_to_create, shared_colocate, actor_rollout_pg_roles)
 
         if teacher_pg is not None:
             shared_pg = teacher_pg
-        elif actor_rollout_colocate and not self.config.hybrid:
+        elif shared_colocate and not self.config.hybrid:
             shared_pg = create_placement_group(
-                num_gpus=self.config.resource[ROLES.actor][1],
+                num_gpus=self.config.resource["actor"][1],
                 node_group_affinity=self.config.enable_affinity,
             )
         else:
@@ -1317,7 +1405,11 @@ class Controller:
         async def run_all_services(*, resume_existing: bool = False, startup: GlobalStartup):
             if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
                 # Pass genRM manager(s) to actor for coordinated offload/onload
-                if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
+                if (
+                    GENRM_ROLE in self.serve_dict
+                    and not self.config.fully_async
+                    and not getattr(self.config, "_inference_phase_coordinator", None)
+                ):
                     genrm_service = self.serve_dict[GENRM_ROLE]
                     genrm_managers = [
                         await genrm_service.get_genrm_manager(route_key)
@@ -1495,6 +1587,46 @@ class Controller:
             logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
             return False
 
+    def _dispose_shared_inference_task(self) -> bool:
+        """Close separate role owners before releasing their borrowed PGs."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        if getattr(self, "_inference_cleanup_confirmed", False):
+            self._release_pending_inference_services()
+            return True
+        owned = any(
+            getattr(config, name, None)
+            for name in (
+                "_inference_phase_coordinator",
+                "_rollout_engine_manager",
+                "_shared_startup_pending_owners",
+            )
+        )
+        if not owned and not getattr(self, "_pending_inference_pg_services", None):
+            return False
+        from relax.distributed.ray.shared_task_startup import shutdown_shared_task
+
+        # Late service deployments must not attach after teardown has started.
+        config._inference_startup_retired = True
+        shutdown_shared_task(config)
+        self._inference_cleanup_confirmed = True
+        vars(self).setdefault("_retired_inference_tokens", set()).add(
+            getattr(config, "_inference_startup_token", None)
+        )
+        for name in (
+            "_rollout_engine_manager",
+            "_rollout_worker",
+            "_genrm_managers",
+            "_teacher_inference_managers",
+            "_teacher_inference_manager_handle",
+            "_inference_phase_coordinator",
+        ):
+            vars(config).pop(name, None)
+        self._teacher_manager = None
+        self._release_pending_inference_services()
+        return True
+
     def _dispose_managed_genrm(self) -> None:
         from relax.distributed.ray.inference_handle import use_managed_auxiliary
 
@@ -1532,10 +1664,10 @@ class Controller:
             except Exception as exc:
                 logger.warning(f"Image SFT producer shutdown failed: {exc}")
 
-        self._dispose_rollout_manager()
-        self._dispose_managed_genrm()
-
-        shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
+        if not self._dispose_shared_inference_task():
+            self._dispose_rollout_manager()
+            self._dispose_managed_genrm()
+            shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
 
         self._shutdown_agentic_rollout_services()
 
@@ -1791,9 +1923,10 @@ class Controller:
         self._cancel_pending_tasks()
 
         # The rollout actor owns router subprocesses; dispose before deleting its handle.
-        self._dispose_rollout_manager()
-        self._dispose_managed_genrm()
-        shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
+        if not self._dispose_shared_inference_task():
+            self._dispose_rollout_manager()
+            self._dispose_managed_genrm()
+            shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
         self._teacher_manager = None
         if hasattr(self.config, "_teacher_inference_manager_handle"):
             delattr(self.config, "_teacher_inference_manager_handle")

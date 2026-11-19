@@ -12,24 +12,16 @@ Wire-up (in the training script):
   --defer-reward-to-post-process         # actor.update_weights skips GenRM onload
   --custom-reward-post-process-path <path to this file>
 
-Assumptions:
-- Shared-bundles colocate: rollout_num_gpus == genrm_num_gpus == actor_total.
-- GenRMManager is created with name="relax_genrm_manager" (see
-  relax/distributed/ray/placement_group.py::create_genrm_manager).
-- We run inside the RolloutManager Ray actor's process, so rollout offload
-  goes through the in-process singleton (get_local_rollout_manager) to avoid
-  a self-remote-call deadlock. GenRM offload/onload goes through the Ray
-  handle (cross-actor call).
+The task inference coordinator owns memory transitions. This hook only scores;
+call it through deferred scoring, not through a named manager actor.
 """
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import ray
 import torch
 
-from relax.distributed.ray.rollout import get_local_rollout_manager
 from relax.engine.rewards.dapo_genrm import (
     MAX_ANSWER_LEN,
     _extract_answer,
@@ -71,8 +63,7 @@ async def _score_one(client, url, question, ground_truth, predict_str):
         resp.raise_for_status()
         judge_response = resp.json().get("response", "")
     except Exception as e:
-        logger.error(f"GenRM judge call failed, degrading to 0: {e}")
-        return 0.0
+        raise RuntimeError("GenRM judge call failed") from e
     prediction = judge_response.strip()
     if "Judgement:" in prediction:
         prediction = prediction.split("Judgement:")[-1].strip()
@@ -152,15 +143,9 @@ def custom_reward_post_process(args, samples):
     else:
         flat_samples = list(samples)
 
-    rollout = get_local_rollout_manager()
-    rollout._offload_local()
-
-    genrm = ray.get_actor("relax_genrm_manager")
-    ray.get(genrm.onload.remote())
-    try:
-        raw_rewards = _run_async(_score_all(flat_samples))
-    finally:
-        ray.get(genrm.offload.remote())
+    if not getattr(args, "_managed_genrm_scoring_phase", False):
+        raise RuntimeError("GenRM batch scoring must run inside the task inference scoring phase")
+    raw_rewards = _run_async(_score_all(flat_samples))
 
     reward_key = getattr(args, "reward_key", None)
     for sample, score in zip(flat_samples, raw_rewards, strict=True):

@@ -4085,6 +4085,26 @@ def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
     args.colocate = False
 
 
+def _resolve_genrm_colocate_layout(args: Any, actor_total_gpus: int) -> None:
+    from relax.engine.inference.phase_plans import require_deferred_shared_genrm
+
+    rollout_g = args.rollout_num_gpus
+    genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
+    if rollout_g + genrm_g == actor_total_gpus:
+        args._genrm_colocate_with_rollout = False
+        logger.info(f"GenRM split bundles: rollout={rollout_g}, genrm={genrm_g}, actor={actor_total_gpus}")
+    elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
+        args._genrm_colocate_with_rollout = True
+        require_deferred_shared_genrm(args)
+        logger.info(f"GenRM deferred shared bundles: rollout=genrm={actor_total_gpus}")
+    else:
+        raise ValueError(
+            "GenRM colocate requires split bundles (rollout + genrm == actor), or deferred shared bundles "
+            "(rollout == genrm == actor with --defer-reward-to-post-process). "
+            f"Got rollout={rollout_g}, genrm={genrm_g}, actor={actor_total_gpus}."
+        )
+
+
 def relax_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -4660,7 +4680,8 @@ def relax_validate_args(args):
                 f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-    elif args.colocate and genrm_enabled:
+    # GenRM may coexist with a managed Teacher; validate both role layouts.
+    if args.colocate and not args.hybrid and genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True
         if args.offload_rollout is None:
@@ -4677,28 +4698,7 @@ def relax_validate_args(args):
         if args.use_critic:
             actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
-        rollout_g = args.rollout_num_gpus
-        genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
-        if rollout_g + genrm_g == actor_total_gpus:
-            args._genrm_colocate_with_rollout = False
-            logger.info(
-                f"GenRM colocate (split bundles): rollout={rollout_g}, genrm={genrm_g}, "
-                f"actor total={actor_total_gpus}."
-            )
-        elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
-            args._genrm_colocate_with_rollout = True
-            logger.info(
-                f"GenRM colocate (shared bundles with rollout): rollout=genrm={actor_total_gpus} GPUs. "
-                f"Set per-engine SGLang mem_fraction_static via --sglang-config (rollout) and "
-                f"--genrm-engine-config '{{\"mem_fraction_static\": <float>}}' (genrm)."
-            )
-        else:
-            raise ValueError(
-                "In colocated mode with genRM enabled, GPU allocation must satisfy one of:\n"
-                f"  (1) split: --rollout-num-gpus + --genrm-num-gpus == actor total ({actor_total_gpus}), or\n"
-                f"  (2) shared: --rollout-num-gpus == --genrm-num-gpus == actor total ({actor_total_gpus}).\n"
-                f"Got rollout={rollout_g}, genrm={genrm_g}, actor total={actor_total_gpus}."
-            )
+        _resolve_genrm_colocate_layout(args, actor_total_gpus)
 
     if args.offload_train is None:
         args.offload_train = False

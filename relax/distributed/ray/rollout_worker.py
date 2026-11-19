@@ -70,10 +70,16 @@ class RolloutWorker:
                 task.add_done_callback(self._active.discard)
 
     async def generate(self, rollout_id: int) -> None:
+        coordinator = getattr(self.args, "_inference_phase_coordinator", None)
+        if coordinator is not None:
+            await coordinator.switch.remote("inference")
         await self.manager.begin_rollout.remote(rollout_id)
         await self._run("generate", rollout_id)
 
     async def eval(self, rollout_id: int) -> None:
+        coordinator = getattr(self.args, "_inference_phase_coordinator", None)
+        if coordinator is not None:
+            await coordinator.switch.remote("inference")
         await self.manager.begin_rollout.remote(rollout_id)
         await self._run("eval", rollout_id)
 

@@ -8,6 +8,12 @@ For a standard SGLang task without `--colocate`, a Relax-managed single teacher 
 
 With `--opd-teacher-url`, the teacher is external: Relax sends requests but does not allocate its GPUs or stop its process when training ends. Existing external teacher routing remains applicable.
 
+## Colocated teacher phases
+
+Standard native SGLang tasks validate the complete shared GPU layout before engine startup. Split teachers use disjoint slices and score inline; teachers sharing Rollout bundles score after generation has drained. A phase coordinator serializes offload/onload across the separate role owners, then restores the student when a token selection needs another forward pass.
+
+Deferred batches retain their training partition and final-batch marker. Required scoring fields must pass shape, token-ID and effective loss-mask numerical checks before publication; an incomplete batch is not partially published. Existing role entry points and discovery defaults remain unchanged. Agentic and custom lifecycle migration is a separate step.
+
 ## Key Parameters
 
 | Parameter                 | Description                                                                                                                                |

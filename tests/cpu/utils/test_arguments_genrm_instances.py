@@ -173,3 +173,28 @@ def test_genrm_resource_must_match_instance_gpu_sum(_arguments_module):
 
     with pytest.raises(ValueError, match="must equal the sum"):
         _arguments_module._validate_genrm_resource_config(args, resolved)
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_full_gpu_genrm_requires_deferred_scoring(_arguments_module, defer):
+    args = SimpleNamespace(
+        rollout_num_gpus=8,
+        _genrm_instances_resolved={"judge": {"num_gpus": 8}},
+        defer_reward_to_post_process=defer,
+    )
+    if defer:
+        _arguments_module._resolve_genrm_colocate_layout(args, 8)
+        assert args._genrm_colocate_with_rollout
+    else:
+        with pytest.raises(ValueError, match="--defer-reward-to-post-process"):
+            _arguments_module._resolve_genrm_colocate_layout(args, 8)
+
+
+def test_split_genrm_preserves_concurrent_layout(_arguments_module):
+    args = SimpleNamespace(
+        rollout_num_gpus=4,
+        _genrm_instances_resolved={"judge": {"num_gpus": 4}},
+        defer_reward_to_post_process=False,
+    )
+    _arguments_module._resolve_genrm_colocate_layout(args, 8)
+    assert not args._genrm_colocate_with_rollout

@@ -85,6 +85,19 @@ def is_managed_opd_teacher_colocate(args: Any) -> bool:
     )
 
 
+def teacher_shares_rollout_bundles(args: Any) -> bool:
+    """Identify a shared teacher slice without changing layout validation."""
+    if not is_managed_opd_teacher_colocate(args):
+        return False
+    rollout_gpus = getattr(args, "rollout_num_gpus", None)
+    if rollout_gpus is None:
+        rollout_gpus = args.resource["rollout"][1]
+    actor_gpus = args.resource["actor"][1]
+    if getattr(args, "use_critic", False):
+        actor_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
+    return int(rollout_gpus) >= int(actor_gpus)
+
+
 def _mirror_teacher_sglang_server_args(parser: Any) -> None:
     import argparse
 
@@ -426,6 +439,8 @@ def _start_managed_multi_teacher(
 
 
 async def set_managed_opd_teacher_on_actor_service(actor_service: Any, teacher_manager: Any, args: Any) -> None:
+    if getattr(args, "_inference_phase_coordinator", None) is not None:
+        return
     if actor_service is None or teacher_manager is None or not is_managed_opd_teacher_colocate(args):
         return
     # Colocate teachers (single manager, or a list for MOPD multi-teacher) share the
@@ -499,10 +514,12 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
         actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
     teacher_gpus = args.resource["teacher"][1]
-    if args.rollout_num_gpus + teacher_gpus != actor_total_gpus:
+    split = args.rollout_num_gpus + teacher_gpus == actor_total_gpus
+    shared = args.rollout_num_gpus == actor_total_gpus and 0 < teacher_gpus <= actor_total_gpus
+    if not (split or shared):
         raise ValueError(
-            "Managed OPD teacher colocate requires split bundles where "
-            "--rollout-num-gpus + resource['teacher'][1] equals actor total GPUs. "
+            "Managed OPD teacher colocate requires split bundles (rollout + teacher == actor) "
+            "or shared bundles (rollout == actor and teacher <= actor). "
             f"Got rollout={args.rollout_num_gpus}, teacher={teacher_gpus}, actor total={actor_total_gpus}."
         )
 

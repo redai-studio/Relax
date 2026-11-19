@@ -9,7 +9,8 @@ import psutil
 
 
 def process_is_live(process: psutil.Process) -> bool:
-    """Zombies have exited and no longer own CUDA contexts or executable work."""
+    """Zombies have exited and no longer own CUDA contexts or executable
+    work."""
     try:
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:

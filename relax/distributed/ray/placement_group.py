@@ -332,6 +332,10 @@ def create_genrm_managers(args, pg, runtime_env=None):
     Returns:
         ``{route_key: manager_handle}``.
     """
+    prepared = getattr(args, "_genrm_managers", None)
+    if prepared is not None:
+        return prepared
+
     import copy
 
     from .genrm import GenRMManager

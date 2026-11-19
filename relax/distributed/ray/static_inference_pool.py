@@ -7,11 +7,12 @@ Their placement hooks retain ownership of dedicated teacher PGs; GenRM borrows
 its Service PG.
 """
 
+from copy import copy
 from typing import Any
 
 import ray
 
-from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaSnapshot, Role
+from relax.engine.inference.types import DeploymentMode, LifecycleState, ModelSnapshot, ReplicaSnapshot, Role
 from relax.utils.http_utils import _wrap_ipv6
 
 
@@ -23,6 +24,29 @@ class StaticInferencePool:
         self.spec = static_role_spec(role, args, options)
         self.role = role
         self.model_id = self.spec.models[0].model_id
+        self.start_sleeping = self.spec.deployment.mode is DeploymentMode.DEFER or (
+            self.spec.deployment.mode is DeploymentMode.SPLIT and bool(getattr(args, "offload_rollout", False))
+        )
+        if self.start_sleeping:
+            args = copy(args)
+            if role is Role.GENRM:
+                args.genrm_engine_config = dict(args.genrm_engine_config or {}, enable_memory_saver=True)
+            else:
+                args.teacher_sglang_enable_memory_saver = True
+        shared_teacher = role is Role.TEACHER and self.spec.deployment.mode is not DeploymentMode.DECOUPLED
+        if shared_teacher and self.spec.deployment.mode is DeploymentMode.DEFER:
+            # The legacy TeacherManager adds the rollout slice before its
+            # relative offset; deferred teachers reuse the bundles from zero.
+            args = copy(args)
+            args.rollout_num_gpus = 0
+        if binding is not None:
+            from relax.engine.inference.placement import PlacementPlanner
+            from relax.engine.inference.task_placement import StaticPlacement, plan_static_placement
+
+            offset = options.get("bundle_offset", 0)
+            if shared_teacher:
+                offset += args.rollout_num_gpus
+            plan_static_placement(args, StaticPlacement(self.spec, binding, offset), PlacementPlanner())
         if role is Role.GENRM:
             from relax.distributed.ray.genrm import GenRMManager
 
@@ -36,9 +60,13 @@ class StaticInferencePool:
             implementation = TeacherManager.__ray_metadata__.modified_class
             ctor_args = (args, options["num_replicas"], options["gpus_per_replica"])
             ctor_kwargs = {}
+            if shared_teacher:
+                ctor_kwargs.update(pg=binding, shared_pg=True, bundle_offset=options.get("bundle_offset", 0))
         self.backend = implementation.__new__(implementation)
         try:
             implementation.__init__(self.backend, *ctor_args, **ctor_kwargs)
+            if self.start_sleeping:
+                self.backend.offload()
         except BaseException:
             if hasattr(self.backend, "all_engines"):
                 self.dispose()
@@ -51,9 +79,14 @@ class StaticInferencePool:
             bindings = [(self.backend.pg, False, self.backend.bundle_offset, self.spec.models[0].total_num_gpus)]
         else:
             bindings = [
-                (binding, owned, 0, self.backend.gpus_per_replica)
-                for binding, owned in self.backend._engine_placements.values()
-                if owned
+                (
+                    binding,
+                    owned,
+                    self.backend._resolve_placement(rank)[2] if self.backend._shared_pg else 0,
+                    self.backend.gpus_per_replica,
+                )
+                for rank, (binding, owned) in self.backend._engine_placements.items()
+                if rank % self.backend.nodes_per_engine == 0
             ]
         tp = self.spec.models[0].num_gpus_per_engine
         for index, (binding, owned, offset, total) in enumerate(bindings):
@@ -76,6 +109,7 @@ class StaticInferencePool:
                         tp,
                         self.backend.args.num_gpus_per_node,
                         bundle_offset=offset,
+                        phase=self.spec.deployment.phase,
                     )
                 ],
                 view,

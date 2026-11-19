@@ -97,6 +97,7 @@ async def _blocking(fn: Any, *args: Any, **kwargs: Any) -> Any:
 class InferenceManager:
     def __init__(self) -> None:
         self.pool: Any = None
+        self._worker: Any = None
         self.role = Role.ROLLOUT
         self._last_health = 0.0
         self.placement = PlacementPlanner()
@@ -152,14 +153,18 @@ class InferenceManager:
                 self.pool.record_placement(self.placement)
 
             await _blocking(create_pool)
-            self.memory_ready = True
-            self.state = LifecycleState.READY
+            self.memory_ready = not getattr(self.pool, "start_sleeping", False)
+            self.state = LifecycleState.READY if self.memory_ready else LifecycleState.SLEEPING
+            if not self.memory_ready:
+                self.ledger.fences.add("memory")
             self._last_health = asyncio.get_running_loop().time()
 
     async def recover_static(self) -> None:
         async with self._transition:
             if self._closing or self.pool is None:
                 raise RuntimeError("Inference manager is closed")
+            if not self.memory_ready or "memory" in self.ledger.fences:
+                return
             dead = await _blocking(self.pool.unhealthy_ranks)
             self._last_health = asyncio.get_running_loop().time()
             if not dead:
@@ -405,7 +410,18 @@ class InferenceManager:
             self.pool.mark_synced(set(args[0] if args else kwargs["synced_actor_ids"]))
         return result
 
+    async def attach_worker(self, worker: Any) -> None:
+        if self._closing or self._disposed:
+            raise RuntimeError("Inference manager is closing")
+        if self._worker is not None and self._worker != worker:
+            raise RuntimeError("Rollout worker is already attached")
+        self._worker = worker
+
     async def dispose(self, worker: Any = None) -> None:
+        if worker is not None:
+            self._worker = worker
+        else:
+            worker = self._worker
         self._closing = True
         self.ledger.fences.add("shutdown")
         if self._cleanup_task is None or (
@@ -512,7 +528,10 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
             "scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=node, soft=False),
         },
     )
-    manager = InferenceManager.options(**options).remote()
+    manager = getattr(args, "_rollout_engine_manager", None)
+    prepared = manager is not None
+    if manager is None:
+        manager = InferenceManager.options(**options).remote()
     worker = None
     try:
         address = ray.get(manager.start.remote(deepcopy(args), pg))
@@ -521,7 +540,9 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
         worker_args.sglang_router_port = address["router_port"]
         worker_args._inference_manager_handle = manager
         worker = RolloutWorker.options(**options).remote(worker_args, data_source, manager)
-        handle = ManagedRolloutHandle(manager, worker)
+        if prepared:
+            ray.get(manager.attach_worker.remote(worker))
+        handle = ManagedRolloutHandle(manager, worker, getattr(args, "_inference_phase_coordinator", None))
         count = ray.get(handle.get_num_rollout_per_epoch.remote())
         args.num_rollout_per_epoch = count
         if args.num_epoch is not None:
@@ -544,6 +565,15 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
             ray.get(handle.offload.remote())
         return handle, count
     except BaseException:
+        if prepared:
+            # Record the worker even when startup fails before attachment. The
+            # Controller retains this manager until cleanup is confirmed.
+            if worker is not None:
+                try:
+                    ray.get(manager.dispose.remote(worker), timeout=60)
+                except BaseException:
+                    logger.exception("Shared rollout worker cleanup is unconfirmed; owner retained")
+            raise
         try:
             ray.get(manager.dispose.remote(worker), timeout=60)
         except BaseException:
@@ -563,6 +593,7 @@ def create_static_inference_manager(
     *,
     runtime_env: Any = None,
     name: str | None = None,
+    pending_owners: list[Any] | None = None,
     **pool_options: Any,
 ) -> Any:
     """Start one static model with rollback before returning its owner."""
@@ -572,9 +603,12 @@ def create_static_inference_manager(
     if name is not None:
         options["name"] = name
     manager = InferenceManager.options(**with_control_plane_affinity(args, options)).remote()
+    if pending_owners is not None:
+        pending_owners.append(manager)
     try:
         ray.get(manager.start_static.remote(role, deepcopy(args), binding, pool_options))
     except BaseException:
-        rollback_static_inference_manager(manager)
+        if pending_owners is None:
+            rollback_static_inference_manager(manager)
         raise
     return manager

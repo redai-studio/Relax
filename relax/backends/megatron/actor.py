@@ -424,7 +424,19 @@ class MegatronTrainRayActor(TrainRayActor):
         # Only rollout requests consume this live handle. Megatron saves its
         # args in common.pt; serializing a job-scoped Ray owner breaks resume.
         args = copy.copy(args)
-        vars(args).pop("_teacher_inference_manager_handle", None)
+        for runtime_owner in (
+            "_teacher_inference_manager_handle",
+            "_inference_phase_coordinator",
+            "_rollout_engine_manager",
+            "_genrm_managers",
+            "_teacher_inference_managers",
+            "_shared_startup_pending_owners",
+            "_shared_inference_owners",
+            "_rollout_worker",
+            "_inference_startup_token",
+            "_inference_manager_handle",
+        ):
+            vars(args).pop(runtime_owner, None)
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 

@@ -32,6 +32,7 @@ class ManagedRolloutHandle:
 
     inference_manager: Any
     worker: Any
+    phase_coordinator: Any = None
 
     def __getattr__(self, method: str) -> Any:
         if method.startswith("_"):
@@ -47,6 +48,8 @@ class _PoolCall:
     method: str
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
+        if self.method == "offload" and self.handle.phase_coordinator is not None:
+            return self.handle.phase_coordinator.switch.remote("startup")
         if self.method == "dispose":
             from relax.distributed.ray.inference_manager import dispose_managed_rollout
 
@@ -58,16 +61,21 @@ def use_managed_rollout(args: Any) -> bool:
     """Select engine ownership for the complete task, including auxiliary
     roles."""
     from relax.engine.sft.runtime import is_offline_mode
+    from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
 
+    if getattr(args, "colocate", False) and getattr(args, "use_opd", False):
+        if not is_managed_opd_teacher_enabled(args):
+            return False
     standard = "relax.engine.rollout.sglang_rollout.generate_rollout"
     return not (
         is_offline_mode(args)
         or bool(getattr(args, "use_distributed_post", False))
-        or (bool(getattr(args, "_genrm_instances_resolved", None)) and bool(getattr(args, "colocate", False)))
-        or (bool(getattr(args, "use_opd", False)) and bool(getattr(args, "colocate", False)))
         or bool(getattr(args, "use_agentic_rollout", False))
         or bool(getattr(args, "rollout_engine_class_path", None))
-        or bool(getattr(args, "custom_reward_post_process_path", None))
+        or (
+            bool(getattr(args, "custom_reward_post_process_path", None))
+            and not getattr(args, "defer_reward_to_post_process", False)
+        )
         or bool(getattr(args, "custom_convert_samples_to_train_data_path", None))
         or bool(getattr(args, "debug_train_only", False))
         or bool(getattr(args, "rollout_external", False))
@@ -83,4 +91,16 @@ def use_managed_rollout(args: Any) -> bool:
 
 def use_managed_auxiliary(args: Any) -> bool:
     """Use independent ownership for non-colocated auxiliary roles."""
-    return not getattr(args, "colocate", False) and use_managed_rollout(args)
+    return (not getattr(args, "colocate", False) or shared_task_enabled(args)) and use_managed_rollout(args)
+
+
+def shared_task_enabled(args: Any) -> bool:
+    """Shared-GPU native rollout uses independent owners plus a coordinator."""
+    from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
+
+    return (
+        bool(getattr(args, "colocate", False))
+        and not getattr(args, "hybrid", False)
+        and (bool(getattr(args, "_genrm_instances_resolved", None)) or is_managed_opd_teacher_enabled(args))
+        and use_managed_rollout(args)
+    )

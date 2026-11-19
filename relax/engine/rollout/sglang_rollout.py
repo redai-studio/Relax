@@ -763,7 +763,9 @@ async def generate_and_rm(
     elif generated.reward is None:
         generated.reward = await async_rm(args, generated, evaluation=evaluation)
 
-    if opd.is_opd_enabled(args, evaluation=evaluation):
+    from relax.engine.rollout.deferred_opd import deferred_opd_active
+
+    if opd.is_opd_enabled(args, evaluation=evaluation) and (evaluation or not deferred_opd_active(args)):
         await state.opd_manager.prefill(generated, _encode_multimodal_inputs)
 
     return generated
@@ -860,7 +862,9 @@ async def generate_and_rm_group(
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 
-    if opd.is_opd_enabled(args, evaluation=evaluation):
+    from relax.engine.rollout.deferred_opd import deferred_opd_active
+
+    if opd.is_opd_enabled(args, evaluation=evaluation) and (evaluation or not deferred_opd_active(args)):
         await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
@@ -966,6 +970,17 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    from relax.engine.rollout.deferred_opd import DeferredOpdSession
+
+    deferred_session = DeferredOpdSession.maybe_create(
+        args,
+        rollout_id,
+        data_system_client,
+        state.opd_manager,
+        publish=transfer_batch_to_data_system,
+        encode_multimodal_inputs=_encode_multimodal_inputs,
+    )
+    transfer = deferred_session.transfer if deferred_session is not None else transfer_batch_to_data_system
     teacher_routing_enabled = opd.is_teacher_routing_enabled(args)
     if teacher_routing_enabled:
         state.opd_manager.response_stats.new_window()
@@ -1140,7 +1155,7 @@ async def generate_rollout_async(
                 # is_last: this backfill closes the previous partition's debt.
                 prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
                 transfer_task = asyncio.create_task(
-                    transfer_batch_to_data_system(
+                    transfer(
                         args,
                         batch_to_transfer,
                         n,
@@ -1161,7 +1176,7 @@ async def generate_rollout_async(
                     # it always closes the debt, so it is the previous partition's last.
                     prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        transfer(
                             args,
                             batch_to_transfer[:cutoff_batch],
                             n_prev,
@@ -1182,7 +1197,7 @@ async def generate_rollout_async(
                     # target (no deficit carried) — otherwise the tail is backfilled next step.
                     curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        transfer(
                             args,
                             batch_to_transfer,
                             n,
@@ -1203,7 +1218,7 @@ async def generate_rollout_async(
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
             transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
+                transfer(
                     args,
                     batch_to_transfer,
                     n,
@@ -1221,7 +1236,7 @@ async def generate_rollout_async(
             if n_prev:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        transfer(
                             args,
                             batch_to_transfer[:n_prev],
                             n_prev,
@@ -1237,7 +1252,7 @@ async def generate_rollout_async(
             if n:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        transfer(
                             args,
                             batch_to_transfer,
                             n,
@@ -1336,8 +1351,15 @@ async def generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                await transfer(args, accepted, len(accepted), rollout_id, data_system_client)
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
+
+    if deferred_session is not None:
+        try:
+            await deferred_session.flush()
+        except BaseException:
+            await deferred_session.cancel()
+            raise
 
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()

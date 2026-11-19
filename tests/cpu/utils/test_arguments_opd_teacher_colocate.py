@@ -233,6 +233,29 @@ def test_rollout_only_with_external_teacher_uses_student_gpus(arguments_module) 
     assert args.actor_num_gpus_per_node * args.actor_num_nodes == args.rollout_num_gpus == 4
 
 
+@pytest.mark.parametrize("deferred", [True, False])
+def test_shared_teacher_and_genrm_validate_both_layouts(arguments_module, deferred):
+    from relax.engine.inference.phase_plans import deferred_genrm_enabled, deferred_opd_enabled
+
+    args = _opd_args()
+    args.colocate = True
+    args.actor_num_gpus_per_node = 1
+    args.rollout_num_gpus = 1
+    args.resource = {role: [1, 1] for role in ("actor", "rollout", "teacher", "genrm")}
+    args.genrm_model_path = "/judge"
+    args.genrm_num_gpus = 1
+    args.genrm_num_gpus_per_engine = 1
+    args.defer_reward_to_post_process = deferred
+    if not deferred:
+        with pytest.raises(ValueError, match="requires --defer-reward-to-post-process"):
+            arguments_module.relax_validate_args(args)
+        return
+    arguments_module.relax_validate_args(args)
+    assert deferred_genrm_enabled(args)
+    assert deferred_opd_enabled(args)
+    assert args.offload_train and args.offload_rollout
+
+
 def test_sequence_classification_accepts_multimodal_keys(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"

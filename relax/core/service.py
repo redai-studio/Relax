@@ -90,8 +90,20 @@ class Service:
         if self._deployed:
             raise RuntimeError(f"[{self.role}] Service has already been deployed")
         try:
+            token = getattr(self, "_inference_deployment_token", None)
+            if token is not None and token != getattr(self.config, "_inference_startup_token", None):
+                raise RuntimeError("Inference deployment startup token has been superseded")
+            if getattr(self.config, "_inference_startup_retired", False):
+                raise RuntimeError("Inference deployment startup has been retired")
             self._deploy(self.pgs)
         except Exception:
+            if str(self.role) in {"rollout", "genrm"} and (
+                getattr(self, "_inference_task_owner", None) is not None
+                or getattr(self.config, "_rollout_engine_manager", None) is not None
+            ):
+                # Separate role owners can still hold this PG after a failed
+                # Serve deployment. Controller confirms cleanup before release.
+                raise
             # A failed Serve deployment can leave the PG allocated even though
             # this wrapper never becomes visible to the Controller.
             try:

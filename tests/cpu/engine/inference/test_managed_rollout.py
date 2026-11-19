@@ -176,7 +176,6 @@ async def test_pool_operation_cancellation_does_not_spin_the_actor_loop():
 @pytest.mark.parametrize(
     "legacy",
     [
-        {"_genrm_instances_resolved": {"judge": {}}, "colocate": True},
         {"use_opd": True, "colocate": True},
         {"loss_type": "sft"},
         {"use_agentic_rollout": True},
@@ -416,7 +415,8 @@ async def test_cancelled_start_retains_pool_ownership_until_shutdown(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
+@pytest.mark.parametrize("attached", [False, True])
+async def test_concurrent_dispose_closes_worker_only_once(monkeypatch, attached):
     owner = manager()
     entered = asyncio.Event()
     finish = asyncio.Event()
@@ -430,9 +430,12 @@ async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
 
     worker = SimpleNamespace(close=SimpleNamespace(remote=close))
     monkeypatch.setattr(ray, "kill", killed.append)
-    first = asyncio.create_task(owner.dispose(worker))
+    if attached:
+        await owner.attach_worker(worker)
+    argument = None if attached else worker
+    first = asyncio.create_task(owner.dispose(argument))
     await asyncio.wait_for(entered.wait(), 2)
-    second = asyncio.create_task(owner.dispose(worker))
+    second = asyncio.create_task(owner.dispose(argument))
     await asyncio.sleep(0)
     finish.set()
     await asyncio.wait_for(asyncio.gather(first, second), 2)
@@ -451,8 +454,8 @@ def test_independent_auxiliary_tasks_select_managed_path(role):
     assert use_managed_auxiliary(args)
     assert use_managed_rollout(args)
     args.colocate = True
-    assert not use_managed_auxiliary(args)
-    assert not use_managed_rollout(args)
+    assert use_managed_auxiliary(args) is (role == "genrm")
+    assert use_managed_rollout(args) is (role == "genrm")
 
 
 @pytest.mark.asyncio

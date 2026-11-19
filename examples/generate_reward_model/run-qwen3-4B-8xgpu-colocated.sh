@@ -141,7 +141,7 @@ MISC_ARGS=(
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 ${SCRIPT_DIR}/../../relax/entrypoints/train.py \
-   --resource '{"actor": [1, 8], "rollout": [1, 8], "genrm": [1, 8]}' \
+   --resource '{"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]}' \
    --colocate \
    --genrm-model-path ${MODEL_DIR}/Qwen3-VL-30B-A3B-Instruct/ \
    --genrm-num-gpus-per-engine 4 \

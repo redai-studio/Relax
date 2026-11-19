@@ -302,3 +302,91 @@ async def test_policy_abort_cancels_managed_admission_wait(monkeypatch):
             await asyncio.wait_for(task, 2)
     assert not sent
     assert not owner.ledger.permits
+
+
+@pytest.mark.parametrize("role", [Role.GENRM, Role.TEACHER])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_shared_static_pool_borrows_binding_and_records_selected_phase(monkeypatch, role, deferred):
+    from relax.distributed.ray.genrm import GenRMManager
+    from relax.distributed.ray.teacher_manager import TeacherManager
+    from relax.engine.inference.placement import PlacementPlanner, ProbedPlacementGroup
+
+    args = SimpleNamespace(
+        num_gpus_per_node=8,
+        colocate=True,
+        fully_async=False,
+        rollout_num_gpus=8 if deferred else 4,
+        genrm_model_path="judge",
+        genrm_num_gpus_per_engine=2,
+        genrm_num_gpus=2,
+        genrm_engine_config={},
+        genrm_sampling_config={},
+        _genrm_instances_resolved=[{}],
+        _genrm_colocate_with_rollout=deferred,
+        defer_reward_to_post_process=deferred,
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="teacher",
+        hybrid=False,
+        use_critic=False,
+        resource={"actor": [1, 8], "rollout": [1, 8 if deferred else 4], "teacher": [1, 2]},
+    )
+    binding = ProbedPlacementGroup(
+        SimpleNamespace(bundle_count=8), list(range(8)), list(range(8)), ("node",) * 8, tuple(range(8))
+    )
+    implementation = (GenRMManager if role is Role.GENRM else TeacherManager).__ray_metadata__.modified_class
+    releases = []
+
+    def initialize(backend, backend_args, *unused, **options):
+        backend.args = backend_args
+        if role is Role.GENRM:
+            backend.pg = unused[0]
+            backend.bundle_offset = options.get("bundle_offset", 0)
+            backend.dedicated_pg = options["dedicated_pg"]
+            backend.num_gpu_per_engine = 2
+        else:
+            assert options["shared_pg"]
+            backend._shared_pg = True
+            backend._shared_pg_tuple = options["pg"]
+            backend._bundle_offset = options["bundle_offset"]
+            backend.nodes_per_engine = 1
+            backend.gpus_per_replica = 2
+            backend._engine_placements = {0: (options["pg"], False)}
+
+    monkeypatch.setattr(implementation, "__init__", initialize)
+    monkeypatch.setattr(implementation, "offload", lambda backend: releases.append(backend))
+    # GenRM receives an absolute bundle offset; legacy Teacher offsets are
+    # relative to the rollout region, which deferred startup sets to zero.
+    offset = 1 if deferred or role is Role.TEACHER else 5
+    pool = StaticInferencePool(
+        role, args, binding, {"num_replicas": 1, "gpus_per_replica": 2, "bundle_offset": offset}
+    )
+    planner = PlacementPlanner()
+    pool.record_placement(planner)
+    allocation = planner.allocations()[0]
+    assert allocation.bundle_indices == (1 if deferred else 5,)
+    assert allocation.phase == (role.value if deferred else "inference")
+    assert not allocation.owner.removable
+    assert bool(releases) is deferred
+    assert args.rollout_num_gpus == (8 if deferred else 4)
+
+
+@pytest.mark.asyncio
+async def test_static_start_sleeping_keeps_admission_closed_and_skips_health_generation(monkeypatch):
+    def initialize(pool, *args):
+        pool.start_sleeping = True
+
+    def unexpected(*args):
+        pytest.fail("A sleeping static model must not generate or recover during another phase")
+
+    monkeypatch.setattr(StaticInferencePool, "__init__", initialize)
+    monkeypatch.setattr(StaticInferencePool, "record_placement", lambda *args: None)
+    monkeypatch.setattr(StaticInferencePool, "unhealthy_ranks", unexpected)
+    monkeypatch.setattr(StaticInferencePool, "recover", unexpected)
+    owner = InferenceManager.__ray_metadata__.modified_class()
+    await owner.start_static("teacher", None, None, {})
+    assert not owner.memory_ready
+    assert owner.state is LifecycleState.SLEEPING
+    assert "memory" in owner.ledger.fences
+    await owner.recover_static()
+    assert owner.state is LifecycleState.SLEEPING

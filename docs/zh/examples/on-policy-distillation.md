@@ -8,6 +8,12 @@
 
 使用 `--opd-teacher-url` 时，Teacher 为外部服务：Relax 发送请求，但不分配其 GPU，也不会在训练结束时关闭外部进程。原有外部 Teacher 路由继续适用。
 
+## 共置 Teacher 的执行阶段
+
+标准 native SGLang 任务在引擎启动前校验整个共享 GPU 布局。Split Teacher 使用不重叠切片，在线完成评分；与 Rollout 共用 bundles 的 Teacher 在生成排空后评分。阶段协调器串行执行各独立角色 owner 的卸载与加载；token selection 需要额外前向时，再恢复 Student。
+
+延迟批次保留训练分区和终批标记。所需评分字段必须通过形状、token ID 和有效 loss-mask 位置的数值校验后才可发布，不发布不完整批次的成功子集。原有角色入口及 discovery 默认行为保持不变。Agentic 与自定义生命周期的迁移在后续步骤进行。
+
 ## 关键参数
 
 | 参数                      | 描述                                                                                                             |

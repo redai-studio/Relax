@@ -309,6 +309,10 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     # NOTE(wulumeng): Keep this single-return contract. This function previously returned
     # (raw_rewards, post_processed_rewards); it now intentionally returns only
     # post_processed_rewards.
+    if getattr(args, "_genrm_colocate_with_rollout", False) and getattr(args, "defer_reward_to_post_process", False):
+        cached = [getattr(sample, "train_metadata", None) or {} for sample in samples]
+        if cached and all("_deferred_genrm_reward" in metadata for metadata in cached):
+            return [metadata["_deferred_genrm_reward"] for metadata in cached]
     if args.custom_reward_post_process_path is not None:
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
         return custom_reward_post_process_func(args, samples)
@@ -658,7 +662,8 @@ async def transfer_batch_to_data_system(
     rollout_id: int,
     data_system_client: Any,
     is_last: bool = False,
-) -> None:
+    operation_id: str | None = None,
+) -> Any:
     """Helper function to transfer a batch of samples to the data system
     client.
 
@@ -692,6 +697,17 @@ async def transfer_batch_to_data_system(
 
         # Pass sampler metadata inline so it lands atomically with ready samples.
         custom_meta = build_rollout_custom_meta(rollout_batch)
+        if operation_id is not None:
+            from relax.utils.tq.publication import publish_confirmed
+
+            return await publish_confirmed(
+                data_system_client,
+                rollout_batch,
+                partition_id=f"train_{rollout_id}",
+                operation_id=operation_id,
+                custom_meta=custom_meta,
+                is_last=is_last,
+            )
         await data_system_client.async_put(
             data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
         )

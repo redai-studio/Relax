@@ -420,6 +420,79 @@ def test_controller_s3_model_allocates_prefetches_then_deploys(monkeypatch):
     assert instance.serve_dict == {"actor": deployed}
 
 
+def test_controller_shared_inference_prepares_role_owners_before_service_deploy(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(model_source=None)
+    instance._shared_inference_startup = True
+    instance.serve_dict = {}
+    instance.runtime_env = None
+    prepared = {role: SimpleNamespace(pgs=object()) for role in ("rollout", "actor", "genrm")}
+    events = []
+    rollout_owner = object()
+
+    def run_phase(phase, task, task_args):
+        if phase == controller.ServiceStartupPhase.ALLOCATE_RESOURCES:
+            events.append("allocate")
+        else:
+            events.append("deploy")
+            assert instance.config._rollout_engine_manager is rollout_owner
+            assert all(service._inference_task_owner is rollout_owner for service in prepared.values())
+        return prepared
+
+    def prepare(args, binding, **kwargs):
+        events.append("prepare owners")
+        assert binding is prepared["rollout"].pgs
+        assert kwargs["bindings"] == {role: service.pgs for role, service in prepared.items()}
+        args._rollout_engine_manager = rollout_owner
+        args._inference_startup_token = "shared-startup"
+        return "teacher-owner"
+
+    module = SimpleNamespace(prepare_shared_task=prepare)
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.shared_task_startup", module)
+    monkeypatch.setattr(instance, "_run_service_phase", run_phase)
+    monkeypatch.setattr(instance, "_start_model_prefetch", lambda bindings: [])
+
+    assert instance._start_services([]) == []
+    assert events == ["allocate", "prepare owners", "deploy"]
+    assert instance._teacher_manager == "teacher-owner"
+    assert instance.serve_dict == prepared
+    assert instance._pending_inference_pg_services == {}
+
+
+def test_controller_shared_cleanup_retains_service_pg_until_all_role_owners_exit(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(
+        _rollout_engine_manager=object(),
+        _inference_phase_coordinator=object(),
+        _inference_startup_token="shared-startup",
+    )
+    service = SimpleNamespace(pgs=("pg", [], []), _is_shared_pgs=False)
+    instance.serve_dict = {"rollout": service}
+    instance._pending_inference_pg_services = {"rollout": service}
+    events = []
+
+    def unconfirmed(args):
+        events.append("cleanup unconfirmed")
+        raise TimeoutError("role still owns engines")
+
+    module = SimpleNamespace(shutdown_shared_task=unconfirmed)
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.shared_task_startup", module)
+    monkeypatch.setattr(controller.serve, "delete", lambda role: events.append("delete " + role))
+    monkeypatch.setattr(controller, "remove_placement_group", lambda pg: events.append("remove " + pg))
+
+    with pytest.raises(TimeoutError, match="still owns"):
+        instance._dispose_shared_inference_task()
+    assert events == ["cleanup unconfirmed"]
+    assert service.pgs is not None
+    assert instance.config._rollout_engine_manager is not None
+
+    module.shutdown_shared_task = lambda args: events.append("all owners exited")
+    assert instance._dispose_shared_inference_task()
+    assert events == ["cleanup unconfirmed", "all owners exited", "delete rollout", "remove pg"]
+    assert service.pgs is None
+    assert instance.serve_dict == {}
+
+
 def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkeypatch):
     events = []
 

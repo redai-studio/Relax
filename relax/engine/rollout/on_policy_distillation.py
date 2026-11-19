@@ -341,6 +341,49 @@ class OpdManager:
             sample.student_topk_token_ids = np.vstack([sample.student_topk_token_ids, token_ids])
             sample.student_topk_log_probs = np.vstack([sample.student_topk_log_probs, log_probs])
 
+    @property
+    def needs_student_prefill(self) -> bool:
+        """Whether this token selection needs a second pass on the student."""
+        return self.topk_worker is not None and self.topk_worker.spec.student_at_teacher
+
+    async def prepare_teacher_inputs(self, samples: Sequence[Sample]) -> None:
+        """Build the teacher-side inputs OPSD expands before any request."""
+        if self.opsd_worker is not None:
+            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples])
+
+    async def score_teacher(
+        self, samples: Sequence[Sample], session: aiohttp.ClientSession | None = None
+    ) -> list[bool]:
+        """Run teacher prefill for ``samples`` and report per-sample success.
+
+        Separated from :meth:`prefill` so a deferred pipeline can run this
+        stage inside the teacher's activation phase and the student stage in
+        another, instead of holding both models resident at once.
+        """
+        if session is not None:
+            return list(await asyncio.gather(*[self._teacher_prefill(s, session) for s in samples]))
+        async with _create_teacher_client_session(self.args) as owned:
+            return list(await asyncio.gather(*[self._teacher_prefill(s, owned) for s in samples]))
+
+    async def score_student_at_teacher(
+        self,
+        samples: Sequence[Sample],
+        session: aiohttp.ClientSession | None = None,
+        encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
+    ) -> None:
+        """Second pass on the student, for token selections that need it."""
+        if not self.needs_student_prefill:
+            return
+        if session is not None:
+            await asyncio.gather(*[self._student_prefill(s, session, encode_multimodal_inputs) for s in samples])
+            return
+        async with _create_teacher_client_session(self.args) as owned:
+            await asyncio.gather(*[self._student_prefill(s, owned, encode_multimodal_inputs) for s in samples])
+
+    def assemble_transfer(self, samples: Sequence[Sample]) -> None:
+        """Assemble the per-sample training channels from the scored fields."""
+        self._assemble_transfer(list(samples))
+
     async def prefill(
         self,
         samples: Sample | Sequence[Sample],
@@ -348,36 +391,51 @@ class OpdManager:
     ) -> None:
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
-        if self.opsd_worker is not None:
-            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
+        await self.prepare_teacher_inputs(sample_list)
 
         async with _create_teacher_client_session(self.args) as session:
-            successes = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, successes)
-
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
-                await asyncio.gather(
-                    *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
-                )
+            fetch_results = await self.score_teacher(sample_list, session)
+            self._raise_if_all_failed(sample_list, fetch_results)
+            await self.score_student_at_teacher(sample_list, session, encode_multimodal_inputs)
 
         self._assemble_transfer(sample_list)
 
-    async def _post_managed_teacher(self, manager: Any, payload: dict, sample: Sample) -> dict:
+    async def _post_managed_teacher(
+        self, manager: Any, payload: dict, sample: Sample, source: str = "__single__"
+    ) -> dict:
         from relax.engine.inference.executor import InferenceRequestExecutor
         from relax.utils import http_utils
 
-        if not hasattr(self, "_teacher_executor"):
-            self._teacher_executor = InferenceRequestExecutor("teacher", manager, http_utils._http_client)
+        if not hasattr(self, "_teacher_executors"):
+            self._teacher_executors = {}
             limit = int(getattr(self.args, "opd_teacher_connector_limit", 256))
             self._teacher_slots = asyncio.Semaphore(limit) if limit > 0 else None
 
+        cached = self._teacher_executors.get(source)
+        if cached is None or cached.manager_handle is not manager:
+            cached = InferenceRequestExecutor("teacher", manager, http_utils._http_client)
+            self._teacher_executors[source] = cached
+
         async def generate() -> dict:
             if self._teacher_slots is None:
-                return await self._teacher_executor.generate_json(payload, replica_cursor=sample.group_index)
+                return await cached.generate_json(payload, replica_cursor=sample.group_index)
             async with self._teacher_slots:
-                return await self._teacher_executor.generate_json(payload, replica_cursor=sample.group_index)
+                return await cached.generate_json(payload, replica_cursor=sample.group_index)
 
         return await asyncio.wait_for(generate(), timeout=float(self.args.opd_teacher_timeout_s))
+
+    async def _post_managed_student(self, manager: Any, payload: dict, sample: Sample) -> dict:
+        from relax.engine.inference.executor import InferenceRequestExecutor
+        from relax.utils import http_utils
+
+        executor = getattr(self, "_student_executor", None)
+        if executor is None or executor.manager_handle is not manager:
+            executor = InferenceRequestExecutor("rollout", manager, http_utils._http_client)
+            self._student_executor = executor
+        return await asyncio.wait_for(
+            executor.generate_json(payload, replica_cursor=sample.group_index),
+            timeout=float(self.args.opd_teacher_timeout_s),
+        )
 
     async def _post_logprob(
         self,
@@ -390,8 +448,19 @@ class OpdManager:
     ) -> opd_main_worker.LogprobResponse | None:
         try:
             manager = getattr(self.args, "_teacher_inference_manager_handle", None)
+            source = "__single__"
+            managers = getattr(self.args, "_teacher_inference_managers", None)
+            if managers and manager is None and err_tag == "teacher prefill":
+                metadata = sample.metadata or {}
+                source = metadata.get("teacher_id", metadata.get(getattr(self.args, "opd_teacher_key", "data_source")))
+                if source not in managers:
+                    raise KeyError(f"MOPD routing: no managed teacher for source={source!r}")
+                manager = managers[source]
+            student_manager = getattr(self.args, "_inference_manager_handle", None)
             if manager is not None and err_tag == "teacher prefill":
-                data = await self._post_managed_teacher(manager, payload, sample)
+                data = await self._post_managed_teacher(manager, payload, sample, source)
+            elif student_manager is not None and err_tag == "student-at-teacher-topk":
+                data = await self._post_managed_student(student_manager, payload, sample)
             else:
                 async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
                     if resp.status >= 400:
