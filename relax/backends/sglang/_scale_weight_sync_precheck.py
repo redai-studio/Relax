@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Independent two-node NCCL probe used before elastic weight sync."""
+"""Independent NCCL probe used before elastic weight sync."""
 
 import argparse
 import datetime
@@ -15,6 +15,7 @@ def main() -> int:
     parser.add_argument("--master-address", required=True)
     parser.add_argument("--master-port", required=True, type=int)
     parser.add_argument("--rank", required=True, type=int)
+    parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--device-id", required=True, type=int)
     parser.add_argument("--timeout-secs", required=True, type=float)
     parser.add_argument("--run-token", required=True)
@@ -42,7 +43,7 @@ def main() -> int:
         dist.init_process_group(
             backend="nccl",
             init_method=f"tcp://{args.master_address}:{args.master_port}",
-            world_size=2,
+            world_size=args.world_size,
             rank=args.rank,
             timeout=datetime.timedelta(seconds=args.timeout_secs),
             device_id=torch.device("cuda", args.device_id),
@@ -51,7 +52,7 @@ def main() -> int:
         value = torch.tensor([float(args.rank)], device=f"cuda:{args.device_id}")
         dist.all_reduce(value)
         torch.cuda.synchronize(args.device_id)
-        if float(value.cpu()[0]) != 1.0:
+        if float(value.cpu()[0]) != args.world_size * (args.world_size - 1) / 2:
             raise RuntimeError(f"unexpected all_reduce result: {value}")
         result["success"] = True
     except Exception as exc:

@@ -21,7 +21,7 @@ from relax.distributed.ray.rollout_scale_types import ScaleOutRequest, ScaleOutS
 
 @pytest.fixture
 def pool():
-    args = make_mock_args(colocate=True, fully_async=False, scale_in_drain_timeout=0)
+    args = make_mock_args(colocate=True, fully_async=False, scale_in_drain_timeout=0, scale_weight_sync_precheck=False)
     baseline = make_engine_group(args=args)
     server = make_rollout_server(engine_groups=[baseline])
     manager = create_test_manager(args=args, servers={"default": server})
@@ -32,6 +32,10 @@ def pool():
     manager._colocate_remote_group = None
     manager._colocate_retiring = None
     manager._colocate_disposing = False
+    manager._colocate_full_failed = False
+    manager._colocate_sender_probe_unconfirmed = False
+    manager._colocate_shutdown_pgs = set()
+    manager._colocate_pending_pgs = {}
     manager._health_monitors = []
     return manager, server, baseline
 
@@ -136,6 +140,101 @@ async def test_unclaimed_timeout_cannot_join_later_full(pool):
     engine.register_to_router.remote.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_failed_nccl_precheck_keeps_the_current_full_group(pool):
+    manager, server, baseline = pool
+    source = object()
+    first = ScaleOutRequest("first", ScaleOutStatus.CREATING, num_replicas=1)
+    active, active_engine, active_waiter = await start_candidate(manager, first, 4)
+    current, _ = manager.acquire_colocate_full(source)
+    assert await manager.publish_colocate_full(4, ["candidate-4"]) is None
+    manager.release_colocate_full()
+    assert (await active_waiter).success
+
+    manager.args.scale_weight_sync_precheck = True
+    second = ScaleOutRequest("second", ScaleOutStatus.CREATING, num_replicas=1)
+    _, rejected_engine, rejected_waiter = await start_candidate(manager, second, 5)
+    snapshot, obsolete = manager.acquire_colocate_full(source)
+    assert obsolete is None
+    assert snapshot["precheck"][:3] == (5, [rejected_engine], 2)
+    assert second.status is ScaleOutStatus.WAITING_FOR_WEIGHT_SYNC
+    assert not manager.training_weight_updating
+
+    manager.finish_colocate_precheck(5, False, True, True, ())
+    snapshot, obsolete = manager.acquire_colocate_full(source)
+    assert obsolete is None
+    assert snapshot["group_name"] == current["group_name"]
+    assert [engine for engine, _, _ in snapshot["receivers"]] == [baseline.engines[0], active_engine]
+    assert await manager.publish_colocate_full(4, ["candidate-4"]) is None
+    manager.release_colocate_full()
+    result = await rejected_waiter
+    assert not result.success and result.reason.category.name == "NCCL_PRECHECK_FAIL"
+    rejected_engine.register_to_router.remote.assert_not_called()
+    assert server.engine_groups == [baseline, active]
+
+
+@pytest.mark.asyncio
+async def test_precheck_success_allows_candidate_to_join_full(pool):
+    manager, _, _ = pool
+    manager.args.scale_weight_sync_precheck = True
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    _, engine, waiter = await start_candidate(manager, request, 4)
+    source = object()
+    snapshot, _ = manager.acquire_colocate_full(source)
+    assert snapshot["precheck"][0] == 4
+
+    manager.finish_colocate_precheck(4, True, True, True, ())
+    snapshot, _ = manager.acquire_colocate_full(source)
+    assert snapshot["receivers"][-1][0] is engine
+    assert request.status is ScaleOutStatus.WEIGHT_SYNCING
+    assert await manager.publish_colocate_full(4, ["candidate-4"]) is None
+    manager.release_colocate_full()
+    assert (await waiter).success
+
+
+@pytest.mark.parametrize("acknowledged", [True, False])
+@pytest.mark.asyncio
+async def test_late_receiver_probe_ack_does_not_interrupt_baseline_full(
+    pool, patch_ray_get, monkeypatch, acknowledged
+):
+    from relax.distributed.ray import rollout
+
+    manager, _, baseline = pool
+    manager._eval_judge = None
+    manager.args.scale_weight_sync_precheck = True
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    candidate, engine, waiter = await start_candidate(manager, request, 4)
+    candidate.pg = (SimpleNamespace(id="candidate-pg"), [0, 1], [4, 5])
+    source = object()
+    assert manager.acquire_colocate_full(source)[0]["precheck"][0] == 4
+    probe = asyncio.get_running_loop().create_future()
+    monkeypatch.setattr(rollout.ray, "wait", lambda refs, **kwargs: (refs, []) if probe.done() else ([], refs))
+    manager.finish_colocate_precheck(4, False, True, True, (probe,))
+
+    snapshot, obsolete = manager.acquire_colocate_full(source)
+    assert obsolete is None and snapshot["group_name"] is None
+    assert [engine for engine, _, _ in snapshot["receivers"]] == baseline.engines
+    assert not waiter.done()
+    engine.register_to_router.remote.assert_not_called()
+
+    if acknowledged:
+        probe.set_result({"success": True, "stopped": True})
+        result = await asyncio.wait_for(waiter, timeout=2)
+        assert not result.success and result.reason.category.name == "NCCL_PRECHECK_FAIL"
+    else:
+        remove_pg = Mock()
+        monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+        try:
+            with pytest.raises(RuntimeError, match="PGs were retained"):
+                manager.dispose()
+            remove_pg.assert_not_called()
+            baseline.engines[0].shutdown.remote.assert_called_once()
+        finally:
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+
 def test_pure_baseline_full_does_not_fence_shutdown(pool, patch_ray_get):
     manager, _, baseline = pool
     manager._eval_judge = None
@@ -174,6 +273,118 @@ async def test_dispose_shuts_down_published_and_pending_replicas(pool, patch_ray
     assert not (await waiting).success
 
 
+@pytest.mark.parametrize("unconfirmed", [None, "receiver", "sender"])
+@pytest.mark.asyncio
+async def test_failed_full_blocks_publication_and_disposes_only_after_exit(pool, monkeypatch, unconfirmed):
+    from relax.distributed.ray import rollout
+
+    manager, _, baseline = pool
+    manager._eval_judge = None
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    pending, candidate, waiter = await start_candidate(manager, request, 4)
+    pending.pg = (SimpleNamespace(id="candidate-pg"), [0, 1], [4, 5])
+    waiting_pg = SimpleNamespace(id="unready-pg")
+    manager._colocate_pending_pgs[waiting_pg.id] = waiting_pg
+    source = Mock()
+    snapshot, _ = manager.acquire_colocate_full(source)
+    manager.fail_colocate_full(snapshot["group_name"])
+    with pytest.raises(RuntimeError, match="ownership is unavailable"):
+        manager.acquire_colocate_full(source)
+    with pytest.raises(RuntimeError, match="No colocate FULL"):
+        await manager.publish_colocate_full(4, ["candidate-4"])
+
+    candidate_ref, sender_ref = object(), object()
+    candidate.shutdown.options.return_value.remote.return_value = candidate_ref
+    source.abort_colocate_weight_group.remote.return_value = sender_ref
+    remove = Mock()
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove)
+    monkeypatch.setattr(rollout.ray, "kill", Mock())
+
+    def get(ref, **kwargs):
+        if ref is candidate_ref and unconfirmed == "receiver":
+            raise RuntimeError("candidate not stopped")
+        if ref is sender_ref and unconfirmed == "sender":
+            raise RuntimeError("sender abort not confirmed")
+
+    monkeypatch.setattr(rollout.ray, "get", get)
+    try:
+        if unconfirmed is None:
+            manager.dispose()
+        else:
+            with pytest.raises(RuntimeError, match="Could not confirm"):
+                manager.dispose()
+        source.abort_colocate_weight_group.remote.assert_called_once_with(snapshot["group_name"])
+        if unconfirmed != "receiver":
+            assert remove.call_args_list == [call(waiting_pg), call(pending.pg[0])]
+            assert not (await waiter).success
+            assert request.status is ScaleOutStatus.FAILED
+        else:
+            remove.assert_called_once_with(waiting_pg)
+        baseline.engines[0].shutdown.remote.assert_called_once()
+        candidate.shutdown.options.assert_called_once_with(concurrency_group="colocate_shutdown")
+        candidate.register_to_router.remote.assert_not_called()
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+
+@pytest.mark.asyncio
+async def test_dispose_reports_unconfirmed_sender_probe(pool, patch_ray_get, monkeypatch):
+    from relax.distributed.ray import rollout
+
+    manager, _, baseline = pool
+    manager._eval_judge = None
+    manager.args.scale_weight_sync_precheck = True
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    candidate, _, waiter = await start_candidate(manager, request, 4)
+    candidate.pg = (SimpleNamespace(id="candidate-pg"), [0, 1], [4, 5])
+    assert manager.acquire_colocate_full(object())[0]["precheck"][0] == 4
+    manager.finish_colocate_precheck(4, False, False, True, ())
+    remove_pg = Mock()
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+    with pytest.raises(RuntimeError, match="sender probe"):
+        manager.dispose()
+
+    baseline.engines[0].shutdown.remote.assert_called_once()
+    remove_pg.assert_called_once_with(candidate.pg[0])
+    assert not (await waiter).success
+
+
+@pytest.mark.asyncio
+async def test_failed_full_still_releases_unready_pg_in_same_request(pool, monkeypatch):
+    from relax.distributed.ray import rollout
+
+    manager, _, _ = pool
+    request_id = manager.create_scale_out_request(num_replicas=3)["request_id"]
+    ready = asyncio.get_running_loop().create_future()
+    ready.set_result(None)
+    pending = asyncio.get_running_loop().create_future()
+    claimed_pg = SimpleNamespace(id="claimed", ready=lambda: ready)
+    waiting_pg = SimpleNamespace(id="waiting", ready=lambda: pending)
+    monkeypatch.setattr(rollout.ray.util, "placement_group", Mock(side_effect=[claimed_pg, waiting_pg]))
+    monkeypatch.setattr(rollout.asyncio, "wait", AsyncMock(return_value=({ready}, {pending})))
+    remove_pg = Mock()
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+
+    async def finish_failed_candidate(*, request, pg, **kwargs):
+        assert pg is claimed_pg
+        manager._colocate_disposing = True
+        manager._colocate_full_failed = True
+        manager._colocate_shutdown_pgs.add(pg.id)
+        request.update_status(ScaleOutStatus.FAILED)
+        return rollout.ScaleResult(False)
+
+    monkeypatch.setattr(manager, "_bring_up_single_replica", finish_failed_candidate)
+    try:
+        await manager.execute_scale_out(request_id)
+        remove_pg.assert_called_once_with(waiting_pg)
+        assert manager._scale_out_requests[request_id].status is ScaleOutStatus.FAILED
+    finally:
+        pending.cancel()
+
+
 @pytest.mark.parametrize(
     "overrides", [{"pp_size": 2}, {"base_gpu_id": 0}, {"host": "127.0.0.1"}, {"port": 32000}, {"nccl_port": 32001}]
 )
@@ -192,6 +403,16 @@ def test_colocate_fault_tolerance_rejects_scale_out_before_creating_request(pool
     manager.args.use_fault_tolerance = True
 
     with pytest.raises(ValueError, match="--use-fault-tolerance"):
+        manager.create_scale_out_request(num_replicas=2)
+
+    assert not manager._scale_out_requests
+
+
+def test_rollout_only_colocate_rejects_scale_out_before_creating_request(pool):
+    manager, _, _ = pool
+    manager.args.debug_rollout_only = True
+
+    with pytest.raises(ValueError, match="requires a training Actor"):
         manager.create_scale_out_request(num_replicas=2)
 
     assert not manager._scale_out_requests

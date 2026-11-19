@@ -8,7 +8,7 @@ import socket
 import time
 from argparse import Namespace
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from threading import Event
 from typing import Any, List
@@ -160,7 +160,7 @@ from .reference_integrity import (
 from .resident_shared_expert import verify_resident_shared_readiness
 from .weight_update.common import named_params_and_buffers
 from .weight_update.train_offload import MegatronTrainStateOffloader
-from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
+from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed, precheck_colocate_receiver
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 
 
@@ -2927,11 +2927,48 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weight_updater.disconnect_distributed_group(name)
         ray.get(self.rollout_manager.acknowledge_colocate_group_removed.remote(name))
 
+    def abort_colocate_weight_group(self, name: str) -> None:
+        self.weight_updater.abort_colocate_group(name)
+
+    @contextmanager
+    def _report_failed_colocate_full(self, group_name: str):
+        try:
+            yield
+        except Exception:
+            if dist.get_rank(get_gloo_group()) == 0:
+                try:
+                    ray.get(self.rollout_manager.fail_colocate_full.remote(group_name), timeout=5)
+                except Exception:
+                    logger.exception("[Colocate FULL] Could not report failure of %s", group_name)
+            raise
+
     def _acquire_colocate_full(self) -> dict:
         source = ray.get_runtime_context().current_actor
         while True:
             snapshot, obsolete = ray.get(self.rollout_manager.acquire_colocate_full.remote(source))
             if snapshot is not None:
+                if precheck := snapshot.get("precheck"):
+                    rank_offset, engines, local_gpu_count, expires_at = precheck
+                    timeout = min(30.0, expires_at - time.time())
+                    try:
+                        success, sender_stopped, receivers_stopped, pending = precheck_colocate_receiver(
+                            engines, [local_gpu_count] * len(engines), timeout
+                        )
+                    except Exception:
+                        logger.exception("[Colocate FULL] Could not confirm probe result")
+                        success, sender_stopped, receivers_stopped, pending = False, False, False, ()
+                    ray.get(
+                        self.rollout_manager.finish_colocate_precheck.remote(
+                            rank_offset,
+                            success,
+                            sender_stopped,
+                            receivers_stopped,
+                            pending,
+                        )
+                    )
+                    if not sender_stopped:
+                        raise RuntimeError("Could not confirm that the colocate NCCL sender probe stopped")
+                    continue
                 return snapshot
             if obsolete is not None:
                 self.disconnect_colocate_weight_group(obsolete)
@@ -3032,52 +3069,54 @@ class MegatronTrainRayActor(TrainRayActor):
         # a reconnect here, then sleep() at the end.
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
-        if reconnect_rollout_engines:
-            self.wake_up()
-        elif self.args.offload_train:
-            reload_process_groups(
-                timeout_minutes=self.args.distributed_timeout_minutes,
-                process_groups=getattr(self.weight_updater, "process_groups_for_update", None),
-            )
-
-        if num_new_engines > 0 or reconnect_rollout_engines:
-            self.weight_updater.connect_rollout_engines(
-                rollout_engines,
-                rollout_engine_lock,
-                engine_gpu_counts=engine_gpu_counts,
-                engine_gpu_offsets=engine_gpu_offsets,
-                **connect_kwargs,
-            )
-            dist.barrier(group=get_gloo_group())
-            if snapshot is not None:
-                self._colocate_receivers = receivers
-            if elastic_full:
-                if snapshot["num_new_engines"] > 0:
-                    run_on_training_rank_zero(
-                        lambda: ray.get(self.rollout_manager.clear_num_new_engines.remote()),
-                        phase="Colocate receiver reconciliation",
-                    )
-            elif dist.get_rank(get_gloo_group()) == 0:
-                ray.get(self.rollout_manager.clear_num_new_engines.remote())
-
-        with self._train_state_offloader.disable_during_update():
-            print_memory("before update_weights")
-            self.weight_updater.update_weights()
-            print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
-
-            if elastic_full:
-                run_on_training_rank_zero(
-                    lambda: self._publish_colocate_full(rollout_engines), phase="Colocate FULL publication"
+        failure_guard = self._report_failed_colocate_full(snapshot["group_name"]) if elastic_full else nullcontext()
+        with failure_guard:
+            if reconnect_rollout_engines:
+                self.wake_up()
+            elif self.args.offload_train:
+                reload_process_groups(
+                    timeout_minutes=self.args.distributed_timeout_minutes,
+                    process_groups=getattr(self.weight_updater, "process_groups_for_update", None),
                 )
-            if self.args.ci_test and len(rollout_engines) > 0:
-                engine = random.choice(rollout_engines)
-                engine_version = ray.get(engine.get_weight_version.remote())
-                if str(engine_version) != str(self.weight_updater.weight_version):
-                    raise RuntimeError(
-                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
-                    )
 
-            self._advance_keep_old_actor_queue()
+            if num_new_engines > 0 or reconnect_rollout_engines:
+                self.weight_updater.connect_rollout_engines(
+                    rollout_engines,
+                    rollout_engine_lock,
+                    engine_gpu_counts=engine_gpu_counts,
+                    engine_gpu_offsets=engine_gpu_offsets,
+                    **connect_kwargs,
+                )
+                dist.barrier(group=get_gloo_group())
+                if snapshot is not None:
+                    self._colocate_receivers = receivers
+                if elastic_full:
+                    if snapshot["num_new_engines"] > 0:
+                        run_on_training_rank_zero(
+                            lambda: ray.get(self.rollout_manager.clear_num_new_engines.remote()),
+                            phase="Colocate receiver reconciliation",
+                        )
+                elif dist.get_rank(get_gloo_group()) == 0:
+                    ray.get(self.rollout_manager.clear_num_new_engines.remote())
+
+            with self._train_state_offloader.disable_during_update():
+                print_memory("before update_weights")
+                self.weight_updater.update_weights()
+                print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
+
+                if elastic_full:
+                    run_on_training_rank_zero(
+                        lambda: self._publish_colocate_full(rollout_engines), phase="Colocate FULL publication"
+                    )
+                if self.args.ci_test and len(rollout_engines) > 0:
+                    engine = random.choice(rollout_engines)
+                    engine_version = ray.get(engine.get_weight_version.remote())
+                    if str(engine_version) != str(self.weight_updater.weight_version):
+                        raise RuntimeError(
+                            f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+                        )
+
+                self._advance_keep_old_actor_queue()
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
