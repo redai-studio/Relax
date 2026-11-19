@@ -6,7 +6,7 @@ Use the same two-node, 16-GPU Ray cluster for both runs. The tested Megatron Cor
 
 ## Prepare the same inputs
 
-Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` to shared directories and `RAY_ADDRESS` to the Ray Jobs dashboard. Start with a fresh `DATA_DIR` for the synthetic inputs.
+Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` to shared directories and `RAY_ADDRESS` to the Ray Jobs dashboard. Start with a fresh `DATA_DIR` for the synthetic inputs. The `--make-fixture` option generates the PNG and MP4 files in `$DATA_DIR/media` with Pillow and ImageIO's FFmpeg backend.
 
 ```bash
 export PYTHONPATH="$MILES_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"
@@ -21,7 +21,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m scripts.tools.minimax_m31_sft_pari
     --make-fixture
 ```
 
-Use a complete official checkpoint so the converter copies the processor modules and chat template. The fixture includes image-only, video-only, mixed, text-only, and long image samples that exercise sparse block selection. Preparation confirms that the full token sequence and mask match for each distinct row, along with the media pixel tensors and grids. It writes an experiment-specific template that includes `</mm:think>` in the supervised suffix, as Miles does on these single-turn answers.
+Use a complete official checkpoint so the converter copies the processor modules and chat template. Generate the fixture once and share it between the two runs because video encoding can vary by FFmpeg build. The fixture includes image-only, video-only, mixed, text-only, and long image samples that exercise sparse block selection. Preparation confirms that the full token sequence and mask match for each distinct row, along with the media pixel tensors and grids. It writes an experiment-specific template that includes `</mm:think>` in the supervised suffix, as Miles does on these single-turn answers.
 
 ## Run and compare
 

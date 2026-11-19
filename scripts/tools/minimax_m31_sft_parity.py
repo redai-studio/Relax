@@ -9,7 +9,6 @@ import json
 import math
 import os
 import re
-import shutil
 import struct
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -17,11 +16,35 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+def _generate_fixture_media(media: Path) -> None:
+    import numpy as np
+    from imageio.v2 import get_writer
+    from PIL import Image, ImageDraw
+
+    def frame(red: int, left: int, top: int) -> Image.Image:
+        image = Image.new("RGB", (112, 112), (red, 0, 0))
+        ImageDraw.Draw(image).rectangle((left, top, left + 39, top + 43), fill=(red, 230, 0))
+        return image
+
+    media.mkdir(exist_ok=True)
+    frame(60, 18, 22).save(media / "green.png")
+    frame(120, 38, 34).save(media / "red.png")
+    with get_writer(
+        media / "green.mp4",
+        fps=4,
+        codec="libx264",
+        pixelformat="yuv420p",
+        quality=None,
+        macro_block_size=1,
+    ) as writer:
+        for index in range(8):
+            writer.append_data(np.asarray(frame(30 + 15 * index, 10 + 4 * index, 16 + 3 * index)))
+
+
 def make_fixture(data: Path) -> None:
     media = data.parent / "media"
-    source = Path(__file__).resolve().parents[2] / "examples/models/minimax_m31_parity/media"
     with data.open("x") as output:
-        shutil.copytree(source, media, dirs_exist_ok=True)
+        _generate_fixture_media(media)
         green, red, video = (str((media / name).resolve()) for name in ("green.png", "red.png", "green.mp4"))
         note = "The red square is to the left of the blue circle. "
         long_question = (
