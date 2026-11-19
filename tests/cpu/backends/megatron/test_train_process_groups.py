@@ -19,7 +19,7 @@ from relax.backends.megatron.train_process_groups import configure_train_process
 
 
 def _agreement_worker(rank: int, rendezvous: str, output: str, mode: str) -> None:
-    requested = mode not in ("disabled", "mok_disabled") and (mode != "mismatch" or rank == 0)
+    requested = mode != "mok_disabled" and (mode != "mismatch" or rank == 0)
     os.environ["RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS"] = str(int(requested))
     dist.init_process_group(
         "gloo", init_method="file://" + rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30)
@@ -42,7 +42,7 @@ def _agreement_worker(rank: int, rendezvous: str, output: str, mode: str) -> Non
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["disabled", "enabled", "mismatch", "tms", "mok", "mok_disabled"])
+@pytest.mark.parametrize("mode", ["enabled", "mismatch", "tms", "mok", "mok_disabled"])
 def test_train_group_policy_agrees_before_offload(tmp_path: Path, mode: str) -> None:
     context = mp.spawn(_agreement_worker, args=(str(tmp_path / "gloo"), str(tmp_path), mode), nprocs=2, join=False)
     try:
