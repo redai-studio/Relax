@@ -1,41 +1,94 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-# Ray job entrypoint for a MiMo-V2.6-Flash BF16 text checkpoint and messages JSONL.
-set -euo pipefail
-model=${1:?provide the converted BF16 checkpoint directory}
-data=${2:?provide a messages dataset}
-save=${3:?provide the checkpoint output directory}
-shift 3
-python=${PYTHON:-python3}
-read -r layers experts moe_freq < <("$python" - "$model/config.json" <<'PY'
-import json
-import sys
+# Four-layer text SFT on a converted MiMo-V2.6-Flash checkpoint.
+# Set TP and EP for your allocation. Pass GPUS_PER_NODE when submitting from a CPU head.
+# Usage: bash run-mimo-v2.6-flash-sft.sh BF16_CHECKPOINT MESSAGES_JSONL SAVE_DIR [train args...]
+set -eo pipefail
 
-with open(sys.argv[1]) as f:
-    config = json.load(f)
-print(config["num_hidden_layers"], config["n_routed_experts"], json.dumps(config["moe_layer_freq"], separators=(",", ":")))
-PY
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HF_CHECKPOINT=${1:?provide the four-layer BF16 checkpoint directory}
+PROMPT_DATA=${2:?provide a messages dataset}
+SAVE_DIR=${3:?provide the checkpoint output directory}
+shift 3
+
+source "${MODEL_CONFIG_DIR:-${SCRIPT_DIR}/../../models}/mimo-v2.6-flash.sh"
+if [[ "$layers" != 4 ]]; then
+    echo "Expected a four-layer checkpoint, found $layers layers in $HF_CHECKPOINT/config.json" >&2
+    exit 1
+fi
+
+: "${TP:?set TP to the tensor parallel size for this allocation}"
+: "${EP:?set EP to the expert parallel size for this allocation}"
+NODES=${NODES:-1}
+PP=${PP:-1}
+NUM_GPUS=${GPUS_PER_NODE:-${NUM_GPUS:-$("${PYTHON:-python3}" -c 'import torch; print(torch.cuda.device_count())')}}
+for size in "$NUM_GPUS" "$NODES" "$TP" "$EP" "$PP"; do
+    if ! [[ "$size" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Expected positive GPU and parallel sizes. Set GPUS_PER_NODE when the submitter has no visible GPUs." >&2
+        exit 1
+    fi
+done
+world_size=$((NODES * NUM_GPUS))
+if (( world_size % (TP * PP) || world_size % (EP * PP) )); then
+    echo "The actor GPU count must be divisible by both TP × PP and EP × PP." >&2
+    exit 1
+fi
+data_parallel_size=$((world_size / (TP * PP)))
+
+CKPT_ARGS=(
+    --hf-checkpoint "$HF_CHECKPOINT"
+    --ref-load "$HF_CHECKPOINT"
+    --megatron-to-hf-mode bridge
+    --save "$SAVE_DIR"
+    --save-interval "${SAVE_INTERVAL:-100}"
 )
-nodes=${NODES:-1}
-gpus=${GPUS_PER_NODE:-4}
-exec "$python" -m relax.entrypoints.train \
-    --resource "{\"sft\":[1,0],\"actor\":[$nodes,$gpus]}" --num-gpus-per-node "$gpus" \
-    --hf-checkpoint "$model" --ref-load "$model" --megatron-to-hf-mode bridge --save "$save" --save-interval "${SAVE_INTERVAL:-100}" \
-    --loss-type sft --prompt-data "$data" --input-key messages --num-rollout "${STEPS:-1}" \
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-2}" --use-dynamic-batch-size \
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-1024}" --sft-max-in-flight-steps 1 \
-    --num-data-storage-units 1 --tensor-model-parallel-size "${TP:-2}" --sequence-parallel \
-    --pipeline-model-parallel-size "${PP:-1}" --expert-model-parallel-size "${EP:-4}" \
-    --expert-tensor-parallel-size 1 --attention-backend fused --attention-softmax-in-fp32 \
-    --num-layers "$layers" --hidden-size 4096 --ffn-hidden-size 16384 --num-attention-heads 64 \
-    --group-query-attention --num-query-groups 4 --kv-channels 192 --v-head-dim 128 \
-    --position-embedding-type rope --rotary-percent 0.334 --rotary-base 10000000 --no-rope-fusion \
-    --normalization RMSNorm --norm-epsilon 1e-6 --swiglu --disable-bias-linear \
-    --untie-embeddings-and-output-weights --vocab-size 152576 --seq-length "${SEQ_LENGTH:-1024}" \
-    --num-experts "$experts" --moe-layer-freq "$moe_freq" --moe-ffn-hidden-size 2048 \
-    --moe-router-topk 8 --moe-router-score-function sigmoid --moe-router-enable-expert-bias \
-    --moe-router-bias-update-rate 0 --moe-router-load-balancing-type none --moe-aux-loss-coeff 0 \
-    --moe-router-dtype fp32 --moe-grouped-gemm --moe-token-dispatcher-type alltoall \
-    --hidden-dropout 0 --attention-dropout 0 --optimizer adam --lr 1e-5 --lr-decay-style constant \
-    --optimizer-cpu-offload --use-precision-aware-optimizer "$@"
+SFT_ARGS=(
+    --loss-type sft
+    --prompt-data "$PROMPT_DATA"
+    --input-key messages
+    --num-rollout "${STEPS:-1}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-$data_parallel_size}"
+    --use-dynamic-batch-size
+    --seq-length "${SEQ_LENGTH:-1024}"
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-1024}"
+    --sft-max-in-flight-steps 1
+    --num-data-storage-units 1
+)
+PERF_ARGS=(
+    --tensor-model-parallel-size "$TP"
+    --pipeline-model-parallel-size "$PP"
+    --expert-model-parallel-size "$EP"
+    --expert-tensor-parallel-size 1
+    --attention-backend fused
+    --attention-softmax-in-fp32
+)
+if (( TP > 1 )); then
+    PERF_ARGS+=(--sequence-parallel)
+fi
+OPTIMIZER_ARGS=(
+    --optimizer adam
+    --lr 1e-5
+    --lr-decay-style constant
+    --optimizer-cpu-offload
+    --use-precision-aware-optimizer
+)
+TRAIN_CMD=(
+    "${PYTHON:-python3}" -m relax.entrypoints.train
+    --resource "{\"sft\":[1,0],\"actor\":[$NODES,$NUM_GPUS]}"
+    --num-gpus-per-node "$NUM_GPUS"
+    "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${SFT_ARGS[@]}" "${PERF_ARGS[@]}" "${OPTIMIZER_ARGS[@]}" "$@"
+)
+
+# A script used as the entrypoint of an existing Ray Job is already on the driver.
+if [[ -n "${RAY_JOB_CONFIG_JSON_ENV_VAR:-}" ]]; then
+    exec "${TRAIN_CMD[@]}"
+fi
+if [[ -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
+    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
+fi
+
+ray job submit ${RAY_NO_WAIT:+--no-wait} \
+    --address="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}" \
+    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+    --runtime-env-json="${RUNTIME_ENV_JSON}" -- "${TRAIN_CMD[@]}"
