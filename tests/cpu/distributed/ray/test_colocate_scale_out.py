@@ -46,7 +46,8 @@ async def start_candidate(manager, request, rank):
 
 
 @pytest.mark.asyncio
-async def test_colocate_publishes_only_snapshot_members(pool):
+@pytest.mark.parametrize("second_arrives_during_full", [True, False], ids=["during-full", "after-release"])
+async def test_colocate_publishes_only_snapshot_members(pool, second_arrives_during_full):
     manager, server, baseline = pool
     request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=2)
     manager._scale_out_requests[request.request_id] = request
@@ -62,13 +63,16 @@ async def test_colocate_publishes_only_snapshot_members(pool):
     assert [entry[0] for entry in snapshot["receivers"]] == [baseline.engines[0], engine1]
     assert snapshot["shared_count"] == 1
     assert request.status is ScaleOutStatus.WEIGHT_SYNCING
-    group2, engine2, second = await start_candidate(manager, request, 5)
-    assert request.status is ScaleOutStatus.WEIGHT_SYNCING
+    if second_arrives_during_full:
+        group2, engine2, second = await start_candidate(manager, request, 5)
+        assert request.status is ScaleOutStatus.WEIGHT_SYNCING
 
     assert await manager.publish_colocate_full(4, ["candidate-4"]) is None
     manager.release_colocate_full()
-    assert (await first).success
+    if not second_arrives_during_full:
+        group2, engine2, second = await start_candidate(manager, request, 5)
     assert request.status is ScaleOutStatus.WAITING_FOR_WEIGHT_SYNC
+    assert (await first).success
     assert server.engine_groups == [baseline, group1]
     assert not second.done()
     engine1.register_to_router.remote.assert_called_once_with(confirm=True)
@@ -80,6 +84,7 @@ async def test_colocate_publishes_only_snapshot_members(pool):
     next_snapshot, obsolete = manager.acquire_colocate_full(source)
     assert obsolete is None
     assert next_snapshot["group_name"] != snapshot["group_name"]
+    assert request.status is ScaleOutStatus.WEIGHT_SYNCING
     assert await manager.publish_colocate_full(4, ["candidate-4", "candidate-5"]) is None
     manager.release_colocate_full()
     assert (await second).success
