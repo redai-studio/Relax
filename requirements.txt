@@ -40,7 +40,7 @@ peft>=0.20.0,<0.21.0
 soundfile
 colorlog
 loguru
-av==16.1.0
+av==17.0.0
 transformers
 huggingface_hub>=1.10.0
 blessed==1.38.0
