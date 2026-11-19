@@ -32,7 +32,14 @@ from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
 from .common import all_gather_param, all_gather_params_async, gdn_component_sizes, named_params_and_buffers
-from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_projections, bucket_experts_by_owner
+from .expert_gather import (
+    Bf16ExpertGather,
+    PackedExpertGather,
+    bucket_expert_projections,
+    bucket_experts_by_owner,
+    canonical_owner_projection,
+    identity_down_projection,
+)
 from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -421,30 +428,81 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             chunk_size=self.args.update_weight_buffer_size,
         )
 
-    def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
+    def _target_shard_group(self, metadata_group):
+        group = self._owner_delta_group(metadata_group)
+        if group is None or mpu.get_context_parallel_world_size() != 1:
+            return None
+        infos = [info for bucket in self._bf16_expert_buckets for info in bucket]
+        try:
+            bucket_expert_projections(infos, self.args.num_experts, dist.get_process_group_ranks(group))
+        except ValueError:
+            return None
+        return group
+
+    def _owner_delta_group(self, metadata_group):
+        if self._bf16_expert_buckets is None or self._packed_expert_sync or self._expert_router is not None:
+            return None
+        ep = mpu.get_expert_model_parallel_group()
+        ranks = dist.get_process_group_ranks(ep)
+        if (
+            ranks == dist.get_process_group_ranks(metadata_group) == dist.get_process_group_ranks(dist.group.WORLD)
+            and dist.get_backend(metadata_group) == "gloo"
+        ):
+            return ep
+        return None
+
+    def _owner_delta_chunks(self, shards, metadata_group, *, target_shards=False):
+        yield from _chunk_with_mla_pairing(
+            self._iter_bf16_expert_params(shards, metadata_group=metadata_group, target_shards=target_shards),
+            chunk_size=self.args.update_weight_buffer_size,
+        )
+
+    def _iter_bf16_expert_params(
+        self, megatron_local_weights, *, include_non_experts=True, metadata_group=None, target_shards=False
+    ):
         # Preserve the current GDN and vision conversion; only expert ownership
         # and transport differ. ETP1 owners already hold complete expert tensors.
         if include_non_experts:
             yield from self._iter_hf_params(megatron_local_weights, include_experts=False)
-        for chunk in self._iter_bf16_expert_chunks(megatron_local_weights):
+        for chunk in self._iter_bf16_expert_chunks(
+            megatron_local_weights, metadata_group=metadata_group, target_shards=target_shards
+        ):
             yield from chunk
 
-    def _iter_bf16_expert_chunks(self, megatron_local_weights):
+    def _iter_bf16_expert_chunks(self, megatron_local_weights, *, metadata_group=None, target_shards=False):
         group = mpu.get_expert_model_parallel_group()
         rank = dist.get_rank(group=dist.group.WORLD)
         device = device_utils.make_current_torch_device()
         for infos, gather in zip(self._bf16_expert_buckets, self._bf16_expert_gathers, strict=True):
-            converted = []
-            for info in infos:
-                if info.src_rank == rank:
-                    tensor = (
-                        megatron_local_weights[self._vanilla_key_map[info.name]]
-                        .detach()
-                        .to(device=device, non_blocking=_NON_BLOCKING)
-                    )
-                    converted.extend(self._bridge_converter.convert(info.name, tensor))
-                    del tensor
-            gathered = gather(converted, group=group, device=device)
+            converted, sources = [], []
+            error = None
+            try:
+                for info in infos:
+                    if info.src_rank == rank:
+                        tensor = (
+                            megatron_local_weights[self._vanilla_key_map[info.name]]
+                            .detach()
+                            .to(device=device, non_blocking=_NON_BLOCKING)
+                        )
+                        items = self._bridge_converter.convert(info.name, tensor)
+                        if metadata_group is not None:
+                            qualifies = canonical_owner_projection if target_shards else identity_down_projection
+                            source = info.name if qualifies(info.name, tensor, items) else None
+                            sources.extend([source] * len(items))
+                        converted.extend(items)
+                        del items
+                        del tensor
+            except Exception as exc:
+                if metadata_group is None:
+                    raise
+                error = exc
+            if metadata_group is None:
+                gathered = gather(converted, group=group, device=device)
+            else:
+                owned = [info.name for info in infos if info.name in self._vanilla_key_map]
+                gathered = gather.owner_slots(
+                    converted, sources, owned, group=group, metadata_group=metadata_group, device=device, error=error
+                )
             del converted
             yield gathered
             del gathered

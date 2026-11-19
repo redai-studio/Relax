@@ -25,6 +25,7 @@ _DTYPES = {
     "int64": 8,
     "float64": 8,
 }
+WIRE_ALIGNMENT = max(_DTYPES.values())
 
 
 def encode(weights: Iterable[tuple[str, tuple[int, ...], Any, Any, Any]], *, max_bytes: int) -> tuple[dict, Any]:
@@ -63,7 +64,7 @@ def encode(weights: Iterable[tuple[str, tuple[int, ...], Any, Any, Any]], *, max
         ):
             raise ValueError("Sparse coordinates must be flat int32 on the values' device")
         # Eight-byte alignment also supports FULL int64/FP64 buffers.
-        offset = (size + 7) // 8 * 8
+        offset = (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
         if offset > size:
             pieces.append(torch.zeros(offset - size, dtype=torch.uint8, device=device))
         position_bytes = 0 if full else count * 4

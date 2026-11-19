@@ -40,6 +40,17 @@ class GpuSyncGroup:
         warmup = torch.zeros(1, dtype=torch.int32, device=self.device)
         dist.all_reduce(warmup, group=self.group)
         torch.cuda.synchronize(self.device)
+        if connection.get("target_shard_p2p") is True:
+            # A first NCCL P2P op can synchronously rendezvous with its peer.
+            # Warm these links in concurrent join, before any receiver must ACK
+            # a posted irecv while the publisher waits to issue the matching send.
+            peers = range(1, connection["world_size"])
+            works = (
+                [self.group.send([warmup], peer, 0) for peer in peers]
+                if rank == 0
+                else [self.group.recv([warmup], 0, 0)]
+            )
+            self.fence(works, deadline=monotonic() + timeout_s)
 
     def receive(self, batch: dict, slab: Any = None) -> tuple[Any, list]:
         import torch
@@ -55,7 +66,10 @@ class GpuSyncGroup:
             or slab.numel() != batch["bytes"]
         ):
             raise ValueError("Receive storage must match the admitted byte slab")
-        works = [dist.broadcast(slab, src=0, group=self.group, async_op=True)] if slab.numel() else []
+        if batch.get("target_shard") is True:
+            works = [self.group.recv([slab], 0, 0)] if slab.numel() else []
+        else:
+            works = [dist.broadcast(slab, src=0, group=self.group, async_op=True)] if slab.numel() else []
         return slab, works
 
     def send(self, raw: Any, *, deadline: float) -> None:
@@ -64,6 +78,17 @@ class GpuSyncGroup:
         if self.rank != 0 or raw.device != self.device or raw.ndim != 1:
             raise ValueError("GPU frame broadcast requires the elected source and its contiguous payload")
         works = [dist.broadcast(raw, src=0, group=self.group, async_op=True)] if raw.numel() else []
+        self.fence(works, deadline=deadline)
+
+    def send_lanes(self, slabs: list, peers: list[list[int]], *, deadline: float) -> None:
+        # Group-local peers belong to this private ProcessGroup, irrespective of training WORLD.
+        # Each slab is immutable and shared by its two consuming engine replicas.
+        works = [
+            self.group.send([raw], peer, 0)
+            for replica in peers
+            for peer, raw in zip(replica, slabs, strict=True)
+            if raw.numel()
+        ]
         self.fence(works, deadline=deadline)
 
     def fence(self, works: list, *, deadline: float) -> None:

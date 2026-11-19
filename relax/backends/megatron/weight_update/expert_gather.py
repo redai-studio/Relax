@@ -7,7 +7,9 @@ not. The caller supplies the live EP group after each offload/reload cycle.
 """
 
 import re
+from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -70,6 +72,79 @@ def _layout(tensors: Sequence[NamedTensor]) -> tuple[TensorLayout, ...]:
     return tuple((name, tuple(tensor.shape), tensor.numel()) for name, tensor in tensors)
 
 
+@dataclass(frozen=True)
+class OwnerExpert:
+    """HF directory slot whose complete BF16 data stays on one EP owner."""
+
+    owner: int  # EP group rank
+    shape: tuple[int, ...]
+    tensor: torch.Tensor | None
+    device: torch.device
+    dtype = torch.bfloat16
+
+    @property
+    def nbytes(self) -> int:
+        return torch.Size(self.shape).numel() * 2
+
+
+def identity_down_projection(name: str, raw: torch.Tensor, converted: Sequence[NamedTensor]) -> bool:
+    """Accept only the exact canonical HF name and the same complete word
+    sequence."""
+    source = re.fullmatch(
+        r"(?:module\.|vp_stages\.0\.)*decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc2\.weight(\d+)", name
+    )
+    if source is None or len(converted) != 1:
+        return False
+    layer, expert = source.groups()
+    target, out = converted[0]
+    return (
+        target == f"model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+        and raw.dtype == out.dtype == torch.bfloat16
+        and raw.ndim == out.ndim == 2
+        and 0 < raw.numel() == out.numel() < 2**31
+        and raw.is_contiguous()
+        and out.is_contiguous()
+        and raw.device == out.device
+        and raw.data_ptr() == out.data_ptr()
+        and raw.storage_offset() == out.storage_offset() == 0
+        and raw.untyped_storage().nbytes() == out.nbytes
+        and not out.is_neg()
+        and not out.is_conj()
+    )
+
+
+def canonical_owner_projection(name: str, raw: torch.Tensor, converted: Sequence[NamedTensor]) -> bool:
+    """Recognize uniquely owned Bridge outputs before comparing their actual
+    BF16 words."""
+    if identity_down_projection(name, raw, converted):
+        return True
+    source = re.fullmatch(
+        r"(?:module\.|vp_stages\.0\.)*decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc1\.weight(\d+)", name
+    )
+    if source is None or len(converted) != 2 or raw.ndim != 2 or raw.dtype != torch.bfloat16:
+        return False
+    prefix = f"model.layers.{source[1]}.mlp.experts.{source[2]}."
+    names = {n for n, _ in converted}
+    if names != {prefix + "gate_proj.weight", prefix + "up_proj.weight"}:
+        return False
+    rows, cols = raw.shape
+    return (
+        rows > 0
+        and cols > 0
+        and rows % 8 == 0
+        and all(
+            out.dtype == torch.bfloat16
+            and out.device == raw.device
+            and tuple(out.shape) == (rows // 2, cols)
+            and out.numel() < 2**31
+            and out.is_contiguous()
+            and not out.is_neg()
+            and not out.is_conj()
+            for _, out in converted
+        )
+    )
+
+
 class Bf16ExpertGather:
     """Cache CPU layouts; allocate independent receive storage on every
     call."""
@@ -78,6 +153,60 @@ class Bf16ExpertGather:
         self._ranks: tuple[int, ...] | None = None
         self._layouts: tuple[tuple[TensorLayout, ...], ...] | None = None
         self._sizes: tuple[int, ...] = ()
+
+    def owner_slots(
+        self,
+        tensors: Sequence[NamedTensor],
+        sources: Sequence[str | None],
+        owned_names: Sequence[str],
+        *,
+        group: dist.ProcessGroup,
+        metadata_group: dist.ProcessGroup,
+        device: torch.device,
+        error: Exception | None = None,
+    ) -> list[tuple[str, torch.Tensor | OwnerExpert]]:
+        """Keep verified identities local and gather the remaining BF16 tensors
+        as usual.
+
+        All ranks agree on the layout before using it, even if an owner has no
+        eligible slots. Only host descriptors survive an update or group
+        reload.
+        """
+        ranks = tuple(dist.get_process_group_ranks(group))
+        rank = dist.get_rank(group)
+        try:
+            signature = (ranks, _layout(tensors), tuple(sources), tuple(owned_names))
+            state = int(signature != getattr(self, "_owner_signature", None))
+        except Exception as exc:
+            error = exc
+        agreement = torch.tensor(2 if error is not None else state, dtype=torch.int32, device="cpu")
+        dist.all_reduce(agreement, op=dist.ReduceOp.MAX, group=metadata_group)
+        decision = int(agreement)
+        if decision == 2:
+            raise RuntimeError("Owner expert conversion failed on a source rank") from error
+        if decision:
+            reports = [None] * len(ranks)
+            dist.all_gather_object(reports, signature[1:], group=metadata_group)
+            ownership = Counter(name for _, _, owned in reports for name in owned)
+            names = Counter(name for layout, _, _ in reports for name, _, _ in layout)
+            self._owner_slots = [
+                [
+                    (name, shape, source is not None and ownership[source] == 1 and names[name] == 1)
+                    for (name, shape, _), source in zip(layout, sources, strict=True)
+                ]
+                for layout, sources, _ in reports
+            ]
+            self._owner_signature = signature
+            self._remainder = Bf16ExpertGather()
+        remainder = [item for item, (_, _, local) in zip(tensors, self._owner_slots[rank], strict=True) if not local]
+        gathered = iter(self._remainder(remainder, group=group, device=device))
+        return [
+            (name, OwnerExpert(owner, shape, tensors[i][1] if rank == owner else None, device))
+            if local
+            else next(gathered)
+            for owner, slots in enumerate(self._owner_slots)
+            for i, (name, shape, local) in enumerate(slots)
+        ]
 
     def __call__(
         self, tensors: Sequence[NamedTensor], *, group: dist.ProcessGroup, device: torch.device

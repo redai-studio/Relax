@@ -104,3 +104,197 @@ def test_retired_export_cannot_acknowledge_a_new_pending_snapshot():
         source.commit()
     list(source.export())
     source.commit()
+
+
+def _compare_owner_export(rank, world, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from relax.backends.megatron.weight_update.expert_gather import Bf16ExpertGather, OwnerExpert
+    from relax.distributed.weight_sync.codec import encode
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world, timeout=timedelta(seconds=30))
+    group = dist.group.WORLD
+    device = torch.device("cpu")
+
+    class ExpertIterator:
+        def __init__(self):
+            self.gather = Bf16ExpertGather()
+
+        def items(self, shards):
+            return [(f"{name}.{rank}", tensor) for name, tensor in shards.items()]
+
+        def get_hf_weight_chunks(self, shards):
+            yield self.gather(self.items(shards), group=group, device=device)
+
+        def _owner_delta_group(self, metadata_group):
+            return group
+
+        def _owner_delta_chunks(self, shards, metadata_group):
+            items = self.items(shards)
+            # Mixed entries, including a replicated raw source, exercise both
+            # the original gather and owner locations in a single HF frame.
+            sources = [None, "replica", *(f"{name}.{rank}" for name in ("sparse", "dense", "forced", "empty"))]
+            owned = [name for name in sources if name is not None]
+            result = self.gather.owner_slots(
+                items, sources, owned, group=group, metadata_group=metadata_group, device=device
+            )
+            assert [isinstance(tensor, OwnerExpert) for _, tensor in result] == [
+                False,
+                False,
+                True,
+                True,
+                True,
+                True,
+            ] * world
+            yield result
+
+    def wire(chunk):
+        return encode(
+            ((entry.name, entry.shape, entry.dtype, entry.positions, entry.values) for entry in chunk),
+            max_bytes=1 << 20,
+        )
+
+    reference = ShardDeltaExporter(ExpertIterator(), ExpertIterator(), snapshot_budget_bytes=1 << 20)
+    candidate = ShardDeltaExporter(ExpertIterator(), ExpertIterator(), snapshot_budget_bytes=1 << 20)
+    candidate._owner_local_diff = True
+    initial = {
+        name: torch.zeros(12, dtype=torch.bfloat16)
+        for name in ("ordinary", "replicated", "sparse", "dense", "forced", "empty")
+    }
+    initial["sparse"].view(torch.int16)[1] = 0x7FC1
+    updated = {name: tensor.clone() for name, tensor in initial.items()}
+    if rank:
+        updated["sparse"].view(torch.int16)[:2] = torch.tensor([-32768, 0x7FC2], dtype=torch.int16)
+    updated["ordinary"].view(torch.int16)[3] = -32768
+    updated["dense"][:4] = 1  # 4 * (4 + 2) == 12 * 2 triggers the original FULL threshold.
+    try:
+        for publication, shards in enumerate((initial, updated, updated, initial)):
+            outputs = []
+            for source in (reference, candidate) if publication % 2 == 0 else (candidate, reference):
+                source.begin(shards)
+                names = frozenset(f"forced.{owner}" for owner in range(world)) if publication != 2 else frozenset()
+                chunks = list(source.export(full_names=names, emit=rank == 0, _owner_group=group))
+                assert len(chunks) == 1
+                if rank:
+                    assert chunks[0] == []
+                else:
+                    outputs.append(wire(chunks[0]))
+                source.commit()
+            if rank == 0:
+                (ref_meta, ref_data), (got_meta, got_data) = outputs
+                assert got_meta == ref_meta and torch.equal(got_data, ref_data)
+                if publication == 2:
+                    assert got_data.numel() == 0
+        # One owner can fail before its first payload collective. All peers must
+        # leave the same pending attempt without acknowledging its contents.
+        failing = Bf16ExpertGather()
+        with pytest.raises(RuntimeError, match="conversion failed"):
+            failing.owner_slots(
+                [],
+                [],
+                [],
+                group=group,
+                metadata_group=group,
+                device=device,
+                error=ValueError("failed owner conversion") if rank == 1 else None,
+            )
+        candidate.begin(updated)
+        previous = candidate._acknowledged
+        # This name mismatch is visible on just one rank. The original owner
+        # diff reports it to every peer before a payload exchange.
+        new = OwnerExpert(0, (12,), updated["sparse"] if rank == 0 else None, device)
+        with pytest.raises(RuntimeError, match="comparison failed"):
+            candidate._encode_owner_chunk(
+                [("x", new)], [("bad" if rank == 1 else "x", new)], frozenset(), group, group
+            )
+        candidate.abort()
+        assert candidate._acknowledged is previous
+        candidate.begin(updated)
+        retry = list(candidate.export(emit=rank == 0, _owner_group=group))
+        if rank == 0:
+            assert all(entry.full for entry in retry[0])
+        candidate.commit()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_owner_export_matches_original_wire_across_real_gloo_group(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _compare_owner_export, args=(2, (tmp_path / "rendezvous").as_uri()), nprocs=2, start_method="fork"
+    )
+
+
+def _check_owner_target_lanes(rank, world, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from relax.backends.megatron.weight_update.expert_gather import OwnerExpert
+    from relax.backends.megatron.weight_update.target_shard import encode_frame
+    from relax.distributed.weight_sync.codec import tensors
+
+    dist.init_process_group("gloo", rank=rank, world_size=world, init_method=rendezvous, timeout=timedelta(seconds=20))
+    group, device = dist.group.WORLD, torch.device("cpu")
+    try:
+        current, baseline, complete = [], [], []
+        # Real owner gather of two projection axes, zero lane/whole entry,
+        # forced ordinary FULL, raw NaN payload and negative zero.
+        suffixes = ["down_proj", "gate_proj", "up_proj", "down_proj", "gate_proj", "up_proj", "gate_proj", "down_proj"]
+        for index, projection in enumerate(suffixes):
+            name = f"model.layers.0.mlp.experts.{index}.{projection}.weight"
+            old = torch.zeros((8, 12), dtype=torch.bfloat16)
+            new = old.clone()
+            if index != 3:
+                new.view(torch.int16).flatten()[[0, 5, 12, 46, 95]] = torch.tensor(
+                    [-32768, 0x7FC1, 0x7FC2, -1, 0x3F80], dtype=torch.int16
+                )
+            owner = index % world
+            baseline.append((name, OwnerExpert(owner, old.shape, old if owner == rank else None, device)))
+            current.append((name, OwnerExpert(owner, new.shape, new if owner == rank else None, device)))
+            complete.append((old, new))
+        ordinary = torch.tensor([3, 4], dtype=torch.int64)
+        current.append(("ordinary", ordinary))
+        baseline.append(("ordinary", ordinary.clone()))
+        forced = {current[4][0]}
+        changes = ShardDeltaExporter._encode_owner_chunk(current, baseline, forced, group, group, target_lanes=True)
+        if rank:
+            assert changes == []
+            return
+        directories, raw = encode_frame(changes, 4096)
+        moved = 0
+        for tp, (directory, slab) in enumerate(zip(directories, raw, strict=True)):
+            marker = directory.pop("target_shard")
+            assert marker == dict(format=1, tp_rank=tp, tp_size=4, entries=[0, 1, 2, 3, 5, 6, 7])
+            decoded = list(tensors(directory, slab))
+            assert [entry["name"] for entry, _, _ in decoded] == [key for key, _ in current]
+            for index, (entry, positions, values) in enumerate(decoded):
+                if index == len(suffixes):
+                    assert torch.equal(values, ordinary)
+                    continue
+                old, new = complete[index]
+                if index == 4:
+                    assert entry["full"] and torch.equal(values.view(torch.int16), new.view(torch.int16).flatten())
+                    continue
+                axis = 1 if suffixes[index] == "down_proj" else 0
+                actual = old.chunk(4, dim=axis)[tp].contiguous().view(torch.int16).clone()
+                actual.flatten().index_copy_(0, positions.long(), values.view(torch.int16))
+                assert torch.equal(actual, new.chunk(4, dim=axis)[tp].view(torch.int16))
+                assert positions.tolist() == sorted(set(positions.tolist()))
+                moved += positions.numel()
+            assert not decoded[3][1].numel()
+        assert moved == 30
+    finally:
+        dist.destroy_process_group()
+
+
+def test_owner_target_lanes_reconstruct_every_original_word(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _check_owner_target_lanes, args=(8, (tmp_path / "lane-owners").as_uri()), nprocs=8, start_method="fork"
+    )

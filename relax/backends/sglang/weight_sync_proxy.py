@@ -7,33 +7,48 @@ CUDA payloads never enter the parent actor.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
+import zlib
 from multiprocessing.connection import Connection
 from typing import Any
 
+from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, validate_directory
 from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup, remaining
 
 from .delta_loader import LOADER as PROXY_MEMORY_LOADER
-
-
-MAX_DOCUMENT_BYTES = 16 << 20
+from .delta_loader import MAX_DOCUMENT_BYTES, MAX_HTTP_BYTES
+from .delta_shard_layout import ShardFrame, marked_ordinals
 
 
 def json_bytes(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), allow_nan=False).encode()
 
 
-MAX_HTTP_BYTES = 65536
-
-
 def _http_bytes(payload: dict) -> int:
     # requests' json= body uses these default separators/ASCII escaping.
     return len(json.dumps(payload, allow_nan=False).encode())
+
+
+def _compressed_directory(data: bytes, tp_size: int) -> str | None:
+    # Each TP control contains its own base64 copy, even before adding the
+    # outer serializer and IPC handles. Stop incompressible input early.
+    cap = (min(len(data) - 1, MAX_HTTP_BYTES // tp_size) // 4) * 3
+    compressor = zlib.compressobj(level=1)
+    compressed = bytearray()
+    for offset in range(0, len(data), MAX_HTTP_BYTES):
+        compressed.extend(compressor.compress(data[offset : offset + MAX_HTTP_BYTES]))
+        if len(compressed) > cap:
+            return None
+    compressed.extend(compressor.flush())
+    if len(compressed) > cap:
+        return None
+    return base64.b64encode(compressed).decode("ascii")
 
 
 def _process_identity(pid: int) -> tuple[int, int]:
@@ -133,7 +148,7 @@ class _StagingArena:
         if not size:
             self.active[key] = (0, 0)
             return self.storage[:0]
-        charged = (size + 3) // 4 * 4
+        charged = (size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
         for index, (offset, available) in enumerate(self.free):
             if size <= available:
                 charged = min(charged, available)
@@ -248,31 +263,46 @@ def _child(connection: Connection) -> None:
                         cuda_process_peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
                         cuda_process_peak_reserved_bytes=torch.cuda.max_memory_reserved(device),
                     )
+                elif op == "locations":
+                    keys = range(command["round"], command["stop"])
+                    if any(not buffers[k]["complete"] or buffers[k]["exported"] for k in keys):
+                        raise ValueError("Ordered consume requires a fenced, unexported prefix")
+                    result = dict(
+                        success=True,
+                        free_bytes=torch.cuda.mem_get_info(device)[0],
+                        spans=[(arena.active[k][0], buffers[k]["slab"].numel()) for k in keys],
+                    )
                 elif op == "export":
                     item = buffers[command["round"]]
                     if not item["complete"]:
                         raise ValueError("Cannot export an incomplete NCCL receive")
                     # Mark before serialization: even an ambiguous send failure
                     # must not cause early producer destruction.
+                    slab = item["slab"]
+                    if "span" in command:
+                        offset, length = command["span"]
+                        slab = arena.storage.narrow(0, offset, length)
+                        for key in range(command["round"], command["stop"]):
+                            buffers[key]["exported"] = True
                     item["exported"] = True
                     item["status"] = torch.empty(command["count"], dtype=torch.uint8, device=device)
-                    result = dict(
-                        success=True, serialized=_serialize(command["control"], item["slab"], item["status"])
-                    )
-                    del item
+                    if command.get("sentinel"):
+                        item["status"].fill_(255)
+                    result = dict(success=True, serialized=_serialize(command["control"], slab, item["status"]))
+                    del item, slab
                 elif op == "status":
                     item = buffers[command["round"]]
                     result = dict(success=True, full_required=item["status"].cpu().tolist())
                     del item
                 elif op == "release":
-                    item = buffers[command["round"]]
-                    if item["exported"] and command.get("consumed") is not True:
-                        raise ValueError("Exported IPC slab lacks a worker consumption fence")
-                    if not item["complete"]:
-                        raise ValueError("Cannot release an in-flight NCCL receive")
-                    del buffers[command["round"]]
-                    del item
-                    arena.release(command["round"])
+                    for key in range(command["round"], command.get("stop", command["round"] + 1)):
+                        item = buffers[key]
+                        if item["exported"] and command.get("consumed") is not True:
+                            raise ValueError("Exported IPC slab lacks a worker consumption fence")
+                        if not item["complete"]:
+                            raise ValueError("Cannot release an in-flight NCCL receive")
+                        del buffers[key], item
+                        arena.release(key)
                     torch.cuda.ipc_collect()
                     result = dict(success=True)
                 elif op == "memory":
@@ -288,6 +318,16 @@ def _child(connection: Connection) -> None:
                         retained_payload_bytes=sum(v["slab"].numel() for v in buffers.values()),
                     )
                 elif op == "close":
+                    # A fenced pre-receive prefix has never exported an IPC
+                    # handle. It can be discarded without waiting for the live
+                    # generating server to exit. Ambiguous reads/exports keep
+                    # the original stronger lifetime protection below.
+                    for key in list(buffers):
+                        item = buffers[key]
+                        if item["complete"] and not item["exported"]:
+                            del buffers[key]
+                            arena.release(key)
+                        del item
                     if buffers and not _workers_exited(workers):
                         raise RuntimeError("Retaining unresolved IPC/NCCL buffers until model worker exit")
                     connection.send(dict(success=True))
@@ -318,6 +358,10 @@ def _child(connection: Connection) -> None:
 class WeightSyncProxy:
     def __init__(self, engine: Any) -> None:
         self.engine = engine
+        self._inline_frame_directory = False
+        self._ordered_capable = self._record_seed = False
+        self._seed_directory: dict[str, tuple] = {}
+        self._target_requested = self._target_capable = self._target_failed = False
         self.children: list[tuple[Any, Connection]] = []
         self.connection: dict | None = None
         self.identities: list[dict] = []
@@ -437,40 +481,42 @@ class WeightSyncProxy:
             deadline=deadline,
         )
 
-    def _documents(self, kind: str, documents: list, *, deadline: float) -> list[str]:
-        encoded = [json_bytes(d).decode() for d in documents]
-        if any(len(data.encode()) > MAX_DOCUMENT_BYTES for data in encoded):
-            raise ValueError("Proxy document exceeds its bounded worker directory capacity")
-        identities = [hashlib.sha256(data.encode()).hexdigest() for data in encoded]
-        # Decide the complete fragment set before publishing its first fragment.
-        width = max(1, MAX_HTTP_BYTES // (4 * len(encoded)))
+    def _send_frame_directory(self, data: bytes, identity: str, *, deadline: float) -> None:
+        text = data.decode("ascii")
+        tp_size = len(self.children)
+        width = max(1, MAX_HTTP_BYTES // (4 * tp_size))
         while True:
-            count = max((len(data) + width - 1) // width for data in encoded)
-            controls = [
-                [
-                    dict(
-                        op="document",
-                        kind=kind,
-                        id=identity,
-                        index=i,
-                        count=count,
-                        data=data[i * width : (i + 1) * width],
-                    )
-                    for data, identity in zip(encoded, identities, strict=True)
-                ]
+            count = (len(text) + width - 1) // width
+            parts = [
+                dict(
+                    op="document",
+                    kind="frame",
+                    id=identity,
+                    index=i,
+                    count=count,
+                    data=text[i * width : (i + 1) * width],
+                )
                 for i in range(count)
             ]
-            if all(_http_bytes(self._payload([_serialize(c) for c in part])) <= MAX_HTTP_BYTES for part in controls):
+            if all(
+                _http_bytes(self._payload([_serialize(part) for _ in self.children])) <= MAX_HTTP_BYTES
+                for part in parts
+            ):
                 break
             if width == 1:
                 raise ValueError("One proxy control fragment cannot fit the whole-engine HTTP budget")
             width = max(1, width // 2)
-        for part in controls:
-            self._controls(part, deadline=deadline)
-            self.metrics["schema_calls" if kind == "schema" else "update_directory_calls"] += 1
-        return identities
+        for part in parts:
+            self._controls([part] * tp_size, deadline=deadline)
+            self.metrics["update_directory_calls"] += 1
+
+    def _fits_ipc(self, control: dict) -> bool:
+        preview = self._payload([_serialize(control, _CudaWireSize(), _CudaWireSize()) for _ in self.children])
+        return _http_bytes(preview) <= MAX_HTTP_BYTES
 
     def begin(self, control: dict, *, timeout: float) -> dict:
+        if self._target_failed:
+            raise RuntimeError("Target shard publication has an ambiguous outcome")
         deadline = time.monotonic() + timeout
         self.metrics = dict(
             http_calls=0, control_bytes=0, http_s=0.0, schema_calls=0, update_directory_calls=0, consume_calls=0
@@ -478,26 +524,271 @@ class WeightSyncProxy:
         self.batch = 0
         self.version = control["version"]
         self.staging_budget = control["staging_budget_bytes"]
-        self._controls(
-            [dict(op="begin", **control, uuid=identity["uuid"]) for identity in self.identities], deadline=deadline
-        )
-        return dict(success=True)
+        self._target_requested = control.get("target_shard_request", False)
+        if type(self._target_requested) is not bool or (self._target_requested and len(self.children) != 4):
+            raise ValueError("Target shard publication requires four TP owners")
+        if control["seed"] or not self._target_requested:
+            self._target_capable = self._ordered_capable = False
+            self._seed_directory.clear()
+        self._record_seed = self._target_requested and control["seed"]
+        self._workspace_budget = control.get("receiver_gpu_budget_bytes", 0) - self.staging_budget
+        controls = [dict(op="begin", **control, uuid=i["uuid"]) for i in self.identities]
+        if self._target_requested:
+            for rank, c in enumerate(controls):
+                c["target_shard_rank"] = rank
+                c["ordered_target_consume"] = True
+        self._controls(controls, deadline=deadline)
+        return dict(success=True, **({"ordered_target_consume": True} if self._ordered_capable else {}))
 
-    def consume(self, round_id: int, metadata: dict, *, timeout: float) -> dict:
+    def _shared_controls(self, metadata: dict, deadline: float) -> tuple:
+        data = json_bytes(metadata)
+        if len(data) > MAX_DOCUMENT_BYTES:
+            raise ValueError("Proxy document exceeds its bounded worker directory capacity")
+        identity = hashlib.sha256(data).hexdigest()
+        control = dict(op="consume", version=self.version, frame=self.batch, metadata_id=identity)
+        inline = False
+        if self._inline_frame_directory:
+            compressed = _compressed_directory(data, len(self.children))
+            if compressed is not None:
+                candidate = dict(control, metadata_zlib=dict(bytes=len(data), data=compressed))
+                if self._fits_ipc(candidate):
+                    control, inline = candidate, True
+        if not inline:
+            if not self._fits_ipc(control):
+                raise ValueError("One GPU bucket IPC control exceeds its HTTP budget")
+            self._send_frame_directory(data, identity, deadline=deadline)
+        return [control] * len(self.children), inline
+
+    def _validate_lanes(self, lanes: list[dict]) -> None:
+        if not self._target_requested or not self._target_capable or len(lanes) != 4 or len(self.children) != 4:
+            raise ValueError("Partial lanes require a confirmed four-TP capability")
+        previous = None
+        for rank, lane in enumerate(lanes):
+            clean = dict(lane)
+            ordinals = marked_ordinals(clean.pop("target_shard", None), rank, len(clean["tensors"]))
+            validate_directory(clean, max_bytes=self.staging_budget)
+            marked = set(ordinals)
+            key = (
+                [
+                    (e["name"], e["shape"], e["dtype"], e["full"], None if i in marked else e["count"])
+                    for i, e in enumerate(clean["tensors"])
+                ],
+                ordinals,
+            )
+            if (previous is not None and previous != key) or any(
+                clean["tensors"][i]["full"] or clean["tensors"][i]["dtype"] != "bfloat16" for i in ordinals
+            ):
+                raise ValueError("Target lane logical directories disagree")
+            previous = key
+
+    def _lane_controls(self, lanes: list[dict], deadline: float) -> tuple:
+        self._validate_lanes(lanes)
+        docs, controls, inline = [], [], []
+        for lane in lanes:
+            data = json_bytes(lane)
+            if len(data) > MAX_DOCUMENT_BYTES:
+                raise ValueError("Target lane directory exceeds its retained bound")
+            ctl = dict(
+                op="consume", version=self.version, frame=self.batch, metadata_id=hashlib.sha256(data).hexdigest()
+            )
+            controls.append(ctl)
+            docs.append(data.decode("ascii"))
+            compressed = _compressed_directory(data, len(lanes))
+            if compressed is not None:
+                inline.append(dict(ctl, metadata_zlib=dict(bytes=len(data), data=compressed)))
+
+        def fits(ctl):
+            return (
+                _http_bytes(self._payload([_serialize(c, _CudaWireSize(), _CudaWireSize()) for c in ctl]))
+                <= MAX_HTTP_BYTES
+            )
+
+        if len(inline) == len(lanes) and fits(inline):
+            return inline, True
+        if not fits(controls):
+            raise ValueError("Target lane IPC control exceeds whole-engine HTTP budget")
+        # All TPs receive the same number of original document operations.
+        # Equal partition counts also accommodate unequal lane directory sizes.
+        width = MAX_HTTP_BYTES // (4 * len(lanes))
+        longest = max(map(len, docs))
+        while True:
+            count = (longest + width - 1) // width
+            if count > 65536:
+                raise ValueError("Too many target directory fragments")
+            groups = [
+                [
+                    dict(
+                        op="document",
+                        kind="frame",
+                        id=c["metadata_id"],
+                        index=i,
+                        count=count,
+                        data=d[i * len(d) // count : (i + 1) * len(d) // count],
+                    )
+                    for c, d in zip(controls, docs, strict=True)
+                ]
+                for i in range(count)
+            ]
+            if all(_http_bytes(self._payload([_serialize(c) for c in g])) <= MAX_HTTP_BYTES for g in groups):
+                break
+            if width == 1:
+                raise ValueError("A target directory fragment cannot fit its HTTP budget")
+            width = max(1, width // 2)
+        for g in groups:
+            self._controls(g, deadline=deadline)
+            self.metrics["update_directory_calls"] += 1
+        return controls, False
+
+    def consume(
+        self, round_id: int, metadata: dict | list[dict], *, timeout: float, following: list | None = None
+    ) -> dict:
+        lanes = isinstance(metadata, (list, tuple))
+        if self._target_failed:
+            raise RuntimeError("Target shard publication has an ambiguous outcome")
         deadline = time.monotonic() + timeout
-        ids = self._documents("frame", [metadata] * len(self.children), deadline=deadline)
-        controls = [
-            dict(op="consume", version=self.version, frame=self.batch, metadata_id=identity) for identity in ids
-        ]
-        # Bound the request before the first real IPC export. No speculative
-        # CUDA handle is created and abandoned during control-size planning.
-        preview = self._payload([_serialize(c, _CudaWireSize(), _CudaWireSize()) for c in controls])
-        if _http_bytes(preview) > MAX_HTTP_BYTES:
-            raise ValueError("One GPU bucket IPC control exceeds its HTTP budget")
+        try:
+            if following:
+                if not lanes or not self._ordered_capable or round_id != self.batch:
+                    raise ValueError("Ordered consume requires an acknowledged target prefix")
+                return self._ordered(round_id, [metadata, *following], deadline)
+            return self._consume(round_id, metadata, deadline, lanes)
+        except BaseException:
+            if lanes or following:
+                self._target_failed = True
+            raise
+
+    def _ordered(self, first: int, frames: list, deadline: float) -> dict:
+        # The FULL seed installed the same name order in the worker and proxy.
+        # Only changing counts and seed ordinals need to cross HTTP.
+        compact, workspace = [], []
+        for lanes in frames:
+            self._validate_lanes(lanes)
+            encoded, peak = [], 0
+            for lane in lanes:
+                entries = lane["tensors"]
+                if len(lane["target_shard"]["entries"]) != len(entries):
+                    raise ValueError("Only complete target-only frames can share a consume")
+                codes = []
+                for e in entries:
+                    ordinal, shape, dtype = self._seed_directory[e["name"]]
+                    if tuple(e["shape"]) != shape or e["dtype"] != dtype:
+                        raise ValueError("Target frame disagrees with its seed directory")
+                    codes.append((ordinal, e["count"]))
+                encoded.append(codes)
+                peak = max(peak, ShardFrame.ordered_workspace(codes))
+            compact.append(encoded)
+            workspace.append(peak)
+        locations = self._commands(
+            [dict(op="locations", round=first, stop=first + len(frames))] * 4, deadline=deadline
+        )
+        if len(locations) != 4 or any(len(reply["spans"]) != len(frames) for reply in locations):
+            raise ValueError("Missing retained target frame locations")
+        for rank, reply in enumerate(locations):
+            if any(size != frame[rank]["bytes"] for (_, size), frame in zip(reply["spans"], frames, strict=True)):
+                raise ValueError("Target directory disagrees with fenced frame size")
+
+        available = min(self._workspace_budget, *(r["free_bytes"] for r in locations))
+
+        def partition(lo, hi):
+            if hi - lo == 1:
+                return [(lo, hi, None)]
+            count = sum(len(frame[0]) for frame in compact[lo:hi])
+            commands = []
+            if count + 1024 + sum(workspace[lo:hi]) <= available:
+                for rank, reply in enumerate(locations):
+                    spans = [(offset, size) for offset, size in reply["spans"][lo:hi] if size]
+                    if any(
+                        offset != (prev + size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
+                        for (prev, size), (offset, _) in zip(spans, spans[1:])
+                    ):
+                        break
+                    start = spans[0][0] if spans else 0
+                    length = sum(spans[-1]) - start if spans else 0
+                    if length > self.staging_budget:
+                        break
+                    directory = [frame[rank] for frame in compact[lo:hi]]
+                    data = json_bytes(directory)
+                    if len(data) > MAX_DOCUMENT_BYTES:
+                        break
+                    ctl = dict(op="consume", ordered_target=True, frame=first + lo, version=self.version)
+                    compressed = _compressed_directory(data, 4)
+                    if compressed is None:
+                        ctl["metadata"] = directory
+                    else:
+                        ctl.update(
+                            metadata_zlib=dict(bytes=len(data), data=compressed),
+                            metadata_id=hashlib.sha256(data).hexdigest(),
+                        )
+                    commands.append(
+                        dict(
+                            op="export",
+                            round=first + lo,
+                            stop=first + hi,
+                            span=(start, length),
+                            count=count,
+                            sentinel=True,
+                            control=ctl,
+                        )
+                    )
+            if (
+                len(commands) == 4
+                and _http_bytes(
+                    self._payload([_serialize(c["control"], _CudaWireSize(), _CudaWireSize()) for c in commands])
+                )
+                <= MAX_HTTP_BYTES
+            ):
+                return [(lo, hi, commands)]
+            mid = (lo + hi) // 2
+            return partition(lo, mid) + partition(mid, hi)
+
+        # Plan every real serializer envelope before exporting any IPC handle.
+        # A transport/worker error after export is terminal, including a partial ACK.
+        for lo, hi, commands in partition(0, len(frames)):
+            if commands is None:
+                self._consume(first + lo, frames[lo], deadline, True)
+                continue
+            replies = self._commands(commands, deadline=deadline)
+            self._request(
+                "update_weights_from_tensor", self._payload([r["serialized"] for r in replies]), deadline=deadline
+            )
+            statuses = self._commands([dict(op="status", round=first + lo)] * 4, deadline=deadline)
+            count = commands[0]["count"]
+            if len(statuses) != 4 or any(
+                len(s["full_required"]) != count or any(s["full_required"]) for s in statuses
+            ):
+                raise RuntimeError("Missing ordered target install acknowledgement")
+            self._commands(
+                [dict(op="release", round=first + lo, stop=first + hi, consumed=True)] * 4, deadline=deadline
+            )
+            for frame in frames[lo:hi]:
+                self._record_target_frame(frame)
+            self.metrics["consume_calls"] += 1
+            self.metrics["ordered_consume_calls"] = self.metrics.get("ordered_consume_calls", 0) + 1
+            self.metrics["ordered_consume_frames"] = self.metrics.get("ordered_consume_frames", 0) + hi - lo
+            self.batch += hi - lo
+        return dict(success=True, full_required=[], ordered_frames_ack=len(frames))
+
+    def _consume(self, round_id: int, metadata: dict | list[dict], deadline: float, lanes: bool) -> dict:
+        if round_id != self.batch:
+            raise ValueError("Unexpected logical round")
+        if lanes:
+            controls, inline = self._lane_controls(metadata, deadline)
+            directory = metadata[0]
+        else:
+            if "target_shard" in metadata:
+                raise ValueError("Partial target mapping requires four ordered lanes")
+            controls, inline = self._shared_controls(metadata, deadline)
+            directory = metadata
         replies = self._commands(
             [
-                dict(op="export", round=round_id, control=control, count=len(metadata["tensors"]))
-                for control in controls
+                dict(
+                    op="export",
+                    round=round_id,
+                    control=c,
+                    count=len(directory["tensors"]),
+                    **({"sentinel": True} if lanes else {}),
+                )
+                for c in controls
             ],
             deadline=deadline,
         )
@@ -505,16 +796,59 @@ class WeightSyncProxy:
             "update_weights_from_tensor", self._payload([item["serialized"] for item in replies]), deadline=deadline
         )
         statuses = self._commands([dict(op="status", round=round_id)] * len(self.children), deadline=deadline)
+        if lanes:
+            marked = set(directory["target_shard"]["entries"])
+            if len(statuses) != 4 or any(
+                len(s["full_required"]) != len(directory["tensors"])
+                or any(v not in (0, 1) or (i in marked and v != 0) for i, v in enumerate(s["full_required"]))
+                for s in statuses
+            ):
+                raise RuntimeError("Missing or invalid target shard install acknowledgement")
         self._commands([dict(op="release", round=round_id, consumed=True)] * len(self.children), deadline=deadline)
+        if lanes:
+            self._record_target_frame(metadata)
+        elif self._record_seed:
+            for e in directory["tensors"]:
+                self._seed_directory[e["name"]] = (len(self._seed_directory), tuple(e["shape"]), e["dtype"])
         self.metrics["consume_calls"] += 1
+        if self._inline_frame_directory or lanes:
+            metric = "inline_directory_frames" if inline else "inline_directory_fallback_frames"
+            self.metrics[metric] = self.metrics.get(metric, 0) + 1
         self.batch += 1
-        names = [entry["name"] for entry in metadata["tensors"]]
+        names = [entry["name"] for entry in directory["tensors"]]
         required = sorted(
             {name for status in statuses for name, flag in zip(names, status["full_required"], strict=True) if flag}
         )
         return dict(success=True, full_required=required)
 
+    def _record_target_frame(self, metadata: list[dict]) -> None:
+        stats = self.metrics.setdefault(
+            "target_shards",
+            [
+                dict(tp_rank=r, frames=0, raw_bytes=0, marked_words=0, marked_entries=0, status_acks=0, releases=0)
+                for r in range(4)
+            ],
+        )
+        for lane, record in zip(metadata, stats, strict=True):
+            ordinals = lane["target_shard"]["entries"]
+            record["frames"] += 1
+            record["raw_bytes"] += lane["bytes"]
+            record["marked_entries"] += len(ordinals)
+            record["marked_words"] += sum(lane["tensors"][i]["count"] for i in ordinals)
+            record["status_acks"] += 1
+            record["releases"] += 1
+
     def finalize(self, update: str, *, timeout: float) -> dict:
+        try:
+            return self._finalize(update, timeout=timeout)
+        except BaseException:
+            if self._target_requested:
+                self._target_failed = True
+            raise
+
+    def _finalize(self, update: str, *, timeout: float) -> dict:
+        if self._target_failed:
+            raise RuntimeError("Target shard publication has an ambiguous outcome")
         if update != self.version:
             raise ValueError("Final delta version differs from the active update")
         deadline = time.monotonic() + timeout
@@ -523,7 +857,17 @@ class WeightSyncProxy:
         self.ready(self.batch, timeout=remaining(deadline))
         control = dict(op="finalize", version=update, frames=self.batch)
         replies = self._commands(
-            [dict(op="export", round=self.batch, control=control, count=1)] * len(self.children), deadline=deadline
+            [
+                dict(
+                    op="export",
+                    round=self.batch,
+                    control=control,
+                    count=2 if self._target_requested else 1,
+                    **({"sentinel": True} if self._target_requested else {}),
+                )
+            ]
+            * len(self.children),
+            deadline=deadline,
         )
         self._request(
             "update_weights_from_tensor",
@@ -531,10 +875,24 @@ class WeightSyncProxy:
             deadline=deadline,
         )
         statuses = self._commands([dict(op="status", round=self.batch)] * len(self.children), deadline=deadline)
+        if self._target_requested:
+            if len(statuses) != 4 or any(
+                len(r["full_required"]) != 2
+                or r["full_required"][0] not in (0, 1)
+                or r["full_required"][1] not in (0, 1, 2)
+                for r in statuses
+            ):
+                self._target_failed = True
+                raise RuntimeError("Incomplete target shard final acknowledgement")
+            capable = all(r["full_required"][0] == 0 and r["full_required"][1] in (1, 2) for r in statuses)
+            self._ordered_capable = all(r["full_required"] == [0, 2] for r in statuses)
         self._commands([dict(op="release", round=self.batch, consumed=True)] * len(self.children), deadline=deadline)
         self._request("update_weight_version", dict(new_version=update, abort_all_requests=False), deadline=deadline)
+        if self._target_requested:
+            self._target_capable = capable
         return dict(
             success=True,
+            **({"target_shard_capable": self._target_capable} if self._target_requested else {}),
             force_full_seed=any(reply["full_required"][0] for reply in statuses),
             metrics=dict(self.metrics),
             proxies=self.identities,

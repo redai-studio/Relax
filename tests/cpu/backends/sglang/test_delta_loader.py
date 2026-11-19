@@ -182,3 +182,110 @@ def test_unknown_full_loader_buffer_side_effect_runs_once_and_cache_stays_ordina
     assert int(model.loads) == 1
     assert type(model.cached) is torch.Tensor
     assert float(model.cached.sum()) == 6
+
+
+def zipped_control(data):
+    import base64
+    import hashlib
+    import zlib
+
+    return dict(
+        op="consume",
+        version="1",
+        frame=0,
+        metadata_id=hashlib.sha256(data).hexdigest(),
+        metadata_zlib={"bytes": len(data), "data": base64.b64encode(zlib.compress(data)).decode("ascii")},
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "sha",
+        "truncated",
+        "trailing",
+        "concatenated",
+        "size",
+        "bomb",
+        "too-big",
+        "negative",
+        "non-ascii",
+        "schema",
+        "bad-base64",
+        "excess-base64",
+        "mixed",
+        "staged",
+    ],
+)
+def test_invalid_inline_directory_fails_before_writes_and_cannot_replay(kind):
+    import base64
+    import zlib
+
+    model = TinyModel(torch.bfloat16)
+    begin(model, "0", seed=True)
+    frame(model, torch.ones(4, dtype=torch.bfloat16))
+    control(model, op="finalize", frames=1)
+    begin(model, "1", base="0")
+    metadata, raw = encode(
+        [
+            (
+                "weight",
+                (2, 2),
+                torch.bfloat16,
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([-32768], dtype=torch.int16).view(torch.bfloat16),
+            )
+        ],
+        max_bytes=1024,
+    )
+    data = json.dumps(metadata, separators=(",", ":")).encode("ascii")
+    original = zipped_control(data)
+    candidate = zipped_control(data)
+    packed = candidate["metadata_zlib"]
+    if kind in ("truncated", "trailing", "concatenated"):
+        blob = base64.b64decode(packed["data"])
+        packed["data"] = base64.b64encode(
+            {"truncated": blob[:-1], "trailing": blob + b"junk", "concatenated": blob + blob}[kind]
+        ).decode()
+    elif kind == "sha":
+        candidate["metadata_id"] = "0" * 64
+    elif kind == "bomb":
+        packed.update(bytes=32, data=base64.b64encode(zlib.compress(b"x" * (1 << 20))).decode())
+    elif kind in ("size", "too-big", "negative"):
+        packed["bytes"] = {"size": len(data) + 1, "too-big": (16 << 20) + 1, "negative": -1}[kind]
+    elif kind == "non-ascii":
+        candidate = zipped_control(b'"\xff"')
+    elif kind == "schema":
+        candidate = zipped_control(b'{"format":1,"bytes":1,"tensors":[]}')
+    elif kind == "mixed":
+        candidate["metadata"] = metadata
+    elif kind == "staged":
+        control(
+            model, op="document", kind="frame", id=original["metadata_id"], index=0, count=2, data=data[:10].decode()
+        )
+    else:
+        packed["data"] = "?" if kind == "bad-base64" else "A" * 65537
+    before = model.weight.detach().clone()
+    status = torch.full((1,), 73, dtype=torch.uint8)
+    with pytest.raises(ValueError):
+        load_delta_weights(model, [(json.dumps(candidate), raw), ("__delta_capability__", status)])
+    assert torch.equal(model.weight, before) and status.tolist() == [73]
+    assert model._relax_delta_receiver.version == "0"
+    with pytest.raises(RuntimeError, match="failed update"):
+        load_delta_weights(model, [(json.dumps(original), raw), ("__delta_capability__", status)])
+    assert torch.equal(model.weight, before) and status.tolist() == [73]
+
+
+def test_inline_consume_rejects_duplicate_frame_in_source_order():
+    model = TinyModel(torch.float32)
+    metadata, raw = encode(
+        [("weight", (2, 2), torch.float32, None, torch.arange(4, dtype=torch.float32))], max_bytes=1024
+    )
+    begin(model, "1", seed=True)
+    ctl = zipped_control(json.dumps(metadata, separators=(",", ":")).encode("ascii"))
+    weights = [(json.dumps(ctl), raw), ("__delta_capability__", torch.zeros(1, dtype=torch.uint8))]
+    load_delta_weights(model, weights)
+    before = model.weight.detach().clone()
+    with pytest.raises(ValueError, match="once in source order"):
+        load_delta_weights(model, weights)
+    assert torch.equal(before, model.weight)
