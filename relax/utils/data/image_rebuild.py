@@ -15,6 +15,7 @@ from relax.utils.data.image_refs import (
     validate_image_ref_descriptor,
 )
 from relax.utils.data.kimi_k3 import build_kimi_k3_image_features
+from relax.utils.data.minimax import is_minimax_processor
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.image_utils import load_image
 
@@ -69,9 +70,8 @@ def build_hf_image_features(processor: Any, images: list[Image.Image]) -> dict[s
     pixel_values = features["pixel_values"]
     if isinstance(pixel_values, np.ndarray):
         pixel_values = torch.from_numpy(pixel_values)
-    if pixel_values.dtype == torch.float32:
-        # Same rule as _BF16_DOWNCAST_KEYS and the K3 rebuild: downstream casts
-        # the encoder input to the vision tower's weight dtype.
+    if pixel_values.dtype == torch.float32 and not is_minimax_processor(processor):
+        # Match the producer, which preserves FP32 for MiniMax's patch embed.
         pixel_values = pixel_values.to(torch.bfloat16)
     return {
         "pixel_values": pixel_values.contiguous(),
@@ -95,11 +95,11 @@ def build_image_features_in_worker(descriptor: dict) -> tuple[dict[str, torch.Te
     reads the referenced image files from shared storage and applies the pixel
     pipeline named by the descriptor's ``kind``, so the rebuild input matches
     the producer exactly (same numpy normalization, same resize limits, same
-    BF16 rule). The producer's ``pixel_values`` are never shipped in this mode,
+    dtype rule). The producer's ``pixel_values`` are never shipped in this mode,
     so both sides must normalize identically.
 
     Returns:
-        (features, timings) where features holds ``pixel_values`` (bf16, shared
+        (features, timings) where features holds ``pixel_values`` (shared
         memory) and ``image_grid_thw``, and timings splits file read from
         processor work for the ``sft_rank_image_*`` metrics.
 

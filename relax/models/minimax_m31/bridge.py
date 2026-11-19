@@ -18,6 +18,8 @@ from megatron.bridge.models.minimax_m3.modeling_minimax_m3_vl import MiniMaxM3VL
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
+from .vlm import MiniMaxM31VLModel
+
 
 def _get_msa_config(config: Any) -> dict[str, Any] | None:
     text_config = getattr(config, "text_config", None)
@@ -35,11 +37,14 @@ def _get_msa_config(config: Any) -> dict[str, Any] | None:
 @dataclass
 class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
     msa_config: dict[str, Any] = field(default_factory=dict)
-    relax_minimax_text_sft: bool = field(default=True, init=False)
+    relax_minimax_external_sft_loss: bool = field(default=True, init=False)
 
     def configure_runtime(self, args: Namespace) -> None:
-        if args.loss_type != "sft" or args.lora_rank <= 0 or args.multimodal_keys:
-            raise ValueError("MiniMax-M3.1-Flash requires text-only LoRA SFT.")
+        if args.loss_type != "sft" or args.lora_rank <= 0:
+            raise ValueError("MiniMax-M3.1-Flash requires LoRA SFT.")
+        if set(args.multimodal_keys or ()) - {"image", "video"}:
+            raise ValueError("MiniMax-M3.1-Flash supports image and video inputs, with text outputs.")
+        args.multimodal_host_grid_keys = ("image_grid_thw", "video_grid_thw")
         if args.context_parallel_size != 1 or args.pipeline_model_parallel_size != 1 or args.dynamic_context_parallel:
             raise ValueError("MiniMax-M3.1-Flash requires PP=CP=1 and static context parallelism.")
         if args.qkv_format != "thd" or args.allgather_cp:
@@ -48,6 +53,23 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
             raise ValueError("MiniMax-M3.1-Flash supports tensor parallel sizes 1, 2, and 4.")
         if args.apply_rope_fusion:
             raise ValueError("MiniMax-M3.1-Flash requires --no-rope-fusion.")
+
+    def provide(
+        self, pre_process: bool | None = None, post_process: bool | None = None, vp_stage: int | None = None
+    ) -> MiniMaxM31VLModel:
+        model = MiniMaxM31VLModel(
+            self,
+            pre_process=pre_process is not False,
+            post_process=post_process is not False,
+            vp_stage=vp_stage,
+        )
+        if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
+            model.freeze(
+                freeze_language_model=self.freeze_language_model,
+                freeze_vision_model=self.freeze_vision_model,
+                freeze_vision_projection=self.freeze_vision_projection,
+            )
+        return model
 
 
 def minimax_m31_block_spec(config: MiniMaxM31ModelProvider, **kwargs: Any) -> TransformerBlockSubmodules:

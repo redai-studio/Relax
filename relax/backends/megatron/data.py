@@ -840,6 +840,7 @@ def get_batch(
         multimodal_num_items = {}  # key -> list of item counts per sequence
         tensor_dict_list = {}
         input_key_map = getattr(get_args(), "multimodal_input_key_map", {})
+        host_grid_keys = getattr(get_args(), "multimodal_host_grid_keys", ())
 
         for mm_input_dict in multimodal_train_inputs:
             if mm_input_dict is None:
@@ -853,7 +854,14 @@ def get_batch(
                 tensor_dict_list.setdefault(mapped_key, []).append(mm_tensor)
 
         for key, tensor_list in tensor_dict_list.items():
-            if key in PAD_RULES:
+            if key in host_grid_keys:
+                if any(tensor.device.type != "cpu" for tensor in tensor_list):
+                    raise ValueError(f"Multimodal host grid {key!r} must be collated on CPU.")
+                # Keep the per-sample grouping so the vision tower can isolate
+                # packed documents without copying grid metadata back from CUDA.
+                multimodal_data[key] = [tensor.tolist() for tensor in tensor_list]
+                multimodal_num_items[key] = [tensor.shape[0] for tensor in tensor_list]
+            elif key in PAD_RULES:
                 multimodal_data[key], multimodal_num_items[key] = pad_and_flatten(
                     tensor_list,
                     **PAD_RULES[key],

@@ -5,7 +5,9 @@
 # Prepare it from a local copy of the official checkpoint:
 # python scripts/tools/convert_minimax_m3_to_bf16.py --model-dir "$MODEL_DIR/MiniMax-M3.1-Flash" \
 #   --layers 0,1,3,4 --save-dir "$MODEL_DIR/MiniMax-M3.1-Flash-4L-BF16" --device cpu
-# Provide "$DATA_DIR/minimax-m3.1-flash-sft.jsonl" with text-only messages.
+# Provide "$DATA_DIR/minimax-m3.1-flash-sft.jsonl" with messages.
+# For image/video training, set MULTIMODAL_KEYS='{"image":"images","video":"videos"}'.
+# Use <image>/<video> in messages and put the matching media paths in those fields.
 # Launch through scripts/entrypoint/ray-job.sh on a running 2x8 GPU Ray cluster.
 set -eo pipefail
 
@@ -20,7 +22,12 @@ fi
 : "${SAVE_DIR:?Set SAVE_DIR to the shared checkpoint root}"
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs dashboard HTTP address}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
-EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-lora-16xgpu}"
+MULTIMODAL_KEYS="${MULTIMODAL_KEYS:-}"
+if [[ -n "$MULTIMODAL_KEYS" ]]; then
+    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-vl-lora-16xgpu}"
+else
+    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-lora-16xgpu}"
+fi
 TRAIN_STEPS="${TRAIN_STEPS:-2}"
 now="$(date +%Y%m%d-%H%M%S)"
 SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}}"
@@ -57,6 +64,11 @@ SFT_ARGS=(
    --max-tokens-per-gpu 4096
    --calculate-per-token-loss
 )
+if [[ -n "$MULTIMODAL_KEYS" ]]; then
+    SFT_ARGS+=(
+        --multimodal-keys "$MULTIMODAL_KEYS"
+    )
+fi
 PARALLEL_ARGS=(
    --tensor-model-parallel-size 2
    --pipeline-model-parallel-size 1

@@ -36,6 +36,7 @@ from relax.utils.data.kimi_k3 import (
     is_kimi_k3_tokenizer,
     make_kimi_k3_sft_request,
 )
+from relax.utils.data.minimax import MiniMaxMediaTokens, align_minimax_loss_mask
 from relax.utils.data.streaming_dataset import CompositeStreamingReader, IndexManager, PrefetchBuffer, StreamingReader
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -642,6 +643,10 @@ class SFTStreamingDataset:
         self.source_name = source_name
         self.require_response = require_response and training_mode != "cpt"
         self._pad_token_ids: frozenset[int] = frozenset(pad_token_ids or ())
+        self._minimax_media_tokens = MiniMaxMediaTokens.from_tokenizer(tokenizer) if multimodal_keys else None
+        if self._minimax_media_tokens is not None:
+            # MiniMax's released config uses image_token_index/video_token_index.
+            self._pad_token_ids |= {self._minimax_media_tokens.image, self._minimax_media_tokens.video}
         # Forwarded into tokenizer.apply_chat_template() via render_with_loss_mask
         # / render_to_text. Lets callers (and per-sample metadata) override the
         # tokenizer's bound chat_template — needed for models whose native
@@ -1211,6 +1216,15 @@ class SFTStreamingDataset:
             loss_mask = _to_long_tensor(precomputed_mask)
             if loss_mask.shape != tokens.shape:
                 raise ValueError("Kimi K3 processor loss mask must match the expanded token sequence.")
+        elif self._minimax_media_tokens is not None:
+            loss_mask = align_minimax_loss_mask(
+                tokenizer=self.tokenizer,
+                text=rendered.rendered_text or "",
+                short_ids=rendered.short_ids,
+                short_mask=rendered.short_mask,
+                expanded_ids=tokens,
+                video_grids=(mm_inputs or {}).get("video_grid_thw"),
+            )
         else:
             loss_mask = _expand_loss_mask_via_alignment(
                 short_ids=rendered.short_ids,

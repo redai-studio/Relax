@@ -30,6 +30,7 @@ from PIL import Image
 
 from relax.utils.data.image_refs import SFT_HF_IMAGE_REBUILD_SUPPORTED
 from relax.utils.data.kimi_k3 import KIMI_K3_SFT_REQUEST, process_kimi_k3_sft_images
+from relax.utils.data.minimax import is_minimax_processor
 from relax.utils.data.processing_utils import (
     adapt_processor_kwargs,
     expand_kimi_k25_placeholders,
@@ -306,6 +307,8 @@ def process_sample_in_worker(
         if isinstance(prompt_ids, torch.Tensor):
             prompt_ids = prompt_ids.tolist()
 
+        # MiniMax's pretrained patch projection is FP32, including in BF16 runs.
+        minimax_pixels = is_minimax_processor(_worker_processor)
         mm_train_inputs = {}
         for k, v in processor_output.items():
             if k in ("input_ids", "attention_mask"):
@@ -321,7 +324,7 @@ def process_sample_in_worker(
                 # full precision and would be silently corrupted (e.g. Qwen3-Omni's
                 # `video_second_per_grid` drives mrope position IDs; bf16 rounding
                 # there drifts them irrecoverably).
-                if k in _BF16_DOWNCAST_KEYS and v.dtype == torch.float32:
+                if k in _BF16_DOWNCAST_KEYS and v.dtype == torch.float32 and not minimax_pixels:
                     v = v.to(torch.bfloat16)
                 # Place in shared memory for zero-copy return via fd-based IPC.
                 # contiguous() is required: share_memory_() does not support non-contiguous storage.
