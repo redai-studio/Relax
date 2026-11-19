@@ -704,15 +704,18 @@ ray job submit -- python3 relax/entrypoints/train.py \
 #### 基线节点组亲和性
 
 启用 autoscaler 配置后，Relax 会将 actor、critic、reference、rollout-seed 和 colocate 的基线 placement group
-固定到初始节点组，弹性 rollout 引擎不受此约束。节点组前缀由 `RELAX_INITIAL_NODE_GROUP` 设置，默认为
+固定到初始节点组。节点组前缀由 `RELAX_INITIAL_NODE_GROUP` 设置，默认为
 `stable`；集群必须发布对应的 `<prefix>_gpu` 和 `<prefix>_cpu` Ray 自定义资源。例如设置
 `RELAX_INITIAL_NODE_GROUP=baseline` 时，需要提供 `baseline_gpu` 和 `baseline_cpu`。任一标记资源不可用时
 Relax 会快速失败；没有标记资源的集群可通过 `--no-enable-affinity` 关闭该约束。
 
-该 affinity 的作用是把固定训练基线放到平台定义的稳定、不可抢占 worker group。为弹性 Rollout Engine
-创建的 Placement Group 不申请节点组标记资源，因此可以使用任意满足条件的容量，也可能被调度到可抢占
-worker。这个环境变量只负责选择固定基线所在的节点组，并不会让该节点组自动具备不可抢占性；节点组的
-可用性、稳定性和抢占策略需要由 Ray 集群、Kubernetes 配置或外部资源平台保障。
+#### 扩容节点组亲和性
+
+启用基线亲和性的任务会给新增 rollout engine 的每个 PG bundle 额外请求 `elastic_gpu: 1`。
+`RELAX_ELASTIC_NODE_GROUP` 可覆盖 `elastic` 前缀。目标组需在 Ray 的 Worker Group 配置中声明对应的
+`<prefix>_gpu`，配置从 0 个副本起扩时也需要声明。关闭基线亲和性或手动扩容的任务，可以显式设置
+`RELAX_ELASTIC_NODE_GROUP=elastic` 单独启用扩容定向。没有启用此约束时，扩容 PG 可使用任意满足条件的容量。
+节点组的可用性、稳定性和抢占策略由 Ray 集群、Kubernetes 配置或外部资源平台保障。
 
 #### 配置文件格式
 
