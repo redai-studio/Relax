@@ -3,7 +3,7 @@
 
 # Four-layer text SFT on a converted MiMo-V2.6-Flash checkpoint.
 # Default layout: one 8-GPU node, TP4, PP1 and EP4.
-# Usage: bash run-mimo-v2.6-flash-sft.sh BF16_CHECKPOINT MESSAGES_JSONL SAVE_DIR [train args...]
+# Usage: bash run-mimo-v2.6-flash-sft-4layer-8xgpu.sh BF16_CHECKPOINT MESSAGES_JSONL SAVE_DIR [train args...]
 set -eo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
