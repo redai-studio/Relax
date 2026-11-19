@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 # Four-layer text SFT on a converted MiMo-V2.6-Flash checkpoint.
-# Default layout: one 8-GPU node, TP2, PP2 and EP2.
+# Default layout: one 8-GPU node, TP4, PP1 and EP4.
 # Usage: bash run-mimo-v2.6-flash-sft.sh BF16_CHECKPOINT MESSAGES_JSONL SAVE_DIR [train args...]
 set -eo pipefail
 
@@ -20,9 +20,9 @@ fi
 
 NODES=${NODES:-1}
 NUM_GPUS=${GPUS_PER_NODE:-${NUM_GPUS:-8}}
-TP=${TP:-2}
-PP=${PP:-2}
-EP=${EP:-2}
+TP=${TP:-4}
+PP=${PP:-1}
+EP=${EP:-4}
 
 CKPT_ARGS=(
     --hf-checkpoint "$HF_CHECKPOINT"
@@ -35,14 +35,12 @@ SFT_ARGS=(
     --loss-type sft
     --prompt-data "$PROMPT_DATA"
     --input-key messages
-    --num-rollout "${STEPS:-4}"
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-16}"
+    --num-rollout "${STEPS:-1}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-2}"
     --qkv-format thd
     --use-dynamic-batch-size
-    --calculate-per-token-loss
-    --rollout-shuffle
-    --seq-length "${SEQ_LENGTH:-4096}"
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-9216}"
+    --seq-length "${SEQ_LENGTH:-1024}"
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-1024}"
     --sft-max-in-flight-steps 1
     --num-data-storage-units 1
 )
@@ -52,9 +50,6 @@ PERF_ARGS=(
     --expert-model-parallel-size "$EP"
     --expert-tensor-parallel-size 1
     --context-parallel-size 1
-    --recompute-granularity full
-    --recompute-method uniform
-    --recompute-num-layers 1
     --attention-backend fused
     --attention-softmax-in-fp32
 )
@@ -63,11 +58,14 @@ if (( TP > 1 )); then
 fi
 OPTIMIZER_ARGS=(
     --optimizer adam
-    --lr 1e-6
+    --lr 1e-5
     --lr-decay-style constant
-    --weight-decay 0.1
+    --weight-decay 0.01
     --adam-beta1 0.9
-    --adam-beta2 0.98
+    --adam-beta2 0.999
+    --optimizer-cpu-offload
+    --optimizer-offload-fraction 1.0
+    --use-precision-aware-optimizer
     --accumulate-allreduce-grads-in-fp32
 )
 TRAIN_CMD=(
