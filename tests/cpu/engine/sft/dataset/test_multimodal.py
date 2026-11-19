@@ -21,6 +21,7 @@ from relax.engine.sft.dataset.sample import (
     CanonicalMessage,
     CanonicalSample,
 )
+from relax.utils.data.deepseek_v41 import expand_sft_mask
 from relax.utils.data.processor_pool import MediaLoadError, _load_media_for_worker
 
 
@@ -63,6 +64,17 @@ def test_has_multimodal_content_text_only():
 
 def test_has_multimodal_content_image():
     assert has_multimodal_content(_image_sample()) is True
+
+
+def test_deepseek_v41_adjacent_images_preserve_assistant_supervision():
+    # Each image includes its own start/newline/end positions, all using the same token ID.
+    compact = torch.tensor([10, 42, 42, 11, 12])
+    expanded = torch.tensor([10, 42, 42, 42, 42, 42, 11, 12])
+    spans = torch.tensor([[1, 2], [3, 3]])
+    mask = expand_sft_mask(compact, torch.tensor([0, 0, 0, 1, 1]), expanded, spans)
+    assert expanded[mask.bool()].tolist() == [11, 12]
+    with pytest.raises(ValueError, match="assistant supervision"):
+        expand_sft_mask(compact, torch.tensor([0, 0, 1, 1, 1]), expanded, spans)
 
 
 def test_preprocess_text_only_returns_none():

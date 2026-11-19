@@ -19,6 +19,7 @@ from torch.distributed.checkpoint import save
 
 from relax.backends.megatron import checkpoint_metadata, compat
 from relax.engine.sft.runtime import is_rm_mode
+from relax.utils.deepseek_v41_assets import FROZEN_BASE_RECORD, check_frozen_base
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import is_model_source_alias
 
@@ -33,6 +34,7 @@ def _load_checkpoint_module():
     names = {
         "_resolve_checkpoint_iteration_dir",
         "_checkpoint_load_state",
+        "_v41_multimodal_base",
         "load_checkpoint",
         "is_megatron_checkpoint",
         "_is_hf_checkpoint",
@@ -51,6 +53,8 @@ def _load_checkpoint_module():
     module.__dict__.update(
         Namespace=Namespace,
         Path=Path,
+        FROZEN_BASE_RECORD=FROZEN_BASE_RECORD,
+        check_frozen_base=check_frozen_base,
         os=os,
         re=re,
         nullcontext=nullcontext,

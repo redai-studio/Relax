@@ -3,7 +3,7 @@
 # Adapted from Miles (Apache-2.0):
 # https://github.com/radixark/miles/blob/6f52e0b3021484e8d6ad0d43c1074100adc8e4b9/tools/convert_deepseek_v4_1_to_bf16.py
 
-"""Prepare text-only V4.1 BF16 HF weights, preserving frozen Engram bytes.
+"""Prepare V4.1 BF16 HF weights, optionally retaining the native vision branch.
 
 Process one tensor at a time; raw tensors (including the large Engram tables)
 are streamed without loading them into Torch. No Miles or GPU dependency.
@@ -17,9 +17,16 @@ import json
 import math
 import shutil
 import struct
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 
+from relax.utils.deepseek_v41_assets import (
+    NATIVE_VISION_FILES,
+    validate_vision_entry,
+    validate_vision_files,
+    vision_tensor_shapes,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -46,7 +53,9 @@ def read_header(path: Path) -> tuple[dict[str, Any], int]:
     return header, size + 8
 
 
-def convert_config(config: dict[str, Any]) -> dict[str, Any]:
+def convert_config(
+    config: dict[str, Any], *, keep_vision: bool = False, decoder_layers: int | None = None
+) -> dict[str, Any]:
     if config.get("model_type") != "deepseek_v41" or not config.get("text_config"):
         raise ValueError("Expected an original V4.1 composite checkpoint with text_config.")
     quant = config.get("quantization_config", {})
@@ -54,6 +63,27 @@ def convert_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Expected FP8 dense + FP4 experts with UE8M0 scales.")
     if quant.get("weight_block_size") != [32, 32]:
         raise ValueError("Only the V4.1 32x32 FP8 block format is supported.")
+    if decoder_layers is not None and (
+        not keep_vision or not 1 <= decoder_layers <= config["text_config"]["num_hidden_layers"]
+    ):
+        raise ValueError("--decoder-layers requires --keep-vision and a nonempty prefix within the original decoder.")
+    if keep_vision:
+        if not config.get("vision_config"):
+            raise ValueError("--keep-vision requires the original composite vision_config.")
+        text = {k: v for k, v in config["text_config"].items() if not k.startswith("dspark_")}
+        text.pop("quantization_config", None)
+        text["num_nextn_predict_layers"] = 0
+        if decoder_layers is not None:
+            text["num_hidden_layers"] = decoder_layers
+            for field in ("kv_source_layer_ids", "index_source_layer_ids"):
+                text[field] = [i for i in text[field] if i < decoder_layers]
+            if text["candidate_source_layer_id"] >= decoder_layers:
+                text["candidate_source_layer_id"] = -1
+            engrams = dict(zip(text["engram_layer_ids"], text["engram_num_embeddings"], strict=True))
+            text["engram_layer_ids"] = [i for i in engrams if i < decoder_layers]
+            text["engram_num_embeddings"] = [engrams[i] for i in text["engram_layer_ids"]]
+        text["compress_ratios"] = text["compress_ratios"][: text["num_hidden_layers"]]
+        return {**{k: v for k, v in config.items() if k != "quantization_config"}, "text_config": text}
     text = {k: v for k, v in config["text_config"].items() if k != "model_type" and not k.startswith("dspark_")}
     text.update({k: v for k, v in config.items() if k not in ("text_config", "vision_config", "quantization_config")})
     text.pop("quantization_config", None)
@@ -84,9 +114,16 @@ def converted_entry(name: str, entry: dict[str, Any]) -> dict[str, Any]:
     return {"dtype": dtype, "shape": shape}
 
 
-def plan_conversion(src: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def plan_conversion(
+    src: Path, *, keep_vision: bool = False, decoder_layers: int | None = None
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Inspect all headers, scales and indexed tensors before writing anything."""
-    config = convert_config(json.loads((src / "config.json").read_text()))
+    config = convert_config(
+        json.loads((src / "config.json").read_text()), keep_vision=keep_vision, decoder_layers=decoder_layers
+    )
+    visual = vision_tensor_shapes(config) if keep_vision else {}
+    if keep_vision:
+        validate_vision_files(src)
     weight_map = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
     shards, output, all_entries = {}, {}, {}
     for filename in sorted(set(weight_map.values())):
@@ -106,7 +143,15 @@ def plan_conversion(src: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str
     if all_entries.keys() != weight_map.keys():
         raise ValueError("Source index and shard tensors differ.")
     for name, entry in all_entries.items():
-        if not kept(name):
+        if decoder_layers is not None and name.startswith("layers."):
+            _, layer, _ = name.split(".", 2)
+            if int(layer) >= decoder_layers:
+                continue
+        if name in visual:
+            validate_vision_entry(name, entry, visual[name])
+        elif keep_vision and name.startswith(("vision.", "aligner.", "image_")):
+            raise ValueError(f"Unrecognized native vision tensor: {name}")
+        elif not kept(name):
             continue
         if name.endswith(".scale") and not name.endswith(RAW_SUFFIXES):
             weight = all_entries.get(name.removesuffix("scale") + "weight", {})
@@ -126,14 +171,17 @@ def plan_conversion(src: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str
                 raise ValueError(f"Missing or incompatible scale: {name}: {scale}")
         output.setdefault(weight_map[name], {})[name] = converted
     names = {name for entries in output.values() for name in entries}
+    if missing := visual.keys() - names:
+        raise ValueError(f"Missing native vision tensors: {sorted(missing)[:5]}")
+    text = config.get("text_config", config)
     required = {"embed.weight", "head.weight", "norm.weight"}
-    for layer in range(config["num_hidden_layers"]):
+    for layer in range(text["num_hidden_layers"]):
         required.update(
-            f"layers.{layer}.ffn.experts.{e}.w{i}.weight" for e in range(config["n_routed_experts"]) for i in (1, 2, 3)
+            f"layers.{layer}.ffn.experts.{e}.w{i}.weight" for e in range(text["n_routed_experts"]) for i in (1, 2, 3)
         )
         required.update(f"layers.{layer}.attn.{proj}.weight" for proj in ("wq_a", "wkv", "wo_a", "wo_b"))
         required.add(f"layers.{layer}.ffn.gate.weight")
-    for layer in config["engram_layer_ids"]:
+    for layer in text["engram_layer_ids"]:
         required.update(f"layers.{layer}.engram.{suffix}" for suffix in ("embed.weight", "embed.scale", "wkv.weight"))
     if missing := required - names:
         raise ValueError(f"Source is missing required text weights: {sorted(missing)[:5]}")
@@ -235,21 +283,66 @@ def convert_shard(
     pending.replace(dst / filename)
 
 
-def convert(src: Path, dst: Path, *, device: str = "cpu", resume: bool = False, check_only: bool = False) -> None:
+def convert(
+    src: Path,
+    dst: Path,
+    *,
+    device: str = "cpu",
+    resume: bool = False,
+    check_only: bool = False,
+    keep_vision: bool = False,
+    decoder_layers: int | None = None,
+) -> None:
     src, dst = src.resolve(), dst.resolve()
     if src == dst or src in dst.parents or dst in src.parents:
         raise ValueError("Source and destination must be separate directories, not nested.")
-    config, shards, output = plan_conversion(src)
+    config, shards, output = plan_conversion(src, keep_vision=keep_vision, decoder_layers=decoder_layers)
     total_size = sum(output_header(entries)[1] for entries in output.values())
     logger.info(
         "Planned %d tensors in %d shards, %.2f GB", sum(map(len, output.values())), len(output), total_size / 1e9
     )
+    if keep_vision:
+        dtypes = Counter(entry["dtype"] for shard in output.values() for entry in shard.values())
+        logger.info(
+            "Native frozen vision tensors including router biases: %d; planned dtypes: %s",
+            len(vision_tensor_shapes(config)),
+            dict(dtypes),
+        )
     if check_only:
         return
     source_map = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
     identity = {"source": str(src), "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     for filename in ("config.json", "model.safetensors.index.json"):
         identity[filename + "_sha256"] = hashlib.sha256((src / filename).read_bytes()).hexdigest()
+    assets = [
+        path.relative_to(src)
+        for pattern in (
+            "tokenizer*",
+            "chat_template*",
+            "generation_config.json",
+            "special_tokens_map.json",
+            "LICENSE*",
+        )
+        for path in src.glob(pattern)
+        if path.is_file()
+    ]
+    if keep_vision:
+        assets.extend(map(Path, NATIVE_VISION_FILES))
+        identity["mode"] = "frozen_vision"
+        identity["decoder_layers"] = decoder_layers
+        identity["assets_sha256"] = {str(p): hashlib.sha256((src / p).read_bytes()).hexdigest() for p in assets}
+        # HF --local-dir writes revision and content etag into the first two metadata lines.
+        # Also detect replacement of a shard in a manually prepared source directory.
+        source_shards = {}
+        for filename in shards:
+            shard = (src / filename).stat()
+            meta = src / ".cache/huggingface/download" / (filename + ".metadata")
+            source_shards[filename] = [
+                shard.st_size,
+                shard.st_mtime_ns,
+                meta.read_text().splitlines()[:2] if meta.is_file() else None,
+            ]
+        identity["source_shards"] = source_shards
     marker = dst / "conversion.json"
     if dst.exists() and any(dst.iterdir()):
         if not resume or not marker.is_file() or json.loads(marker.read_text()).get("source_identity") != identity:
@@ -270,10 +363,9 @@ def convert(src: Path, dst: Path, *, device: str = "cpu", resume: bool = False, 
         convert_shard(src, dst, filename, shards, entries, source_map, device)
     if {path.name for path in dst.glob("*.safetensors")} != output.keys():
         raise ValueError("Unexpected output shards; use a clean destination.")
-    for pattern in ("tokenizer*", "chat_template*", "generation_config.json", "special_tokens_map.json", "LICENSE*"):
-        for path in src.glob(pattern):
-            if path.is_file():
-                shutil.copy2(path, dst / path.name)
+    for asset in assets:
+        (dst / asset).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src / asset, dst / asset)
     write_json(dst / "config.json", config)
     index = {
         "metadata": {"total_size": total_size},
@@ -296,8 +388,26 @@ def main() -> None:
     parser.add_argument(
         "--check-only", action="store_true", help="Check source headers and estimate output bytes; no writes."
     )
+    parser.add_argument(
+        "--keep-vision",
+        action="store_true",
+        help="Retain native vision weights, image router biases, renderer and processor in a composite BF16 model.",
+    )
+    parser.add_argument(
+        "--decoder-layers",
+        type=int,
+        help="Keep this contiguous decoder prefix for a smaller multimodal test model. Retain original layer IDs, expert counts and frozen tables.",
+    )
     args = parser.parse_args()
-    convert(args.model_dir, args.save_dir, device=args.device, resume=args.resume, check_only=args.check_only)
+    convert(
+        args.model_dir,
+        args.save_dir,
+        device=args.device,
+        resume=args.resume,
+        check_only=args.check_only,
+        keep_vision=args.keep_vision,
+        decoder_layers=args.decoder_layers,
+    )
 
 
 if __name__ == "__main__":

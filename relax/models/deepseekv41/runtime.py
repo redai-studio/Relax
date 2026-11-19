@@ -131,7 +131,8 @@ class V41CarryPlan:
         )
         values = {
             "pre": layer_id >= 0,
-            "input_ids": bool(config.v41_engram_layer_ids) and layer_id < max(config.v41_engram_layer_ids),
+            "input_ids": (bool(config.v41_engram_layer_ids) and layer_id < max(config.v41_engram_layer_ids))
+            or (getattr(config, "relax_is_multimodal", False) and layer_id < config.num_layers - 1),
             "latent_keys": tuple(sorted(latent_keys)),
             "index_k_keys": tuple(sorted(index_k_keys)),
             "topk": next_layer < config.num_layers

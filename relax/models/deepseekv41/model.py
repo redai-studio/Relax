@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from copy import copy
+from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import torch
@@ -141,6 +144,13 @@ class V41TransformerLayer(HyperConnectionTransformerLayer):
                 hidden_states = self.v41_engram(
                     hidden_states, self.v41_runtime.input_ids, thd_layout=self.v41_runtime.thd_layout
                 )
+        if getattr(packed_seq_params, "v41_has_images", False):
+            ids = self.v41_runtime.input_ids
+            if self.config.sequence_parallel:
+                local = hidden_states.shape[0]
+                ids = ids.narrow(1, self.pg_collection.tp.rank() * local, local)
+            # Explicit arguments are retained by Core's MoE recomputation closure.
+            kwargs["input_ids"] = ids.transpose(0, 1).contiguous()
         output, context = super().forward(hidden_states, *args, **kwargs)
         if self.v41_is_last:
             output = v41_aggregate(output, self.v41_runtime.pre, self.config.num_residual_streams)
@@ -204,6 +214,12 @@ def get_v41_spec(
         config, vp_stage=vp_stage, pp_rank=pp_rank
     )
     for layer_spec in block_spec.layer_specs:
+        if getattr(config, "relax_is_multimodal", False):
+            from .router import V41VisionRouter
+
+            mlp = layer_spec.submodules.mlp
+            submodules = replace(mlp.keywords["submodules"], router=V41VisionRouter)
+            layer_spec.submodules.mlp = partial(mlp, submodules=submodules)
         layer_spec.module = V41TransformerLayer
         layer_spec.params = {**layer_spec.params, "runtime": runtime}
         layer_spec.submodules.self_attention = ModuleSpec(
@@ -272,6 +288,13 @@ class DeepSeekV41GPTModel(GPTModel):
             vp_stage=vp_stage,
             **kwargs,
         )
+        self.v41_frozen_vision = None
+        if pre_process and getattr(config, "relax_is_multimodal", False):
+            from .vision import FrozenVisionInput
+
+            self.v41_frozen_vision = FrozenVisionInput(
+                config.v41_hf_checkpoint, config.v41_hf_config["vision_config"], config.hidden_size
+            )
         _freeze_routers(self)
 
     def _get_transformer_block_class(self) -> type[TransformerBlock]:
@@ -287,6 +310,8 @@ class DeepSeekV41GPTModel(GPTModel):
             # The shared cache owns immutable CUDA frequency tables too; they
             # are cheaply rebuilt after wake and must not pin selective-offload memory.
             precompute_freqs_cis.cache_clear()
+            if getattr(self, "v41_frozen_vision", None) is not None:
+                self.v41_frozen_vision.release()
 
     def forward(
         self,
@@ -305,6 +330,9 @@ class DeepSeekV41GPTModel(GPTModel):
         padding_mask: torch.Tensor | None = None,
         output_processor: Any = None,
         output_processor_context: Any = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_hws: Sequence[tuple[int, int]] = (),
+        image_spans: Sequence[tuple[int, int]] = (),
     ) -> torch.Tensor:
         qkv_format = getattr(getattr(self, "config", None), "v41_qkv_format", "bshd")
         if (packed_seq_params is not None) != (qkv_format == "thd"):
@@ -317,6 +345,11 @@ class DeepSeekV41GPTModel(GPTModel):
             raise NotImplementedError(
                 "DeepSeek V4.1 uses built-in causal attention; explicit attention masks are unsupported."
             )
+        if image_spans or image_grid_hws or pixel_values is not None:
+            if not getattr(self.config, "relax_is_multimodal", False) or packed_seq_params is None:
+                raise ValueError("DeepSeek V4.1 image input requires a vision checkpoint and packed THD execution.")
+            if not image_spans or len(image_grid_hws) != len(image_spans):
+                raise ValueError("DeepSeek V4.1 image grids and spans must match.")
         self.v41_runtime.reset()
         self.v41_runtime.input_ids = input_ids
         try:
@@ -333,6 +366,27 @@ class DeepSeekV41GPTModel(GPTModel):
                 )
                 packed_seq_params.v41_thd_layout = layout
                 self.v41_runtime.thd_layout = layout
+                packed_seq_params.v41_has_images = bool(image_spans)
+                if image_spans and self.pre_process:
+                    from megatron.core import tensor_parallel
+
+                    if pixel_values is None or decoder_input is not None:
+                        raise ValueError("The first DeepSeek V4.1 stage needs pixels and token IDs for image spans.")
+                    decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+                    global_start = layout.global_start
+                    if self.config.sequence_parallel:
+                        if not self.embedding.scatter_to_sequence_parallel:
+                            decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                                decoder_input, group=self.pg_collection.tp
+                            )
+                        global_start += self.pg_collection.tp.rank() * decoder_input.shape[0]
+                        if padding_mask is not None:
+                            padding_mask = padding_mask.narrow(
+                                1, self.pg_collection.tp.rank() * decoder_input.shape[0], decoder_input.shape[0]
+                            ).contiguous()
+                    decoder_input = self.v41_frozen_vision.merge(
+                        decoder_input, pixel_values, image_grid_hws, image_spans, global_start
+                    )
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,

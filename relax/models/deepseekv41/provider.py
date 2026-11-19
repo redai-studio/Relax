@@ -36,6 +36,18 @@ class DeepSeekV41ModelProvider(MLAModelProvider):
     v41_qkv_format: str = "bshd"
     v41_allgather_cp: bool = False
 
+    @property
+    def relax_is_multimodal(self) -> bool:
+        return bool(self.v41_hf_config.get("vision_config"))
+
+    @property
+    def relax_uses_packed_multimodal_inputs(self) -> bool:
+        return self.relax_is_multimodal
+
+    @property
+    def v41_image_token_id(self) -> int | None:
+        return int(self.v41_hf_config["image_token_id"]) if self.relax_is_multimodal else None
+
     def finalize(self) -> None:
         relax_thd_cp = (
             self.v41_qkv_format == "thd"

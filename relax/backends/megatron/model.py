@@ -72,6 +72,7 @@ from .checkpoint import (
     save_checkpoint,
 )
 from .conditional_branch_sync import disable_frozen_conditional_branch_sync
+from .cp_utils import needs_unsplit_forward
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import (
@@ -1016,7 +1017,7 @@ def forward_only(
         # takes the image_grid_thw=None branch.
         mm_kwargs = batch.get("multimodal_train_inputs") or {}
         has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-        needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+        needs_unsplit = needs_unsplit_forward(args, has_mm_inputs)
 
         # Bridge Qwen3VLModel.forward (VL or text-only Qwen3.6) does CP+SP
         # splitting internally, so pass unsplit tokens.
@@ -1434,7 +1435,7 @@ def train_one_step(
                 )
         else:
             has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-            needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
+            needs_unsplit = needs_unsplit_forward(args, has_mm_inputs)
             use_unsplit = needs_unsplit and "unsplit_tokens" in batch
 
             forward_kwargs = {

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from argparse import Namespace
 from collections.abc import Callable
 
 import torch
@@ -117,6 +118,13 @@ def warmup_static_cp_forward_neighbor_p2p() -> None:
         pp_rank,
         cp_rank,
         cp_size,
+    )
+
+
+def needs_unsplit_forward(args: Namespace, has_mm_inputs: bool = False) -> bool:
+    """Whether the model packs its own VL inputs and splits them across CP ranks."""
+    return not getattr(args, "uses_packed_multimodal_inputs", False) and (
+        has_mm_inputs or getattr(args, "is_vl_model", False) or getattr(args, "uses_unsplit_forward", False)
     )
 
 

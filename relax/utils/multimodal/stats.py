@@ -52,7 +52,11 @@ def _audio_token_counts(mm_input: dict[str, Any]) -> list[int]:
 def get_multimodal_token_counts(multimodal_train_inputs: Any) -> dict[str, int]:
     counts = {"image": 0, "video": 0, "audio": 0}
     for mm_input in _iter_train_inputs(multimodal_train_inputs) or ():
-        counts["image"] += sum(_grid_token_counts(mm_input.get("image_grid_thw")))
+        spans = _to_list(mm_input.get("image_spans"))
+        if spans is not None:
+            counts["image"] += sum(length for _, length in spans)
+        else:
+            counts["image"] += sum(_grid_token_counts(mm_input.get("image_grid_thw")))
         counts["video"] += sum(_grid_token_counts(mm_input.get("video_grid_thw")))
         counts["audio"] += sum(_audio_token_counts(mm_input))
     counts["total"] = counts["image"] + counts["video"] + counts["audio"]
@@ -68,7 +72,7 @@ def count_images(multimodal_inputs: dict[str, Any] | None, multimodal_train_inpu
 
     image_count = 0
     for mm_input in _iter_train_inputs(multimodal_train_inputs) or ():
-        grid_thw = _to_list(mm_input.get("image_grid_thw"))
+        grid_thw = _to_list(mm_input.get("image_grid_thw", mm_input.get("image_grid_hws")))
         if grid_thw is not None:
             image_count += len(grid_thw)
     return image_count

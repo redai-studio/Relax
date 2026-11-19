@@ -656,9 +656,11 @@ def test_cpu_export_batching_respects_memory_budget(tmp_path: Path) -> None:
         shard_bytes=512,
         batch_bytes=1024**2,
         memory_budget=single["planned_buffer_bytes"],
+        prefetch_batches=8,
         dry_run=True,
     )
     assert bounded["planned_buffer_bytes"] <= single["planned_buffer_bytes"]
+    assert bounded["max_prefetched_batches"] < 8
     assert bounded["load_batches"] > combined["load_batches"]
     assert bounded["prefetched_batches"] < bounded["load_batches"] - 1
     serial = export_checkpoint(checkpoint, model, output, shard_bytes=512, read_workers=1, dry_run=True)
@@ -716,42 +718,70 @@ def test_cpu_batch_plan_recomputes_reader_workspace_when_combining_files() -> No
     assert all(sum(4 for _ in batch) + workspace(batch) <= 100 for batch in batches)
 
 
-@pytest.mark.parametrize("failure", [None, "load", "write"])
+def test_cpu_prefetch_budget_accounts_for_later_mapping_buffers() -> None:
+    # The first batch has room to start all three reads, but the next batch's
+    # mapping and shard-writing buffers leave room for just one pending reader.
+    current = [10, 82, 10, 10]
+    loads = [12, 18, 14, 16]
+    ends, peak = exporter._prefetch_plan(current, loads, depth=3, budget=100)
+    assert ends[0] <= 2
+    assert all(cost + sum(loads[i + 1 : max(ends[: i + 1]) + 1]) <= 100 for i, cost in enumerate(current))
+    assert peak <= 100
+
+
+@pytest.mark.parametrize("depth,failure", [(1, None), (4, None), (4, "load"), (4, "write")])
 @_cpu_only
 def test_cpu_export_prefetch_overlaps_and_joins_on_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, depth: int, failure: str | None
 ) -> None:
-    checkpoint, model, _ = _fixture(tmp_path)
-    output = tmp_path / "export"
-    second_started, appending = threading.Event(), threading.Event()
+    checkpoint, model, expected = _fixture(tmp_path)
+    reference, output = tmp_path / "serial", tmp_path / "export"
+    loads_started, appending, later_finished = threading.Event(), threading.Event(), threading.Event()
     lock = threading.Lock()
     original_load, original_add = exporter.load_slices, exporter.ShardWriter.add
-    calls = active = peak = 0
+    order: list[tuple[TensorSlice, ...]] = []
+
+    def record(reader: Any, items: tuple[TensorSlice, ...], metadata: Any) -> dict[str, torch.Tensor]:
+        order.append(items)
+        return original_load(reader, items, metadata)
+
+    monkeypatch.setattr(exporter, "load_slices", record)
+    export_checkpoint(checkpoint, model, reference, batch_bytes=1, shard_bytes=128, prefetch=False)
+    blocked = set(order[1 : 1 + min(depth, 2)])
+    active_readers: set[int] = set()
+    started = peak = 0
     first_append = True
 
-    def load(*args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
-        nonlocal calls, active, peak
+    def load(reader: Any, items: tuple[TensorSlice, ...], metadata: Any) -> dict[str, torch.Tensor]:
+        nonlocal started, peak
         with lock:
-            calls += 1
-            number = calls
-            active += 1
-            peak = max(peak, active)
+            assert id(reader) not in active_readers, "Concurrent loads shared a mutable DCP reader"
+            active_readers.add(id(reader))
+            peak = max(peak, len(active_readers))
+            if items in blocked:
+                started += 1
+                if started == len(blocked):
+                    loads_started.set()
         try:
-            if number == 2:
-                second_started.set()
+            if items in blocked:
                 assert appending.wait(10), "Prefetch did not overlap output processing"
+            if items == order[1]:
+                if depth > 1:
+                    assert later_finished.wait(10), "Later batch could not finish ahead of its predecessor"
                 if failure == "load":
                     raise OSError("prefetch failed")
-            return original_load(*args, **kwargs)
+            return original_load(reader, items, metadata)
         finally:
             with lock:
-                active -= 1
+                active_readers.remove(id(reader))
+            if items == order[2]:
+                later_finished.set()
 
     def add(self: exporter.ShardWriter, name: str, tensor: torch.Tensor) -> None:
         nonlocal first_append
         if first_append:
             first_append = False
-            assert second_started.wait(10), "Second batch was not prefetched"
+            assert loads_started.wait(10), "Requested batch reads did not overlap"
             appending.set()
             if failure == "write":
                 raise OSError("write failed")
@@ -759,15 +789,24 @@ def test_cpu_export_prefetch_overlaps_and_joins_on_failure(
 
     monkeypatch.setattr(exporter, "load_slices", load)
     monkeypatch.setattr(exporter.ShardWriter, "add", add)
+    options = {"batch_bytes": 1, "shard_bytes": 128, "prefetch_batches": depth}
     if failure:
         with pytest.raises(OSError, match="failed"):
-            export_checkpoint(checkpoint, model, output, batch_bytes=1, shard_bytes=512)
+            export_checkpoint(checkpoint, model, output, **options)
         assert not output.exists()
         assert not list(tmp_path.glob("export.incomplete-*/model.safetensors.index.json"))
     else:
-        result = export_checkpoint(checkpoint, model, output, batch_bytes=1, shard_bytes=512)
+        result = export_checkpoint(checkpoint, model, output, **options)
         assert result["prefetched_batches"] == result["load_batches"] - 1
-    assert active == 0 and peak == 1
+        assert result["max_prefetched_batches"] == depth
+        index = "model.safetensors.index.json"
+        assert (reference / index).read_bytes() == (output / index).read_bytes()
+        for name, shard in json.loads((output / index).read_text())["weight_map"].items():
+            with safe_open(output / shard, framework="pt", device="cpu") as handle:
+                actual = handle.get_tensor(name)
+                assert actual.dtype == expected[name].dtype and torch.equal(actual, expected[name]), name
+    assert not active_readers
+    assert min(depth, 2) <= peak <= depth
 
 
 @pytest.mark.parametrize("copy_buffer_bytes", [None, 31], ids=["planned-buffer", "small-buffer"])

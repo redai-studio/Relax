@@ -27,6 +27,33 @@ def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def case_manifest_protocol(path: Path, revision: str, questions_sha256: str) -> dict:
+    raw = path.read_bytes()
+    manifest = json.loads(raw)
+    if manifest.get("dataset_revision") != revision or manifest.get("questions_sha256") != questions_sha256:
+        raise ValueError("Case manifest points to a different V*Bench question set")
+    ids = manifest.get("case_ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(q, str) and q for q in ids):
+        raise ValueError("Case manifest requires a nonempty list of original string question IDs")
+    if len(set(ids)) != len(ids):
+        raise ValueError("Duplicate question ID in case manifest")
+    return {"case_manifest_sha256": hashlib.sha256(raw).hexdigest(), "case_ids": ids}
+
+
+def validate_evaluation_model(provenance: dict, label: str, checkpoint_step: int | None) -> None:
+    if checkpoint_step is None:
+        expected = {"base": "base", "relax": "trained-final"}[label]
+    else:
+        if label != "relax" or checkpoint_step < 1:
+            raise ValueError("An intermediate checkpoint requires label=relax and a positive checkpoint step")
+        expected = "trained-checkpoint"
+        updates = provenance.get("completed_updates")
+        if type(updates) is not int or updates != checkpoint_step:
+            raise ValueError(f"Expected checkpoint completed_updates={checkpoint_step}, got {updates!r}")
+    if provenance.get("kind") != expected:
+        raise ValueError(f"Expected model provenance kind={expected!r}, got {provenance.get('kind')!r}")
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")

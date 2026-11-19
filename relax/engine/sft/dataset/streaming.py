@@ -22,6 +22,7 @@ from relax.engine.sft.dataset.multimodal import (
     preprocess_multimodal_async,
     take_preprocess_stats,
 )
+from relax.engine.sft.dataset.raw_text import raw_text_concat_enabled
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.utils.data.data_utils import (
     build_messages,
@@ -1079,6 +1080,8 @@ class SFTStreamingDataset:
             logger.warning(f"SFTStreamingDataset[invalid-multimodal=skip]: {exc} Skipping.")
             return None
         cpt_rendered_text = None
+        v41_path = getattr(self.tokenizer, "deepseek_v41_model_dir", None)
+        v41_text = None
         if self.training_mode == "cpt" and self.cpt_template == "multimodal":
             # Generation-only prefixes must never become CPT targets.
             effective_kwargs = {
@@ -1096,6 +1099,28 @@ class SFTStreamingDataset:
             short_mask = mask_cpt_media_tokens(short_ids, self.tokenizer, self._pad_token_ids)
         elif self.training_mode == "cpt":
             short_ids, short_mask = render_cpt(sample, tokenizer=self.tokenizer, template=self.cpt_template)
+        elif isinstance(v41_path, str) and not raw_text_concat_enabled():
+            from relax.utils.data.deepseek_v41 import compact_ids_and_mask, render_conversation
+
+            options = {
+                **(self.apply_chat_template_kwargs or {}),
+                **(sample.metadata.get("apply_chat_template_kwargs") or {}),
+            }
+            last_user = max((i for i, msg in enumerate(sample.messages) if msg.role == "user"), default=-1)
+            messages = [
+                {**vars(msg), "learn": msg.learn and (not self.loss_last_turn_only or i > last_user)}
+                for i, msg in enumerate(sample.messages)
+            ]
+            v41_text, spans, order = render_conversation(
+                v41_path, messages, sample.tools, options, ignore_empty_think=self.loss_ignore_empty_think
+            )
+            short_ids, short_mask = compact_ids_and_mask(self.tokenizer, v41_text, spans)
+            images = sample.images or []
+            if len(order) != len(images):
+                raise ValueError(
+                    f"DeepSeek-V4.1 sample {idx} has {len(order)} image references for {len(images)} images"
+                )
+            sample.images = [images[i] for i in order] or None
         else:
             short_ids, short_mask = render_with_loss_mask(
                 sample,
@@ -1104,6 +1129,12 @@ class SFTStreamingDataset:
                 last_turn_only=self.loss_last_turn_only,
                 ignore_empty_think=self.loss_ignore_empty_think,
             )
+        if self.training_mode == "sft" and isinstance(v41_path, str):
+            image_slots = int(short_ids.eq(self.tokenizer.deepseek_v41_image_token_id).sum())
+            if image_slots != len(sample.images or []):
+                raise ValueError(
+                    f"DeepSeek-V4.1 sample {idx} has {image_slots} image slots for {len(sample.images or [])} images"
+                )
         n = int(short_ids.shape[0])
         effective_n = n + 1 if self.task_type == "seq_cls" else n
         if self.capacity is not None and effective_n > self.capacity and self._oversize_strategy == "skip":
@@ -1116,7 +1147,9 @@ class SFTStreamingDataset:
         processor_kwargs = None
         image_refs, image_fallback = self._image_transport.capture(sample.images, idx, self.source_name)
         if has_multimodal_content(sample):
-            if is_kimi_k3_tokenizer(self.tokenizer):
+            if v41_text is not None:
+                rendered_text = v41_text
+            elif is_kimi_k3_tokenizer(self.tokenizer):
                 # Image dimensions are only known inside the processor worker.
                 # K3 must encode its original segments after those prompts are
                 # available; a rendered string would lose literal-token safety.
@@ -1201,6 +1234,14 @@ class SFTStreamingDataset:
             loss_mask = mask_cpt_media_tokens(tokens, self.tokenizer, self._pad_token_ids)
         elif prompt_ids is None:
             loss_mask = rendered.short_mask
+        elif (
+            mm_inputs
+            and "image_spans" in mm_inputs
+            and isinstance(getattr(self.tokenizer, "deepseek_v41_model_dir", None), str)
+        ):
+            from relax.utils.data.deepseek_v41 import expand_sft_mask
+
+            loss_mask = expand_sft_mask(rendered.short_ids, rendered.short_mask, tokens, mm_inputs["image_spans"])
         elif precomputed_mask is not None:
             loss_mask = _to_long_tensor(precomputed_mask)
             if loss_mask.shape != tokens.shape:
@@ -1262,6 +1303,9 @@ class SFTStreamingDataset:
                     f"from {before} to {after}, but its image features were retained. "
                     "Increase capacity or use oversize_strategy='skip' to keep image tokens and features aligned."
                 )
+        if mm_inputs and "image_spans" in mm_inputs and tokens is not untruncated_tokens:
+            if tokens.shape != untruncated_tokens.shape or not torch.equal(tokens, untruncated_tokens):
+                raise ValueError("DeepSeek-V4.1 SFT truncation would invalidate image offsets; use oversize skip")
         n = int(tokens.shape[0])
         if self.training_mode == "cpt" and n < 2:
             raise ValueError(f"CPT row idx={rendered.idx} has fewer than two tokens after truncation")

@@ -35,7 +35,7 @@ def _has_image_inputs(multimodal_train_inputs) -> bool:
     for mm_input in inputs:
         if mm_input is None:
             continue
-        for key in ("pixel_values", "image_position_ids", "image_grid_thw"):
+        for key in ("pixel_values", "image_position_ids", "image_grid_thw", "image_grid_hws"):
             value = mm_input.get(key)
             if value is not None and (value.numel() > 0 if isinstance(value, torch.Tensor) else len(value) > 0):
                 return True

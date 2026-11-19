@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import stat
 from pathlib import Path
 from types import ModuleType
 
@@ -25,7 +26,9 @@ def converter() -> ModuleType:
     return module
 
 
-def _checkpoint(directory: Path, *, omit_dense_scale: bool = False) -> dict[str, torch.Tensor]:
+def _checkpoint(
+    directory: Path, *, omit_dense_scale: bool = False, multimodal: bool = False
+) -> dict[str, torch.Tensor]:
     directory.mkdir()
     config = {
         "architectures": ["DeepseekV41ForCausalLM"],
@@ -49,6 +52,22 @@ def _checkpoint(directory: Path, *, omit_dense_scale: bool = False) -> dict[str,
             "expert_dtype": "fp4",
         },
     }
+    if multimodal:
+        config["text_config"].update(
+            num_hidden_layers=2,
+            vocab_size=8,
+            kv_source_layer_ids=[1],
+            index_source_layer_ids=[1],
+            candidate_source_layer_id=1,
+            engram_layer_ids=[0, 1],
+            engram_num_embeddings=[2, 3],
+            compress_ratios=[0, 1, 0],
+        )
+        config["vision_config"].update(num_hidden_layers=1, intermediate_size=3, patch_size=2, downsample_ratio=2)
+        config["image_token_id"] = 7
+        for asset in ("encoding/encoding.py", "inference/image_processor.py", "inference/vision.py", "tokenizer.json"):
+            (directory / asset).parent.mkdir(parents=True, exist_ok=True)
+            (directory / asset).write_text(f"# {asset}")
     (directory / "config.json").write_text(json.dumps(config))
     (directory / "tokenizer_config.json").write_text('{"eos_token": "</s>"}\n')
 
@@ -101,6 +120,18 @@ def _checkpoint(directory: Path, *, omit_dense_scale: bool = False) -> dict[str,
         first[name] = torch.ones(1, dtype=torch.bfloat16)
     first["layers.0.ffn.gate.bias_vl"] = torch.ones(1, dtype=torch.float32)
 
+    if multimodal:
+        from relax.utils.deepseek_v41_assets import vision_tensor_shapes
+
+        del first["vision.weight"], first["aligner.weight"]
+        for offset, (name, shape) in enumerate(vision_tensor_shapes(config).items(), start=1):
+            dtype = torch.float32 if "norm" in name or "bias_vl" in name else torch.bfloat16
+            first[name] = torch.full(shape, offset, dtype=dtype)
+            if not name.startswith("layers.1."):
+                expected[name] = first[name]
+        for site in ("attn", "ffn"):
+            name = f"layers.0.hc_{site}_scale"
+            first[name] = expected[name] = torch.zeros(3, dtype=torch.float32)
     weight_map = {}
     total_size = 0
     for number, tensors in enumerate((first, second), start=1):
@@ -186,3 +217,99 @@ def test_resume_rejects_a_truncated_output_shard(converter: ModuleType, tmp_path
     with pytest.raises(ValueError, match="Existing shard is incomplete or incompatible"):
         converter.convert(src, dst, resume=True)
     assert json.loads((dst / "conversion.json").read_text())["complete"] is False
+
+
+def test_frozen_vision_sft_checkpoint_roundtrip(converter: ModuleType, tmp_path: Path) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    from relax.utils.deepseek_v41_assets import check_frozen_base
+    from scripts.tools.convert_checkpoint_to_hf_cpu import export_checkpoint
+
+    src, base, dcp_dir, output = (tmp_path / name for name in ("src", "base", "iter_0000001", "export"))
+    source = _checkpoint(src, multimodal=True)
+    converter.convert(src, base, keep_vision=True, decoder_layers=1, check_only=True)
+    assert not base.exists()
+    converter.convert(src, base, keep_vision=True, decoder_layers=1)
+    converter.convert(src, base, keep_vision=True, decoder_layers=1, resume=True)
+    with pytest.raises(ValueError, match="matching conversion.json"):
+        other = tmp_path / "other"
+        shutil.copytree(src, other)
+        converter.convert(other, base, resume=True, decoder_layers=1, keep_vision=True)
+    config = json.loads((base / "config.json").read_text())
+    assert config["image_token_id"] == 7
+    assert "quantization_config" not in config
+    text = config["text_config"]
+    assert (text["engram_layer_ids"], text["engram_num_embeddings"], text["compress_ratios"]) == ([0], [2], [0])
+    assert text["num_hidden_layers"] == 1 and text["num_nextn_predict_layers"] == 0
+    assert (
+        text["kv_source_layer_ids"] == text["index_source_layer_ids"] == [] and text["candidate_source_layer_id"] == -1
+    )
+    assert config["vision_config"] == json.loads((src / "config.json").read_text())["vision_config"]
+
+    # Logical global DCP layout: include a nonzero training change in every language tensor.
+    state = {}
+    expected = dict(source)
+    names = {
+        "embedding.word_embeddings.weight": "embed.weight",
+        "output_layer.weight": "head.weight",
+        "decoder.final_layernorm.weight": "norm.weight",
+        "decoder.layers.0.mlp.router.weight": "layers.0.ffn.gate.weight",
+        "decoder.layers.0.v41_engram.linear_wkv.weight": "layers.0.engram.wkv.weight",
+        "decoder.layers.0.self_attention.linear_kv_proj.weight": "layers.0.attn.wkv.weight",
+        "decoder.layers.0.self_attention.linear_q_down_proj.weight": "layers.0.attn.wq_a.weight",
+        "decoder.layers.0.self_attention.linear_o_group_proj": "layers.0.attn.wo_a.weight",
+        "decoder.layers.0.self_attention.linear_proj.weight": "layers.0.attn.wo_b.weight",
+    }
+    for source_name, hf_name in names.items():
+        state[source_name] = expected[hf_name] = source[hf_name] + 1
+    for site, mg in (("ffn", "mlp"), ("attn", "self_attention")):
+        expected[f"layers.0.hc_{site}_scale"] = torch.tensor([1.0, 2.0, 3.0])
+        for index, part in enumerate(("pre", "post", "res"), start=1):
+            state[f"decoder.layers.0.{mg}_hyper_connection.alpha_{part}"] = torch.tensor([float(index)])
+    expert = "layers.0.ffn.experts.0."
+    for i in (1, 2, 3):
+        expected[expert + f"w{i}.weight"] = source[expert + f"w{i}.weight"] + i
+    fc1 = torch.cat([expected[expert + f"w{i}.weight"] for i in (1, 3)])
+    state["decoder.layers.0.mlp.experts.experts.linear_fc1.weight"] = fc1.unsqueeze(0)
+    state["decoder.layers.0.mlp.experts.experts.linear_fc2.weight"] = expected[expert + "w2.weight"].unsqueeze(0)
+    dcp.save(state, checkpoint_id=dcp_dir, no_dist=True)
+    with pytest.raises(ValueError, match="Missing training base identity"):
+        export_checkpoint(dcp_dir, base, output, dry_run=True)
+    check_frozen_base(dcp_dir, base, record=True)
+    report = export_checkpoint(dcp_dir, base, output, allow_base_fallback=("vision", "engram"))
+    assert report["base_fallback_keys"] == sorted(
+        source.keys()
+        - names.values()
+        - {*(expert + f"w{i}.weight" for i in (1, 2, 3)), "layers.0.hc_ffn_scale", "layers.0.hc_attn_scale"}
+    )
+    index = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
+    assert index.keys() == expected.keys()
+    assert stat.S_IMODE(output.stat().st_mode) == stat.S_IMODE((output / "inference").stat().st_mode)
+    file_mode = stat.S_IMODE((output / "model.safetensors.index.json").stat().st_mode)
+    for shard in set(index.values()):
+        assert stat.S_IMODE((output / shard).stat().st_mode) == file_mode
+        for name, actual in load_file(output / shard).items():
+            assert torch.equal(actual.view(torch.uint8), expected[name].view(torch.uint8)), name
+    for asset in (
+        "config.json",
+        "tokenizer.json",
+        "encoding/encoding.py",
+        "inference/image_processor.py",
+        "inference/vision.py",
+    ):
+        assert (output / asset).read_bytes() == (base / asset).read_bytes()
+
+    wrong_base = tmp_path / "wrong-base"
+    shutil.copytree(base, wrong_base)
+    (wrong_base / "encoding/encoding.py").write_text("# different source")
+    with pytest.raises(ValueError, match="base differs"):
+        export_checkpoint(
+            dcp_dir, wrong_base, tmp_path / "wrong", dry_run=True, allow_base_fallback=("vision", "engram")
+        )
+
+    del state["decoder.layers.0.v41_engram.linear_wkv.weight"]
+    incomplete = tmp_path / "incomplete"
+    dcp.save(state, checkpoint_id=incomplete, no_dist=True)
+    check_frozen_base(incomplete, base, record=True)
+    with pytest.raises(ValueError, match="layers.0.engram.wkv.weight"):
+        export_checkpoint(incomplete, base, tmp_path / "bad", dry_run=True, allow_base_fallback=("vision", "engram"))

@@ -1156,6 +1156,16 @@ def get_data_from_transfer_queue(
     # per micro-batch by get_batch).
     if has_multimodal and mm_inputs is not None:
         rollout_data["multimodal_train_inputs"] = mm_inputs
+    if (
+        getattr(args, "uses_packed_multimodal_inputs", False)
+        and rollout_data.get("multimodal_train_inputs") is not None
+        and not mpu.is_pipeline_first_stage()
+    ):
+        # SFT fetches on each rank. Later decoder stages only retain image geometry for routing.
+        rollout_data["multimodal_train_inputs"] = [
+            {key: value for key, value in sample.items() if key != "pixel_values"} if sample else None
+            for sample in rollout_data["multimodal_train_inputs"]
+        ]
 
     if post_process:
         post_process_rollout_data(args, rollout_data)
@@ -1194,7 +1204,11 @@ def post_process_rollout_data(args, rollout_data):
         rollout_data.clear()
         rollout_data.update(expanded)
 
-    from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
+    from relax.backends.megatron.cp_utils import (
+        maybe_padded_total_lengths,
+        needs_unsplit_forward,
+        slice_log_prob_with_cp,
+    )
 
     if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
         masks = rollout_data["loss_masks"]
@@ -1244,9 +1258,7 @@ def post_process_rollout_data(args, rollout_data):
     padded_total_lengths = maybe_padded_total_lengths(
         rollout_data["total_lengths"],
         args.qkv_format,
-        getattr(args, "is_vl_model", False)
-        or "multimodal_train_inputs" in rollout_data
-        or getattr(args, "uses_unsplit_forward", False),
+        needs_unsplit_forward(args, "multimodal_train_inputs" in rollout_data),
     )
 
     response_float_fields = [

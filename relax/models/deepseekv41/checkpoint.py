@@ -8,6 +8,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from relax.utils.deepseek_v41_assets import validate_vision_entry, validate_vision_files, vision_tensor_shapes
+
 
 _V41_MODEL_TYPES = {"deepseek_v41", "deepseek_v41_text"}
 _BF16_REQUIRED = (
@@ -64,6 +66,15 @@ def validate_bf16_checkpoint(checkpoint: str | None, *, require_v41: bool = Fals
     if not weight_map:
         raise ValueError("DeepSeek V4.1 checkpoint index contains no weights.")
 
+    visual = vision_tensor_shapes(config) if config.get("vision_config") else {}
+    if visual:
+        validate_vision_files(root)
+        if missing := visual.keys() - weight_map.keys():
+            raise ValueError(f"DeepSeek V4.1 checkpoint is missing native vision tensors: {sorted(missing)[:5]}")
+        marker = root / "conversion.json"
+        if marker.exists() and not json.loads(marker.read_text()).get("complete"):
+            raise ValueError("DeepSeek V4.1 BF16 conversion is incomplete.")
+
     frozen_names: dict[str, tuple[str, ...]] = {}
     for layer in text.get("engram_layer_ids", ()):
         prefix = f"layers.{layer}.engram.embed"
@@ -83,7 +94,12 @@ def validate_bf16_checkpoint(checkpoint: str | None, *, require_v41: bool = Fals
             and parts[1].isdigit()
             and (num_layers is None or int(parts[1]) < num_layers)
         )
-        if name in frozen_names or is_text_layer or name in ("embed.weight", "head.weight", "norm.weight"):
+        if (
+            name in visual
+            or name in frozen_names
+            or is_text_layer
+            or name in ("embed.weight", "head.weight", "norm.weight")
+        ):
             if name not in frozen_names and name.endswith((".scale", ".weight_scale_inv")):
                 raise ValueError(f"DeepSeek V4.1 checkpoint contains obsolete weight scale {name!r}. {_BF16_REQUIRED}")
             by_shard.setdefault(shard, []).append(name)
@@ -94,6 +110,8 @@ def validate_bf16_checkpoint(checkpoint: str | None, *, require_v41: bool = Fals
         for name in names:
             if name not in header:
                 raise ValueError(f"DeepSeek V4.1 tensor {name!r} is missing from indexed shard {shard!r}.")
+            if name in visual:
+                validate_vision_entry(name, header[name], visual[name])
             dtype = header[name]["dtype"]
             allowed = frozen_names.get(name, ("BF16", "F32"))
             if dtype not in allowed:

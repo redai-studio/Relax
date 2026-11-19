@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from relax.utils.deepseek_v41_assets import V41_REPLICATED_LAYER_WEIGHTS
+
 
 @dataclass(frozen=True)
 class TensorSlice:
@@ -71,10 +73,90 @@ def model_key(key: str) -> bool:
     return normalize_key(key).startswith(("embedding.", "output_layer.", "decoder.", "mtp.", "vision_model."))
 
 
+def _v41_conversions(
+    tensors: dict[str, Any], config: dict[str, Any], reference: dict[str, dict[str, Any]]
+) -> list[Conversion]:
+    """Reverse the V4.1 Bridge mappings from global DCP tensors on CPU."""
+    text = config.get("text_config", config)
+    names = {normalize_key(key): key for key in tensors}
+    if len(names) != len(tensors):
+        raise ValueError("Duplicate normalized checkpoint keys")
+
+    def select(name: str) -> TensorSlice:
+        key = names[name]
+        shape = tuple(tensors[key].size)
+        return TensorSlice(key, shape, (0,) * len(shape))
+
+    top = {
+        "embedding.word_embeddings.weight": "embed.weight",
+        "output_layer.weight": "head.weight",
+        "decoder.final_layernorm.weight": "norm.weight",
+    }
+    direct = {
+        **V41_REPLICATED_LAYER_WEIGHTS,
+        "self_attention.linear_q_up_proj.weight": "attn.wq_b.weight",
+        "self_attention.linear_o_group_proj": "attn.wo_a.weight",
+        "self_attention.core_attention.attn_sink": "attn.attn_sink",
+        "self_attention.linear_proj.weight": "attn.wo_b.weight",
+        "mlp.shared_experts.linear_fc2.weight": "ffn.shared_experts.w2.weight",
+    }
+    jobs = []
+    for name in sorted(names):
+        item = select(name)
+        if name in top:
+            target = top[name]
+            if target in ("embed.weight", "head.weight"):
+                # Vocab parallel weights may include partition padding.
+                shape = tuple(reference[target]["shape"])
+                if len(shape) != 2 or len(item.shape) != 2 or shape[0] > item.shape[0] or shape[1] != item.shape[1]:
+                    raise ValueError(f"Invalid V4.1 padded vocabulary {name}: {item.shape} vs {shape}")
+                item = TensorSlice(item.key, shape, (0, 0))
+            jobs.append(Conversion((item,), (target,)))
+            continue
+        match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
+        if not match:
+            raise ValueError(f"Unsupported V4.1 checkpoint tensor: {name}")
+        layer, suffix = match.groups()
+        prefix = f"layers.{layer}."
+        if suffix in direct:
+            target = prefix + direct[suffix]
+            # The Bridge synthesizes a zero text-only router bias for source
+            # checkpoints which omit it. Bias updates are disabled in V4.1.
+            if suffix != "mlp.router.expert_bias" or target in reference:
+                jobs.append(Conversion((item,), (target,)))
+        elif suffix == "mlp.shared_experts.linear_fc1.weight":
+            outputs = tuple(prefix + f"ffn.shared_experts.w{i}.weight" for i in (1, 3))
+            jobs.append(Conversion((item,), outputs, "split_mlp"))
+        elif suffix in ("mlp.experts.experts.linear_fc1.weight", "mlp.experts.experts.linear_fc2.weight"):
+            if len(item.shape) != 3 or item.shape[0] != text["n_routed_experts"]:
+                raise ValueError(f"Invalid V4.1 global expert shape: {name}: {item.shape}")
+            fc1 = suffix.endswith("linear_fc1.weight")
+            for expert in range(item.shape[0]):
+                part = TensorSlice(item.key, (1, *item.shape[1:]), (expert, 0, 0), True)
+                outputs = tuple(prefix + f"ffn.experts.{expert}.w{i}.weight" for i in ((1, 3) if fc1 else (2,)))
+                jobs.append(Conversion((part,), outputs, "split_mlp" if fc1 else "copy"))
+        else:
+            hc = re.fullmatch(r"(self_attention|mlp)_hyper_connection\.(.+)", suffix)
+            if not hc:
+                raise ValueError(f"Unsupported V4.1 checkpoint tensor: {name}")
+            field = hc[2]
+            stem = prefix + ("hc_attn" if hc[1] == "self_attention" else "hc_ffn")
+            if field in ("mapping_proj.weight", "bias"):
+                jobs.append(Conversion((item,), (stem + ("_fn" if field == "mapping_proj.weight" else "_base"),)))
+            elif field == "alpha_pre":
+                group = tuple(select(name.removesuffix("pre") + part) for part in ("pre", "post", "res"))
+                jobs.append(Conversion(group, (stem + "_scale",), "concat"))
+            elif field not in ("alpha_post", "alpha_res") or name.rsplit("_", 1)[0] + "_pre" not in names:
+                raise ValueError(f"Unsupported/incomplete V4.1 hyper connection tensor: {name}")
+    return jobs
+
+
 def build_conversions(
     tensors: dict[str, Any], config: dict[str, Any], reference: dict[str, dict[str, Any]]
 ) -> list[Conversion]:
     """Build a metadata-only plan; every supported model tensor is consumed."""
+    if config.get("model_type") in ("deepseek_v41", "deepseek_v41_text"):
+        return _v41_conversions(tensors, config, reference)
     standard_norm = config.get("model_type") in ("qwen3_5_moe", "qwen3_5_moe_text")
     if not standard_norm and config.get("model_type") not in ("qwen4_exp", "qwen4_exp_text"):
         raise ValueError(f"No CPU checkpoint mapping for model_type={config.get('model_type')!r}")

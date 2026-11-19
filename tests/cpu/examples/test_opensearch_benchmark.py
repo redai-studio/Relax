@@ -61,6 +61,7 @@ def test_http_runner_keeps_history_within_32k(monkeypatch, benchmark, input_toke
         )
 
     runner = benchmark.HTTPRunner.__new__(benchmark.HTTPRunner)
+    runner.deepseek_v41 = False
     runner.processor = SimpleNamespace(
         apply_chat_template=lambda *_args, **_kwargs: {"input_ids": SimpleNamespace(shape=(1, input_tokens))}
     )
@@ -95,12 +96,53 @@ def test_http_runner_keeps_history_within_32k(monkeypatch, benchmark, input_toke
         assert not captured
 
 
-@pytest.mark.parametrize("invalid", [None, "protocol", "partial", "smoke", "infrastructure", "server_abort"])
+@pytest.mark.parametrize("source", ["alias", "wrong-checkpoint", "wrong-name"])
+def test_native_model_identity_checks_live_sglang_service(benchmark, tmp_path, source):
+    import httpx
+    from openai import OpenAI
+
+    trained, base = tmp_path / "trained", tmp_path / "base"
+    trained.mkdir()
+    base.mkdir()
+    alias = tmp_path / "server-mount"
+    alias.symlink_to(base if source == "wrong-checkpoint" else trained)
+    name = "unexpected" if source == "wrong-name" else "benchmark-model"
+
+    def model_info(request):
+        assert request.url.path == "/model_info"
+        return httpx.Response(200, json={"served_model_name": name, "model_path": str(alias)})
+
+    with OpenAI(
+        base_url="http://sglang.test/v1",
+        api_key="test",
+        http_client=httpx.Client(transport=httpx.MockTransport(model_info)),
+    ) as client:
+        if source == "alias":
+            assert benchmark.verify_native_model(client, name, trained) == {
+                "served_model_name": name,
+                "model_path": str(alias),
+            }
+        else:
+            with pytest.raises(ValueError, match="SGLang"):
+                benchmark.verify_native_model(client, "benchmark-model", trained)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None, "protocol", "partial", "smoke", "infrastructure", "server_abort", "intermediate", "wrong_step",
+        "as_final", "subset", "duplicate_subset",
+    ],
+)
 def test_comparison_needs_only_full_vstar_results(monkeypatch, tmp_path, invalid):
     monkeypatch.syspath_prepend(str(TOOLS))
     spec = importlib.util.spec_from_file_location("opensearch_comparison", TOOLS / "compare_benchmark.py")
     comparison = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(comparison)
+    subset = invalid in ("subset", "duplicate_subset")
+    case_manifest = tmp_path / "subset.json"
+    if subset:
+        case_manifest.write_text(json.dumps({"dataset_revision": "rev", "questions_sha256": "digest", "case_ids": ["3", "7"]}))
     for label, score in [("base", 0.4), ("relax", 0.5)]:
         summary = {
             "protocol": {"smoke": False, "evaluator_sha256": "same-source"},
@@ -121,12 +163,27 @@ def test_comparison_needs_only_full_vstar_results(monkeypatch, tmp_path, invalid
                 summary["errors"] = {"APIConnectionError": 1}
             elif invalid == "server_abort":
                 summary["errors"] = {"server_finish_error": 1}
-        directory = tmp_path / label / "vstar"
+            elif invalid in ("intermediate", "wrong_step", "as_final"):
+                summary["model_source"] = {
+                    "kind": "trained-checkpoint",
+                    "completed_updates": 49 if invalid == "wrong_step" else 50,
+                }
+        intermediate = invalid in ("intermediate", "wrong_step")
+        directory = tmp_path / ("checkpoint-step50" if label == "relax" and intermediate else label) / "vstar"
         directory.mkdir(parents=True)
+        if subset:
+            summary["protocol"].update(dataset_revision="rev", questions_sha256="digest")
+            summary["protocol"].update(comparison.case_manifest_protocol(case_manifest, "rev", "digest"))
+            summary["expected_cases"] = summary["deduplicated_cases"] = 2
+            ids = ["7", "7"] if invalid == "duplicate_subset" and label == "relax" else ["7", "3"]
+            (directory / "trajectories.jsonl").write_text("".join(json.dumps({"id": q}) + "\n" for q in ids))
         (directory / "summary.json").write_text(json.dumps(summary))
     output = tmp_path / "comparison.json"
-    monkeypatch.setattr(sys, "argv", ["compare", "--root", str(tmp_path), "--output", str(output)])
-    if invalid:
+    argv = ["compare", "--root", str(tmp_path), "--output", str(output)]
+    if subset:
+        argv += ["--case-manifest", str(case_manifest)]
+    monkeypatch.setattr(sys, "argv", [*argv, "--checkpoint-step", "50"] if intermediate else argv)
+    if invalid not in (None, "intermediate", "subset"):
         with pytest.raises(ValueError):
             comparison.main()
         assert not output.exists()
@@ -160,7 +217,8 @@ def test_final_option_extracts_explicit_answers_without_guessing(vstar, text, an
     assert vstar.final_option(text) == answer
 
 
-def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monkeypatch, tmp_path):
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monkeypatch, tmp_path, checkpoint):
     from PIL import Image, ImageDraw
 
     data = tmp_path / "data"
@@ -170,14 +228,26 @@ def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monke
     image.save(data / "scene.png")
     case = {"question_id": 0, "category": "direct_attributes", "image": "scene.png", "text": "Color?", "label": "A"}
     questions = data / "test_questions.jsonl"
-    questions.write_text(json.dumps(case) + "\n")
+    cases = [dict(case, question_id="other", image="unused.png"), case] if checkpoint else [case]
+    questions.write_text("".join(json.dumps(row) + "\n" for row in cases))
     manifest = {"files_sha256": {questions.name: vstar.file_hash(questions)}}
     (data / "manifest.json").write_text(json.dumps(manifest))
+    if checkpoint:
+        selection = tmp_path / "subset.json"
+        selection.write_text(json.dumps({
+            "dataset_revision": vstar.REVISION, "questions_sha256": vstar.file_hash(questions), "case_ids": ["0"]
+        }))
+        (tmp_path / "vstar-run-plan.json").write_text(json.dumps({"case_manifest": str(selection)}))
     monkeypatch.setattr(vstar, "prepare", lambda _: manifest)
     provenance = tmp_path / "model.json"
-    provenance.write_text(json.dumps({"hashes_verified": True, "kind": "base", "served_model_name": "test-model"}))
+    source = {"hashes_verified": True, "kind": "base", "served_model_name": "test-model"}
+    if checkpoint:
+        source.update(kind="trained-checkpoint", completed_updates=50)
+    provenance.write_text(json.dumps(source))
     overlap = tmp_path / "overlap.json"
     overlap.write_text('{"questions":[],"images":[]}')
+    training_index = tmp_path / "checkpoint-overlap-index.json"
+    training_index.write_text(json.dumps({"questions": [vstar.question_hash("Color?")], "images": []}))
     calls = [
         {"image": "img_1", "x": 128, "y": 64, "width": 768, "height": 384},
         {"image": "img_2", "x": 171, "y": 85, "width": 341, "height": 171},
@@ -185,6 +255,9 @@ def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monke
     observed_pixels = []
 
     class Runner:
+        deepseek_v41 = False
+        image_factor = 32
+
         def __init__(self, *_args):
             self.processor = SimpleNamespace(image_processor=SimpleNamespace(patch_size=16, merge_size=2))
             self.template_sha256 = "test-template"
@@ -227,11 +300,11 @@ def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monke
             "--output",
             str(output),
             "--label",
-            "base",
+            "relax" if checkpoint else "base",
+            *(["--checkpoint-step", "50", "--training-overlap-index", str(training_index)] if checkpoint else []),
             "--workers",
             "1",
-            "--max-cases",
-            "1",
+            *([] if checkpoint else ["--max-cases", "1"]),
             "--max-turns",
             "3",
             "--image-tokens",
@@ -241,6 +314,13 @@ def test_crop_workflow_maps_display_coordinates_to_original_regions(vstar, monke
     vstar.main()
     assert json.loads((output / "evaluator.json").read_text())["git_commit"] == "0" * 40
     record = json.loads((output / "trajectories.jsonl").read_text())
+    if checkpoint:
+        protocol = json.loads((output / "protocol.json").read_text())
+        assert not protocol["smoke"] and protocol["case_ids"] == ["0"]
+        assert not record["overlaps_sft_train"] and record["overlaps_checkpoint_train"]
+        audit = json.loads((output / "checkpoint-overlap.json").read_text())
+        assert audit["completed_updates"] == 50 and audit["deduplicated_cases"] == 0
+        assert audit["cases_with_overlap"] == ["0"]
     assert record["correct"] and "error" not in record
     assert [call["source_box"] for call in record["tool_calls"]] == [[320, 160, 2240, 1120], [320, 159, 960, 480]]
     assert all(call["success"] for call in record["tool_calls"])

@@ -2,15 +2,13 @@
 
 [中文](./README.md)
 
-[convert_to_bf16.py](./convert_to_bf16.py) converts the official DeepSeek-V4.1-Flash HF checkpoint, which contains mixed FP8/FP4 weights, into the BF16 HF format used by Relax for text-only training and rollout. SFT, RL, BSHD and THD use the same format; switching to THD does not require another conversion.
+[convert_to_bf16.py](./convert_to_bf16.py) converts the official DeepSeek-V4.1-Flash HF checkpoint, which contains mixed FP8/FP4 weights, into a BF16 HF base. Use `--keep-vision` to prepare a composite model for frozen-vision SFT on Flash-1017. The default produces the existing text-only training and rollout format.
 
 ## Source and conversion scope
 
-The previously prepared `DeepSeek-V4.1-bf16` came from the official `deepseek-ai/DeepSeek-V4.1-Flash` model. Its local download record identifies revision `8b3cec70c307624fb098c3a04bdbfc118e7abda9`. The archived `convert_deepseek_v4_1_to_bf16-6f52e0b.py` is identical to the script in [Miles commit `6f52e0b`](https://github.com/radixark/miles/blob/6f52e0b3021484e8d6ad0d43c1074100adc8e4b9/tools/convert_deepseek_v4_1_to_bf16.py); the accompanying `convert-v41-bf16.log` records a completed conversion.
+The previously prepared `DeepSeek-V4.1-bf16` came from the official `deepseek-ai/DeepSeek-V4.1-Flash` model at revision `8b3cec70c307624fb098c3a04bdbfc118e7abda9`.
 
-The `dsv41_cut_cast.py` mentioned in the [Miles documentation](https://github.com/radixark/miles/blob/fa13e2ec42622f6e77aabd8e0c295ab8b4347eac/docs/models/deepseek/deepseek-v4-1-flash.md#L44-L53) is not a runnable file in the current main branch. The historical commit above provides the model-specific converter. This tool retains its conversion semantics while removing the Miles package dependency, processing one tensor at a time, streaming unchanged data, and adding preflight checks and explicit resume support.
-
-| Source content | Output |
+| Source content | Default text-only output |
 | --- | --- |
 | Dense FP8 weights with 32×32 E8M0 scales | Dequantize to BF16 and remove the corresponding ordinary scales |
 | Routed experts stored as packed FP4 with group-32 E8M0 scales | Dequantize to BF16 and remove the corresponding ordinary scales |
@@ -19,11 +17,27 @@ The `dsv41_cut_cast.py` mentioned in the [Miles documentation](https://github.co
 | `mtp.*`, `vision.*`, `aligner.*`, `image_*`, `.ffn.gate.bias_vl` | Drop |
 | Configuration | Flatten `text_config`, remove quantization and vision configuration and `dspark_*` fields, and set `num_nextn_predict_layers=0` |
 
-The tool preserves all text layers and their original indices. It does not select or remap layers. It also removes the vision head, so its output is unsuitable for multimodal training with a frozen vision encoder. A four-layer model that is already in BF16 does not need this conversion.
+## Flash-1017 with frozen vision
 
-## Prepare the checkpoint
+Use the complete `deepseek-ai/DeepSeek-V4.1-Flash-1017` snapshot. The downloaded revision is `08c8657f02291e11b6f6b63e0e16014f8e748518`. It adds `chat_template.jinja` to revision `1bae0e1088993b9b82de08f59de5be5a34e42170` with identical weights and configuration. Run from the Relax repository root in the training environment. Set `SOURCE_1017` to the downloaded snapshot and `BASE_1017` to a new directory on storage accessible to every rank.
 
-Run these commands from the repository root in a Relax CU13 environment that matches the repository. Conversion uses PyTorch and Relax's existing logging module; Miles is not required. It runs on CPU by default and does not require Ray.
+```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export SOURCE_1017=/path/to/DeepSeek-V4.1-Flash-1017
+export BASE_1017=/path/to/DeepSeek-V4.1-Flash-1017-bf16
+convert=(python examples/models/deepseek-v4.1/tools/convert_to_bf16.py
+  --model-dir "$SOURCE_1017" --save-dir "$BASE_1017" --keep-vision)
+"${convert[@]}" --check-only
+"${convert[@]}"
+```
+
+The multimodal base retains the native `vision.*`, `aligner.*`, `image_start`, `image_end`, `image_newline`, and each retained decoder layer’s `ffn.gate.bias_vl` with the original bytes and dtypes. It includes the composite config, tokenizer, official prompt encoder, image processor and vision reference module. Draft MTP/DSpark weights are excluded. The converter records its mode, source shard sizes/timestamps, available HF download revisions and etags, and asset digests in `conversion.json`. To continue an interrupted conversion, rerun the same command with `--resume`.
+
+For a smaller diagnostic model, add `--decoder-layers 4` to the command array **before both commands** and choose a separate output directory. It keeps native layers 0–3, all 384 experts per layer, the entire vision tower, and the full original Engram table and scale at layer 1. KV and index source 2 retain their original numbering. Candidate filtering is disabled because its source is outside the prefix. Check disk capacity with `--check-only` on the actual source revision.
+
+## Prepare the default text-only checkpoint
+
+Run these commands from the repository root in the matching Relax CU13 environment. The converter uses PyTorch and the Relax logging module and runs independently on CPU by default.
 
 Start with a complete source model downloaded at a fixed revision. The revision below is the base release used previously, not `Flash-1017`:
 
@@ -74,12 +88,18 @@ Training loads the HF weights directly; you do not need to create a Megatron `to
 
 ## Exporting trained checkpoints to HF
 
-This tool only handles **original quantized HF → BF16 HF** conversion. Megatron `torch_dist` checkpoints saved during training can be used to resume training. Exporting a standalone HF model for inference is a separate operation.
+Use the CPU exporter from the repository root. `DCP_ITER` selects the saved training iteration and `BASE_1017` must point to the exact read-only BF16 directory used by that run. An iteration records its base identity in `v41-frozen-base.json`. The exporter and checkpoint resume compare asset digests and shard names, sizes and modification times against that record. Preserve file timestamps when relocating the base. Allow enough space for a complete HF export in a fresh directory.
 
-As of Miles commit `fa13e2e`, Miles provides a generic [DCP → HF exporter](https://github.com/radixark/miles/blob/fa13e2ec42622f6e77aabd8e0c295ab8b4347eac/tools/convert_torch_dist_to_hf.py) and [V4.1 parameter mappings](https://github.com/radixark/miles/blob/fa13e2ec42622f6e77aabd8e0c295ab8b4347eac/miles/backends/megatron_utils/megatron_to_hf/deepseekv4_1.py), but no complete V4.1 deployment export recipe. The mapping skips frozen Engram tables and scales, and the exporter's asset-copying step skips the original safetensors files. Running that generic exporter alone therefore does not produce a complete standalone model with its frozen tables.
+```bash
+export DCP_ITER=/path/to/checkpoints/iter_0000100
+export HF_EXPORT=/path/to/new-hf-export
+convert=(python scripts/tools/convert_checkpoint_to_hf_cpu.py
+  --input-dir "$DCP_ITER" --origin-hf-dir "$BASE_1017" --output-dir "$HF_EXPORT"
+  --allow-base-fallback vision --allow-base-fallback engram)
+"${convert[@]}" --dry-run
+"${convert[@]}"
+```
 
-Relax has not yet implemented this complete export path either. Its [V4.1 Bridge](../../../../relax/models/deepseekv41/bridge.py) explicitly sets `SUPPORTS_HF_PRETRAINED_EXPORT=False`, and the existing CPU exporter has no V4.1 model mapping. Generic export commands for other models cannot be used directly.
+The exporter reconstructs language weights from the global DCP shards, including routed/shared experts, mHC and trainable Engram projections. The explicit fallback groups permit byte copies of frozen vision assets, image router biases and frozen Engram tables only. The resulting directory includes its own index, processor, tokenizer, original composite configuration and trained weights in their saved floating-point dtypes. `conversion-result.json` lists the tensors copied from the base and any DCP/base dtype differences. For a legacy flat text-only model, use `--allow-base-fallback engram` alone.
 
-A complete export must map trained checkpoint parameters back to V4.1 HF names, copy the four frozen Engram tensors unchanged from **the BF16 base used for that training run**, preserve required FP32 parameters, rebuild the index/configuration/tokenizer assets, and verify numerical behavior after reloading. Successful online weight synchronization to SGLang does not establish that these offline export steps are implemented.
-
-A BF16 HF export also differs from the original FP8/FP4 deployment package. Returning to low-precision deployment weights requires a separate requantization step and inference accuracy checks; adding the original `quantization_config` back is insufficient.
+To check an export, compare its mean negative log-likelihood in a fresh SGLang process with Megatron at the same training step. Use identical images, histories and supervised assistant token positions. To measure the effect of switching the full model from native quantization to BF16, evaluate the original 40-layer 1017 and the untrained 40-layer BF16 base on the same protocol. See the [eight-GPU validation results](../../../../docs/draft/deepseek-v41-1017-frozen-vision-thd-plan.md) for the four-layer measurements.

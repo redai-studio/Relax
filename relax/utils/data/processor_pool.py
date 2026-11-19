@@ -28,6 +28,7 @@ import torch
 import torch.multiprocessing as mp
 from PIL import Image
 
+from relax.utils.data.deepseek_v41 import DeepSeekV41Processor
 from relax.utils.data.image_refs import SFT_HF_IMAGE_REBUILD_SUPPORTED
 from relax.utils.data.kimi_k3 import KIMI_K3_SFT_REQUEST, process_kimi_k3_sft_images
 from relax.utils.data.processing_utils import (
@@ -117,6 +118,8 @@ def prepare_worker_images(images: list[np.ndarray]) -> list[Image.Image]:
     rules."""
     processor = get_worker_processor()
     restored_images = [Image.fromarray(arr) for arr in images]
+    if isinstance(processor, DeepSeekV41Processor):
+        return restored_images
     if _is_qwen_vl_processor(processor):
         resized_images = []
         for image in restored_images:
@@ -187,6 +190,9 @@ def process_sample_from_paths_in_worker(
             maps this to its invalid-multimodal skip policy).
     """
     media = _load_media_for_worker(media_paths)
+    if "images" in media and isinstance(get_worker_processor(), DeepSeekV41Processor):
+        # Array IPC discards palettes and CMYK mode. The native loader converts to RGB first.
+        media["images"] = [image.convert("RGB") for image in media["images"]]
     prompt_ids, train_inputs = process_sample_in_worker(text, prepare_mm_inputs_for_ipc(media), processor_kwargs)
     if train_inputs is not None:
         processor = get_worker_processor()

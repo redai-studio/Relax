@@ -329,6 +329,7 @@ class DeepSeekV41Engram(MegatronModule):
             )
         if not 0 <= config.v41_engram_pad_token_id < len(token_map):
             raise ValueError("Engram pad token ID is outside the checkpoint tokenizer vocabulary.")
+        self.image_token_id = getattr(config, "v41_image_token_id", None)
         self.pad_id = token_map[config.v41_engram_pad_token_id]
         flat_primes = [prime for sizes in layout.primes[self.layer_hash_index] for prime in sizes]
         offsets = np.cumsum([0, *flat_primes[:-1]])
@@ -376,6 +377,9 @@ class DeepSeekV41Engram(MegatronModule):
             raise ValueError("Engram input IDs must be an integer [batch, sequence] tensor.")
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
+        image_id = getattr(self, "image_token_id", None)
+        if image_id is not None:
+            compressed = compressed.masked_fill(input_ids == image_id, -1)
         positions = torch.arange(seqlen, device=input_ids.device).expand(batch, seqlen)
         if seq_positions is not None and seq_positions.shape != (seqlen,):
             raise ValueError("Engram packed positions must have one entry per input token.")
@@ -385,6 +389,9 @@ class DeepSeekV41Engram(MegatronModule):
         for shift in range(self.max_ngram_size):
             source = compressed.gather(1, (positions - shift).clamp_min(0))
             blocked = blocked | (in_segment < shift)
+            if image_id is not None:
+                # Image slots terminate the entire lookback, just like a document boundary.
+                blocked = blocked | (source < 0)
             tokens.append(torch.where(blocked, self.pad_id, source))
         products = torch.stack(tokens, dim=-1) * self.multipliers
         rolling, hashes = products[..., 0], []
@@ -459,6 +466,8 @@ class DeepSeekV41Engram(MegatronModule):
             else:
                 ids = self.hash_ids(input_ids).transpose(0, 1)
             rows = self.lookup(ids)
+            if getattr(self, "image_token_id", None) is not None:
+                rows = rows.masked_fill((input_ids == self.image_token_id).T[..., None, None], 0)
             if thd_layout is not None:
                 rows = rows.masked_fill(~thd_layout.valid_mask(rows.device)[:, None, None, None], 0)
         kv, _ = self.linear_wkv(rows.flatten(-2))

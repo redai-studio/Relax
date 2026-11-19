@@ -16,8 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import local
 
-from benchmark import HTTPRunner, image_hash, question_hash
-from common import extract_answer, extract_calls, write_json
+from benchmark import HTTPRunner, image_hash, question_hash, verify_native_model
+from common import case_manifest_protocol, extract_answer, extract_calls, validate_evaluation_model, write_json
 
 
 DATASET = "craigwu/vstar_bench"
@@ -143,21 +143,46 @@ def main() -> None:
     parser.add_argument("--processor", type=Path)
     parser.add_argument("--provenance", type=Path)
     parser.add_argument("--overlap-index", type=Path)
+    parser.add_argument("--training-overlap-index", type=Path, help="Also audit overlap at the evaluated training step")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--label", choices=["base", "relax"])
+    parser.add_argument("--checkpoint-step", type=int, help="Evaluate this intermediate training update")
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--max-turns", type=int, default=10)
     parser.add_argument("--image-tokens", type=int, default=1024)
     parser.add_argument("--max-cases", type=int, default=0)
+    parser.add_argument("--case-manifest", type=Path, help="Fixed V*Bench question IDs for a paired subset evaluation")
+    parser.add_argument("--http-timeout", type=int, default=600, help="HTTP read timeout per model request, in seconds.")
     args = parser.parse_args()
     if args.workers < 1 or args.max_turns < 1 or args.image_tokens < 256 or args.max_cases < 0:
         parser.error("Invalid concurrency or generation budget")
+    if args.http_timeout <= 0:
+        parser.error("--http-timeout must be positive")
     manifest = prepare(args.data)
     if args.prepare_only:
         print(json.dumps({"cases": manifest["cases"], "revision": REVISION}), flush=True)
         return
     if any(value is None for value in (args.processor, args.provenance, args.output, args.label, args.overlap_index)):
         parser.error("Evaluation requires processor, provenance, output, label and overlap-index")
+    # A launcher can publish a run plan while a long-lived model server is still loading.
+    plan_path = args.output.parent / "vstar-run-plan.json"
+    if plan_path.is_file():
+        planned_path = Path(json.loads(plan_path.read_text())["case_manifest"]).resolve(strict=True)
+        if args.case_manifest is not None and args.case_manifest.resolve(strict=True) != planned_path:
+            parser.error("The command and the output directory's run plan select different case manifests")
+        args.case_manifest = planned_path
+    if args.case_manifest and args.max_cases:
+        parser.error("Use either --case-manifest for a paired subset or --max-cases for a smoke test")
+    cases = [json.loads(line) for line in (args.data / "test_questions.jsonl").read_text().splitlines()]
+    cohort = {}
+    if args.case_manifest:
+        cohort = case_manifest_protocol(args.case_manifest, REVISION, manifest["files_sha256"]["test_questions.jsonl"])
+        by_id = {str(case["question_id"]): case for case in cases}
+        if len(by_id) != len(cases) or not by_id.keys() >= set(cohort["case_ids"]):
+            raise ValueError("Case manifest IDs must resolve to distinct questions in the official dataset")
+        cases = [by_id[q] for q in cohort["case_ids"]]
+    elif args.max_cases:
+        cases = cases[: args.max_cases]
     import httpx
     from openai import OpenAI
     from PIL import Image
@@ -165,22 +190,31 @@ def main() -> None:
     provenance = json.loads(args.provenance.read_text())
     if not provenance.get("hashes_verified") or provenance["served_model_name"] != os.environ["AGENT_MODEL"]:
         raise ValueError("Model service differs from verified model provenance")
-    if (provenance["kind"] == "trained-final") != (args.label == "relax"):
-        raise ValueError("Model provenance does not match evaluation label")
+    validate_evaluation_model(provenance, args.label, args.checkpoint_step)
+    if args.training_overlap_index is not None and (
+        args.label != "relax" or type(provenance.get("completed_updates")) is not int
+    ):
+        raise ValueError("A training-step overlap audit requires a trained model with a verified completed_updates")
     client = OpenAI(
         base_url=os.environ["AGENT_BASE_URL"],
         api_key=os.environ.get("AGENT_API_KEY", "EMPTY"),
         http_client=httpx.Client(trust_env=False),
-        timeout=600,
+        timeout=args.http_timeout,
         max_retries=2,
     )
-    runner = HTTPRunner(args.processor, client, os.environ["AGENT_MODEL"])
-    factor = int(runner.processor.image_processor.patch_size) * int(runner.processor.image_processor.merge_size)
+    served_model = os.environ["AGENT_MODEL"]
+    runner = HTTPRunner(args.processor, client, served_model)
+    if runner.deepseek_v41:
+        # Provenance may name the server's mount explicitly when the client sees a different mount.
+        server_model = verify_native_model(client, served_model, Path(provenance.get("model_path") or args.processor))
+        provenance["server_model"] = server_model
+        served_model = server_model["served_model_name"]
+    factor = runner.image_factor
     overlap = json.loads(args.overlap_index.read_text())
     known_questions, known_images = set(overlap["questions"]), set(overlap["images"])
-    cases = [json.loads(line) for line in (args.data / "test_questions.jsonl").read_text().splitlines()]
-    if args.max_cases:
-        cases = cases[: args.max_cases]
+    if args.training_overlap_index is not None:
+        training_overlap = json.loads(args.training_overlap_index.read_text())
+        training_questions, training_images = set(training_overlap["questions"]), set(training_overlap["images"])
     args.output.mkdir(parents=True, exist_ok=False)
     protocol = {
         "dataset": DATASET,
@@ -200,9 +234,11 @@ def main() -> None:
         "score": "final-option-exact-match-with-terminal-statement-normalization-v2",
         "workers": args.workers,
         "smoke": bool(args.max_cases),
+        **cohort,
         "overlap_index_sha256": file_hash(args.overlap_index),
         "evaluator_sha256": file_hash(Path(__file__)),
         "http_runner_sha256": file_hash(Path(__file__).with_name("benchmark.py")),
+        "common_sha256": file_hash(Path(__file__).with_name("common.py")),
     }
     write_json(args.output / "protocol.json", protocol)
     write_json(args.output / "model-provenance.json", provenance)
@@ -218,7 +254,7 @@ def main() -> None:
 
     def evaluate(case: dict) -> dict:
         if not hasattr(state, "runner"):
-            state.runner = HTTPRunner(args.processor, client, os.environ["AGENT_MODEL"])
+            state.runner = HTTPRunner(args.processor, client, served_model)
         current = state.runner
         current.requests, current.error, current.last_response = [], None, None
         record = {
@@ -256,9 +292,11 @@ def main() -> None:
 
         try:
             payload = (args.data / case["image"]).read_bytes()
-            record["overlaps_sft_train"] = (
-                question_hash(case["text"].split("\n(A)")[0]) in known_questions or image_hash(payload) in known_images
-            )
+            question = question_hash(case["text"].split("\n(A)")[0])
+            source_image = image_hash(payload)
+            record["overlaps_sft_train"] = question in known_questions or source_image in known_images
+            if args.training_overlap_index is not None:
+                record["overlaps_checkpoint_train"] = question in training_questions or source_image in training_images
             with Image.open(io.BytesIO(payload)) as image:
                 raw = image.convert("RGB")
             history = [{"role": "user", "parts": [*add_image(raw), {"text": case["text"]}]}]
@@ -347,6 +385,19 @@ def main() -> None:
                 flush=True,
             )
     clean = [record for record in records if record.get("overlaps_sft_train") is False]
+    if args.training_overlap_index is not None:
+        clean_at_step = [record for record in records if record.get("overlaps_checkpoint_train") is False]
+        write_json(
+            args.output / "checkpoint-overlap.json",
+            {
+                "completed_updates": provenance["completed_updates"],
+                "index": str(args.training_overlap_index.resolve()),
+                "index_sha256": file_hash(args.training_overlap_index),
+                "cases_with_overlap": [record["id"] for record in records if record.get("overlaps_checkpoint_train")],
+                "deduplicated_cases": len(clean_at_step),
+                "deduplicated_correct": sum(record["correct"] for record in clean_at_step),
+            },
+        )
     calls = [call for record in records for call in record["tool_calls"]]
     write_json(
         args.output / "summary.json",

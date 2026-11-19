@@ -38,6 +38,7 @@ from .cp_utils import (
     dynamic_cp_split_data,
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
+    needs_unsplit_forward,
     slice_bshd_contiguous_cp,
     slice_log_prob_with_cp,
     slice_with_cp,
@@ -566,7 +567,7 @@ def get_batch(
         # multimodal_train_inputs, so VL models with text-only batches still
         # land here — bridge skips vision embedding when image_grid_thw is None.
         has_mm_inputs = batch.get("multimodal_train_inputs") is not None
-        needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
+        needs_unsplit_input = needs_unsplit_forward(get_args(), has_mm_inputs or is_vl_model)
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
@@ -834,7 +835,17 @@ def get_batch(
 
     # Process multimodal training tensors if present
     multimodal_train_inputs = batch.get("multimodal_train_inputs", None)
-    if multimodal_train_inputs is not None:
+    if multimodal_train_inputs is not None and getattr(get_args(), "uses_packed_multimodal_inputs", False):
+        from relax.models.deepseekv41.thd.images import pack_image_inputs
+
+        if qkv_format != "thd":
+            raise ValueError("DeepSeek V4.1 packed image training requires --qkv-format thd")
+        batch["multimodal_train_inputs"] = pack_image_inputs(
+            multimodal_train_inputs,
+            [sample.numel() for sample in batch["unconcat_tokens"]],
+            include_pixels=mpu.is_pipeline_first_stage(),
+        )
+    elif multimodal_train_inputs is not None:
         multimodal_data = {}  # key -> concatenated tensor
         multimodal_num_items = {}  # key -> list of item counts per sequence
         tensor_dict_list = {}
@@ -1386,11 +1397,7 @@ def get_data_iterator(
         assert len(samples) == num_local_samples
         # Bridge pads each THD document before CP splitting, including text-only
         # batches of VL models. Plan with those physical lengths as well.
-        needs_unsplit_input = (
-            getattr(args, "is_vl_model", False)
-            or getattr(args, "uses_unsplit_forward", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
-        )
+        needs_unsplit_input = needs_unsplit_forward(args, rollout_data.get("multimodal_train_inputs") is not None)
         if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
             samples = [(length + alignment - 1) // alignment * alignment for length in samples]
@@ -1524,9 +1531,7 @@ def log_rollout_data(
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             args.qkv_format,
-            getattr(args, "is_vl_model", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
-            or getattr(args, "uses_unsplit_forward", False),
+            needs_unsplit_forward(args, rollout_data.get("multimodal_train_inputs") is not None),
         )
 
         for key, val in rollout_data.items():

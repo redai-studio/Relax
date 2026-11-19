@@ -53,13 +53,38 @@ def preserve_history_template(processor) -> str:
     return patched.template
 
 
+def verify_native_model(client, expected_name: str, checkpoint: Path) -> dict[str, str]:
+    """Native /generate has no model selector. Bind this run to the loaded HF checkpoint."""
+    origin = str(client.base_url).rstrip("/").removesuffix("/v1")
+    info = client.get(f"{origin}/model_info", cast_to=object)
+    name, path = info.get("served_model_name"), info.get("model_path")
+    if name != expected_name or not isinstance(path, str) or not path or not Path(path).is_absolute():
+        raise ValueError(f"SGLang reports served_model_name={name!r}, model_path={path!r}; expected {expected_name!r}")
+    server_path = Path(path)
+    if server_path != checkpoint.absolute() and not (
+        checkpoint.exists() and server_path.exists() and checkpoint.samefile(server_path)
+    ):
+        raise ValueError(f"SGLang loaded {path!r}, expected verified checkpoint {str(checkpoint)!r}")
+    return {"served_model_name": name, "model_path": path}
+
+
 class HTTPRunner:
     def __init__(self, processor_path: Path, client, model: str) -> None:
-        from transformers import AutoProcessor
+        from relax.utils.data.deepseek_v41 import DeepSeekV41Processor
+        from relax.utils.data.processing_utils import load_processor
 
-        self.processor = AutoProcessor.from_pretrained(processor_path, local_files_only=True)
-        self.template_sha256 = sha256(preserve_history_template(self.processor).encode())
-        self.chat_template_kwargs = inference_chat_kwargs(self.processor)
+        self.processor = load_processor(str(processor_path), local_files_only=True, trust_remote_code=True)
+        self.deepseek_v41 = isinstance(self.processor, DeepSeekV41Processor)
+        if self.deepseek_v41:
+            self.template_sha256 = sha256((processor_path / "encoding" / "encoding.py").read_bytes())
+            self.chat_template_kwargs = {"thinking_mode": "thinking", "drop_thinking": False}
+            self.image_factor = (
+                self.processor.image_processor.patch_size * self.processor.image_processor.vision_downsample_ratio
+            )
+        else:
+            self.template_sha256 = sha256(preserve_history_template(self.processor).encode())
+            self.chat_template_kwargs = inference_chat_kwargs(self.processor)
+            self.image_factor = self.processor.image_processor.patch_size * self.processor.image_processor.merge_size
         self.client, self.model = client, model
         self.requests: list[dict] = []
         self.error: str | None = None
@@ -92,56 +117,103 @@ class HTTPRunner:
             role = "assistant" if item["role"] == "model" else "user"
             hf_messages.append({"role": role, "content": hf_parts})
             messages.append({"role": role, "content": parts})
-        inputs = self.processor.apply_chat_template(
-            hf_messages,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            add_generation_prompt=True,
-            **self.chat_template_kwargs,
-        )
-        tokens = int(inputs["input_ids"].shape[-1])
+        if self.deepseek_v41:
+            from relax.utils.data.deepseek_v41 import render_conversation
+
+            text, _, order = render_conversation(
+                self.processor.tokenizer.deepseek_v41_model_dir, hf_messages, None, self.chat_template_kwargs
+            )
+            images = [
+                part["image"]
+                for msg in hf_messages
+                if isinstance(msg["content"], list)
+                for part in msg["content"]
+                if part["type"] == "image"
+            ]
+            tokens = self.processor.prompt_token_count(text, [images[i] for i in order])
+        else:
+            inputs = self.processor.apply_chat_template(
+                hf_messages,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                add_generation_prompt=True,
+                **self.chat_template_kwargs,
+            )
+            tokens = int(inputs["input_ids"].shape[-1])
         # Reserve one terminal token; SGLang rejects a request at the exact context boundary.
         remaining = 32768 - tokens - 1
         if remaining <= 0:
             self.error = "context_limit"
             raise ValueError("Complete history exceeds the 32K context budget; no history was truncated")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0,
-            max_tokens=remaining,
-            extra_body={"chat_template_kwargs": self.chat_template_kwargs},
-        )
-        if response.usage is not None and response.usage.prompt_tokens != tokens:
+        if self.deepseek_v41:
+            # SGLang's V4.1 OpenAI chat endpoint drops reasoning from earlier rounds.
+            # Native /generate accepts the exact compact prompt IDs, then expands each image once.
+            urls = [
+                part["image_url"]["url"]
+                for message in messages
+                if isinstance(message["content"], list)
+                for part in message["content"]
+                if part["type"] == "image_url"
+            ]
+            base = str(self.client.base_url).rstrip("/")
+            result = self.client.post(
+                base.removesuffix("/v1") + "/generate",
+                cast_to=object,
+                body={
+                    "input_ids": self.processor.tokenizer.encode(text, add_special_tokens=False),
+                    "image_data": [urls[i] for i in order],
+                    "sampling_params": {"temperature": 0, "max_new_tokens": remaining, "skip_special_tokens": False},
+                },
+            )
+            meta = result["meta_info"]
+            finish_reason = meta["finish_reason"]["type"]
+            usage = {"prompt_tokens": meta["prompt_tokens"], "completion_tokens": meta["completion_tokens"]}
+            usage["total_tokens"] = sum(usage.values())
+            text = result["text"].removesuffix(self.processor.tokenizer.eos_token)
+            if not text.startswith("<think>"):
+                text = "<think>" + text
+            model = self.model
+        else:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0,
+                max_tokens=remaining,
+                extra_body={"chat_template_kwargs": self.chat_template_kwargs},
+            )
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            usage = response.usage.model_dump() if response.usage else {}
+            text = choice.message.content or ""
+            reasoning = getattr(choice.message, "reasoning_content", None)
+            if reasoning:
+                text = "<think>" + reasoning + "</think>" + text
+            model = response.model
+        if usage and usage["prompt_tokens"] != tokens:
             self.error = "token_budget_mismatch"
             raise ValueError(
                 "Local and server prompt token counts differ; verify the shared template and image processing"
             )
-        choice = response.choices[0]
-        text = choice.message.content or ""
-        reasoning = getattr(choice.message, "reasoning_content", None)
-        if reasoning:
-            text = "<think>" + reasoning + "</think>" + text
         self.last_response = text
         self.requests.append(
             {
                 "input_tokens": tokens,
                 "max_tokens": remaining,
-                "finish_reason": choice.finish_reason,
-                "usage": response.usage.model_dump() if response.usage else None,
+                "finish_reason": finish_reason,
+                "usage": usage or None,
             }
         )
-        if choice.finish_reason == "length":
+        if finish_reason == "length":
             self.error = "context_limit"
             raise ValueError("Generation exhausted the 32K context budget")
-        if choice.finish_reason != "stop":
+        if finish_reason != "stop":
             self.error = "server_finish_error"
-            raise ValueError(f"Model server ended the response with finish_reason={choice.finish_reason!r}")
+            raise ValueError(f"Model server ended the response with finish_reason={finish_reason!r}")
         return {
             "candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": "STOP"}],
-            "modelVersion": response.model,
-            "usageMetadata": response.usage.model_dump() if response.usage else {},
+            "modelVersion": model,
+            "usageMetadata": usage,
         }
 
 

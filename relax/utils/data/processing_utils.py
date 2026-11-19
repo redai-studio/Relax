@@ -120,10 +120,13 @@ DEFAULT_PATCH_SIZE = 14
 
 
 def load_tokenizer(name_or_path: str, **kwargs):
+    has_v41_vision = False
     config_path = os.path.join(name_or_path, "config.json")
     if os.path.isfile(config_path):
         with open(config_path) as config_file:
-            model_type = json.load(config_file).get("model_type")
+            config = json.load(config_file)
+            model_type = config.get("model_type")
+            has_v41_vision = model_type == "deepseek_v41" and bool(config.get("vision_config"))
         if model_type in ("deepseek_v41", "deepseek_v41_text"):
             # Data-source workers do not import the Megatron backend that
             # normally registers this configuration-only HF compatibility shim.
@@ -131,6 +134,9 @@ def load_tokenizer(name_or_path: str, **kwargs):
 
             register_hf_config()
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    if has_v41_vision and kwargs.get("trust_remote_code"):
+        tokenizer.deepseek_v41_model_dir = os.path.abspath(name_or_path)
+        tokenizer.deepseek_v41_image_token_id = int(config["image_token_id"])
     # Multimodal models like Qwen3-Omni ship the chat template in a standalone
     # chat_template.json (loaded by AutoProcessor) rather than tokenizer_config.json,
     # so AutoTokenizer leaves chat_template unset. Backfill from the sidecar file.
@@ -388,6 +394,16 @@ def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:
 
 
 def load_processor(name_or_path: str, **kwargs):
+    config_path = os.path.join(name_or_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path) as f:
+            config = json.load(f)
+        if config.get("model_type") == "deepseek_v41" and config.get("vision_config"):
+            if not kwargs.get("trust_remote_code"):
+                raise ValueError("The DeepSeek-V4.1 processor uses checkpoint code; set trust_remote_code=True")
+            from relax.utils.data.deepseek_v41 import DeepSeekV41Processor
+
+            return DeepSeekV41Processor(load_tokenizer(name_or_path, **kwargs), config)
     try:
         proc = AutoProcessor.from_pretrained(name_or_path, **kwargs)
     except (OSError, ValueError) as e:

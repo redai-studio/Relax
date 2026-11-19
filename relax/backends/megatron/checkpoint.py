@@ -19,6 +19,7 @@ from megatron.training.global_vars import get_args
 
 from relax.engine.sft.runtime import is_rm_mode
 from relax.utils import megatron_bridge_utils
+from relax.utils.deepseek_v41_assets import FROZEN_BASE_RECORD, check_frozen_base
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
@@ -600,13 +601,32 @@ def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> None:
         raise RuntimeError(f"Lightweight LoRA checkpoint is incompatible with the current run: {details}")
 
 
+def _v41_multimodal_base(model) -> Path | None:
+    config = getattr(model[0], "config", None) if model else None
+    if (getattr(config, "v41_hf_config", None) or {}).get("vision_config"):
+        return Path(config.v41_hf_checkpoint)
+    return None
+
+
 def save_checkpoint(*args, lora_only: bool = False, **kwargs):
     """Save either the regular full DCP or a resumable LoRA-only DCP."""
+    model = args[1] if len(args) > 1 else kwargs["model"]
+    base = _v41_multimodal_base(model)
+    if base is not None:
+        from megatron.training.checkpointing import get_checkpoint_name
+
+        iteration = args[0] if args else kwargs["iteration"]
+        directory = Path(get_checkpoint_name(get_args().save, iteration, return_base_dir=True))
+
+        def record_base() -> None:
+            if not dist.is_initialized() or dist.get_rank(get_gloo_group()) == 0:
+                check_frozen_base(directory, base, record=True)
+
+        _collective_checkpoint_probe(record_base)
     if not lora_only:
         return _save_checkpoint_megatron(*args, **kwargs)
 
     runtime_args = get_args()
-    model = args[1] if len(args) > 1 else kwargs["model"]
     optimizer = args[2] if len(args) > 2 else kwargs.get("optimizer")
     _sync_hybrid_optimizer_checkpoint_steps(optimizer)
     trainable_names = _global_trainable_lora_parameter_names(model)
@@ -705,6 +725,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             logger.info("Applied compatibility fix for native-FP32 CPU-offloaded optimizer checkpoint load")
 
         def probe_metadata():
+            base = _v41_multimodal_base(ddp_model)
+            if base is not None:
+                check_frozen_base(Path(iter_dir), base)
+            elif (Path(iter_dir) / FROZEN_BASE_RECORD).is_file():
+                raise ValueError("This DCP requires the original composite DeepSeek V4.1 BF16 base.")
             common = _load_checkpoint_metadata(args, ddp_model, Path(iter_dir))
             if (Path(iter_dir) / ".metadata").is_file():
                 common = validate_native_checkpoint(

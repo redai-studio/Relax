@@ -21,6 +21,8 @@ from megatron.bridge.models.deepseek.deepseek_v4_bridge import _HCAlphaMapping, 
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.core.models.gpt import GPTModel
 
+from relax.utils.deepseek_v41_assets import V41_REPLICATED_LAYER_WEIGHTS
+
 from .configuration import V41_CONFIG_FIELDS, hf_config_dict, normalize_text_config
 from .provider import DeepSeekV41ModelProvider
 
@@ -120,27 +122,7 @@ class DeepSeekV41Bridge(MegatronModelBridge):
         ]
         mg = "decoder.layers.*."
         hf = "layers.*."
-        replicated = {
-            "input_layernorm.weight": "attn_norm.weight",
-            "pre_mlp_layernorm.weight": "ffn_norm.weight",
-            "self_attention.linear_q_down_proj.weight": "attn.wq_a.weight",
-            "self_attention.q_layernorm.weight": "attn.q_norm.weight",
-            "self_attention.linear_kv_proj.weight": "attn.wkv.weight",
-            "self_attention.kv_layernorm.weight": "attn.kv_norm.weight",
-            "self_attention.core_attention.compressor.linear_wkv.weight": "attn.compressor.wkv.weight",
-            "self_attention.core_attention.compressor.linear_wgate.weight": "attn.compressor.wgate.weight",
-            "self_attention.core_attention.compressor.norm.weight": "attn.compressor.norm.weight",
-            "self_attention.core_attention.indexer.linear_wq_b.weight": "attn.indexer.wq_b.weight",
-            "self_attention.core_attention.indexer.linear_weights_proj.weight": "attn.indexer.weights_proj.weight",
-            "self_attention.core_attention.indexer.linear_wk.weight": "attn.indexer.wk.weight",
-            "self_attention.core_attention.indexer.k_norm.weight": "attn.indexer.k_norm.weight",
-            "mlp.router.weight": "ffn.gate.weight",
-            "mlp.router.expert_bias": "ffn.gate.bias",
-            "v41_engram.linear_wkv.weight": "engram.wkv.weight",
-            "v41_engram.q_weight": "engram.q_weight",
-            "v41_engram.k_weight": "engram.k_weight",
-        }
-        mappings.extend(ReplicatedMapping(mg + key, hf + value) for key, value in replicated.items())
+        mappings.extend(ReplicatedMapping(mg + key, hf + value) for key, value in V41_REPLICATED_LAYER_WEIGHTS.items())
         mappings.extend(
             [
                 ColumnParallelMapping(mg + "self_attention.linear_q_up_proj.weight", hf + "attn.wq_b.weight"),

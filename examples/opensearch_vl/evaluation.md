@@ -7,6 +7,7 @@
 ## 固定协议
 
 - 官方`craigwu/vstar_bench`共191题，revision为`d9ae62c903da0c98336e85c5ee89cd863b04b4da`，题目及对应图片约281 MB。
+- [LMMs-Lab 的 Parquet 版](https://huggingface.co/datasets/lmms-lab-encoder/vstar-bench/tree/b44023b4dca749ed8a76b85eb576627d05a1c174) 的 191 行记录与上述版本逐行核对一致，包括题号、顺序、题文、选项、类别及答案。两份图片未逐张核验。下方命令读取官方 JSONL 和对应原图。
 - 使用`test_questions.jsonl`自带的选项及标签。参考标签只参与评分，不发送给模型，也不读取原始标注中的目标bbox作为工具参数。
 - 温度0、输入输出合计32K、最多10轮，每张显示图片最多1,024视觉token。两组保留完整历史，共用提示、工具与图像处理预算。
 - 工具为`crop(image, x, y, width, height)`；坐标采用当前显示图的整数像素，映射到该图对应的原始分辨率区域裁剪，再缩放显示。新图引用依次为`img_2`、`img_3`等。
@@ -29,9 +30,13 @@ source /path/to/benchmark.env
 
 `AGENT_PROVENANCE_FILE`为仓库外的模型来源记录。基座`kind=base`，SFT为`kind=trained-final`；记录完整训练分支/commit、实际训练量、`served_model_name`和可信文件hash。对照可信清单检查配置、权重索引及所有分片后，才可标记`hashes_verified=true`。服务名须与真实服务相同，不以目录存在代替校验。
 
+评测中期模型时，向评测器传入 `--label relax --checkpoint-step N`，来源文件须记录 `kind=trained-checkpoint` 和整数 `completed_updates=N`。将结果写入与 `base/vstar` 同级的 `checkpoint-stepN/vstar`，再向比较器传入 `--checkpoint-step N` 即可复用同一份 Base 评分。默认比较器继续读取 `relax/vstar` 并核实 `kind=trained-final`。如另传 `--training-overlap-index`，评测器还会依据该权重训练步数的样本索引保存独立去重审计。三组用于配对评分的 `--overlap-index` 必须相同。
+
+快速对照可给评测器和比较器传入同一份 `--case-manifest`。清单指定数据版本、官方题目文件 SHA-256 和互不重复的原始题号。评测记录清单 SHA-256，比较器逐条核验两组实际作答题号。复用已在加载的服务时，也可在该次输出目录的父目录预置 `vstar-run-plan.json`，用 `case_manifest` 指定清单的绝对路径。子集分数须标明分母，正式验收保留全量 191 题。
+
 ## 部署模型服务
 
-设置本组模型的显式HF目录，基座与SFT分别启动。两组使用相同图像处理和chat template规则；Qwen3-VL-8B-Instruct保留原生模板，Qwen3.5/3.6保留完整thinking历史。先生成服务与客户端共用的模板：
+设置本组模型的显式 HF 目录，基座与 SFT 分别启动。下面的命令用于 Qwen：Qwen3-VL-8B-Instruct 使用原生模板，Qwen3.5/3.6 保留完整 thinking 历史。
 
 ```bash
 export HF_CHECKPOINT=/path/to/base-or-final-hf
@@ -52,7 +57,23 @@ python3 examples/opensearch_vl/tools/serve_sglang.py \
   --chat-template "${BENCHMARK_CHAT_TEMPLATE}"
 ```
 
-按实际空卡和显存选择TP/DP；脚本名中的8卡是训练配置，benchmark模式只请求已有模型服务。保留原始`<tool_call>`文本，不启用会消费它的工具解析器。客户端核对包含全部历史图片的实际输入token数，32K内不做历史截断。
+DeepSeek-V4.1-Flash-1017 使用 BF16 基座或从训练 DCP 导出的独立 HF 目录。评测客户端读取目录内的 `encoding/encoding.py`，向 SGLang 的 `/generate` 提交原生 token ID 和每一轮图片。四层模型在单机 8×H800 上使用以下服务配置；共享 Engram 表约需要 95 GiB 主机内存。
+
+```bash
+export HF_CHECKPOINT=/path/to/deepseek-1017-4layer-base-or-trained-hf
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=shared \
+SGLANG_DSV4_FP4_EXPERTS=0 SGLANG_OPT_FP8_WO_A_GEMM=0 \
+SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 SGLANG_OPT_FUSE_WQA_WKV=0 \
+python -m sglang.launch_server \
+  --model-path "$HF_CHECKPOINT" --served-model-name benchmark-model \
+  --tp-size 8 --ep-size 8 --dtype bfloat16 --load-format auto \
+  --attention-backend dsv4 --context-length 32768 --image-processor-backend pil \
+  --mem-fraction-static 0.60 --max-running-requests 2 \
+  --disable-cuda-graph --disable-radix-cache --trust-remote-code \
+  --host 127.0.0.1 --port 30000
+```
+
+按实际空卡和显存选择 TP/DP。评测请求已有模型服务，保留原始 `<tool_call>` 文本。客户端核对包含全部历史图片的实际输入 token 数，并在 32K 预算内保留完整历史。
 
 ## 运行与比较
 

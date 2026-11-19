@@ -481,3 +481,45 @@ def test_gather_multimodal_metrics_weights_dp_samples_and_preserves_extrema(monk
     assert result["rollout/image_count/mean"] == pytest.approx(4 / 3)
     assert result["rollout/image_count/max"] == 3
     assert logged == [result]
+
+
+@pytest.mark.parametrize("first_stage", [True, False])
+def test_native_vision_thd_keeps_image_spans_across_cp_and_text_samples(monkeypatch, first_stage):
+    data = _load_data_module(monkeypatch)
+    args = Namespace(
+        loss_type="sft", is_vl_model=True, uses_packed_multimodal_inputs=True, cp_partition_mode="contiguous"
+    )
+    monkeypatch.setattr(data, "get_args", lambda: args)
+    monkeypatch.setattr(data, "PackedSeqParams", types.SimpleNamespace)
+    monkeypatch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda: 1, raising=False)
+    monkeypatch.setattr(data.mpu, "is_pipeline_first_stage", lambda: first_stage, raising=False)
+
+    # The image starts at global row 4 and crosses the contiguous CP boundary at row 8.
+    rows = [torch.arange(3), torch.tensor([11] + [99] * 8 + [13, 14])]
+    pixels = torch.randn(25, 3, 14, 14)
+    sample = {
+        "image_grid_hws": torch.tensor([[5, 5]]),
+        "image_spans": torch.tensor([[1, 8]]),
+    }
+    if first_stage:
+        sample["pixel_values"] = pixels
+    batch = {
+        "tokens": rows,
+        "total_lengths": [3, 11],
+        "response_lengths": [3, 11],
+        "loss_masks": [torch.tensor([0, 1, 1]), torch.tensor([0] * 9 + [1, 1])],
+        "multimodal_train_inputs": [None, sample],
+    }
+    out = data.get_batch(iter([(batch, None)]), ["tokens"], pad_multiplier=2, allgather_cp=True, is_vl_model=True)
+    assert "unsplit_tokens" not in out and "vlm_packed_seq_params" not in out
+    assert out["packed_seq_params"].valid_seqlens_q_cpu == [3, 11]
+    torch.testing.assert_close(out["tokens"], torch.tensor([[99, 99, 99, 99, 13, 14, 0, 0]]))
+    mm = out["multimodal_train_inputs"]
+    assert mm["image_spans"] == ((4, 8),)
+    assert mm["image_grid_hws"] == ((5, 5),)
+    if first_stage:
+        torch.testing.assert_close(mm["pixel_values"], pixels)
+    else:
+        assert "pixel_values" not in mm

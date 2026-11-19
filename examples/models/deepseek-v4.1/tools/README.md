@@ -2,15 +2,13 @@
 
 [English](./README.en.md)
 
-[convert_to_bf16.py](./convert_to_bf16.py) 将官方 DeepSeek-V4.1-Flash 的混合 FP8/FP4 HF checkpoint 转换为 Relax 纯文本训练和 rollout 使用的 BF16 HF checkpoint。SFT、RL、BSHD、THD 共用这一格式，无需为 THD 再转换一份。
+[convert_to_bf16.py](./convert_to_bf16.py) 将官方 DeepSeek-V4.1-Flash 的混合 FP8/FP4 HF checkpoint 转换为 BF16 HF 基座。准备 Flash-1017 冻结视觉塔的 SFT 时使用 `--keep-vision` 保留图文结构。默认模式用于已有纯文本训练和 rollout。
 
 ## 来源和转换范围
 
-此前使用的 `DeepSeek-V4.1-bf16` 来自官方 `deepseek-ai/DeepSeek-V4.1-Flash`，本地下载记录的 revision 为 `8b3cec70c307624fb098c3a04bdbfc118e7abda9`。旧实验归档中的 `convert_deepseek_v4_1_to_bf16-6f52e0b.py` 与 [Miles 提交 `6f52e0b`](https://github.com/radixark/miles/blob/6f52e0b3021484e8d6ad0d43c1074100adc8e4b9/tools/convert_deepseek_v4_1_to_bf16.py) 中的脚本相同；同目录 `convert-v41-bf16.log` 记录了成功转换。
+此前使用的 `DeepSeek-V4.1-bf16` 来自官方 `deepseek-ai/DeepSeek-V4.1-Flash`，本地下载记录的 revision 为 `8b3cec70c307624fb098c3a04bdbfc118e7abda9`。
 
-[Miles 文档](https://github.com/radixark/miles/blob/fa13e2ec42622f6e77aabd8e0c295ab8b4347eac/docs/models/deepseek/deepseek-v4-1-flash.md#L44-L53) 提到的 `dsv41_cut_cast.py` 不是当前 main 中可直接运行的文件。上面的历史提交补齐了专用转换器。本工具基于该实现，保留转换语义，移除 Miles 包依赖，改为逐张量转换、流式复制原始数据，并增加预检查和显式恢复。
-
-| 原始内容 | 输出处理 |
+| 原始内容 | 默认纯文本模式的输出处理 |
 | --- | --- |
 | Dense FP8 + 32×32 E8M0 scale | 反量化为 BF16，删除对应普通 scale |
 | Routed experts 的 packed FP4 + group-32 E8M0 scale | 反量化为 BF16，删除对应普通 scale |
@@ -19,11 +17,27 @@
 | `mtp.*`、`vision.*`、`aligner.*`、`image_*`、`.ffn.gate.bias_vl` | 丢弃 |
 | 配置 | 展开 `text_config`，移除量化配置、视觉配置及 `dspark_*`，设置 `num_nextn_predict_layers=0` |
 
-工具保留全部文本层及原层号，不提供减层重映射。它也不保留视觉头，不能用于准备 frozen-vision 多模态训练模型。已是 BF16 的四层模型无需运行此转换。
+## 准备保留视觉塔的 Flash-1017
 
-## 操作流程
+使用完整的 `deepseek-ai/DeepSeek-V4.1-Flash-1017` 快照。当前下载的 revision 为 `08c8657f02291e11b6f6b63e0e16014f8e748518`，与 `1bae0e1088993b9b82de08f59de5be5a34e42170` 的权重和配置相同，新增了 `chat_template.jinja`。在训练环境的 Relax 仓库根目录执行。`SOURCE_1017` 指向已下载的快照，`BASE_1017` 指向所有训练节点均可访问的新目录。
 
-在与仓库匹配的 Relax CU13 环境、仓库根目录执行。转换只使用 PyTorch 和已有 Relax 日志模块，不需要安装 Miles；默认在 CPU 上运行，也不需要启动 Ray。
+```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export SOURCE_1017=/path/to/DeepSeek-V4.1-Flash-1017
+export BASE_1017=/path/to/DeepSeek-V4.1-Flash-1017-bf16
+convert=(python examples/models/deepseek-v4.1/tools/convert_to_bf16.py
+  --model-dir "$SOURCE_1017" --save-dir "$BASE_1017" --keep-vision)
+"${convert[@]}" --check-only
+"${convert[@]}"
+```
+
+图文模式逐字节保留原始 `vision.*`、`aligner.*`、`image_start`、`image_end`、`image_newline` 和每个主干层的 `ffn.gate.bias_vl`，同时复制 composite 配置、tokenizer、官方 prompt 编码器、图像预处理器和视觉参考实现。转换时移除 draft MTP/DSpark。`conversion.json` 记录模式、源分片大小与修改时间、可取得的 HF 下载 revision 和 etag，以及资产摘要。中断后用同样的参数加 `--resume` 恢复。
+
+四层诊断模型使用单独的输出目录，在执行上述两条命令前向 `convert` 数组追加 `--decoder-layers 4`。它保留原生第 0 到 3 层、每层全部 384 个专家、整个视觉塔和第 1 层完整的 Engram 表与 scale，KV 和 index 源仍为第 2 层。候选过滤的源层在裁剪区间之外，因此关闭候选过滤。可对实际源 revision 执行 `--check-only` 估算空间。
+
+## 准备默认纯文本基座
+
+在与仓库匹配的 Relax CU13 环境中，从仓库根目录执行。转换器使用 PyTorch 和 Relax 日志模块，默认在 CPU 上独立运行。
 
 先准备一个固定 revision 的完整原始模型。下面的 revision 对应此前使用的基础版，不是 `Flash-1017`：
 
@@ -72,14 +86,20 @@ export HF_CKPT="$MODEL_DIR/DeepSeek-V4.1-bf16-new"
 
 训练仍直接从 HF 权重加载，不需要预先生成 Megatron `torch_dist` checkpoint。保留这份 BF16 base；续训和未来独立部署导出都需要其中的冻结 Engram 数据。
 
-## 训练结果导出为 HF 的现状
+## 将训练结果导出为 HF
 
-这里的工具只负责**原始量化 HF → BF16 HF**。训练保存的 Megatron `torch_dist` checkpoint 可用于续训；这与导出可独立加载的 HF 推理模型是两个步骤。
+在仓库根目录调用 CPU 导出器，`DCP_ITER` 选择要评测的训练迭代，`BASE_1017` 指向这次训练实际使用的只读 BF16 目录。训练在迭代目录记录 `v41-frozen-base.json`，恢复和导出时会核对资产摘要与分片名、大小和修改时间。迁移基座时需保留文件修改时间。请为完整 HF 模型准备足够的空间，并使用新的输出目录。
 
-截至 Miles 提交 `fa13e2e`，官方有通用 [DCP → HF exporter](https://github.com/radixark/miles/blob/fa13e2ec42622f6e77aabd8e0c295ab8b4347eac/tools/convert_torch_dist_to_hf.py) 及 [V4.1 参数映射](https://github.com/radixark/miles/blob/fa13e2ec42622f6e77aabd8e0c295ab8b4347eac/miles/backends/megatron_utils/megatron_to_hf/deepseekv4_1.py)，但尚未给出完整 V4.1 部署导出 recipe。该映射跳过冻结 Engram table/scale，而 exporter 的资产复制也跳过原始 safetensors；仅运行通用 exporter 不会自动得到包含冻结表的完整独立模型。
+```bash
+export DCP_ITER=/path/to/checkpoints/iter_0000100
+export HF_EXPORT=/path/to/new-hf-export
+convert=(python scripts/tools/convert_checkpoint_to_hf_cpu.py
+  --input-dir "$DCP_ITER" --origin-hf-dir "$BASE_1017" --output-dir "$HF_EXPORT"
+  --allow-base-fallback vision --allow-base-fallback engram)
+"${convert[@]}" --dry-run
+"${convert[@]}"
+```
 
-Relax 当前也尚未接通这条完整导出路径：[V4.1 Bridge](../../../../relax/models/deepseekv41/bridge.py) 明确设置 `SUPPORTS_HF_PRETRAINED_EXPORT=False`，现有 CPU exporter 的模型映射不包含 V4.1。不能直接套用其他模型的通用导出命令。
+导出器从 DCP 全局分片重建语言权重，包括 routed/shared experts、mHC 与可训练的 Engram 投影。显式指定的两个 fallback 组仅允许从基座逐字节补回冻结视觉资产、图像路由 bias 和冻结 Engram 表。产物包含独立索引、处理器、tokenizer、原 composite 配置以及保持训练保存 dtype 的浮点权重。`conversion-result.json` 列出从基座补回的张量及 DCP 与基座之间的 dtype 差异。旧版 flat 纯文本模型只需 `--allow-base-fallback engram`。
 
-完整导出需要将训练 checkpoint 的参数映射回 V4.1 HF 名称，从**同一次训练的 BF16 base** 原样补齐冻结 Engram 四个张量，保留必要的 FP32 参数，重建 index/config/tokenizer，并验证重新加载后的数值。在线同步到 SGLang 成功不等于这些离线导出步骤已经实现。
-
-导出的 BF16 HF 与官方原始 FP8/FP4 部署包也不同；若希望恢复低精度部署权重，还需要单独的重新量化及推理精度验证，不能只把原始 `quantization_config` 加回去。
+导出精度以同一步训练 checkpoint 为参照。在 Megatron 和独立冷加载 HF 的 SGLang 上，用同一图文输入和相同的 assistant 监督位置比较平均负对数似然。若要衡量原始量化格式改用 BF16 对整模效果的影响，应在训练前分别评测原始 40 层 1017 和 40 层 BF16 基座。四层实验的测量结果见[八卡验证记录](../../../../docs/draft/deepseek-v41-1017-frozen-vision-thd-plan.md)。

@@ -53,6 +53,7 @@ from .cp_utils import (
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
+    needs_unsplit_forward,
     slice_log_prob_with_cp,
 )
 from .score_centering import (
@@ -733,9 +734,7 @@ def compute_advantages_and_returns(
     padded_total_lengths: list[int] | None = maybe_padded_total_lengths(
         total_lengths,
         args.qkv_format,
-        getattr(args, "is_vl_model", False)
-        or rollout_data.get("multimodal_train_inputs") is not None
-        or getattr(args, "uses_unsplit_forward", False),
+        needs_unsplit_forward(args, rollout_data.get("multimodal_train_inputs") is not None),
     )
 
     # return when not the last pp stage.

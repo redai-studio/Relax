@@ -119,6 +119,7 @@ from .collective_utils import _agree_drained
 from .cp_utils import (
     all_gather_with_cp,
     maybe_padded_total_lengths,
+    needs_unsplit_forward,
     slice_bshd_contiguous_cp,
     slice_with_cp,
     warmup_pipeline_process_group,
@@ -1132,7 +1133,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # the forward uses get_batch's per-sample slice_with_cp (2*cp align) + global
             # tp*data_pad_size_multiplier pad, so mirror the corresponding layout here.
             padded_total_lengths = maybe_padded_total_lengths(
-                [t.shape[0] for t in tokens], self.args.qkv_format, getattr(self.args, "is_vl_model", False)
+                [t.shape[0] for t in tokens], self.args.qkv_format, needs_unsplit_forward(self.args)
             )
             if self.args.qkv_format == "bshd":
                 rollout_routed_experts = _pack_bshd_routing_replay(
@@ -1314,7 +1315,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 padded_total_lengths = maybe_padded_total_lengths(
                     [t.shape[0] for t in tokens],
                     self.args.qkv_format,
-                    getattr(self.args, "is_vl_model", False),
+                    needs_unsplit_forward(self.args),
                 )
                 if padded_total_lengths is not None:
                     per_sample_topk = [
@@ -3944,9 +3945,7 @@ class MegatronTrainRayActor(TrainRayActor):
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             self.args.qkv_format,
-            getattr(self.args, "is_vl_model", False)
-            or "multimodal_train_inputs" in rollout_data
-            or getattr(self.args, "uses_unsplit_forward", False),
+            needs_unsplit_forward(self.args, "multimodal_train_inputs" in rollout_data),
         )
         if padded_total_lengths is None:
             padded_total_lengths = [None] * len(total_lengths)

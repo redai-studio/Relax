@@ -158,6 +158,16 @@ def test_hash_ids_match_independent_ngram_reference_and_sample_padding() -> None
     torch.testing.assert_close(actual[1, :1], module.hash_ids(input_ids[1:2, :1])[0])
 
 
+def test_image_slots_end_ngram_history_and_receive_padding_hashes() -> None:
+    module = _bare_engram()
+    module.image_token_id = 3
+    tokens = torch.tensor([[1, 2, 3, 1, 2]])
+    hashes = module.hash_ids(tokens)
+    torch.testing.assert_close(hashes[:, 2:3], module.hash_ids(torch.tensor([[0]])))
+    torch.testing.assert_close(hashes[:, 3:], module.hash_ids(tokens[:, 3:]))
+    torch.testing.assert_close(hashes[:, :2], module.hash_ids(tokens[:, :2]))
+
+
 def test_thd_hash_matches_independent_samples_and_ignores_previous_sample() -> None:
     from relax.models.deepseekv41.thd.engram import hash_ids_thd
     from relax.models.deepseekv41.thd.layout import ThdLayout

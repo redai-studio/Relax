@@ -21,12 +21,16 @@ def main() -> None:
     if args.max_samples_per_split < 0:
         parser.error("--max-samples-per-split must be nonnegative")
     from relax.engine.sft.dataset.streaming import SFTStreamingDataset
+    from relax.utils.data.deepseek_v41 import DeepSeekV41Processor
     from relax.utils.data.processing_utils import load_processor
     from relax.utils.data.processor_pool import ProcessorPool
     from relax.utils.multimodal.config import MultimodalConfig
 
-    processor = load_processor(str(args.model), local_files_only=True)
+    processor = load_processor(str(args.model), local_files_only=True, trust_remote_code=True)
     tokenizer = processor.tokenizer
+    image_token_id = getattr(processor, "image_token_id", None)
+    if image_token_id is None:
+        image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     reports = []
     pool = ProcessorPool(
         str(args.model),
@@ -43,7 +47,7 @@ def main() -> None:
                 tool_key="tools",
                 multimodal_keys={"image": "images"},
                 prefetch_max_cached=0,
-                pad_token_ids=[tokenizer.convert_tokens_to_ids("<|image_pad|>")],
+                pad_token_ids=[image_token_id],
                 apply_chat_template_kwargs={"preserve_thinking": True},
             )
             indices = list(range(len(dataset)))
@@ -62,10 +66,30 @@ def main() -> None:
                         for thinking in re.findall(r"<think>(.*?)</think>", message["content"], re.DOTALL):
                             if thinking.strip() and thinking.strip() not in decoded:
                                 raise ValueError(f"Reasoning supervision missing in {row['id']}")
+                image_summary = {}
+                features = processed.multimodal_train_inputs or {}
+                if isinstance(processor, DeepSeekV41Processor) and row["images"]:
+                    spans = features["image_spans"].tolist()
+                    grids = features["image_grid_hws"].tolist()
+                    if len(spans) != len(row["images"]) or len(grids) != len(spans):
+                        raise ValueError(f"Image count mismatch in {row['id']}")
+                    if sum(length for _, length in spans) != ids.count(image_token_id):
+                        raise ValueError(f"Unaccounted image tokens in {row['id']}")
+                    previous_end = 0
+                    for start, length in spans:
+                        if length <= 0 or start < previous_end or start + length > len(ids):
+                            raise ValueError(f"Invalid image span in {row['id']}")
+                        if any(t != image_token_id for t in ids[start : start + length]):
+                            raise ValueError(f"Misaligned image span in {row['id']}")
+                        if processed.loss_mask[start : start + length].any():
+                            raise ValueError(f"Image supervision in {row['id']}")
+                        previous_end = start + length
+                    image_summary = {"image_spans": spans, "image_grid_hws": grids}
                 reports.append(
                     {
                         "id": row["id"],
                         "split": split,
+                        **image_summary,
                         "tokens": len(ids),
                         "learned_tokens": len(learned),
                         "input_ids_sha256": digest(ids),

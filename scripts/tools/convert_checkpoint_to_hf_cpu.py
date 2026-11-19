@@ -11,9 +11,10 @@ the HF configuration and rejects unsupported architectures or tensors.
 Input batches default to 2 GiB and use four concurrent file readers. The memory
 budget can split batches further; an indivisible conversion can exceed the batch
 target but must still fit the budget. --cpu-threads controls tensor operations,
-independently of --read-workers. One batch is prefetched when the memory budget
-allows it. --no-prefetch disables overlap. Missing frozen tensors stream through
-a bounded copy buffer. Load and write work can overlap; load_wait measures the
+independently of --read-workers. --prefetch-batches controls the number of upcoming
+batches loaded concurrently within the memory budget (default one). --no-prefetch
+disables overlap. Missing frozen tensors stream through a bounded copy buffer.
+Load and write work can overlap; load_wait measures the
 main thread's wait. Write time is included in append/frozen/finalize, and
 preflight is excluded from seconds.
 """
@@ -28,21 +29,32 @@ import os
 import re
 import resource
 import shutil
+import stat
 import struct
 import sys
 import tempfile
 import time
+from bisect import bisect_right
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import replace
+from itertools import accumulate
 from pathlib import Path
+from threading import local
 from typing import Any
 
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from relax.utils.deepseek_v41_assets import (
+    FROZEN_BASE_RECORD,
+    NATIVE_VISION_FILES,
+    check_frozen_base,
+    validate_vision_entry,
+    vision_tensor_shapes,
+)
 from relax.utils.logging_utils import get_logger
 from scripts.tools.convert_checkpoint_mapping import Conversion, TensorSlice, build_conversions, model_key
 from scripts.tools.convert_checkpoint_reader import READ_BLOCK_BYTES, prepare_range_reads, read_tensor_range
@@ -280,6 +292,24 @@ def _reader_workspace(
     return workspace
 
 
+def _prefetch_plan(
+    current_buffers: list[int], load_buffers: list[int], depth: int, budget: int
+) -> tuple[list[int], int]:
+    """Last batch that may be in flight while each current batch is converted."""
+    cumulative = list(accumulate(load_buffers))
+    ends = list(range(len(current_buffers)))
+    peak = max(current_buffers)
+    for current in range(len(ends) - 2, -1, -1):
+        # A future already submitted here can still own its input and reader
+        # workspace when a later batch with larger mapping/writer buffers starts.
+        last = min(current + depth, ends[current + 1])
+        limit = cumulative[current] + max(0, budget - current_buffers[current])
+        end = bisect_right(cumulative, limit, current, last + 1) - 1
+        ends[current] = end
+        peak = max(peak, current_buffers[current] + cumulative[end] - cumulative[current])
+    return ends, peak
+
+
 def load_slices(reader: Any, items: tuple[TensorSlice, ...], metadata: Any) -> dict[str, Any]:
     import torch
     import torch.distributed.checkpoint as dcp
@@ -453,7 +483,7 @@ def _fallback_group(key: str) -> str | None:
     return None
 
 
-def _copy_assets(source: Path, output: Path) -> None:
+def _copy_assets(source: Path, output: Path, native_vision: bool = False) -> None:
     names = {
         "config.json",
         "generation_config.json",
@@ -469,6 +499,11 @@ def _copy_assets(source: Path, output: Path) -> None:
         "video_preprocessor_config.json",
         "chat_template.json",
     }
+    if native_vision:
+        for asset in NATIVE_VISION_FILES:
+            (output / asset).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / asset, output / asset)
+        names.update(path.name for path in source.glob("LICENSE*"))
     for item in source.iterdir():
         if item.is_file() and (item.name in names or item.suffix in (".model", ".tiktoken", ".jinja", ".py")):
             shutil.copyfile(item, output / item.name)
@@ -486,6 +521,7 @@ def export_checkpoint(
     batch_bytes: int = 2 * 1024**3,
     read_workers: int = 4,
     prefetch: bool = True,
+    prefetch_batches: int = 1,
     allow_base_fallback: tuple[str, ...] = (),
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -495,8 +531,8 @@ def export_checkpoint(
     if torch.cuda.is_initialized() or torch.distributed.is_initialized():
         raise RuntimeError("CPU conversion must run without CUDA or a distributed process group")
     preflight_started = time.monotonic()
-    if min(shard_bytes, memory_budget, batch_bytes, read_workers) <= 0:
-        raise ValueError("Shard size, memory budget, batch size and read workers must be positive")
+    if min(shard_bytes, memory_budget, batch_bytes, read_workers, prefetch_batches) <= 0:
+        raise ValueError("Shard size, memory budget, batch size, read workers and prefetch batches must be positive")
     checkpoint, model, output = resolve_checkpoint(checkpoint), model.resolve(), output.resolve()
     if output.exists():
         raise FileExistsError(f"Output already exists: {output}; choose a fresh output directory")
@@ -505,6 +541,12 @@ def export_checkpoint(
     config = json.loads((model / "config.json").read_text())
     if config.get("quantization_config") or config.get("text_config", {}).get("quantization_config"):
         raise ValueError("Quantized source models are not supported")
+    v41 = config.get("model_type") in ("deepseek_v41", "deepseek_v41_text")
+    native_vision = v41 and bool(config.get("vision_config"))
+    if native_vision:
+        check_frozen_base(checkpoint, model)
+    elif (checkpoint / FROZEN_BASE_RECORD).is_file():
+        raise ValueError("This DCP requires the original composite DeepSeek V4.1 BF16 base.")
     fingerprint = hashlib.sha256((checkpoint / ".metadata").read_bytes()).hexdigest()
     reader = make_reader(checkpoint, read_workers)
     metadata = reader.read_metadata()
@@ -577,7 +619,24 @@ def export_checkpoint(
                 dtype_changes[name] = {"base": schema[name]["dtype"], "export": dtype}
             expected_schema[name] = {"shape": list(tensor.shape), "dtype": dtype}
     missing = sorted(schema.keys() - expected.keys())
-    forbidden = [key for key in missing if _fallback_group(key) not in allow_base_fallback]
+    if v41:
+        # Only the non-persistent, explicitly frozen model assets may come from the base.
+        groups = {}
+        for layer in config.get("text_config", config).get("engram_layer_ids", ()):
+            for field, allowed in (("weight", ("F8_E4M3", "U8")), ("scale", ("F8_E8M0", "U8"))):
+                name = f"layers.{layer}.engram.embed.{field}"
+                if schema.get(name, {}).get("dtype") not in allowed:
+                    raise ValueError(f"Missing or invalid frozen V4.1 Engram tensor: {name}")
+                groups[name] = "engram"
+        if native_vision:
+            for name, shape in vision_tensor_shapes(config).items():
+                if name not in schema:
+                    raise ValueError(f"Missing native vision tensor: {name}")
+                validate_vision_entry(name, schema[name], shape)
+                groups[name] = "vision"
+        forbidden = [key for key in missing if groups.get(key) not in allow_base_fallback]
+    else:
+        forbidden = [key for key in missing if _fallback_group(key) not in allow_base_fallback]
     if forbidden:
         raise ValueError(
             f"Missing {len(forbidden)} HF tensors; base fallback is disabled for these keys: {forbidden[:5]}"
@@ -591,14 +650,14 @@ def export_checkpoint(
     batch_read_buffers = [read_workspace(batch) for batch in batches]
     batch_inputs = [sum(input_bytes[i] for i in batch) for batch in batches]
     batch_buffers = [size + max(extra_bytes[i] for i in batch) for size, batch in zip(batch_inputs, batches)]
-    overlap_buffers = [
-        current + following + read_bytes
-        for current, following, read_bytes in zip(batch_buffers, batch_inputs[1:], batch_read_buffers[1:])
-    ]
-    prefetch_after = [prefetch and size <= memory_budget for size in overlap_buffers]
+    load_buffers = [size + read_bytes for size, read_bytes in zip(batch_inputs, batch_read_buffers)]
+    prefetch_ends, overlap_peak = _prefetch_plan(
+        batch_buffers, load_buffers, prefetch_batches if prefetch else 0, memory_budget
+    )
+    max_prefetched = max(end - i for i, end in enumerate(prefetch_ends))
     reservation = max(
         max(size + read_bytes for size, read_bytes in zip(batch_buffers, batch_read_buffers)),
-        max((size for size, enabled in zip(overlap_buffers, prefetch_after) if enabled), default=0),
+        overlap_peak,
         copy_buffer_bytes,
     )
     report = {
@@ -611,7 +670,8 @@ def export_checkpoint(
         "base_fallback_keys": missing,
         "max_input_bytes": max(input_bytes),
         "load_batches": len(batches),
-        "prefetched_batches": sum(prefetch_after),
+        "prefetched_batches": sum(end > i for i, end in enumerate(prefetch_ends)),
+        "max_prefetched_batches": max_prefetched,
         "copy_buffer_bytes": copy_buffer_bytes,
         "batch_bytes": batch_bytes,
         "peak_batch_input_bytes": max(sum(input_bytes[i] for i in batch) for batch in batches),
@@ -624,6 +684,12 @@ def export_checkpoint(
         "metadata_sha256": fingerprint,
         "dtype_changes": dtype_changes,
     }
+    if v41:
+        report["base_sha256"] = {
+            name: hashlib.sha256((model / name).read_bytes()).hexdigest()
+            for name in ("config.json", "model.safetensors.index.json", "conversion.json")
+            if (model / name).is_file()
+        }
     if reservation > memory_budget:
         raise ValueError(
             f"Planned buffers need {reservation / 1024**3:.1f} GiB, above budget {memory_budget / 1024**3:.1f} GiB; increase --memory-budget-gb. This excludes Python and OS overhead."
@@ -636,23 +702,35 @@ def export_checkpoint(
     started = time.monotonic()
     timing = {"preflight": started - preflight_started, "load": 0.0, "load_wait": 0.0, "map": 0.0, "append": 0.0}
 
+    readers = local()
+    readers.reader = reader
+
     def load_batch(batch: list[int]) -> tuple[dict[str, Any], float]:
         begin = time.monotonic()
-        state = load_slices(reader, tuple(item for i in batch for item in jobs[i].inputs), metadata)
+        if not hasattr(readers, "reader"):
+            # DCP sets storage_data on its reader during each load; the parsed
+            # metadata and range descriptions are immutable and can be shared.
+            readers.reader = make_reader(checkpoint, read_workers, range_records)
+            readers.reader.read_metadata = lambda: metadata
+        state = load_slices(readers.reader, tuple(item for i in batch for item in jobs[i].inputs), metadata)
         return state, time.monotonic() - begin
 
     try:
         writer = ShardWriter(staging, shard_bytes)
-        with ThreadPoolExecutor(max_workers=1) as loader:
-            future = None
+        with ExitStack() as cleanup:
+            loader = ThreadPoolExecutor(max_workers=max(1, max_prefetched))
+            pending = {}
+            cleanup.callback(pending.clear)
+            cleanup.callback(loader.shutdown, cancel_futures=True)
+            submitted = -1
             for number, batch in enumerate(batches):
                 phase_started = time.monotonic()
-                state, elapsed = load_batch(batch) if future is None else future.result()
-                future = None
+                state, elapsed = pending.pop(number).result() if number in pending else load_batch(batch)
                 timing["load_wait"] += time.monotonic() - phase_started
                 timing["load"] += elapsed
-                if number < len(prefetch_after) and prefetch_after[number]:
-                    future = loader.submit(load_batch, batches[number + 1])
+                for following in range(max(submitted, number) + 1, prefetch_ends[number] + 1):
+                    pending[following] = loader.submit(load_batch, batches[following])
+                submitted = prefetch_ends[number]
                 for i in batch:
                     job = jobs[i]
                     phase_started = time.monotonic()
@@ -688,7 +766,7 @@ def export_checkpoint(
         timing["append_frozen"] = time.monotonic() - phase_started
         timing["frozen_read"] = writer.copy_read_seconds
         phase_started = time.monotonic()
-        _copy_assets(model, staging)
+        _copy_assets(model, staging, native_vision)
         writer.finish()
         _, actual = read_hf_schema(staging)
         if actual != expected_schema:
@@ -707,6 +785,13 @@ def export_checkpoint(
             distributed_initialized=torch.distributed.is_initialized(),
         )
         (staging / "conversion-result.json").write_text(json.dumps(report, indent=2) + "\n")
+        if native_vision:
+            # Safetensors uses private temporary files. Publish all trained/frozen
+            # shards with the same umask-derived permissions as the HF metadata.
+            file_mode = stat.S_IMODE((staging / "model.safetensors.index.json").stat().st_mode)
+            for filename in set(writer.weight_map.values()):
+                (staging / filename).chmod(file_mode)
+            staging.chmod(stat.S_IMODE((staging / "inference").stat().st_mode))
         if output.exists():
             raise FileExistsError(output)
         staging.rename(output)
@@ -729,7 +814,13 @@ def main() -> None:
         "--memory-budget-gb", type=float, default=64, help="Conservative tensor-buffer budget in GiB, not an RSS limit"
     )
     parser.add_argument("--cpu-threads", type=int, default=2)
-    parser.add_argument("--read-workers", type=int, default=4, help="Concurrent checkpoint file readers")
+    parser.add_argument("--read-workers", type=int, default=4, help="Concurrent checkpoint file readers per batch")
+    parser.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=1,
+        help="Maximum upcoming load batches in flight within the memory budget",
+    )
     parser.add_argument(
         "--no-prefetch", action="store_true", help="Disable memory-budgeted overlap of loading and writing"
     )
@@ -741,7 +832,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--allow-base-fallback",
-        choices=("vision", "ple", "mtp"),
+        choices=("vision", "ple", "mtp", "engram"),
         action="append",
         default=[],
         help="Explicitly copy missing tensors in this group from the exact training base",
@@ -770,6 +861,7 @@ def main() -> None:
         memory_budget=int(args.memory_budget_gb * 1024**3),
         batch_bytes=int(args.load_batch_size_gb * 1024**3),
         read_workers=args.read_workers,
+        prefetch_batches=args.prefetch_batches,
         prefetch=not args.no_prefetch,
         allow_base_fallback=tuple(args.allow_base_fallback),
         dry_run=args.dry_run,
