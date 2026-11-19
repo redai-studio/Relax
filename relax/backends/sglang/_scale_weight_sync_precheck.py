@@ -7,7 +7,44 @@ import datetime
 import json
 import os
 import socket
+import subprocess
 import sys
+
+
+def transport_fingerprint() -> dict:
+    return {
+        f"nccl_{name}": os.getenv(f"NCCL_{name.upper()}")
+        for name in ("ib_disable", "socket_ifname", "ib_hca", "ib_gid_index")
+    }
+
+
+def launch_probe(
+    master_address: str, port: str, rank: int, world_size: int, device: int, timeout: float, token: str, **popen_kwargs
+) -> subprocess.Popen:
+    """Start one isolated rank on the caller's assigned GPU."""
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            __name__,
+            "--master-address",
+            master_address,
+            "--master-port",
+            port,
+            "--rank",
+            str(rank),
+            "--world-size",
+            str(world_size),
+            "--device-id",
+            str(device),
+            "--timeout-secs",
+            str(timeout),
+            "--run-token",
+            token,
+        ],
+        start_new_session=True,
+        **popen_kwargs,
+    )
 
 
 def main() -> int:
@@ -27,12 +64,7 @@ def main() -> int:
         "device_id": args.device_id,
         "hostname": socket.gethostname(),
         "run_token": args.run_token,
-        "fingerprint": {
-            "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
-            "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
-            "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
-            "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
-        },
+        "fingerprint": transport_fingerprint(),
     }
     process_group_initialized = False
     try:

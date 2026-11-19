@@ -322,46 +322,45 @@ def test_failed_receiver_ack_keeps_the_sender_group_for_abort(monkeypatch):
     assert updater._model_update_groups is None
 
 
-@pytest.mark.parametrize("file_unavailable", [False, True])
-def test_colocate_precheck_uses_sender_device_and_every_receiver_rank(monkeypatch, file_unavailable):
+@pytest.mark.parametrize("launch_fails", [False, True])
+def test_colocate_precheck_uses_sender_device_and_every_receiver_rank(monkeypatch, launch_fails):
     from relax.backends.megatron.weight_update import update_weight_from_distributed as distributed
 
     receivers = [Mock(), Mock()]
     for receiver in receivers:
-        receiver.get_scale_weight_sync_transport_fingerprint.remote.return_value = {}
-        receiver.run_scale_weight_sync_precheck.remote.return_value = {"success": True, "stopped": True}
-    monkeypatch.setattr(distributed, "os", SimpleNamespace(environ={}))
+        receiver.run_scale_weight_sync_precheck.remote.return_value = {
+            "success": True,
+            "stopped": True,
+            "fingerprint": {},
+        }
     monkeypatch.setattr(distributed.device_utils, "get_dist_backend", lambda: "nccl")
     monkeypatch.setattr(distributed.torch.cuda, "current_device", lambda: 3)
     monkeypatch.setattr(distributed.torch.cuda, "mem_get_info", lambda device: (1 << 30, 1 << 30))
     monkeypatch.setattr(distributed.ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
     monkeypatch.setattr(distributed.ray, "get", lambda refs, **kwargs: refs)
-    monkeypatch.setattr(distributed.ray, "wait", lambda refs, **kwargs: (refs, []))
     launch = Mock(return_value=Mock(wait=Mock(return_value=0), poll=Mock(return_value=0)))
-    monkeypatch.setattr(distributed.subprocess, "Popen", launch)
+    monkeypatch.setattr(distributed, "launch_probe", launch)
 
-    if file_unavailable:
-        monkeypatch.setattr(distributed.tempfile, "TemporaryFile", Mock(side_effect=OSError("FD limit")))
-        assert distributed.precheck_colocate_receiver(receivers, [2, 2], timeout=30) == (False, True, True, ())
-        launch.assert_not_called()
+    if launch_fails:
+        launch.side_effect = OSError("FD limit")
+        assert distributed.precheck_colocate_receiver(receivers, 2, timeout=30) == (False, True, ())
         for receiver in receivers:
             receiver.run_scale_weight_sync_precheck.remote.assert_not_called()
         return
 
-    assert distributed.precheck_colocate_receiver(receivers, [2, 2], timeout=30) == (True, True, True, ())
+    monkeypatch.delenv("NCCL_IB_DISABLE", raising=False)
+    assert distributed.precheck_colocate_receiver(receivers, 2, timeout=30) == (True, True, ())
+    receivers[0].run_scale_weight_sync_precheck.remote.return_value["fingerprint"] = {"nccl_ib_disable": "1"}
+    assert distributed.precheck_colocate_receiver(receivers, 2, timeout=30) == (False, True, ())
 
-    command = launch.call_args.args[0]
-    assert command[command.index("--device-id") + 1] == "3"
-    assert command[command.index("--world-size") + 1] == "5"
-    assert command[command.index("--rank") + 1] == "0"
+    _, port, rank, world_size, device, _, _ = launch.call_args.args
+    assert (rank, world_size, device) == (0, 5, 3)
     receiver_calls = [receiver.run_scale_weight_sync_precheck.remote.call_args.kwargs for receiver in receivers]
     assert [(call["group_rank"], call["tp_size"], call["world_size"]) for call in receiver_calls] == [
         (1, 2, 5),
         (3, 2, 5),
     ]
-    assert all(
-        call["ports"].split(",") == [command[command.index("--master-port") + 1]] * 2 for call in receiver_calls
-    )
+    assert all(call["ports"].split(",") == [port] * 2 for call in receiver_calls)
 
 
 @pytest.mark.parametrize("geometry", [(256, 2048, 512), (256, 7168, 2048)])

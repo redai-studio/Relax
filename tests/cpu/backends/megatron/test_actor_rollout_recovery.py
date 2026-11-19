@@ -164,14 +164,13 @@ def test_colocate_admission_probes_before_requesting_full_snapshot(monkeypatch):
     acquire_full = Mock(side_effect=[({"precheck": (4, engines, 2, 130)}, None), (final_snapshot, None)])
     actor.rollout_manager = SimpleNamespace(
         acquire_colocate_full=SimpleNamespace(remote=acquire_full),
-        finish_colocate_precheck=Mock(),
     )
-    probe = Mock(return_value=(False, True, True, ()))
+    probe = Mock(return_value=(False, True, ()))
     monkeypatch.setattr(actor_module, "precheck_colocate_receiver", probe)
     monkeypatch.setattr(actor_module, "time", SimpleNamespace(time=lambda: 120))
     monkeypatch.setattr(actor_module.ray, "get_runtime_context", lambda: SimpleNamespace(current_actor=source))
     monkeypatch.setattr(actor_module.ray, "get", lambda ref: ref)
 
     assert actor._acquire_colocate_full() is final_snapshot
-    probe.assert_called_once_with(engines, [2, 2], 10)
-    actor.rollout_manager.finish_colocate_precheck.remote.assert_called_once_with(4, False, True, True, ())
+    probe.assert_called_once_with(engines, 2, 10)
+    assert [c.args for c in acquire_full.call_args_list] == [(source, None), (source, (4, False, True, ()))]

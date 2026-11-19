@@ -8,7 +8,6 @@ import multiprocessing
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -31,6 +30,7 @@ except ImportError:
     # imports working, but fail closed if S3 streaming is requested.
     _SGLANG_LOAD_FORMAT_CHOICES = None
 
+from relax.backends.sglang._scale_weight_sync_precheck import launch_probe, transport_fingerprint
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
@@ -1569,12 +1569,7 @@ class SGLangEngine(RayActor):
         """The engine's NCCL transport env — a cheap fingerprint (no NCCL, no
         subprocess) for the Stage-1 seed-vs-new compatibility gate before the
         real probe."""
-        return {
-            "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
-            "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
-            "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
-            "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
-        }
+        return transport_fingerprint()
 
     def run_scale_weight_sync_precheck(
         self,
@@ -1695,44 +1690,33 @@ class SGLangEngine(RayActor):
             if timeout_secs <= 0:
                 return {"success": False, "category": PrecheckProbeCategory.TIMEOUT.value, "results": []}
         deadline = time.monotonic() + timeout_secs
+        terminate = scale_utils._terminate_probe_process
+        if world_size is not None:
+            terminate = functools.partial(terminate, grace_secs=0.1)
         processes = []
         log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
         for local_rank, port in enumerate(port_list):
-            command = [
-                sys.executable,
-                "-m",
-                "relax.backends.sglang._scale_weight_sync_precheck",
-                "--master-address",
-                master_address,
-                "--master-port",
-                port,
-                "--rank",
-                str(group_rank if world_size is None else group_rank + local_rank),
-                "--world-size",
-                str(world_size or 2),
-                "--device-id",
-                str(local_rank),
-                "--timeout-secs",
-                str(timeout_secs),
-                "--run-token",
-                f"{run_token}-{local_rank}",
-            ]
             try:
                 log_path = os.path.join(log_directory.name, f"rank-{local_rank}.log")
                 log_file = open(log_path, "w", encoding="utf-8")
-                process = subprocess.Popen(
-                    command,
+                process = launch_probe(
+                    master_address,
+                    port,
+                    group_rank if world_size is None else group_rank + local_rank,
+                    world_size or 2,
+                    local_rank,
+                    timeout_secs,
+                    f"{run_token}-{local_rank}",
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     env=env,
-                    start_new_session=True,
                 )
                 processes.append((local_rank, process, log_file, log_path))
             except Exception as exc:
                 if "log_file" in locals() and not log_file.closed:
                     log_file.close()
                 for _, process, process_log, _ in processes:
-                    scale_utils._terminate_probe_process(process, grace_secs=0.1 if world_size is not None else 2.0)
+                    terminate(process)
                     process_log.close()
                 log_directory.cleanup()
                 return {
@@ -1755,7 +1739,7 @@ class SGLangEngine(RayActor):
             timed_out = {local_rank for local_rank, process, _, _ in processes if process.poll() is None}
             for local_rank, process, _, _ in processes:
                 if local_rank in timed_out:
-                    scale_utils._terminate_probe_process(process, grace_secs=0.1 if world_size is not None else 2.0)
+                    terminate(process)
 
             results = []
             for local_rank, process, log_file, log_path in processes:
@@ -1814,18 +1798,12 @@ class SGLangEngine(RayActor):
                 "error": failed[0].get("error") if failed else None,
                 "run_token": run_token,
                 "memory": memory_results,
-                "fingerprint": {
-                    "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
-                    "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
-                    "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
-                    "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
-                    "visible_devices": selected_visible,
-                },
+                "fingerprint": {**transport_fingerprint(), "visible_devices": selected_visible},
                 "results": results,
             }
         finally:
             for _, process, log_file, _ in processes:
-                scale_utils._terminate_probe_process(process, grace_secs=0.1 if world_size is not None else 2.0)
+                terminate(process)
                 try:
                     log_file.close()
                 except Exception:
