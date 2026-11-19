@@ -348,6 +348,7 @@ def get_model_provider_func(
 
     if args.megatron_to_hf_mode == "bridge":
         is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
+        is_glm53_flash = type(provider).__name__ == "GLM53FlashModelProvider"
         if is_kimi_k3:
             from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
 
@@ -469,6 +470,10 @@ def get_model_provider_func(
         args_dict = vars(args)
         for attr in vars(provider):
             if attr in args_dict and attr in bridge_keys:
+                # Flash maps each HF block to separate attention and FFN layers.
+                # The CLI count/frequency describes HF blocks for argument validation.
+                if is_glm53_flash and attr in {"num_layers", "moe_layer_freq"}:
+                    continue
                 if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
                     continue
                 old_val = getattr(provider, attr)
@@ -594,8 +599,22 @@ def get_model_provider_func(
                 )
                 provider.apply_dsa_kernel_fusion = want_fusion
 
+        if is_glm53_flash and getattr(args, "loss_type", None) == "sft":
+            if provider.context_parallel_size != 1 or getattr(args, "qkv_format", "thd") != "thd":
+                raise ValueError("GLM-5.3-Flash SFT requires packed THD batches with context parallel size 1.")
+            if not getattr(args, "enable_mtp_training", False):
+                # The HF checkpoint contains a draft block, but ordinary SFT
+                # consumes only the main model logits and supplies no MTP labels.
+                provider.mtp_num_layers = None
+                provider.mtp_hybrid_override_pattern = None
+                provider.mtp_use_repeated_layer = False
+
         _validate_linear_cp_mode(args, provider)
         provider.finalize()
+        if is_glm53_flash:
+            # MCore records the source architecture in checkpoint args. Bridge
+            # owns the physical layout, so the CLI never sees this pattern.
+            args.hybrid_layer_pattern = provider.hybrid_layer_pattern
 
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
         if not dist.is_initialized() or dist.get_rank() == 0:

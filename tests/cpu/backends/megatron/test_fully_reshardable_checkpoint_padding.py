@@ -56,3 +56,27 @@ def test_fully_reshardable_checkpoint_slices_coalesced_optimizer_states():
         compact_start = compact_end
     assert optimizer.buffers[0].param_index_map is param_index_map
     assert param_index_map == original_indices
+
+
+def test_dp_reshardable_load_skips_alignment_padding_and_restores_next_bucket():
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    parameter = torch.nn.Parameter(torch.zeros(4))
+    restored = {}
+
+    def restore(model_param, state):
+        restored[model_param] = state["exp_avg"]
+
+    optimizer = SimpleNamespace(
+        data_parallel_group=SimpleNamespace(rank=lambda: 0, size=lambda: 2),
+        buffers=[SimpleNamespace(buckets=[SimpleNamespace(grad_data=torch.empty(8), numel_unpadded=8)] * 2)],
+        gbuf_ranges=[{torch.float32: [{"param_map": {}}, {"param_map": {parameter: {}}}]}],
+        _set_main_param_and_optimizer_states=restore,
+    )
+    exp_avg = torch.arange(1.0, 5.0)
+    state = {0: {torch.float32: [[{"padding": True}], [{"padding": False, "exp_avg": exp_avg}]]}}
+
+    DistributedOptimizer.load_parameter_state_from_dp_reshardable(optimizer, state)
+
+    assert list(restored) == [parameter]
+    torch.testing.assert_close(restored[parameter], exp_avg)
