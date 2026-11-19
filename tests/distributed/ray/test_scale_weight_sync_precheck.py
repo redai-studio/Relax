@@ -509,8 +509,12 @@ def test_actor_probe_timeout_terminates_and_reaps_every_child():
         created.append(process)
         return process
 
+    attempted = set()
+
     def _terminate(process):
-        process.returncode = -9
+        if process in attempted:
+            process.returncode = -9
+        attempted.add(process)
 
     with (
         patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=_popen),
@@ -529,6 +533,7 @@ def test_actor_probe_timeout_terminates_and_reaps_every_child():
 
     assert result["success"] is False
     assert result["category"] == "timeout"
+    assert result["stopped"] is True
     # Timed-out children are terminated in-loop (fast join) AND again in the
     # finally safety-net; both calls are idempotent on an already-dead process.
     assert terminate.call_count == 4

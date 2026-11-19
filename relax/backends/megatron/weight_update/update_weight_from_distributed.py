@@ -433,12 +433,20 @@ def connect_rollout_engines_from_distributed(
 
 
 def disconnect_rollout_engines_from_distributed(
-    args, group_name, model_update_groups, rollout_engines, *, strict: bool = False
+    args,
+    group_name,
+    model_update_groups,
+    rollout_engines,
+    *,
+    strict: bool = False,
+    on_local_destroy: Callable[[], None] | None = None,
 ):
     """Destroy NCCL on training and engines."""
     kwargs = {"strict": True} if strict else {}
     refs = [engine.destroy_weights_update_group.remote(group_name, **kwargs) for engine in rollout_engines]
     dist.destroy_process_group(model_update_groups)
+    if on_local_destroy is not None:
+        on_local_destroy()
     results = ray.get(refs, timeout=35) if strict else ray.get(refs)
     if strict and any(not isinstance(result, dict) or result.get("success") is not True for result in results):
         raise RuntimeError(f"Engine did not acknowledge destruction of weight-update group {group_name}")

@@ -2924,8 +2924,18 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
     def disconnect_colocate_weight_group(self, name: str) -> None:
-        self.weight_updater.disconnect_distributed_group(name)
+        try:
+            self.weight_updater.disconnect_distributed_group(name)
+        except Exception:
+            self._report_failed_colocate_full(name)
+            raise
         ray.get(self.rollout_manager.acknowledge_colocate_group_removed.remote(name))
+
+    def _report_failed_colocate_full(self, name: str) -> None:
+        try:
+            ray.get(self.rollout_manager.fail_colocate_full.remote(name), timeout=5)
+        except Exception:
+            logger.exception("[Colocate FULL] Could not report failure of %s", name)
 
     def abort_colocate_weight_group(self, name: str) -> None:
         self.weight_updater.abort_colocate_group(name)
@@ -3019,10 +3029,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self._sync_rollout_weights(snapshot)
         except Exception:
             if snapshot and snapshot["group_name"] and dist.get_rank(get_gloo_group()) == 0:
-                try:
-                    ray.get(self.rollout_manager.fail_colocate_full.remote(snapshot["group_name"]), timeout=5)
-                except Exception:
-                    logger.exception("[Colocate FULL] Could not report failure of %s", snapshot["group_name"])
+                self._report_failed_colocate_full(snapshot["group_name"])
             raise
 
     def _sync_rollout_weights(self, snapshot: dict | None) -> None:

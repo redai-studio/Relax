@@ -313,13 +313,17 @@ class UpdateWeightFromTensor:
             raise RuntimeError(f"Removal of weight-update group {group_name} failed without all acknowledgments")
         if self._model_update_groups is None or (group_name is not None and self._group_name != group_name):
             return
+        # Remote acknowledgments can fail after the local handle has been destroyed.
+        strict = group_name is not None
+        cleanup = {"on_local_destroy": lambda: setattr(self, "_model_update_groups", None)} if strict else {}
         try:
             disconnect_rollout_engines_from_distributed(
                 self.args,
                 self._group_name,
                 self._model_update_groups,
                 self.distributed_rollout_engines,
-                strict=group_name is not None,
+                strict=strict,
+                **cleanup,
             )
         except Exception:
             self._uncertain_group_removal = group_name
