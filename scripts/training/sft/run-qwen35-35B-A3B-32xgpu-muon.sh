@@ -44,35 +44,11 @@ CHECKPOINT_DIR="${SAVE_DIR}/${EXP_NAME}"
 TRAIN_STEPS="${TRAIN_STEPS:-200}"
 
 # Share native libraries while keeping preprocessing and training thread limits separate.
-ENV_JSON="$(python3 - "$MULTIMODAL" "$TASK_NAME" <<'PYENV'
+ENV_JSON="$(python3 - "$MULTIMODAL" <<'PYENV'
 import json
 import os
 import sys
 from pathlib import Path
-
-# Shared with all train workers; keep the image and training preloads intact.
-runtime_dir = Path(os.environ["SAVE_DIR"]).resolve() / ".relax-runtime" / sys.argv[2]
-if os.environ.get("DRY_RUN") != "1":
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    (runtime_dir / "_relax_tilelang_nvcc.py").write_text('''\
-def install(args: object) -> None:
-    import os
-    from tilelang.contrib import nvcc
-    from relax.utils.logging_utils import get_logger
-
-    original = getattr(nvcc, "get_nvcc_subprocess_env", None)
-    if not callable(original):
-        raise RuntimeError("TileLang lacks get_nvcc_subprocess_env; cannot isolate NVCC preloads")
-
-    def compiler_environment() -> dict[str, str]:
-        original_env = original()
-        env = dict(os.environ if original_env is None else original_env)
-        env.pop("LD_PRELOAD", None)
-        return env
-
-    nvcc.get_nvcc_subprocess_env = compiler_environment
-    get_logger(__name__).info("TileLang NVCC preload isolation enabled; training LD_PRELOAD is unchanged")
-''')
 
 def build_environment() -> dict[str, str]:
     """Select only the optimized job's native libraries, including Ray
@@ -88,7 +64,6 @@ def build_environment() -> dict[str, str]:
         if not Path(p).name.startswith(("libnccl.so", "libcublas.so", "libcublasLt.so"))
     ]
     env = {key: os.environ[key] for key in ("PYTHONPATH", "PYTHONDONTWRITEBYTECODE") if key in os.environ}
-    env["PYTHONPATH"] = f"{runtime_dir}:{env.get('PYTHONPATH', '')}"
     env.update(
         {
             "LD_PRELOAD": ":".join(
@@ -310,7 +285,7 @@ PERF_ARGS=(
     --expert-model-parallel-size 8
     --expert-tensor-parallel-size 1
     --max-tokens-per-gpu 262144
-    --custom-megatron-init-path _relax_tilelang_nvcc.install
+    --custom-megatron-init-path relax.models.qwen3_5.tilelang_nvcc.install
     --custom-megatron-before-train-step-hook-path relax.models.qwen3_5.recipe.before_step
 )
 
