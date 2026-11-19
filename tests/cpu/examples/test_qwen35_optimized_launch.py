@@ -132,3 +132,34 @@ def test_wholepack_can_be_disabled_without_disabling_model_optimizations(entry, 
         "relax.models.qwen3_5.recipe.before_step"
     )
     assert "--overlap-dispatch-backward-with-experts-wgrad" in argv
+
+
+def test_muon_expanded_sample_limit_preserves_long_singletons():
+    import torch
+
+    from relax.engine.sft.dataset.streaming import apply_oversize_strategy
+    from relax.utils.misc import load_function
+
+    script = ROOT / "scripts/training/sft/run-qwen36-35B-A3B-32xgpu-muon.sh"
+    env = dict(os.environ, DRY_RUN="1", MODEL_DIR="/model", DATA_DIR="/data", SAVE_DIR="/checkpoints")
+    argv = json.loads(subprocess.check_output(["bash", str(script), "--multimodal"], env=env))["argv"]
+    strategy = argv[argv.index("--sft-oversize-strategy") + 1]
+    hook = load_function(argv[argv.index("--sft-oversize-custom-function-path") + 1]) if strategy == "custom" else None
+    budget = int(argv[argv.index("--max-tokens-per-gpu") + 1])
+
+    for length in (budget + 1, 524288, 524289):
+        tokens = torch.zeros(1, dtype=torch.long).expand(length)
+        mask = torch.ones(1, dtype=torch.long).expand(length)
+        result = apply_oversize_strategy(
+            tokens=tokens,
+            loss_mask=mask,
+            capacity=budget,
+            strategy=strategy,
+            custom_fn=hook,
+            idx=0,
+            has_multimodal=True,
+        )
+        if length > 524288:
+            assert result is None
+        else:
+            assert result[0] is tokens and result[1] is mask

@@ -3,8 +3,9 @@
 # Qwen3.6-35B-A3B multimodal SFT on 4 x 8 Blackwell GPUs with Megatron Muon.
 # Every training node needs the optimized Blackwell image with FlashQLA, patched FLA 0.5.2, DeepEP v2 and emerging-optimizers
 # compatible with the image's Megatron. These packages must be available to the Ray training workers.
-# Expanded DeepEP requires each EP8 group on one NVLink node and at most 131072 input rows per rank after TP splitting.
-# Default Wholepack also needs the TransferQueue assignment_transform patch on the data service.
+# Expanded DeepEP requires each EP8 group on one NVLink node. TP4 keeps long samples intact through 524288
+# expanded tokens (131072 rows per rank) and skips longer samples before packing.
+# Default Wholepack requires the TransferQueue assignment_transform patch in the Ray job driver's Python environment.
 # Set QWEN35_WHOLEPACK=0 to use binpack with an unpatched TransferQueue.
 # MODEL_DIR=/models/Qwen3.6-35B-A3B DATA_DIR=/data/parquet SAVE_DIR=/checkpoints \
 #   bash scripts/training/sft/run-qwen36-35B-A3B-32xgpu-muon.sh
@@ -138,7 +139,8 @@ SFT_ARGS=(
     --global-batch-size "${GLOBAL_BATCH_SIZE:-800}"
     --seq-length 262144
     --max-tokens-per-gpu 262144
-    --sft-oversize-strategy keep
+    --sft-oversize-strategy custom
+    --sft-oversize-custom-function-path relax.utils.data.wholepack_policy.keep_within_tp4_deepep_capacity
     --sft-invalid-multimodal-strategy error
     --use-dynamic-batch-size
     --balance-data

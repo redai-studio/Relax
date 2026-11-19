@@ -1,8 +1,18 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Scheduling geometry for whole-pack Qwen3.5 training."""
 
+from functools import partial
+
+from relax.engine.sft.dataset.oversize import keep_within_sequence_limit
+
+
 GLOBAL_BATCH_SIZE = 1600
 EXPERT_PARALLEL_SIZE = 8
+EXPANDED_ROWS_PER_RANK = 131072
+
+# The TP4/CP1 recipe splits padded tokens across four ranks. Both the
+# singleton limit and the packing budget are multiples of its 4096-token alignment.
+keep_within_tp4_deepep_capacity = partial(keep_within_sequence_limit, seq_length=4 * EXPANDED_ROWS_PER_RANK)
 
 
 def resolve_tp(dp_size: int, tp_size: int | None) -> int:
