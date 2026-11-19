@@ -1465,6 +1465,11 @@ def train_one_step(
                 forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
                 forward_kwargs["loss_mask"] = None
 
+            if getattr(get_model_config(model), "relax_minimax_text_sft", False):
+                # MiniMax Bridge returns a (tensor, mask) pair with an input mask.
+                # CP=1 text SFT uses the unchanged batch mask in the loss callback.
+                forward_kwargs["loss_mask"] = None
+
             # VL model with text-only batch has is_vl_model=True but no
             # multimodal_train_inputs in batch — no kwargs to splice in.
             mm_inputs = batch.get("multimodal_train_inputs")

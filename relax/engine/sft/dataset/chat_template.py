@@ -31,6 +31,7 @@ from relax.engine.sft.dataset.gemma4_chat_template_patch import (
     GEMMA4_SFT_TOOL_TURN_BOUNDARY_SENTINEL,
     try_patch_gemma4_thinking,
 )
+from relax.engine.sft.dataset.minimax_chat_template_patch import try_patch_minimax_chat_template
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
     is_qwen38_chat_template,
     split_qwen38_leading_thinking,
@@ -49,7 +50,12 @@ logger = get_logger(__name__)
 # form for the purpose of marking assistant-token spans, so they should be
 # recognised as the same marker.
 _GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
-_CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template, try_patch_deepseek_chat_template, try_patch_gemma4_thinking)
+_CHAT_TEMPLATE_PATCHERS = (
+    try_patch_qwen_chat_template,
+    try_patch_deepseek_chat_template,
+    try_patch_gemma4_thinking,
+    try_patch_minimax_chat_template,
+)
 _FALLBACK_WARNED: set[int] = set()  # tokenizer id → warned once
 _EMPTY_THINK_UNSUPPORTED_WARNED: set[int] = set()  # tokenizer id → warned once
 _TEMPLATE_LOGGED: set[tuple[int, int, str]] = set()  # tokenizer id + template hash + preserve mode
