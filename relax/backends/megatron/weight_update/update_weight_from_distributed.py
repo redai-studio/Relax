@@ -97,7 +97,7 @@ class UpdateWeightFromDistributed:
         self._model_update_groups = None
 
     @torch.no_grad()
-    def update_weights(self) -> None:
+    def update_weights(self, *, resume_generation: bool = True) -> None:
         """Pause → flush → non-expert (TP) → expert (EP) → continue.
 
         Progress on PP source.
@@ -155,7 +155,8 @@ class UpdateWeightFromDistributed:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            if resume_generation:
+                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
     def _update_weight_from_distributed(

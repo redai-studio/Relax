@@ -1,0 +1,13 @@
+{
+  "mode": "delta",
+  "stream": "qwen3-0.6b-normal-ab",
+  "store_root": "store",
+  "canonical_root": "canonical",
+  "chunk_bytes": 1048576,
+  "compression": true,
+  "anchor_interval": 20,
+  "host_budget_bytes": 4294967296,
+  "disk_budget_bytes": 549755813888,
+  "sync_timeout_s": 1800,
+  "full_only": false
+}
