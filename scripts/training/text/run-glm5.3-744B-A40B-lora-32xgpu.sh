@@ -7,7 +7,8 @@
 # MODEL_DIR, DATA_DIR and SAVE_DIR must be visible on all nodes.
 # Use an explicit BF16 export; the original GLM-5.3 release has FP8 metadata.
 # Submit through the established cluster entrypoint, for example:
-#   bash scripts/entrypoint/ray-job.sh scripts/training/text/run-glm5.3-744B-A40B-lora-32xgpu.sh
+#   MODEL_DIR=... DATA_DIR=... SAVE_DIR=... EVAL_DATA=... RAY_JOB_ADDRESS=http://ray-head:8265 \
+#     bash scripts/entrypoint/ray-job.sh scripts/training/text/run-glm5.3-744B-A40B-lora-32xgpu.sh
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -17,7 +18,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"
 MODEL_NAME="${MODEL_NAME:-glm53-base-dequant-bf16}"
-: "${EVAL_DATA:?Set EVAL_DATA to the fixed evaluation JSONL}"
+if [[ -z "${EVAL_CONFIG:-}" ]]; then
+    : "${EVAL_DATA:?Set EVAL_DATA to the fixed evaluation JSONL or provide EVAL_CONFIG}"
+fi
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/dapo-math}"
 EXP_NAME="${EXP_NAME:-glm53-dapo-lora-32xgpu-colocate}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
@@ -175,7 +178,6 @@ fi
 # Interval >=2 preserves initial eval/0.jsonl (the first update also has id 0).
 EVAL_ARGS=(
     --eval-interval "${EVAL_INTERVAL:-20}"
-    --eval-prompt-data "${EVAL_NAME:-validation}" "${EVAL_DATA}"
     --n-samples-per-eval-prompt 1
     --eval-temperature 0
     --eval-top-p 1
@@ -183,6 +185,8 @@ EVAL_ARGS=(
 )
 if [[ -n "${EVAL_CONFIG:-}" ]]; then
     EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
+else
+    EVAL_ARGS+=(--eval-prompt-data "${EVAL_NAME:-validation}" "${EVAL_DATA}")
 fi
 # Optional: start training immediately while retaining periodic evaluation.
 if [[ "${SKIP_EVAL_BEFORE_TRAIN:-0}" == "1" ]]; then

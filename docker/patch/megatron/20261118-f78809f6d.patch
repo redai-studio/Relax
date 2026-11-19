@@ -3392,7 +3392,7 @@ index 6680aab..66a4a11 100644
                      output_layer=self.output_layer,
                      output_weight=output_weight,
 diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/hybrid/hybrid_block.py
-index deea03b..03ac526 100644
+index deea03b..b094dfe 100644
 --- a/megatron/core/models/hybrid/hybrid_block.py
 +++ b/megatron/core/models/hybrid/hybrid_block.py
 @@ -53,7 +53,7 @@ from megatron.core.transformer.residual_recompute import (
@@ -3417,20 +3417,6 @@ index deea03b..03ac526 100644
                  layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
              self.layers.append(layer)
  
-@@ -730,7 +734,12 @@ class HybridStack(MegatronModule):
- 
-         with outer_fp8_context:
-             if self.config.recompute_granularity == 'full' and self.training:
--                hidden_states = checkpointed_forward(
-+                checkpoint_impl = checkpointed_forward
-+                if any(getattr(layer, "_relax_qsa_attention_retained", False) for layer in self.layers):
-+                    from relax.models.qwen3_8.qsa_split_recompute import qsa_split_checkpointed_forward
-+
-+                    checkpoint_impl = qsa_split_checkpointed_forward
-+                hidden_states = checkpoint_impl(
-                     self,
-                     hidden_states=hidden_states,
-                     attention_mask=attention_mask,
 diff --git a/megatron/core/optimizer/clip_grads.py b/megatron/core/optimizer/clip_grads.py
 index 2e0ff0f..be550a3 100644
 --- a/megatron/core/optimizer/clip_grads.py
@@ -3770,7 +3756,7 @@ index 41fb343..81ac69d 100644
              DSAIndexerLossAutoScaler,
          )
 diff --git a/megatron/core/recompute.py b/megatron/core/recompute.py
-index 0ee01f0..05413c5 100644
+index 0ee01f0..f0c38b9 100644
 --- a/megatron/core/recompute.py
 +++ b/megatron/core/recompute.py
 @@ -1,5 +1,5 @@
@@ -3812,7 +3798,17 @@ index 0ee01f0..05413c5 100644
                      if isinstance(layer, TransformerLayer):
                          hidden_states, context = layer(**layer_kwargs)
                      elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
-@@ -246,6 +261,8 @@ def checkpointed_forward(
+@@ -185,6 +200,9 @@ def checkpointed_forward(
+     def chunk_runner(start: int, end: int, use_checkpoint: bool):
+         nonlocal hidden_states, context
+         cf = custom(start, end)
++        if end == start + 1 and getattr(self.layers[start], "_relax_qsa_attention_retained", False):
++            # The layer retains attention and controls its own MLP recomputation.
++            use_checkpoint = False
+         if use_checkpoint and self.config.enable_mhc_connections:
+             # mHC expands the block input and its zero-dropout BDA path can return views.
+             # Distributed activation checkpointing replaces the first input's .data, which
+@@ -246,6 +264,8 @@ def checkpointed_forward(
                  layer_idx >= recompute_skip_num_layers
                  and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
              )
@@ -7595,7 +7591,7 @@ index bdf9145..785f7ca 100644
                  num_local_experts=self.num_local_experts,
                  router_topk=self.tp_size * self.config.moe_router_topk,
 diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
-index 0be6203..0ecdaf1 100644
+index 0be6203..8b87f5a 100644
 --- a/megatron/core/transformer/multi_token_prediction.py
 +++ b/megatron/core/transformer/multi_token_prediction.py
 @@ -1778,7 +1778,10 @@ def _compute_mtp_acceptance_counts(
@@ -7844,23 +7840,29 @@ index 0be6203..0ecdaf1 100644
  class MultiTokenPredictionLayer(MegatronModule):
      """The implementation for Multi-Token Prediction (MTP) which extends
      the prediction scope to multiple future tokens at each position.
-@@ -2912,6 +2947,15 @@ class MultiTokenPredictionLayer(MegatronModule):
-             fill_values.append(False)
-             sequence_fields.append("mtp_input_mask")
- 
-+        if mtp_input_mask is not None:
+@@ -2907,8 +2942,11 @@ class MultiTokenPredictionLayer(MegatronModule):
+             fill_values.append(True)
+             sequence_fields.append("padding_mask")
+         if mtp_input_mask is not None:
+-            assert mtp_input_mask.shape == input_ids.shape, "MTP input mask must match token IDs."
+-            tensors_to_roll.append(mtp_input_mask.bool())
 +            if mtp_input_mask.dtype != torch.bool:
 +                raise ValueError("MTP conditioning mask must be boolean")
 +            if mtp_input_mask.shape != input_ids.shape or mtp_input_mask.device != input_ids.device:
 +                raise ValueError("MTP conditioning mask must match input_ids shape and device")
 +            tensors_to_roll.append(mtp_input_mask)
-+            fill_values.append(False)
-+            sequence_fields.append("mtp_input_mask")
-+
-         rolled_tensors = roll_tensor(
-             tensors_to_roll,
-             shifts=-1,
-@@ -2952,12 +2996,23 @@ class MultiTokenPredictionLayer(MegatronModule):
+             fill_values.append(False)
+             sequence_fields.append("mtp_input_mask")
+ 
+@@ -2944,20 +2982,28 @@ class MultiTokenPredictionLayer(MegatronModule):
+                 .contiguous()
+             )
+         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+-        if mtp_input_mask is not None:
+-            valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
+-            decoder_input = torch.where(valid_decoder_input, decoder_input, decoder_input.detach())
+         if self.config.sequence_parallel and not getattr(
+             embedding, "scatter_to_sequence_parallel", True
          ):
              decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
  
@@ -7871,7 +7873,7 @@ index 0be6203..0ecdaf1 100644
 +                tp_size = self.tp_group.size() if self.tp_group is not None else 1
 +                if not self.config.sequence_parallel or tp_size <= 1 or valid.shape[0] != decoder_input.shape[0] * tp_size:
 +                    raise ValueError("MTP conditioning mask does not match the embedding sequence layout")
-+                valid = tensor_parallel.scatter_to_sequence_parallel_region(valid, group=self.tp_group)
++                valid = scatter_to_sequence_parallel_region(valid, group=self.tp_group)
 +            if valid.shape[:2] != decoder_input.shape[:2]:
 +                raise ValueError("MTP conditioning mask does not match the embedding batch/sequence layout")
 +            decoder_input = torch.where(valid, decoder_input, decoder_input.detach())
@@ -7886,7 +7888,7 @@ index 0be6203..0ecdaf1 100644
          # checkpointing requires at least one differentiable tensor input, so keep
          # MTP parameter gradients enabled explicitly.
          if not hidden_states.requires_grad:
-@@ -3973,8 +4028,11 @@ class MultiTokenPredictionBlock(MegatronModule):
+@@ -3973,8 +4019,11 @@ class MultiTokenPredictionBlock(MegatronModule):
          else:
              hidden_states = hidden_states_list[offset]
  
@@ -7900,7 +7902,7 @@ index 0be6203..0ecdaf1 100644
  
          hidden_state_mixing_enabled = self.config.mtp_hsm and self.training
          if hidden_state_mixing_enabled:
-@@ -4118,6 +4176,7 @@ class MultiTokenPredictionBlock(MegatronModule):
+@@ -4118,6 +4167,7 @@ class MultiTokenPredictionBlock(MegatronModule):
          hidden_states = torch.cat(hidden_states_list, dim=0)
          return hidden_states
  
@@ -8848,7 +8850,7 @@ index 7b53fae..9d8e9d5 100755
          """Set input tensor to be used instead of forward()'s input.
  
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 6f16f80..8b9e5b5 100644
+index 6f16f80..725fec3 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
 @@ -75,6 +75,8 @@ class TransformerConfig(ModelParallelConfig):
@@ -8960,6 +8962,15 @@ index 6f16f80..8b9e5b5 100644
  
      ####################
      # initialization
+@@ -1469,7 +1550,7 @@ class TransformerConfig(ModelParallelConfig):
+     and P2P communications in high-level CP groups (e.g., via IBLink).
+     """
+ 
+-    linear_cp_mode: Optional[Literal["headwise", "chunkwise"]] = None
++    linear_cp_mode: Optional[Literal["headwise", "chunkwise", "all_gather"]] = None
+     """Linear-attention CP algorithm. Unset uses chunkwise for dev GDN/KDA and
+     legacy HybridModel configurations, and headwise for other layer families.
+     Explicit settings take precedence. Layer-specific config views preserve Mamba's
 @@ -1615,6 +1696,18 @@ class TransformerConfig(ModelParallelConfig):
      num_residual_streams: int = 4
      """Number of residual streams (n in paper)."""
@@ -9815,7 +9826,7 @@ index aa7ec93..2bb4dc5 100644
              if self.moe_layer_recompute and self.training:
                  output = precision_aware_checkpoint(
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 8b9e5b5..2d00514 100644
+index 725fec3..8a378cd 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
 @@ -1148,9 +1148,13 @@ class TransformerConfig(ModelParallelConfig):

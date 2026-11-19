@@ -7,7 +7,8 @@
 # MODEL_DIR, DATA_DIR and SAVE_DIR must be visible on all nodes.
 # For GLM-5.3 set MODEL_NAME=GLM-5.3-BF16 (the default GLM-5.3 release is FP8).
 # Submit through the established cluster entrypoint, for example:
-#   bash scripts/entrypoint/ray-job.sh scripts/training/text/run-glm5.2-744B-A40B-128xgpu.sh
+#   MODEL_DIR=... DATA_DIR=... SAVE_DIR=... RAY_JOB_ADDRESS=http://ray-head:8265 \
+#     bash scripts/entrypoint/ray-job.sh scripts/training/text/run-glm5.2-744B-A40B-128xgpu.sh
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"

@@ -220,9 +220,7 @@ RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router
 # The complete CUDA patch retains its provenance in the final image.
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/megatron.patch
 RUN cd /root/Megatron-LM && \
-    profiles=common && \
-    if [ "$PATCH_VERSION" = latest ]; then profiles="common cu13"; fi && \
-    for profile in $profiles; do \
+    for profile in common cu13; do \
         sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply --check - && \
         sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply - || exit 1; \
     done && \

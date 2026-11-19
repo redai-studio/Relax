@@ -5,6 +5,7 @@
 import ast
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,6 +26,40 @@ _attach_mtp_forward_kwargs = _namespace["_attach_mtp_forward_kwargs"]
 
 def _mk_args(enable_mtp_training: bool) -> Namespace:
     return Namespace(enable_mtp_training=enable_mtp_training)
+
+
+@pytest.mark.parametrize("embedding_scattered", [False, True])
+def test_mtp_input_mask_controls_gradients_after_sequence_scatter(embedding_scattered, monkeypatch):
+    native = pytest.importorskip("megatron.core.transformer.multi_token_prediction")
+    tp_group = SimpleNamespace(size=lambda: 2)
+
+    def scatter(tensor, *, group):
+        assert group is tp_group
+        return tensor.chunk(2, dim=0)[0]
+
+    monkeypatch.setattr(native, "scatter_to_sequence_parallel_region", scatter)
+    layer = native.MultiTokenPredictionLayer.__new__(native.MultiTokenPredictionLayer)
+    torch.nn.Module.__init__(layer)
+    layer.cp_group = None
+    layer.tp_group = tp_group
+    layer.config = SimpleNamespace(sequence_parallel=True, attention_cp_layout=None, mtp_detach_embedding=False)
+    table = torch.nn.Embedding(5, 1)
+
+    def embedding(*, input_ids, position_ids):
+        values = table(input_ids).transpose(0, 1)
+        return scatter(values, group=tp_group) if embedding_scattered else values
+
+    embedding.scatter_to_sequence_parallel = embedding_scattered
+    ids = torch.tensor([[1, 2, 3, 4]])
+    mask = torch.tensor([[False, True, False, True]])
+    _, _, _, rolled_mask, decoder_input, _ = layer._get_embeddings(
+        ids, ids, embedding, torch.zeros(2, 1, 1), mtp_input_mask=mask
+    )
+
+    torch.testing.assert_close(rolled_mask, torch.tensor([[True, False, True, False]]))
+    torch.testing.assert_close(decoder_input[:, 0], table.weight[[2, 3]])
+    decoder_input.sum().backward()
+    torch.testing.assert_close(table.weight.grad[:, 0], torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0]))
 
 
 def test_attach_mtp_forward_kwargs_noop_when_disabled():
