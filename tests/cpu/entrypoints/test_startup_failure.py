@@ -5,6 +5,7 @@
 import ast
 import asyncio
 import concurrent.futures
+import copy
 import json
 import os
 import signal
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import threading
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Optional
@@ -21,6 +23,7 @@ import pytest
 import yaml
 
 from relax.utils.agentic_obs.run_hooks import RunRecorder
+from relax.utils.env import resolve_in
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -316,10 +319,16 @@ class _RecordingRemovePG:
         self.calls.append(pg)
 
 
-def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, remove_pg=None):
+def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, remove_pg=None, service_class=object):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    wanted = {"_run_service_phase", "_abort_service_phase"}
+    wanted = {
+        "_run_service_phase",
+        "_abort_service_phase",
+        "_start_services",
+        "_create_service_task",
+        "_deploy_service_task",
+    }
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "concurrent": SimpleNamespace(futures=concurrent.futures),
@@ -331,7 +340,15 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
         "Any": object,
         "os": os,
         "Optional": Optional,
-        "Service": object,
+        "Service": service_class,
+        "copy": copy,
+        "partial": partial,
+        "resolve_in": resolve_in,
+        "ROLES": SimpleNamespace(actor="actor", rollout="rollout"),
+        "ACTOR_ROLLOUT_PG_ROLES": {"actor", "rollout"},
+        "run": asyncio.run,
+        "asyncio": asyncio,
+        "_uses_s3_model_prefetch": lambda config: bool(getattr(config, "model_source", None)),
     }
     exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), namespace)
     controller = SimpleNamespace(
@@ -342,7 +359,62 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
     controller._abort_service_phase = lambda phase_, services, failed_services=None: namespace["_abort_service_phase"](
         controller, phase_, services, failed_services
     )
+    for name in wanted - {"_abort_service_phase"}:
+        setattr(controller, name, namespace[name].__get__(controller))
     return controller, lambda task, args: namespace["_run_service_phase"](controller, phase, task, args)
+
+
+@pytest.mark.parametrize("enabled,s3", [(False, True), (True, False), (True, True)])
+def test_weight_retention_preserves_actor_first_startup_and_rollout_flag(enabled, s3):
+    events, prepared = [], {}
+
+    def service(_cls, **kwargs):
+        role = kwargs["role"]
+        result = Mock(
+            config=kwargs["config"],
+            runtime_env=kwargs["runtime_env"],
+            pgs=kwargs["actor_rollout_pgs"],
+            num_gpus=2,
+            _is_shared_pgs=True,
+        )
+        result.deploy.side_effect = lambda: events.append(role)
+        result.get_rollout_manager = AsyncMock(return_value="manager")
+        prepared[role] = result
+        return result
+
+    instance, _ = _service_phase(False, service_class=service)
+    flag = "RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP"
+    instance.runtime_env = {"env_vars": {flag: "1" if not enabled else "0"}, "working_dir": "source"}
+    original_runtime_env = copy.deepcopy(instance.runtime_env)
+    instance._health_manager = SimpleNamespace(status=object())
+    instance._cleanup_aborted_service = Mock()
+    instance.config = SimpleNamespace(
+        fully_async=False,
+        train_backend="megatron",
+        colocate=True,
+        offload_train=True,
+        offload_rollout=True,
+        enable_weights_backuper=True,
+        selective_offload=False,
+        rollout_num_gpus_per_engine=2,
+        megatron_to_hf_mode="bridge",
+        model_source="s3://model" if s3 else None,
+        train_env_vars={flag: "0" if not enabled else "1", "NCCL_BUFFSIZE": "1048576"},
+    )
+    instance._start_model_prefetch = Mock(side_effect=lambda pgs: events.append("prefetch") or ["prefetch-ref"])
+    pgs = (object(), [0, 1], [0, 1])
+    service_args = [(role, object(), 2, None, pgs, {"actor", "rollout"}) for role in ("actor", "rollout")]
+
+    assert instance._start_services(service_args) == (["prefetch-ref"] if s3 else [])
+    assert events == (["prefetch"] if s3 else []) + ["actor", "rollout"]
+    assert prepared["actor"].config is prepared["rollout"].config is instance.config
+    assert not instance.config.selective_offload  # ActorGroup selects its worker-local offloader.
+    assert instance.runtime_env == original_runtime_env
+    assert prepared["rollout"].runtime_env == {
+        **original_runtime_env,
+        "env_vars": {flag: "1" if enabled else "0"},
+    }
+    prepared["rollout"].get_rollout_manager.assert_not_called()
 
 
 def test_controller_serial_startup_stops_at_first_failure():

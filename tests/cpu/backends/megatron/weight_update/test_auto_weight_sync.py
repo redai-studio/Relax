@@ -225,8 +225,8 @@ def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, 
     monkeypatch.setattr(sync.ray, "get", lambda refs: [{"node_id": "local"} for _ in refs])
     monkeypatch.setattr(sync.ray, "get_runtime_context", lambda: SimpleNamespace(get_node_id=lambda: "local"))
     monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
-    monkeypatch.setattr(sync.dist, "get_world_size", lambda: 4)
-    monkeypatch.setattr(sync.dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(sync.dist, "get_world_size", lambda group=None: 4)
+    monkeypatch.setattr(sync.dist, "get_rank", lambda group=None: rank)
     monkeypatch.setattr(
         sync.dist, "all_gather_object", lambda out, local, **kw: out.__setitem__(slice(None), [local] * 4)
     )
