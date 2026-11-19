@@ -231,6 +231,35 @@ def _expert_partial_dispatch_worker(rank, rendezvous, directory):
 
     cuda_initialized = torch.cuda.is_initialized()
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
+    # A teacher-side Actor has no student engine, but still joins every native
+    # packing-error collective. Reuse these two processes to catch a hang on
+    # both the successful path and a student-side packing failure.
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater._ipc_engine = object() if rank == 0 else None
+    updater._ipc_allocator_version = updater.weight_version = 1
+    updater._ipc_bucket_allocator = object()
+    updater._ipc_gather_src, updater._ipc_gather_group = 0, dist.group.WORLD
+    updater._route_experts = updater.use_distribute = False
+    updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = True
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(module, "get_gloo_group", lambda: dist.group.WORLD)
+        for fail in (False, True):
+
+            def pack(values, *, pack_error_group, **kwargs):
+                with module._check_packing_errors_across_ranks(pack_error_group):
+                    if fail:
+                        raise ValueError("student packing failed")
+                return [], None
+
+            patch.setattr(module, "_send_to_colocated_engine", pack)
+            if fail:
+                with pytest.raises(RuntimeError, match="student packing failed"):
+                    updater._send_hf_params([])
+            else:
+                assert updater._send_hf_params([]) == ([], None)
+            alive = torch.tensor(1)
+            dist.all_reduce(alive)
+            assert alive.item() == 2
     # Exercise the real cold collective: one unsupported owner makes all
     # owners keep canonical bindings for this session.
     from relax.distributed.checkpoint_service.backends.shard_p2p import synchronizer as sync
@@ -484,6 +513,43 @@ def test_expert_consumer_qualifies_without_enabling_backup_overlap(module, monke
     assert not module.Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
 
 
+@pytest.mark.parametrize("check_content", [False, True])
+def test_ordinary_replica_content_audit_preserves_layout_and_expert_checks(module, monkeypatch, check_content):
+    from relax.backends.megatron.weight_update.combined_shard_source import CombinedShardSource
+
+    monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1" if check_content else "0")
+    monkeypatch.setattr(module.dist, "get_global_rank", lambda group, rank: rank)
+    source = object.__new__(CombinedShardSource)
+    source.group, source.rank = "gloo", 0
+    source.expert = Mock()
+    source.ordinary = SimpleNamespace(replica_ranks=(0, 1), _views=Mock())
+    weights = {"weight": torch.ones(2, dtype=torch.bfloat16)}
+    source.ordinary._views.return_value = (weights, [], {})
+    cpu_copy = torch.Tensor.cpu
+    copies = []
+
+    def copy(tensor):
+        copies.append(tensor)
+        return cpu_copy(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", copy)
+    record = source.replica_record(weights)
+    assert bool(record["hashes"]) is check_content and len(copies) == int(check_content)
+    source.ordinary._views.assert_called_once_with(weights, selected_only=False)
+    source.expert.replica_record.assert_called_once_with(weights)
+    peer = dict(record, global_rank=1)
+    source.validate_replicas([record, peer])
+    source.expert.validate_replicas.assert_called_once_with([record["expert"], peer["expert"]])
+    if check_content:
+        with pytest.raises(ValueError, match="replica weights differ"):
+            source.validate_replicas([record, dict(peer, hashes={"weight": "different"})])
+    with pytest.raises(ValueError, match="replica weights differ"):
+        source.validate_replicas([record, dict(peer, replicas=(1, 0))])
+    source.ordinary._views.side_effect = ValueError("source layout changed")
+    with pytest.raises(ValueError, match="source layout changed"):
+        source.replica_record(weights)
+
+
 def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_active_capability_loss(
     module, monkeypatch
 ):
@@ -504,6 +570,9 @@ def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_act
     assert not updater._colocate_tp_ipc_enabled and not updater._colocate_expert_ipc_enabled
 
     updater._ordinary_tp_receiver_support = True
+    # MOPD's four TP1 student engines use only half the eight Actor GPUs.
+    updater.rollout_engines = [object() for _ in range(4)]
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: 8)
     updater._configure_colocate_expert_ipc(["node"])
     assert updater._colocate_tp_ipc_enabled
     source = object.__new__(CombinedShardSource)
