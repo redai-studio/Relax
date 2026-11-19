@@ -126,10 +126,23 @@ async def test_unclaimed_timeout_cannot_join_later_full(pool):
     assert snapshot["group_name"] is None
     assert [entry[0] for entry in snapshot["receivers"]] == baseline.engines
     assert not (await waiting).success
-    assert await manager.publish_colocate_full(1, []) is None
-    manager.release_colocate_full()
+    assert not manager.training_weight_updating
     assert server.engine_groups == [baseline]
     engine.register_to_router.remote.assert_not_called()
+
+
+def test_pure_baseline_full_does_not_fence_shutdown(pool, patch_ray_get):
+    manager, _, baseline = pool
+    manager._eval_judge = None
+
+    snapshot, obsolete = manager.acquire_colocate_full(object())
+    assert obsolete is None
+    assert snapshot["group_name"] is None
+    assert not manager.training_weight_updating
+
+    # Simulate the actor unwinding after a failed IPC update, with no publication.
+    manager.dispose()
+    baseline.engines[0].shutdown.remote.assert_called_once()
 
 
 @pytest.mark.parametrize(

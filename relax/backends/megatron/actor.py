@@ -3001,22 +3001,26 @@ class MegatronTrainRayActor(TrainRayActor):
             if recovery_error[0] is not None:
                 raise RuntimeError(f"Rollout engine recovery failed: {recovery_error[0]}")
 
-        colocate_elastic = getattr(self, "_colocate_elastic", False)
-        connect_kwargs = {}
-        if colocate_elastic:
+        snapshot = None
+        if getattr(self, "_colocate_elastic", False):
             snapshot = run_on_training_rank_zero(self._acquire_colocate_full, phase="Colocate FULL admission")
+        elastic_full = snapshot is not None and snapshot["group_name"] is not None
+        receivers = None
+        connect_kwargs = {}
+        if snapshot is not None:
             rollout_engines = [engine for engine, _, _ in snapshot["receivers"]]
             engine_gpu_counts = [count for _, count, _ in snapshot["receivers"]]
             engine_gpu_offsets = [offset for _, _, offset in snapshot["receivers"]]
             rollout_engine_lock = snapshot["lock"]
-            connect_kwargs = {
-                "shared_engine_count": snapshot["shared_count"],
-                "remote_group_name": snapshot["group_name"],
-            }
-            receivers = (
-                tuple((engine._actor_id.hex(), count, offset) for engine, count, offset in snapshot["receivers"]),
-                snapshot["group_name"],
-            )
+            if elastic_full:
+                connect_kwargs = {
+                    "shared_engine_count": snapshot["shared_count"],
+                    "remote_group_name": snapshot["group_name"],
+                }
+                receivers = (
+                    tuple((engine._actor_id.hex(), count, offset) for engine, count, offset in snapshot["receivers"]),
+                    snapshot["group_name"],
+                )
             num_new_engines = int(receivers != self._colocate_receivers or snapshot["num_new_engines"] > 0)
         else:
             rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
@@ -3045,8 +3049,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 **connect_kwargs,
             )
             dist.barrier(group=get_gloo_group())
-            if colocate_elastic:
+            if snapshot is not None:
                 self._colocate_receivers = receivers
+            if elastic_full:
                 if snapshot["num_new_engines"] > 0:
                     run_on_training_rank_zero(
                         lambda: ray.get(self.rollout_manager.clear_num_new_engines.remote()),
@@ -3060,7 +3065,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
 
-            if colocate_elastic:
+            if elastic_full:
                 run_on_training_rank_zero(
                     lambda: self._publish_colocate_full(rollout_engines), phase="Colocate FULL publication"
                 )

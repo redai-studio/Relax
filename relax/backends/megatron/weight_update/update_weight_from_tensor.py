@@ -123,6 +123,7 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
+        self._colocate_remote_full = False
         self._uncertain_group_removal: str | None = None
         self.distributed_rollout_engines: list[ActorHandle] = []
 
@@ -181,6 +182,7 @@ class UpdateWeightFromTensor:
             colocate_engine_nums = shared_engine_count
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
+        self._colocate_remote_full = shared_engine_count is not None and self.use_distribute
         if self._route_experts and self.use_distribute:
             raise ValueError("Expert routing does not support mixed remote/colocated engines")
 
@@ -508,6 +510,7 @@ class UpdateWeightFromTensor:
         # Pause/flush must cover both IPC and distributed-broadcast engines,
         # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
+        colocate_remote_full = getattr(self, "_colocate_remote_full", False)
 
         rank = dist.get_rank()
         if self._route_experts:
@@ -522,7 +525,7 @@ class UpdateWeightFromTensor:
                     restore_weights_before_load=True,
                     post_process_quantization=False,
                 )
-        elif self.use_distribute:
+        elif colocate_remote_full:
             self._routed_engine_call(all_engines, "pause_generation")
             self._routed_engine_call(all_engines, "flush_cache")
             if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
@@ -594,7 +597,7 @@ class UpdateWeightFromTensor:
                     else:
                         self._wait_for_ipc(prev_refs)
                         prev_refs = []
-                        if self.use_distribute:
+                        if colocate_remote_full:
                             self._wait_for_ipc([], error="; ".join(dispatch_errors) or None)
                         elif dispatch_errors:
                             self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
@@ -631,7 +634,7 @@ class UpdateWeightFromTensor:
                 )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
             self._routed_engine_call(all_engines, "continue_generation")
-        elif self.use_distribute:
+        elif colocate_remote_full:
             if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
                 self._routed_engine_call(
                     all_engines,
@@ -674,7 +677,7 @@ class UpdateWeightFromTensor:
             # ray.get(list) may raise before other requests finish. Keep source
             # buffers alive until every submitted reader has completed/failed.
             _drain_ipc_refs(refs)
-        if not self._route_experts and not getattr(self, "use_distribute", False):
+        if not self._route_experts and not getattr(self, "_colocate_remote_full", False):
             if error is not None:
                 raise RuntimeError(f"Weight load failed: {error}")
             return
@@ -966,19 +969,22 @@ class UpdateWeightFromTensor:
 
         if self.use_distribute and self._is_distributed_src_rank:
             try:
-                update_weights_from_distributed(
+                remote_refs = update_weights_from_distributed(
                     self._group_name,
                     self._model_update_groups,
                     self.weight_version,
                     self.distributed_rollout_engines,
                     hf_named_tensors,
-                    submitted_refs=all_refs,
                 )
             except Exception as exc:
-                if dispatch_errors is None:
+                # A failed broadcast can leave remote receivers waiting for data.
+                # Only the IPC readers already submitted here hold source storage.
+                if dispatch_errors is None or not getattr(self, "_colocate_remote_full", False):
                     _drain_ipc_refs(all_refs)
                     raise
                 dispatch_errors.append(str(exc))
+            else:
+                all_refs.extend(remote_refs)
 
         return all_refs, long_lived_tensors
 

@@ -359,21 +359,18 @@ def update_weights_from_distributed(
     weight_version: int,
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
-    *,
-    submitted_refs: list[ObjectRef] | None = None,
 ) -> list[ObjectRef]:
     """Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines)."""
-    refs = [] if submitted_refs is None else submitted_refs
-    for engine in rollout_engines:
-        refs.append(
-            engine.update_weights_from_distributed.remote(
-                names=[name for name, _ in converted_named_tensors],
-                dtypes=[param.dtype for _, param in converted_named_tensors],
-                shapes=[param.shape for _, param in converted_named_tensors],
-                group_name=group_name,
-                weight_version=str(weight_version),
-            )
+    refs = [
+        engine.update_weights_from_distributed.remote(
+            names=[name for name, _ in converted_named_tensors],
+            dtypes=[param.dtype for _, param in converted_named_tensors],
+            shapes=[param.shape for _, param in converted_named_tensors],
+            group_name=group_name,
+            weight_version=str(weight_version),
         )
+        for engine in rollout_engines
+    ]
 
     handles = []
     for _, param in converted_named_tensors:

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -72,3 +73,45 @@ def test_update_weights_shares_rollout_recovery_result_before_weight_sync(monkey
     assert all(call.args == (process_group,) for call in get_rank.call_args_list)
     assert reached_weight_sync == ([] if fails else [0, 1])
     assert manager.get_rollout_engines_and_lock.remote.call_count == (0 if fails else 2)
+
+
+@pytest.mark.parametrize("after_scale_in", [False, True])
+def test_baseline_snapshot_connects_with_legacy_ipc_arguments(monkeypatch, after_scale_in):
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(
+        debug_train_only=False,
+        debug_rollout_only=False,
+        offload_train=False,
+        offload_rollout=False,
+        use_fault_tolerance=False,
+    )
+    actor._colocate_elastic = True
+    actor._colocate_receivers = ("old-receivers", "retired-group") if after_scale_in else None
+    baseline, lock = Mock(), object()
+    actor._acquire_colocate_full = Mock(
+        return_value={
+            "receivers": [(baseline, 2, 0)],
+            "lock": lock,
+            "num_new_engines": 0 if after_scale_in else 1,
+            "shared_count": 1,
+            "group_name": None,
+        }
+    )
+    actor.rollout_manager = SimpleNamespace(clear_num_new_engines=Mock())
+    actor._train_state_offloader = SimpleNamespace(disable_during_update=nullcontext)
+    actor.weight_updater = Mock()
+    actor.weight_updater.update_weights.side_effect = RuntimeError("IPC failed")
+    monkeypatch.setattr(actor_module, "run_on_training_rank_zero", lambda function, **kwargs: function())
+    monkeypatch.setattr(actor_module, "print_memory", Mock())
+    monkeypatch.setattr(actor_module, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(actor_module.dist, "barrier", Mock())
+    monkeypatch.setattr(actor_module.ray, "get", lambda ref: ref)
+
+    with pytest.raises(RuntimeError, match="IPC failed"):
+        actor_module.MegatronTrainRayActor.update_weights.__wrapped__(actor)
+
+    actor.weight_updater.connect_rollout_engines.assert_called_once_with(
+        [baseline], lock, engine_gpu_counts=[2], engine_gpu_offsets=[0]
+    )
+    assert actor._colocate_receivers is None

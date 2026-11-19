@@ -1583,7 +1583,18 @@ class RolloutManager(ReloadableMixin):
             remote_ids = tuple(engine._actor_id.hex() for engine, _, _ in receivers[shared_count:])
             if old is not None and old[1] != remote_ids:
                 return None, old[0]
-            if remote_ids and old is None:
+            if not remote_ids:
+                # Keep the baseline snapshot and shutdown behavior before the first scale-out
+                # and after the last independent receiver leaves.
+                engines, lock, num_new, counts, offsets = self.get_rollout_engines_and_lock()
+                return {
+                    "receivers": list(zip(engines, counts, offsets, strict=True)),
+                    "shared_count": len(engines),
+                    "lock": lock,
+                    "num_new_engines": num_new,
+                    "group_name": None,
+                }, None
+            if old is None:
                 self._colocate_remote_group = (f"colocate-full-{uuid.uuid4().hex}", remote_ids)
                 logger.info("[Colocate FULL] New group %s: %s", self._colocate_remote_group[0], remote_ids)
             self._colocate_source = source
@@ -1596,7 +1607,7 @@ class RolloutManager(ReloadableMixin):
                 "shared_count": shared_count,
                 "lock": self.rollout_engine_lock,
                 "num_new_engines": sum(group.num_new_engines for group in shared),
-                "group_name": self._colocate_remote_group[0] if self._colocate_remote_group else None,
+                "group_name": self._colocate_remote_group[0],
             }, None
 
     @ray.method(concurrency_group="scale_in")
