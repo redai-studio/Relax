@@ -1167,11 +1167,11 @@ class SGLangEngine(RayActor):
                     if worker.get("url", "").rstrip("/") == url.rstrip("/")
                 ]
                 if len(matches) > 1:
-                    raise ValueError("Duplicate PD worker URL in router registry")
+                    raise ValueError("Duplicate worker URL in router registry")
                 if len(matches) == 1 and (not healthy or matches[0].get("is_healthy") is True):
                     registered_id = self._router_worker_id
                     if registered_id is not None and matches[0].get("id") != registered_id:
-                        raise ValueError("PD worker registration ID changed before readiness")
+                        raise ValueError("Router worker registration ID changed before readiness")
                     if pd:
                         self.bind_registered_pd_worker(self.router_ip, self.router_port, matches[0])
                     else:
@@ -1186,7 +1186,7 @@ class SGLangEngine(RayActor):
             except requests.RequestException as error:
                 last_error = type(error).__name__
             time.sleep(0.25)
-        raise TimeoutError(f"PD worker did not become ready in the router: {last_error}")
+        raise TimeoutError(f"Worker registration was not confirmed by the router: {last_error}")
 
     def get_pid_and_node_id(self) -> dict:
         """Return the PID and Ray node ID of this engine.

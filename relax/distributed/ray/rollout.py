@@ -1431,14 +1431,15 @@ class RolloutManager(ReloadableMixin):
                     elastic_groups = [
                         group for srv in self.servers.values() for group in srv.engine_groups if group.is_scaled_out
                     ]
-                    candidates = list(self._colocate_candidates.values())
+                    pending_groups = [
+                        candidate.group for candidate in self._colocate_candidates.values() if candidate.result is None
+                    ]
                     current = self._colocate_remote_group
                     source = self._colocate_source
                 if current is not None:
                     ray.get(source.disconnect_colocate_weight_group.remote(current[0]), timeout=35)
-                elastic_groups.extend(candidate.group for candidate in candidates if candidate.result is None)
-                self._shutdown_all_engines(extra_groups=elastic_groups)
-                for group in elastic_groups:
+                self._shutdown_all_engines(extra_groups=pending_groups)
+                for group in [*elastic_groups, *pending_groups]:
                     ray.util.remove_placement_group(group.pg[0])
             else:
                 self._shutdown_all_engines()
@@ -1467,7 +1468,7 @@ class RolloutManager(ReloadableMixin):
         for srv in self.servers.values():
             for group in srv.engine_groups:
                 for engine in group.all_engines:
-                    if engine is not None and engine not in all_engines:
+                    if engine is not None:
                         all_engines.append(engine)
 
         if not all_engines:
@@ -1689,10 +1690,6 @@ class RolloutManager(ReloadableMixin):
                         candidate.failure = ScaleOutFailure(category)
 
             if candidate.result is not None:
-                if self.args.use_fault_tolerance:
-                    monitor = RolloutHealthMonitor(group, self.args)
-                    self._health_monitors.append(monitor)
-                    monitor.start()
                 continue
             if attempted_registration:
                 # A failed registration response can leave a live Router entry.

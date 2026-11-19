@@ -3,7 +3,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from conftest import (
@@ -148,6 +148,30 @@ def test_pure_baseline_full_does_not_fence_shutdown(pool, patch_ray_get):
     # Simulate the actor unwinding after a failed IPC update, with no publication.
     manager.dispose()
     baseline.engines[0].shutdown.remote.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_dispose_shuts_down_published_and_pending_replicas(pool, patch_ray_get, monkeypatch):
+    from relax.distributed.ray import rollout
+
+    manager, server, baseline = pool
+    manager._eval_judge = None
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    published = make_engine_group(args=manager.args, is_scaled_out=True, rank_offset=2)
+    pending, pending_engine, waiting = await start_candidate(manager, request, 4)
+    published.pg = (object(), [0, 1], [2, 3])
+    pending.pg = (object(), [0, 1], [4, 5])
+    server.engine_groups.append(published)
+    remove_pg = Mock()
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+
+    manager.dispose()
+
+    for engine in (baseline.engines[0], published.engines[0], pending_engine):
+        engine.shutdown.remote.assert_called_once()
+    remove_pg.assert_has_calls([call(published.pg[0]), call(pending.pg[0])], any_order=True)
+    assert remove_pg.call_count == 2
+    assert not (await waiting).success
 
 
 @pytest.mark.parametrize(
