@@ -1637,18 +1637,9 @@ class StreamingTQIterator:
         data["__loss_scale__"] = self.loss_scale
         self._sample_count += n_samples
         self._buffer.append((data, meta))
-        # Snapshot for dummy padding.  ``get_batch`` mutates the batch
-        # dict IN PLACE (e.g. reassigns ``batch["tokens"]`` to the
-        # concatenated+padded packed tensor), and the schedule passes
-        # this very ``data`` object to ``get_batch``.  If we kept a
-        # reference to it, a later ``_make_dummy_batch`` would copy the
-        # ALREADY-PACKED ``tokens`` while ``loss_masks`` / ``total_lengths``
-        # stay per-sample lists → loss_mask/token shape mismatch in
-        # ``get_batch`` (tok length = sum of two samples).  Store a
-        # shallow dict copy (new top-level dict, same per-sample list
-        # values, which get_batch does not mutate) so the dummy always
-        # rebuilds from the pristine raw fields.
-        self._last_batch = (dict(data), meta)
+        # Keep the original rows for metrics and dummy padding. get_batch rewrites
+        # the top-level fields on the copy returned to the training schedule.
+        self._last_batch = (data, meta)
         self._batch_index += 1
         self._mb_count += 1
 
@@ -1689,7 +1680,7 @@ class StreamingTQIterator:
         # Warm the controller cache for the next mb while the trainer
         # computes this one (tail prefetch; meta-only).
         self._warm_next_batch_index(self._batch_index)
-        return data, meta
+        return dict(data), meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
         # Dummy-padding phase: real data exhausted, emit dummies up to k_global.
