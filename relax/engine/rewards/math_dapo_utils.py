@@ -161,6 +161,7 @@ REMOVED_EXPRESSIONS = [
     "\\dots",
     "<|im_end|>",
     "<|endoftext|>",
+    "<|endofassistant|>",
 ]
 
 
