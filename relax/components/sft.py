@@ -114,6 +114,8 @@ def _resolve_classification_sentinel_token_id(tokenizer) -> int:
 
 
 def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict[str, Any]:
+    from relax.utils.data import wholepack_policy
+
     oversize_strategy = getattr(config, "sft_oversize_strategy", "keep")
     invalid_multimodal_strategy = getattr(config, "sft_invalid_multimodal_strategy", "error")
     oversize_custom_path = getattr(config, "sft_oversize_custom_function_path", None)
@@ -126,6 +128,26 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
             oversize_custom_fn = partial(oversize_custom_fn, seq_length=config.seq_length)
         if logger is not None:
             logger.info(f"SFT oversize strategy: custom (loaded {oversize_custom_path})")
+    elif (
+        oversize_strategy == "keep"
+        and getattr(config, "sft_training_mode", "sft") == "sft"
+        and getattr(config, "task_type", "causal_lm") == "causal_lm"
+        and getattr(config, "custom_megatron_before_train_step_hook_path", None) == wholepack_policy.QWEN_STEP_HOOK
+        and getattr(config, "optimizer", None) == "muon"
+    ):
+        # Preserve the keep cursor and all trainable samples, including singletons
+        # above the packing budget. Reject an impossible batch before publishing it.
+        tp = config.tensor_model_parallel_size
+        padding = tp * config.data_pad_size_multiplier
+        if tp != 4 or config.context_parallel_size != 1 or padding <= 0:
+            raise ValueError("The Qwen Muon expanded dispatcher requires TP4, CP1 and positive padding")
+        limit = (tp * wholepack_policy.EXPANDED_ROWS_PER_RANK // padding) * padding
+        if not 0 < config.max_tokens_per_gpu <= limit or config.max_tokens_per_gpu % padding:
+            raise ValueError(f"Qwen Muon packing budget must be a positive multiple of {padding} at most {limit}")
+        oversize_strategy = "custom"
+        oversize_custom_fn = partial(wholepack_policy.require_dispatchable_sample, max_length=limit)
+        if logger is not None:
+            logger.info("SFT keeps samples intact up to the DeepEP limit of %d expanded tokens", limit)
     elif logger is not None:
         logger.info(f"SFT oversize strategy: {oversize_strategy}")
     if logger is not None:

@@ -4,7 +4,10 @@
 # Set MODEL_DIR, DATA_DIR and a persistent shared SAVE_DIR.
 # DRY_RUN=1 renders the command and worker environment without submitting a job.
 # Multimodal SFT is enabled by default. Resume from SAVE_DIR/EXP_NAME when available.
-# Use the unified Blackwell training image with Emerging Optimizers on all nodes.
+# Use the unified Relax CUDA 13 Blackwell image with its runtime manifest and
+# Megatron-compatible Emerging Optimizers on all training nodes.
+# Default Wholepack requires the TransferQueue assignment_transform patch in the
+# Ray job driver's Python environment. Set QWEN35_WHOLEPACK=0 to use binpack.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,7 +54,7 @@ import shlex
 import sys
 from pathlib import Path
 
-def build_environment() -> dict[str, str]:
+def build_environment(runtime_vars: dict[str, str]) -> dict[str, str]:
     """Select only the optimized job's native libraries, including Ray
     workers."""
     import sysconfig
@@ -59,11 +62,13 @@ def build_environment() -> dict[str, str]:
     site = Path(sysconfig.get_paths()["purelib"])
     nccl = site / "nvidia/nccl"
     cublas = Path("/opt/relax/cublas13.3/nvidia/cu13/lib")
-    # DeepEP 2.1 invokes NVCC via a shell. Keep training preloads, but isolate
-    # its compiler subprocess even when the image NVCC is not wrapped.
-    nvcc_wrapper = Path(os.environ["RELAX"]) / "scripts/tools/nvcc-without-preload.sh"
-    if shlex.quote(str(nvcc_wrapper)) != str(nvcc_wrapper):
-        raise ValueError("DeepEP requires a Relax checkout path without shell-special characters")
+    cache_dir = (
+        os.environ.get("EP_JIT_CACHE_DIR")
+        or runtime_vars.get("EP_JIT_CACHE_DIR")
+        or f"/tmp/relax-qwen35-{os.getuid()}/deepep"
+    )
+    if not Path(cache_dir).is_absolute() or shlex.quote(cache_dir) != cache_dir:
+        raise ValueError("EP_JIT_CACHE_DIR must be an absolute path without whitespace or shell-special characters")
     kept = [
         p
         for p in os.environ.get("LD_PRELOAD", "").replace(":", " ").split()
@@ -90,9 +95,9 @@ def build_environment() -> dict[str, str]:
             ),
             "RELAX_FLA_CONV_NB_MODE": "none",
             "EP_NCCL_ROOT_DIR": str(nccl),
-            "EP_JIT_CACHE_DIR": os.environ.get("EP_JIT_CACHE_DIR") or f"/tmp/relax-qwen35-{os.getuid()}/deepep",
-            "EP_JIT_NVCC_COMPILER": str(nvcc_wrapper),
-            "EP_JIT_PRINT_COMPILER_COMMAND": os.environ.get("EP_JIT_PRINT_COMPILER_COMMAND", "1"),
+            "EP_JIT_CACHE_DIR": cache_dir,
+            "EP_JIT_PRINT_COMPILER_COMMAND": os.environ.get("EP_JIT_PRINT_COMPILER_COMMAND")
+            or runtime_vars.get("EP_JIT_PRINT_COMPILER_COMMAND", "1"),
         }
     )
     env.update(
@@ -129,19 +134,18 @@ def build_environment() -> dict[str, str]:
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
-    if compiler := os.environ.get("EP_JIT_NVCC_COMPILER"):
-        target = Path(compiler).absolute()
-        if target.resolve() == nvcc_wrapper.resolve():
-            raise ValueError("EP_JIT_NVCC_COMPILER must point to the original compiler")
-        env["RELAX_DEEPEP_NVCC"] = str(target)
+    for key in ("EP_JIT_NVCC_COMPILER", "CUDA_HOME", "CUDA_PATH"):
+        value = os.environ.get(key) or runtime_vars.get(key)
+        if value:
+            env[key] = value
+        else:
+            runtime_vars.pop(key, None)
     data_node = os.environ.get("RELAX_SFT_DATA_NODE_IP") or os.environ.get("MASTER_ADDR")
     if data_node:
         env["RELAX_SFT_DATA_NODE_IP"] = data_node
     elif os.environ.get("DRY_RUN") != "1":
         raise RuntimeError("The standard Ray entrypoint must resolve MASTER_ADDR before submission")
     for key in (
-        "CUDA_HOME",
-        "CUDA_PATH",
         "CPATH",
         "TRITON_PTXAS_PATH",
         "TRITON_CACHE_DIR",
@@ -161,12 +165,12 @@ if os.environ.get("DRY_RUN") != "1":
     assert manifest["packages"]["relax-deep-ep-v2"] == "2.1.0"
     mode = os.environ.get("RELAX_FLA_CONV_NB_MODE", "original")
     assert mode == "none" or (mode == "auto" and os.environ.get("RELAX_GPU_ARCH") in {"blackwell", "b300"})  # gitleaks:allow -- existing runtime environment compatibility key
-env = build_environment()
+runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
+env = build_environment(runtime.setdefault("env_vars", {}))
 multimodal = sys.argv[1] == "1"
 if multimodal:
     env.update({"RELAX_DISABLE_VISION_BRANCH_SYNC": "0", "RELAX_LOGPROB_FAST_PATH": "0"})
-runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
-runtime.setdefault("env_vars", {}).update(env)
+runtime["env_vars"].update(env)
 if multimodal:
     preprocessing = {
         "RELAX_PROCESSOR_POOL_SIZE": "96",

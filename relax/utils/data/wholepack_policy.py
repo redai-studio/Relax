@@ -1,8 +1,31 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Scheduling geometry for whole-pack Qwen3.5 training."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from torch import Tensor
+
+
 GLOBAL_BATCH_SIZE = 1600
 EXPERT_PARALLEL_SIZE = 8
+EXPANDED_ROWS_PER_RANK = 131072
+QWEN_STEP_HOOK = "relax.models.qwen3_5.recipe.before_step"
+
+
+def require_dispatchable_sample(
+    *, tokens: Tensor, loss_mask: Tensor, capacity: int, idx: int, max_length: int
+) -> tuple[Tensor, Tensor]:
+    """Retain over-budget singletons that still fit the expanded dispatcher."""
+    length = tokens.shape[0]
+    if length > max_length:
+        raise ValueError(
+            f"SFT sample idx={idx}: expanded length {length} exceeds the DeepEP limit of {max_length} tokens"
+        )
+    return tokens, loss_mask
 
 
 def resolve_tp(dp_size: int, tp_size: int | None) -> int:
