@@ -285,6 +285,52 @@ def test_empty_get_returns_without_hanging(tq_factory) -> None:
     assert getattr(meta, "size", None) == 0 and list(data.keys()) == []
 
 
+def test_agentic_text_first_batch_publishes_nullable_multimodal_column(tq_factory) -> None:
+    from argparse import Namespace
+
+    from relax.utils.training.data_fields import build_data_fields
+    from relax.utils.types import Sample
+    from relax.utils.utils import convert_samples_to_train_data
+
+    producer = Namespace(
+        loss_type="policy_loss",
+        advantage_estimator="grpo",
+        use_agentic_rollout=True,
+        multimodal_keys=None,
+        use_opd=False,
+        debug_train_only=False,
+        custom_reward_post_process_path=None,
+        agentic_custom_advantage_path="unused:advantage",
+    )
+    image = {"pixel_values": torch.ones(4, 4), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+    client = tq_factory()
+    for index, multimodal in enumerate((None, image)):
+        sample = Sample(
+            index=index,
+            tokens=[1, 2],
+            response_length=1,
+            rollout_log_probs=[-0.1],
+            custom_advantage=0.5,
+            multimodal_train_inputs=multimodal,
+        )
+        batch = convert_samples_to_train_data(producer, [sample])
+        assert "multimodal_train_inputs" in batch
+        client.put(batch, partition_id="text_first")
+    consumer = Namespace(**vars(producer), is_vl_model=True)
+    meta, received = _get(client, "text_first", build_data_fields(consumer), 2)
+    assert meta.size == 2
+    by_index = dict(
+        zip(
+            (int(value) for value in payload_rows(received["sample_indices"])),
+            payload_rows(received["multimodal_train_inputs"]),
+            strict=True,
+        )
+    )
+    assert by_index[0] is None
+    torch.testing.assert_close(by_index[1]["pixel_values"], image["pixel_values"])
+    torch.testing.assert_close(by_index[1]["image_grid_thw"], image["image_grid_thw"])
+
+
 def test_repeat_put_stays_bounded_and_uncorrupted(tq_factory) -> None:
     client = tq_factory()
     first, second = _payload(4, ["a"], 4, 1), _payload(4, ["a"], 4, 2)

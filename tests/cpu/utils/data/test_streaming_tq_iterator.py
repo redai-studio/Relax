@@ -465,7 +465,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
         args=Namespace(),
         tq_client=_TQClient(),
-        data_fields=["response_lengths", "total_lengths", "rewards", "dataset_ids"],
+        data_fields=["response_lengths", "total_lengths", "rewards", "dataset_ids", "sample_indices"],
         batch_size=2,
         partition_id="train_0",
         task_name="ref_log_probs",
@@ -480,6 +480,8 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     assert rollout_data["rewards"] == [1.5, 2.5]
     assert rollout_data["dataset_ids"] == [0, 1]
     assert all(type(value) is int for value in rollout_data["dataset_ids"])
+    assert rollout_data["sample_indices"] == [901, 901]
+    assert all(type(value) is int for value in rollout_data["sample_indices"])
 
 
 def test_tensor_to_python_values_dense_tensor(monkeypatch):

@@ -54,6 +54,7 @@ tensorboard_log
 # .github
 .github/copilot-instructions.md
 env.sh
+examples/osworld_agentic/env.local.sh
 
 # Machine-local multimodal acceptance artifacts (hundreds of MB, never commit)
 tests/fixtures/

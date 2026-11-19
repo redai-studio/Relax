@@ -23,6 +23,7 @@ from relax.backends.megatron.reference_integrity import (
 )
 from relax.engine.sft.runtime import is_dpo_mode
 from relax.utils.model_source import is_model_source_alias
+from relax.utils.multimodal.vision_feature_cache import clear_train_vision_cache
 from relax.utils.training import tensor_backper
 
 
@@ -104,6 +105,7 @@ def reference_actor_methods():
         "os": os,
         "is_model_source_alias": is_model_source_alias,
         "is_dpo_mode": is_dpo_mode,
+        "clear_train_vision_cache": clear_train_vision_cache,
         "is_megatron_checkpoint": checkpoint_module.is_megatron_checkpoint,
         "_checkpoint_iteration_dir": checkpoint_module._checkpoint_iteration_dir,
         "canonical_tensor_sha256": canonical_tensor_sha256,

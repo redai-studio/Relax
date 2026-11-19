@@ -445,6 +445,8 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_MM_RELEASE_TRIM = EnvProperty("RELAX_MM_RELEASE_TRIM", bool, True)
     RELAX_MM_RELEASE_LOG = EnvProperty("RELAX_MM_RELEASE_LOG", bool, True)
     RELAX_MM_PIXEL_DTYPE = EnvProperty("RELAX_MM_PIXEL_DTYPE", str, "fp32")
+    RELAX_MM_IMAGE_POOL = EnvProperty("RELAX_MM_IMAGE_POOL", bool, False)
+    RELAX_EVAL_ON_EPOCH_BOUNDARY = EnvProperty("RELAX_EVAL_ON_EPOCH_BOUNDARY", bool, True)
 
     # ------------- Entrypoint / launcher scripts -------------
     # Set by scripts/entrypoint/*.sh; read back by the training scripts to

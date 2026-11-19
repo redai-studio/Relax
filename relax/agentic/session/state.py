@@ -7,7 +7,6 @@ import copy
 import hashlib
 import json
 import math
-import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -16,6 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
+from relax.utils.env import Envs
 from relax.utils.types import Sample
 
 
@@ -414,7 +414,7 @@ def _multimodal_inputs_from_messages(messages: list[dict[str, Any]]) -> dict[str
 # shows it (~4x for a 4-image window). Now pixel_values is split per image, one
 # copy per unique image lives in SessionForest.mm_image_pool, and nodes keep
 # only fingerprints. build_sample() re-assembles the exact original tensor.
-_MM_POOL_ENABLED = os.environ.get("RELAX_MM_IMAGE_POOL", "0") == "1"
+_MM_POOL_ENABLED = Envs.RELAX_MM_IMAGE_POOL
 _MM_POOL_KEYS = ("pixel_values", "image_grid_thw")
 
 

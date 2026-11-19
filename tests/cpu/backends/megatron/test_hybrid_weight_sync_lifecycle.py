@@ -13,6 +13,7 @@ from relax.components.actor import Actor
 @pytest.fixture(params=[None, "elastic.yaml"])
 def hybrid_actor(monkeypatch, request):
     actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.model = []
     actor.args = SimpleNamespace(
         hybrid=True,
         advantage_estimator="grpo",

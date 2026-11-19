@@ -611,6 +611,9 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
     assert result.returncode == 0, result.stdout + result.stderr
     commands = [json.loads(line) for line in record.read_text().splitlines()]
     assert any(command[0] == "start" for command in commands) == (nvls is None)
+    if nvls is None:
+        start = next(command for command in commands if command[0] == "start")
+        assert "--temp-dir" not in start
     command = next(command for command in commands if command[:2] == ["job", "submit"])
     assert "--no-wait" not in command
     assert "--use-agentic-rollout" in command
@@ -654,6 +657,21 @@ def test_agentic_launch_uses_local_entrypoint_and_distinct_checkpoint(tmp_path, 
             assert "--over-sampling-batch-size" not in command
             assert command[command.index("--max-staleness") + 1] == "0"
             assert micro == 4
+    if nvls is None and not hybrid and not score_centering:
+        # Exercise the shared entrypoint with a real argv override, including spaces.
+        for directory in ("", str(tmp_path / "ray with spaces")):
+            env["RAY_TEMP_DIR"] = directory
+            record.write_text("")
+            result = subprocess.run(
+                ["bash", str(script)], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            starts = [cmd for line in record.read_text().splitlines() if (cmd := json.loads(line))[0] == "start"]
+            assert len(starts) == 1
+            if directory:
+                assert starts[0][starts[0].index("--temp-dir") + 1] == directory
+            else:
+                assert "--temp-dir" not in starts[0]
     if hybrid or score_centering:
         (Path(expected)).mkdir(parents=True)
         (Path(expected) / "latest_checkpointed_iteration.txt").write_text("1")

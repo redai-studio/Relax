@@ -17,7 +17,7 @@ import copy
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 from mm_agents.hybrid_agent_local import HybridAgentLocal
@@ -35,6 +35,14 @@ class SessionDiscardedError(RuntimeError):
 
 class ContextLengthExceededError(RuntimeError):
     """Prompt exceeded the served model's context window."""
+
+
+class _PredictionTerminated(BaseException):
+    """Carry control flow through upstream's generic parsing retry handler."""
+
+    def __init__(self, error: RuntimeError) -> None:
+        self.error = error
+        super().__init__(str(error))
 
 
 class RelaxHybridAgent(HybridAgentLocal):
@@ -91,7 +99,18 @@ class RelaxHybridAgent(HybridAgentLocal):
     def predict(self, instruction: str, obs: dict[str, Any], **kwargs: Any) -> Any:
         if self.visual_context is not None:
             self.visual_context.begin_turn(int(kwargs.get("step_idx", len(self.actions))))
-        return super().predict(instruction, obs, **kwargs)
+        self._prediction_active = True
+        try:
+            return super().predict(instruction, obs, **kwargs)
+        except _PredictionTerminated as signal:
+            raise signal.error from None
+        finally:
+            self._prediction_active = False
+
+    def _terminate_prediction(self, error: RuntimeError) -> NoReturn:
+        if getattr(self, "_prediction_active", False):
+            raise _PredictionTerminated(error)
+        raise error
 
     def call_llm(self, payload: dict[str, Any], model: str) -> str:  # noqa: D401
         """Send `payload` to Relax's chat completions endpoint and return
@@ -143,12 +162,12 @@ class RelaxHybridAgent(HybridAgentLocal):
                 # `{"error": {"code": "context_length_exceeded"}}`; fall back on
                 # substring match for older service versions.
                 if self._is_error_code(resp, "context_length_exceeded") or "context length" in resp.text.lower():
-                    raise ContextLengthExceededError(resp.text[:400])
+                    self._terminate_prediction(ContextLengthExceededError(resp.text[:400]))
 
             if resp.status_code == 404 and self._is_error_code(resp, "session_discarded"):
                 # Sync-mode tail discard by the Relax pipeline. Not an error;
                 # surface so the driver can exit the loop cleanly.
-                raise SessionDiscardedError("session discarded by pipeline")
+                self._terminate_prediction(SessionDiscardedError("session discarded by pipeline"))
 
             if resp.status_code != 200:
                 last_error = f"HTTP {resp.status_code}: {resp.text[:400]}"

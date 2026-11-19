@@ -346,7 +346,6 @@ async def run_session(
                 "osworld/model_calls": len(agent.turn_records),
                 "osworld/model_request_s": agent.model_request_s,
                 "osworld/transport_retries": agent.transport_retries,
-                "osworld/session_error_rate": 0.0,
                 "osworld/parse_retries": sum(r.get("parse_attempt", 0) > 0 for r in agent.turn_records),
                 "osworld/parse_exhausted_steps": parse_failed_steps,
                 "osworld/execution_failures": execution_failures,
@@ -396,7 +395,7 @@ def main() -> None:
                 "data_source": metadata.get("data_source"),
                 "session_wallclock_s": 0.0,
                 "last_error": f"{type(exc).__name__}: {exc}",
-                "_session_metrics": {"osworld/success_rate": 0.0, "osworld/session_error_rate": 1.0},
+                "_session_metrics": {"osworld/success_rate": 0.0},
             },
         }
     write_session_output(args.output_json, output)

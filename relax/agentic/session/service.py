@@ -1491,6 +1491,8 @@ class _SessionRecord:
     lora_binding: Optional[VersionIdentity] = None
     lora_bind_task: Optional[asyncio.Task] = None
     observation: SessionObservation | None = None
+    terminal_failure: tuple[str, str, str] | None = None
+    terminal_metrics_recorded: bool = False
     first_ir_ready: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -1545,6 +1547,7 @@ class AgenticSessionShard:
         self._trajectory_recorder = ShardTrajectoryRecorder(args)
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
+        self._session_terminal_counts: dict[tuple[str, str], int] = {}
         self._generation_backend = SGLangBackendAdapter(args)
         self._agent_launcher = ManagedAgentLauncher(
             load_agent_app_spec_from_args(args),
@@ -1759,12 +1762,9 @@ class AgenticSessionShard:
                 )
         except BaseException as error:
             for session in tuple(group.sessions):
+                session.terminal_failure = ("session_prepare_failed", "infra", f"{type(error).__name__}: {error}")
                 if session.observation is not None:
-                    session.observation.failure = (
-                        "session_prepare_failed",
-                        "infra",
-                        f"{type(error).__name__}: {error}",
-                    )
+                    session.observation.failure = session.terminal_failure
             await self.drop_group(group_id)
             raise
 
@@ -1777,7 +1777,16 @@ class AgenticSessionShard:
 
         return session_sampling_config(self.args, session_spec.sampling_params, sample_position)
 
+    def _record_terminal_metrics(self, session: _SessionRecord, status: str) -> None:
+        if not session.terminal_metrics_recorded:
+            session.terminal_metrics_recorded = True
+            counts = self.__dict__.setdefault("_session_terminal_counts", {})
+            key = (session.group.rollout_mode, status)
+            counts[key] = counts.get(key, 0) + 1
+
     def _observe_session(self, session: _SessionRecord, stage: str, status: str, **fields: Any) -> None:
+        if fields.get("is_terminal"):
+            self._record_terminal_metrics(session, status)
         observation = session.observation
         if observation is None:
             return
@@ -2190,17 +2199,26 @@ class AgenticSessionShard:
             "permit_cleanup_task_count": len(self._permit_cleanup_tasks),
         }
 
-    async def agentic_kv_metrics(self, reset: bool = False) -> dict[str, float]:
-        if not self.args.agentic_session_lifecycle:
-            return {}
+    async def agentic_kv_metrics(self, reset: bool = False, rollout_mode: str = "train") -> dict[str, float]:
+        """Report terminal Sessions independently of optional KV cleanup."""
+        counts = getattr(self, "_session_terminal_counts", {})
         metrics = {
-            "session/lifecycle_enabled": 1.0,
-            "session/close": float(self._lifecycle_close_count),
-            "session/close_failure": float(self._lifecycle_close_failure_count),
+            f"terminal/{status}": float(counts.get((rollout_mode, status), 0))
+            for status in ("completed", "failed", "cancelled")
         }
+        if self.args.agentic_session_lifecycle:
+            metrics.update(
+                {
+                    "session/lifecycle_enabled": 1.0,
+                    "session/close": float(self._lifecycle_close_count),
+                    "session/close_failure": float(self._lifecycle_close_failure_count),
+                }
+            )
         if reset:
             self._lifecycle_close_count = 0
             self._lifecycle_close_failure_count = 0
+            for status in ("completed", "failed", "cancelled"):
+                counts.pop((rollout_mode, status), None)
         return metrics
 
     def _group_debug_state(self, group: ResidentGroup) -> dict[str, Any]:
@@ -3174,8 +3192,11 @@ class AgenticSessionShard:
         if session.phase is not SessionPhase.ACTIVE or self._session_records.get(session.session_id) is not session:
             return
         if process_error is None and not session.first_ir_ready.is_set():
+            process = session.resources.process if session.resources is not None else None
+            metadata = getattr(getattr(process, "output", None), "metadata", {}) or {}
+            diagnostic = {key: str(metadata[key])[:400] for key in ("stop_reason", "last_error") if metadata.get(key)}
             process_error = AgentExecutionError(
-                "agent exited before its first request", reason_code="agent_no_request"
+                f"agent exited before its first request; output={diagnostic}", reason_code="agent_no_request"
             )
 
         group = session.group
@@ -3418,8 +3439,10 @@ class AgenticSessionShard:
         async with session.lock:
             if session.finish_task is None and session in session.group.sessions:
                 session.phase = SessionPhase.FINALIZING
-                if session.observation is not None and session.observation.failure is None and failure is not None:
-                    session.observation.failure = failure
+                if session.terminal_failure is None:
+                    session.terminal_failure = failure
+                if session.observation is not None and session.observation.failure is None:
+                    session.observation.failure = session.terminal_failure
                 session.finish_task = asyncio.create_task(
                     self._finish_session_once(session, outcome), name=f"session-finish:{session.session_id}"
                 )
@@ -3441,6 +3464,16 @@ class AgenticSessionShard:
             # Backend abort is independent of joining that runner.
             if ir.runner_task is not None:
                 ir.runner_task.cancel()
+        failure = session.terminal_failure or (
+            session.observation.failure if session.observation is not None else None
+        )
+        if isinstance(outcome, SessionExportTransport):
+            status = "completed"
+        elif isinstance(outcome, RuntimeGroupError) or (failure is not None and failure[1] != "selection"):
+            status = "failed"
+        else:
+            status = "cancelled"
+        self._record_terminal_metrics(session, status)
         session.result_cell.publish(outcome)
         self._schedule_agent_cleanup(session, outcome)
         self._notify_state_change(group)
@@ -3546,7 +3579,9 @@ class AgenticSessionShard:
             if resources is not None and session.observation is not None:
                 session.observation.active_ms = getattr(resources.process, "active_ms", 0.0)
                 session.observation.log_ref = getattr(resources.process, "observation_log_ref", None)
-            failure = session.observation.failure if session.observation is not None else None
+            failure = session.terminal_failure or (
+                session.observation.failure if session.observation is not None else None
+            )
             if isinstance(outcome, SessionExportTransport):
                 self._observe_session(session, "rollout", "completed", is_terminal=True)
             else:

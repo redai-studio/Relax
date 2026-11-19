@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import os
 import time
 import uuid
 from argparse import Namespace
@@ -24,7 +23,7 @@ from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
-_EVAL_ON_EPOCH_BOUNDARY = os.environ.get("RELAX_EVAL_ON_EPOCH_BOUNDARY", "1") == "1"
+_EVAL_ON_EPOCH_BOUNDARY = Envs.RELAX_EVAL_ON_EPOCH_BOUNDARY
 
 
 app = FastAPI()

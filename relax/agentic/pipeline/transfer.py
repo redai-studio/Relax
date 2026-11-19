@@ -26,8 +26,8 @@ from relax.utils.types import Sample
 
 # ---- release pixel tensors once a batch crossed the TQ boundary (2026-09-08) ----
 # The pipeline keeps every Sample of the rollout (context.output_groups) for the
-# end-of-rollout metrics / log / debug dump. None of those read pixel data, yet each
-# Sample carried its full image window (~1.7 GiB per session in bf16), so the
+# end-of-rollout metrics / log. Full debug dumps need pixels and bypass release.
+# Each Sample carried its full image window (~1.7 GiB per session in bf16), so the
 # RolloutManager grew by that amount per finished session until the rollout ended.
 # After async_put() succeeded the trainer owns the only copy that matters; replace
 # pixel tensors with 0-row stand-ins that keep dtype and width. image_grid_thw is
@@ -129,7 +129,8 @@ async def _transfer_batch_to_data_system(
             is_last=is_last,
         )
         del rollout_batch
-        _release_transferred_pixels(samples)
+        if getattr(args, "save_debug_rollout_data", None) is None and getattr(args, "dump_details", None) is None:
+            _release_transferred_pixels(samples)
     finally:
         for sample in samples:
             mark_sample_agentic_event(sample, "transfer_release_end_at")

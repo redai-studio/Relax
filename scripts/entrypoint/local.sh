@@ -18,6 +18,7 @@
 #   NUM_GPUS               - Number of GPUs to use (optional, auto-detect from CUDA_VISIBLE_DEVICES)
 #   CUDA_VISIBLE_DEVICES   - Comma-separated GPU IDs (e.g., "0,1,2,3" → 4 GPUs)
 #   MASTER_ADDR            - Head node IP address (default: 127.0.0.1)
+#   RAY_TEMP_DIR           - Optional override of Ray's temporary directory
 #   MEGATRON               - Path to Megatron-LM (default: /root/Megatron-LM/)
 #   RELAX                  - Path to Relax project (default: ../../)
 
@@ -95,8 +96,12 @@ fi
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 echo "Starting Ray head node: MASTER_ADDR=$MASTER_ADDR, NUM_GPUS=$NUM_GPUS"
 
+ray_temp_args=()
+if [ -n "${RAY_TEMP_DIR:-}" ]; then
+    ray_temp_args=(--temp-dir "${RAY_TEMP_DIR}")
+fi
 ray start --head \
-    --temp-dir "${RAY_TEMP_DIR:-/data/temp/ray}" \
+    "${ray_temp_args[@]}" \
     --node-ip-address "${MASTER_ADDR}" \
     --num-gpus "${NUM_GPUS}" \
     --disable-usage-stats \

@@ -24,12 +24,12 @@ PREFERENCE_DATA_FIELDS = (
 def needs_multimodal_fields(args: Namespace) -> bool:
     """Whether consumers must fetch multimodal tensors from the rollout.
 
-    Agentic VL sessions supply images at runtime without dataset multimodal
-    keys.
+    All Agentic batches publish a nullable column: rollout processes do not
+    share the training backend's is_vl_model flag and may emit text-only rows.
     """
     if getattr(args, "multimodal_keys", None) is not None:
         return True
-    return bool(getattr(args, "use_agentic_rollout", False) and getattr(args, "is_vl_model", False))
+    return bool(getattr(args, "use_agentic_rollout", False))
 
 
 def _base_rollout_fields(args: Namespace) -> list[str]:

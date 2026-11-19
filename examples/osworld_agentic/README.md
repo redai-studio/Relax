@@ -88,6 +88,8 @@ Actor 与 rollout colocate，共用检测到的 8 或 16 张物理 GPU。session
 
 96 条逻辑轨迹可以导出远多于 96 条训练记录。`rollout/raw_reward` 为对齐交接实现的**按导出记录数加权的 shaped reward**，不是轨迹成功率。判断任务能力应同时看成功率、轮数、异常比例；不能将 raw reward 图标成 success rate。全成功/全失败组的策略 advantage 被置零，但启用的 KL 项仍可能产生梯度。
 
+基础设施与执行异常按 Session 终态统计：`agentic/sessions_completed`、`agentic/sessions_failed`、`agentic/sessions_cancelled`，以及 `agentic/session_error_rate = failed / (completed + failed)`。统计按采集区间累积，train/eval 隔离；选择性取消不进入异常率分母。首个模型请求前失败也计入，即使整组被丢弃、没有训练 Sample；原任务 evaluator 判负仍属于正常完成的 Session。丢弃日志保留 task 进程的 `stop_reason` 和 `last_error`，不从成功导出的 Sample 推算基础设施异常率。
+
 baseline 的 `max_image_history_length=2` 限制单次模型上下文的图像历史，不表示一条轨迹只有两张截图。VCS 模式改用独立的 K/Δ 窗口，raw reward 仍按原始调用数加权。
 
 ## 三项可选优化
@@ -198,7 +200,7 @@ TP/PP/CP/DP、LM sequence parallel 和原视觉通信保持不变。CP 使用实
 
 `RELAX_TRANSFER_BATCH_GROUPS=1` 允许非 fully-async 模式在一个**完整且已评分的 Group** 就绪时写入 TransferQueue，无需等满 rollout。Group 仍含同一任务的多次独立尝试及全部导出样本，不提前训练未完成的 Group，不改变 advantage、batch 或更新频率。
 
-`RELAX_MM_RELEASE_AFTER_TRANSFER=1` 等待 `async_put` 成功后，把 rollout 本地 Sample 的像素张量替换为零行占位，保留 dtype、宽度与图片网格；训练读取队列中的完整图片。写入失败或取消时保留数据。默认执行垃圾回收和 `malloc_trim`，`mm_release samples=... freed=... rss=... returned=...` 记录张量字节和实际 RSS 变化；`freed` 不等于操作系统即时回收字节。
+`RELAX_MM_RELEASE_AFTER_TRANSFER=1` 等待 `async_put` 成功后，把 rollout 本地 Sample 的像素张量替换为零行占位，保留 dtype、宽度与图片网格；训练读取队列中的完整图片。写入失败或取消时保留数据。设置 `--save-debug-rollout-data` 或 `--dump-details` 时也保留原像素，保证调试文件可回放。默认执行垃圾回收和 `malloc_trim`，`mm_release samples=... freed=... rss=... returned=...` 记录张量字节和实际 RSS 变化；`freed` 不等于操作系统即时回收字节。
 
 `RELAX_MM_IMAGE_POOL=1` 另可在 SessionForest 内按图片指纹复用像素存储，导出时还原原张量。`RELAX_MM_PIXEL_DTYPE` 控制存储/传输精度，不是视觉特征缓存。当前 colocate 仍等整批 rollout 完成后训练，队列和运行中 Sessions 也占内存，提前传输不等于提前执行 GPU 更新。
 
@@ -208,16 +210,18 @@ CPU 回归使用 mock 模型/环境和轻量视觉 fixture，不启动 Nex 或 G
 
 ```bash
 python3 -m pytest -q \
-  tests/examples/test_osworld_visual_context.py \
+  tests/cpu/examples/test_osworld_visual_context.py \
   tests/examples/test_osworld_agentic_advantage.py \
   tests/examples/test_osworld_agentic_monitoring.py \
   tests/cpu/test_agentic_rollout.py \
   tests/utils/test_visual_context.py \
   tests/utils/test_train_vision_cache.py \
-  tests/agentic/test_cua_transfer_memory.py
+  tests/cpu/agentic/test_cua_transfer_memory.py
 ```
 
 覆盖真实 Forest 匹配、导出、mask 与训练转换，以及缓存命中/去重、隔离、淘汰、失效、merger/语言层梯度和传输打包。缓存控制组测试覆盖 TP=1/2/4；CP metadata 覆盖 CP=1/2/4、空分配和 LM SP 开关；PP 覆盖无视觉模块的 stage。CPU 结果不等于实际模型吞吐或 GPU 并行验证。
+
+固定 fork 的真实 `predict`/动作解析回归需在 Agent 环境中设置 `OSWORLD_REPO` 指向已准备的外部仓库；未配置时该用例明确跳过。它读取上述固定提交的代码，以 HTTP 替身验证上下文超限和 Session 丢弃只请求一次，并保留普通解析重试，不启动模型服务或 Nex。
 
 已有 Qwen3.5-9B MobileGym 实验在 TP4/PP1/CP1/DP2、LM SP 开启时完成过 18 次更新，观察到缓存命中和批内去重；不代表本 Qwen3-VL recipe 启用了缓存。PP>1、CP>1、动态 CP 等其余组合尚无 GPU 端到端验证。性能比较需固定模型、轨迹、硬件和预算，分别开关功能，计入缓存构建、rollout 和训练全周期；短实验不能证明独立加速比或最终成功率无损。
 

@@ -1426,12 +1426,11 @@ class RuntimeDomain:
         }
 
     async def collect_agentic_kv_metrics(self) -> dict[str, float]:
-        if not getattr(self.args, "agentic_program_admission", False) and not getattr(
-            self.args, "agentic_session_lifecycle", False
-        ):
-            return {}
         shard_metrics = await asyncio.gather(
-            *(shard.handle.agentic_kv_metrics.remote(reset=True) for shard in self._shards),
+            *(
+                shard.handle.agentic_kv_metrics.remote(reset=True, rollout_mode=self.rollout_mode)
+                for shard in self._shards
+            ),
             return_exceptions=True,
         )
         metrics: dict[str, float] = {}
@@ -1448,7 +1447,13 @@ class RuntimeDomain:
                 metrics.update(await self._admission_coordinator.metrics.remote(True))
             except Exception:
                 pass
-        return {f"agentic_kv/{key}": value for key, value in metrics.items()}
+        terminal = {status: metrics.pop(f"terminal/{status}", 0.0) for status in ("completed", "failed", "cancelled")}
+        result = {f"agentic_kv/{key}": value for key, value in metrics.items()}
+        result.update({f"agentic/sessions_{status}": value for status, value in terminal.items()})
+        denominator = terminal["completed"] + terminal["failed"]
+        if denominator:
+            result["agentic/session_error_rate"] = terminal["failed"] / denominator
+        return result
 
     async def shutdown(self) -> None:
         """Release local ownership and give remote cleanup a bounded grace."""

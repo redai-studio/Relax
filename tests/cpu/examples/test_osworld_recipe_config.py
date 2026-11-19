@@ -10,38 +10,7 @@ import pytest
 from examples.osworld_agentic.scripts.prepare_data import _select
 
 
-RECIPE = Path(__file__).resolve().parents[2] / "examples/osworld_agentic"
-
-
-def test_private_env_preserves_launch_roots_without_tracing_secrets(tmp_path):
-    # Execute only configuration setup, before the cluster entrypoint can run.
-    launcher = (RECIPE / "scripts/run-qwen3vl-8B-osworld-8xgpu.sh").read_text()
-    setup = launcher.split("# Keep launch-time roots authoritative", 1)[1].split(': "${OSWORLD_REPO:', 1)[0]
-    setup = "# Keep launch-time roots authoritative" + setup
-    (tmp_path / "setup.sh").write_text('set +x\nSCRIPT_DIR="$1"\n' + setup)
-    secret = "test-only-secret-do-not-log"
-    (tmp_path / "env.local.sh").write_text(
-        f'export NEX_API_KEY="{secret}"\n'
-        'export OSWORLD_REPO="/example/osworld"\n'
-        'export MODEL_DIR="/private/models" DATA_DIR="/private/data" SAVE_DIR="/private/save"\n'
-    )
-    env = dict(os.environ, MODEL_DIR="/launch/models", DATA_DIR="/launch/data", SAVE_DIR="/launch/save")
-    result = subprocess.run(
-        [
-            "bash",
-            "-euxc",
-            'source "$1/setup.sh"; '
-            'test "$MODEL_DIR" = /launch/models; test "$DATA_DIR" = /launch/data; '
-            'test "$SAVE_DIR" = /launch/save; test -n "${NEX_API_KEY:+present}"',
-            "test",
-            str(tmp_path),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr.replace(secret, "<redacted>")
-    assert secret not in result.stdout + result.stderr
+RECIPE = Path(__file__).resolve().parents[3] / "examples/osworld_agentic"
 
 
 @pytest.mark.parametrize("content, message", [("missing\n", "unknown task_id"), ("# empty\n", "no tasks")])
@@ -102,7 +71,10 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
         "print('/tmp/test-local-agent-env/bin/python')\n"
     )
     secret = "private-test-api-key-never-log"
-    (recipe / "env.local.sh").write_text(f'export OSWORLD_REPO="{tmp_path}/external"\nexport NEX_API_KEY="{secret}"\n')
+    (recipe / "env.local.sh").write_text(
+        f'export OSWORLD_REPO="{tmp_path}/external"\nexport NEX_API_KEY="{secret}"\n'
+        'export MODEL_DIR="/private/models" DATA_DIR="/private/data" SAVE_DIR="/private/save"\n'
+    )
     data = tmp_path / "data with spaces"
     (data / "osworld").mkdir(parents=True)
     (data / "osworld/train.parquet").write_text("placeholder; no training is executed")
@@ -147,6 +119,8 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
     assert runtime["env_vars"]["ENTRY_SENTINEL"] == "kept"
     assert runtime["env_vars"]["OSWORLD_AGENT_PYTHON"] == "/tmp/test-local-agent-env/bin/python"
     assert secret not in json.dumps(argv) + result.stdout + result.stderr
+    run_dir = Path(runtime["env_vars"]["OSWORLD_REWARD_DUMP"])
+    assert run_dir.is_relative_to(tmp_path / "outputs with spaces")
     train = argv[argv.index("--") + 1 :]
     assert train[:2] == ["python3", "relax/entrypoints/train.py"]
     for flag, expected in {
@@ -158,6 +132,8 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
         "--kl-loss-coef": "0.001",
         "--tb-project-name": "Relax/osworld-agentic",
         "--prompt-data": str(data / "osworld/train.parquet"),
+        "--hf-checkpoint": str(tmp_path / "models with spaces/Qwen3-VL-8B-Thinking"),
+        "--ref-load": str(tmp_path / "models with spaces/Qwen3-VL-8B-Thinking"),
     }.items():
         assert train[train.index(flag) + 1] == expected
     assert json.loads(train[train.index("--resource") + 1]) == {"actor": [1, gpu_count], "rollout": [1, gpu_count]}

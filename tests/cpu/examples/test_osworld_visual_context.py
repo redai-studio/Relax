@@ -27,7 +27,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.utils import convert_samples_to_train_data
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def observation(turn):
@@ -367,8 +367,27 @@ def test_segments_share_trajectory_advantage_and_legacy_metric(monkeypatch, norm
     assert compute_legacy_raw_reward(metric_samples(baseline)) == compute_legacy_raw_reward(metric_samples(vcs))
 
 
-@pytest.mark.parametrize("mode,fail_at", [("baseline", None), ("vcs", None), ("vcs", 5)])
-def test_real_session_driver_mock_environment_tail_and_early_stop(hybrid, monkeypatch, tmp_path, mode, fail_at):
+@pytest.mark.parametrize(
+    "mode,fail_at,error_kind",
+    [
+        (None, None, None),
+        ("baseline", None, None),
+        ("vcs", None, None),
+        ("vcs", 5, "predict_error"),
+        ("vcs", 5, "context_length_exceeded"),
+    ],
+)
+def test_real_session_driver_mock_environment_tail_and_early_stop(
+    hybrid, monkeypatch, tmp_path, mode, fail_at, error_kind
+):
+    import yaml
+
+    monkeypatch.delenv("RELAX_VCS", raising=False)
+    config = (
+        yaml.safe_load((ROOT / "examples/osworld_agentic/app/osworld_config.yaml").read_text())
+        if mode is None
+        else {"max_turns": 10, "context_mode": mode}
+    )
     backend = MockBackend(monkeypatch, hybrid)
     actions = []
     obs = SimpleNamespace(
@@ -396,13 +415,15 @@ def test_real_session_driver_mock_environment_tail_and_early_stop(hybrid, monkey
 
     def maybe_fail(*args, **kwargs):
         if fail_at is not None and len(backend.generated) == fail_at:
+            if error_kind == "context_length_exceeded":
+                return httpx.Response(400, json={"error": {"code": error_kind}})
             raise RuntimeError("mock model unavailable")
         return post(*args, **kwargs)
 
     monkeypatch.setattr(hybrid.httpx, "post", maybe_fail)
     ns = adapter_functions(
         time=SimpleNamespace(monotonic=lambda: 1),
-        _load_config=lambda: {"max_turns": 10, "context_mode": mode},
+        _load_config=lambda: config,
         OSWorldEnv=Env,
         RelaxHybridAgent=hybrid.RelaxHybridAgent,
         parse_mcp_action=lambda a: None,
@@ -412,14 +433,16 @@ def test_real_session_driver_mock_environment_tail_and_early_stop(hybrid, monkey
         emit=lambda *a, **k: None,
     )
     result = asyncio.run(ns["run_session"]({"task_config": {"id": "task", "instruction": "task"}}, {}))
-    count = fail_at or 10
+    count = fail_at or config["max_turns"]
+    assert result["reward"] == 1.0
+    if fail_at:
+        assert result["metadata"]["stop_reason"] == error_kind
+        assert "FAIL" not in actions
     assert result["metadata"]["agent_turns"] == count
     assert result["metadata"]["_session_metrics"]["osworld/model_calls"] == count
     assert len(actions) == count + 1 and actions[-1] == "close"
     if mode == "vcs":
-        assert result["_segment_records"][-1]["vcs_segment"]["reason"] == (
-            "predict_error" if fail_at else "agent_done"
-        )
+        assert result["_segment_records"][-1]["vcs_segment"]["reason"] == (error_kind if fail_at else "agent_done")
         assert result["metadata"]["_session_metrics"]["osworld/answer_tokens"] == count * 2
     else:
         assert "_segment_records" not in result
@@ -461,3 +484,87 @@ def test_tool_change_at_image_boundary_records_both_causes(hybrid, monkeypatch, 
     assert agent.visual_context.metrics()["osworld/vcs_pruned_images"] == 2
     assert len(trained_pairs(samples)) == 10
     assert image_count(backend.requests[-1]["messages"]) == 3
+
+
+def test_terminal_signals_cross_pinned_upstream_predict_and_preserve_parse_retry():
+    """Run the pinned fork's real predict/parser; only HTTP and unused tools
+    are isolated."""
+    import subprocess
+
+    repo = os.environ.get("OSWORLD_REPO")
+    if not repo or not (Path(repo) / "mm_agents/hybrid_agent_local.py").is_file():
+        pytest.skip("Set OSWORLD_REPO to the pinned external fork for native predict validation")
+    source = subprocess.check_output(
+        ["git", "-C", repo, "show", "50b4a85778cfc13ce00e3bf63a3cd08bd260fb96:mm_agents/hybrid_agent_local.py"],
+        text=True,
+    )
+    script = r"""
+import io
+import logging
+import sys
+import types
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+from PIL import Image
+
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+# predict does not use ComputerUse; do not require its separate qwen_agent SDK.
+tools = types.ModuleType("mm_agents.agent_function_call")
+tools.ComputerUse = object
+sys.modules[tools.__name__] = tools
+upstream = types.ModuleType("mm_agents.hybrid_agent_local")
+upstream.__file__ = str(Path(sys.argv[1]) / "mm_agents/hybrid_agent_local.py")
+sys.modules[upstream.__name__] = upstream
+exec(compile(sys.stdin.read(), upstream.__file__, "exec"), upstream.__dict__)
+from examples.osworld_agentic.app.hybrid_agent import (
+    RelaxHybridAgent, ContextLengthExceededError, SessionDiscardedError,
+)
+
+def make_agent():
+    agent = object.__new__(RelaxHybridAgent)
+    agent._hybrid = True
+    agent.model, agent.max_steps, agent.max_tokens = "qwen3-vl", 30, 4096
+    agent.top_p = agent.temperature = agent._repetition_penalty = 1.0
+    agent.visual_context, agent._stop_token_ids = None, []
+    agent._base_url, agent._api_key = "http://mock/v1", "session"
+    agent._max_llm_call_retries, agent._llm_call_timeout_s, agent._backoff_seconds = 3, 1.0, 0
+    agent.turn_records, agent.model_request_s, agent.transport_retries = [], 0.0, 0
+    agent.reset(logging.getLogger("native-predict"))
+    agent._build_messages_owl = lambda *a: ([{"role": "user", "content": "task"}], [])
+    agent._build_base_reward_context = lambda *a: ("reward", [])
+    agent._finalize_reward_messages = lambda *a: []
+    return agent
+
+buffer = io.BytesIO()
+Image.new("RGB", (64, 64)).save(buffer, format="PNG")
+obs = {"screenshot": buffer.getvalue(), "tool_list": [], "cur_app": "test"}
+for status, code, error_type in (
+    (400, "context_length_exceeded", ContextLengthExceededError),
+    (404, "session_discarded", SessionDiscardedError),
+):
+    agent = make_agent()
+    with patch("httpx.post", return_value=httpx.Response(status, json={"error": {"code": code}})) as post:
+        try:
+            agent.predict("task", obs, step_idx=0)
+        except error_type:
+            pass
+        else:
+            raise AssertionError("terminal signal was swallowed by upstream retry")
+        assert post.call_count == 1 and not agent.actions and not agent._prediction_active
+
+agent = make_agent()
+good = '<tool_call>{"name":"app.click","arguments":{"x":1}}</tool_call>'
+replies = [httpx.Response(200, json={"choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                                   "usage": {"prompt_tokens": 3, "completion_tokens": 2}})
+           for content in ("bad parse", good)]
+with patch("httpx.post", side_effect=replies) as post:
+    result = agent.predict("task", obs, step_idx=0)
+    assert post.call_count == 2 and len(agent.turn_records) == 2 and len(agent.actions) == 1
+    assert not result[2].get("parse_failed") and result[1] == ['MCP:app.click:{"x": 1}']
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, repo, str(ROOT)], input=source, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

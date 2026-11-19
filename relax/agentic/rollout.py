@@ -350,10 +350,7 @@ class AgenticResidentPipeline:
             metrics.update(self.reward_domain.collect_metrics())
             if self.runtime_domain.teacher_routing_enabled:
                 metrics.update(self._opd_manager.response_stats.metrics())
-            if getattr(self.args, "agentic_program_admission", False) or getattr(
-                self.args, "agentic_session_lifecycle", False
-            ):
-                metrics.update(await self.runtime_domain.collect_agentic_kv_metrics())
+            metrics.update(await self.runtime_domain.collect_agentic_kv_metrics())
             for key, value in _collect_agentic_metadata_metrics(samples).items():
                 metrics.setdefault(key, value)
 

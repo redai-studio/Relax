@@ -125,6 +125,12 @@ def test_rl_data_fields_include_replay_metadata():
         "group_index",
     ):
         assert required in fields
+    assert "multimodal_train_inputs" not in fields
+    args.use_agentic_rollout = True
+    assert "multimodal_train_inputs" in build_data_fields(args)
+    for is_vl_model in (False, True):
+        args.is_vl_model = is_vl_model
+        assert "multimodal_train_inputs" in build_data_fields(args)
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "score_centering"])

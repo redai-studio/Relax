@@ -45,6 +45,8 @@ def test_optimization_flags_pass_strict_env_validation(monkeypatch):
         "RELAX_MM_RELEASE_TRIM": "1",
         "RELAX_MM_RELEASE_LOG": "1",
         "RELAX_MM_PIXEL_DTYPE": "bf16",
+        "RELAX_MM_IMAGE_POOL": "1",
+        "RELAX_EVAL_ON_EPOCH_BOUNDARY": "0",
     }
     env.validate_env(flags)
     assert env.resolve_in("RELAX_TRANSFER_BATCH_GROUPS", flags) == 1
@@ -53,6 +55,10 @@ def test_optimization_flags_pass_strict_env_validation(monkeypatch):
     assert env.resolve_in("RELAX_VCS", {}) is False
     assert env.resolve_in("RELAX_TRANSFER_BATCH_GROUPS", {}) == 0
     assert env.resolve_in("RELAX_MM_RELEASE_AFTER_TRANSFER", {}) is False
+    assert env.resolve_in("RELAX_MM_IMAGE_POOL", flags) is True
+    assert env.resolve_in("RELAX_MM_IMAGE_POOL", {}) is False
+    assert env.resolve_in("RELAX_EVAL_ON_EPOCH_BOUNDARY", flags) is False
+    assert env.resolve_in("RELAX_EVAL_ON_EPOCH_BOUNDARY", {}) is True
 
 
 @pytest.mark.parametrize(
@@ -84,7 +90,8 @@ def test_complete_group_can_transfer_before_rollout_is_full(monkeypatch, fully_a
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
-def test_pixels_release_only_after_successful_queue_write(monkeypatch, outcome):
+@pytest.mark.parametrize("debug_option", [None, "save_debug_rollout_data", "dump_details"])
+def test_pixels_release_only_after_successful_queue_write(monkeypatch, tmp_path, outcome, debug_option):
     monkeypatch.setenv("RELAX_TRAIN_VISION_CACHE", "1")
     monkeypatch.setattr(transfer, "_MM_RELEASE_AFTER_TRANSFER", True)
     monkeypatch.setattr(transfer, "_MM_RELEASE_TRIM", False)
@@ -98,6 +105,8 @@ def test_pixels_release_only_after_successful_queue_write(monkeypatch, outcome):
         multimodal_keys=None,
         use_opd=False,
     )
+    if debug_option is not None:
+        setattr(args, debug_option, str(tmp_path / "debug"))
 
     async def run():
         entered, allow_finish = asyncio.Event(), asyncio.Event()
@@ -141,7 +150,8 @@ def test_pixels_release_only_after_successful_queue_write(monkeypatch, outcome):
 
     stored = asyncio.run(run())
     mm = sample.multimodal_train_inputs
-    assert mm["pixel_values"].shape == ((0, 4) if outcome == "success" else (4, 4))
+    released = outcome == "success" and debug_option is None
+    assert mm["pixel_values"].shape == ((0, 4) if released else (4, 4))
     assert mm["pixel_values"].dtype == torch.bfloat16
     assert mm["image_grid_thw"] is grid
     assert sample.tokens == [1, 2] and sample.rollout_log_probs == [-0.1]
@@ -149,6 +159,12 @@ def test_pixels_release_only_after_successful_queue_write(monkeypatch, outcome):
     assert transferred["pixel_values"].shape == (4, 4)
     assert transferred["_relax_vision_cache"][0]["key"][0] == "session"
     assert stored["partition_id"] == "train_3"
+    if outcome == "success" and debug_option is not None:
+        path = tmp_path / "rollout.pt"
+        torch.save(sample.to_dict(), path)
+        restored = Sample.from_dict(torch.load(path, weights_only=False)).multimodal_train_inputs
+        torch.testing.assert_close(restored["pixel_values"], torch.ones(4, 4, dtype=torch.bfloat16))
+        torch.testing.assert_close(restored["image_grid_thw"], grid)
 
 
 def test_pixel_reference_is_gone_before_malloc_trim(monkeypatch):

@@ -2443,12 +2443,17 @@ def test_train_start_does_not_wait_for_tensor_writer(tmp_path, fake_mpu, monkeyp
     assert end["stage_id"] == start["stage_id"]
 
 
-def test_registration_error_after_shard_execution_has_only_one_session_end(tmp_path, rollout_module):
+@pytest.mark.parametrize("dump_enabled", [False, True])
+def test_registration_error_after_shard_execution_has_only_one_session_end(tmp_path, rollout_module, dump_enabled):
     from relax.agentic.pipeline import GroupInput
     from relax.agentic.pipeline import runtime as runtime_module
 
     async def scenario():
         shard, _ = _session_observation_fixture(tmp_path)
+        if not dump_enabled:
+            await shard._trajectory_recorder.aclose()
+            shard.args.dump_agentic_obs = None
+            shard._trajectory_recorder = ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
         shard._groups.clear()
         shard._session_records.clear()
         shard._start_session = lambda *a: (_ for _ in ()).throw(RuntimeError("launch failed"))
@@ -2456,7 +2461,12 @@ def test_registration_error_after_shard_execution_has_only_one_session_end(tmp_p
             "shard", SimpleNamespace(start_group=SimpleNamespace(remote=shard.start_group))
         )
         runtime = runtime_module.RuntimeDomain(
-            _obs_args(tmp_path, rollout_global_dataset=False), "train", [binding], 1
+            _obs_args(
+                tmp_path, rollout_global_dataset=False, dump_agentic_obs=str(tmp_path) if dump_enabled else None
+            ),
+            "train",
+            [binding],
+            1,
         )
         runtime._start_shard_observers = lambda: None
         with pytest.raises(RuntimeError, match="launch failed"):
@@ -2465,10 +2475,15 @@ def test_registration_error_after_shard_execution_has_only_one_session_end(tmp_p
         await runtime._inventory.aclose()
         if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
             await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        metrics = await shard.agentic_kv_metrics()
+        assert metrics["terminal/failed"] == 2 and metrics["terminal/cancelled"] == 0
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
     events = [row for path in (tmp_path / "run_test/stages").glob("*.jsonl") for row in _read_jsonl(path)]
+    if not dump_enabled:
+        assert events == []
+        return
     assert len(events) == 4
     for session_id in {row["session_id"] for row in events}:
         pair = sorted((row for row in events if row["session_id"] == session_id), key=lambda row: row["event_seq"])
@@ -2671,3 +2686,79 @@ def test_backend_timing_omits_missing_invalid_and_unrelated_fields():
         },
     )
     assert attempt["backend_timing"] == {"queue_time": 0.0, "forward_entry_time": 10.0}
+
+
+@pytest.mark.parametrize("dump_enabled", [False, True])
+def test_pre_request_failure_uses_terminal_metrics_without_training_samples(
+    tmp_path, rollout_module, monkeypatch, dump_enabled
+):
+    from relax.agentic.pipeline import SessionExportTransport
+    from relax.agentic.session import service
+
+    errors = []
+    monkeypatch.setattr(service.logger, "error", lambda *args: errors.append(args))
+
+    async def scenario():
+        shard, session = _session_observation_fixture(tmp_path)
+        if not dump_enabled:
+            await shard._trajectory_recorder.aclose()
+            shard.args.dump_agentic_obs = None
+            shard._trajectory_recorder = ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+            session.observation = None
+        process_wait = asyncio.create_task(asyncio.sleep(0))
+        watcher = asyncio.create_task(asyncio.Event().wait())
+        cleanup_release = asyncio.Event()
+        process = SimpleNamespace(
+            output=SimpleNamespace(metadata={"stop_reason": "session_error", "last_error": "Nex reset failed"}),
+            terminate_and_join=AsyncMock(side_effect=cleanup_release.wait),
+        )
+        session.resources = service.SessionResources(process, process_wait, watcher)
+        await shard._watch_agent_process(session, process_wait)
+        assert session.result_cell.dropped and session.group.drop_committed
+        assert (await shard.agentic_kv_metrics())["terminal/failed"] == 1
+        cleanup_release.set()
+        if shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        await asyncio.gather(watcher, return_exceptions=True)
+        # Repeated observation cannot count the same terminal Session twice.
+        shard._observe_session(session, "rollout", "failed", is_terminal=True)
+        sibling = service._SessionRecord(session.group, "sibling", {}, service._SessionResultCell())
+        session.group.sessions.append(sibling)
+        session.group.result_cells[sibling.session_id] = sibling.result_cell
+        shard._session_records[sibling.session_id] = sibling
+        await shard.drop_group("g")
+        for mode in ("train", "eval"):
+            group = service.ResidentGroup(mode, f"{mode}_completed", {}, [], ownership=service.GroupOwnership.RUNTIME)
+            completed = service._SessionRecord(group, group.group_id, {}, service._SessionResultCell())
+            group.sessions.append(completed)
+            group.result_cells[completed.session_id] = completed.result_cell
+            shard._session_records[completed.session_id] = completed
+            await shard._finish_session(completed, SessionExportTransport(exports=()))
+        if shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        runtime = object.__new__(rollout_module.RuntimeDomain)
+        runtime.rollout_mode = "train"
+        runtime._admission_coordinator = None
+        runtime._shards = (
+            SimpleNamespace(
+                handle=SimpleNamespace(agentic_kv_metrics=SimpleNamespace(remote=shard.agentic_kv_metrics))
+            ),
+        )
+        metrics = await runtime.collect_agentic_kv_metrics()
+        assert metrics["agentic/sessions_failed"] == 1
+        assert metrics["agentic/sessions_completed"] == 1
+        assert metrics["agentic/sessions_cancelled"] == 1
+        assert metrics["agentic/session_error_rate"] == 0.5
+        assert "agentic/session_error_rate" not in await runtime.collect_agentic_kv_metrics()
+        assert (await shard.agentic_kv_metrics(rollout_mode="eval"))["terminal/completed"] == 1
+        await shard._trajectory_recorder.aclose()
+
+    asyncio.run(scenario())
+    assert any(
+        "Dropping failed resident agentic session" in row[0] and "Nex reset failed" in str(row) for row in errors
+    )
+    if dump_enabled:
+        events = _read_jsonl(tmp_path / "run_test/stages/shard_00.jsonl")
+        (failed,) = [event for event in events if event["session_id"] == "s" and event["is_terminal"]]
+        assert failed["status"] == "failed" and failed["reason_code"] == "agent_no_request"
+        assert failed["export_ids"] == [] and "Nex reset failed" in failed["reason"]
