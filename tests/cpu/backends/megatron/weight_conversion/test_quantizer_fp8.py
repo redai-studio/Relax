@@ -270,6 +270,19 @@ class TestQuantizeByIgnoreList:
         assert out["m.experts.0.gate_proj.weight"] == "Q"
         assert out["m.experts.0.down_proj.weight"] == "Q"
 
+    def test_parent_ignore_preserves_children_without_matching_sibling_prefix(self, monkeypatch):
+        weight = torch.zeros(2, 2, dtype=torch.bfloat16)
+        params = [
+            ("model.vision.encoder.proj.weight", weight),
+            ("model.vision_adapter.proj.weight", weight),
+            ("model.layers.0.mlp.experts.3.up_proj.weight", weight),
+        ]
+        out = dict(self._run(monkeypatch, params, ignore={"model.vision", "model.layers.0.mlp"}))
+
+        assert out["model.vision.encoder.proj.weight"] is weight
+        assert out["model.layers.0.mlp.experts.3.up_proj.weight"] is weight
+        assert out["model.vision_adapter.proj.weight"] == "Q"
+
 
 # ---------------------------------------------------------------------------
 # quantize_params_fp8: dispatch into the ignore-list path

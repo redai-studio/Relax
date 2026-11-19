@@ -178,11 +178,18 @@ def _checkpoint_module_name(hf_name):
 def _quantize_params_fp8_by_ignore_list(converted_named_params, modules_to_not_convert, weight_block_size, scale_fmt):
     quantize_named_params = []
     for name, param in converted_named_params:
+        module_name = _checkpoint_module_name(name)
+        ignored = False
+        while module_name:
+            if module_name in modules_to_not_convert:
+                ignored = True
+                break
+            module_name = module_name.rpartition(".")[0]
         is_quantizable = (
             name.endswith(".weight")
             and param.dim() == 2
             and param.dtype in (torch.bfloat16, torch.float16, torch.float32)
-            and _checkpoint_module_name(name) not in modules_to_not_convert
+            and not ignored
         )
         if is_quantizable:
             quantize_named_params.extend(_quantize_param(name, param, weight_block_size, scale_fmt))
