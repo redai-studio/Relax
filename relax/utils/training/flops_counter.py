@@ -57,16 +57,9 @@ def _unit_convert(value: float, target_unit: str) -> float:
 def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> float:
     """Get theoretical BF16 peak FLOPS for the current GPU.
 
-    Prefer an explicit RELAX_DEVICE_PEAK_TFLOPS override, then the optional
-    telemetry hook's device mapping when available. Returns
+    Prefer the optional telemetry hook's device mapping when available. Returns
     ``float('inf')`` for unknown GPUs (MFU silently skipped).
     """
-    peak_override = Envs.RELAX_DEVICE_PEAK_TFLOPS
-    if peak_override is not None:
-        if not math.isfinite(peak_override) or peak_override <= 0:
-            raise ValueError("RELAX_DEVICE_PEAK_TFLOPS must be a finite positive BF16 TFLOPS value")
-        return _unit_convert(peak_override * 1e12, unit)
-
     if device_name is None:
         try:
             from relax.utils.device import device_module

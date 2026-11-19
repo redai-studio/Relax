@@ -10,11 +10,11 @@
 #
 # Online (two updates by default), with MODEL_DIR/DATA_DIR/SAVE_DIR supplied:
 #   QKV_FORMAT=bshd bash scripts/entrypoint/ray-job.sh \
-#     scripts/training/text/run-deepseek-v4.1-4layer-8xgpu-gsm8k-logprob.sh
+#     examples/models/deepseek-v4.1/scripts/run-deepseek-v4.1-4layer-8xgpu-gsm8k-logprob.sh
 # Dumps go to SAVE_DIR/EXP_NAME/debug/{rollout_data,train_data}.
 # Replay the same dump from the same initial weights, using a fresh EXP_NAME:
 #   QKV_FORMAT=thd EXP_NAME=v41-gsm8k-replay-thd bash scripts/entrypoint/ray-job.sh \
-#     scripts/training/text/run-deepseek-v4.1-4layer-8xgpu-gsm8k-logprob.sh \
+#     examples/models/deepseek-v4.1/scripts/run-deepseek-v4.1-4layer-8xgpu-gsm8k-logprob.sh \
 #     --load-debug-rollout-data '/path/to/saved/rollout_data/{rollout_id}.pt'
 # That existing flag selects train-only: no SGLang or online weight-update check.
 # Repeat with bshd and another fresh EXP_NAME for the layout comparison.
@@ -29,7 +29,7 @@ set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 now=$(date "+%Y%m%d-%H%M%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
+RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." &>/dev/null && pwd)"
 : "${MODEL_DIR:?Set MODEL_DIR to the model root}"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint root}"

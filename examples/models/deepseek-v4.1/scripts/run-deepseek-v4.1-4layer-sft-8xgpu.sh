@@ -13,7 +13,7 @@
 #
 # Usage on a dedicated training host:
 #   MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/checkpoints \
-#     bash scripts/training/sft/run-deepseek-v4.1-4layer-sft-8xgpu.sh
+#     bash examples/models/deepseek-v4.1/scripts/run-deepseek-v4.1-4layer-sft-8xgpu.sh
 # With an existing Ray cluster, use scripts/entrypoint/ray-job.sh as usual.
 # DRY_RUN=1 prints argv/runtime env without starting Ray or importing ML packages.
 # Reuse SAVE_DIR/EXP_NAME to resume; change EXP_NAME for an independent baseline.
@@ -24,7 +24,7 @@ set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 now=$(date "+%Y%m%d-%H%M%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
+RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." &>/dev/null && pwd)"
 
 : "${MODEL_DIR:?Set MODEL_DIR to the model root}"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
@@ -175,7 +175,7 @@ TRAIN_ARGS=(
 )
 
 if [ "${DRY_RUN:-0}" != 1 ] && [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
+    source "${RELAX_ROOT}/scripts/entrypoint/local.sh"
 fi
 RUNTIME_ENV_JSON=$(python3 - <<'PY'
 import json

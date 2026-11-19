@@ -15,7 +15,7 @@
 #   RELAX_SKIP_CLUSTER_CLEANUP=1 \
 #     MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/checkpoints \
 #     bash scripts/entrypoint/ray-job.sh \
-#       scripts/training/sft/run-deepseek-v4.1-flash-sft-thd-128xgpu.sh
+#       examples/models/deepseek-v4.1/scripts/run-deepseek-v4.1-flash-sft-thd-128xgpu.sh
 # Direct bash also uses the existing-cluster entrypoint; it does not create Ray.
 # DRY_RUN=1 prints argv/runtime env without starting Ray or importing ML packages.
 # Keep SAVE_DIR/EXP_NAME to resume; change EXP_NAME for an independent comparison.
@@ -25,7 +25,7 @@ set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 now=$(date "+%Y%m%d-%H%M%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
+RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." &>/dev/null && pwd)"
 
 : "${MODEL_DIR:?Set MODEL_DIR to the model root}"
 : "${DATA_DIR:?Set DATA_DIR to the dataset root}"
@@ -152,10 +152,6 @@ import os
 
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
 runtime.setdefault("env_vars", {}).update({
-    # Physical H800 GPUs; reported device names may be masked.
-    "RELAX_DEVICE_PEAK_TFLOPS": os.environ.get(
-        "RELAX_DEVICE_PEAK_TFLOPS", runtime.get("env_vars", {}).get("RELAX_DEVICE_PEAK_TFLOPS", "989")
-    ),
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "0",
     "NCCL_CUMEM_ENABLE": "1",
