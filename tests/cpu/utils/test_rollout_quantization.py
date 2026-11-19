@@ -10,19 +10,6 @@ import pytest
 from relax.utils.quant_cast import resolve_receiver_quantization_config
 
 
-@pytest.fixture
-def resolve_rollout_quantization_config():
-    def resolve(args, hf_config):
-        from relax.backends.megatron.actor import MegatronTrainRayActor
-
-        actor = object.__new__(MegatronTrainRayActor)
-        actor.args = args
-        actor.hf_config = hf_config
-        return actor._resolve_push_quantization_config()
-
-    return resolve
-
-
 @pytest.mark.parametrize(
     "extra,compatible",
     [
@@ -82,47 +69,6 @@ def compressed_checkpoint(tmp_path):
     header += b" " * (-len(header) % 8)
     (checkpoint / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + b"\0\0\0")
     return checkpoint, config
-
-
-@pytest.mark.parametrize("method_source", ["metadata", "global", "group"])
-def test_receiver_compression_metadata_drives_packing(
-    resolve_rollout_quantization_config, quantization_args, compressed_checkpoint, tmp_path, method_source
-):
-    path, config = compressed_checkpoint
-    quantization_args.sglang_hf_checkpoint = str(path)
-    if method_source != "metadata":
-        config = {key: value for key, value in config.items() if key != "quant_method"}
-        (path / "config.json").write_text(json.dumps({"compression_config": config}))
-        quantization_args.sglang_quantization = "compressed-tensors"
-    if method_source == "group":
-        quantization_args.sglang_quantization = "fp8"
-        _write_groups(
-            quantization_args,
-            tmp_path,
-            [
-                {
-                    "name": "policy",
-                    "engine_groups": [
-                        {"worker_type": "regular", "num_gpus": 2, "overrides": {"quantization": "compressed-tensors"}}
-                    ],
-                }
-            ],
-        )
-    actual = resolve_rollout_quantization_config(
-        quantization_args, SimpleNamespace(quantization_config={"quant_method": "fp8"})
-    )
-    assert actual["quant_method"] == "compressed-tensors"
-    assert actual["format"] == "pack-quantized"
-    assert "re:.*vision_tower.*" in actual["ignore"]
-    assert config["ignore"] == []
-    # Execute the real sender dispatch on a plain namespace excluded by the
-    # checkpoint scan; this CPU case does not invoke the CUDA packing kernel.
-    import torch
-
-    from relax.backends.megatron.weight_conversion.processors import quantize_params
-
-    named = [("vision_tower.proj.weight", torch.ones(1, 1))]
-    assert quantize_params(quantization_args, "unused", named, actual) == named
 
 
 @pytest.mark.parametrize("alias", ["source", "original"])
@@ -192,29 +138,12 @@ def quantization_args(tmp_path):
         ({"quantization_config": {"quant_method": "other"}}, {"quant_method": "other"}),
     ],
 )
-def test_rollout_quantization_preserves_explicit_null(
-    resolve_rollout_quantization_config, quantization_args, override, expected
-):
+def test_rollout_quantization_preserves_explicit_null(quantization_args, override, expected):
     args = quantization_args
-    args.sglang_json_model_override_args = json.dumps(override)
-    assert resolve_rollout_quantization_config(args, SimpleNamespace()) == expected
-
-
-def test_rollout_quantization_uses_receiver_checkpoint(
-    resolve_rollout_quantization_config, quantization_args, tmp_path
-):
-    pytest.importorskip("transformers")
-    receiver = tmp_path / "receiver"
-    receiver.mkdir()
-    expected = {"quant_method": "other"}
-    (receiver / "config.json").write_text(json.dumps({"text_config": {"quantization_config": expected}}))
-    quantization_args.sglang_hf_checkpoint = str(receiver)
-    assert (
-        resolve_rollout_quantization_config(
-            quantization_args, SimpleNamespace(quantization_config={"quant_method": "fp8"})
-        )
-        == expected
+    actual = resolve_receiver_quantization_config(
+        args, SimpleNamespace(), [("receiver", args.hf_checkpoint, json.dumps(override), None)]
     )
+    assert actual == expected
 
 
 @pytest.mark.parametrize(
@@ -231,7 +160,7 @@ def test_rollout_quantization_uses_receiver_checkpoint(
     ],
 )
 def test_rollout_quantization_matches_receiver_text_config(
-    resolve_rollout_quantization_config, quantization_args, overrides, root_null, requested_quantization, keeps_fp8
+    quantization_args, overrides, root_null, requested_quantization, keeps_fp8
 ):
     from pathlib import Path
 
@@ -247,47 +176,19 @@ def test_rollout_quantization_matches_receiver_text_config(
     if root_null:
         config.quantization_config = None
     config.save_pretrained(path)
-    quantization_args.sglang_json_model_override_args = json.dumps(overrides)
-    quantization_args.sglang_quantization = requested_quantization
     receiver = ModelConfig(str(path), model_override_args=json.dumps(overrides), quantization=requested_quantization)
     if receiver.quantization is not None:
         loaded = get_quant_config(receiver, LoadConfig(load_format="dummy"), {})
         assert loaded.get_name() == "fp8"
         assert loaded.is_checkpoint_fp8_serialized
         assert loaded.weight_block_size == [128, 128]
-    actual = resolve_rollout_quantization_config(quantization_args, SimpleNamespace())
+    actual = resolve_receiver_quantization_config(
+        quantization_args,
+        SimpleNamespace(),
+        [("receiver", str(path), json.dumps(overrides), requested_quantization)],
+    )
     assert (actual["quant_method"] if actual else None) == receiver.quantization == ("fp8" if keeps_fp8 else None)
     assert actual == (expected if keeps_fp8 else None)
-
-
-@pytest.mark.parametrize("order", ["single", "empty-first", "plain-first"])
-def test_rollout_empty_quantization_preserves_bf16_dispatch(
-    resolve_rollout_quantization_config, quantization_args, tmp_path, order
-):
-    from pathlib import Path
-
-    import torch
-
-    from relax.backends.megatron.weight_conversion.processors import quantize_params
-
-    (Path(quantization_args.hf_checkpoint) / "config.json").write_text(json.dumps({"quantization_config": {}}))
-    quantization_args.sglang_quantization = "compressed-tensors"
-    groups = [{"worker_type": "regular", "num_gpus": 1}]
-    if order != "single":
-        groups.append(
-            {
-                "worker_type": "regular",
-                "num_gpus": 1,
-                "overrides": {"quantization": None, "json_model_override_args": '{"quantization_config": null}'},
-            }
-        )
-    if order == "plain-first":
-        groups.reverse()
-    _write_groups(quantization_args, tmp_path, [{"name": "policy", "engine_groups": groups}])
-    actual = resolve_rollout_quantization_config(quantization_args, SimpleNamespace())
-    named = [("model.weight", torch.ones(1, 1))]
-    assert quantize_params(quantization_args, "unused", named, actual) is named
-    assert actual is None
 
 
 def test_receiver_reuses_shard_headers_without_reusing_group_overrides(
@@ -320,111 +221,8 @@ def test_receiver_reuses_shard_headers_without_reusing_group_overrides(
     assert open_header.call_count == 3
 
 
-def _write_groups(args, tmp_path, models):
-    pytest.importorskip("relax.distributed.ray.rollout")
-    path = tmp_path / "rollout.yaml"
-    path.write_text(json.dumps({"sglang": models}))
-    args.sglang_config = str(path)
-    args.rollout_num_gpus = sum(group["num_gpus"] for model in models for group in model["engine_groups"])
-
-
-@pytest.mark.parametrize(
-    "override,expected",
-    [
-        ("{}", {"quant_method": "fp8"}),
-        ('{"quantization_config": null}', None),
-    ],
-)
-def test_rollout_quantization_group_json_replaces_global(
-    resolve_rollout_quantization_config, quantization_args, tmp_path, override, expected
-):
-    args = quantization_args
-    args.sglang_json_model_override_args = '{"quantization_config": {"quant_method": "other"}}'
-    _write_groups(
-        args,
-        tmp_path,
-        [
-            {
-                "name": "policy",
-                "engine_groups": [
-                    {"worker_type": "regular", "num_gpus": 2, "overrides": {"json_model_override_args": override}},
-                ],
-            }
-        ],
-    )
-    assert resolve_rollout_quantization_config(args, SimpleNamespace()) == expected
-
-
-@pytest.mark.parametrize("fully_async,hybrid", [(False, False), (True, False), (False, True)])
-def test_rollout_quantization_checks_publication_recipients(
-    resolve_rollout_quantization_config, quantization_args, tmp_path, fully_async, hybrid
-):
-    args = quantization_args
-    args.fully_async, args.hybrid = fully_async, hybrid
-    _write_groups(
-        args,
-        tmp_path,
-        [
-            {
-                "name": "policy",
-                "engine_groups": [
-                    {"worker_type": "regular", "num_gpus": 1},
-                    {
-                        "worker_type": "placeholder",
-                        "num_gpus": 1,
-                        "overrides": {"json_model_override_args": '{"quantization_config": null}'},
-                    },
-                ],
-            },
-            {
-                "name": "second",
-                "engine_groups": [
-                    {
-                        "worker_type": "regular",
-                        "num_gpus": 1,
-                        "overrides": {"json_model_override_args": '{"quantization_config": null}'},
-                    },
-                ],
-            },
-        ],
-    )
-    if fully_async or hybrid:
-        with pytest.raises(ValueError, match="policy/0:regular and second/0:regular"):
-            resolve_rollout_quantization_config(args, SimpleNamespace())
-    else:
-        assert resolve_rollout_quantization_config(args, SimpleNamespace()) == {"quant_method": "fp8"}
-
-
-@pytest.mark.parametrize("worker_types", [("regular", "regular"), ("prefill", "decode")])
-def test_rollout_quantization_rejects_mixed_group_formats(
-    resolve_rollout_quantization_config, quantization_args, tmp_path, worker_types
-):
-    args = quantization_args
-    _write_groups(
-        args,
-        tmp_path,
-        [
-            {
-                "name": "policy",
-                "engine_groups": [
-                    {"worker_type": worker_types[0], "num_gpus": 1},
-                    {
-                        "worker_type": worker_types[1],
-                        "num_gpus": 1,
-                        "overrides": {"json_model_override_args": '{"quantization_config": null}'},
-                    },
-                ],
-            }
-        ],
-    )
-    with pytest.raises(ValueError, match="different quantization configs"):
-        resolve_rollout_quantization_config(args, SimpleNamespace())
-
-
-@pytest.mark.parametrize("method,group_override", [("FP8", True), ("modelopt_fp4", False)])
-def test_receiver_mode_names_preserve_dense_block_fp8_layout(
-    resolve_rollout_quantization_config, quantization_args, tmp_path, method, group_override
-):
+@pytest.mark.parametrize("method", ["FP8", "modelopt_fp4"])
+def test_receiver_mode_names_preserve_dense_block_fp8_layout(quantization_args, method):
     from pathlib import Path
 
     from transformers import Qwen3Config
@@ -449,22 +247,6 @@ def test_receiver_mode_names_preserve_dense_block_fp8_layout(
     config = Qwen3Config(quantization_config=expected)
     config.architectures = ["Qwen3ForCausalLM"]
     config.save_pretrained(path)
-    if group_override:
-        _write_groups(
-            quantization_args,
-            tmp_path,
-            [
-                {
-                    "name": "policy",
-                    "engine_groups": [
-                        {"worker_type": "regular", "num_gpus": 2, "overrides": {"quantization": method}}
-                    ],
-                }
-            ],
-        )
-    else:
-        quantization_args.sglang_quantization = method
-
     receiver = ModelConfig(str(path), quantization=method)
     loaded = get_quant_config(receiver, LoadConfig(load_format="dummy"), {})
     layer = LinearBase(128, 128, quant_config=loaded, prefix="model.layers.0.self_attn.q_proj")
@@ -472,21 +254,7 @@ def test_receiver_mode_names_preserve_dense_block_fp8_layout(
     assert isinstance(layer.quant_method, Fp8LinearMethod)
     assert layer.quant_method.is_checkpoint_fp8_serialized
     assert loaded.weight_block_size == [128, 128]
-    assert resolve_rollout_quantization_config(quantization_args, SimpleNamespace()) == expected
-
-
-def test_sender_still_rejects_unsupported_serialized_layout(resolve_rollout_quantization_config, quantization_args):
-    from pathlib import Path
-
-    import torch
-
-    from relax.backends.megatron.weight_conversion.processors import quantize_params
-
-    unsupported = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
-    (Path(quantization_args.hf_checkpoint) / "config.json").write_text(
-        json.dumps({"quantization_config": unsupported})
+    actual = resolve_receiver_quantization_config(
+        quantization_args, SimpleNamespace(), [("receiver", str(path), None, method)]
     )
-    quantization_args.sglang_quantization = "modelopt_fp4"
-    actual = resolve_rollout_quantization_config(quantization_args, SimpleNamespace())
-    with pytest.raises(ValueError, match="Unsupported quantization method"):
-        quantize_params(quantization_args, "unused", [("model.weight", torch.ones(1, 1))], actual)
+    assert actual == expected
