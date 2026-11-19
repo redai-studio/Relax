@@ -150,15 +150,15 @@ def test_selected_main_head_matches_dense_masked_loss_and_gradients(rows):
 def test_expert_static_forward_preserves_checkpoint_gradients(full_layer):
     from torch.utils.checkpoint import checkpoint
 
-    module = load("expert_recompute")
+    experts = pytest.importorskip("megatron.core.transformer.moe.experts", exc_type=ImportError)
     hidden = torch.randn(3, 4, requires_grad=True)
     probs = torch.randn(3, 1, requires_grad=True)
     counts = torch.tensor([3])
     expected = (hidden.sin() * probs).sum()
     expected_grads = torch.autograd.grad(expected, (hidden, probs))
 
-    def native(x, counts, probs):
-        return x.sin() * probs, None
+    def native(x, counts, probs, *_buffers):
+        return x.sin() * probs
 
     def checkpoint_function(body, distribute_saved_activations, *args):
         assert distribute_saved_activations is False
@@ -171,7 +171,12 @@ def test_expert_static_forward_preserves_checkpoint_gradients(full_layer):
         replay_calls=0,
         full_bypass_calls=0,
     )
-    output, bias = module.forward(None, hidden, counts, probs, native, state)
+    expert = experts.TEGroupedMLP.__new__(experts.TEGroupedMLP)
+    torch.nn.Module.__init__(expert)
+    expert._with_fused_impl = True
+    expert._fused_forward = native
+    expert._qwen_expert_checkpoint_state = state
+    output, bias = expert(hidden, counts, probs)
     # Layer exit clears current-wave state before backward. Replay must capture
     # its original native call and never consult the next wave's packed mask.
     state["active"] = None

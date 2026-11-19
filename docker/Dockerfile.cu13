@@ -47,16 +47,19 @@ COPY docker/scripts/blackwell_constraints.py /tmp/blackwell_constraints.py
 RUN python /tmp/blackwell_constraints.py && \
     pip install --no-cache-dir "ray[default,serve]==2.56.1"
 
-RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+# Refresh inconsistent Ubuntu indexes from the origin when a proxy has stale entries.
+RUN for attempt in 1 2 3; do \
+        apt-get -o Acquire::http::No-Cache=true -o APT::Update::Error-Mode=any update && break; \
+        if [ "$attempt" -eq 3 ]; then exit 100; fi; \
+        sleep "$((attempt * 5))"; \
+    done && apt-get install -y --no-install-recommends \
     build-essential patchelf tmux net-tools htop nano iputils-ping \
     autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
     libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
-    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync && \
-    rm -rf /var/lib/apt/lists/*
-
-RUN apt-get update && apt-get install -y locales tzdata && \
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync locales tzdata && \
     locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
-    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
 
 ARG EFA_INSTALLER_VERSION=latest
 RUN if [ "$GPU_ARCH" = "blackwell" ]; then \

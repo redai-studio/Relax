@@ -2176,8 +2176,228 @@ index 14cdb55..6290796 100644
                              and (block_requires_input_grad is None or block_requires_input_grad(_block))
                          ):
                              hidden_states = hidden_states.detach().requires_grad_(True)
+diff --git a/megatron/core/dist_checkpointing/strategies/bounded_staging.py b/megatron/core/dist_checkpointing/strategies/bounded_staging.py
+new file mode 100644
+index 0000000..a5a0a83
+--- /dev/null
++++ b/megatron/core/dist_checkpointing/strategies/bounded_staging.py
+@@ -0,0 +1,214 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++"""Bounded host staging for synchronous distributed checkpoint writes."""
++
++import collections
++import logging
++import os
++import threading
++from contextlib import contextmanager
++from io import UnsupportedOperation
++
++import torch
++from torch.distributed.checkpoint.filesystem import _write_item
++from torch.distributed.checkpoint.planner import WriteItemType
++from torch.futures import Future
++
++logger = logging.getLogger(__name__)
++
++
++class _BoundedSyncStager:
++    """Stage checkpoint tensors just ahead of the synchronous writer.
++
++    A single producer thread copies tensors to host memory (pinned async D2H for
++    CUDA tensors, compaction clone for CPU views) while the writer thread
++    consumes them in the original write order. Staged bytes are capped by
++    ``max_bytes``; a single item larger than the cap is staged once the window
++    is empty, so peak extra host memory per rank is bounded by
++    ``max(max_bytes, largest_item)`` rather than the whole checkpoint.
++    """
++
++    def __init__(self, max_bytes: int):
++        self.max_bytes = max_bytes
++        self.peak_staged_bytes = 0
++        self._cond = threading.Condition()
++        self._window = collections.deque()
++        self._staged_bytes = 0
++        self._inflight_bytes = 0
++        self._ready_events = []
++        self._error = None
++        self._closed = False
++        self._thread = None
++
++    @staticmethod
++    def _stage(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Event | None]:
++        tensor = tensor.detach()
++        if tensor.device.type == "cuda":
++            if "dequantize" in type(tensor).__dict__:
++                tensor = tensor.dequantize()
++            with torch.cuda.device(tensor.device):
++                staged = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
++                staged.copy_(tensor, non_blocking=True)
++                event = torch.cuda.Event()
++                event.record()
++            return staged, event
++        staged = tensor.to("cpu", non_blocking=False)
++        if staged.untyped_storage().nbytes() != staged.numel() * staged.element_size():
++            staged = staged.clone()
++        return staged, None
++
++    def _produce(self, tensors: list[torch.Tensor]) -> None:
++        try:
++            # The producer has its own thread-local CUDA current streams. Wait for
++            # work submitted on the caller's streams before reading checkpoint data.
++            for event in self._ready_events:
++                event.synchronize()
++            for tensor in tensors:
++                if tensor.device.type == "cuda" and "dequantize" in type(tensor).__dict__:
++                    with torch.cuda.device(tensor.device):
++                        tensor = tensor.dequantize()
++                nbytes = tensor.numel() * tensor.element_size()
++                with self._cond:
++                    while (
++                        self._staged_bytes
++                        and self._staged_bytes + nbytes > self.max_bytes
++                        and not self._closed
++                    ):
++                        self._cond.wait()
++                    if self._closed:
++                        return
++                    # Reserve before allocating, including the writer's live item.
++                    self._staged_bytes += nbytes
++                    self.peak_staged_bytes = max(self.peak_staged_bytes, self._staged_bytes)
++                staged, event = self._stage(tensor)
++                with self._cond:
++                    if self._closed:
++                        if event is not None:
++                            event.synchronize()
++                        return
++                    self._window.append((staged, event))
++                    # Only the queue/writer may retain the staging allocation.
++                    del staged, event
++                    self._cond.notify_all()
++        except BaseException as exc:
++            # Report to the writer thread; it surfaces through the results queue.
++            with self._cond:
++                self._error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
++                self._cond.notify_all()
++
++    def start(self, tensors: list[torch.Tensor]) -> None:
++        for device in {tensor.device for tensor in tensors if tensor.is_cuda}:
++            with torch.cuda.device(device):
++                event = torch.cuda.Event()
++                event.record(torch.cuda.current_stream(device))
++                self._ready_events.append(event)
++        self._thread = threading.Thread(
++            target=self._produce, args=(tensors,), name="sync-save-stager", daemon=True
++        )
++        self._thread.start()
++
++    def take(self) -> torch.Tensor:
++        with self._cond:
++            while not self._window:
++                if self._error is not None:
++                    raise self._error
++                if self._closed:
++                    raise RuntimeError("Synchronous save stager closed with items pending")
++                self._cond.wait()
++            staged, event = self._window.popleft()
++            self._inflight_bytes = staged.numel() * staged.element_size()
++        if event is not None:
++            event.synchronize()
++        return staged
++
++    def release(self) -> None:
++        """Return budget only after the writer has dropped its tensor reference."""
++        with self._cond:
++            self._staged_bytes -= self._inflight_bytes
++            self._inflight_bytes = 0
++            self._cond.notify_all()
++
++    def close(self) -> None:
++        with self._cond:
++            self._closed = True
++            self._cond.notify_all()
++        if self._thread is not None and self._thread.ident is not None:
++            self._thread.join()
++        # Complete outstanding D2H copies before releasing pinned destinations.
++        for _, event in self._window:
++            if event is not None:
++                event.synchronize()
++        self._window.clear()
++        self._ready_events.clear()
++
++
++def _stage_sync_tensor(tensor: torch.Tensor) -> torch.Tensor:
++    tensor = tensor.detach()
++    if tensor.device.type == "cuda" and "dequantize" in type(tensor).__dict__:
++        tensor = tensor.dequantize()
++    tensor = tensor.cpu()
++    if tensor.untyped_storage().nbytes() != tensor.nbytes:
++        tensor = tensor.clone()
++    return tensor
++
++
++@contextmanager
++def _staging_window(planner, items, stage_bytes):
++    if stage_bytes == 0:
++        yield None
++        return
++
++    stager = _BoundedSyncStager(stage_bytes)
++    try:
++        # The planner resolves views of model and optimizer state. Copies happen
++        # only in the producer after reserving bytes in the staging window.
++        stager.start([planner.resolve_data(item) for item in items])
++        yield stager
++    except BaseException:
++        try:
++            stager.close()
++        except Exception:
++            logger.exception("Failed to close the synchronous checkpoint staging window")
++        raise
++    else:
++        stager.close()
++        logger.debug("Synchronous save peak staged bytes: %d", stager.peak_staged_bytes)
++
++
++def make_bounded_writer(writer_type, checkpoint_dir, stage_bytes):
++    """Keep DCP planning and finalization with a single bounded file writer."""
++
++    class BoundedWriter(writer_type):
++        def _write_data(self, planner, file_queue):
++            results = []
++            # DCP has finished populating the queue and this is its sole consumer.
++            while not file_queue.empty():
++                path, storage_key, items = file_queue.get_nowait()
++                tensors = [item for item in items if item.type != WriteItemType.BYTE_IO]
++                with _staging_window(planner, tensors, stage_bytes) as stager:
++                    with self.fs.create_stream(path, "wb") as stream:
++                        for item in items:
++                            if item.type == WriteItemType.BYTE_IO:
++                                data = planner.resolve_data(item)
++                            else:
++                                data = stager.take() if stager else _stage_sync_tensor(planner.resolve_data(item))
++                            results.append(
++                                _write_item(
++                                    self.transforms, stream, data, item, storage_key, self.serialization_format
++                                )
++                            )
++                            # A failing writer leaves the reservation intact until close().
++                            del data
++                            if stager and item.type != WriteItemType.BYTE_IO:
++                                stager.release()
++                        if self.sync_files:
++                            try:
++                                os.fsync(stream.fileno())
++                            except (AttributeError, UnsupportedOperation):
++                                os.sync()
++
++            future = Future()
++            future.set_result(results)
++            return future
++
++    return BoundedWriter(checkpoint_dir, thread_count=1)
 diff --git a/megatron/core/dist_checkpointing/strategies/torch.py b/megatron/core/dist_checkpointing/strategies/torch.py
-index 53b41e8..42bbf2e 100644
+index 53b41e8..6ee208d 100644
 --- a/megatron/core/dist_checkpointing/strategies/torch.py
 +++ b/megatron/core/dist_checkpointing/strategies/torch.py
 @@ -527,10 +527,12 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
@@ -2206,7 +2426,7 @@ index 53b41e8..42bbf2e 100644
          ]
          try:
              # Temporarily set sizes to expected shapes
-@@ -765,7 +767,16 @@ class TorchDistSaveShardedStrategy:
+@@ -765,7 +767,18 @@ class TorchDistSaveShardedStrategy:
          )
          pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
  
@@ -2214,17 +2434,41 @@ index 53b41e8..42bbf2e 100644
 +        bounded = os.environ.get("MEGATRON_SYNC_SAVE_BOUNDED_STAGING", "0")
 +        if bounded not in {"0", "1"}:
 +            raise ValueError("MEGATRON_SYNC_SAVE_BOUNDED_STAGING must be 0 or 1")
-+        writer = _get_filesystem_writer(
-+            checkpoint_dir, thread_count=1 if bounded == "1" else self.thread_count
-+        )
++        stage_bytes = None
 +        if bounded == "1":
-+            # A zero threshold uses PyTorch's serial CPU loader. It releases
-+            # each staged tensor before staging the next one.
-+            writer.per_thread_copy_ahead = 0
++            budget_env = "MEGATRON_SYNC_SAVE_STAGE_BYTES"
++            stage_bytes = int(os.environ.get(budget_env, str(1024**3)))
++            if stage_bytes < 0:
++                raise ValueError(f"{budget_env} must be nonnegative")
++        writer = _get_filesystem_writer(
++            checkpoint_dir, thread_count=self.thread_count, stage_bytes=stage_bytes
++        )
  
          checkpoint.save(
              pyt_state_dict,
-@@ -976,6 +987,7 @@ class TorchDistLoadShardedStrategy:
+@@ -886,13 +899,18 @@ class TorchDistSaveShardedStrategy:
+ 
+ 
+ def _get_filesystem_writer(
+-    checkpoint_dir: Union[str, Path], thread_count: int = 1
++    checkpoint_dir: Union[str, Path], thread_count: int = 1, *, stage_bytes: Optional[int] = None
+ ) -> FileSystemWriter:
++    writer_type = FileSystemWriter
+     if MultiStorageClientFeature.is_enabled():
+         msc = MultiStorageClientFeature.import_package()
+-        return msc.torch.MultiStorageFileSystemWriter(checkpoint_dir, thread_count=thread_count)
++        writer_type = msc.torch.MultiStorageFileSystemWriter
++
++    if stage_bytes is not None:
++        from .bounded_staging import make_bounded_writer
+ 
+-    return FileSystemWriter(checkpoint_dir, thread_count=thread_count)
++        return make_bounded_writer(writer_type, checkpoint_dir, stage_bytes)
++    return writer_type(checkpoint_dir, thread_count=thread_count)
+ 
+ 
+ def _get_filesystem_reader(
+@@ -976,6 +994,7 @@ class TorchDistLoadShardedStrategy:
                  shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                  allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
                  stream_ckpt_dequant=self.stream_ckpt_dequant,
@@ -7021,7 +7265,7 @@ index 03f7d33..f25cf68 100644
          """Forward MLP with hyper connection pre/post processing."""
          is_last_in_recompute_block = bool(
 diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
-index 5f80c7e..ce15378 100644
+index 5f80c7e..8f2fba3 100644
 --- a/megatron/core/transformer/moe/experts.py
 +++ b/megatron/core/transformer/moe/experts.py
 @@ -720,6 +720,13 @@ class TEGroupedMLP(MegatronModule):
@@ -7081,6 +7325,29 @@ index 5f80c7e..ce15378 100644
              if not isinstance(tokens_per_expert, torch.Tensor):
                  tokens_per_expert = torch.tensor(
                      tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
+@@ -1379,6 +1387,22 @@ class TEGroupedMLP(MegatronModule):
+ 
+         # Call fused impl if enabled
+         if self._with_fused_impl:
++            checkpoint_state = getattr(self, "_qwen_expert_checkpoint_state", None)
++            # Checkpoint replay cannot write into another dispatch step's IPC buffers.
++            if checkpoint_state is not None and output_buffer is None and grad_input_buffer is None:
++                from relax.models.qwen3_5.expert_recompute import forward as checkpoint_expert
++
++                def native_forward(hidden, counts, probs):
++                    return self._fused_forward(hidden, counts, probs, None, None), None
++
++                return checkpoint_expert(
++                    self,
++                    permuted_local_hidden_states,
++                    tokens_per_expert,
++                    permuted_probs,
++                    native_forward,
++                    checkpoint_state,
++                )
+             output = self._fused_forward(
+                 permuted_local_hidden_states,
+                 tokens_per_expert,
 diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
 index 20a5f4e..e69fcb4 100644
 --- a/megatron/core/transformer/moe/fused_a2a.py
