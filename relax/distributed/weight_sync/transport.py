@@ -54,6 +54,9 @@ class DeltaTransfer:
             raise ValueError("Delta transport requires the original owner's nonempty GPU recipient layout")
         return tuple((engine._actor_id.hex(), count) for engine, count in zip(engines, counts, strict=True))
 
+    def can_reuse(self, engines: list, counts: list[int]) -> bool:
+        return self.signature == self._signature(engines, counts)
+
     def connect(self, engines: list, counts: list[int], *, reconnect: bool = False) -> bool:
         """Return whether receiver identities changed and a FULL seed is
         needed."""
@@ -148,7 +151,7 @@ class DeltaTransfer:
         self.joined = joined
         return True
 
-    def begin(self, *, version: str, base: str | None, seed: bool) -> None:
+    def begin(self, *, version: str, base: str | None, seed: bool, defer_apply: bool = False) -> None:
         if self._staged or self._active_raw is not None:
             raise RuntimeError("Cannot begin with unresolved receiver storage")
         self.frame, self.version = 0, version
@@ -161,6 +164,8 @@ class DeltaTransfer:
             transfer_apply_s=0.0,
             receive_s=0.0,
             apply_s=0.0,
+            prestaged_bytes=0,
+            prestaged_frames=0,
             proxy_receive_memory=[],
         )
         self._control = dict(
@@ -178,7 +183,8 @@ class DeltaTransfer:
                 target_shard_entries=0,
                 target_shard_changed_words=0,
             )
-        self.activate()
+        if not defer_apply:
+            self.activate()
 
     def activate(self) -> None:
         """Called only after the original owner establishes its apply
@@ -363,6 +369,9 @@ class DeltaTransfer:
             for tp, size in enumerate(sizes):
                 self.metrics["target_shard_lane_bytes"][tp] += size
         self.metrics["frames"] += 1
+        if not self._applying:
+            self.metrics["prestaged_bytes"] += sum(sizes)
+            self.metrics["prestaged_frames"] += 1
         self.frame += 1
 
     def apply(self) -> set[str]:
