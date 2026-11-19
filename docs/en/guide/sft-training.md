@@ -146,6 +146,23 @@ Minimal row shape:
 }
 ```
 
+### Literal image tags in text
+
+With `--multimodal-keys '{"image":"images"}'`, string content containing `<image>` requires matching image data by default. A missing, null, or empty `images` field does not prove that the row is text-only: the image data may have been lost.
+
+For message-list SFT data, explicitly mark known text as a structured `text` item. This preserves literal tags, including CLI arguments such as `emu <image>`, without a new flag or metadata field:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Explain emu <image>."}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "<image> is the input file argument."}]}
+  ]
+}
+```
+
+Only apply this representation when the source identifies the content as text. Do not convert a genuine missing-image placeholder to text just to pass validation. Structured `image`/`image_url` items still require an image source, and image counts must still match for string placeholders. Explicit text items can coexist with valid structured images in the same conversation.
+
 ### Verify Data Files
 
 Run this before launching to catch missing files or wrong columns:

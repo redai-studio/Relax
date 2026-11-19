@@ -134,16 +134,6 @@ def _assistant_quotes_media_tags(row: dict[str, Any], prompt_key: str, multimoda
     return found
 
 
-def _literal_multimodal_keys(row: dict[str, Any], multimodal_keys: dict[str, str] | None) -> dict[str, str]:
-    # Text datasets may contain CLI arguments or missing figure labels such as
-    # <image>. Only interpret these strings as images when the row supplies them.
-    return {
-        media_name: data_key
-        for media_name, data_key in (multimodal_keys or {}).items()
-        if media_name != "image" or _as_list(row.get(data_key))
-    }
-
-
 def _validate_multimodal_contract(
     row: dict[str, Any],
     prompt: str | list[Any],
@@ -152,9 +142,7 @@ def _validate_multimodal_contract(
     multimodal_keys: dict[str, str] | None,
     source_name: str,
 ) -> None:
-    message_counts = count_message_multimodal_items(
-        prompt, literal_modalities=set(_literal_multimodal_keys(row, multimodal_keys))
-    )
+    message_counts = count_message_multimodal_items(prompt, literal_modalities=set(multimodal_keys or {}))
     inline_media = collect_message_multimodal_data(prompt)
     mismatches = {}
     for media_name, message_count in message_counts.items():
@@ -426,9 +414,7 @@ def _build_canonical_sample_from_row(
             multimodal_keys=multimodal_keys,
             source_name=source_name,
         )
-        raw_messages = build_messages(
-            row, prompt_key, system_prompt, True, _literal_multimodal_keys(row, multimodal_keys)
-        )
+        raw_messages = build_messages(row, prompt_key, system_prompt, True, multimodal_keys)
     elif task_type == "seq_cls":
         if not isinstance(prompt, (str, list)):
             raise TypeError(
@@ -450,9 +436,7 @@ def _build_canonical_sample_from_row(
             multimodal_keys=multimodal_keys,
             source_name=source_name,
         )
-        raw_messages = build_messages(
-            row, prompt_key, system_prompt, True, _literal_multimodal_keys(row, multimodal_keys)
-        )
+        raw_messages = build_messages(row, prompt_key, system_prompt, True, multimodal_keys)
     else:
         if not isinstance(prompt, str):
             raise TypeError(
@@ -468,9 +452,7 @@ def _build_canonical_sample_from_row(
             multimodal_keys=multimodal_keys,
             source_name=source_name,
         )
-        raw_messages = build_messages(
-            row, prompt_key, system_prompt, True, _literal_multimodal_keys(row, multimodal_keys)
-        )
+        raw_messages = build_messages(row, prompt_key, system_prompt, True, multimodal_keys)
         raw_messages = list(raw_messages)
         raw_messages.append({"role": "assistant", "content": row[label_key], "learn": True})
 

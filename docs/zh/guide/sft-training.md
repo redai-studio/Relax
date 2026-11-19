@@ -146,6 +146,23 @@ PROMPT_DATA="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 }
 ```
 
+### 正文中的字面量图片标签
+
+配置 `--multimodal-keys '{"image":"images"}'` 后，字符串正文中的 `<image>` 默认必须有对应图片。`images` 字段缺失、为 null 或为空列表，都不能证明样本是纯文本，因为图片数据也可能已经丢失。
+
+对于消息列表格式的 SFT 数据，可将已确认的文字明确写成结构化 `text` 项。这样可以保留 `emu <image>` 等命令行参数中的字面量标签，无需新增开关或 metadata 字段：
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Explain emu <image>."}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "<image> is the input file argument."}]}
+  ]
+}
+```
+
+只有数据来源明确说明内容是文字时才应采用这种表示；不能为了通过校验，把真正缺图的占位符转成文本。结构化 `image`/`image_url` 项仍必须提供图片来源，字符串占位符与图片的数量也仍需匹配。显式 `text` 项可以和有效的结构化图片共存于同一段对话中。
+
 ### 验证数据文件
 
 启动前运行下面的检查，提前发现缺文件或列名不匹配：
