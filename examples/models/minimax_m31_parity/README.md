@@ -47,3 +47,9 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m scripts.tools.minimax_m31_sft_pari
 ```
 
 The comparison checks loss, gradient norm, global batch size, mean packed token count, and every stored adapter and optimizer tensor at each of the ten steps.
+
+## Full-parameter SFT
+
+Set `SFT_MODE=full` for both launches and use separate experiment and submission names. The four-layer checkpoint and inputs are the same. The recipe uses TP=4, EP=8, and a learning rate of `1e-5`. It trains the language model, vision tower, and projectors. The MSA block indexer stays frozen because it produces discrete block selections outside autograd.
+
+Add `--full` to the comparison command. Full-parameter parity records SHA-256 digests of the rank-local model parameters, Adam master parameters, and optimizer tensor state after each successful update. Both runs save a regular full-training checkpoint after the last step. For ordinary full-parameter training, set `SFT_MODE=full` and use the same `SAVE_DIR` and `EXP_NAME` to resume.

@@ -225,7 +225,7 @@ def _load_training_tensors(checkpoint: Path) -> dict:
     return state
 
 
-def compare_runs(logs: list[Path], checkpoints: list[Path], steps: int) -> None:
+def compare_runs(logs: list[Path], checkpoints: list[Path], steps: int, *, full: bool = False) -> None:
     import torch
 
     from relax.utils.logging_utils import get_logger
@@ -237,6 +237,12 @@ def compare_runs(logs: list[Path], checkpoints: list[Path], steps: int) -> None:
     logger = get_logger(__name__)
     left_metrics = _read_metrics(logs[0], steps, "relax")
     right_metrics = _read_metrics(logs[1], steps, "miles")
+    if full:
+        from scripts.tools.minimax_m31_sft_parity_state import read_rank_digests
+
+        for root in checkpoints:
+            if not (root / f"iter_{steps - 1:07d}" / ".metadata").is_file():
+                raise ValueError(f"{root}: missing final full checkpoint.")
     mismatches = []
     for index in range(steps):
         fields = [
@@ -244,26 +250,35 @@ def compare_runs(logs: list[Path], checkpoints: list[Path], steps: int) -> None:
             for name, value in left_metrics[index].items()
             if struct.pack("!d", value) != struct.pack("!d", right_metrics[index][name])
         ]
-        left, right = (_load_training_tensors(root / f"iter_{index:07d}") for root in checkpoints)
-        if left.keys() != right.keys():
-            raise ValueError(f"Step {index + 1}: different checkpoint tensor keys: {left.keys() ^ right.keys()}")
-        tensors = [
-            key
-            for key, value in left.items()
-            if value.shape != right[key].shape
-            or value.dtype != right[key].dtype
-            or not torch.equal(value.reshape(-1).view(torch.uint8), right[key].reshape(-1).view(torch.uint8))
-        ]
+        if full:
+            left, right = (read_rank_digests(root, index) for root in checkpoints)
+            tensors = [
+                f"{rank}.{name}" for rank in left for name in left[rank] if left[rank][name] != right[rank][name]
+            ]
+            num_compared = sum(len(components) for components in left.values())
+            compared = f"{num_compared} rank/component state digests"
+        else:
+            left, right = (_load_training_tensors(root / f"iter_{index:07d}") for root in checkpoints)
+            if left.keys() != right.keys():
+                raise ValueError(f"Step {index + 1}: different checkpoint tensor keys: {left.keys() ^ right.keys()}")
+            tensors = [
+                key
+                for key, value in left.items()
+                if value.shape != right[key].shape
+                or value.dtype != right[key].dtype
+                or not torch.equal(value.reshape(-1).view(torch.uint8), right[key].reshape(-1).view(torch.uint8))
+            ]
+            compared = f"{len(left)} checkpoint tensors"
         if fields or tensors:
             mismatches.append(index + 1)
             logger.error("Step %d differs: metrics=%s tensors=%s", index + 1, fields, tensors)
         else:
             logger.info(
-                "Step %d: loss=%r grad_norm=%r; %d checkpoint tensors bitwise equal",
+                "Step %d: loss=%r grad_norm=%r; %s match",
                 index + 1,
                 left_metrics[index]["loss"],
                 left_metrics[index]["grad_norm"],
-                len(left),
+                compared,
             )
     if mismatches:
         raise SystemExit(f"Bitwise mismatch at steps {mismatches}")
@@ -280,6 +295,7 @@ if __name__ == "__main__":
     compare.add_argument("--logs", nargs=2, required=True, type=Path)
     compare.add_argument("--checkpoints", nargs=2, required=True, type=Path)
     compare.add_argument("--steps", type=int, default=10)
+    compare.add_argument("--full", action="store_true", help="Compare full-SFT rank digests and final checkpoints.")
     args = parser.parse_args()
     if args.command == "prepare":
         args.data_dir.mkdir(parents=True, exist_ok=True)
@@ -288,4 +304,4 @@ if __name__ == "__main__":
             make_fixture(data)
         verify_inputs(args.checkpoint, data, args.data_dir / "miles-mask.jinja")
     else:
-        compare_runs(args.logs, args.checkpoints, args.steps)
+        compare_runs(args.logs, args.checkpoints, args.steps, full=args.full)

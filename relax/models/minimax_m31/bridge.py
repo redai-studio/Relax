@@ -40,8 +40,8 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
     relax_minimax_external_sft_loss: bool = field(default=True, init=False)
 
     def configure_runtime(self, args: Namespace) -> None:
-        if args.loss_type != "sft" or args.lora_rank <= 0:
-            raise ValueError("MiniMax-M3.1-Flash requires LoRA SFT.")
+        if args.loss_type != "sft":
+            raise ValueError("MiniMax-M3.1-Flash requires SFT.")
         if set(args.multimodal_keys or ()) - {"image", "video"}:
             raise ValueError("MiniMax-M3.1-Flash supports image and video inputs, with text outputs.")
         args.multimodal_host_grid_keys = ("image_grid_thw", "video_grid_thw")

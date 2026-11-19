@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-# Two-node MiniMax-M3.1-Flash LoRA SFT on the four-layer BF16 checkpoint.
+# Two-node MiniMax-M3.1-Flash SFT on the four-layer BF16 checkpoint.
+# Set SFT_MODE=full to train without LoRA, including the vision tower and projectors.
 # Prepare it from a local copy of the official checkpoint:
 # python scripts/tools/convert_minimax_m3_to_bf16.py --model-dir "$MODEL_DIR/MiniMax-M3.1-Flash" \
 #   --layers 0,1,3,4 --save-dir "$MODEL_DIR/MiniMax-M3.1-Flash-4L-BF16" --device cpu
@@ -23,19 +24,31 @@ fi
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs dashboard HTTP address}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 MULTIMODAL_KEYS="${MULTIMODAL_KEYS:-}"
+SFT_MODE="${SFT_MODE:-lora}"
+SAVE_INTERVAL=1
+case "$SFT_MODE" in
+    lora) TP=2; EP=4; LR=1e-4; PARITY_NAME=minimax-m3.1-flash-4l-parity ;;
+    full) TP=4; EP=8; LR=1e-5; PARITY_NAME=minimax-m3.1-flash-4l-full-parity ;;
+    *) echo "Set SFT_MODE to lora or full" >&2; exit 1 ;;
+esac
 if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
     : "${SFT_CHAT_TEMPLATE:?Prepare a verified parity template with scripts.tools.minimax_m31_sft_parity}"
-    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-parity-${MINIMAX_MSA_IMPL:-relax}}"
+    EXP_NAME="${EXP_NAME:-${PARITY_NAME}-${MINIMAX_MSA_IMPL:-relax}}"
     TRAIN_STEPS="${TRAIN_STEPS:-10}"
-    KEEP_CHECKPOINTS="$TRAIN_STEPS"
-    if [[ -e "${SAVE_DIR}/${EXP_NAME}/latest_checkpointed_iteration.txt" ]]; then
+    if [[ "$SFT_MODE" == full ]]; then
+        SAVE_INTERVAL="$TRAIN_STEPS"
+    else
+        KEEP_CHECKPOINTS="$TRAIN_STEPS"
+    fi
+    if [[ -e "${SAVE_DIR}/${EXP_NAME}/latest_checkpointed_iteration.txt" ||
+          -d "${SAVE_DIR}/${EXP_NAME}/parity-state" ]]; then
         echo "Parity requires a fresh experiment name: ${EXP_NAME}" >&2
         exit 1
     fi
 elif [[ -n "$MULTIMODAL_KEYS" ]]; then
-    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-vl-lora-16xgpu}"
+    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-vl-${SFT_MODE}-16xgpu}"
 else
-    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-lora-16xgpu}"
+    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-${SFT_MODE}-16xgpu}"
 fi
 TRAIN_STEPS="${TRAIN_STEPS:-2}"
 now="$(date +%Y%m%d-%H%M%S)"
@@ -48,20 +61,23 @@ CKPT_ARGS=(
    --megatron-to-hf-mode bridge
    --save "${SAVE_DIR}/${EXP_NAME}"
    --load "${SAVE_DIR}/${EXP_NAME}"
-   --save-lora-only
-   --save-interval 1
+   --save-interval "$SAVE_INTERVAL"
    --max-actor-ckpt-to-keep "${KEEP_CHECKPOINTS:-2}"
 )
-LORA_ARGS=(
-   --lora-rank 16
-   --lora-alpha 32
-   --lora-target-modules linear_qkv linear_proj
-   --lora-scope language
-   --lora-dropout 0
-   --lora-merge-mode
-   --freeze-vision-model
-   --freeze-vision-projection
-)
+LORA_ARGS=()
+if [[ "$SFT_MODE" == lora ]]; then
+    CKPT_ARGS+=(--save-lora-only)
+    LORA_ARGS=(
+        --lora-rank 16
+        --lora-alpha 32
+        --lora-target-modules linear_qkv linear_proj
+        --lora-scope language
+        --lora-dropout 0
+        --lora-merge-mode
+        --freeze-vision-model
+        --freeze-vision-projection
+    )
+fi
 SFT_ARGS=(
    --loss-type sft
    --prompt-data "${DATA_DIR}/minimax-m3.1-flash-sft.jsonl"
@@ -84,10 +100,10 @@ if [[ -n "${SFT_CHAT_TEMPLATE:-}" ]]; then
     )
 fi
 PARALLEL_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size "$TP"
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
-   --expert-model-parallel-size 4
+   --expert-model-parallel-size "$EP"
    --expert-tensor-parallel-size 1
    --sequence-parallel
    --moe-token-dispatcher-type alltoall
@@ -96,7 +112,7 @@ PARALLEL_ARGS=(
 )
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-4
+   --lr "$LR"
    --lr-decay-style constant
    --use-checkpoint-opt-param-scheduler
    --weight-decay 0
@@ -123,6 +139,11 @@ if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
         --deterministic-mode
         --custom-megatron-init-path scripts.tools.minimax_m31_sft_parity.configure_worker
     )
+    if [[ "$SFT_MODE" == full ]]; then
+        MISC_ARGS+=(
+            --custom-megatron-before-train-step-hook-path scripts.tools.minimax_m31_sft_parity_state.record_full_sft_step
+        )
+    fi
     RUNTIME_ENV_JSON=$(jq -c \
         --arg implementation "${MINIMAX_MSA_IMPL:-relax}" \
         --arg seed "${SEED:-1234}" \
@@ -137,6 +158,10 @@ if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
             "MINIMAX_MSA_IMPL": $implementation,
             "MINIMAX_PARITY_SEED": $seed
         }' <<< "$RUNTIME_ENV_JSON")
+elif [[ "$SFT_MODE" == full && -n "$MULTIMODAL_KEYS" ]]; then
+    RUNTIME_ENV_JSON=$(jq -c \
+        --arg pool_size "${RELAX_PROCESSOR_POOL_SIZE:-4}" \
+        '.env_vars.RELAX_PROCESSOR_POOL_SIZE = $pool_size' <<< "$RUNTIME_ENV_JSON")
 fi
 WORKING_DIR="${WORKING_DIR:-${RELAX_ROOT}}"
 mkdir -p "${SCRIPT_DIR}/log"
