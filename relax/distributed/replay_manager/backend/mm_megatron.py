@@ -146,6 +146,8 @@ class MMReplayReader:
             raise ValueError("MM replay requires an explicit tensor-parallel process group")
         self.tp_rank = dist.get_rank(self.tp) if self.enabled and dist.is_initialized() else 0
         self.tp_size = dist.get_world_size(self.tp) if self.enabled and dist.is_initialized() else 1
+        self.tp_source = dist.get_global_rank(self.tp, 0) if self.tp_size > 1 else None
+        self.tp_control = self.tp
         self.device = torch.device("cuda", torch.cuda.current_device()) if self.enabled else torch.device("cpu")
         if not self.enabled:
             return
@@ -163,13 +165,52 @@ class MMReplayReader:
         self.metrics["unique_bytes"] = sum(ref.rows * 5120 for ref in seen.values())
         if self.tp_rank == 0:
             self.refs = list(seen.values())
-            self.leases = self.store.acquire_many(self.refs, partition=region.partition) if self.refs else []
+        if seen:
+            if self.tp_size > 1 and dist.get_backend(self.tp) != "gloo":
+                # Only the disjoint input-stage TP groups participate. Keep
+                # the control group for the model's lifetime, across updates.
+                control = getattr(model, "_relax_mm_replay_control_group", None)
+                if control is None:
+                    control = dist.new_group(
+                        ranks=dist.get_process_group_ranks(self.tp), backend="gloo", use_local_synchronization=True
+                    )
+                    model._relax_mm_replay_control_group = control
+                self.tp_control = control
+            error = None
+            if self.tp_rank == 0:
+                try:
+                    self.leases = self.store.acquire_many(self.refs, partition=region.partition)
+                except Exception as exc:
+                    error = exc
+            try:
+                self._check_source_error(error)
+            except BaseException as primary:
+                try:
+                    self.close()
+                except Exception as cleanup:
+                    primary.add_note(f"MM replay lease release failed: {cleanup!r}")
+                raise
         self._leases_by_record = {ref.record: lease for ref, lease in zip(self.refs, self.leases, strict=True)}
+
+    def _check_source_error(self, error: Exception | None) -> None:
+        """Check source I/O on CPU before entering any payload collective."""
+        if self.tp_size > 1:
+            failed = torch.tensor([error is not None], dtype=torch.uint8, device="cpu")
+            dist.broadcast(failed, src=self.tp_source, group=self.tp_control)
+            if failed[0]:
+                details = [None if error is None else f"{type(error).__name__}: {error}"]
+                dist.broadcast_object_list(details, src=self.tp_source, group=self.tp_control, device=failed.device)
+                if error is None:
+                    raise RuntimeError(f"MM replay source I/O failed: {details[0]}")
+        if error is not None:
+            raise error
 
     def load(self, media: list[dict[str, Any]]) -> torch.Tensor:
         from ..mm_embedding import read_mm_embedding
 
         outputs = []
+        pending = []
+        error = None
         for entry in media:
             ref = ReplayRef.from_dict(entry["ref"])
             tensor = self.cache.get(ref.record)
@@ -177,17 +218,18 @@ class MMReplayReader:
                 self.metrics["cache_misses"] += 1
                 if self.tp_rank == 0:
                     started = perf_counter()
-                    tensor = read_mm_embedding(
-                        self.store, entry, device=self.device, lease=self._leases_by_record[ref.record]
-                    )
+                    try:
+                        tensor = read_mm_embedding(
+                            self.store, entry, device=self.device, lease=self._leases_by_record[ref.record]
+                        )
+                    except Exception as exc:
+                        error = exc
+                        break
                     self.metrics["read_cpu_seconds"] += perf_counter() - started
                     self.metrics["read_bytes"] += ref.rows * 5120
                 else:
                     tensor = torch.empty((ref.rows, 2560), device=self.device, dtype=torch.bfloat16)
-                if self.tp_size > 1:
-                    started = perf_counter()
-                    dist.broadcast(tensor, src=dist.get_global_rank(self.tp, 0), group=self.tp)
-                    self.metrics["tp_broadcast_cpu_seconds"] += perf_counter() - started
+                pending.append(tensor)
                 size = tensor.numel() * tensor.element_size()
                 if size <= self.capacity_bytes:
                     while self.cache and self.cache_bytes + size > self.capacity_bytes:
@@ -201,6 +243,20 @@ class MMReplayReader:
                 self.metrics["cache_hits"] += 1
                 self.cache.move_to_end(ref.record)
             outputs.append(tensor)
+        if pending or error is not None:
+            # All ranks traverse the same media and cache order. Confirm
+            # every cold read once per microbatch before sharing embeddings.
+            try:
+                self._check_source_error(error)
+            except BaseException:
+                self.cache.clear()
+                self.cache_bytes = 0
+                raise
+            if self.tp_size > 1:
+                started = perf_counter()
+                for tensor in pending:
+                    dist.broadcast(tensor, src=self.tp_source, group=self.tp)
+                self.metrics["tp_broadcast_cpu_seconds"] += perf_counter() - started
         return torch.cat(outputs, dim=0)
 
     def close(self) -> None:

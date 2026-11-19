@@ -101,6 +101,28 @@ def test_capture_layout_preserves_dsv4_sparse_and_keye_all_layers():
         indexer_capture_layout(dsv4)
 
 
+def test_keye_capture_rejects_trainable_model_indexer():
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="KeyeVL2", sa_config={"topk": 2048}),
+        num_layers=3,
+        keye_indexer_loss_coeff=0.01,
+    )
+    with pytest.raises(ValueError, match="zero indexer loss"):
+        indexer_capture_layout(config)
+    config.keye_indexer_loss_coeff = 0
+    assert indexer_capture_layout(config) == (2048, (0, 1, 2))
+
+
+def test_keye_replay_accepts_default_and_rejects_nonzero_indexer_loss(monkeypatch):
+    args = valid_args("KeyeVL2", monkeypatch)
+    args.dsa_indexer_loss_coeff = None
+    args.freeze_params_name_list = [r"\.sa_indexer\."]
+    validate_indexer_replay_args(args, is_offline=False)
+    args.dsa_indexer_loss_coeff = 0.01
+    with pytest.raises(ValueError, match="dsa_indexer_loss_coeff"):
+        validate_indexer_replay_args(args, is_offline=False)
+
+
 def test_codec_contract_rejects_wrong_kind_topk_and_width():
     codec = replay_codec("keye-bitmap-v1")
     codec.validate("indexer", 2048)

@@ -62,11 +62,12 @@ class ProducerChunkWriter:
 
     Workers receive independent CPU arrays, never a KV-slot view. Backpressure
     blocks the scheduler only when the in-flight byte budget is exhausted. The
-    TQ writer may additionally pack up to 1 MiB; single-layer writes use a
-    view. This budget does not include TQ serialization or stored bodies.
+    TQ writers may use another capacity_bytes for packing. Each worker has its
+    own transport client, while all share the snapshot byte budget. This budget
+    does not include TQ serialization or stored bodies.
     """
 
-    def __init__(self, capacity_bytes: int) -> None:
+    def __init__(self, capacity_bytes: int, *, max_workers: int = 1) -> None:
         if capacity_bytes <= 0:
             raise ValueError("Publication byte budget must be positive")
         self.capacity_bytes = capacity_bytes
@@ -74,7 +75,7 @@ class ProducerChunkWriter:
         self._error = None
         self._closed = False
         self._condition = Condition()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-publish")
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="replay-publish")
 
     def submit(self, size: int, snapshot: Callable[[], Any], write_block: Callable[[Any], None]):
         if size > self.capacity_bytes:
@@ -125,7 +126,7 @@ class ProducerChunkWriter:
             raise
 
     def submit_completion(self, complete: Callable[[], Any]) -> Future:
-        """Run publication sealing after already queued body writes."""
+        """Enqueue a callback that seals after its publication's writes."""
         with self._condition:
             if self._closed:
                 raise RuntimeError("Replay writer is closing")
@@ -258,7 +259,7 @@ class ProducerPublication:
         writes = tuple(self._futures)
 
         def complete():
-            # These writes were enqueued before this task on the same worker.
+            # Writes were enqueued first, but may still run on another worker.
             for future in writes:
                 future.result()
             ref = self.store.invoke("finish_publication", self.record, self.rows, digest)

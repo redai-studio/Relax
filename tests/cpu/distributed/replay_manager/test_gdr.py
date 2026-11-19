@@ -100,3 +100,32 @@ def test_gdr_reader_cleans_failed_client_initialization():
     assert closed == [True] and reader._client is None
     reader.close()
     assert closed == [True]
+
+
+@pytest.mark.parametrize("failed", [("gdr",), ("tq",), ("gdr", "tq")])
+def test_body_backend_close_attempts_all_clients_and_retries_only_failures(failed):
+    from relax.distributed.replay_manager.storage import TQBodyBackend
+
+    class Client:
+        def __init__(self, name):
+            self.name = name
+            self.calls = 0
+
+        def close(self):
+            self.calls += 1
+            if self.name in failed and self.calls == 1:
+                raise RuntimeError(f"{self.name} close failed")
+
+    backend = TQBodyBackend("abcd", lambda: pytest.fail("Cleanup must not create a client"))
+    gdr, tq = Client("gdr"), Client("tq")
+    backend._gdr_reader, backend._client = gdr, tq
+    with pytest.raises(RuntimeError, match=f"{failed[0]} close failed"):
+        backend.close()
+    assert gdr.calls == tq.calls == 1
+    backend.close()
+    assert gdr.calls == 1 + ("gdr" in failed)
+    assert tq.calls == 1 + ("tq" in failed)
+    assert backend._gdr_reader is backend._client is None
+    backend.close()
+    assert gdr.calls == 1 + ("gdr" in failed)
+    assert tq.calls == 1 + ("tq" in failed)

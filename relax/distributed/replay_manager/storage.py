@@ -14,9 +14,10 @@ import asyncio
 import os
 import uuid
 from collections import OrderedDict
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from threading import RLock
+from threading import RLock, Thread, current_thread
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from .ref_data import ReplayRef
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 
 
 _NAMESPACE = "relax-replay"
+_BASE_READ_BATCH_BYTES = 64 << 20
+_SIMPLE_STORAGE_PUBLICATION_WORKERS = 4
 BODY_PARTITION_PREFIX = "__replay_body__:"
 
 
@@ -119,12 +122,35 @@ async def _clear_empty_body_partition(client: Any, partition: str) -> None:
         raise RuntimeError("Replay body partition metadata remains after close")
 
 
+def _select_body_rows(field_data: Any, positions: list[int], fallback: Callable) -> Any:
+    """Select strided CPU layers without scheduling PyTorch's thread pool."""
+    import numpy as np
+    import torch
+
+    if (
+        isinstance(field_data, torch.Tensor)
+        and not field_data.is_nested
+        and field_data.device.type == "cpu"
+        and field_data.dtype == torch.int32
+        and field_data.ndim == 3
+        and len(positions) > 1
+        and min(positions) >= 0
+        and max(positions) < len(field_data)
+    ):
+        stride = positions[1] - positions[0]
+        if stride > 1 and all(positions[i] - positions[i - 1] == stride for i in range(2, len(positions))):
+            return torch.from_numpy(
+                np.ascontiguousarray(field_data.numpy()[positions[0] : positions[-1] + 1 : stride])
+            )
+    return fallback(field_data, positions)
+
+
 def tq_client_factory(connection: Any, *, body_partition: str) -> Any:
     """Connect sockets to resolved endpoints, never bootstrap a TQ cluster."""
     import psutil
     import torch
     from transfer_queue.client import TQ_NUM_THREADS, TransferQueueClient
-    from transfer_queue.storage.managers import simple_storage_manager  # noqa: F401
+    from transfer_queue.storage.managers import simple_storage_manager
     from transfer_queue.utils.common import DEFAULT_TORCH_NUM_THREADS
 
     if connection is None or not connection.controller.zmq_info:
@@ -178,6 +204,11 @@ def tq_client_factory(connection: Any, *, body_partition: str) -> Any:
     backend = connection.backend.storage_backend
     try:
         client.initialize_storage_manager(backend, connection.backend[backend])
+        if isinstance(client.storage_manager, simple_storage_manager.AsyncSimpleStorageManager):
+            select = client.storage_manager._select_by_positions
+            client.storage_manager._select_by_positions = lambda data, positions: _select_body_rows(
+                data, positions, select
+            )
     except BaseException:
         client.close()
         raise
@@ -253,6 +284,7 @@ class TQBodyBackend:
         self.partition = BODY_PARTITION_PREFIX + run
         self._factory = client_factory
         self._client = None
+        self._write_clients: dict[Thread, Any] = {}
         self._gdr_reader = None
         self._pid = os.getpid()
         self._lock = RLock()
@@ -267,20 +299,31 @@ class TQBodyBackend:
             return self._client
 
     def write_many(self, keys: list[str], values: tuple[Any, ...]) -> None:
+        import numpy as np
         import torch
         from tensordict import TensorDict
 
-        client = self.client()
+        if os.getpid() != self._pid:
+            raise RuntimeError("Create replay transport after spawn; do not inherit TQ sockets across fork")
+        # Each worker owns its client's event loop and sockets. Foreground
+        # reads and concurrent writers must never share a synchronous client.
+        with self._lock:
+            thread = current_thread()
+            if thread not in self._write_clients:
+                self._write_clients[thread] = self._factory()
+            client = self._write_clients[thread]
         # Deterministic key is reserved in the inventory BEFORE this call, so a
         # lost allocation/write response cannot lose the only address of a body.
         meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=True)
         if meta.size != len(keys):
             raise RuntimeError("TQ returned an unexpected replay allocation")
-        body = (
-            torch.from_numpy(values[0]).unsqueeze(0)
-            if len(values) == 1
-            else torch.stack([torch.from_numpy(value) for value in values])
-        )
+        if len(values) == 1:
+            body = torch.from_numpy(values[0]).unsqueeze(0)
+        elif all(value.dtype == np.int32 and value.shape == values[0].shape for value in values):
+            body = torch.from_numpy(np.stack(values))
+        else:
+            # Preserve BF16 byte payloads and other existing dtype handling.
+            body = torch.stack([torch.from_numpy(value) for value in values])
         client.put(TensorDict({"replay_body": body}, batch_size=[len(keys)]), metadata=meta)
 
     def read(self, keys: list[str]) -> list[Any]:
@@ -290,6 +333,8 @@ class TQBodyBackend:
         return self._read(keys, cache_metadata=True)
 
     def _read(self, keys: list[str], *, cache_metadata: bool) -> list[Any]:
+        import torch
+
         if not keys:
             return []
         # Serialize foreground and speculative reads on the same sync client.
@@ -321,26 +366,35 @@ class TQBodyBackend:
                 while len(self._encoded_metadata) > 8192:
                     self._encoded_metadata.popitem(last=False)
                 meta = type(ordered[0]).concat(ordered) if len(ordered) > 1 else ordered[0]
-            if cache_metadata:
-                manager = getattr(client, "storage_manager", None)
-                loop = getattr(client, "_loop", None)
-                if (
-                    isinstance(loop, asyncio.AbstractEventLoop)
-                    and loop.is_running()
-                    and callable(getattr(manager, "_group_by_hash", None))
-                    and callable(getattr(manager, "_get_from_single_storage_unit", None))
-                ):
-                    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+            # Both raw and encoded bodies can bypass generic nested-tensor
+            # repacking. Keep encoded metadata caching and GDR selection intact.
+            manager = getattr(client, "storage_manager", None)
+            loop = getattr(client, "_loop", None)
+            if (
+                isinstance(loop, asyncio.AbstractEventLoop)
+                and loop.is_running()
+                and callable(getattr(manager, "_group_by_hash", None))
+                and callable(getattr(manager, "_get_from_single_storage_unit", None))
+            ):
+                from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 
-                    if isinstance(manager, AsyncSimpleStorageManager):
-                        # Use this client's socket-owning loop, but bypass generic
-                        # get_data's process-global torch thread-count changes and
-                        # SimpleStorage's full nested-tensor repacking copy.
-                        return asyncio.run_coroutine_threadsafe(
-                            _read_simple_storage_bodies(manager, meta), loop
-                        ).result()
+                if isinstance(manager, AsyncSimpleStorageManager):
+                    # Use this client's socket-owning loop, but bypass generic
+                    # get_data's process-global torch thread-count changes and
+                    # SimpleStorage's full nested-tensor repacking copy.
+                    return asyncio.run_coroutine_threadsafe(_read_simple_storage_bodies(manager, meta), loop).result()
             values = client.get_data(meta)["replay_body"]
-            return [value.cpu().numpy() for value in values.unbind()]
+            if isinstance(values, torch.Tensor):
+                blocks = values.unbind()
+            elif isinstance(values, Sequence) and all(
+                isinstance(value, torch.Tensor) and value.ndim == 2 and value.device.type == "cpu" for value in values
+            ):
+                blocks = values
+            else:
+                raise RuntimeError("TQ returned invalid replay body buffers")
+            if len(blocks) != len(keys):
+                raise RuntimeError("TQ returned an unexpected replay block count")
+            return [value.cpu().numpy() for value in blocks]
 
     def delete(self, keys: list[str]) -> None:
         if not keys:
@@ -356,12 +410,32 @@ class TQBodyBackend:
     def close(self) -> None:
         with self._lock:
             self._encoded_metadata.clear()
+            errors = []
+            for thread, client in tuple(self._write_clients.items()):
+                try:
+                    client.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    del self._write_clients[thread]
             if self._gdr_reader is not None:
-                self._gdr_reader.close()
-                self._gdr_reader = None
+                try:
+                    self._gdr_reader.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    self._gdr_reader = None
             if self._client is not None:
-                self._client.close()  # Local sockets only. Never tq.close().
-                self._client = None
+                try:
+                    self._client.close()  # Local sockets only. Never tq.close().
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    self._client = None
+            if errors:
+                for extra in errors[1:]:
+                    errors[0].add_note(f"Another replay client failed to close: {extra!r}")
+                raise errors[0]
 
 
 def _connection_identity(connection: Any) -> Any:
@@ -443,10 +517,16 @@ class TQReplayStorage:
         self._registry_handle = None
         self._driver = None
         self._writer = None
+        self._writer_lock = RLock()
         self._pid = os.getpid()
         self._backend = TQBodyBackend(self.run, client_factory or self._make_client)
         self._pending_releases = []
         self._device_reads = None
+
+    @property
+    def read_batch_bytes(self) -> int:
+        """Bound read scratch independently of larger publication batches."""
+        return min(self.publication_bytes, max(_BASE_READ_BATCH_BYTES, self.config.materialization_bytes // 4))
 
     def _registry(self) -> Any:
         if self._registry_handle is None:
@@ -495,9 +575,18 @@ class TQReplayStorage:
     def begin_publication(self, **kwargs: Any) -> Any:
         from .producer import ProducerChunkWriter, ProducerPublication
 
-        if self._writer is None:
-            self._writer = ProducerChunkWriter(self.publication_bytes)
-        return ProducerPublication(self, self._writer, **kwargs)
+        with self._writer_lock:
+            if self._writer is None:
+                # A Mooncake client registers a full host segment and buffer,
+                # so use one worker and one write client for that backend.
+                parallel = (
+                    self._inventory is not None
+                    or self.invoke("get_connection").backend.storage_backend == "SimpleStorage"
+                )
+                max_workers = _SIMPLE_STORAGE_PUBLICATION_WORKERS if parallel else 1
+                self._writer = ProducerChunkWriter(self.publication_bytes, max_workers=max_workers)
+            writer = self._writer
+        return ProducerPublication(self, writer, **kwargs)
 
     def write_blocks(self, record: str, chunk: int, layers: tuple[int, ...], values: tuple[Any, ...]) -> None:
         if not layers or len(layers) != len(values) or any(value.shape != values[0].shape for value in values):
@@ -598,17 +687,37 @@ class TQReplayStorage:
     def _read_many_into(self, requests: list[tuple[ReplayRef, Any, Any, str | None]], layer: int, output: Any) -> None:
         self._read_layers_into([(requests, layer, output)])
 
-    def _read_layers_into(self, layers: list[tuple[list[tuple[ReplayRef, Any, Any, str | None]], int, Any]]) -> None:
+    def _read_layers_into(
+        self,
+        layers: list[tuple[list[tuple[ReplayRef, Any, Any, str | None]], int, Any]],
+        *,
+        on_layer: Callable[[int], None] | None = None,
+    ) -> None:
         """Read local layers with bounded, explicit-key TQ batches.
 
         Requests come from disjoint sample positions in ConsumerBatchLayout.
         Validate the entire window before I/O. Each distinct reference/lease is
         authorized once, including different leases for duplicate references.
+        on_layer receives an output's position after all its rows are written.
+        The caller must still observe completion/failure of the entire read.
         """
         import numpy as np
 
         normalized, identities = _validate_read_layers(layers)
+        positions = {id(output): index for index, (_, _, output) in enumerate(layers)}
+        if on_layer is not None and (
+            len(positions) != len(layers)
+            or any(
+                np.shares_memory(output, other)
+                for index, (_, _, output) in enumerate(layers)
+                for _, _, other in layers[:index]
+            )
+        ):
+            raise ValueError("Progressive replay reads require non-overlapping layer outputs")
         if not normalized:
+            if on_layer is not None:
+                for index in range(len(layers)):
+                    on_layer(index)
             return
         if len(identities) == 1:
             self.invoke("authorize_read", *identities[0])
@@ -617,6 +726,18 @@ class TQReplayStorage:
 
         pending: dict[str, _ReadBlock] = {}
         pending_bytes = 0
+        remaining = dict.fromkeys(positions, 0)
+        enumerated = {id(output) for requests, _, output in layers if not requests}
+        published: set[int] = set()
+
+        def publish_ready() -> None:
+            if on_layer is not None:
+                for identity in positions:
+                    if identity in enumerated and not remaining[identity] and identity not in published:
+                        on_layer(positions[identity])
+                        published.add(identity)
+
+        publish_ready()
 
         def flush() -> None:
             blocks = self._backend.read(list(pending))
@@ -624,10 +745,22 @@ class TQReplayStorage:
                 if block.dtype != np.int32 or block.shape != (plan.rows, plan.topk):
                     raise RuntimeError("TQ replay body shape/dtype differs from manifest")
                 for copy in plan.copies:
-                    copy.output[copy.output_rows] = block[copy.block_rows]
+                    source, destination = copy.block_rows, copy.output_rows
+                    if len(source) and np.all(np.diff(source) == 1) and np.all(np.diff(destination) == 1):
+                        # Basic slices are views: avoid the full temporary
+                        # produced by advanced indexing for contiguous CP rows.
+                        np.copyto(
+                            copy.output[int(destination[0]) : int(destination[-1]) + 1],
+                            block[int(source[0]) : int(source[-1]) + 1],
+                        )
+                    else:
+                        copy.output[destination] = block[source]
+                    if on_layer is not None:
+                        remaining[id(copy.output)] -= 1
             pending.clear()
+            publish_ready()
 
-        for selection in normalized:
+        for index, selection in enumerate(normalized):
             ref = selection.ref
             chunks = selection.source_rows // ref.chunk_rows
             offsets = selection.source_rows % ref.chunk_rows
@@ -636,7 +769,7 @@ class TQReplayStorage:
                 count = min(ref.chunk_rows, ref.rows - int(chunk) * ref.chunk_rows)
                 if key not in pending:
                     size = count * ref.topk * 4
-                    if pending and pending_bytes + size > self.publication_bytes:
+                    if pending and pending_bytes + size > self.read_batch_bytes:
                         flush()
                         pending_bytes = 0
                     # As in single-sample reads, one indivisible chunk may
@@ -647,6 +780,13 @@ class TQReplayStorage:
                 pending[key].copies.append(
                     _RowCopy(selection.output, selection.output_rows[indexes], offsets[indexes])
                 )
+                if on_layer is not None:
+                    remaining[id(selection.output)] += 1
+            if on_layer is not None and (
+                index + 1 == len(normalized) or normalized[index + 1].output is not selection.output
+            ):
+                enumerated.add(id(selection.output))
+                publish_ready()
         if pending:
             flush()
 

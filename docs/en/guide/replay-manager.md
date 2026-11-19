@@ -67,17 +67,25 @@ The `bf16-raw-v1` codec transports the original BF16 bits as bytes, with no quan
 
 Training loads the body on the input pipeline stage, reads once per tensor-parallel group and broadcasts to its peers. A bounded cache reuses embeddings for log-probability and training forwards; the original placeholder scatter, MRoPE and language-model gradients are preserved. Disabling the flag leaves the original visual computation path in use.
 
-### Supported indexer layouts
+## Replay support by model
 
-The current validator recognizes these model families. These are adapter constraints, not claims that every topology has been benchmarked.
+| Model | Router (R3) | Indexer (QSA / DSA) | Multimodal embedding |
+| --- | --- | --- | --- |
+| Qwen3 MoE | Supported via standard MoE routing. | Unsupported | Unsupported |
+| Qwen3-VL MoE | Supported for language-model expert routing. | Unsupported | Unsupported |
+| Qwen3.5 MoE | Supported for language-model expert routing. | Unsupported | Unsupported |
+| Qwen3.8 Flash Next text (`qwen4_exp_text`) | Supported via standard MoE routing. Can be enabled with QSA replay. | **QSA supported.** CP1, zigzag, no allgather-CP. TP/SP supported. Use mixed attention and the TP selector with both fused variants off. Rollout uses no DP attention, R4 with 512 complete blocks, and `qsa-r4-bitmap-v1`. Capture context up to 262,144 tokens. | Unsupported |
+| Qwen3.8 Flash Next multimodal (`qwen4_exp`) | Supported for language-model expert routing. | **QSA supported in text-only runs.** Same layout and capture limits as `qwen4_exp_text`. | **Supported for images and videos.** CP1, packed THD, BF16, frozen vision encoder and merger/projection. Requires width 2560, spatial merge size 2, and no DeepStack. |
+| DeepSeek-V4 (`deepseek_v4`) | Supported via MoE routing. | **DSA supported.** CP>1, TP1, SP off, contiguous partitioning and allgather-CP. Enable rollout DP attention. Captures configured C4 layers as `int32`. Indexer MXFP4 QAT cannot be combined with replay. | Unsupported |
+| Keye-VL2 (`KeyeVL2`) | Supported via standard MoE routing. The Keye recipes leave R3 off by default. | **DSA supported in text-only runs.** CP>1, TP1, PP1, SP off, zigzag, no allgather-CP. Disable rollout DP attention, overlap scheduling and radix cache. Top-k 2048, `keye-bitmap-v1`, capture context up to 32,768 tokens. Replay freezes the indexer. | Unsupported |
 
-| Model | Training layout | Rollout constraints / representation |
-| --- | --- | --- |
-| Qwen3.8 (`qwen4_exp`, `qwen4_exp_text`) | CP1; zigzag partition mode; no allgather-CP; mixed backend and TP selector; TP/SP supported | No DP attention; R4, 512 complete blocks; `qsa-r4-bitmap-v1`; capture context at most 262144 tokens |
-| DeepSeek-V4 (`deepseek_v4`) | CP>1, TP1, no SP; contiguous partition mode and allgather-CP | DP attention enabled; captures configured C4 layers; current generic publication uses `int32` |
-| Keye DSA (`KeyeVL2`) | CP>1, TP1, no SP, PP1; zigzag mode, no allgather-CP | No DP attention; disable overlap scheduling and radix cache; top-k 2048; `keye-bitmap-v1`, capture context at most 32768 tokens |
+R3 uses the generic SGLang expert capture and Megatron top-k replay path. Other MoE models can use it when both hooks cover the same expert layers. R3 excludes partial rollout. For R3 alone, set `RELAX_REPLAY_REFERENCES=1` to select reference delivery, which requires colocated Megatron training.
 
-Indexer replay currently rejects offline training, non-colocated, fully async/hybrid, multimodal, agentic/custom rollout paths, partial rollout, dynamic CP, MTP/speculative decoding and hierarchical cache. Indexer loss must be zero; full activation recomputation requires the uniform method. Combined-1f1b MoE overlap is also rejected. Startup validation reports unsupported combinations.
+Indexer replay requires online colocated Megatron with packed THD, zero indexer loss and static CP. It excludes multimodal input, fully async/hybrid, agentic/custom rollout paths, partial rollout, MTP/speculative decoding, hierarchical cache and combined-1f1b MoE overlap. Use the uniform method for full activation recomputation.
+
+For Keye replay, leave `--dsa-indexer-loss-coeff` unset or set it to `0`. A Keye checkpoint saved with a trainable indexer has a different optimizer layout. To switch that checkpoint to frozen indexer replay, use `--no-load-optim` for the migration and save a checkpoint with the new optimizer layout.
+
+Multimodal embedding replay requires the multimodal input mapping and a single input pipeline chunk. It also excludes agentic rollout, the Slime router and OPD. Keep indexer replay off in multimodal runs.
 
 Use a compatible Relax training image with the SGLang capture and Megatron integration patches. Runtime adapters install process-local hooks; source changes alone cannot supply missing engine APIs. There is no additional Megatron source edit for the bitmap attention operator itself.
 

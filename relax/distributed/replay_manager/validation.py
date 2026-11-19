@@ -40,6 +40,8 @@ class IndexerReplayCapabilities:
         if topk is None or int(topk) <= 0:
             raise ValueError("Indexer capture requires a positive top-k")
         if self.capture_ratio is None:
+            if getattr(config, "keye_indexer_loss_coeff", 0):
+                raise ValueError("Keye replay requires zero indexer loss")
             return int(topk), tuple(range(config.num_layers))
         ratios = getattr(config, "csa_compress_ratios", None)
         if ratios is None or topk is None or getattr(config, "dsa_indexer_loss_coeff", 0):

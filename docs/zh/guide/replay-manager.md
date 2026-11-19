@@ -67,17 +67,25 @@ MoE replay 由 `--use-rollout-routing-replay` 独立开启；`--use-routing-repl
 
 训练只在输入 PP stage 加载，每个 TP 组读取一次后广播给组内其他 rank。有界缓存复用于 log-probability 和训练前向，保留原有 placeholder scatter、MRoPE 及语言模型梯度。不开此参数时仍走原有视觉计算路径。
 
-### 当前 indexer 接入范围
+## 各模型的 replay 支持情况
 
-校验器识别以下模型族。这些是适配约束，不代表每种拓扑均已完成性能测试。
+| 模型 | Router（R3） | Indexer（QSA / DSA） | Multimodal embedding |
+| --- | --- | --- | --- |
+| Qwen3 MoE | 支持，走标准 MoE 路由。 | 不支持 | 不支持 |
+| Qwen3-VL MoE | 支持语言模型侧的专家路由。 | 不支持 | 不支持 |
+| Qwen3.5 MoE | 支持语言模型侧的专家路由。 | 不支持 | 不支持 |
+| Qwen3.8 Flash Next 文本版（`qwen4_exp_text`） | 支持标准 MoE 路由，可与 QSA replay 同开。 | **支持 QSA。** CP1、zigzag，关闭 allgather-CP，支持 TP/SP。使用 mixed attention 和 TP selector，关闭两者的 fused 路径。Rollout 关闭 DP attention，采用 R4、512 个完整块和 `qsa-r4-bitmap-v1`，采集上下文上限为 262,144 token。 | 不支持 |
+| Qwen3.8 Flash Next 多模态版（`qwen4_exp`） | 支持语言模型侧的专家路由。 | **纯文本运行时支持 QSA。** 布局和采集限制与 `qwen4_exp_text` 相同。 | **支持图像和视频。** CP1、packed THD、BF16，冻结视觉编码器及 merger/projection。要求 embedding 宽度为 2560、spatial merge size 为 2，且没有 DeepStack。 |
+| DeepSeek-V4（`deepseek_v4`） | 支持 MoE 专家路由。 | **支持 DSA。** CP>1、TP1、关闭 SP，使用 contiguous partition 和 allgather-CP。开启 rollout DP attention。以 `int32` 采集配置中的 C4 层。Indexer MXFP4 QAT 与 replay 互斥。 | 不支持 |
+| Keye-VL2（`KeyeVL2`） | 支持标准 MoE 路由。现有 Keye 配方默认关闭 R3。 | **纯文本运行时支持 DSA。** CP>1、TP1、PP1、关闭 SP，使用 zigzag，关闭 allgather-CP。Rollout 关闭 DP attention、overlap schedule 和 radix cache。Top-k 为 2048，使用 `keye-bitmap-v1`，采集上下文上限为 32,768 token。开启后冻结 indexer。 | 不支持 |
 
-| 模型 | 训练布局 | Rollout 约束与数据表示 |
-| --- | --- | --- |
-| Qwen3.8（`qwen4_exp`、`qwen4_exp_text`） | CP1；zigzag partition；不使用 allgather-CP；mixed backend、TP selector；支持 TP/SP | 不开 DP attention；R4、512 个完整块；`qsa-r4-bitmap-v1`；采集 context 上限 262144 token |
-| DeepSeek-V4（`deepseek_v4`） | CP>1、TP1、不开 SP；contiguous partition、开启 allgather-CP | 开启 DP attention；采集配置中的 C4 层；当前通用发布路径使用 `int32` |
-| Keye DSA（`KeyeVL2`） | CP>1、TP1、不开 SP、PP1；zigzag、不使用 allgather-CP | 不开 DP attention；关闭 overlap schedule 和 radix cache；top-k 2048；`keye-bitmap-v1`，采集 context 上限 32768 token |
+R3 复用通用的 SGLang 专家采集和 Megatron top-k 重放路径。其他 MoE 模型可以在两端 hook 覆盖相同专家层时使用。R3 与 partial rollout 互斥。只开 R3 时，通过 `RELAX_REPLAY_REFERENCES=1` 选择 reference 传输，该模式要求 colocate Megatron。
 
-Indexer replay 当前拒绝离线训练、非 colocate、fully async/hybrid、多模态、agentic/自定义 rollout、partial rollout、dynamic CP、MTP/推测解码和 hierarchical cache。Indexer loss 必须为零；full activation recompute 必须使用 uniform 方法；也不支持 combined-1f1b MoE overlap。启动校验会列出不支持的组合。
+Indexer replay 要求在线 colocate Megatron、packed THD、静态 CP 和零 indexer loss。它与多模态输入、fully async/hybrid、agentic/自定义 rollout、partial rollout、MTP/推测解码、hierarchical cache 和 combined-1f1b MoE overlap 互斥。Full activation recompute 必须使用 uniform 方法。
+
+Keye replay 可以省略 `--dsa-indexer-loss-coeff`，也可以显式设为 `0`。旧 Keye checkpoint 如果保存了可训练 indexer 的优化器状态，切到冻结 indexer 的 replay 时需用 `--no-load-optim` 跳过旧优化器状态，随后保存采用新布局的 checkpoint。
+
+Multimodal embedding replay 要求配置多模态输入映射，且只能有一个负责输入的 pipeline chunk。它也与 agentic rollout、Slime router 和 OPD 互斥。多模态运行时保持 indexer replay 关闭。
 
 需要使用带有 SGLang capture 和 Megatron 集成 patch 的兼容 Relax 训练镜像。运行时适配器安装进程内 hook，单独更新仓库源码不能补齐镜像中缺失的引擎 API。专用 bitmap attention 算子本身不需要额外修改 Megatron 源码。
 

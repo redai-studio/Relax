@@ -185,3 +185,94 @@ def test_mm_input_stage_metrics_initialize_service_once_and_report_each_step(mon
         adapter = metrics_service_adapter.get_metrics_service_adapter()
         if adapter is not None:
             adapter.finish_async_reporting()
+
+
+def _mm_tp_worker(rank, rendezvous):
+    from dataclasses import replace
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from relax.distributed.replay_manager import mm_embedding
+    from relax.distributed.replay_manager.backend import mm_megatron
+    from relax.distributed.replay_manager.ref_data import ReplayRef
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    try:
+        group = dist.group.WORLD
+        ref = ReplayRef(2, "abcd", "abcd", "f" * 32, "mm_embedding", 4, 1, 2560, 4, "a" * 64, "bf16-raw-v1")
+        media = dict(hash="a" * 64, grid=[1, 4, 4], modality="image", ref=ref.to_dict(), lease="b" * 32)
+        second_ref = replace(ref, record="e" * 32, tokens="d" * 64)
+        second_media = dict(media, hash=second_ref.tokens, ref=second_ref.to_dict())
+        entries = [media, second_media, media]
+        batch = {"rollout_replay_refs": [{"mm_embedding": {"version": 1, "media": entries}}]}
+        # Replace only CUDA device selection and external TQ I/O. The real
+        # reader constructor, cache, close and every collective execute here.
+        cpu_torch = SimpleNamespace(
+            Tensor=torch.Tensor,
+            device=lambda *args: torch.device("cpu"),
+            cuda=SimpleNamespace(current_device=lambda: 0),
+            empty=torch.empty,
+            cat=torch.cat,
+            tensor=torch.tensor,
+            uint8=torch.uint8,
+            bfloat16=torch.bfloat16,
+        )
+        for failure in ("acquire", "read", None):
+            acquired, released, reads = [], [], []
+            fail_read = failure == "read"
+
+            def acquire(refs, *, partition):
+                assert rank == 0
+                if failure == "acquire":
+                    raise RuntimeError("injected acquire failure")
+                acquired.extend(refs)
+                return ["c" * 32] * len(refs)
+
+            def read(_store, entry, **kwargs):
+                assert rank == 0
+                reads.append(entry["hash"])
+                if fail_read and entry is second_media:
+                    raise RuntimeError("injected read failure")
+                return torch.full((4, 2560), 2 if entry is media else 3, dtype=torch.bfloat16)
+
+            store = SimpleNamespace(acquire_many=acquire, release_many=lambda refs, leases: released.extend(leases))
+            manager = SimpleNamespace(store=lambda: store, config=SimpleNamespace(materialization_bytes=1 << 20))
+            model = _VisualModel()
+            model.pg_collection = SimpleNamespace(tp=group)
+            with patch.object(mm_megatron, "torch", cpu_torch), patch.object(mm_embedding, "read_mm_embedding", read):
+                if failure == "acquire":
+                    with pytest.raises(RuntimeError, match="injected acquire failure"):
+                        mm_megatron.MMReplayReader(manager, batch, SimpleNamespace(partition="train_0"), model)
+                    continue
+                reader = mm_megatron.MMReplayReader(manager, batch, SimpleNamespace(partition="train_0"), model)
+                try:
+                    if failure == "read":
+                        with pytest.raises(RuntimeError, match="injected read failure"):
+                            reader.load(entries)
+                        assert reader.cache_bytes == 0
+                        fail_read = False
+                        reads.clear()
+                    hits_before = reader.metrics["cache_hits"]
+                    expected = torch.tensor([2] * 4 + [3] * 4 + [2] * 4, dtype=torch.bfloat16)
+                    for _ in range(2):
+                        actual = reader.load(entries)
+                        torch.testing.assert_close(actual, expected[:, None].expand(-1, 2560))
+                    assert reads == ([media["hash"], second_media["hash"]] if rank == 0 else [])
+                    assert reader.metrics["cache_hits"] - hits_before == 4
+                finally:
+                    reader.close()
+                assert len(acquired) == len(released) == (2 if rank == 0 else 0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_mm_tp_io_failures_reach_all_ranks_and_success_keeps_cache(tmp_path):
+    import torch.multiprocessing as mp
+
+    # Mocks cannot expose a peer waiting on an unmatched collective. One
+    # two-process Gloo run covers both I/O failures and the successful path;
+    # every collective has a 15-second timeout and no CUDA is required.
+    mp.spawn(_mm_tp_worker, args=((tmp_path / "mm_tp_gloo").as_uri(),), nprocs=2, join=True)
