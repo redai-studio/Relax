@@ -598,11 +598,10 @@ class UpdateWeightFromTensor:
                         self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
                         current_refs = []
                     else:
-                        self._wait_for_ipc(prev_refs)
+                        dispatch_error = ("; ".join(dispatch_errors) or None) if colocate_remote_full else None
+                        self._wait_for_ipc(prev_refs, error=dispatch_error)
                         prev_refs = []
-                        if colocate_remote_full:
-                            self._wait_for_ipc([], error="; ".join(dispatch_errors) or None)
-                        elif dispatch_errors:
+                        if dispatch_errors and not colocate_remote_full:
                             self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
                     prev_long_lived_tensors = long_lived_tensors
                     prev_refs, current_refs = current_refs, []
