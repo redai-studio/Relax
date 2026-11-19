@@ -198,7 +198,10 @@ def test_colocate_fault_tolerance_rejects_scale_out_before_creating_request(pool
 
 
 @pytest.mark.asyncio
-async def test_cancelled_colocate_scale_out_keeps_conflict_until_pg_removal_is_confirmed(pool, monkeypatch):
+@pytest.mark.parametrize("delete_failures", [0, 2])
+async def test_cancelled_colocate_scale_out_keeps_conflict_until_pg_removal_is_confirmed(
+    pool, monkeypatch, delete_failures
+):
     from relax.distributed.ray import rollout
 
     manager, _, _ = pool
@@ -216,8 +219,13 @@ async def test_cancelled_colocate_scale_out_keeps_conflict_until_pg_removal_is_c
             raise RaySystemError("GCS query failed")
         return {"state": "REMOVED"}
 
+    def remove_pg(group):
+        assert group is pg
+        if delete_pg.call_count <= delete_failures:
+            raise RaySystemError("GCS delete failed")
+
     query_pg_mock = Mock(side_effect=query_pg)
-    delete_pg = Mock(side_effect=[RaySystemError("GCS delete failed")] * 4 + [None])
+    delete_pg = Mock(side_effect=remove_pg)
     monkeypatch.setattr(rollout.ray.util, "placement_group", cancel_after_allocating_pg)
     monkeypatch.setattr(rollout.ray.util, "remove_placement_group", delete_pg)
     monkeypatch.setattr(rollout.ray.util, "placement_group_table", query_pg_mock)
@@ -225,6 +233,7 @@ async def test_cancelled_colocate_scale_out_keeps_conflict_until_pg_removal_is_c
 
     await manager.execute_scale_out(request_id)
 
+    assert delete_pg.call_count == delete_failures + 1
     assert query_pg_mock.call_count == 3
     assert manager._scale_out_requests[request_id].status is ScaleOutStatus.CANCELLED
     assert manager.create_scale_out_request(num_replicas=2)["status"] == "PENDING"

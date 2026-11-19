@@ -2602,6 +2602,19 @@ class RolloutManager(ReloadableMixin):
             return
 
         per_replica_pgs = []
+        removal_submitted: set[ray.PlacementGroupID] | None = set() if _synchronous_colocate(self.args) else None
+
+        def try_remove_replica_pg(idx: int) -> None:
+            pg = per_replica_pgs[idx]
+            if removal_submitted is not None and pg.id in removal_submitted:
+                return
+            try:
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                return
+            if removal_submitted is not None:
+                removal_submitted.add(pg.id)
+
         try:
             # Step 1: Update status
             with self._engine_lifecycle_lock:
@@ -2670,10 +2683,7 @@ class RolloutManager(ReloadableMixin):
                 if request.status == ScaleOutStatus.CANCELLED:
                     logger.info(f"[ScaleOut] Request {request.request_id} cancelled during PG wait")
                     for idx in pending_indices:
-                        try:
-                            ray.util.remove_placement_group(per_replica_pgs[idx])
-                        except Exception:
-                            pass
+                        try_remove_replica_pg(idx)
                     # Keep already-succeeded replicas (don't roll back)
                     break
 
@@ -2699,10 +2709,7 @@ class RolloutManager(ReloadableMixin):
                             pending_indices.discard(idx)
                             failed_replica_ids.append(f"replica_{idx}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_FAILED))
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[idx])
-                            except Exception:
-                                pass
+                            try_remove_replica_pg(idx)
 
                 if newly_ready:
                     logger.info(f"[ScaleOut] {len(newly_ready)} PGs became ready: indices={newly_ready}")
@@ -2747,10 +2754,7 @@ class RolloutManager(ReloadableMixin):
                             logger.exception(f"[ScaleOut] Unexpected exception during parallel bring-up: {result}")
                             failed_replica_ids.append(f"replica_{replica_idx_for_result}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED))
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
-                            except Exception:
-                                pass
+                            try_remove_replica_pg(replica_idx_for_result)
                             continue
                         idx, success, reason, engine_offset = result
                         if success:
@@ -2762,10 +2766,7 @@ class RolloutManager(ReloadableMixin):
                             if reason:
                                 failure_reasons.append(reason)
                             logger.warning(f"[ScaleOut] ❌ Replica {idx} failed during bring-up: {reason}")
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[idx])
-                            except Exception:
-                                pass
+                            try_remove_replica_pg(idx)
 
                 if not newly_ready and pending_indices:
                     elapsed_now = time.monotonic() - start_time
@@ -2781,14 +2782,11 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"[ScaleOut] Replica {idx} timed out waiting for resources")
                 failed_replica_ids.append(f"replica_{idx}")
                 failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
-                try:
-                    ray.util.remove_placement_group(per_replica_pgs[idx])
-                except Exception:
-                    pass
+                try_remove_replica_pg(idx)
 
             # Phase C: Determine final status
-            if _synchronous_colocate(self.args):
-                await self._confirm_unused_colocate_pgs(srv, per_replica_pgs)
+            if removal_submitted is not None:
+                await self._confirm_unused_colocate_pgs(srv, per_replica_pgs, removal_submitted)
             with self._engine_lifecycle_lock:
                 if request.status is not ScaleOutStatus.CANCELLED:
                     self._update_scale_out_final_status(
@@ -2796,19 +2794,20 @@ class RolloutManager(ReloadableMixin):
                     )
 
         except Exception as e:
-            if _synchronous_colocate(self.args):
-                await self._confirm_unused_colocate_pgs(srv, per_replica_pgs)
+            if removal_submitted is not None:
+                await self._confirm_unused_colocate_pgs(srv, per_replica_pgs, removal_submitted)
             # Surface only the exception type, never its args (may leak); full exc logged below.
             failure = ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, type(e).__name__)
             request.failure_categories = scale_utils._scale_out_failure_categories([failure])
             request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {failure.message()}")
             logger.exception(f"Scale-out failed for request {request.request_id}")
 
-    async def _confirm_unused_colocate_pgs(self, srv: RolloutServer, pgs: list) -> None:
+    async def _confirm_unused_colocate_pgs(
+        self, srv: RolloutServer, pgs: list, removal_submitted: set[ray.PlacementGroupID]
+    ) -> None:
         with self._engine_lifecycle_lock:
             published = {group.pg[0].id for group in srv.engine_groups if group.pg is not None}
         remaining = {pg.id: pg for pg in pgs if pg.id not in published}
-        removal_submitted = set()
         # Keep the scale-out request in charge until Ray confirms release.
         while remaining:
             retry_delay = 0.2
