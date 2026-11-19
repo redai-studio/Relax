@@ -170,40 +170,6 @@ def _native_updater(model: Any, loader: Any, device: Any) -> Any:
 
 
 class TestNativeWeightUpdateCompletion(unittest.TestCase):
-    def test_model_owned_cache_hooks_survive_native_updates(self) -> None:
-        for run_post_load in (False, True):
-            with self.subTest(run_post_load=run_post_load):
-                model = SimpleNamespace(cache="stale")
-
-                def begin():
-                    model.cache = None
-
-                def end():
-                    model.cache = "fresh"
-
-                def restore(actual, device):
-                    self.assertIs(actual, model)
-                    self.assertIsNone(model.cache)
-
-                def postprocess(actual, device):
-                    self.assertIs(actual, model)
-                    self.assertEqual(model.cache, "fresh")
-
-                model.begin_weight_update = begin
-                model.end_weight_update = end
-                loader = SimpleNamespace(
-                    restore_weights_before_loading=Mock(side_effect=restore),
-                    postprocess_weights=Mock(side_effect=postprocess),
-                    post_load_weights=Mock(),
-                )
-                updater = _native_updater(model, loader, SimpleNamespace())
-                updater.begin_weight_update()
-                updater.end_weight_update(run_post_load=run_post_load)
-                self.assertEqual(model.cache, "fresh")
-                loader.restore_weights_before_loading.assert_called_once()
-                loader.postprocess_weights.assert_called_once()
-                loader.post_load_weights.assert_not_called()
-
     def test_models_without_hooks_keep_default_postload_policy(self) -> None:
         for run_post_load in (False, True):
             with self.subTest(run_post_load=run_post_load):

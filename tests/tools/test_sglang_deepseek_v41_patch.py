@@ -216,37 +216,5 @@ class TestDeepseekV41WeightUpdate(unittest.TestCase):
         method(manager, SimpleNamespace(tags=["kv"]))
         self.assertEqual(events, ["flush", "sync", "unmap", "sync"])
 
-    def test_loader_calls_duck_typed_marlin_restore_hook(self) -> None:
-        restore = Mock()
-        layer = object()
-        method = _method(
-            "model_loader/loader.py",
-            "restore_weights_before_loading",
-            {
-                "_modules_with_quant_method": lambda model: [
-                    (layer, SimpleNamespace(restore_weights_before_loading=restore)),
-                    (object(), object()),
-                    (object(), SimpleNamespace(restore_weights_before_loading=None)),
-                ],
-                "device_loading_context": lambda *args: nullcontext(),
-            },
-        )
-        method(object(), "cuda:0")
-        restore.assert_called_once_with(layer)
-
-    def test_repeated_marlin_restore_does_not_clear_loaded_buckets(self) -> None:
-        method = _method("layers/quantization/mxfp4_marlin_moe.py", "restore_weights_before_loading", {})
-        layer = SimpleNamespace(_mxfp4_marlin_reload_in_place=True, w13_weight=Mock())
-        method(SimpleNamespace(), layer)
-        layer.w13_weight.data.zero_.assert_not_called()
-
-    def test_repeated_marlin_postprocess_does_not_repack_runtime_bytes(self) -> None:
-        method = _method("layers/quantization/mxfp4_marlin_moe.py", "process_weights_after_loading", {})
-        fp8 = Mock()
-        layer = SimpleNamespace(_mxfp4_marlin_runtime_parameter_specs={}, _mxfp4_marlin_reload_in_place=False)
-        method(SimpleNamespace(_fp8=fp8), layer)
-        fp8.process_weights_after_loading.assert_not_called()
-
-
 if __name__ == "__main__":
     unittest.main()
