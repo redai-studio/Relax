@@ -10,6 +10,14 @@ from relax.utils.misc import resolve_is_vl_model
 from relax.utils.training import ppo_utils
 
 
+class _FakePEFT:
+    def __init__(self) -> None:
+        self.target_modules = ["linear_qkv"]
+
+    def __call__(self, model: torch.nn.Module, training: bool) -> torch.nn.Module:
+        return model
+
+
 class _FakeProvider:
     def __init__(self, model=None):
         self.calls = []
@@ -145,6 +153,7 @@ def _load_model_provider(monkeypatch, provider=None):
 def _bridge_args(**overrides):
     values = {
         "megatron_to_hf_mode": "bridge",
+        "task_type": "causal_lm",
         "hf_checkpoint": "fake-hf",
         "attention_backend": "flash",
         "tensor_model_parallel_size": 2,
@@ -576,6 +585,27 @@ def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch
     assert post_process_values == [False]
 
 
+@pytest.mark.parametrize("tie_weights", [False, True])
+def test_embedding_provider_keeps_only_used_weights_trainable_after_allowlist(monkeypatch, tie_weights):
+    model = torch.nn.Module()
+    language_model = torch.nn.Module()
+    model.language_model = language_model
+    language_model.embedding = torch.nn.Embedding(8, 4)
+    language_model.output_layer = torch.nn.Linear(4, 8, bias=False)
+    if tie_weights:
+        language_model.output_layer.weight = language_model.embedding.weight
+    module, _ = _load_model_provider(monkeypatch, _FakeProvider(model))
+    args = _bridge_args(
+        task_type="embedding", only_train_params_name_list=["language_model"], freeze_params_name_list=None
+    )
+
+    build_model = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
+    build_model()
+
+    assert language_model.embedding.weight.requires_grad
+    assert language_model.output_layer.weight.requires_grad == tie_weights
+
+
 def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
 
@@ -643,7 +673,7 @@ def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrappe
         return model
 
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
-    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
     args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None)
     provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
     if "lora" in wrapper:
@@ -684,7 +714,7 @@ def test_custom_provider_forwards_supported_mcore_arguments(monkeypatch, accepts
 def test_bridge_provider_receives_mcore_process_groups_through_wrappers(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
-    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
     args = _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None)
     wrapped = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
     config = object()
@@ -792,3 +822,14 @@ def test_bridge_provider_preserves_native_offload_policy(monkeypatch):
     module.get_model_provider_func(_bridge_args(**policy), role="actor")
     assert provider.finalized
     assert {name: getattr(provider, name) for name in policy} == policy
+
+
+@pytest.mark.parametrize("overlap", [True, False, None])
+def test_bridge_provider_preserves_p2p_cli_choice(monkeypatch, overlap):
+    provider = _FakeProvider()
+    provider.overlap_p2p_comm = False
+    provider.batch_p2p_comm = True
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(overlap_p2p_comm=overlap), role="actor")
+    assert provider.overlap_p2p_comm is (False if overlap is None else overlap)
+    assert provider.batch_p2p_comm is (True if overlap is None else not overlap)

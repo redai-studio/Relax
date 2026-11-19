@@ -1,21 +1,19 @@
-# Megatron + MoK 增量镜像
+# CUDA 13 Blackwell 镜像中的 MoK
 
-在 CUDA 13 Blackwell 训练镜像上增加 Megatron MoK 适配、640 维尾块支持和调度器优化。MoK wheel 在增量镜像内编译。
+`docker/Dockerfile.cu13` 的 Blackwell 最终镜像包含 Megatron 适配、MoK 640 维尾块支持和调度器优化。MoK wheel 在镜像内编译，运行时无需另建增量镜像、挂载实验目录或复用旧 `.so`。
 
 ## 构建
 
-从 Relax 仓库根目录构建 `docker/Dockerfile.cu13` 的 Blackwell 镜像，再用它作为 `BASE_IMAGE`。已有相同源码构建的镜像时，可以直接使用对应的 digest。
+从 Relax 仓库根目录执行：
 
 ```bash
-docker build --platform linux/amd64 -f docker/Dockerfile.cu13 --target relax \
-  --build-arg GPU_ARCH=blackwell -t relax-cu13-blackwell:f78809f6 .
-docker build --platform linux/amd64 --build-arg BASE_IMAGE=relax-cu13-blackwell:f78809f6 \
-  -t relax-mok:pr10-sm103 docker/mok
+docker build -f docker/Dockerfile.cu13 --build-arg GPU_ARCH=blackwell \
+  -t relax:cu13-blackwell .
 ```
 
-增量构建上下文为 `docker/mok`。基底提供 Python 3.12、Torch `2.13.0+cu130`、CUDA 13.0 NVCC、TE 2.18、Bridge、HybridEP、Git、Make 和 patch。`PYTHON_BIN` 默认指向解释器目录 `/opt/sglang/bin`，`MEGATRON_ROOT` 默认指向 `/root/Megatron-LM`。MoK 目标架构为 Blackwell `SM103`。
+构建上下文为仓库根目录。MoK 使用主镜像的 Python 3.12、Torch `2.13.0+cu130`、CUDA 13.0 NVCC 和 TE 2.18；构建不升级这些依赖。Megatron 路径为 `/root/Megatron-LM`，目标架构为 Blackwell `SM103`。Hopper 和 CUDA 12 不构建这个后端。
 
-构建先校验 CUDA 13 基底中 Megatron 补丁涉及的 7 个文件的 SHA256，用 `--fuzz=0` 应用补丁，再校验结果。基底为 `f78809f6` 应用 `Dockerfile.cu13` 的 Megatron 补丁后的源码。
+Megatron 适配由主补丁 `docker/patch/latest/megatron.patch` 的 Blackwell 段安装。MoK 构建检查适配涉及的 7 个文件的最终 SHA256；未知源码版本会拒绝。更新主补丁涉及的文件时，需要同步审查 `manifest.json` 中的源码指纹。
 
 ## 来源与补丁
 
@@ -27,7 +25,7 @@ docker build --platform linux/amd64 --build-arg BASE_IMAGE=relax-cu13-blackwell:
 | ThunderKittens     | `HazyResearch/ThunderKittens@1c3920d993404dd49a6d4c7267ea11d583bd5c68`              | `tcgen05.cuh` MN-major 修复                                                   |
 | Transformer Engine | 基底 TE 2.18                                                                        | bounded Adam 修复，限制临时 tensor 句柄数量                                   |
 
-补丁顺序及目标文件 SHA256 见 `manifest.json`。`docker/Dockerfile.cu13` 已应用 TE 的 bounded Adam 补丁，MoK 构建直接校验补丁后的 TE 源码。
+补丁顺序及目标文件 SHA256 见 `manifest.json`。MoK 尾块和调度器改动合并在 `patches/mok.patch`；ThunderKittens 保持独立补丁。TE bounded Adam 修复已合入主镜像的 TE 2.18 补丁，MoK 构建只检查最终源码。
 
 `build.py` 使用 `pip wheel --no-deps --no-build-isolation` 编译并安装 MoK。CUDA driver stub 仅用于链接，不写入运行时 `LD_LIBRARY_PATH`。普通 `docker build` 不需要 GPU，只检查源码、安装路径及 SM103 cubin。
 
@@ -36,7 +34,7 @@ docker build --platform linux/amd64 --build-arg BASE_IMAGE=relax-cu13-blackwell:
 构建后，在有 GPU 的容器中检查实际导入路径及扩展加载：
 
 ```bash
-docker run --rm --gpus all --entrypoint python relax-mok:pr10-sm103 \
+docker run --rm --gpus all --entrypoint python relax:cu13-blackwell \
   /opt/relax/mok-build/verify.py --runtime
 ```
 

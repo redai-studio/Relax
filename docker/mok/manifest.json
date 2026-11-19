@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "scope": "Incremental MoK image over a compatible CUDA13 training image; verify patch targets without dependency upgrades.",
+  "scope": "MoK shipped by Dockerfile.cu13 Blackwell; Megatron adapter is part of the complete CUDA patch.",
   "megatron": {
     "baseline": "CUDA 13 Blackwell image built by docker/Dockerfile.cu13",
     "core_commit": "f78809f6d9c88f8638ea7822966f35057a63fd5c",
@@ -88,15 +88,12 @@
     "sequence_parallel": true
   },
   "patch_order": {
-    "megatron": ["megatron-mok.patch"],
-    "mok": ["mok-640-tail.patch", "mok-pr10-scheduler.patch"],
+    "mok": ["mok.patch"],
     "thunderkittens": ["thunderkittens-mn-major.patch"]
   },
   "patch_sha256": {
-    "megatron-mok.patch": "db1fdcc261a2c9084c4cbce62941475cb78be5fff98c099d1765830e3db9cb55",
-    "mok-640-tail.patch": "dcf2516f6ee1552b305c3206e4d5a1b8ce900aae8566beb200feb7dea7718a97",
-    "mok-pr10-scheduler.patch": "7c8b649f5f4d7584387c63637a54b9a6c5bd1b4f3a56c52de3d6d972ce1a5c5b",
-    "thunderkittens-mn-major.patch": "e001b2d0b6e4088bcedb5cef49bf6811d1757b9e9e9835ae50744ee54b8f633d"
+    "thunderkittens-mn-major.patch": "e001b2d0b6e4088bcedb5cef49bf6811d1757b9e9e9835ae50744ee54b8f633d",
+    "mok.patch": "6ccc61da96f39a37a92655e24ba713dbdc680680317cafdc8f8ea0a065ab59f6"
   },
   "transformer_engine": {
     "distribution": "transformer-engine",

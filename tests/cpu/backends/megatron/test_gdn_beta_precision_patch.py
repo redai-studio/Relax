@@ -1,8 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Verify both configured beta precision modes on the image's GDN
-implementation."""
+"""Verify the installed GDN methods in both configured beta precision modes."""
 
-from inspect import unwrap
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -12,15 +11,17 @@ import torch.nn.functional as F
 
 @pytest.mark.parametrize("beta_in_fp32", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_gdn_preserves_configured_beta_values_and_gradients(dtype: torch.dtype, beta_in_fp32: bool) -> None:
-    gdn = pytest.importorskip("megatron.core.ssm.gated_delta_net")
+def test_gdn_image_patch_preserves_configured_beta_values_and_gradients(
+    dtype: torch.dtype, beta_in_fp32: bool
+) -> None:
+    from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+
     beta = torch.linspace(-8, 8, 4112, dtype=dtype).reshape(257, 16).requires_grad_()
     alpha = torch.linspace(-2, 2, 4112, dtype=dtype).reshape(257, 16).requires_grad_()
     a_log = torch.linspace(-1, 1, 16, requires_grad=True)
     dt_bias = torch.linspace(-0.5, 0.5, 16, requires_grad=True)
     model = SimpleNamespace(config=SimpleNamespace(linear_attention_beta_in_fp32=beta_in_fp32))
-    compute_gates = unwrap(gdn.GatedDeltaNet._compute_gates)
-    decay, features = compute_gates(model, a_log, dt_bias, 1, 257, beta, alpha)
+    decay, features = inspect.unwrap(GatedDeltaNet._compute_gates)(model, a_log, dt_bias, 1, 257, beta, alpha)
     expected_decay = -a_log.exp() * F.softplus(alpha.float() + dt_bias)
     expected_beta = (beta.float() if beta_in_fp32 else beta).sigmoid()
     assert features["beta"].dtype == expected_beta.dtype

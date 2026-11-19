@@ -49,13 +49,13 @@ CP4 使用 `QWEN38_CP_SIZE=4`，并换一个实验名。在 32 卡 TP2/PP4 下�
 
 Radix 有启动开销，短文档或长短混合 batch 可能变慢，开启前应按实际长度分布与 `torch` 对照。CP TP 分摊以 512 行 tile 为单位，尾 tile 和短文档可能导致 TP ranks 工作量不均，不能保证负载均衡。
 
-CP 只保留本地 Q 和 attention 输出，汇集完整 K/V 与 indexer 原始 key，并在反向通过求和的 reduce-scatter 归还 K/V 梯度。Packed 文档保留各自的位置和因果尾块。这不是 ring attention，也不会只拉取选中的远端 K/V。GDN 继续使用 chunkwise CP 布局，PLE 在卷积前仍重建完整序列。因此 CP 能减少部分 activation/workspace，但会增加通信、减少 DP，短文档 packing 下端到端吞吐不一定提高。支持 CP 本身不代表已具备 1M 训练容量或长上下文质量。
+CP 只保留本地 Q 和 attention 输出，汇集完整 K/V 与 indexer 原始 key，并在反向通过求和的 reduce-scatter 归还 K/V 梯度。Packed 文档保留各自的位置和因果尾块。这不是 ring attention，也不会只拉取选中的远端 K/V。GDN 继续使用 chunkwise CP 布局，PLE 默认在卷积前重建完整序列（下文的局部计算可减少这部分开销）。因此 CP 能减少部分 activation/workspace，但会增加通信、减少 DP，短文档 packing 下端到端吞吐不一定提高。支持 CP 本身不代表已具备 1M 训练容量或长上下文质量。
 
 回到 CP1 Grouped 对照时，设置 `QWEN38_CP_SIZE=1`、`RELAX_QWEN38_QSA_CP=0`、`RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`，关闭三个 CP 优化开关，并保留 `SELECTOR_BACKEND=torch`。做 CP2/4 消融时，保留 `QSA_CP=1` 和 `MIXED_LONG_BACKEND=cute`，逐项切换 CP 优化开关。不同实验使用独立 checkpoint 目录或实验名；对比吞吐时保持数据、token 预算、batch size、重算和 profiling 配置一致。
 
 可选的 cuDNN QSA 后端替换 Qwen3.8 mixed QSA 的长文档 Grouped attention 分支，短文档仍使用因果 Flash Attention。原有 selector 及其四 token block ID 保持不变。
 
-适配器支持 CUDA BF16、TP2 下 local 12Q/1KV、D256、CP1，以及冻结的 Stage-1 indexer，不支持 TP8 下的 local 3Q/1KV attention。Packed 输入必须携带 producer 提供的 CPU 文档边界；每篇文档独立处理 token 位置和不完整的因果尾块。
+适配器支持 CUDA BF16、D256、CP1 和冻结的 Stage-1 indexer。本地 attention 头数支持 TP1 的 24Q/2KV 和 TP2 的 12Q/1KV。Packed 输入必须携带 producer 提供的 CPU 文档边界；每篇文档独立处理 token 位置和不完整的因果尾块。
 
 ## 运行环境
 
@@ -103,7 +103,9 @@ docker build --build-arg RELAX_BASE_IMAGE='<your-cu13-blackwell-image>' \
 
 ## 选择训练入口
 
-两套脚本均使用 4 节点 × 8 GPU、48 层、global 24Q/2KV、TP2/PP4/CP1/EP8/ETP1 和 sequence parallelism，采用 BF16、GBS512/MB1、每两层一次的 full uniform recompute，以及一层 MTP。
+两套脚本默认使用 4 节点 × 8 GPU、48 层、global 24Q/2KV、TP2/PP4/CP1/EP8/ETP1 和 sequence parallelism，采用 BF16、GBS512/MB1、每两层一次的 full uniform recompute，以及一层 MTP。
+
+在任一 NV 脚本的命令末尾追加 `--tensor-model-parallel-size 1` 即可选择 TP1。Megatron 会在 TP1 下关闭 sequence parallelism。
 
 | 脚本 | 各 PP 阶段层数 | LR decay iterations | 输入 |
 | --- | --- | --- | --- |
@@ -201,9 +203,9 @@ export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
 
 | 算子 | 具体做法 | 并行配置条件 | 主要限制 | 开启方式 |
 | --- | --- | --- | --- | --- |
-| cuDNN PR1765 | 将选中的块转换为 byte mask，调用 NVIDIA QSA 算子 | **本模型要求 TP2、CP1**：TP2 后每张卡为 12Q/1KV/D256，符合当前适配器的固定输入要求；TP1/4/8 的本地头数不符合，CP>1 也不接受 | CUDA BF16；冻结 indexer、indexer loss 为 0；R4、512 列 int32 块 ID；需要额外依赖 | 通过 Mixed 设置 `MIXED_LONG_BACKEND=cudnn_pr1765`，完整配置见下文；`MIXED_FLASH_MAX_LEN=0` 可使所有文档使用 cuDNN |
+| cuDNN PR1765 | 将选中的块转换为 byte mask，调用 NVIDIA QSA 算子 | **要求 CP1**，接受 TP1 的 24Q/2KV/D256 和 TP2 的 12Q/1KV/D256 | CUDA BF16；冻结 indexer、indexer loss 为 0；R4、512 列 int32 块 ID；需要额外依赖 | 通过 Mixed 设置 `MIXED_LONG_BACKEND=cudnn_pr1765`，完整配置见下文；`MIXED_FLASH_MAX_LEN=0` 可使所有文档使用 cuDNN |
 | Grouped | 对共享同一 KV 头的 Q 头进行分组计算，将选中的块展开为 token 索引，仅访问这些 token | **要求 CP1**；本地 Q 头数能被 KV 头数整除，D256。本模型 TP1/2/4/8 的本地布局均满足头数条件，不固定要求 TP2 | 通过 Mixed 接入；CUDA BF16、冻结 indexer；反向用 FP32 atomic 累加 K/V 梯度 | Mixed 公共配置 + `MIXED_LONG_BACKEND=grouped`，将 Flash 和 Flex 上限都设为 `0` |
-| Flash | 对短文档直接执行完整的因果 attention | **要求 CP1**；通过 Grouped 路线接入时，本模型 TP1/2/4/8 满足头数条件；通过 cuDNN 路线接入时，整个入口要求 TP2，即使全部文档使用 Flash 也需满足 | 仅作为 Mixed 内部分支；不能用它替代长文档的稀疏选择；需要 Flash Attention | 通过 Mixed 的 `MIXED_FLASH_MAX_LEN` 控制，默认自动取选择预算 + 3 |
+| Flash | 对短文档直接执行完整的因果 attention | **要求 CP1**。Grouped 路线接受本模型的 TP1/2/4/8，cuDNN 路线接受 TP1/2。所有文档都走 Flash 时也会检查所选路线的头数 | 仅作为 Mixed 内部分支；不能用它替代长文档的稀疏选择；需要 Flash Attention | 通过 Mixed 的 `MIXED_FLASH_MAX_LEN` 控制，默认自动取选择预算 + 3 |
 | Triton v1 | 按 bitset 标记的稀疏块计算 attention，复用 selector 结果 | 本地 Q 头数能被 KV 头数整除，本模型 TP1/2/4/8 满足头数条件；CP1 直接计算，CP>1 由原生框架收集 Q/K/V 后计算，再切分本地输出 | CUDA、R4、D 为 64/128/256；selection 为单行；非 THD 输入要求 batch=1；不满足条件时回退到 Flex | `MCORE_QSA_SPARSE_BACKEND=flex`、`FUSED_ATTENTION=triton` |
 | Triton v2 | 沿用 v1 的选择结果，调整循环、tile 和反向计算 | TP 和 CP 条件与 v1 相同：不固定为 TP2；CP>1 通过框架处理通信 | 同 v1 | `MCORE_QSA_SPARSE_BACKEND=flex`、`FUSED_ATTENTION=triton_v2` |
 | Triton v3 | 沿用 v2 前向，反向可共享 FP32 dS，减少重复计算 | TP 和 CP 条件与 v1 相同；使用 CP local-query 时不启用共享 dS 优化，仍保留常规反向路径 | 同 v1；共享 dS 另限 SM103/BF16/D256、Q/K 长度不超过 128K，并受地址范围和临时显存限制；不满足时使用常规反向路径 | `MCORE_QSA_SPARSE_BACKEND=flex`、`FUSED_ATTENTION=triton_v3` |
@@ -217,7 +219,7 @@ export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
 - **原生与 Mixed 的区别**：原生 `id_sparse` 可接原生 CP 流程；设置 `COMMUNITY_BACKEND=mixed` 后，同一入口的计算由 Mixed 替换，Grouped/cuDNN 路线须遵守 CP1 限制；CuTe 的静态 CP 路径见上文。
 - **CP**：原生路径在 CP>1 时先汇集完整 Q/K/V，计算完成后切分为本地输出。Flex/Triton 可配合 `LOCAL_QUERY=1` 只保留本地 Q、汇集 K/V，但要求 THD、CUDA、R4 bitset 和冻结的 Stage-1 indexer 等条件；不满足时回退到原生路径。Grouped/cuDNN Mixed 只允许 CP1；CuTe 可显式启用上述静态 CP 路径。
 - **SP**：selector 会按 TP group 汇集序列。SP 不改变表中的本地 attention 头数要求；可选 TP selector 只用于 Mixed，并要求汇集后的序列长度能被 TP 整除。
-- **PP / EP**：分别负责层分配和 MoE 通信，不由 QSA 算子决定。表中的条件是算子和适配层条件；TP1/2/4/8 满足头数要求不代表完整训练拓扑已经验证；使用 HybridEP 时还要满足其拓扑检查。
+- **PP / EP**：分别负责层分配和 MoE 通信。Mixed 的 Grouped 和 cuDNN 路线要求 CP1。开启 QSA CP 后，Mixed CuTe 也允许本指南列出的[静态 CP2/4 拓扑](#可选-cute-attention-与静态-cp)和 [32 卡 CP8/16 拓扑](#长上下文-cp-的运行前提)。HybridEP 要求 ETP1、EP4 或 EP8，且总 rank 数须满足所选拓扑的整除条件。EP×ETP 组的 rank 必须在同一台主机上且互相可访问，加载的模块和安装包必须匹配 `RELAX_HYBRID_EP_COMMIT`。
 
 ### Mixed 几何与文档长度分流
 
@@ -234,9 +236,9 @@ export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
 | Mixed 长文档后端 | 本地 attention 条件 | 对 global 24Q/2KV/D256 模型的含义 |
 | --- | --- | --- |
 | `grouped` | Q/KV 头数为正，Q 能被 KV 整除，D256 | TP1/2/4/8 分别得到 24Q/2KV、12Q/1KV、6Q/1KV、3Q/1KV，均能通过几何检查 |
-| `cudnn_pr1765` | 仅接受 **12Q/1KV/D256** | 当前应使用 TP2；即使 batch 中全是短文档，也会先检查此限制 |
+| `cudnn_pr1765` | **24Q/2KV/D256** 和 **12Q/1KV/D256** | 分别对应 TP1 和 TP2。仅含短文档的 batch 也适用此检查 |
 
-TP4/8 时，模型投影层会在 TP rank 之间共享 KV 组。上表说明代码允许的头数布局，不是完整训练验证记录。cuDNN 路线遇到不支持的布局会报错，不会自动换成 Grouped。
+TP4/8 时，模型投影层会在 TP rank 之间共享 KV 组。对 TP4 的 6Q/1KV 或 TP8 的 3Q/1KV，设置 `RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=grouped`。
 
 #### 按单篇文档长度分流
 
@@ -289,3 +291,53 @@ cuDNN 路线需要兼容的 CUDA 13 Blackwell 环境，以及额外的 NVIDIA cu
 - 公共模型脚本默认开启 fused attention，Mixed 不能与它同时使用，所以公共配置中的 `FUSED_ATTENTION=0` 必须显式设置。
 
 实现入口：[Mixed 分发](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/mixed.py)、[几何检查](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/geometry.py)、[cuDNN 适配](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/ops/qsa_mixed_ops/cudnn.py)、[Triton 选择](https://github.com/fxsc03/Relax/blob/fit/fengxiaoshi/QSA/relax/models/qwen3_8/qsa_fused.py)。
+
+## 长上下文 CP 的运行前提
+
+新增两种已验证的 32 卡配置：TP1/PP2/CP8/EP8/ETP1 和 TP1/PP2/CP16/EP8/ETP1。两者都要求开启 QSA CP，并选择 mixed 后端及其 CuTe 长序列实现。仍检查每个 EP8 专家组的 8 张卡是否位于同一主机，以及组内 GPU 能否通过 HybridEP 相互通信。
+
+CP16 将 GDN 的 48 个 V heads 分到 16 张卡，每卡只有 3 个 heads。FlashQLA 的 chunk64 累加计算要求 head 数为偶数，因此临时补零至偶数个 heads，计算后裁回原始数量。各 head 独立计算，不改变原有 head 的结果。修复以补丁形式纳入 `docker/Dockerfile.cu13`，随镜像构建安装。
+
+## 冻结 PLE 的局部计算
+
+静态 CP、TP1、THD packed 输入且所有 PLE 参数冻结时可启用。下面的 32 卡示例使用 **TP1/PP2/CP8/EP8/ETP1**，序列上限 128K；脚本会把两个 PLE 开关同时传入 Ray job 和训练 Actor，无需修改脚本。使用上述已安装 HybridEP 的镜像，并从仓库根目录运行：
+
+```bash
+export MODEL_DIR=/path/to/model
+export DATA_DIR=/path/to/sft-data
+export SAVE_DIR=/path/to/checkpoints
+export MEGATRON=/path/to/image-patched/Megatron-LM
+export RAY_JOBS_ADDRESS=http://ray-head:8265
+export RAY_ADDRESS="$RAY_JOBS_ADDRESS"
+export RAY_API_SERVER_ADDRESS="$RAY_JOBS_ADDRESS"
+export QWEN38_PLE_INPUT_HALO_CP=1
+export QWEN38_PLE_INPUT_HALO_TRANSPORT=adaptive
+export RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
+export RELAX_QWEN38_QSA_CP=1
+export QWEN38_CP_SIZE=8
+export QWEN38_PP_LAYOUT='Et*24|t*24mL'
+export QWEN38_SFT_MODALITY=text
+export QWEN38_CUDA_DEVICE_MAX_CONNECTIONS=1
+export EXP_NAME=qwen38-ple-halo-cp8
+NUM_STEPS=20 bash examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-32xgpu-blackwell.sh \
+  --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
+  --linear-cp-mode headwise --global-batch-size 32 --rollout-batch-size 32 \
+  --max-tokens-per-gpu 16384 \
+  --chunked-optimizer-state-offload --optimizer-state-offload-fraction 1.0
+```
+
+命令末尾的 TP/PP 参数覆盖脚本的 TP2/PP4 默认值；Megatron 在 TP1 时关闭 sequence parallelism。脚本已有的冻结参数设置包含全部 PLE 参数。先添加 `DRY_RUN=1` 可检查最终参数；这是 PLE 启动示例，不代表 512K/1M 容量验收。
+
+该功能默认关闭。开启后，每张卡只计算自己负责的输出，以及卷积需要的左侧输入；文档边界仍使用原来的补零规则。数据处理自动记录每篇文档补齐后的边界，无需额外开启 QSA CPU layout。原生 GPT 和 VL Bridge 重计算均按微批保存、恢复 PLE 状态；仅支持按文档的 zigzag 分片；不支持 allgather CP、动态 CP、TP 大于 1 或训练 PLE 参数。
+
+| 通信模式 | 输入通信 | PLE 计算范围 |
+| --- | --- | --- |
+| `full` | 汇集完整输入 | 本卡输出及其卷积左侧输入 |
+| `halo`（开启功能后的默认值） | 交换各卡所需的边界输入 | 本卡输出及其卷积左侧输入 |
+| `adaptive` | 每篇文档的 CP 小块均不短于卷积左侧范围时使用 `halo`，否则整个 batch 使用 `full` | 本卡输出及其卷积左侧输入 |
+
+`full` 可用于同输入对照，并非原始的全序列 PLE 计算。边界输入的梯度会归约回持有该输入的卡；BF16 下通信归约次序变化可能产生浮点差异，需按实际数据验证。开启该路径后，原有 PLE streamed/fused-conv 开关不参与执行。
+
+构建 `docker/Dockerfile` 或 `docker/Dockerfile.cu13` 会安装所需 Megatron 补丁。使用外部 Megatron checkout 时也须安装该补丁。512K/1M 训练 recipe 单独提供。
+
+512K/1M 的 32 卡入口、数据构造和保存恢复方式见 [长序列训练 recipe](./qwen38-long-context.md)。
