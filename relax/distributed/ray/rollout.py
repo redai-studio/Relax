@@ -23,7 +23,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
-from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.core.node_group_affinity import get_scale_out_node_group, with_control_plane_affinity
 from relax.distributed.ray.rollout_scale_types import (
     ScaleInRequest,
     ScaleInStatus,
@@ -2205,17 +2205,20 @@ class RolloutManager(ReloadableMixin):
 
             # Step 2: Create one PG per replica so that replicas with available
             # resources can proceed immediately without waiting for the others.
+            bundle = {device_utils.get_ray_accelerator_name(): 1, "CPU": 1}
+            if node_group := get_scale_out_node_group(self.args):
+                # The group can scale from zero, so keep the marker in the pending demand.
+                bundle[f"{node_group}_gpu"] = 1
             per_replica_pgs = []
-            for i in range(request.num_replicas):
-                num_gpus = gpus_per_engine
-                accel_resource = device_utils.get_ray_accelerator_name()
-                bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
+            for _ in range(request.num_replicas):
+                bundles = [dict(bundle) for _ in range(gpus_per_engine)]
                 pg = ray.util.placement_group(bundles, strategy="PACK")
                 per_replica_pgs.append(pg)
 
             logger.info(
                 f"[ScaleOut] Created {len(per_replica_pgs)} per-replica placement groups "
-                f"({gpus_per_engine} GPUs each). Waiting for resources (timeout={request.timeout_secs}s)..."
+                f"({gpus_per_engine} GPUs each, bundle={bundle}). "
+                f"Waiting for resources (timeout={request.timeout_secs}s)..."
             )
 
             # Step 3: Incrementally wait for PGs to become ready.

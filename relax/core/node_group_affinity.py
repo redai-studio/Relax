@@ -6,6 +6,7 @@ import os
 import time
 from typing import Any, Optional
 
+from relax.utils.env import Envs, is_env_set
 from relax.utils.logging_utils import get_logger
 
 
@@ -55,6 +56,13 @@ def _get_elastic_node_group(args: Any) -> Optional[str]:
         return None
 
     return os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip() or "stable"
+
+
+def get_scale_out_node_group(args: Any) -> Optional[str]:
+    """Resolve the worker group for newly scaled-out rollout engines."""
+    if is_env_set("RELAX_ELASTIC_NODE_GROUP") or _get_elastic_node_group(args) is not None:
+        return Envs.RELAX_ELASTIC_NODE_GROUP.strip()
+    return None
 
 
 def with_control_plane_affinity(args: Any, actor_options: Optional[dict] = None) -> dict:

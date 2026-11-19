@@ -727,17 +727,20 @@ ray job submit -- python3 relax/entrypoints/train.py \
 #### Baseline Node-Group Affinity
 
 When the autoscaler configuration is enabled, Relax pins baseline actor, critic, reference, rollout-seed, and
-colocated placement groups to the initial node group. Elastic rollout engines remain unpinned. The node-group prefix
+colocated placement groups to the initial node group. The node-group prefix
 comes from `RELAX_INITIAL_NODE_GROUP` and defaults to `stable`; the cluster must publish matching `<prefix>_gpu` and
 `<prefix>_cpu` Ray custom resources. For example, `RELAX_INITIAL_NODE_GROUP=baseline` requires `baseline_gpu` and
 `baseline_cpu`. Relax fails fast if either marker is unavailable. Use `--no-enable-affinity` to disable this
 constraint on clusters without marker resources.
 
-The purpose of this affinity is to keep the fixed training baseline on a worker group that the platform treats as
-stable and non-preemptible. Placement groups created for elastic Rollout engines do not request the node-group
-markers, so they can use any eligible capacity and may be scheduled on preemptible workers. The environment variable
-only selects the baseline group; it does not make that group non-preemptible. The Ray cluster, Kubernetes setup, or
-external resource platform must enforce the group's availability and preemption policy.
+#### Scale-Out Node-Group Affinity
+
+With baseline affinity enabled, each placement-group bundle for a new rollout engine also requests `elastic_gpu: 1`.
+Set `RELAX_ELASTIC_NODE_GROUP` to override the `elastic` prefix. The target Ray worker group must advertise
+`<prefix>_gpu` in its configuration, including when it starts with zero replicas. Set
+`RELAX_ELASTIC_NODE_GROUP=elastic` explicitly to target scale-out on jobs with baseline affinity disabled or on
+manually scaled jobs. Without that constraint, scale-out placement groups can use any eligible capacity. The Ray
+cluster, Kubernetes setup, or resource platform enforces worker-group availability and preemption policy.
 
 #### Configuration File Format
 
