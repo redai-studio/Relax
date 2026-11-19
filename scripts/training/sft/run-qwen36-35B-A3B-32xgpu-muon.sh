@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.6-35B-A3B multimodal SFT on 4 x 8 Blackwell GPUs with Megatron Muon.
+# Every training node needs a Blackwell image with FLA 0.4.2 and emerging-optimizers
+# compatible with the image's Megatron. Ray training workers must be able to import both.
 # MODEL_DIR=/models/Qwen3.6-35B-A3B DATA_DIR=/data/parquet SAVE_DIR=/checkpoints \
 #   bash scripts/training/sft/run-qwen36-35B-A3B-32xgpu-muon.sh
 # Set DRY_RUN=1 to inspect the Ray job. Reuse EXP_NAME to resume the same run.
@@ -28,7 +30,7 @@ CHECKPOINT_DIR="$SAVE_DIR/$EXP_NAME"
 # The standard Ray entrypoint supplies the other paths and the worker setup hook.
 FLA_ROOT="${RELAX_LEGACY_FLA_ROOT:-/opt/relax/compat/fla-0.4.2}"
 if [[ "${DRY_RUN:-0}" != 1 && ! -f "$FLA_ROOT/fla/ops/gated_delta_rule/chunk.py" ]]; then
-    echo "Missing Blackwell FLA runtime at $FLA_ROOT. Use the Relax Blackwell image." >&2
+    echo "Missing Blackwell FLA runtime at $FLA_ROOT. Set RELAX_LEGACY_FLA_ROOT if installed elsewhere." >&2
     exit 1
 fi
 RUNTIME_ENV_JSON="$(python3 - "$FLA_ROOT" <<'PY'
