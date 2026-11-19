@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.6-35B-A3B multimodal SFT on 4 x 8 Blackwell GPUs with Megatron Muon.
-# Every training node needs a optimized Blackwell image with patched FLA 0.5.2, DeepEP v2 and emerging-optimizers
+# Every training node needs the optimized Blackwell image with FlashQLA, patched FLA 0.5.2, DeepEP v2 and emerging-optimizers
 # compatible with the image's Megatron. These packages must be available to the Ray training workers.
 # Expanded DeepEP requires each EP8 group on one NVLink node and at most 131072 input rows per rank after TP splitting.
 # Default Wholepack also needs the TransferQueue assignment_transform patch on the data service.
@@ -53,7 +53,6 @@ train = {
     "EP_JIT_CACHE_DIR": f"/tmp/relax-qwen35-{os.getuid()}/deepep",
     "EP_DISABLE_GIN": "1",
     "RELAX_FLA_CONV_NB_MODE": "none",
-    "FLA_FLASH_QLA": "0",
     "NCCL_CUMEM_ENABLE": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "0",
@@ -171,6 +170,7 @@ PARALLEL_ARGS=(
     --expert-tensor-parallel-size 1
     --moe-token-dispatcher-type flex
     --moe-flex-dispatcher-backend deepepv2
+    --custom-megatron-init-path relax.models.qwen3_5.tilelang_nvcc.install
     --custom-megatron-before-train-step-hook-path relax.models.qwen3_5.recipe.before_step
     --moe-flex-dispatcher-num-sms 80
     --moe-router-fusion

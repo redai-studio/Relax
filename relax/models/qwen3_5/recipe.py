@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Install the Qwen TP4 optimization recipe."""
 
+from pathlib import Path
 from typing import Any
 
 from relax.utils.data import wholepack_policy
@@ -102,8 +103,7 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     assert not any(chunk.ddp_config.check_for_nan_in_grad for chunk in model)
     args._selective_loss_head = args._qwen_fused_head = True
     prime_expert_communicators(args, model)
-    use_muon = getattr(args, "optimizer", None) == "muon"
-    if use_muon:
+    if getattr(args, "optimizer", None) == "muon":
         # Megatron clips Muon gradients; Relax checks for nonfinite values before updating any parameters.
         if not getattr(optimizer, "_relax_nonfinite_guard_installed", False):
             raise RuntimeError("The optimized Muon recipe requires RELAX_SKIP_NONFINITE_GRAD=1")
@@ -111,7 +111,9 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
         install_norm_guard(args, optimizer)
     _ACTIVE = True
     install_ce_launches()
-    install_gdn(model, use_native_fla=use_muon)
+    import importlib.util
+
+    install_gdn(model, Path(importlib.util.find_spec("flash_qla").origin).parent.parent)
     attention.before_step(args, rollout_id, step_id, model, optimizer, scheduler)
     attention_value.install(model, SelfAttention)
     attention_gate.install(model, SelfAttention)

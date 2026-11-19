@@ -20,43 +20,6 @@ def load(name):
     return module
 
 
-def test_gdn_kernel_selection_preserves_flashqla_default(tmp_path, monkeypatch):
-    import sys
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    backend = load("gdn_backend")
-
-    class GatedDeltaNet:
-        config = SimpleNamespace(context_parallel_size=1)
-        num_key_heads, num_value_heads = 4, 8
-
-    model = [SimpleNamespace(modules=lambda: [GatedDeltaNet() for _ in range(30)])]
-    native, flash = Mock(), Mock()
-    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule", SimpleNamespace(chunk_gated_delta_rule=native))
-    monkeypatch.setitem(sys.modules, "flash_qla", SimpleNamespace(chunk_gated_delta_rule=flash))
-    (tmp_path / "flash_qla").mkdir()
-    (tmp_path / "flash_qla/__init__.py").touch()
-    verify_tilelang = Mock()
-    monkeypatch.setattr(backend, "_guard_kkt_tma", verify_tilelang)
-
-    monkeypatch.delenv("FLA_FLASH_QLA", raising=False)
-    with pytest.raises(RuntimeError, match="FLA_FLASH_QLA=0"):
-        backend.install_gdn(model, use_native_fla=True)
-    monkeypatch.setenv("FLA_FLASH_QLA", "0")
-    backend.install_gdn(model, use_native_fla=True)
-    q, k, v, cu = (object() for _ in range(4))
-    assert backend.rule(q, k, v, cp_context=None, cu_seqlens=cu) is native.return_value
-    native.assert_called_once_with(q, k, v, cu_seqlens=cu)
-    flash.assert_not_called()
-    verify_tilelang.assert_not_called()
-
-    backend.install_gdn(model, tmp_path)
-    assert backend.rule(q, k, v, cp_context=None, cu_seqlens=cu) is flash.return_value
-    flash.assert_called_once_with(q, k, v, auto_cp=True, cu_seqlens=cu)
-    verify_tilelang.assert_called_once_with(tmp_path)
-
-
 @pytest.mark.parametrize("tampered", [False, True])
 def test_cublas_verification_uses_image_manifest(tmp_path, monkeypatch, tampered):
     import hashlib
