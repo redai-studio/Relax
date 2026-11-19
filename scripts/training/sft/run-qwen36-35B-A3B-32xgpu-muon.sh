@@ -191,7 +191,7 @@ SFT_ARGS=(
     --loss-type sft
     --prompt-data "${DATA_DIR}"
     --seq-length 262144
-    --global-batch-size 1600
+    --global-batch-size 800
     --use-dynamic-batch-size
     --balance-data
     --sft-oversize-strategy keep
