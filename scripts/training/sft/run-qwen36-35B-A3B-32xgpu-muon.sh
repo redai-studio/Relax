@@ -3,6 +3,8 @@
 # Qwen3.6-35B-A3B multimodal SFT on 4 x 8 Blackwell GPUs with Megatron Muon.
 # Every training node needs a Blackwell image with FLA 0.4.2, DeepEP v2 and emerging-optimizers
 # compatible with the image's Megatron. These packages must be available to the Ray training workers.
+# Default Wholepack also needs the TransferQueue assignment_transform patch on the data service.
+# Set QWEN35_WHOLEPACK=0 to use binpack with an unpatched TransferQueue.
 # MODEL_DIR=/models/Qwen3.6-35B-A3B DATA_DIR=/data/parquet SAVE_DIR=/checkpoints \
 #   bash scripts/training/sft/run-qwen36-35B-A3B-32xgpu-muon.sh
 # Set DRY_RUN=1 to inspect the Ray job. Reuse EXP_NAME to resume the same run.
@@ -59,6 +61,7 @@ train = {
     "EP_DISABLE_GIN": "1",
     # Native DeepEP creates its own EP communicator. The optimized hook used to prime a PyTorch one.
     "EP_REUSE_NCCL_COMM": "0",
+    "RELAX_QWEN_DEEPEP_GROUP_CAPACITY": "1",
     "NCCL_CUMEM_ENABLE": "1",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "0",
