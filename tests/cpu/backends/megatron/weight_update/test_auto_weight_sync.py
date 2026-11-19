@@ -398,6 +398,50 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
     assert set(completed) == set(alive)
 
 
+@pytest.mark.parametrize("independent_pg", [False, True])
+def test_failed_nccl_dispatch_drains_ipc_reader_and_propagates_error(monkeypatch, independent_pg):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
+    updater.use_distribute = updater._is_distributed_src_rank = True
+    updater._colocate_remote_full = independent_pg
+    updater.weight_version = 0
+    updater._ipc_allocator_version = 1
+    updater._ipc_bucket_allocator = updater._ipc_gather_src = updater._ipc_gather_group = None
+    updater.quantization_config = None
+    updater._group_name = "independent" if independent_pg else "slime"
+    updater._model_update_groups = object()
+    updater.weights_getter = lambda: {}
+    updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=lambda weights: [[("p", torch.zeros(1))]])
+    ipc, receiver = Mock(), Mock()
+    updater._ipc_engine = ipc
+    updater.rollout_engines, updater.distributed_rollout_engines = [ipc], [receiver]
+    receiver.update_weights_from_distributed.remote.return_value = "nccl-ack"
+    read_refs = []
+
+    def get(ref):
+        read_refs.extend(ref if isinstance(ref, list) else [ref])
+        return [] if isinstance(ref, list) else None
+
+    monkeypatch.setattr(sync, "_send_to_colocated_engine", lambda *args, **kwargs: (["ipc-ack"], object()))
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(sync.dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(sync.dist, "barrier", Mock())
+    monkeypatch.setattr(sync.dist, "broadcast", Mock(side_effect=ValueError("sender failed")))
+    monkeypatch.setattr(sync.dist, "all_gather_object", lambda out, error, **kwargs: out.__setitem__(0, error))
+    reduce = Mock()
+    monkeypatch.setattr(sync.dist, "all_reduce", reduce)
+    monkeypatch.setattr(sync.ray, "get", get)
+
+    with pytest.raises(RuntimeError if independent_pg else ValueError, match="sender failed"):
+        updater.update_weights()
+
+    receiver.update_weights_from_distributed.remote.assert_called_once()
+    assert "ipc-ack" in read_refs
+    assert "nccl-ack" not in read_refs
+    assert reduce.called == independent_pg
+
+
 @pytest.mark.parametrize("kind", ["replicated", "duplicated", "buffer", "sharded"])
 def test_auto_async_plan_reads_gdn_config_only_for_sharded_parameters(monkeypatch, kind):
     from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
