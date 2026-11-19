@@ -1718,6 +1718,13 @@ class SGLangEngine(RayActor):
         except OSError:
             logger.exception("Could not create the NCCL probe log directory")
             return {"success": False, "stopped": True, "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value}
+
+        def cleanup_probe_logs() -> None:
+            try:
+                log_directory.cleanup()
+            except OSError:
+                logger.exception("Could not remove the NCCL probe log directory %s", log_directory.name)
+
         for local_rank, port in enumerate(port_list):
             try:
                 log_path = os.path.join(log_directory.name, f"rank-{local_rank}.log")
@@ -1741,7 +1748,7 @@ class SGLangEngine(RayActor):
                 for _, process, process_log, _ in processes:
                     terminate(process)
                     process_log.close()
-                log_directory.cleanup()
+                cleanup_probe_logs()
                 return {
                     "success": False,
                     "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value,
@@ -1830,7 +1837,7 @@ class SGLangEngine(RayActor):
                     log_file.close()
                 except Exception:
                     pass
-            log_directory.cleanup()
+            cleanup_probe_logs()
         verdict["stopped"] = all(process.poll() is not None for _, process, _, _ in processes)
         return verdict
 

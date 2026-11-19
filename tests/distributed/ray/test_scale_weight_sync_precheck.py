@@ -459,6 +459,39 @@ def test_actor_probe_explicitly_limits_child_visible_devices(world_size):
     assert all(process.kwargs["stdout"] is not subprocess.PIPE for process in created)
 
 
+@pytest.mark.parametrize("partial_launch", [False, True])
+def test_actor_probe_retains_exit_ack_when_log_cleanup_fails(partial_launch):
+    import tempfile
+
+    engine = object.__new__(SGLangEngine)
+    engine.node_rank = 0
+    engine.base_gpu_id = 0
+    engine.num_gpus_per_engine = 2
+    engine.args = SimpleNamespace(num_gpus_per_node=8)
+    engine._colocate_probe_cumem = "0"
+    cleanup = tempfile.TemporaryDirectory.cleanup
+
+    def fail_cleanup(directory):
+        cleanup(directory)
+        raise OSError("log directory cleanup failed")
+
+    def launch(command, **kwargs):
+        if partial_launch and "--rank" in command and command[command.index("--rank") + 1] == "2":
+            raise OSError("second child could not start")
+        return _CompletedProcess(command, **kwargs)
+
+    with (
+        patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=launch),
+        patch.object(tempfile.TemporaryDirectory, "cleanup", fail_cleanup),
+        patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
+        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}),
+    ):
+        result = engine.run_scale_weight_sync_precheck("10.0.0.1", "18000,18000", 1, "cleanup", 2, 10, world_size=3)
+    assert result["stopped"] is True
+    assert result["success"] is (not partial_launch)
+    assert result["category"] == ("launch_transient" if partial_launch else None)
+
+
 def test_actor_probe_large_logs_do_not_use_pipe_or_deadlock():
     engine = object.__new__(SGLangEngine)
     engine.node_rank = 0
@@ -586,6 +619,7 @@ def test_actor_probe_unreapable_child_does_not_block_actor():
 
     assert result["success"] is False
     assert result["category"] == "timeout"
+    assert result["stopped"] is False
     assert len(created) == 2
 
 
