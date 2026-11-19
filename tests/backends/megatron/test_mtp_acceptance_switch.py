@@ -50,7 +50,7 @@ def test_acceptance_switch_preserves_loss_and_gradients(monkeypatch, fused_ce, a
     def track(loss, num_tokens, depth, config, correct, total, **_kwargs):
         tracked.append((loss.detach().clone(), num_tokens.detach().clone(), correct, total))
 
-    monkeypatch.setattr(fused, "supported", lambda *_args: fused_ce)
+    monkeypatch.setattr(fused, "supported", lambda *_args, **_kwargs: fused_ce)
     monkeypatch.setattr(fused, "linear_cross_entropy", linear)
     monkeypatch.setattr(patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", acceptance)
     monkeypatch.setattr(patch, "roll_tensor", lambda tensors, **kwargs: [roll(t, **kwargs)[0] for t in tensors])
