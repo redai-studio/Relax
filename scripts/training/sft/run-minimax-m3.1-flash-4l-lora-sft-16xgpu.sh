@@ -23,7 +23,16 @@ fi
 : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray Jobs dashboard HTTP address}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 MULTIMODAL_KEYS="${MULTIMODAL_KEYS:-}"
-if [[ -n "$MULTIMODAL_KEYS" ]]; then
+if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
+    : "${SFT_CHAT_TEMPLATE:?Prepare a verified parity template with scripts.tools.minimax_m31_sft_parity}"
+    EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-parity-${MINIMAX_MSA_IMPL:-relax}}"
+    TRAIN_STEPS="${TRAIN_STEPS:-10}"
+    KEEP_CHECKPOINTS="$TRAIN_STEPS"
+    if [[ -e "${SAVE_DIR}/${EXP_NAME}/latest_checkpointed_iteration.txt" ]]; then
+        echo "Parity requires a fresh experiment name: ${EXP_NAME}" >&2
+        exit 1
+    fi
+elif [[ -n "$MULTIMODAL_KEYS" ]]; then
     EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-vl-lora-16xgpu}"
 else
     EXP_NAME="${EXP_NAME:-minimax-m3.1-flash-4l-lora-16xgpu}"
@@ -41,7 +50,7 @@ CKPT_ARGS=(
    --load "${SAVE_DIR}/${EXP_NAME}"
    --save-lora-only
    --save-interval 1
-   --max-actor-ckpt-to-keep 2
+   --max-actor-ckpt-to-keep "${KEEP_CHECKPOINTS:-2}"
 )
 LORA_ARGS=(
    --lora-rank 16
@@ -67,6 +76,11 @@ SFT_ARGS=(
 if [[ -n "$MULTIMODAL_KEYS" ]]; then
     SFT_ARGS+=(
         --multimodal-keys "$MULTIMODAL_KEYS"
+    )
+fi
+if [[ -n "${SFT_CHAT_TEMPLATE:-}" ]]; then
+    SFT_ARGS+=(
+        --apply-chat-template-kwargs "$(jq -cn --rawfile chat_template "$SFT_CHAT_TEMPLATE" '{chat_template:$chat_template}')"
     )
 fi
 PARALLEL_ARGS=(
@@ -98,6 +112,32 @@ MISC_ARGS=(
    --sft-logits-chunk-size 256
    --use-health-check
 )
+if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
+    OPTIMIZER_ARGS+=(
+        --seed "${SEED:-1234}"
+        --adam-beta1 0.9
+        --adam-beta2 0.999
+        --moe-router-bias-update-rate 0
+    )
+    MISC_ARGS+=(
+        --deterministic-mode
+        --custom-megatron-init-path scripts.tools.minimax_m31_sft_parity.configure_worker
+    )
+    RUNTIME_ENV_JSON=$(jq -c \
+        --arg implementation "${MINIMAX_MSA_IMPL:-relax}" \
+        --arg seed "${SEED:-1234}" \
+        '.env_vars += {
+            "NCCL_ALGO": "Ring",
+            "NCCL_PROTO": "Simple",
+            "NCCL_NVLS_ENABLE": "0",
+            "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+            "PYTHONHASHSEED": "0",
+            "RELAX_PROCESSOR_POOL_SIZE": "4",
+            "MINIMAX_MSA_IMPL": $implementation,
+            "MINIMAX_PARITY_SEED": $seed
+        }' <<< "$RUNTIME_ENV_JSON")
+fi
 WORKING_DIR="${WORKING_DIR:-${RELAX_ROOT}}"
 mkdir -p "${SCRIPT_DIR}/log"
 ray job submit ${RAY_NO_WAIT:+--no-wait} \
