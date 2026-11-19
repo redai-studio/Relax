@@ -22,6 +22,8 @@
 # Reuse SAVE_DIR/EXP_NAME only to resume that experiment's checkpoint.
 # DRY_RUN=1 prints argv/runtime env without starting Ray or importing ML packages.
 # Direct bash uses local.sh; existing clusters should use ray-job.sh above.
+# SKIP_SAVING=1 disables checkpoint loading/saving for fixed-rollout comparisons.
+# MOE_DISPATCHER=alltoall and DETERMINISTIC_MODE=0 select the performance configuration.
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
@@ -34,6 +36,7 @@ RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
 HF_CKPT="${HF_CKPT:-${MODEL_DIR}/DeepSeek-V4.1-4layer}"
 PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/gsm8k/train.parquet}"
 QKV_FORMAT="${QKV_FORMAT:-thd}"
+MOE_DISPATCHER="${MOE_DISPATCHER:-deepep}"
 case "${QKV_FORMAT}" in
     bshd|thd) ;;
     *) echo "QKV_FORMAT must be bshd or thd" >&2; exit 1 ;;
@@ -52,12 +55,16 @@ CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --ref-load "${HF_CKPT}"
     --megatron-to-hf-mode bridge
-    --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
-    --save "${SAVE_DIR}/${EXP_NAME}/checkpoints"
-    --save-interval "${SAVE_INTERVAL:-2}"
-    --max-actor-ckpt-to-keep 2
     --dump-details "${SAVE_DIR}/${EXP_NAME}/debug"
 )
+if [ "${SKIP_SAVING:-0}" != 1 ]; then
+    CKPT_ARGS+=(
+        --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
+        --save "${SAVE_DIR}/${EXP_NAME}/checkpoints"
+        --save-interval "${SAVE_INTERVAL:-2}"
+        --max-actor-ckpt-to-keep 2
+    )
+fi
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_DATA}"
     --input-key messages
@@ -96,8 +103,6 @@ PERF_ARGS=(
     # complete packed stream to 128 tokens without padding between samples.
     --data-pad-size-multiplier 32
     --calculate-per-token-loss
-    --moe-token-dispatcher-type flex
-    --moe-flex-dispatcher-backend deepep
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
@@ -107,6 +112,11 @@ PERF_ARGS=(
     --recompute-loss-function
     --empty-unused-memory-level 1
 )
+case "${MOE_DISPATCHER}" in
+    deepep) PERF_ARGS+=(--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep) ;;
+    alltoall) PERF_ARGS+=(--moe-token-dispatcher-type alltoall) ;;
+    *) echo "MOE_DISPATCHER must be deepep or alltoall" >&2; exit 1 ;;
+esac
 if [ "${QKV_FORMAT}" = thd ]; then
     PERF_ARGS+=(
         --use-dynamic-batch-size
@@ -170,7 +180,6 @@ MISC_ARGS=(
     --bf16
     --transformer-impl transformer_engine
     --seed 1234
-    --deterministic-mode
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
@@ -180,6 +189,9 @@ MISC_ARGS=(
     --update-weight-buffer-size 1073741824
     --train-memory-margin-bytes 1073741824
 )
+if [ "${DETERMINISTIC_MODE:-1}" = 1 ]; then
+    MISC_ARGS+=(--deterministic-mode)
+fi
 TRAIN_ARGS=(
     --resource '{"actor": [1, 8], "rollout": [1, 8]}'
     --num-gpus-per-node 8
@@ -225,10 +237,13 @@ runtime.setdefault("env_vars", {}).update({
     "SGLANG_DG_CACHE_DIR_PER_PROCESS": "1",
     "SGLANG_HEALTH_CHECK_TIMEOUT": "900",
     "TORCHINDUCTOR_COMPILE_THREADS": "1",
-    "NCCL_ALGO": "Ring",
-    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
 })
+if os.environ.get("DETERMINISTIC_MODE", "1") == "1":
+    runtime["env_vars"].update({
+        "NCCL_ALGO": "Ring",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    })
 for name in ("CUDA_HOME", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "CLEARML_CONFIG_FILE", "NO_VCS_VERSION"):
     if os.environ.get(name):
         runtime["env_vars"][name] = os.environ[name]

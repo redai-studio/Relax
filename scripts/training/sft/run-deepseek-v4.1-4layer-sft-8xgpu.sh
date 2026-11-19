@@ -85,10 +85,10 @@ SFT_ARGS=(
 PERF_ARGS=(
     --qkv-format "${QKV_FORMAT}"
     # --seq-length "$((MAX_TOKENS_PER_GPU * 2))"
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 2
-    --context-parallel-size 2
-    --expert-model-parallel-size 4
+    --tensor-model-parallel-size "${TP_SIZE:-2}"
+    --pipeline-model-parallel-size "${PP_SIZE:-2}"
+    --context-parallel-size "${CP_SIZE:-2}"
+    --expert-model-parallel-size "${EP_SIZE:-4}"
     --expert-tensor-parallel-size 1
     --sequence-parallel
     --allgather-cp
@@ -103,6 +103,9 @@ PERF_ARGS=(
     --log-probs-chunk-size 4096
     --moe-router-dtype fp32
 )
+if [ "${OVERLAP_COMM:-0}" = 1 ]; then
+    PERF_ARGS+=(--overlap-grad-reduce --overlap-param-gather)
+fi
 case "${MOE_DISPATCHER}" in
     deepep) PERF_ARGS+=(--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep) ;;
     alltoall) PERF_ARGS+=(--moe-token-dispatcher-type alltoall) ;;
@@ -152,6 +155,9 @@ MISC_ARGS=(
     --log-interval 1
     --use-health-check
 )
+if [ "${DETERMINISTIC_MODE:-0}" = 1 ]; then
+    MISC_ARGS+=(--deterministic-mode)
+fi
 
 TRAIN_ARGS=(
     --resource '{"actor": [1, 8], "sft": [1, 0]}'

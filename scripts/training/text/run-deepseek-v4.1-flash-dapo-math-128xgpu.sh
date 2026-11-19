@@ -14,7 +14,7 @@
 #   MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/checkpoints \
 #     bash scripts/entrypoint/ray-job.sh \
 #       scripts/training/text/run-deepseek-v4.1-flash-dapo-math-128xgpu.sh
-# Direct bash uses the same existing-cluster entrypoint; it does not create a cluster.
+# Launch through ray-job.sh to prepare the existing-cluster environment.
 # DRY_RUN=1 prints arguments without Ray or ML imports.
 
 set -eo pipefail
@@ -37,9 +37,9 @@ CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --ref-load "${HF_CKPT}"
     --megatron-to-hf-mode bridge
-    --load "${SAVE_DIR}/${EXP_NAME}/checkpoints"
-    --save "${SAVE_DIR}/${EXP_NAME}/checkpoints"
-    --save-interval 1000
+    # --load "${SAVE_DIR}/${EXP_NAME}"
+    --save "${SAVE_DIR}/${EXP_NAME}-${now}"
+    --save-interval 100
     --max-actor-ckpt-to-keep 2
 )
 ROLLOUT_ARGS=(
@@ -84,7 +84,11 @@ PERF_ARGS=(
     --recompute-num-layers 1
     --recompute-loss-function
     --moe-token-dispatcher-type alltoall
+    --moe-permute-fusion
+    --moe-shared-expert-overlap
     --moe-router-dtype fp32
+    --overlap-grad-reduce
+    --overlap-param-gather
 )
 
 GRPO_ARGS=(
@@ -145,7 +149,6 @@ MISC_ARGS=(
     --bf16
     --transformer-impl transformer_engine
     --seed 1234
-    --deterministic-mode
     --attention-dropout 0
     --hidden-dropout 0
     --accumulate-allreduce-grads-in-fp32
@@ -175,10 +178,6 @@ TRAIN_ARGS=(
     "$@"
 )
 
-if [ "${DRY_RUN:-0}" != 1 ] && [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    : "${RAY_ADDRESS:?Set RAY_ADDRESS for the existing 128-GPU Ray cluster}"
-    source "${RELAX_ROOT}/scripts/entrypoint/ray-job.sh"
-fi
 RUNTIME_ENV_JSON=$(python3 - <<'PY'
 import json
 import os
@@ -204,9 +203,6 @@ runtime.setdefault("env_vars", {}).update({
     "SGLANG_SKIP_CHECKPOINT_LOAD_CHECK": "1",
     "SGLANG_HEALTH_CHECK_TIMEOUT": "900",
     "TORCHINDUCTOR_COMPILE_THREADS": "1",
-    "NCCL_ALGO": "Ring",
-    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": "1",
     "MEGATRON_SYNC_SAVE_STAGE_BYTES": "0",
 })
@@ -224,14 +220,9 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
     exit 0
 fi
 
-RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-${RAY_DASHBOARD_ADDRESS:-${RAY_ADDRESS:-http://127.0.0.1:8265}}}"
-if [[ "${RAY_JOB_ADDRESS}" != http://* && "${RAY_JOB_ADDRESS}" != https://* ]]; then
-    echo "Set RAY_JOB_ADDRESS or RAY_DASHBOARD_ADDRESS to the existing cluster's Ray Jobs HTTP address." >&2
-    exit 1
-fi
-
 mkdir -p "${LOG_DIR}"
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOB_ADDRESS}" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} \
+    --address="${RAY_JOB_ADDRESS:-${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}" \

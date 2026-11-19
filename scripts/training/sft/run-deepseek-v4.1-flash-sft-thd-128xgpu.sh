@@ -35,9 +35,9 @@ PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/sft/data/OpenMathReasoning-mini/data/cot
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/deepseek-v41-openmath}"
 EXP_NAME="${EXP_NAME:-deepseek-v41-flash-sft-openmath-thd-tp2-pp2-cp2-ep64-gpu128}"
 NUM_STEPS="${NUM_STEPS:-100}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"
 # SFT filters after rendering at CP2 * MAX_TOKENS_PER_GPU; changing this changes the dataset.
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-4096}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 SEED="${SEED:-1234}"
 source "${RELAX_ROOT}/scripts/models/deepseek-v4.1-flash.sh"
 
@@ -64,27 +64,32 @@ SFT_ARGS=(
     --balance-data
     # Same padding quantum as the four-layer THD SFT baseline.
     --data-pad-size-multiplier 1024
+    --sft-max-in-flight-steps 2
 )
 
 PERF_ARGS=(
     --qkv-format thd
     --use-dynamic-batch-size
-    --tensor-model-parallel-size 2
+    --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 2
-    --context-parallel-size 2
-    --expert-model-parallel-size 64
+    --context-parallel-size 1
+    --expert-model-parallel-size 32
     --expert-tensor-parallel-size 1
     --sequence-parallel
-    --allgather-cp
-    --cp-partition-mode contiguous
-    --calculate-per-token-loss
+    # --allgather-cp
+    # --cp-partition-mode contiguous
+    # --calculate-per-token-loss
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
     --recompute-loss-function
     --log-probs-chunk-size 4096
     --moe-token-dispatcher-type alltoall
-    --sft-max-in-flight-steps 2
+    --overlap-grad-reduce
+    --overlap-param-gather
+    --moe-permute-fusion
+    --moe-router-fusion
+    --moe-shared-expert-overlap
 )
 
 OPTIMIZER_ARGS=(
@@ -155,7 +160,6 @@ runtime.setdefault("env_vars", {}).update({
     "NCCL_NVLS_ENABLE": "0",
     "NCCL_CUMEM_ENABLE": "1",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-    "NCCL_ALGO": "Ring",
     # Bound host staging for synchronous CPU-optimizer checkpoints.
     "MEGATRON_SYNC_SAVE_BOUNDED_STAGING": os.environ.get("MEGATRON_SYNC_SAVE_BOUNDED_STAGING", "1"),
     "MEGATRON_SYNC_SAVE_STAGE_BYTES": os.environ.get("MEGATRON_SYNC_SAVE_STAGE_BYTES", "0"),
