@@ -746,12 +746,14 @@ class DeviceDirectBackend(CommBackend):
                 )
 
     @torch.no_grad()
-    def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
+    def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> list[str]:
         """Update weights used by rollout nodes.
 
         Sequence: pause rollout generation, flush caches, gather and broadcast
         model parameters (non-expert then expert), then resume generation.
+        Rank 0 returns the Actor IDs that received every PP stage.
         """
+        rollout_recipients: list[str] = []
         self.weight_version += 1
         managed = self.managed_lora_publication_enabled
         if managed:
@@ -759,7 +761,7 @@ class DeviceDirectBackend(CommBackend):
 
         if managed and self._lora_sync.base_sync_done and rollout_only and not actor_fwd_only:
             self._publish_managed_lora()
-            return
+            return rollout_recipients
 
         if self._use_bridge:
             # Bridge task construction and config exchange contain PP
@@ -956,10 +958,12 @@ class DeviceDirectBackend(CommBackend):
                     "/post_process_weights",
                     {"restore_weights_before_load": False, "post_process_quantization": True},
                 )
-            if not push_failed:
-                self._record_agentic_publication()
+            sources = self._collect_rollout_recipients() if not self._lora_adapter_mode else []
+            self._record_agentic_publication(sources)
             self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
+            if sources and dist.get_rank(group=get_gloo_group()) == 0:
+                rollout_recipients = sorted(actor_id for actor_id in set.intersection(*sources) if actor_id)
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
             # group) when the topology is unchanged. They are torn down only when the
@@ -975,19 +979,24 @@ class DeviceDirectBackend(CommBackend):
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
+        return rollout_recipients
 
-    def _record_agentic_publication(self) -> None:
-        """Confirm every PP source installed the same policy before
-        auditing."""
-        if not getattr(self.args, "use_agentic_rollout", False) or self._lora_adapter_mode:
-            return
+    def _collect_rollout_recipients(self) -> list[set[str | None]]:
+        """Collect raw PP receiver identities once for audit and routing."""
         group = get_gloo_group()
         recipients = None
         if self._is_pp_src_rank:
             recipients = {(info.get("metadata") or {}).get("actor_id") for info in self.rollout_topology.values()}
         all_recipients = [None] * dist.get_world_size(group=group)
         dist.all_gather_object(all_recipients, recipients, group=group)
-        sources = [ids for ids in all_recipients if ids is not None]
+        return [ids for ids in all_recipients if ids is not None]
+
+    def _record_agentic_publication(self, sources: list[set[str | None]]) -> None:
+        """Confirm every PP source installed the same policy before
+        auditing."""
+        if not getattr(self.args, "use_agentic_rollout", False) or self._lora_adapter_mode:
+            return
+        group = get_gloo_group()
         # A nonempty intersection is insufficient: another resumed engine may
         # have only some PP stages but still return the same raw version tag.
         if not sources or any(not ids or None in ids or ids != sources[0] for ids in sources):

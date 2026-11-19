@@ -7,15 +7,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import torch
 
-from tests.cpu.engine.lora_versions.test_training import ThreadRanks, assert_rank_errors
-
-
-pytest.importorskip("megatron.core")
-
 from relax.distributed.checkpoint_service.backends import device_direct
 from relax.distributed.checkpoint_service.client import engine as engine_module
 from relax.distributed.checkpoint_service.client.engine import CheckpointEngineClient
 from relax.engine.lora_versions.training import LoRATrainingConfig
+from tests.cpu.engine.lora_versions.test_training import ThreadRanks, assert_rank_errors
 
 
 @pytest.fixture
@@ -71,7 +67,7 @@ def test_first_sync_resumes_before_probe_and_later_sync_never_pauses(backends, q
     if quantized:
         for worker in workers:
             worker.quantization_config = {"quant_method": "compressed-tensors"}
-    assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True)) == [None, None]
+    assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True)) == [[], []]
     quantization_events = (
         [
             ("/post_process_weights", {"restore_weights_before_load": True, "post_process_quantization": False}),
@@ -86,7 +82,7 @@ def test_first_sync_resumes_before_probe_and_later_sync_never_pauses(backends, q
     for worker in workers:
         worker.events.clear()
         worker._run_expert_pass.reset_mock()
-    assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True)) == [None, None]
+    assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True)) == [[], []]
     assert all(worker.events == ["publish"] for worker in workers)
     assert all(worker._run_expert_pass.call_count == 0 for worker in workers)
 
@@ -96,10 +92,7 @@ def test_later_actor_fwd_updates_keep_completion_marker_without_pausing_rollout(
     ranks, workers = backends
     for worker in workers:
         worker._lora_sync.base_sync_done = True
-    assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout(actor_fwd_only=actor_fwd_only)) == [
-        None,
-        None,
-    ]
+    assert ranks.run(lambda rank: workers[rank].update_weights_for_rollout(actor_fwd_only=actor_fwd_only)) == [[], []]
     assert workers[0].events == (["actor-fwd-end"] if actor_fwd_only else ["actor-fwd-end", "publish"])
     assert workers[1].events == ([] if actor_fwd_only else ["publish"])
     assert all(worker._run_expert_pass.call_count == 1 for worker in workers)
@@ -166,7 +159,7 @@ def test_client_agrees_on_incomplete_initial_pool_and_skips_later_topology(backe
         backend._is_pp_src_rank = True
         backend.rollout_topology = topology["nodes"]["rollout"]
         backend.init_process_group_for_rollout = Mock()
-        backend.update_weights_for_rollout = Mock()
+        backend.update_weights_for_rollout = Mock(return_value=[])
         client = object.__new__(CheckpointEngineClient)
         client._backend = backend
         client.coordinator_url = "http://coordinator"

@@ -24,7 +24,8 @@ def test_rollout_update_shares_one_topology_snapshot(monkeypatch, rank, fail_fet
     client._http_client = SimpleNamespace(get=AsyncMock(return_value=response))
     if fail_fetch:
         client._http_client.get.side_effect = RuntimeError("coordinator unavailable")
-    backend = Mock(_lora_adapter_mode=False, _is_pp_src_rank=True, rollout_topology=data["nodes"]["rollout"])
+    backend = Mock()
+    backend.update_weights_for_rollout.return_value = ["A"] if rank == 0 else []
     client._backend = backend
     monkeypatch.setattr(engine_module, "get_gloo_group", lambda: group)
     monkeypatch.setattr(engine_module.dist, "get_rank", lambda **kw: rank)
@@ -39,9 +40,7 @@ def test_rollout_update_shares_one_topology_snapshot(monkeypatch, rank, fail_fet
             status[0] = (None, "coordinator unavailable") if fail_fetch else (data, None)
 
     monkeypatch.setattr(engine_module.dist, "broadcast_object_list", broadcast)
-    monkeypatch.setattr(
-        engine_module.dist, "all_gather_object", lambda out, ids, **kw: out.__setitem__(slice(None), [{"A"}, {"A"}])
-    )
+    monkeypatch.setattr(engine_module.dist, "all_gather_object", Mock(side_effect=AssertionError("duplicate gather")))
     if fail_fetch:
         with pytest.raises(RuntimeError, match="Failed to fetch rollout topology: coordinator unavailable"):
             asyncio.run(client.update_weights_for_rollout(rollout_only=True))
@@ -62,16 +61,22 @@ def rollout_backend(monkeypatch):
     backend.args = SimpleNamespace(num_experts=4)
     backend.quantization_config = None
     backend.rollout_engines = {0: Mock()}
+    backend.rollout_topology = {0: {"metadata": {"actor_id": "A"}}}
     events = []
     backend._named_params_and_buffers = lambda **kw: iter(())
     backend._run_expert_pass = lambda **kw: events.append("push")
     backend._batch_request = lambda endpoint, payload=None: events.append((endpoint, payload)) or [endpoint]
     backend.rollout_engines[0].flush_cache.remote.side_effect = lambda: events.append("flush")
     monkeypatch.setattr(device_direct.dist, "get_rank", lambda *a, **kw: 0)
+    monkeypatch.setattr(device_direct.dist, "get_world_size", lambda **kw: 1)
+    monkeypatch.setattr(
+        device_direct.dist, "all_gather_object", Mock(side_effect=lambda out, ids, **kw: out.__setitem__(0, ids))
+    )
     monkeypatch.setattr(device_direct.dist, "barrier", lambda **kw: None)
     monkeypatch.setattr(device_direct.dist, "broadcast_object_list", lambda *a, **kw: None)
     monkeypatch.setattr(device_direct.dist, "all_reduce", lambda *a, **kw: None)
     monkeypatch.setattr(device_direct, "get_gloo_group", lambda: object())
+    monkeypatch.setattr(engine_module, "get_gloo_group", device_direct.get_gloo_group)
     awaited = []
     monkeypatch.setattr(device_direct.ray, "get", lambda refs: awaited.append(refs))
     monkeypatch.setattr(device_direct.device_module, "empty_cache", lambda: None)
@@ -83,7 +88,9 @@ def rollout_backend(monkeypatch):
 def test_dcs_quantized_rollout_restores_and_repacks_before_resume(rollout_backend, quant_method, actor_fwd_only):
     backend, events, awaited = rollout_backend
     backend.quantization_config = {"quant_method": quant_method} if quant_method else None
-    backend.update_weights_for_rollout(rollout_only=True, actor_fwd_only=actor_fwd_only)
+    recipients = backend.update_weights_for_rollout(rollout_only=True, actor_fwd_only=actor_fwd_only)
+    assert recipients == ([] if actor_fwd_only else ["A"])
+    assert device_direct.dist.all_gather_object.call_count == (0 if actor_fwd_only else 1)
     if actor_fwd_only:
         assert events == ["push"]
     else:
@@ -108,17 +115,26 @@ def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_
     backend._lora_adapter_mode = True
     backend._lora_sync = SimpleNamespace(base_sync_done=False, adapter_loaded=False)
     backend._push_lora_adapter_distributed = lambda **kw: events.append("adapter")
-    backend.update_weights_for_rollout(rollout_only=True)
+    assert backend.update_weights_for_rollout(rollout_only=True) == []
     assert len([e for e in events if isinstance(e, tuple) and e[0] == "/post_process_weights"]) == 2
     assert backend._lora_sync.base_sync_done
     events.clear()
-    backend.update_weights_for_rollout(rollout_only=True)
+    assert backend.update_weights_for_rollout(rollout_only=True) == []
     assert events == [("/pause_generation", None), "flush", "adapter", ("/continue_generation", None)]
+    device_direct.dist.all_gather_object.assert_not_called()
 
 
 @pytest.mark.parametrize("rank", [0, 2])
 @pytest.mark.parametrize(
-    "receivers", [({"A"}, {"A"}), ({"A"}, {"B"}), ({"A", "B"}, {"B"}), (set(), set()), ({None}, {None})]
+    "receivers",
+    [
+        ({"A"}, {"A"}),
+        ({"A"}, {"B"}),
+        ({"A", "B"}, {"B"}),
+        (set(), set()),
+        ({None}, {None}),
+        ({"A", None}, {"A"}),
+    ],
 )
 def test_agentic_publication_requires_complete_receivers_before_resume(rollout_backend, monkeypatch, receivers, rank):
     from ray import serve
@@ -151,7 +167,9 @@ def test_agentic_publication_requires_complete_receivers_before_resume(rollout_b
     handle = Mock()
     handle.record_publication.remote.side_effect = publish
     monkeypatch.setattr(serve, "get_app_handle", lambda name: handle)
-    backend.update_weights_for_rollout(rollout_only=True)
+    recipients = backend.update_weights_for_rollout(rollout_only=True)
+    expected_recipients = sorted(actor_id for actor_id in set.intersection(*receivers) if actor_id)
+    assert recipients == (expected_recipients if rank == 0 else [])
     valid = bool(receivers[0]) and None not in receivers[0] and receivers[0] == receivers[1]
     if valid and rank == 0:
         assert consumption_snapshot(backend)["sequence"] == ledger.sequence == 2
@@ -169,6 +187,26 @@ def test_agentic_publication_requires_complete_receivers_before_resume(rollout_b
         assert consumption_snapshot(backend) == {"audit_valid": False}
         if rank == 0:
             assert backend._agentic_publication == ("policy", 1, "0")
+
+
+def test_dcs_client_reuses_backend_receiver_snapshot(rollout_backend, monkeypatch):
+    backend, events, _ = rollout_backend
+    backend.rollout_topology[1] = {"metadata": {"actor_id": "B"}}
+    backend.init_process_group_for_rollout = Mock()
+    client = engine_module.CheckpointEngineClient(
+        args=backend.args, coordinator_url="http://dcs", role="actor", rank=0
+    )
+    client._backend = backend
+    response = Mock()
+    response.json.return_value = {"nodes": {"rollout": backend.rollout_topology}}
+    client._http_client = SimpleNamespace(get=AsyncMock(return_value=response))
+    monkeypatch.setattr(device_direct.dist, "get_world_size", lambda **kw: 3)
+    gather = Mock(side_effect=lambda out, ids, **kw: out.__setitem__(slice(None), [{"A", "B"}, {"B"}, None]))
+    monkeypatch.setattr(device_direct.dist, "all_gather_object", gather)
+
+    assert asyncio.run(client.update_weights_for_rollout(rollout_only=True)) == ["B"]
+    gather.assert_called_once()
+    assert events[-1] == ("/continue_generation", None)
 
 
 @pytest.mark.parametrize("rank", [0, 1])
