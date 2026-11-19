@@ -1527,13 +1527,15 @@ class RolloutManager(ReloadableMixin):
             return False
         from relax.engine.sft.runtime import is_offline_mode
 
-        placement_overrides = {"base_gpu_id", "gpu_id_step", "nnodes", "node_rank", "tp_size", "dist_init_addr"}
+        placement_overrides = {"base_gpu_id", "gpu_id_step", "nnodes", "node_rank", "tp_size"}
+        endpoint_overrides = {"host", "port", "nccl_port", "dist_init_addr"}
         return (
             getattr(self.args, "train_backend", "megatron") == "megatron"
             and not is_offline_mode(self.args)
             and not getattr(self.args, "rollout_external", False)
             and not getattr(self.args, "colocate_expert_weight_routing", False)
             and not getattr(self.args, "lora_adapter_mode", False)
+            and not getattr(self.args, "use_fault_tolerance", False)
             and _resolve_rollout_engine_class(self.args) is SGLangEngine
             and bool(self.server.engine_groups)
             and all(
@@ -1542,6 +1544,7 @@ class RolloutManager(ReloadableMixin):
                 and group.sglang_overrides.get("pp_size", getattr(self.args, "sglang_pp_size", 1)) == 1
                 and group.sglang_overrides.get("dp_size", getattr(self.args, "sglang_dp_size", 1)) == 1
                 and not placement_overrides.intersection(group.sglang_overrides)
+                and not endpoint_overrides.intersection(group.sglang_overrides)
                 for group in self.server.engine_groups
             )
         )
@@ -2372,8 +2375,8 @@ class RolloutManager(ReloadableMixin):
         ):
             raise ValueError(
                 "Colocate scale-out requires Ray-native Megatron/SGLang with homogeneous regular engines "
-                "using SGLang PP=DP=1 and PG-derived placement, with FULL weights "
-                "(without adapter mode or explicit expert routing)"
+                "using SGLang PP=DP=1, PG-derived placement, and automatically assigned endpoints, with FULL weights "
+                "(without adapter mode, explicit expert routing, or --use-fault-tolerance)"
             )
 
         # Mutual exclusion: reject if any scale operation is in progress
@@ -2792,15 +2795,28 @@ class RolloutManager(ReloadableMixin):
     async def _confirm_unused_colocate_pgs(self, srv: RolloutServer, pgs: list) -> None:
         with self._engine_lifecycle_lock:
             published = {group.pg[0].id for group in srv.engine_groups if group.pg is not None}
-        remaining = [pg for pg in pgs if pg.id not in published]
-        for pg in remaining:
-            ray.util.remove_placement_group(pg)
-        while remaining and not self._colocate_disposing:
-            remaining = [
-                pg for pg in remaining if ray.util.placement_group_table(pg).get("state") not in (None, "REMOVED")
-            ]
+        remaining = {pg.id: pg for pg in pgs if pg.id not in published}
+        removal_submitted = set()
+        # Keep the scale-out request in charge until Ray confirms release.
+        while remaining:
+            retry_delay = 0.2
+            for pg_id, pg in list(remaining.items()):
+                try:
+                    if pg_id not in removal_submitted:
+                        ray.util.remove_placement_group(pg)
+                        removal_submitted.add(pg_id)
+                    if self._colocate_disposing or ray.util.placement_group_table(pg).get("state") in (
+                        None,
+                        "REMOVED",
+                    ):
+                        del remaining[pg_id]
+                except (ray.exceptions.RayError, RuntimeError) as error:
+                    logger.warning("[ScaleOut] PG %s removal unconfirmed (%s)", pg_id, type(error).__name__)
+                    retry_delay = 1.0
+            if self._colocate_disposing:
+                return
             if remaining:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(retry_delay)
 
     async def _bring_up_single_replica(
         self,

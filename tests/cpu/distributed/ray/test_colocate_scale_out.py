@@ -2,6 +2,8 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from conftest import (
@@ -12,6 +14,7 @@ from conftest import (
     make_mock_engine,
     make_rollout_server,
 )
+from ray.exceptions import RaySystemError
 
 from relax.distributed.ray.rollout_scale_types import ScaleOutRequest, ScaleOutStatus
 
@@ -129,7 +132,9 @@ async def test_unclaimed_timeout_cannot_join_later_full(pool):
     engine.register_to_router.remote.assert_not_called()
 
 
-@pytest.mark.parametrize("overrides", [{"pp_size": 2}, {"base_gpu_id": 0}])
+@pytest.mark.parametrize(
+    "overrides", [{"pp_size": 2}, {"base_gpu_id": 0}, {"host": "127.0.0.1"}, {"port": 32000}, {"nccl_port": 32001}]
+)
 def test_incompatible_engine_override_is_rejected_before_scale_request(pool, overrides):
     manager, _, baseline = pool
     baseline.sglang_overrides.update(overrides)
@@ -140,10 +145,51 @@ def test_incompatible_engine_override_is_rejected_before_scale_request(pool, ove
     assert not manager._scale_out_requests
 
 
+def test_colocate_fault_tolerance_rejects_scale_out_before_creating_request(pool):
+    manager, _, _ = pool
+    manager.args.use_fault_tolerance = True
+
+    with pytest.raises(ValueError, match="--use-fault-tolerance"):
+        manager.create_scale_out_request(num_replicas=2)
+
+    assert not manager._scale_out_requests
+
+
+@pytest.mark.asyncio
+async def test_cancelled_colocate_scale_out_keeps_conflict_until_pg_removal_is_confirmed(pool, monkeypatch):
+    from relax.distributed.ray import rollout
+
+    manager, _, _ = pool
+    request_id = manager.create_scale_out_request(num_replicas=2)["request_id"]
+    pg = SimpleNamespace(id="colocate-pg")
+
+    def cancel_after_allocating_pg(*args, **kwargs):
+        assert manager.cancel_scale_out(request_id)["status"] == "CANCELLED"
+        return pg
+
+    def query_pg(group):
+        assert group is pg
+        assert manager.create_scale_out_request(num_replicas=2)["status"] == "CONFLICT"
+        if query_pg_mock.call_count <= 2:
+            raise RaySystemError("GCS query failed")
+        return {"state": "REMOVED"}
+
+    query_pg_mock = Mock(side_effect=query_pg)
+    delete_pg = Mock(side_effect=[RaySystemError("GCS delete failed")] * 4 + [None])
+    monkeypatch.setattr(rollout.ray.util, "placement_group", cancel_after_allocating_pg)
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", delete_pg)
+    monkeypatch.setattr(rollout.ray.util, "placement_group_table", query_pg_mock)
+    monkeypatch.setattr(rollout.asyncio, "sleep", AsyncMock())
+
+    await manager.execute_scale_out(request_id)
+
+    assert query_pg_mock.call_count == 3
+    assert manager._scale_out_requests[request_id].status is ScaleOutStatus.CANCELLED
+    assert manager.create_scale_out_request(num_replicas=2)["status"] == "PENDING"
+
+
 @pytest.mark.asyncio
 async def test_noncontiguous_pg_cannot_start_an_engine(pool, monkeypatch):
-    from unittest.mock import Mock
-
     from relax.distributed.ray import rollout
 
     manager, server, _ = pool
