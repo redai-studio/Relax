@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -15,7 +16,7 @@ from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import is_embedding_sft_mode, is_sft_mode
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.env import Envs
 from relax.utils.misc import load_function
@@ -1641,6 +1642,92 @@ def get_sequence_classification_outputs(
     return torch.stack(local_logits, dim=0), local_indices
 
 
+def gather_with_local_grad(features: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
+    """Gather detached remote features, preserving only this rank's graph."""
+    world_size = dist.get_world_size(process_group)
+    if world_size == 1:
+        return features
+    # Shape agreement is checked collectively before all_gather, so one rank's
+    # partial batch cannot leave its peers hanging in a tensor collective.
+    shape = torch.tensor(features.shape, device=features.device, dtype=torch.long)
+    shapes = [torch.empty_like(shape) for _ in range(world_size)]
+    dist.all_gather(shapes, shape, group=process_group)
+    torch._assert_async(torch.stack(shapes).eq(shape).all(), "InfoNCE ranks must have equal complete feature batches")
+    gathered = [torch.empty_like(features) for _ in range(world_size)]
+    dist.all_gather(gathered, features.contiguous(), group=process_group)
+    gathered[dist.get_rank(process_group)] = features
+    return torch.cat(gathered, dim=0)
+
+
+def infonce_loss(
+    query: torch.Tensor,
+    positive: torch.Tensor,
+    *,
+    temperature: float = 0.05,
+    process_group: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Native mean one-way InfoNCE, before the backend's gradient reduction.
+
+    Every DP rank evaluates the global objective with only its own feature
+    graph attached. Summing those rank-local gradients gives the gradient of
+    the full objective.
+    """
+    if query.ndim != 2 or query.shape != positive.shape or query.shape[0] == 0:
+        raise ValueError("InfoNCE features must have matching nonempty [pairs, hidden] shapes")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("InfoNCE temperature must be finite and positive")
+    if process_group is None and dist.is_initialized():
+        raise ValueError("Distributed InfoNCE requires an explicit data-parallel process group")
+    if process_group is not None:
+        query = gather_with_local_grad(query, process_group)
+        positive = gather_with_local_grad(positive, process_group)
+    if query.shape[0] < 2:
+        raise ValueError("InfoNCE requires at least two pairs per global batch")
+    if query.dtype in (torch.float16, torch.bfloat16):
+        query, positive = query.float(), positive.float()
+    # Apply the cosine epsilon per row after feature normalization, without
+    # constructing a [pairs, pairs, hidden] tensor.
+    query = F.normalize(F.normalize(query, dim=-1), dim=-1, eps=1e-8)
+    positive = F.normalize(F.normalize(positive, dim=-1), dim=-1, eps=1e-8)
+    scores = (query @ positive.transpose(0, 1)) / temperature
+    return F.cross_entropy(scores, torch.arange(scores.shape[0], device=scores.device))
+
+
+infonce_loss.requires_dp_gradient_sum = True
+
+
+def embedding_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply InfoNCE or a custom embedding loss, then scale it."""
+    from relax.utils.training.embedding import pool_packed_embeddings, scale_for_megatron_sample_mean
+
+    features = pool_packed_embeddings(
+        hidden_states,
+        batch["total_lengths"],
+        positions=batch.get("embedding_positions"),
+        padded_lengths=batch.get("padded_total_lengths"),
+    )
+    group = mpu.get_data_parallel_group(with_context_parallel=False)
+    loss_path = getattr(args, "custom_loss_function_path", None)
+    compute_loss = load_function(loss_path) if loss_path else infonce_loss
+    mean_loss = compute_loss(
+        features[::2], features[1::2], temperature=args.contrastive_temperature, process_group=group
+    )
+    global_pairs = int(batch.get("dynamic_global_batch_size", args.global_batch_size))
+    dp_size = dist.get_world_size(group)
+    loss = scale_for_megatron_sample_mean(mean_loss, global_pairs=global_pairs, dp_size=dp_size)
+    metric_loss = loss.detach()
+    if getattr(compute_loss, "requires_dp_gradient_sum", False):
+        # Each rank owns a disjoint part of the global gradient; compensate
+        # for DDP averaging while keeping the forward value and metric intact.
+        loss = metric_loss + (loss - metric_loss) * dp_size
+    return loss, {"loss": metric_loss}
+
+
 def sequence_classification_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1832,24 +1919,29 @@ def loss_function(
           "values" (1D tensor: [denominator, metric1, metric2, ...]). The
           denominator is the token count for per-token loss and a zero
           placeholder for sample-mean loss. "num_tokens" separately carries
-          the effective token count used to detect no-signal steps.
+          the effective signal count used to detect no-signal steps
+          (pairs for embedding, tokens otherwise).
     """
-    # CP-local token count (tokens whose loss this rank actually contributes).
-    # Summed across the CP group in finalize_model_grads / the metric all-reduce,
-    # it counts every token exactly once regardless of CP degree, so the per-token
-    # normalizer is correct even when CP differs across micro-batches (dynamic CP).
-    # Under static CP it equals the old full-sample count distributed across ranks,
-    # so the final loss/grad/metric are unchanged after all-reduce.
-    num_tokens = get_cp_local_num_tokens(
-        batch["total_lengths"],
-        batch["response_lengths"],
-        batch["loss_masks"],
-        args.qkv_format,
-        batch.get("max_seq_lens", None),
-        batch.get("padded_total_lengths", None),
-        dynamic_cp_size=batch.get("dynamic_cp_size", None),
-        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
-    )
+    is_embedding = is_embedding_sft_mode(args)
+    if is_embedding:
+        if num_microbatches != 1:
+            raise ValueError("embedding requires one complete contrastive microbatch per optimizer update")
+        # A single-token sequence can yield a useful embedding even when its
+        # shifted language-model mask is empty.
+        num_tokens = logits.new_tensor(len(batch["total_lengths"]) // 2, dtype=torch.int)
+    else:
+        # Count this rank's contributing tokens so the CP reduction counts
+        # each token once, including when the CP degree changes per microbatch.
+        num_tokens = get_cp_local_num_tokens(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            args.qkv_format,
+            batch.get("max_seq_lens", None),
+            batch.get("padded_total_lengths", None),
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1878,7 +1970,9 @@ def loss_function(
             case "rm":
                 func = reward_model_loss_function
             case "sft":
-                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                if is_embedding:
+                    func = embedding_loss_function
+                elif getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function
                 elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
                     # Bind lm_head_forward so chunked path matches the standard

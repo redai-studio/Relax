@@ -35,7 +35,8 @@ from typing import Any
 import ray
 import torch.nn.functional as F
 from ray import serve
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from relax.components.base import Base
 from relax.engine.sft.data_state import restore_data_state, save_data_state
@@ -96,10 +97,24 @@ def _resolve_pad_token_ids_from_config(model_path: str) -> frozenset[int]:
 
     Returns an empty set for text-only models or when the keys are absent.
     """
-    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    try:
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except ValueError:
+        # Custom checkpoints may be loadable by a model-specific backend even
+        # when this standalone SFT Ray worker has not imported that backend's
+        # AutoConfig registration. Pad-token discovery only needs raw config
+        # fields, so do not make the data pipeline depend on model recognition.
+        config_values, _ = PretrainedConfig.get_config_dict(model_path)
+        model_type = config_values.get("model_type")
+        auto_map = config_values.get("auto_map")
+        has_custom_auto_config = isinstance(auto_map, dict) and "AutoConfig" in auto_map
+        if not isinstance(model_type, str) or model_type in CONFIG_MAPPING or has_custom_auto_config:
+            raise
+    else:
+        config_values = {key: getattr(config, key, None) for key in _PAD_TOKEN_ID_KEYS}
     ids: list[int] = []
     for key in _PAD_TOKEN_ID_KEYS:
-        v = getattr(cfg, key, None)
+        v = config_values.get(key)
         if isinstance(v, int) and v >= 0:
             ids.append(v)
     return frozenset(ids)
@@ -389,6 +404,7 @@ class _SFTBatchProducerActor:
                 self.config.hf_checkpoint,
                 pool_size=prefetch_num_workers,
                 trust_remote_code=True,
+                multimodal_config=MultimodalConfig.from_args(self.config),
             )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
@@ -652,7 +668,10 @@ class SFT(Base):
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         try:
             self._processor_pool = ProcessorPool(
-                self.config.hf_checkpoint, pool_size=_PRODUCER_POOL_SIZE, trust_remote_code=True
+                self.config.hf_checkpoint,
+                pool_size=_PRODUCER_POOL_SIZE,
+                trust_remote_code=True,
+                multimodal_config=MultimodalConfig.from_args(self.config),
             )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal eval samples will fail at push.")

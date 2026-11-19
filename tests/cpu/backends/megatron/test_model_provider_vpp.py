@@ -153,6 +153,7 @@ def _load_model_provider(monkeypatch, provider=None):
 def _bridge_args(**overrides):
     values = {
         "megatron_to_hf_mode": "bridge",
+        "task_type": "causal_lm",
         "hf_checkpoint": "fake-hf",
         "attention_backend": "flash",
         "tensor_model_parallel_size": 2,
@@ -582,6 +583,27 @@ def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch
     wrapped_provider(post_process=False)
 
     assert post_process_values == [False]
+
+
+@pytest.mark.parametrize("tie_weights", [False, True])
+def test_embedding_provider_keeps_only_used_weights_trainable_after_allowlist(monkeypatch, tie_weights):
+    model = torch.nn.Module()
+    language_model = torch.nn.Module()
+    model.language_model = language_model
+    language_model.embedding = torch.nn.Embedding(8, 4)
+    language_model.output_layer = torch.nn.Linear(4, 8, bias=False)
+    if tie_weights:
+        language_model.output_layer.weight = language_model.embedding.weight
+    module, _ = _load_model_provider(monkeypatch, _FakeProvider(model))
+    args = _bridge_args(
+        task_type="embedding", only_train_params_name_list=["language_model"], freeze_params_name_list=None
+    )
+
+    build_model = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
+    build_model()
+
+    assert language_model.embedding.weight.requires_grad
+    assert language_model.output_layer.weight.requires_grad == tie_weights
 
 
 def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):

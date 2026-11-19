@@ -54,12 +54,13 @@ def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
     for mm_input in inputs:
         if mm_input is None:
             continue
-        grid = mm_input.get("image_grid_thw")
-        if grid is None:
-            continue
-        if isinstance(grid, torch.Tensor):
-            grid = grid.tolist()
-        grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
+        for key in ("image_grid_thw", "video_grid_thw"):
+            grid = mm_input.get(key)
+            if grid is None:
+                continue
+            if isinstance(grid, torch.Tensor):
+                grid = grid.tolist()
+            grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
     return grids
 
 

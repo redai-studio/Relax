@@ -19,6 +19,7 @@ _SOURCE = Path(__file__).resolve().parents[4] / "relax/utils/arguments.py"
 def make_args(**overrides):
     values = dict(
         loss_type="sft",
+        task_type="causal_lm",
         train_backend="megatron",
         max_staleness=1,
         per_rank_fetch=False,
