@@ -1639,7 +1639,8 @@ def test_message_loss_mask_preserves_selected_assistant_round(tmp_path):
     assert "learn" not in row["messages"][1]
 
 
-def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tmp_path):
+@pytest.mark.parametrize("literal_image_tags_as_text", [False, True])
+def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tmp_path, literal_image_tags_as_text):
     path = tmp_path / "tool.jsonl"
     _write_jsonl(
         path,
@@ -1665,11 +1666,34 @@ def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tm
         str(path),
         prompt_key="messages",
         multimodal_keys={"image": "images"},
+        literal_image_tags_as_text=literal_image_tags_as_text,
         prefetch_max_cached=0,
     )
     sample = dataset.get_canonical_sample(0)
-    assert sample.messages[1].content == []
+    assert sample.messages[1].content == ("" if literal_image_tags_as_text else [])
     assert sample.messages[1].tool_calls[0]["function"]["arguments"] == {}
+
+
+@pytest.mark.parametrize(
+    "role,content", [("user", None), ("assistant", None), ("user", 42), ("assistant", {"text": "4"})]
+)
+def test_streaming_dataset_literal_image_opt_in_rejects_invalid_content(tmp_path, role, content):
+    path = tmp_path / "invalid.jsonl"
+    messages = [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}]
+    messages[0 if role == "user" else 1]["content"] = content
+    _write_jsonl(path, [{"messages": messages, "images": []}])
+    dataset = SFTStreamingDataset(
+        str(path),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        literal_image_tags_as_text=True,
+        prefetch_max_cached=0,
+    )
+    try:
+        with pytest.raises(ValueError, match="Unsupported content type"):
+            dataset.get_canonical_sample(0)
+    finally:
+        dataset.stop()
 
 
 def test_expand_loss_mask_alignment_multiple_pad_kinds():

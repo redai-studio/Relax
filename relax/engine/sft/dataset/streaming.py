@@ -350,6 +350,8 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
             else:
                 messages.append(CanonicalMessage(role="assistant", content="", learn=learn, tool_calls=[tool_call]))
             continue
+        if not isinstance(content, (str, list)):
+            raise ValueError(f"Unsupported content type: {type(content)}, expected str or list of dicts")
         if role == "tool_response":
             role = "tool"
         learn = _resolve_learn_flag(raw, role)
