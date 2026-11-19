@@ -337,7 +337,7 @@ def test_optimization_contract_preserves_topology_with_wholepack_disabled(wholep
 def test_muon_recipe_accepts_layerwise_optimizer_without_cpu_offload():
     from relax.models.qwen3_5 import recipe
 
-    args = _optimization_args(wholepack=True, gbs=800, multimodal=True)
+    args = _optimization_args(wholepack=True, gbs=1600, multimodal=True)
     args.optimizer = "muon"
     args.use_distributed_optimizer = False
     args.use_layer_wise_distributed_optimizer = True

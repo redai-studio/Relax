@@ -33,8 +33,7 @@ def _check_args(args: Any) -> None:
     assert args.bf16 and args.sequence_parallel
     assert not getattr(args, "use_megatron_fsdp", False)
     if getattr(args, "optimizer", None) == "muon":
-        # Megatron normalizes --use-distributed-optimizer to layer-wise distribution for Muon.
-        assert getattr(args, "use_layer_wise_distributed_optimizer", False)
+        assert args.use_distributed_optimizer or getattr(args, "use_layer_wise_distributed_optimizer", False)
         assert not args.use_precision_aware_optimizer and not args.optimizer_cpu_offload
     else:
         assert args.use_distributed_optimizer

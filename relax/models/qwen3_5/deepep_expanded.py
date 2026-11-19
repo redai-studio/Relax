@@ -8,7 +8,8 @@ import torch
 from megatron.core.transformer.moe import fused_a2a as fa
 from megatron.core.transformer.moe import token_dispatcher as td
 
-from relax.utils.data.wholepack_policy import EXPANDED_ROWS_PER_RANK as CAPACITY
+
+CAPACITY = 131072
 
 
 def _event_args(buffer, asynchronous, allocate):
