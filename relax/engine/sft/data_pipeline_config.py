@@ -6,12 +6,18 @@ from argparse import Namespace
 
 from relax.engine.sft.image_preprocessing_config import configure_image_preprocessing
 from relax.engine.sft.runtime import is_embedding_task, is_offline_mode, is_sft_mode
-from relax.models.qwen3_5.recipe import enabled as qwen35_recipe_enabled
+from relax.models.qwen3_5 import recipe as qwen35_recipe
 from relax.utils.data.wholepack_policy import enabled as wholepack_enabled
 
 
 def configure_sft_data_pipeline(args: Namespace) -> None:
     is_sft = is_sft_mode(args) or getattr(args, "loss_type", None) in ("sft_loss", "sft-loss")
+    optimized_qwen = is_sft and qwen35_recipe.enabled(args)
+    args.sft_dispatch_token_limit = (
+        qwen35_recipe.dispatch_token_limit(args)
+        if optimized_qwen and getattr(args, "optimizer", None) == "muon"
+        else None
+    )
     if is_sft or is_offline_mode(args):
         args.per_rank_fetch = args.train_backend == "megatron"
         lookahead = args.per_rank_fetch and args.max_staleness >= 1
@@ -22,7 +28,7 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
             # Wholepack owns the packing plan and requires raw prefetched batches.
             and not wholepack_enabled(args)
             # The optimized recipe consumes raw batches even without wholepack.
-            and not qwen35_recipe_enabled(args)
+            and not optimized_qwen
             and lookahead
             # Embedding pairs are packed by their task-specific forward path;
             # the generic prepacker cannot concatenate anchor/positive dicts.
