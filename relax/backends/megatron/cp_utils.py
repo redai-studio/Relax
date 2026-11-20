@@ -643,7 +643,7 @@ def dynamic_cp_split_data(batch: dict, max_tokens_per_gpu: int) -> int:
     partitions = get_seqlen_balanced_partitions(total_lengths, num_sub, equal_size=False)
     # The partitioner returns the heaviest group first. Rotate physical owners
     # between microbatches, preserving the same assignment across all DP/TP peers.
-    shift = batch.get("replay_micro_batch_index", 0) % num_sub
+    shift = batch.get("micro_batch_index", 0) % num_sub
     partitions = partitions[shift:] + partitions[:shift]
     selected = partitions[sub_idx]
     for key, val in list(batch.items()):

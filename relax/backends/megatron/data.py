@@ -928,7 +928,7 @@ def get_batch(
 
     if (
         batch.get("selective_logit_rows") is not None
-        and batch.get("replay_micro_batch_index") == 0
+        and batch.get("micro_batch_index") == 0
         and mpu.is_pipeline_last_stage()
         and mpu.get_tensor_model_parallel_rank() == 0
     ):
@@ -1046,7 +1046,6 @@ class DataIterator:
         micro_batch_indices: list[list[int]] | None = None,
         max_tokens_per_gpu: int | None = None,
         dummy_micro_batch_offsets: set[int] | None = None,
-        start_micro_batch_index: int = 0,
     ) -> None:
         """Initialize an iterator over `rollout_data`.
 
@@ -1061,14 +1060,12 @@ class DataIterator:
                 training uses max_tokens_per_gpu). None falls back to args.max_tokens_per_gpu.
             dummy_micro_batch_offsets: Microbatch offsets that repeat real rows only to align
                 the number of microbatches across data-parallel ranks.
-            start_micro_batch_index: Ordinal of the first microbatch in the enclosing stream.
         """
         self.rollout_data = rollout_data
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
         self.max_tokens_per_gpu = max_tokens_per_gpu
         self.dummy_micro_batch_offsets = dummy_micro_batch_offsets or set()
-        self.start_micro_batch_index = start_micro_batch_index
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
 
@@ -1108,9 +1105,8 @@ class DataIterator:
             self.offset += 1
         else:
             self.offset += self.micro_batch_size
-        # DataIterator micro-batch ordinal (0-based). Trajectory replay stamps
-        # this onto each sample so --batch selects a real training micro-batch.
-        batch["replay_micro_batch_index"] = self.start_micro_batch_index + micro_batch_index
+        # A streamed microbatch already has its position in the enclosing stream.
+        batch["micro_batch_index"] = self.rollout_data.get("micro_batch_index", micro_batch_index)
         return batch
 
     def reset(self) -> "DataIterator":

@@ -15,6 +15,7 @@ def _exercise_rank(rank, init_url):
     from relax.backends.megatron import cp_utils
     from relax.backends.megatron.data import DataIterator
     from relax.utils import device
+    from relax.utils.data.stream_dataloader import MicroBatchListIterator
 
     timeout = timedelta(seconds=45)
     dist.init_process_group("gloo", rank=rank, world_size=6, init_method=init_url, timeout=timeout)
@@ -36,6 +37,8 @@ def _exercise_rank(rank, init_url):
         rows = dict(total_lengths=lengths, ids=ids, loss_masks=masks)
         plan = [[0, 1, 2], [3, 4, 5], [0, 1, 2], [3, 0, 1]]
         it = DataIterator(rows, micro_batch_indices=plan)
+        vpp_batches = [({key: [values[i] for i in indices] for key, values in rows.items()}, None) for indices in plan]
+        vpp_chunks = [MicroBatchListIterator(vpp_batches) for _ in range(2)]
         with (
             patch.object(cp_utils, "mpu", groups),
             patch.object(device, "make_current_torch_device", return_value=torch.device("cpu")),
@@ -45,6 +48,10 @@ def _exercise_rank(rank, init_url):
                 batch = it.get_next(list(rows))
                 size = cp_utils.dynamic_cp_split_data(batch, 16)
                 chosen = batch["ids"]
+                for chunk in vpp_chunks:
+                    chunk_batch, _ = next(chunk)
+                    cp_utils.dynamic_cp_split_data(chunk_batch, 16)
+                    assert chunk_batch["ids"] == chosen
                 if mb == 1:
                     assert size == 2 and chosen == [ids[i] for i in indices]
                     continue
@@ -81,7 +88,7 @@ def test_dynamic_cp_rotation_round_trip(tmp_path):
     over DP3 x CP2."""
     deadline = monotonic() + 120
     workers = mp.start_processes(
-        _exercise_rank, args=((tmp_path / "gloo").as_uri(),), nprocs=6, start_method="fork", join=False
+        _exercise_rank, args=((tmp_path / "gloo").as_uri(),), nprocs=6, start_method="spawn", join=False
     )
     try:
         while (remaining := deadline - monotonic()) > 0:
@@ -123,7 +130,7 @@ def test_streaming_forward_preserves_ordinals_and_full_logprobs(monkeypatch, pre
 
     def compute_log_prob(iterators, counts, store_prefix):
         batch = iterators[0].get_next(["ids"])
-        ordinals.append(batch["replay_micro_batch_index"])
+        ordinals.append(batch["micro_batch_index"])
         return {store_prefix + "log_probs": [torch.tensor([i, i + 0.5]) for i in batch["ids"]]}
 
     actor.compute_log_prob = compute_log_prob

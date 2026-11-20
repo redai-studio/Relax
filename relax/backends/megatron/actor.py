@@ -2606,13 +2606,7 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         for data, batch_meta in streaming_iter:
             n = len(data["total_lengths"])
-            data_iterator = [
-                DataIterator(
-                    data,
-                    micro_batch_indices=[list(range(n))],
-                    start_micro_batch_index=data["replay_micro_batch_index"],
-                )
-            ]
+            data_iterator = [DataIterator(data, micro_batch_indices=[list(range(n))])]
             num_microbatches = [1]
             output_dict = self.compute_log_prob(
                 data_iterator,

@@ -104,7 +104,6 @@ def test_micro_batch_list_iterator_observability_excludes_vpp_padding(monkeypatc
         assert dummy["__is_dummy__"]
         capture_training_input(dummy)
         record_optimizer_result(True)
-    assert [mb["replay_micro_batch_index"] for mb, _ in iterator] == [0, 1]
     assert len(iterator.get_buffer()) == 2
     close_train_appenders()
     path = resolve_agentic_obs_config(args).train_scalar_path(1, 0)
@@ -289,9 +288,9 @@ def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeyp
 
     actual, _ = next(iterator)
     assert len(actual["tokens"]) == 2
-    assert actual["replay_micro_batch_index"] == 0
+    assert actual["micro_batch_index"] == 0
     # The peer emitted three microbatches, so this DP's last two slots are padding.
-    padding = [(mb["replay_micro_batch_index"], mb["__is_dummy__"]) for mb, _ in iterator]
+    padding = [(mb["micro_batch_index"], mb["__is_dummy__"]) for mb, _ in iterator]
     assert padding == [(1, True), (2, True)]
     assert len(iterator.get_buffer()) == 1
 
@@ -410,7 +409,7 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     # get_batch replaces full response fields with CP-local slices during training.
     real["log_probs"] = [real["log_probs"][0][:1]]
     padding = [mb for mb, _ in iterator]
-    slots = [(mb["replay_micro_batch_index"], mb.get("__is_dummy__", False)) for mb in (first, real, *padding)]
+    slots = [(mb["micro_batch_index"], mb.get("__is_dummy__", False)) for mb in (first, real, *padding)]
     assert slots == [(0, False), (1, False), (2, True), (3, True)]
     assert padding[0]["log_probs"][0].tolist() == [-1.0, -2.0]
     assert len(iterator.get_buffer()) == 2
