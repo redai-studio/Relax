@@ -375,13 +375,20 @@ def _should_skip_reload_and_destroy() -> bool:
     return device_utils.is_klx()
 
 
-def destroy_process_groups(post_destroy_delay: float = 2.0, *, force: bool = False):
+def destroy_process_groups(
+    post_destroy_delay: float = 2.0,
+    *,
+    force: bool = False,
+    process_groups: Sequence[ReloadableProcessGroup] | None = None,
+):
     """Release offloaded groups; force also releases retained sync groups."""
     if _should_skip_reload_and_destroy():
         return
     if device_utils.is_npu_available:
         post_destroy_delay = 0.0
-    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay, force=force)
+    ReloadableProcessGroup.destroy_process_groups(
+        post_destroy_delay=post_destroy_delay, force=force, process_groups=process_groups
+    )
 
 
 def reload_process_groups(
@@ -407,15 +414,14 @@ def weight_export_groups(*, offload_train: bool, timeout_minutes: int):
     groups."""
     registry = ReloadableProcessGroup.GROUPS.get(os.getpid(), ())
     sleeping = [group for group in registry if group.group is None] if offload_train else []
-    if not sleeping or _should_skip_reload_and_destroy():
+    if not sleeping:
         yield
         return
     try:
         reload_process_groups(timeout_minutes=timeout_minutes, process_groups=sleeping)
         yield
     finally:
-        delay = 0.0 if device_utils.is_npu_available else 2.0
-        ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=delay, process_groups=sleeping)
+        destroy_process_groups(process_groups=sleeping)
 
 
 def retain_process_groups(
