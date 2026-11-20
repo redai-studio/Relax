@@ -1691,30 +1691,39 @@ class RolloutManager(ReloadableMixin):
                 if eligible:
                     if not all(engine._actor_id.hex() in synced for engine in engines):
                         raise RuntimeError("Candidate was absent from the completed FULL")
-                    versions = await asyncio.wait_for(
-                        asyncio.gather(*(engine.get_weight_version.remote() for engine in engines)), timeout=30
+                    versions = await self._wait_for_colocate_publication(
+                        asyncio.gather(*(engine.get_weight_version.remote() for engine in engines)),
+                        "Candidate weight version",
+                        timeout=30,
                     )
                     if not all(str(value) == str(version) for value in versions):
                         raise RuntimeError("Candidate reported a different FULL version")
                     with self._engine_lifecycle_lock:
                         eligible = candidate.eligible() and not self._colocate_disposing
                     if eligible:
-                        evictions = await asyncio.wait_for(
-                            asyncio.gather(*(engine.is_evicted.remote() for engine in group.all_engines)), timeout=5
+                        evictions = await self._wait_for_colocate_publication(
+                            asyncio.gather(*(engine.is_evicted.remote() for engine in group.all_engines)),
+                            "Candidate eviction status",
+                            timeout=5,
                         )
                         with self._engine_lifecycle_lock:
                             eligible = candidate.eligible() and not self._colocate_disposing and not any(evictions)
                 if eligible:
                     attempted_registration = True
-                    registered = await asyncio.wait_for(
+                    registered = await self._wait_for_colocate_publication(
                         asyncio.gather(*(engine.register_to_router.remote(confirm=True) for engine in engines)),
+                        "Router registration",
                         timeout=35,
                     )
                     if not all(result is True for result in registered):
                         raise RuntimeError("Router rejected a candidate")
-                    evictions = await asyncio.wait_for(
-                        asyncio.gather(*(engine.is_evicted.remote() for engine in group.all_engines)), timeout=5
-                    )
+                    evictions = []
+                    if not self._colocate_disposing:
+                        evictions = await self._wait_for_colocate_publication(
+                            asyncio.gather(*(engine.is_evicted.remote() for engine in group.all_engines)),
+                            "Candidate eviction status",
+                            timeout=5,
+                        )
                     with self._engine_lifecycle_lock:
                         if candidate.eligible() and not self._colocate_disposing and not any(evictions):
                             srv = self._get_server(candidate.request.model_name)
@@ -1730,6 +1739,8 @@ class RolloutManager(ReloadableMixin):
             except Exception:
                 logger.exception("[Colocate FULL] Could not publish replica %s", group.rank_offset)
                 with self._engine_lifecycle_lock:
+                    if self._colocate_failure:
+                        raise
                     if candidate.failure is None:
                         category = (
                             ScaleOutFailureCategory.ROUTER_REGISTRATION_FAILED
@@ -1750,25 +1761,42 @@ class RolloutManager(ReloadableMixin):
         with self._engine_lifecycle_lock:
             return self._colocate_remote_group[0] if rejected else None
 
+    async def _wait_for_colocate_publication(
+        self, task: asyncio.Future, operation: str, *, timeout: float = float("inf")
+    ) -> Any:
+        deadline = time.monotonic() + timeout
+        try:
+            while not task.done():
+                now = time.monotonic()
+                dispose_deadline = self._colocate_dispose_deadline
+                if dispose_deadline is not None and now >= dispose_deadline - _COLOCATE_SHUTDOWN_RESERVE:
+                    # Canceling the local wait does not confirm the remote RPC stopped.
+                    # Leave uncertain registration to the failed FULL shutdown path.
+                    self.fail_colocate_full(self._colocate_remote_group[0])
+                    raise TimeoutError(f"{operation} unconfirmed within the colocate shutdown budget")
+                if now >= deadline:
+                    raise TimeoutError(f"{operation} timed out")
+                await asyncio.wait({task}, timeout=min(0.2, deadline - now))
+            return task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def _rollback_colocate_registration(self, group: EngineGroup, num_engines: int) -> None:
         # A failed registration response can leave a live Router entry.
         drain_time = getattr(self.args, "scale_in_drain_timeout", 30.0)
-        removal = asyncio.create_task(
-            self._drain_engines(
-                [(group, idx) for idx in range(num_engines)], timeout=drain_time, force=True, allow_already_absent=True
-            )
+        _, failed = await self._wait_for_colocate_publication(
+            asyncio.create_task(
+                self._drain_engines(
+                    [(group, idx) for idx in range(num_engines)],
+                    timeout=drain_time,
+                    force=True,
+                    allow_already_absent=True,
+                )
+            ),
+            "Router removal",
         )
-        try:
-            while not removal.done():
-                deadline = self._colocate_dispose_deadline
-                if deadline is not None and time.monotonic() >= deadline - _COLOCATE_SHUTDOWN_RESERVE:
-                    self.fail_colocate_full(self._colocate_remote_group[0])
-                    raise TimeoutError("Router removal unconfirmed within the colocate shutdown budget")
-                await asyncio.wait({removal}, timeout=0.2)
-        finally:
-            if not removal.done():
-                removal.cancel()
-        _, failed = removal.result()
         if failed:
             raise RuntimeError("Could not confirm removal of a rejected colocate candidate")
 
