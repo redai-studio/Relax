@@ -4,7 +4,6 @@
 
 import argparse
 import json
-import os
 import struct
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -73,6 +72,7 @@ def capture_teacher(model, named_tensors):
     process."""
     from sglang.srt.distributed import get_tp_group
 
+    ((prefix, _),) = named_tensors
     rank = get_tp_group().rank_in_group
     weights = _get_target_tensors(model)
     record = {
@@ -81,15 +81,13 @@ def capture_teacher(model, named_tensors):
             name: _hash_tensor(t) for name, t in model.named_buffers() if f"buffer:{name}" not in weights
         },
     }
-    with Path(os.environ["RELAX_ADTS_CAPTURE_FILE"].format(rank=rank)).open("xb") as stream:
+    with Path(f"{prefix}-{rank}.pt").open("xb") as stream:
         torch.save(record, stream)
 
 
 def _capture_checkpoint(_rank, checkpoint, destination, tp_size):
     from sglang import Engine
 
-    # This process and its SGLang children are exclusive to one checkpoint.
-    os.environ["RELAX_ADTS_CAPTURE_FILE"] = str(destination)
     engine = Engine(
         model_path=str(checkpoint),
         tp_size=tp_size,
@@ -107,7 +105,7 @@ def _capture_checkpoint(_rank, checkpoint, destination, tp_size):
     )
     try:
         success, message = engine.update_weights_from_tensor(
-            named_tensors=[(str(checkpoint), torch.empty(0, dtype=torch.uint8))],
+            named_tensors=[(str(destination), torch.empty(0, dtype=torch.uint8))],
             load_format=_CAPTURE_LOADER,
         )
         if not success:
@@ -162,8 +160,7 @@ def build_teacher_delta_packages(paths, output, tp_size=1):
         integrity = {}
         for teacher, path in checkpoints.items():
             print(f"Capturing {path} with TP{tp_size}", flush=True)
-            destination = scratch / f"{teacher}-{{rank}}.pt"
-            torch.multiprocessing.spawn(_capture_checkpoint, args=(path, destination, tp_size), nprocs=1)
+            torch.multiprocessing.spawn(_capture_checkpoint, args=(path, scratch / teacher, tp_size), nprocs=1)
 
         for rank in range(tp_size):
             for index, (captures, header) in enumerate(_checkpoint_pairs(checkpoints, scratch, rank)):

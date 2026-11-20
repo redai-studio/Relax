@@ -40,16 +40,16 @@ def package_teacher_ids(directory: str, routes: dict[str, str], tp_size: int = 1
     return route_to_id, initial_route
 
 
-def control_payload(operation: str, teacher_id: str, tp_size: int = 1) -> dict:
-    """Send only a control marker; compressed bytes stay on the worker."""
+def control_payload(operation: str, target: str, tp_size: int, *, weight_version: str) -> dict:
+    """Prepare takes a package directory. Switch and restore take a Teacher ID."""
     import torch
     from sglang.srt.utils import MultiprocessingSerializer
 
-    marker = [(f"relax_adts:{operation}:{teacher_id}", torch.empty(0, dtype=torch.uint8))]
+    marker = [(f"relax_adts:{operation}:{target}", torch.empty(0, dtype=torch.uint8))]
     return {
         "serialized_named_tensors": [MultiprocessingSerializer.serialize(marker, output_str=True)] * tp_size,
         "load_format": LOADER,
-        "weight_version": teacher_id,
+        "weight_version": weight_version,
         "flush_cache": True,
         "disable_draft_model": True,
     }

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from operator import attrgetter
 from pathlib import Path
@@ -112,22 +111,22 @@ def _restore_teacher(model: torch.nn.Module, state: _State, target: str) -> None
 
 def _update_teacher(model: torch.nn.Module, named_tensors, rank: int) -> None:
     ((command, _),) = named_tensors
-    _, operation, teacher = command.split(":")
+    _, operation, target = command.split(":", 2)
     if operation == "prepare":
-        model._relax_adts_teacher_state = _prepare(model, Path(os.environ["RELAX_ADTS_TEACHER_DIR"]), rank)
+        model._relax_adts_teacher_state = _prepare(model, Path(target), rank)
         return
 
     state = model._relax_adts_teacher_state
     if operation == "switch":
-        if teacher != state.current:
+        if target != state.current:
             torch.cuda.synchronize(next(model.parameters()).device)
-            _apply_delta(model, state, state.current, teacher)
-            state.current = teacher
+            _apply_delta(model, state, state.current, target)
+            state.current = target
         return
 
     if operation == "restore":
-        _restore_teacher(model, state, teacher)
-        state.current = teacher
+        _restore_teacher(model, state, target)
+        state.current = target
         return
 
     raise ValueError(f"Unknown Teacher operation: {operation}")

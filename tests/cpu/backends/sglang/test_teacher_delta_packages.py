@@ -53,8 +53,6 @@ def checkpoint_captures(tmp_path, monkeypatch):
         (path / "config.json").write_text("{}")
         inputs[path] = torch.tensor([0xFFFE + i & 65535, 3 - i, 100 + i], dtype=torch.uint16).view(torch.bfloat16)
 
-    monkeypatch.setenv("RELAX_ADTS_CAPTURE_FILE", "")
-
     def spawn(fn, args, nprocs):
         checkpoint, _, tp_size = args
         engine = Mock()
@@ -85,7 +83,7 @@ def checkpoint_captures(tmp_path, monkeypatch):
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 def test_three_checkpoints_publish_three_pairs_for_all_six_switches(tmp_path, checkpoint_captures, tp_size):
     weights = checkpoint_captures
-    bank = tmp_path / "bank"
+    bank = tmp_path / "run:{rank}" / "bank"
     pack.main(["--checkpoints", *map(str, weights), "--output", str(bank), "--tp-size", str(tp_size)])
     manifest = json.loads((bank / "manifest.json").read_text())
     routes = {path.parent.name: str(path) for path in weights}

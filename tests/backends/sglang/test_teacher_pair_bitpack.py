@@ -49,7 +49,7 @@ def test_packed_pair_roundtrip_on_all_tile_modes(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Teacher switching")
-def test_three_teachers_restore_weights_and_logits(tmp_path, monkeypatch):
+def test_three_teachers_restore_weights_and_logits(tmp_path):
     rng = torch.Generator().manual_seed(17)
     states = {
         name: {
@@ -76,7 +76,6 @@ def test_three_teachers_restore_weights_and_logits(tmp_path, monkeypatch):
         _write_package(path, [{"params": states[src]}, {"params": states[dst]}], header)
         packages[path.name] = {"bytes": path.stat().st_size}
     (tmp_path / "manifest.json").write_text(json.dumps({"initial_teacher": "A", "package_integrity": packages}))
-    monkeypatch.setenv("RELAX_ADTS_TEACHER_DIR", str(tmp_path))
 
     model = torch.nn.Linear(32, 32, bias=False, device="cuda", dtype=torch.bfloat16)
     model.weight.data.copy_(states["A"]["weight"])
@@ -93,8 +92,8 @@ def test_three_teachers_restore_weights_and_logits(tmp_path, monkeypatch):
     }
     ptrs = model.weight.data_ptr(), model.gemma_weight.data_ptr()
 
-    def update(operation, teacher):
-        adts_teacher_loader(model, [(f"relax_adts:{operation}:{teacher}", torch.empty(0))])
+    def update(operation, target):
+        adts_teacher_loader(model, [(f"relax_adts:{operation}:{target}", torch.empty(0))])
 
     def compare(teacher):
         assert torch.equal(model.weight.cpu().view(torch.int16), states[teacher]["weight"].view(torch.int16))
@@ -111,7 +110,7 @@ def test_three_teachers_restore_weights_and_logits(tmp_path, monkeypatch):
             atol=0,
         )
 
-    update("prepare", "A")
+    update("prepare", tmp_path)
     # Every six switches visit all six directed pairs and return to A.
     for teacher in islice(cycle("BCACBA"), 100):
         update("switch", teacher)
