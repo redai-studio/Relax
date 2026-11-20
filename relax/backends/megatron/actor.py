@@ -1083,23 +1083,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         )
 
-    def fill_routing_replay(
-        self, data_iterator, num_microbatches, rollout_data, *, delivery_manager=None, region=None, cache=None
-    ):
-        if "rollout_replay_refs" in rollout_data:
-            from relax.distributed.replay_manager.backend.megatron import fill_reference_replay
-
-            fill_reference_replay(
-                self,
-                data_iterator,
-                num_microbatches,
-                kind="moe",
-                delivery_manager=delivery_manager,
-                region=region,
-                cache=cache,
-            )
-            return
-
+    def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
             raise ValueError(
                 "rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set."
@@ -1122,24 +1106,8 @@ class MegatronTrainRayActor(TrainRayActor):
         for iterator in data_iterator:
             iterator.reset()
 
-    def fill_indexer_replay(
-        self, data_iterator, num_microbatches, rollout_data, *, delivery_manager=None, region=None, cache=None
-    ):
+    def fill_indexer_replay(self, data_iterator, num_microbatches, rollout_data):
         """Pack SGLang's logical C4 IDs into Megatron's local CP/PP layout."""
-        if "rollout_replay_refs" in rollout_data:
-            from relax.distributed.replay_manager.backend.megatron import fill_reference_replay
-
-            fill_reference_replay(
-                self,
-                data_iterator,
-                num_microbatches,
-                kind="indexer",
-                delivery_manager=delivery_manager,
-                region=region,
-                cache=cache,
-            )
-            return
-
         from relax.distributed.replay_manager.backend.megatron import IndexerReplay
 
         if "rollout_indexer_topk" not in rollout_data:

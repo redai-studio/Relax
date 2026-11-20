@@ -28,7 +28,7 @@ The orchestration and model semantics are separate:
 
 | Component | Responsibility |
 | --- | --- |
-| `ReplayManager`, `ReplayKind` | Register producer/consumer adapters and process-local engine hooks; manage run and channel state |
+| `ReplayManager`, `ReplayKind` | Register producer/consumer adapters and process-local engine hooks; manage run state |
 | `ProducerPublication` | Publish bounded row chunks and layer bodies; expose a reference only after writes complete |
 | `ReplayRef` | Identify the run, owner, record, kind, dimensions, codec and token digest; carries no dense top-k array |
 | `ReplayInventory`, `ReplayRegion` | Track capacity, queue-partition ownership and reader leases; coordinate reclamation |

@@ -85,7 +85,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
-from relax.utils.types import Sample, get_spec_token_counts
+from relax.utils.types import get_spec_token_counts
 
 
 # Stable actor-name prefix embedded in opaque Session route tokens. Renaming it
@@ -3112,11 +3112,10 @@ class AgenticSessionShard:
                 capture_prefix = ir.history_train_token_prefix
             tokens = ir.history_train_token_prefix + ir.pending_token_delta
             start = ir.referenced_route_rows
-            sample = Sample(tokens=tokens[start:])
-            producer.accept_response(
-                sample, meta, self.args, captured_tokens=(capture_prefix + captured_delta)[start:]
+            refs = producer.accept_route_refs(
+                meta, self.args, tokens[start:], (capture_prefix + captured_delta)[start:]
             )
-            (span,) = moe_route_spans(sample.rollout_replay_refs["moe"])
+            (span,) = moe_route_spans(refs["moe"])
             ref = span.ref
             if (ref.layers, ref.topk) != (self.args.num_layers, self.args.moe_router_topk):
                 raise ValueError("Agentic MoE replay shape does not match the model")

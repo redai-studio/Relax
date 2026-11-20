@@ -74,47 +74,7 @@ class SGLangProducer(Producer):
         if self.manager.uses_references:
             if evaluation or not self.kinds:
                 return
-            refs = {}
-            capture = sample.tokens if captured_tokens is None else captured_tokens
-            if len(capture) != len(sample.tokens):
-                raise ValueError("Replay token normalization must preserve row positions")
-            for kind in self.kinds - {"mm_embedding"}:
-                field = _CAPTURE_FIELDS[kind]
-                value = meta[field]
-                if isinstance(value, dict) and "replay_manifest" in value:
-                    decoded = _response_references(value)
-                    if set(decoded) != {kind}:
-                        raise ValueError("SGLang response contains unexpected replay kinds")
-                    value = meta[field] = decoded[kind]
-                if not isinstance(value, dict):
-                    # External/unpatched SGLang keeps its original HTTP payload.
-                    # Publish it at ingress; TQ still carries only a reference.
-                    values = (
-                        decode_routed_experts(meta, len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
-                        if kind == "moe"
-                        else decode_indexer_topk(meta, len(sample.tokens) - 1)
-                    )
-                    if kind == "indexer":
-                        topk = getattr(args, "dsa_indexer_topk", None)
-                        if topk is None:
-                            from relax.utils.misc import get_hf_config
-
-                            config = get_hf_config(args.hf_checkpoint)
-                            from ..validation import indexer_topk
-
-                            topk = indexer_topk(config)
-                        values = values.reshape(len(sample.tokens) - 1, -1, topk)
-                    if hasattr(args, "tq_config"):
-                        self.manager.store().register_local_owner(args.tq_config)
-                    value = self._publish_response(values, kind=kind, tokens=capture)
-                    # The enclosing response guard now owns cleanup on failure.
-                    meta[field] = value
-                if capture != sample.tokens:
-                    validate_sample({kind: value}, capture)
-                    from ..ref_data import token_digest
-
-                    value = {**value, "training_tokens": token_digest(sample.tokens)}
-                refs[kind] = value
+            refs = self.accept_route_refs(meta, args, sample.tokens, captured_tokens)
             if "mm_embedding" in self.kinds:
                 from .mm_sglang import accept_mm_response
 
@@ -123,7 +83,6 @@ class SGLangProducer(Producer):
                     meta,
                     keep_pixels=getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False),
                 )
-            validate_sample(refs, sample.tokens)
             sample.rollout_replay_refs = refs
         else:
             if "routed_experts" in meta:
@@ -132,6 +91,56 @@ class SGLangProducer(Producer):
                 )
             if "indexer" in self.kinds and not evaluation:
                 sample.rollout_indexer_topk = decode_indexer_topk(meta, len(sample.tokens) - 1)
+
+    def accept_route_refs(
+        self, meta: dict, args: Any, tokens: list[int], captured_tokens: list[int] | None = None
+    ) -> dict[str, dict]:
+        """Accept SGLang route references against the capture and training
+        token sequences."""
+        capture = tokens if captured_tokens is None else captured_tokens
+        refs = {}
+        if len(capture) != len(tokens):
+            raise ValueError("Replay token normalization must preserve row positions")
+        for kind in self.kinds - {"mm_embedding"}:
+            field = _CAPTURE_FIELDS[kind]
+            value = meta[field]
+            if isinstance(value, dict) and "replay_manifest" in value:
+                decoded = _response_references(value)
+                if set(decoded) != {kind}:
+                    raise ValueError("SGLang response contains unexpected replay kinds")
+                value = meta[field] = decoded[kind]
+            if not isinstance(value, dict):
+                # External/unpatched SGLang keeps its original HTTP payload.
+                # Publish it at ingress; TQ still carries only a reference.
+                values = (
+                    decode_routed_experts(meta, len(tokens) - 1, args.num_layers, args.moe_router_topk)
+                    if kind == "moe"
+                    else decode_indexer_topk(meta, len(tokens) - 1)
+                )
+                if kind == "indexer":
+                    topk = getattr(args, "dsa_indexer_topk", None)
+                    if topk is None:
+                        from relax.utils.misc import get_hf_config
+
+                        config = get_hf_config(args.hf_checkpoint)
+                        from ..validation import indexer_topk
+
+                        topk = indexer_topk(config)
+                    values = values.reshape(len(tokens) - 1, -1, topk)
+                if hasattr(args, "tq_config"):
+                    self.manager.store().register_local_owner(args.tq_config)
+                value = self._publish_response(values, kind=kind, tokens=capture)
+                # The enclosing response guard now owns cleanup on failure.
+                meta[field] = value
+            if capture != tokens:
+                validate_sample({kind: value}, capture)
+                from ..ref_data import token_digest
+
+                value = {**value, "training_tokens": token_digest(tokens)}
+            refs[kind] = value
+        if refs:
+            validate_sample(refs, tokens)
+        return refs
 
     def response_refs(self, meta: dict) -> list[ReplayRef]:
         return [

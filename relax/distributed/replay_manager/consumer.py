@@ -10,7 +10,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from ._encoded_prefetch import _EncodedReadAhead
 from ._prefetch import _ConsumerReadAhead
@@ -24,16 +24,6 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from .core import ConsumerChannel, ReplayManager, ReplayRegion
-
-
-@dataclass(frozen=True)
-class ConsumerChannelKey:
-    """One replay kind and layer; coordinates preserve the backend's layer
-    numbering."""
-
-    kind: str
-    layer: int
-    coordinate: Literal["global_layer", "local_registration"] = "global_layer"
 
 
 @dataclass(frozen=True)

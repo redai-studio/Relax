@@ -3,6 +3,7 @@
 """Lightweight indexer replay capabilities; no model/backend imports at
 validation."""
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,7 @@ class IndexerReplayCapabilities:
     capture_ratio: int | None = 4
     hf_topk_path: tuple[str, ...] = ("index_topk",)
     qsa: bool = False
+    supports_full_delivery: bool = False
 
     def capture_layout(self, config: Any) -> tuple[int, tuple[int, ...]]:
         """Validate the actual training model, beyond the launch arguments."""
@@ -56,7 +58,7 @@ class IndexerReplayCapabilities:
 
 _CAPABILITIES = {
     "deepseek_v4": IndexerReplayCapabilities(
-        cp_partition_mode="contiguous", allgather_cp=True, rollout_dp_attention=True
+        cp_partition_mode="contiguous", allgather_cp=True, rollout_dp_attention=True, supports_full_delivery=True
     ),
     "KeyeVL2": IndexerReplayCapabilities(
         cp_partition_mode="zigzag",
@@ -115,6 +117,22 @@ def indexer_capture_layout(config: Any) -> tuple[int, tuple[int, ...]]:
     return indexer_capabilities(model_type).capture_layout(config)
 
 
+def configure_indexer_replay(args: Any, *, is_offline: bool) -> None:
+    from relax.utils.misc import get_hf_config
+
+    from .config import references_enabled
+    from .core import enable_reference_replay
+
+    model_type = getattr(get_hf_config(args.hf_checkpoint), "model_type", None)
+    if (
+        not indexer_capabilities(model_type).supports_full_delivery
+        or not os.environ.get("RELAX_REPLAY_REFERENCES", "").strip()
+        or references_enabled()
+    ):
+        enable_reference_replay()
+    validate_indexer_replay_args(args, is_offline=is_offline)
+
+
 def validate_indexer_replay_args(args: Any, *, is_offline: bool) -> None:
     from relax.utils.misc import get_hf_config
 
@@ -149,7 +167,7 @@ def validate_indexer_replay_args(args: Any, *, is_offline: bool) -> None:
         unsupported.append(f"context_parallel_size={args.context_parallel_size}")
     if not capabilities.qsa and (args.tensor_model_parallel_size != 1 or args.sequence_parallel):
         unsupported.append("TP>1/sequence parallel")
-    if capabilities.qsa or model_type == "KeyeVL2":
+    if not capabilities.supports_full_delivery:
         from .config import references_enabled
 
         if not references_enabled():

@@ -28,7 +28,7 @@ ReplayInventory: run identity, sealed records, capacity, partition holds, leases
 
 | 组件 | 职责 |
 | --- | --- |
-| `ReplayManager`、`ReplayKind` | 注册生产/消费适配器及进程内引擎 hook，管理 run 和 channel 状态 |
+| `ReplayManager`、`ReplayKind` | 注册生产/消费适配器及进程内引擎 hook，管理 run 状态 |
 | `ProducerPublication` | 按有界行块和 layer 发布 body，写入完成后才返回 reference |
 | `ReplayRef` | 记录 run、owner、record、kind、维度、codec 和 token 摘要，不携带完整 top-k 数组 |
 | `ReplayInventory`、`ReplayRegion` | 管理容量、队列 partition 所有权和 reader lease，协调回收 |

@@ -11,11 +11,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from .config import ReplayConfig, get_store
-from .consumer import (
-    ConsumerChannelKey,
-    ConsumerRecord,
-    ConsumerSource,
-)
+from .consumer import ConsumerRecord, ConsumerSource
 from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, register_kind
 
 
@@ -199,12 +195,9 @@ class ReplayManager:
         self,
         *,
         config: ReplayConfig | None = None,
-        phase: ConsumerPhase | None = None,
         store_factory: Callable[[], "TQReplayStorage"] | None = None,
     ) -> None:
         self.config = config if config is not None else ReplayConfig()
-        self.phase = phase if phase is not None else ConsumerPhase()
-        self._channels: dict[ConsumerChannelKey, ConsumerChannel] = {}
         self._closed = False
         self._store_factory = store_factory
         self._store_instance: TQReplayStorage | None = None
@@ -516,68 +509,7 @@ class ReplayManager:
             for value in values
         ]
 
-    def register_channel(self, key: ConsumerChannelKey) -> ConsumerChannel:
-        self._ensure_open()
-        if key in self._channels:
-            raise ValueError(f"Replay channel already registered: {key}")
-        channel = ConsumerChannel(key.kind)
-        self._channels[key] = channel
-        return channel
-
-    def _channel(self, key: ConsumerChannelKey) -> ConsumerChannel:
-        self._ensure_open()
-        return self._channels[key]
-
-    def bind(self, key: ConsumerChannelKey, record: ConsumerRecord) -> None:
-        self._channel(key).bind(record)
-
-    def consume(
-        self,
-        key: ConsumerChannelKey,
-        phase: str | None = None,
-        *,
-        microbatch_id: int | None = None,
-        advance_before_lookup: bool = False,
-        materialize: bool = True,
-    ) -> Any:
-        return self._channel(key).consume(
-            phase if phase is not None else self.phase.get(),
-            microbatch_id=microbatch_id,
-            advance_before_lookup=advance_before_lookup,
-            materialize=materialize,
-        )
-
-    def reset_forward(self, key: ConsumerChannelKey, *, require_consumed: bool = False) -> None:
-        self._channel(key).reset_forward(require_consumed=require_consumed)
-
-    def check_consumed(self, key: ConsumerChannelKey, *, expect_backward: bool = False) -> None:
-        self._channel(key).check_consumed(expect_backward=expect_backward)
-
-    def clear(self) -> None:
-        error = None
-        for channel in self._channels.values():
-            try:
-                channel.clear()
-            except Exception as exc:
-                error = error or exc
-        if error is not None:
-            raise error
-
-    def release_sources(self) -> None:
-        """Release bound leases without clearing externally held inline
-        views."""
-        error = None
-        for channel in self._channels.values():
-            try:
-                channel.release_sources()
-            except Exception as exc:
-                error = error or exc
-        if error is not None:
-            raise error
-
     def close(self) -> None:
-        self.clear()
-        self._channels.clear()
         self._closed = True
 
 
@@ -1203,7 +1135,6 @@ def enable_reference_replay() -> None:
         if (
             manager._enabled_kinds is not None
             or manager._installed_engines
-            or manager._channels
             or manager._store_instance is not None
             or manager._owns_run
         ):

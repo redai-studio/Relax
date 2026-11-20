@@ -4,7 +4,7 @@
 decisions."""
 
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
@@ -66,24 +66,15 @@ class MegatronConsumer(Consumer):
         # Actor retains full-tensor packing; share one cache across reference kinds.
         if cache is None:
             cache = ConsumerTensorCache(self.manager.config.materialization_bytes)
-        if "moe" in self.kinds:
-            actor.fill_routing_replay(
-                data_iterator,
-                num_microbatches,
-                batch,
-                delivery_manager=self.manager,
-                region=region,
-                cache=cache,
-            )
-        if "indexer" in self.kinds:
-            actor.fill_indexer_replay(
-                data_iterator,
-                num_microbatches,
-                batch,
-                delivery_manager=self.manager,
-                region=region,
-                cache=cache,
-            )
+        if REFERENCE_FIELD in batch:
+            for kind in ("moe", "indexer"):
+                if kind in self.kinds:
+                    fill_reference_replay(actor, data_iterator, num_microbatches, kind, region or self.manager, cache)
+        else:
+            if "moe" in self.kinds:
+                actor.fill_routing_replay(data_iterator, num_microbatches, batch)
+            if "indexer" in self.kinds:
+                actor.fill_indexer_replay(data_iterator, num_microbatches, batch)
         if "mm_embedding" in self.kinds:
             from .mm_megatron import prepare_mm_replay
 
@@ -315,12 +306,8 @@ def bind_full_moe_batch(args: Any, batch: dict, routers: list, tokens: list[torc
         router.record(packed[:, layer])
 
 
-def _moe_layout(args: Any, models: Any, *, chunk: int | None = None) -> ConsumerModelLayout:
-    bindings = tuple(
-        ConsumerLayerBinding(layer, router.channel)
-        for vp_stage, layer, router in local_moe_routers(models, args.num_layers)
-        if chunk is None or vp_stage == chunk
-    )
+def _moe_layout(args: Any, routers: Iterable[tuple[int, int, "RoutingReplay"]]) -> ConsumerModelLayout:
+    bindings = tuple(ConsumerLayerBinding(layer, router.channel) for _, layer, router in routers)
     return ConsumerModelLayout("moe", args.moe_router_topk, args.num_layers, bindings)
 
 
@@ -397,17 +384,18 @@ def _bind_reference_batch(
 def streaming_moe_replay(args: Any, models: Any, partition: str) -> Callable[[Any, dict], None]:
     """Bind the current pipeline chunk after the schedule fetches its next
     batch."""
+    routers = {id(model): [] for model in models}
+    for chunk, layer, router in local_moe_routers(models, args.num_layers):
+        routers[id(models[chunk])].append((chunk, layer, router))
+
     if not replay_data_manager.uses_references:
-        routers = {id(model): [] for model in models}
-        for chunk, layer, router in local_moe_routers(models, args.num_layers):
-            routers[id(models[chunk])].append((chunk, layer, router))
 
         def bind_full(model: Any, batch: dict) -> None:
             bind_full_moe_batch(args, batch, routers[id(model)], batch["unconcat_tokens"])
 
         return bind_full
 
-    layouts = {id(model): _moe_layout(args, models, chunk=chunk) for chunk, model in enumerate(models)}
+    layouts = {model_id: _moe_layout(args, layers) for model_id, layers in routers.items()}
     region = replay_data_manager.region(partition)
     cache = ConsumerTensorCache(replay_data_manager.config.materialization_bytes)
     device = device_utils.make_current_torch_device()
@@ -428,21 +416,15 @@ def fill_reference_replay(
     actor: Any,
     data_iterator: list,
     num_microbatches: list[int],
-    *,
     kind: str,
-    delivery_manager: ReplayManager | None = None,
-    region: ReplayRegion | None = None,
-    cache: ConsumerTensorCache | None = None,
+    readers: ReplayManager | ReplayRegion,
+    cache: ConsumerTensorCache,
 ) -> None:
-
-    if kind not in {"moe", "indexer"}:
-        raise ValueError(f"Unsupported replay content: {kind}")
-    if cache is None:
-        manager = region.manager if region is not None else (delivery_manager or replay_data_manager)
-        cache = ConsumerTensorCache(manager.config.materialization_bytes)
-    layout = _moe_layout(actor.args, actor.model) if kind == "moe" else _indexer_layout(actor)
+    if kind == "moe":
+        layout = _moe_layout(actor.args, local_moe_routers(actor.model, actor.args.num_layers))
+    else:
+        layout = _indexer_layout(actor)
     device = device_utils.make_current_torch_device()
-    readers = region if region is not None else (delivery_manager or replay_data_manager)
     for iterator in data_iterator:
         iterator.reset()
     try:
