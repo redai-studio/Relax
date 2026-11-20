@@ -41,7 +41,7 @@ def package_teacher_ids(directory: str, routes: dict[str, str], tp_size: int = 1
 
 
 def control_payload(operation: str, target: str, tp_size: int, *, weight_version: str) -> dict:
-    """Prepare takes a package directory. Switch and restore take a Teacher ID."""
+    """Pass a package directory for prepare and a Teacher ID otherwise."""
     import torch
     from sglang.srt.utils import MultiprocessingSerializer
 
