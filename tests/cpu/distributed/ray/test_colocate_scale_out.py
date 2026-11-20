@@ -254,6 +254,61 @@ async def test_dispose_bounds_rejected_colocate_registration_rollback(pool, rout
             await waiter
 
 
+@pytest.mark.parametrize("registration_confirmed", [True, False])
+@pytest.mark.asyncio
+async def test_dispose_bounds_inflight_colocate_registration(pool, patch_ray_get, monkeypatch, registration_confirmed):
+    from relax.distributed.ray import rollout
+
+    manager, server, baseline = pool
+    manager._eval_judge = None
+    request = ScaleOutRequest("scale", ScaleOutStatus.CREATING, num_replicas=1)
+    group, engine, waiter = await start_candidate(manager, request, 4)
+    group.pg = (SimpleNamespace(id="candidate-pg"), [0, 1], [4, 5])
+    source = Mock()
+    snapshot, _ = manager.acquire_colocate_full(source)
+    started = asyncio.Event()
+    registration = asyncio.get_running_loop().create_future()
+    remove_pg = Mock()
+    monkeypatch.setattr(rollout.ray.util, "remove_placement_group", remove_pg)
+
+    def register(**_kwargs):
+        started.set()
+        # Canceling the local wait does not stop a synchronous Ray actor call.
+        return asyncio.shield(registration)
+
+    engine.register_to_router.remote.side_effect = register
+    publication = asyncio.create_task(manager.publish_colocate_full(4, ["candidate-4"]))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        manager._colocate_dispose_deadline = time.monotonic() + (30 if registration_confirmed else 7)
+        manager._colocate_disposing = True
+        if registration_confirmed:
+            registration.set_result(True)
+            assert await asyncio.wait_for(publication, timeout=2) == snapshot["group_name"]
+            assert engine.unregister_from_router.remote.call_args.kwargs["wait_for_removal"]
+            assert engine.is_evicted.remote.call_count == 1
+        else:
+            with pytest.raises(TimeoutError, match="Router registration unconfirmed"):
+                await asyncio.wait_for(publication, timeout=2)
+            engine.unregister_from_router.remote.assert_not_called()
+            remove_pg.assert_not_called()
+
+            def stop_with_late_ack(**_kwargs):
+                registration.set_result(True)
+
+            engine.shutdown.options.return_value.remote.side_effect = stop_with_late_ack
+            manager.dispose()
+            assert registration.result() is True
+            engine.shutdown.options.assert_called_once_with(concurrency_group="colocate_shutdown")
+            source.abort_colocate_weight_group.remote.assert_called_once_with(snapshot["group_name"])
+            remove_pg.assert_called_once_with(group.pg[0])
+        assert server.engine_groups == [baseline]
+    finally:
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+
 @pytest.mark.parametrize("outcome", ["rpc_error", "late_ack", "dispose"])
 @pytest.mark.asyncio
 async def test_unconfirmed_probe_finishes_request_without_releasing_pg(pool, monkeypatch, patch_ray_get, outcome):
