@@ -39,6 +39,8 @@ Replay 复用 Relax 初始化后解析出的 TQ 连接，不启动第二套 TQ �
 
 Producer 在 body 写完后封存 record。向 sample 队列发布时，先挂上 partition 引用，sample 写入成功后再转移 producer 所有权。Consumer 读取前获取 lease；即使 sample partition 已退休，仍有 reader 持有的 body 也不会被提前删除。释放前会等待未完成读取结束；producer、partition 和 reader 均不再持有数据时才可回收。全局故障恢复会生成新的 replay run 标识，避免旧 reference 混入重启后的数据。
 
+替换 rollout engine 时，旧引擎代际停止发布新记录。恢复会回收已确认写入且未封存的 body，保留在途响应和训练所需的已封存引用。仍有写入未确认时，需通过全局恢复重建 replay run。
+
 Token 身份、kind、codec、layer 和 partition 检查会拒绝不兼容的 reference。Channel 游标检查 forward 和重计算是否少消费或多消费。管理层负责这些通用约束，模型适配器负责采集位置、block 坐标和平行布局语义。
 
 ## 如何开启
@@ -49,9 +51,11 @@ Token 身份、kind、codec、layer 和 partition 检查会拒绝不兼容的 re
 --use-rollout-indexer-replay
 ```
 
-该参数会自动设置 `RELAX_REPLAY_REFERENCES=1`，按需生成 run ID，并把 reference 环境传给 worker，无须再配置一个 reference 开关。
+Indexer replay 默认使用 reference。DeepSeek-V4 可显式选择完整张量；Keye 和 QSA 需要 reference。
 
-MoE replay 由 `--use-rollout-routing-replay` 独立开启；`--use-routing-replay` 控制训练侧路由重放，`--optimize-routing-replay` 选择已有的路由重放优化。这些参数不会开启 QSA。Indexer replay 与 rollout routing replay 同时开启时，两类数据共用 reference 基础设施。
+Reference dump 保存 manifest。关闭对应 replay 后，debug 和 forge 可以复用其中的文本样本。若要在另一轮运行中重放路由，保存 dump 时请选择完整张量。多模态样本需要原始像素或本轮运行的 embedding body。
+
+MoE replay 由 `--use-rollout-routing-replay` 独立开启；`--use-routing-replay` 控制训练侧路由重放，`--optimize-routing-replay` 选择已有的路由重放优化。这些参数不会开启 QSA。开启 reference 传输时，indexer replay 与 rollout routing replay 共用 reference 基础设施。
 
 ### 冻结视觉 embedding replay
 
@@ -63,9 +67,11 @@ MoE replay 由 `--use-rollout-routing-replay` 独立开启；`--use-routing-repl
 
 采集边界位于视觉 merger 之后、与文本 embedding 混合之前。新计算、embedding cache 命中、预计算特征和 chunked prefill 都引用完整媒体 body。按引擎的图片 hash 去重：同 hash 复用第一次发布的 body，不再比较后续特征数值；grid 或 modality 不兼容时拒绝使用。
 
-`bf16-raw-v1` 将 BF16 原始位按字节传输，不做量化。Body 大小为 `N_visual × 2560 × 2` 字节，1024 个视觉 token 对应 5 MiB。多个 response 共用 body，不为每条回答复制。Sample 队列仅携带 reference 和布局元数据，校验 grid 后移除原始 pixel tensor；存储、reader lease 和 partition 回收沿用现有 TQ 机制。
+`bf16-raw-v1` 将 BF16 原始位按字节传输，不做量化。Body 大小为 `N_visual × 2560 × 2` 字节，1024 个视觉 token 对应 5 MiB。多个 response 共用同一个 body。Sample 队列携带 reference 和布局元数据。启用 KL 参考策略时，队列也保留 pixel tensor，供参考模型用自己的视觉权重计算 embedding。存储、reader lease 和 partition 回收沿用现有 TQ 机制。
 
 训练只在输入 PP stage 加载，每个 TP 组读取一次后广播给组内其他 rank。有界缓存复用于 log-probability 和训练前向，保留原有 placeholder scatter、MRoPE 及语言模型梯度。不开此参数时仍走原有视觉计算路径。
+
+替换 rollout engine 时会撤销旧引擎未完成的媒体认领和本地缓存租约。在途响应和已入队的训练数据各自持有引用。如果旧写入仍未收到确认，单引擎恢复会报错，由全局恢复重建 replay run 和对应的 TQ 存储。
 
 ## 各模型的 replay 支持情况
 
@@ -79,13 +85,13 @@ MoE replay 由 `--use-rollout-routing-replay` 独立开启；`--use-routing-repl
 | DeepSeek-V4（`deepseek_v4`） | 支持 MoE 专家路由。 | **支持 DSA。** CP>1、TP1、关闭 SP，使用 contiguous partition 和 allgather-CP。开启 rollout DP attention。以 `int32` 采集配置中的 C4 层。Indexer MXFP4 QAT 与 replay 互斥。 | 不支持 |
 | Keye-VL2（`KeyeVL2`） | 支持标准 MoE 路由。现有 Keye 配方默认关闭 R3。 | **纯文本运行时支持 DSA。** CP>1、TP1、PP1、关闭 SP，使用 zigzag，关闭 allgather-CP。Rollout 关闭 DP attention、overlap schedule 和 radix cache。Top-k 为 2048，使用 `keye-bitmap-v1`，采集上下文上限为 32,768 token。开启后冻结 indexer。 | 不支持 |
 
-R3 复用通用的 SGLang 专家采集和 Megatron top-k 重放路径。其他 MoE 模型可以在两端 hook 覆盖相同专家层时使用。R3 与 partial rollout 互斥。只开 R3 时，通过 `RELAX_REPLAY_REFERENCES=1` 选择 reference 传输，该模式要求 colocate Megatron。
+R3 复用通用的 SGLang 专家采集和 Megatron top-k 重放路径。其他 MoE 模型可以在两端 hook 覆盖相同专家层时使用。R3 与 partial rollout 互斥。Megatron 的 colocate、fully async 和 hybrid 模式使用内置 SGLang 或 Agentic rollout 路径及本地 PP1 或外部 rollout 引擎时，`--use-rollout-routing-replay` 默认选择 reference 传输。Reference R3 要求 packed THD 和静态 CP，并关闭 combined 1F1B MoE overlap。三种模式下，其余已开启的 replay 类型也支持完整张量时，可以设置 `RELAX_REPLAY_REFERENCES=0` 让 R3 传输完整张量。
 
 Indexer replay 要求在线 colocate Megatron、packed THD、静态 CP 和零 indexer loss。它与多模态输入、fully async/hybrid、agentic/自定义 rollout、partial rollout、MTP/推测解码、hierarchical cache 和 combined-1f1b MoE overlap 互斥。Full activation recompute 必须使用 uniform 方法。
 
 Keye replay 可以省略 `--dsa-indexer-loss-coeff`，也可以显式设为 `0`。旧 Keye checkpoint 如果保存了可训练 indexer 的优化器状态，切到冻结 indexer 的 replay 时需用 `--no-load-optim` 跳过旧优化器状态，随后保存采用新布局的 checkpoint。
 
-Multimodal embedding replay 要求配置多模态输入映射，且只能有一个负责输入的 pipeline chunk。它也与 agentic rollout、Slime router 和 OPD 互斥。多模态运行时保持 indexer replay 关闭。
+Multimodal embedding replay 要求配置多模态输入映射、单个负责输入的 pipeline chunk，以及本地启动并安装采集 hook 的 SGLang engine。它与外部或自定义 rollout 引擎、Prefill/Decode 分离、agentic rollout、Slime router 和 OPD 互斥。多模态运行时保持 indexer replay 关闭。
 
 需要使用带有 SGLang capture 和 Megatron 集成 patch 的兼容 Relax 训练镜像。运行时适配器安装进程内 hook，单独更新仓库源码不能补齐镜像中缺失的引擎 API。专用 bitmap attention 算子本身不需要额外修改 Megatron 源码。
 

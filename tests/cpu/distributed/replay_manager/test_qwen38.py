@@ -204,6 +204,7 @@ def test_qsa_scheduler_capture_factory_maps_sparse_layers_and_both_token_paths(m
         get_parallel=lambda: SimpleNamespace(attn_tp_rank=0),
     )
     runner = module("sglang.srt.model_executor.model_runner", create_indexer_capturer=capture.create_indexer_capturer)
+    module("sglang.srt.model_executor", model_runner=runner)
     install_capture_patch()
     install_capture_patch()  # Repeated kind/worker registration must not double-capture.
     config = SimpleNamespace(

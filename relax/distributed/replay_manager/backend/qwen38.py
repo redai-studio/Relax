@@ -134,13 +134,12 @@ def replay_selection(indexer: Any, selection: Any) -> Any:
 def install_capture_patch() -> None:
     """Install before model construction; other model capturers are
     unchanged."""
-    import sys
-
+    from sglang.srt.model_executor import model_runner
     from sglang.srt.state_capturer import indexer_topk
 
-    if getattr(indexer_topk.create_indexer_capturer, "_relax_qsa_capture", False):
+    original_create = model_runner.create_indexer_capturer
+    if getattr(original_create, "_relax_qsa_capture", False):
         return
-    original_create = indexer_topk.create_indexer_capturer
 
     @wraps(original_create)
     def create(*, model_config: Any, num_tokens: int, max_running_requests: int, device: str) -> Any:
@@ -170,11 +169,7 @@ def install_capture_patch() -> None:
         )
 
     create._relax_qsa_capture = True
-    indexer_topk.create_indexer_capturer = create
-    # Some SGLang versions imported the factory before scheduler hook setup.
-    runner = sys.modules.get("sglang.srt.model_executor.model_runner")
-    if runner is not None:
-        runner.create_indexer_capturer = create
+    model_runner.create_indexer_capturer = create
 
     def wrap_select(original: Any, position_arg: int) -> Any:
         @wraps(original)

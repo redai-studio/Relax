@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -123,7 +124,8 @@ def test_mm_request_marker_is_absent_in_evaluation():
     assert producer.request_options(evaluation=True) == {}
 
 
-def test_mm_ingress_checks_grid_and_sends_only_metadata(capture):
+@pytest.mark.parametrize("use_reference_policy", [False, True])
+def test_mm_ingress_keeps_pixels_only_for_reference_policy(capture, use_reference_policy):
     runtime, store, _ = capture
     rid, image = REQUEST_PREFIX + "ingress", item()
     runtime.bind(rid, SimpleNamespace(mm_items=[image]))
@@ -133,9 +135,12 @@ def test_mm_ingress_checks_grid_and_sends_only_metadata(capture):
         tokens=[1, 2],
         multimodal_train_inputs={"pixel_values": torch.ones(16, 3), "image_grid_thw": torch.tensor([[1, 4, 4]])},
     )
-    result = accept_mm_response(sample, {META_FIELD: entries})
-    assert result == {"version": 1, "media": entries}
-    assert set(sample.multimodal_train_inputs) == {"image_grid_thw"}
+    manager = ReplayManager(config=store.config)
+    producer = SGLangProducer(manager, frozenset({"mm_embedding"}))
+    producer.accept_response(sample, {META_FIELD: entries}, SimpleNamespace(use_kl_loss=use_reference_policy))
+    assert sample.rollout_replay_refs["mm_embedding"] == {"version": 1, "media": entries}
+    assert ("pixel_values" in sample.multimodal_train_inputs) == use_reference_policy
+    torch.testing.assert_close(sample.multimodal_train_inputs["image_grid_thw"], torch.tensor([[1, 4, 4]]))
     sample.multimodal_train_inputs["image_grid_thw"] = torch.tensor([[1, 8, 4]])
     with pytest.raises(ValueError, match="grids differ"):
         accept_mm_response(sample, {META_FIELD: entries})
@@ -159,13 +164,14 @@ def test_mm_capture_chunks_media_larger_than_publication_budget(capture):
     release_media_entries(store, entries)
 
 
-def test_mm_sglang_hooks_defer_runtime_and_emit_parked_completion_once(monkeypatch, capture, request):
+@pytest.mark.parametrize("first", ["media-only", "media", "moe"])
+def test_mm_sglang_hooks_wait_for_all_references_and_emit_once(monkeypatch, capture, request, first):
     import sys
     from concurrent.futures import Future
     from types import ModuleType
 
-    from relax.distributed.replay_manager.backend import mm_sglang
-    from relax.distributed.replay_manager.backend.mm_sglang import install_capture_patch
+    from relax.distributed.replay_manager.backend import mm_sglang, sglang
+    from relax.distributed.replay_manager.ref_data import ReplayRef
 
     modules = {}
     for name in (
@@ -173,6 +179,9 @@ def test_mm_sglang_hooks_defer_runtime_and_emit_parked_completion_once(monkeypat
         "sglang.srt",
         "sglang.srt.managers",
         "sglang.srt.runtime_context",
+        "sglang.srt.state_capturer",
+        "sglang.srt.state_capturer.routed_experts",
+        "sglang.srt.managers.io_struct",
         "sglang.srt.managers.mm_schedule",
         "sglang.srt.managers.mm_utils",
         "sglang.srt.managers.schedule_batch",
@@ -192,6 +201,8 @@ def test_mm_sglang_hooks_defer_runtime_and_emit_parked_completion_once(monkeypat
         raise AssertionError("Parallel runtime was read during hook installation")
 
     modules["sglang.srt.runtime_context"].get_parallel = not_initialized
+    capturer_module = modules["sglang.srt.state_capturer.routed_experts"]
+    capturer_module.RoutedExpertsCapturer = type("Capturer", (), {"on_forward_end": lambda self: None})
     schedule = modules["sglang.srt.managers.mm_schedule"]
     for name in (
         "_batch_encode_per_image_misses",
@@ -204,6 +215,9 @@ def test_mm_sglang_hooks_defer_runtime_and_emit_parked_completion_once(monkeypat
 
     class Req:
         def set_finish_with_abort(self):
+            return None
+
+        def reset_for_retract(self):
             return None
 
     class Streamer:
@@ -224,6 +238,16 @@ def test_mm_sglang_hooks_defer_runtime_and_emit_parked_completion_once(monkeypat
             return {}
 
     class Scheduler:
+        max_running_requests = 2
+
+        def _maybe_collect_routed_experts(self, req):
+            raise AssertionError("Native capture ran for an explicit publication")
+
+        def process_batch_result_prefill(self, batch, result):
+            return None
+
+        process_batch_result_decode = process_batch_result_prefill
+
         def run_batch(self, batch):
             return None
 
@@ -244,54 +268,103 @@ def test_mm_sglang_hooks_defer_runtime_and_emit_parked_completion_once(monkeypat
             return True
 
     modules["sglang.srt.managers.schedule_batch"].Req = Req
-    modules["sglang.srt.managers.scheduler"].Scheduler = Scheduler
-    manager = SimpleNamespace(store=not_initialized)
-    install_capture_patch(manager)
-    # Streamer selection also occurs while Scheduler is being constructed.
-    assert issubclass(Scheduler().get_output_streamer_class(), Streamer)
+    modules["sglang.srt.managers.io_struct"].AbortReq = SimpleNamespace
+    scheduler_module = modules["sglang.srt.managers.scheduler"]
+    scheduler_module.Scheduler = Scheduler
+    scheduler_module.get_global_experts_capturer = lambda: None
+    monkeypatch.setattr(sglang, "replay_data_manager", sglang.replay_data_manager)
+    monkeypatch.setattr(sglang, "_scheduler_contract", lambda: (scheduler_module.__name__, "Scheduler", "_"))
+    manager = SimpleNamespace(uses_references=True, store=not_initialized)
+    monkeypatch.setenv("RELAX_REPLAY_ENGINE_PUBLISHER", '[0, "engine"]')
+    kinds = {"mm_embedding"} if first == "media-only" else {"mm_embedding", "moe"}
+    sglang.apply_sglang_patch(manager, kinds=frozenset(kinds))
     scheduler = Scheduler()
-    scheduler._relax_mm_pending = {"finished-mm": object()}
-    assert scheduler.flush_cache() is False
-    assert getattr(scheduler, "native_flushes", 0) == 0
-    scheduler._relax_mm_pending.clear()
-    scheduler._relax_replay_pending = {"finished-r3": object()}
-    assert scheduler.flush_cache() is False
-    assert getattr(scheduler, "native_flushes", 0) == 0
-    scheduler._relax_replay_pending.clear()
+    # SGLang chooses and constructs its streamer before parallel startup.
+    scheduler.output_streamer = scheduler.get_output_streamer_class()()
     assert scheduler.flush_cache() is True
-    assert scheduler.native_flushes == 1
 
     runtime, store, _ = capture
-    monkeypatch.setattr(mm_sglang, "MMCapture", lambda _: runtime)
+    monkeypatch.setattr(mm_sglang, "MMCapture", lambda *_, **_kwargs: runtime)
     manager.store = lambda: store
     parallel_ready = True
-    scheduler.max_running_requests = 2
-    scheduler.output_streamer = scheduler.get_output_streamer_class()()
-    rid = REQUEST_PREFIX + "overlap-completion"
-    runtime.bind(rid, SimpleNamespace(mm_items=[item()]))
-    publication = Future()
-    request.addfinalizer(publication.cancel)
-    runtime.requests[rid][0].future = publication
-    req = SimpleNamespace(rid=rid, finished_output=False, finished=lambda: True)
+    ref = ReplayRef(2, "a", "a", "0" * 32, "moe", 4, 3, 2, 2, "0" * 64)
+    emit = scheduler.output_streamer.stream_output
 
-    scheduler.output_streamer.stream_output([req], False)
-    assert rid in scheduler._relax_mm_pending
+    def pending_request(suffix):
+        req = SimpleNamespace(
+            rid=REQUEST_PREFIX + suffix,
+            multimodal_inputs=SimpleNamespace(mm_items=[item()]),
+            finished_output=False,
+            finished=lambda: True,
+        )
+        scheduler.run_batch(SimpleNamespace(reqs=[req]))
+        media = Future()
+        request.addfinalizer(media.cancel)
+        runtime.requests[req.rid][0].future = media
+        moe = None
+        if first != "media-only":
+            moe = Future()
+            req._relax_replay_finish = {"moe": moe}
+        emit([req], False)
+        return req, media, moe
+
+    req, media, moe = pending_request("overlap-completion")
+    entry = {"completed": req.rid}
+    if first == "media":
+        media.set_result(entry)
+    elif first == "moe":
+        moe.set_result(ref)
+    emit([req], False)
+    scheduler.process_input_requests()
     assert not scheduler.output_streamer.emitted
-    entry = {"completed": rid}
-    publication.set_result(entry)
-    # The overlap scheduler can output the same completed request before its
-    # next process-input/drain call. This must retire the parked output hold.
-    scheduler.output_streamer.stream_output([req], False)
-    assert scheduler.output_streamer.emitted == [{META_FIELD: [[entry]]}]
-    assert rid not in runtime.requests and not scheduler._relax_mm_pending
+    assert scheduler.flush_cache() is False
+    assert scheduler.native_flushes == 1
+
+    if not media.done():
+        media.set_result(entry)
+    if moe is not None and not moe.done():
+        moe.set_result(ref)
     scheduler.process_input_requests()
-    scheduler.output_streamer.stream_output([req], False)
-    # Drain must also tolerate an already-emitted entry in its snapshot, e.g.
-    # when an inner output/drain invocation emitted another parked request.
-    scheduler._relax_mm_pending[rid] = (req, False)
-    scheduler.process_input_requests()
-    assert not scheduler._relax_mm_pending
+    emit([req], False)
     assert scheduler.output_streamer.emitted == [{META_FIELD: [[entry]]}]
+    if moe is not None:
+        assert req.routed_experts == ref.to_dict()
+    assert not runtime.requests
+
+    cancelled, media, moe = pending_request("cancelled")
+    releases, aborted = [], []
+    scheduler.waiting_queue = []
+    scheduler.ipc_channels = SimpleNamespace(
+        send_to_tokenizer=SimpleNamespace(send_output=lambda message, req: aborted.append((message.rid, req)))
+    )
+    if moe is not None:
+        cancelled._relax_replay_streams = {"moe": SimpleNamespace(abort=lambda: releases.append("moe"))}
+    scheduler.abort_request(SimpleNamespace(rid=cancelled.rid, abort_all=False))
+    assert media.cancel()
+    assert not runtime.requests and aborted == [(cancelled.rid, cancelled)]
+    assert releases == ([] if moe is None else ["moe"])
+    assert scheduler.flush_cache() is True
+    emit([cancelled], False)
+    assert scheduler.output_streamer.emitted == [{META_FIELD: [[entry]]}]
+
+    if first in {"moe", "media"}:
+        failed, media_future, moe_future = pending_request("failed")
+        publication = store.begin_publication(kind="moe", layers=1, topk=1)
+        publication.append(1, lambda _: np.zeros((1, 1), dtype=np.int32))
+        route = publication.finish([10, 11])
+        failed._relax_replay_streams = {"moe": publication}
+        if first == "moe":
+            moe_future.set_result(route)
+            media_future.set_exception(RuntimeError("media failed"))
+        else:
+            media_entry = runtime.publisher.publish("a" * 64, np.zeros((4, 5120), dtype=np.uint8), [1, 4, 4])
+            media_future.set_result(media_entry)
+            moe_future.set_exception(RuntimeError("route failed"))
+        with pytest.raises(RuntimeError, match="failed"):
+            scheduler.process_input_requests()
+        runtime._worker.submit(lambda: None).result(timeout=5)
+        assert not runtime.requests and not capture[2].state["objects"]
+        assert scheduler.output_streamer.emitted == [{META_FIELD: [[entry]]}]
 
 
 def test_mm_video_frame_spans_and_repeated_images_keep_media_occurrences(capture):

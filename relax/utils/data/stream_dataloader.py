@@ -478,13 +478,9 @@ def _broadcast_routed_experts(
         is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
 
         # --- Step 0: CP broadcast (cp_rank==0 -> others in each CP group) ---
-        # Only the (TP=0, PP=0) CP group needs this: it fans data from
-        # CP=0 to all CP peers.  Other CP groups are skipped — their
-        # ranks receive data later via the PP and TP broadcasts (the
-        # PP/TP source ranks already have data from this CP step).
-        # All members of a CP group share the same TP/PP rank, so the
-        # guard is uniform within each group — no hang risk.
-        if not cp_trivial and is_tp_rank0 and is_pp_rank0:
+        # Async stages fetch independently on TP0/CP0. When PP broadcasts
+        # are enabled, only stage zero fetches the original CPU tensor.
+        if not cp_trivial and is_tp_rank0 and (not broadcast_pp or is_pp_rank0):
             cp_group = mpu.get_context_parallel_group()
             cp_src_global = dist.get_global_rank(cp_group, 0)
             tensor = _bcast_unknown_shape(tensor, is_cp_rank0, cp_src_global, cp_group)

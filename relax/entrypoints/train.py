@@ -23,7 +23,8 @@ try_import_telemetry_hook()
 from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
 from relax.distributed.replay_manager import replay_data_manager, rollout_kinds  # noqa: E402
-from relax.distributed.replay_manager.config import validate_reference_training  # noqa: E402
+from relax.distributed.replay_manager.config import default_reference_r3, validate_reference_training  # noqa: E402
+from relax.distributed.replay_manager.core import enable_reference_replay  # noqa: E402
 from relax.utils.agentic_obs.run_hooks import RunRecorder  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
@@ -202,8 +203,10 @@ def main(args):
         with open(os.path.join(cur_file_dir, "configs/env.yaml")) as file:
             runtime_env = yaml.safe_load(file)
 
-        runtime_env = post_process_env(args, runtime_env)
+        if replay_data_manager.uses_references or default_reference_r3(args):
+            enable_reference_replay()
         validate_reference_training(args)
+        runtime_env = post_process_env(args, runtime_env)
         replay_data_manager.initialize(kinds=rollout_kinds(args))
         runtime_env.setdefault("env_vars", {})["RELAX_REPLAY_REGISTRATION"] = json.dumps(
             replay_data_manager.export_registration()

@@ -31,7 +31,7 @@ from relax.models.keye_vl2.topk import dsa_topk_indices
 from relax.models.keye_vl2.vision import build_vision, image_features
 
 from .ops import expert_forward, paged_decode, paged_scores, rope
-from .replay import install_indexer_capturer
+from .replay import active_capturer, install_indexer_capturer
 
 
 try:
@@ -184,9 +184,7 @@ class KeyeAttention(Qwen3MoeAttention):
             req_to_token = req_to_token[forward_batch.req_pool_indices]
         else:
             raise ValueError("Keye reference rollout supports extend/decode only")
-        from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-
-        capturer = get_global_indexer_capturer()
+        capturer = active_capturer()
         for batch_index, (length, query_length) in enumerate(zip(lengths, query_lengths)):
             length = int(length)  # CPU metadata, never a GPU synchronization.
             slots = req_to_token[batch_index, :length].long()

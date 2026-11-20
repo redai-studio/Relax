@@ -118,13 +118,14 @@ def test_nonfinite_delivery_policy_reaches_training_workers(monkeypatch):
     assert env["OMP_NUM_THREADS"] == "24"
 
 
-def test_indexer_cli_delivery_replaces_stale_worker_mode_and_store_identity(monkeypatch):
+@pytest.mark.parametrize("flag", ["use_rollout_indexer_replay", "use_rollout_routing_replay"])
+def test_replay_delivery_replaces_stale_worker_mode_and_store_identity(monkeypatch, flag):
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
     monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "abcd")
     monkeypatch.setenv("RELAX_REPLAY_CAPACITY_MB", "777")
     monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
     args = _make_args()
-    args.use_rollout_indexer_replay = True
+    setattr(args, flag, True)
     configured = {
         "RELAX_REPLAY_REFERENCES": "0",
         "RELAX_REPLAY_RUN_ID": "ffff",

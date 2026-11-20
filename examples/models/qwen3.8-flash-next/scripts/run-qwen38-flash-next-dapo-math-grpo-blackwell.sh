@@ -27,8 +27,8 @@
 # SAVE_DIR: persistent checkpoint root, accessible on all nodes.
 # RAY_ADDRESS: existing cluster GCS address; submit from the Ray head via its local dashboard.
 # Resume: keep SAVE_DIR and EXP_NAME unchanged; new experiment: change EXP_NAME.
-# Default: 100 updates without checkpoint saving.
-# Set SAVE_INTERVAL to a positive value only when checkpoint saving is requested.
+# The 32-GPU preset runs 100 updates without checkpoint saving by default.
+# Other presets run 200 updates and save every 50 (16 GPUs) or 100 updates.
 # REPLA_QSA=1 enables QSA reference replay for the 32-GPU preset; defaults to 0.
 # Ray submission blocks by default; set RAY_NO_WAIT=1 only for nonblocking submission.
 # CPU_OFFLOAD: optimizer CPU offload, 1=on / 0=off; defaults to on for 16 GPUs, off for >16.
@@ -145,8 +145,15 @@ fi
 # Reuse the example's full 48-layer architecture and Bridge defaults.
 source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 
-# Use the mixed Flash/Flex/Grouped QSA path for the 32-GPU CP1 preset.
+DEFAULT_NUM_ROLLOUT=200
+DEFAULT_SAVE_INTERVAL=$((TOTAL_GPUS == 16 ? 50 : 100))
+TOKEN_BUDGET=16384
+
+# Keep the same 32-GPU preset for the replay-on/off comparison.
 if [ "${TOTAL_GPUS}" = 32 ]; then
+    DEFAULT_NUM_ROLLOUT=100
+    DEFAULT_SAVE_INTERVAL=0
+    TOKEN_BUDGET=131072
     export RELAX_QWEN38_QSA_COMMUNITY_BACKEND=mixed
     export MCORE_QSA_SPARSE_BACKEND=id_sparse
     export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
@@ -182,8 +189,8 @@ export RELAX_QWEN38_FP32_ROUTER=1
 MODEL_NAME="${MODEL_NAME:-Qwen3.8-Flash-Next}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/dapo-math}"
 EXP_NAME="${EXP_NAME:-qwen38-flash-next-dapo-math-grpo-${TOTAL_GPUS}xgpu-blackwell-280g-colocate-t4p${PP_SIZE}c${CP_SIZE}e${EP_SIZE}}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-${DEFAULT_NUM_ROLLOUT}}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-${DEFAULT_SAVE_INTERVAL}}"
 now=$(date "+%Y%m%d-%H%M%S")
 
 # First launch initializes from HF; subsequent launches restore training state.
@@ -260,7 +267,7 @@ PERF_ARGS=(
     --micro-batch-size 1
     --use-dynamic-batch-size
     # Dynamic microbatch token budget per GPU.
-    --max-tokens-per-gpu 131072
+    --max-tokens-per-gpu "${TOKEN_BUDGET}"
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1

@@ -17,6 +17,126 @@ from relax.distributed.replay_manager.storage import TQBodyBackend, TQReplayStor
 from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
 
 
+def test_engine_replacement_reclaims_acknowledged_unsealed_replay():
+    body = MemoryBody()
+    rows = np.array([[1], [2]], dtype=np.int32)
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, capacity_bytes=3 * rows.nbytes)
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+
+    old, survivor, replacement = (0, "old"), (1, "survivor"), (0, "replacement")
+    store.invoke("register_engine_publisher", *old)
+    store.invoke("register_engine_publisher", *survivor)
+
+    def publish(kind, publisher):
+        publication = store.begin_publication(kind=kind, layers=1, topk=1, engine_publisher=publisher)
+        publication.append(len(rows), lambda _: rows.copy())
+        publication._futures[0].result(timeout=5)
+        return publication
+
+    try:
+        handed_off = publish("moe", old).finish([10, 11, 12])
+        store.attach([handed_off], "train_0")
+        orphan = publish("indexer", old)
+        live = publish("moe", survivor)
+
+        store.invoke("register_engine_publisher", *replacement)
+        assert f"{orphan.record}:0:0" not in body.blocks
+        assert f"{live.record}:0:0" in body.blocks
+        with pytest.raises(RuntimeError, match="generation has been retired"):
+            store.invoke("register_engine_publisher", *old)
+        with pytest.raises(RuntimeError, match="generation has been retired"):
+            store.begin_publication(kind="moe", layers=1, topk=1, engine_publisher=old)
+
+        # Rotation preserves an adopted response while the queue put completes.
+        store.commit([handed_off])
+        store.validate_partition([handed_off], "train_0")
+        assert f"{handed_off.record}:0:0" in body.blocks
+        renewed = publish("indexer", replacement)
+        assert f"{renewed.record}:0:0" in body.blocks
+    finally:
+        store.retire_partition("train_0")
+        store.close_run()
+
+
+def test_engine_replacement_waits_for_sealed_reference_handoff():
+    body = MemoryBody()
+    rows = np.array([[1], [2]], dtype=np.int32)
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, capacity_bytes=rows.nbytes)
+    store = TQReplayStorage(config, inventory=ReplayInventory(config, body.delete))
+    store._backend = body
+    old, replacement = (0, "old"), (0, "replacement")
+    store.invoke("register_engine_publisher", *old)
+
+    try:
+        publication = store.begin_publication(kind="moe", layers=1, topk=1, engine_publisher=old)
+        publication.append(len(rows), lambda _: rows.copy())
+        ref = publication.finish_async([10, 11, 12]).result(timeout=5)
+
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="sealed references without a confirmed handoff"):
+                store.invoke("register_engine_publisher", *replacement)
+        assert body.blocks
+
+        store.invoke("adopt_response", [ref], "rollout")
+        store.invoke("adopt_response", [ref], "rollout")
+        with pytest.raises(RuntimeError, match="another owner"):
+            store.invoke("adopt_response", [ref], "late")
+        store.invoke("discard", [ref], unadopted=True)
+        store.invoke("register_engine_publisher", *replacement)
+        assert body.blocks
+        store.attach([ref], "train_0")
+        store.commit([ref])
+    finally:
+        store.retire_partition("train_0")
+        store.close_run()
+
+
+def test_engine_replacement_fences_ambiguous_write_until_acknowledged():
+    body = MemoryBody()
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2)
+    store = TQReplayStorage(config, inventory=ReplayInventory(config, body.delete))
+    store._backend = body
+    old, replacement = (0, "old"), (0, "replacement")
+    store.invoke("register_engine_publisher", *old)
+    publication = store.begin_publication(kind="moe", layers=1, topk=1, engine_publisher=old)
+    entered, resume = Event(), Event()
+    write = body.write_many
+    delete = body.delete
+    deleted = Event()
+
+    def pause_write(keys, values):
+        write(keys, values)
+        entered.set()
+        assert resume.wait(5)
+
+    def note_delete(keys):
+        delete(keys)
+        deleted.set()
+
+    body.write_many = pause_write
+    store._inventory._delete = note_delete
+    try:
+        publication.append(2, lambda _: np.array([[1], [2]], dtype=np.int32))
+        assert entered.wait(5)
+        with pytest.raises(RuntimeError, match="unacknowledged writes; restart the replay run"):
+            store.invoke("register_engine_publisher", *replacement)
+        with pytest.raises(RuntimeError, match="unacknowledged writes; restart the replay run"):
+            store.invoke("register_engine_publisher", *replacement)
+        assert body.blocks and not deleted.is_set()
+
+        resume.set()
+        publication._futures[0].result(timeout=5)
+        assert deleted.is_set() and not body.blocks
+        with pytest.raises(RuntimeError, match="publication no longer exists"):
+            publication.finish([10, 11, 12])
+        store.invoke("register_engine_publisher", *replacement)
+    finally:
+        resume.set()
+        store.close_run()
+
+
 def test_parallel_publications_seal_independently_abort_drains_and_preserve_codecs():
     body = MemoryBody()
     config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, publication_bytes=32768)
@@ -30,7 +150,9 @@ def test_parallel_publications_seal_independently_abort_drains_and_preserve_code
     media_record = "d" * 32
     media_claim = store.invoke("claim_media", "a" * 64, [1, 2, 2], media_record, "image")
     publications.append(
-        store.begin_publication(kind="mm_embedding", layers=1, topk=2560, codec="bf16-raw-v1", record=media_record)
+        store.begin_publication(
+            kind="mm_embedding", layers=1, topk=2560, codec="bf16-raw-v1", record=media_record, media_hash="a" * 64
+        )
     )
     expected = [np.arange(2 * width, dtype=np.int32).reshape(2, width) for _, _, _, width in specs]
     expected.append(np.arange(5120, dtype=np.uint8).reshape(1, 5120))

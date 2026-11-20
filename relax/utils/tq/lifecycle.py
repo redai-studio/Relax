@@ -301,6 +301,19 @@ def _bounded_tq_init(conf: Any, deadline: float, *, role: str) -> None:
         raise error[0]
 
 
+async def clear_training_partition(client: Any, partition_id: str) -> Any:
+    """Retire replay bodies only after the corresponding sample partition
+    clears."""
+    from relax.utils.env import Envs
+
+    result = await client.async_clear_partition(partition_id=partition_id)
+    if Envs.RELAX_REPLAY_REFERENCES:
+        from relax.distributed.replay_manager import replay_data_manager
+
+        await replay_data_manager.on_partition_cleared(partition_id)
+    return result
+
+
 def attach_tq_client(
     conf: Any,
     *,
@@ -321,6 +334,12 @@ def attach_tq_client(
     if timeout is None:
         timeout = _resolve_attach_timeout()
     deadline = time.monotonic() + timeout
+    from relax.utils.env import Envs
+
+    if Envs.RELAX_REPLAY_REFERENCES:
+        from relax.distributed.replay_manager._tq_compat import install_tq_topology_cache
+
+        install_tq_topology_cache()
     _prepare_mooncake_runtime(conf)
     _await_controller_config(deadline)
     _bounded_tq_init(conf, deadline, role=role)

@@ -513,7 +513,7 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
             engine._init_normal(server_args, apply_policy_load_plan=False)
 
     assert engine.process is process
-    launch.assert_called_once()
+    launch.assert_called_once_with(SimpleNamespace(**server_args), reference_publication=False)
     engine.register_to_router.assert_called_once_with(bootstrap_port=9000)
 
 

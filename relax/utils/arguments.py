@@ -4285,10 +4285,17 @@ def relax_validate_args(args):
         validate_mm_embedding_replay_args(args, is_offline=is_offline)
 
     if getattr(args, "use_rollout_indexer_replay", False):
+        from relax.distributed.replay_manager.config import references_enabled
         from relax.distributed.replay_manager.core import enable_reference_replay
         from relax.distributed.replay_manager.validation import validate_indexer_replay_args
+        from relax.utils.misc import get_hf_config
 
-        enable_reference_replay()
+        if (
+            not os.environ.get("RELAX_REPLAY_REFERENCES", "").strip()
+            or references_enabled()
+            or getattr(get_hf_config(args.hf_checkpoint), "model_type", None) != "deepseek_v4"
+        ):
+            enable_reference_replay()
         validate_indexer_replay_args(args, is_offline=is_offline)
 
     validate_reward_side_kl(args, is_offline)

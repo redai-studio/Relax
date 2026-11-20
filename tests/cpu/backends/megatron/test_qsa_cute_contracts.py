@@ -72,6 +72,61 @@ def test_qsa_cp_layout_rejects_misaligned_physical_documents(operator_imports):
         operator_imports.validate_bounds((0, 10, 8), 8)
 
 
+def test_qsa_cute_mixed_accepts_bitmap_replay(operator_imports, monkeypatch):
+    from megatron.core.transformer.experimental_attention_variant.qsa import QSASelection
+
+    from relax.distributed.replay_manager import _bitmap
+    from relax.models.qwen3_8.ops.qsa_cute import adapter
+    from relax.models.qwen3_8.ops.qsa_mixed_ops import attention_for_selection, cudnn
+    from relax.models.qwen3_8.ops.qsa_mixed_ops.selection import bind_document_bounds
+
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "cute")
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", "3")
+    bounds = (0, 3, 15)
+    bitmap = torch.zeros(15, 1, dtype=torch.int32)
+    bitmap[-1, 0] = 1 << 2
+    expected_ids = torch.full((15, 512), -1, dtype=torch.int32)
+    expected_ids[-1, 0] = 2
+    selection = bind_document_bounds(
+        QSASelection(
+            doc_ids=torch.tensor([[0] * 3 + [1] * 12]),
+            positions=torch.tensor([list(range(3)) + list(range(12))]),
+            selected_bits=bitmap.view(torch.uint8),
+            bits_per_row=4,
+            bits_per_row_t=torch.tensor(4),
+            compress_ratio=4,
+            all_selected=False,
+            selected_ids=None,
+        ),
+        bounds,
+    )
+
+    # Only GPU kernel boundaries are substituted. The real mixed dispatcher
+    # and CuTe adapter still decode the representation and route each document.
+    def decode(data, source_start, destination_start, count, output):
+        assert (source_start, destination_start, count) == (0, 0, 12)
+        torch.testing.assert_close(data[:, 1:], bitmap[3:])
+        output.copy_(expected_ids[3:])
+
+    def flash(query, key, value, lengths, scale):
+        assert lengths == (3,)
+        return query + 1
+
+    def sparse(query, key, value, selected_ids, document_bounds, scale, query_positions):
+        assert document_bounds == bounds
+        torch.testing.assert_close(query_positions, torch.arange(3, 15))
+        torch.testing.assert_close(selected_ids, expected_ids[None, 3:])
+        return query + 2
+
+    monkeypatch.setattr(_bitmap, "decode_contiguous_into", decode)
+    monkeypatch.setattr(cudnn, "_flash", flash)
+    monkeypatch.setattr(adapter, "sparse_attention", sparse)
+    query = torch.zeros(1, 15, 24, 256, dtype=torch.bfloat16)
+    key = torch.zeros(1, 15, 2, 256, dtype=torch.bfloat16)
+    expected = torch.cat((query[:, :3] + 1, query[:, 3:] + 2), dim=1)
+    torch.testing.assert_close(attention_for_selection(query, key, key, selection, 1.0, is_thd=True), expected)
+
+
 @pytest.mark.parametrize("bounds,tp_size", [((0, 0, 16, 2072, 6192), 2), ((0, 16, 56), 4)])
 def test_cp_selector_tiles_restore_ids_with_empty_owners(operator_imports, bounds, tp_size):
     torch.manual_seed(97)

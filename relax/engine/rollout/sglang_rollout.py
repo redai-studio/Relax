@@ -65,6 +65,7 @@ from relax.utils.score_centering import (
     score_centering_enabled,
 )
 from relax.utils.timer import Timer
+from relax.utils.tq.lifecycle import clear_training_partition
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -484,17 +485,14 @@ async def generate(
     output = await _post_generation(args, state, url, payload, headers, evaluation)
     _t_generate = monotonic() - _t_generate_start
 
-    # Interrupted requests may have incomplete replay/logprob metadata. Handle
-    # them like pre-dispatch 499s before mutating the cached sample prefix.
-    if (
-        not evaluation
-        and args.use_rollout_routing_replay
-        and output["meta_info"].get("finish_reason", {}).get("type") == "abort"
-    ):
+    meta_info = output["meta_info"]
+    # An interrupted request can lack replay data and complete logprobs.
+    # Reuse the 499 path so the current prompt can be generated again.
+    if not evaluation and replay_producer.kinds and meta_info.get("finish_reason", {}).get("type") == "abort":
+        replay_producer.discard_response(meta_info)
         raise GenerationAborted
 
-
-    with replay_producer.response(output.get("meta_info", {}), evaluation=evaluation):
+    with replay_producer.response(meta_info, evaluation=evaluation):
         sc_result = None
         if sc_sampling_mode is not None:
             sc_result = parse_score_centering_response(
@@ -648,7 +646,10 @@ async def generate(
         if _t_mm_encode is not None:
             _timing["mm_encode"] = _t_mm_encode
         sample.metadata["_timing"] = _timing
+        if sample.rollout_replay_refs and not evaluation:
+            from uuid import uuid4
 
+            await replay_producer.adopt_response(replay_producer.response_refs(output["meta_info"]), uuid4().hex)
         return sample
 
 
@@ -868,7 +869,7 @@ async def generate_and_rm_group(
                     samples.extend(result if isinstance(result, list) else [result])
             for sample in samples:
                 try:
-                    replay_data_manager.discard([sample])
+                    await replay_data_manager.discard_async([sample])
                 except Exception as cleanup:
                     error.add_note(f"Replay group cleanup failed: {cleanup!r}")
         raise
@@ -941,7 +942,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             if references_enabled():
                 for task in done:
                     if not task.cancelled() and task.exception() is None:
-                        replay_data_manager.discard(task.result())
+                        await replay_data_manager.discard_async(task.result())
             continue
 
         # for partial rollout, collect the partial samples into the data buffer
@@ -1014,6 +1015,7 @@ async def _generate_rollout_async(
     # front (no longer derived from how much get_samples returned), so target_data_size
     # is fixed here instead of being mutated mid-loop.
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
+    carry_across_steps = args.fully_async or args.partial_rollout
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
     strict_fill_current = args.fully_async and args.max_staleness == 0
@@ -1119,7 +1121,7 @@ async def _generate_rollout_async(
             if not group_aborted:
                 dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
                 if not dynamic_filter_output.keep:
-                    replay_data_manager.discard(group)
+                    await replay_data_manager.discard_async(group)
                     metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                     state.remaining_batch_size -= 1
                     continue
@@ -1137,8 +1139,10 @@ async def _generate_rollout_async(
                         sample.abort_count += 1
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
-                if args.fully_async or args.partial_rollout:
+                if carry_across_steps:
                     aborted_samples.append(group)
+                else:
+                    await replay_data_manager.discard_async(group)
                 state.remaining_batch_size -= 1
             elif should_commit:
                 batch_to_transfer.append(group)
@@ -1300,7 +1304,10 @@ async def _generate_rollout_async(
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
     new_aborted, completed_protected = await abort(args, rollout_id)
-    for group in (new_aborted + completed_protected) if args.fully_async or args.partial_rollout else []:
+    for group in new_aborted + completed_protected:
+        if not carry_across_steps:
+            await replay_data_manager.discard_async(group)
+            continue
         # Groups completed during abort have not passed the main-loop filter.
         if (
             args.partial_rollout
@@ -1309,7 +1316,7 @@ async def _generate_rollout_async(
         ):
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
-                replay_data_manager.discard(group)
+                await replay_data_manager.discard_async(group)
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 continue
         aborted_samples.append(group)
@@ -1320,23 +1327,18 @@ async def _generate_rollout_async(
     else:
         logger.info(f"Rollout fully completed for rollout_id: {rollout_id}.")
 
-    # Record this step's current-partition deficit for the next step's backfill debt.
-    # committed_current = groups committed to rollout_id (current partition); the first
-    # num_old_samples committed went to rollout_id-1 (previous-partition backfill).
-    committed_current = 0 if is_final_backfill else max(total_transfer_samples - num_old_samples, 0)
-    if is_final_backfill:
-        state.last_step_current_deficit = 0
-    elif args.fully_async:
-        state.last_step_current_deficit = max(args.rollout_batch_size - committed_current, 0)
-    else:
-        state.last_step_current_deficit = 0
+    # The transfer tasks above have acknowledged these physical partition writes.
+    state.last_step_current_deficit = max(curr_target - committed_curr, 0) if args.fully_async else 0
 
     # Plain synchronous updates must generate every batch with the current
     # weights. Only explicitly off-policy modes may reuse completed surplus.
-    carried_surplus = oversample_surplus if args.fully_async or args.partial_rollout else []
+    carried_surplus = oversample_surplus if carry_across_steps else []
+    if not carry_across_steps:
+        for group in oversample_surplus:
+            await replay_data_manager.discard_async(group)
     aborted_samples.extend(carried_surplus)
     logger.info(
-        f"Rollout step {rollout_id} carry-over: committed_current={committed_current} "
+        f"Rollout step {rollout_id} carry-over: committed_current={committed_curr} "
         f"next_step_deficit={state.last_step_current_deficit} "
         f"oversample_surplus={len(carried_surplus)} "
         f"discarded_surplus={len(oversample_surplus) - len(carried_surplus)} "
@@ -1386,13 +1388,20 @@ async def _generate_rollout_async(
         _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")
-            await data_system_client.async_clear_partition(partition_id=f"train_{rollout_id}")
+            await clear_training_partition(data_system_client, f"train_{rollout_id}")
         # Cleanup
         CURRENT_ROLLOUT_BATCH.clear()
 
     state.reset()
 
-    return RolloutFnTrainOutput(samples=data, metrics=filter_metrics), aborted_samples
+    output = RolloutFnTrainOutput(
+        samples=data,
+        metrics=filter_metrics,
+        partition_complete=(committed_prev >= prev_target and committed_curr >= curr_target)
+        if args.fully_async
+        else None,
+    )
+    return output, aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}

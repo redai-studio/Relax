@@ -585,8 +585,7 @@ def setup_model_and_optimizer(
             for module in model_chunk.modules():
                 if hasattr(module, "routing_replay") and module.routing_replay is not None:
                     active_replays.append(module.routing_replay)
-        if active_replays:
-            RoutingReplay.all_routing_replays = active_replays
+        RoutingReplay.all_routing_replays = active_replays
 
     _patch_gdn_cu_seqlens_validation()
     if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
@@ -1305,9 +1304,20 @@ def train_one_step(
     args = get_args()
     from relax.distributed.replay_manager.backend.megatron import RoutingReplay
 
+    bind_routing_replay = None
+    if (
+        getattr(args, "use_rollout_routing_replay", False)
+        and args.fully_async
+        and not args.hybrid
+        and getattr(model[0], "role", None) == "actor"
+    ):
+        from relax.distributed.replay_manager.backend.megatron import streaming_moe_replay
+
+        bind_routing_replay = streaming_moe_replay(args, model, f"train_{rollout_id}")
+
     use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
     if use_indexer_replay:
-        from relax.utils.training.indexer_replay import IndexerReplay
+        from relax.distributed.replay_manager.backend.megatron import IndexerReplay
 
     # Trajectory-replay capture: open a per-step accumulator (no-op unless
     # capture is enabled and this step is selected).
@@ -1389,6 +1399,11 @@ def train_one_step(
                     "values",
                     "advantages",
                     "returns",
+                    *(
+                        ["rollout_replay_refs" if Envs.RELAX_REPLAY_REFERENCES else "rollout_routed_experts"]
+                        if bind_routing_replay is not None
+                        else []
+                    ),
                     "rollout_log_probs",
                     "rollout_topk_token_ids",
                     "rollout_topk_log_probs",
@@ -1404,6 +1419,8 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
+        if bind_routing_replay is not None:
+            bind_routing_replay(model, batch)
         note_microbatch_tokens(batch.get("total_lengths"))
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
@@ -1596,6 +1613,8 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    if bind_routing_replay is not None:
+        RoutingReplay.clear_all()
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1789,11 +1808,18 @@ def train(
     if is_data_iterator:
         for iterator in data_iterator:
             iterator.reset()
+    elif len(data_iterator) > 1 and all(loader is data_iterator[0] for loader in data_iterator):
+        from itertools import tee
+
+        # The fixed TQ loader has one consuming cursor. VPP chunks must see the
+        # same physical rows, and get_batch rewrites each chunk's batch dict.
+        def chunk_batches(iterator):
+            for batch, meta in iterator:
+                yield batch.copy(), meta
+
+        data_iterator = [chunk_batches(it) for it in tee(iter(data_iterator[0]), len(data_iterator))]
     else:
-        data_iter = []
-        for iterator in data_iterator:
-            data_iter.append(iter(iterator))  # type: ignore
-        data_iterator = data_iter
+        data_iterator = [iter(loader) for loader in data_iterator]
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()

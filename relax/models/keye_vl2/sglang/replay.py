@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from relax.distributed.replay_manager.codecs import KEYE_BITMAP
-from relax.models.keye_vl2.replay import INDEXER_TOPK, capture_rows
+from relax.models.keye_vl2.replay import INDEXER_TOPK
 from relax.utils.logging_utils import get_logger
 
 
@@ -62,20 +62,11 @@ def install_indexer_capturer() -> None:
     model_runner.create_indexer_capturer = create
 
 
-def capture(layer_id: int, indices: torch.Tensor, valid: torch.Tensor) -> None:
+def active_capturer() -> "KeyeBitmapCapturer | None":
     from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 
     capturer = get_global_indexer_capturer()
-    if capturer is not None:
-        capturer.capture(layer_id=layer_id, topk_indices=capture_rows(indices, valid))
-
-
-def capture_compacted(layer_id: int, indices: torch.Tensor, counts: torch.Tensor) -> None:
-    from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-
-    capturer = get_global_indexer_capturer()
-    if capturer is not None:
-        capturer.capture_compacted(layer_id, indices, counts)
+    return capturer if isinstance(capturer, KeyeBitmapCapturer) else None
 
 
 class KeyeBitmapCapturer:

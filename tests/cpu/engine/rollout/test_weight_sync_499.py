@@ -84,6 +84,68 @@ async def test_routing_replay_abort_does_not_cache_logprob_placeholder(monkeypat
     np.testing.assert_array_equal(result.rollout_routed_experts, routes)
 
 
+@pytest.mark.parametrize("replay_field", ["missing", "null", "published"])
+async def test_reference_abort_preserves_prefix_and_releases_response(monkeypatch, replay_field):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_rollout_routing_replay=True,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
+        sglang_router_policy="round_robin",
+        custom_generate_function_path=None,
+        num_layers=1,
+        moe_router_topk=1,
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1, 2]),
+        processor=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
+    config = ReplayConfig(delivery="reference", run_id="a")
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    metadata = {"finish_reason": {"type": "abort"}}
+    if replay_field == "null":
+        metadata["routed_experts"] = None
+    if replay_field == "published":
+        publication = store.begin_publication(kind="moe", layers=1, topk=1)
+        publication.append(2, lambda _: np.array([[3], [4]], dtype=np.int32))
+        metadata["routed_experts"] = publication.finish([1, 2, 42]).to_dict()
+        assert body.blocks
+
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(
+        sglang_rollout,
+        "_post_generation",
+        AsyncMock(return_value={"meta_info": metadata, "output_ids": [42], "text": "aborted token"}),
+    )
+    sample = Sample(prompt="prompt", tokens=[1, 2], rollout_tokens=[1, 2])
+    try:
+        result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+        assert result.status == Sample.Status.ABORTED
+        assert result.tokens == result.rollout_tokens == [1, 2]
+        assert result.response_length == 0
+        assert result.rollout_replay_refs is None
+        assert not body.blocks and not inventory.snapshot()["objects"]
+    finally:
+        if replay_field == "published":
+            store._writer.close()
+
+
 def _status_error(status_code: int, *, body) -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "http://test/generate")
     if isinstance(body, dict):

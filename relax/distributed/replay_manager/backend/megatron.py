@@ -20,7 +20,6 @@ from ..config import references_enabled
 from ..consumer import (
     Consumer,
     ConsumerBatchLayout,
-    ConsumerChannelKey,
     ConsumerLayerBinding,
     ConsumerModelLayout,
     ConsumerReadSession,
@@ -28,8 +27,15 @@ from ..consumer import (
     ConsumerSource,
     ConsumerTensorCache,
 )
-from ..core import ConsumerConsumptionError, ConsumerPhase, ReplayManager, ReplayRegion, replay_data_manager
-from ..ref_data import REFERENCE_FIELD, ReplayRef
+from ..core import (
+    ConsumerChannel,
+    ConsumerConsumptionError,
+    ConsumerPhase,
+    ReplayManager,
+    ReplayRegion,
+    replay_data_manager,
+)
+from ..ref_data import REFERENCE_FIELD, MoERouteSpan, ReplayRef, moe_route_spans, selection_ref
 from ..validation import indexer_capture_layout
 
 
@@ -52,12 +58,14 @@ class MegatronConsumer(Consumer):
         batch: dict[str, Any],
         *,
         region: ReplayRegion | None = None,
+        cache: ConsumerTensorCache | None = None,
     ) -> ConsumerTensorCache:
         self.manager._ensure_open()
         if region is not None and region.manager is not self.manager:
             raise ValueError("Replay region belongs to another manager")
         # Actor retains full-tensor packing; share one cache across reference kinds.
-        cache = ConsumerTensorCache(self.manager.config.materialization_bytes)
+        if cache is None:
+            cache = ConsumerTensorCache(self.manager.config.materialization_bytes)
         if "moe" in self.kinds:
             actor.fill_routing_replay(
                 data_iterator,
@@ -164,6 +172,7 @@ def pack_token_rows(
     pad: Callable[[torch.Tensor, int], torch.Tensor],
     *,
     sequence_parallel: bool,
+    has_mm_inputs: bool = False,
 ) -> torch.Tensor:
     """The existing token layout, independent of what each row contains."""
     from megatron.core import mpu
@@ -172,7 +181,8 @@ def pack_token_rows(
 
     tp = mpu.get_tensor_model_parallel_world_size()
     cp = mpu.get_context_parallel_world_size()
-    padded = maybe_padded_total_lengths(lengths, args.qkv_format, getattr(args, "is_vl_model", False))
+    unsplit = has_mm_inputs or getattr(args, "is_vl_model", False) or getattr(args, "uses_unsplit_forward", False)
+    padded = maybe_padded_total_lengths(lengths, args.qkv_format, unsplit)
     if padded is not None:
         rows = [pad(value, padded[i] - value.shape[0]) for i, value in enumerate(rows)]
         packed = torch.cat([slice_with_cp(value, pad) for value in rows], dim=0)
@@ -202,29 +212,31 @@ def consumer_batch_layout(
     lengths: list[int],
     *,
     sequence_parallel: bool,
+    sample_spans: list[tuple[MoERouteSpan, ...]] | None = None,
+    has_mm_inputs: bool = False,
 ) -> ConsumerBatchLayout:
     import numpy as np
 
-    if any(m.rows != length - 1 for m, length in zip(refs, lengths, strict=True)):
-        raise ValueError("Replay reference row count differs from training tokens")
     canonical = {}
-    indices = []
     for index, ref in enumerate(refs):
         if len(ref.record) != 32 or ref.rows >= 2**31 or len(bytes.fromhex(ref.record)) != 16:
             raise ValueError("Replay record cannot be represented by token handles")
         if ref.record in canonical:
-            previous, first = canonical[ref.record]
+            previous, _ = canonical[ref.record]
             if previous != ref:
                 raise ValueError("Conflicting manifests for one replay record")
         else:
             canonical[ref.record] = (ref, index)
-            first = index
-        indices.append(first)
+    if sample_spans is None:
+        sample_spans = [(MoERouteSpan(ref, 0, ref.rows),) for ref in refs]
     rows = []
-    for index, ref in zip(indices, refs, strict=True):
-        coordinates = np.empty((ref.rows, 2), dtype=np.int64)
-        coordinates[:, 0] = index
-        coordinates[:, 1] = np.arange(ref.rows, dtype=np.int64)
+    for spans, length in zip(sample_spans, lengths, strict=True):
+        if not spans or spans[-1].stop != length - 1:
+            raise ValueError("Replay reference row count differs from training tokens")
+        coordinates = np.empty((length - 1, 2), dtype=np.int64)
+        for span in spans:
+            coordinates[span.start : span.stop, 0] = canonical[span.ref.record][1]
+            coordinates[span.start : span.stop, 1] = np.arange(span.source_start, span.ref.rows, dtype=np.int64)
         rows.append(torch.from_numpy(coordinates))
 
     def pad(value: torch.Tensor, count: int) -> torch.Tensor:
@@ -235,44 +247,88 @@ def consumer_batch_layout(
         padding[:, 1] = np.arange(count, dtype=np.int64)
         return torch.cat((value, torch.from_numpy(padding)), dim=0)
 
-    coordinates = pack_token_rows(args, rows, lengths, pad, sequence_parallel=sequence_parallel).numpy()
+    coordinates = pack_token_rows(
+        args, rows, lengths, pad, sequence_parallel=sequence_parallel, has_mm_inputs=has_mm_inputs
+    ).numpy()
     return ConsumerBatchLayout.from_coordinates(coordinates)
 
 
-def _local_layer_ranges(actor: Any) -> Iterator[tuple[Any, range]]:
+def _local_layer_ranges(models: Any) -> Iterator[tuple[Any, range]]:
     from megatron.core.transformer.transformer_block import get_num_layers_to_build
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+    from megatron.core.utils import get_model_config
 
-    for vp_stage, model in enumerate(actor.model):
-        config = model.module.config
+    for vp_stage, model in enumerate(models):
+        config = get_model_config(model)
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
         yield config, range(offset, offset + get_num_layers_to_build(config, vp_stage=vp_stage))
 
 
-def _moe_layout(actor: Any) -> ConsumerModelLayout:
-    local_layers = []
-    for config, layers in _local_layer_ranges(actor):
-        frequency = config.moe_layer_freq
-        local_layers.extend(
-            layer
-            for layer in layers
-            if (layer % frequency == 0 if isinstance(frequency, int) else frequency[layer] != 0)
-        )
-    routers = RoutingReplay.all_routing_replays
-    if len(local_layers) != len(routers):
-        raise ValueError("MoE reference layout does not match registered routers")
-    bindings = tuple(
-        ConsumerLayerBinding(layer, router.manager, router.channel_key)
-        for layer, router in zip(local_layers, routers, strict=True)
+def local_moe_routers(models: Any, num_layers: int) -> Iterator[tuple[int, int, "RoutingReplay"]]:
+    """Match captured columns to the final global layer numbers assigned by
+    Megatron."""
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    seen = set()
+    for chunk, model in enumerate(models):
+        for module in model.modules():
+            replay = getattr(module, "routing_replay", None)
+            if getattr(module, "is_mtp_layer", False):
+                continue
+            if replay is None:
+                if isinstance(module, TopKRouter):
+                    raise RuntimeError("Megatron MoE router has no Relax routing replay hook")
+                continue
+            layer = module.layer_number - 1
+            if not 0 <= layer < num_layers or layer in seen:
+                raise ValueError(f"Invalid or duplicate MoE replay layer number: {module.layer_number}")
+            seen.add(layer)
+            yield chunk, layer, replay
+
+
+def bind_full_moe_batch(args: Any, batch: dict, routers: list, tokens: list[torch.Tensor]) -> None:
+    """Bind dense capture rows with exactly the same token packing as
+    references."""
+    if not routers:
+        return
+    rows = [
+        row.reshape(row.shape[0], args.num_layers, args.moe_router_topk) for row in batch["rollout_routed_experts"]
+    ]
+    lengths = [len(sample) for sample in tokens]
+    if any(row.shape[0] != size - 1 for row, size in zip(rows, lengths, strict=True)):
+        raise ValueError("MoE replay row count differs from training tokens")
+
+    def pad(value: torch.Tensor, count: int) -> torch.Tensor:
+        shape = (count, args.num_layers, args.moe_router_topk)
+        padding = torch.arange(count * args.num_layers * args.moe_router_topk, device=value.device, dtype=value.dtype)
+        return torch.cat((value, padding.reshape(shape) % args.num_experts))
+
+    packed = pack_token_rows(
+        args,
+        rows,
+        lengths,
+        pad,
+        sequence_parallel=args.sequence_parallel,
+        has_mm_inputs=batch.get("multimodal_train_inputs") is not None,
     )
-    return ConsumerModelLayout("moe", actor.args.moe_router_topk, actor.args.num_layers, bindings)
+    for _, layer, router in routers:
+        router.record(packed[:, layer])
+
+
+def _moe_layout(args: Any, models: Any, *, chunk: int | None = None) -> ConsumerModelLayout:
+    bindings = tuple(
+        ConsumerLayerBinding(layer, router.channel)
+        for vp_stage, layer, router in local_moe_routers(models, args.num_layers)
+        if chunk is None or vp_stage == chunk
+    )
+    return ConsumerModelLayout("moe", args.moe_router_topk, args.num_layers, bindings)
 
 
 def _indexer_layout(actor: Any) -> ConsumerModelLayout:
     local_layers = []
     topk = None
     capture_layers = None
-    for config, layers in _local_layer_ranges(actor):
+    for config, layers in _local_layer_ranges(actor.model):
         model_topk, model_layers = indexer_capture_layout(config)
         if topk is not None and (topk != model_topk or capture_layers != model_layers):
             raise ValueError("Inconsistent Indexer capture layout")
@@ -284,8 +340,7 @@ def _indexer_layout(actor: Any) -> ConsumerModelLayout:
     for model in actor.model:
         model.module.config.relax_use_indexer_replay = True
     bindings = tuple(
-        ConsumerLayerBinding(slot, IndexerReplay._layers[layer + 1].manager, IndexerReplay._layers[layer + 1].key)
-        for layer, slot in local_layers
+        ConsumerLayerBinding(slot, IndexerReplay._layers[layer + 1].channel) for layer, slot in local_layers
     )
     return ConsumerModelLayout("indexer", topk, len(capture_layers), bindings)
 
@@ -304,6 +359,71 @@ def _bind_microbatch(
     bind_read_task(ConsumerReadTask(layout, batch_layout, microbatch, device, num_experts), reader, cache)
 
 
+def _bind_reference_batch(
+    args: Any,
+    batch: dict,
+    tokens: list[torch.Tensor],
+    layout: ConsumerModelLayout,
+    readers: ReplayManager | ReplayRegion,
+    cache: ConsumerTensorCache,
+    device: torch.device,
+    microbatch: int,
+) -> None:
+    if not layout.bindings:
+        return
+    kind = layout.kind
+    if kind == "moe":
+        sample_spans = [moe_route_spans(ref[kind]) for ref in batch[REFERENCE_FIELD]]
+        refs = list(dict.fromkeys(span.ref for spans in sample_spans for span in spans))
+    else:
+        sample_spans = None
+        refs = [selection_ref(ref[kind]) for ref in batch[REFERENCE_FIELD]]
+    if any(ref.layers != layout.capture_layers or ref.topk != layout.topk for ref in refs):
+        raise ValueError("Replay reference shape does not match model")
+    batch_layout = consumer_batch_layout(
+        args,
+        refs,
+        [len(row) for row in tokens],
+        sequence_parallel=kind == "moe" and args.sequence_parallel,
+        sample_spans=sample_spans,
+        has_mm_inputs=batch.get("multimodal_train_inputs") is not None,
+    )
+    with readers.reader(refs) as reader:
+        _bind_microbatch(
+            layout, reader, batch_layout, microbatch, device, args.num_experts if kind == "moe" else 0, cache
+        )
+
+
+def streaming_moe_replay(args: Any, models: Any, partition: str) -> Callable[[Any, dict], None]:
+    """Bind the current pipeline chunk after the schedule fetches its next
+    batch."""
+    if not replay_data_manager.uses_references:
+        routers = {id(model): [] for model in models}
+        for chunk, layer, router in local_moe_routers(models, args.num_layers):
+            routers[id(models[chunk])].append((chunk, layer, router))
+
+        def bind_full(model: Any, batch: dict) -> None:
+            bind_full_moe_batch(args, batch, routers[id(model)], batch["unconcat_tokens"])
+
+        return bind_full
+
+    layouts = {id(model): _moe_layout(args, models, chunk=chunk) for chunk, model in enumerate(models)}
+    region = replay_data_manager.region(partition)
+    cache = ConsumerTensorCache(replay_data_manager.config.materialization_bytes)
+    device = device_utils.make_current_torch_device()
+
+    next_microbatch = {model_id: 0 for model_id in layouts}
+
+    def bind(model: Any, batch: dict) -> None:
+        model_id = id(model)
+        _bind_reference_batch(
+            args, batch, batch["unconcat_tokens"], layouts[model_id], region, cache, device, next_microbatch[model_id]
+        )
+        next_microbatch[model_id] += 1
+
+    return bind
+
+
 def fill_reference_replay(
     actor: Any,
     data_iterator: list,
@@ -320,39 +440,20 @@ def fill_reference_replay(
     if cache is None:
         manager = region.manager if region is not None else (delivery_manager or replay_data_manager)
         cache = ConsumerTensorCache(manager.config.materialization_bytes)
-    layout = _moe_layout(actor) if kind == "moe" else _indexer_layout(actor)
+    layout = _moe_layout(actor.args, actor.model) if kind == "moe" else _indexer_layout(actor)
     device = device_utils.make_current_torch_device()
+    readers = region if region is not None else (delivery_manager or replay_data_manager)
     for iterator in data_iterator:
         iterator.reset()
     try:
-        # Hybrid prepares several sub-batches before training. Append exactly as
-        # the full-tensor RoutingReplay.record path does; do not reset its cursors.
-        first = layout.bindings[0] if layout.bindings else None
-        offset = len(first.manager._channel(first.channel).entries) if first is not None else 0
-        for microbatch in range(offset, offset + sum(num_microbatches)):
-            batch = data_iterator[0].get_next([REFERENCE_FIELD, "tokens"])
-            refs = [ReplayRef.from_dict(ref[kind]) for ref in batch[REFERENCE_FIELD]]
-            if any(m.layers != layout.capture_layers or m.topk != layout.topk for m in refs):
-                raise ValueError("Replay reference shape does not match model")
-            batch_layout = consumer_batch_layout(
-                actor.args,
-                refs,
-                [len(tokens) for tokens in batch["tokens"]],
-                sequence_parallel=kind == "moe" and actor.args.sequence_parallel,
-            )
-            # All local layers share this microbatch's registered reader holds.
-            # Exiting the builder leaves the bound sources in charge of them.
-            readers = region if region is not None else (delivery_manager or replay_data_manager)
-            with readers.reader(refs) as reader:
-                _bind_microbatch(
-                    layout,
-                    reader,
-                    batch_layout,
-                    microbatch,
-                    device,
-                    actor.args.num_experts if kind == "moe" else 0,
-                    cache,
-                )
+        # Hybrid accumulates several forward sub-batches before a single training replay.
+        start = len(layout.bindings[0].channel.entries) if layout.bindings else 0
+        for microbatch in range(start, start + sum(num_microbatches)):
+            keys = [REFERENCE_FIELD, "tokens"]
+            if "multimodal_train_inputs" in getattr(data_iterator[0], "rollout_data", {}):
+                keys.append("multimodal_train_inputs")
+            batch = data_iterator[0].get_next(keys)
+            _bind_reference_batch(actor.args, batch, batch["tokens"], layout, readers, cache, device, microbatch)
     except BaseException as primary_error:
         try:
             if kind == "moe":
@@ -377,55 +478,53 @@ class RoutingReplay:
     phase = ConsumerPhase(environment=os.environ, key="ROUTING_REPLAY_STAGE")
 
     def __init__(self):
-        self.manager = ReplayManager(phase=self.phase)
-        self.channel_key = ConsumerChannelKey("moe", 0, "local_registration")
-        self._channel = self.manager.register_channel(self.channel_key)
+        self.channel = ConsumerChannel("moe")
         RoutingReplay.all_routing_replays.append(self)
 
     @property
     def top_indices_list(self) -> list[torch.Tensor]:
-        return self._channel.entries
+        return self.channel.entries
 
     @top_indices_list.setter
     def top_indices_list(self, entries: list[torch.Tensor]) -> None:
-        self._channel.entries = entries
-        self._channel.microbatch_ids = {}
+        self.channel.entries = entries
+        self.channel.microbatch_ids = {}
 
     @property
     def forward_index(self) -> int:
-        return self._channel.forward_index
+        return self.channel.forward_index
 
     @forward_index.setter
     def forward_index(self, value: int) -> None:
-        self._channel.forward_index = value
+        self.channel.forward_index = value
 
     @property
     def backward_index(self) -> int:
-        return self._channel.backward_index
+        return self.channel.backward_index
 
     @backward_index.setter
     def backward_index(self, value: int) -> None:
-        self._channel.backward_index = value
+        self.channel.backward_index = value
 
     def record(self, top_indices: torch.Tensor) -> None:
         # Exactly the original placement/copy policy for CPU and CUDA inputs.
         buf = torch.empty_like(top_indices, device="cpu", pin_memory=True)
         buf.copy_(top_indices)
-        self.manager.bind(self.channel_key, ConsumerRecord("moe", len(self.top_indices_list), buf))
+        self.channel.bind(ConsumerRecord("moe", len(self.top_indices_list), buf))
 
     def pop_forward(self):
-        values = self.manager.consume(self.channel_key, "replay_forward")
+        values = self.channel.consume("replay_forward")
         return values.to(device=device_utils.make_current_torch_device(), dtype=torch.long)
 
     def pop_backward(self):
-        values = self.manager.consume(self.channel_key, "replay_backward")
+        values = self.channel.consume("replay_backward")
         return values.to(device=device_utils.make_current_torch_device(), dtype=torch.long)
 
     def clear(self):
-        self.manager.clear()
+        self.channel.clear()
 
     def clear_forward(self):
-        self.manager.reset_forward(self.channel_key)
+        self.channel.reset_forward()
 
     @classmethod
     def set_stage(cls, stage: str) -> None:
@@ -538,30 +637,28 @@ def register_routing_replay(module):
 
 
 class _LayerIndexerReplay:
-    def __init__(self, layer_number: int, phase: ConsumerPhase) -> None:
-        self.manager = ReplayManager(phase=phase)
-        self.key = ConsumerChannelKey("indexer", layer_number - 1)
-        self._channel = self.manager.register_channel(self.key)
+    def __init__(self) -> None:
+        self.channel = ConsumerChannel("indexer")
 
     @property
     def entries(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        return self._channel.entries
+        return self.channel.entries
 
     @property
     def forward_index(self) -> int:
-        return self._channel.forward_index
+        return self.channel.forward_index
 
     @forward_index.setter
     def forward_index(self, value: int) -> None:
-        self._channel.forward_index = value
+        self.channel.forward_index = value
 
     @property
     def backward_index(self) -> int:
-        return self._channel.backward_index
+        return self.channel.backward_index
 
     @backward_index.setter
     def backward_index(self, value: int) -> None:
-        self._channel.backward_index = value
+        self.channel.backward_index = value
 
     def record(self, topk: torch.Tensor, row_valid: torch.Tensor) -> None:
         if topk.ndim != 2 or topk.dtype != torch.int32:
@@ -571,7 +668,7 @@ class _LayerIndexerReplay:
                 "indexer replay row-valid mask must be 1-D bool with the same row count as top-k, "
                 f"got topk={tuple(topk.shape)}, row_valid={tuple(row_valid.shape)}/{row_valid.dtype}"
             )
-        self.manager.bind(self.key, ConsumerRecord("indexer", len(self.entries), (topk, row_valid)))
+        self.channel.bind(ConsumerRecord("indexer", len(self.entries), (topk, row_valid)))
 
     def pop(
         self, stage: str, *, materialize: bool = True, microbatch_id: int | None = None
@@ -580,8 +677,8 @@ class _LayerIndexerReplay:
             raise ValueError(f"Cannot pop indexer replay in stage {stage!r}")
         index = self.forward_index if stage == "replay_forward" else self.backward_index
         try:
-            return self.manager.consume(
-                self.key, stage, advance_before_lookup=True, materialize=materialize, microbatch_id=microbatch_id
+            return self.channel.consume(
+                stage, advance_before_lookup=True, materialize=materialize, microbatch_id=microbatch_id
             )
         except IndexError:
             if index < len(self.entries):
@@ -604,7 +701,7 @@ class IndexerReplay:
         cls._release_sources()
         cls._enabled = True
         cls._phase.set("fallthrough")
-        cls._layers = {number: _LayerIndexerReplay(number, cls._phase) for number in dict.fromkeys(layer_numbers)}
+        cls._layers = {number: _LayerIndexerReplay() for number in dict.fromkeys(layer_numbers)}
 
     @classmethod
     def is_enabled(cls) -> bool:
@@ -708,7 +805,7 @@ class IndexerReplay:
     def reset_forward(cls, require_consumed: bool = True) -> None:
         for layer_number, replay in cls._layers.items():
             try:
-                replay.manager.reset_forward(replay.key, require_consumed=require_consumed)
+                replay.channel.reset_forward(require_consumed=require_consumed)
             except ConsumerConsumptionError as exc:
                 raise RuntimeError(
                     f"Indexer layer {layer_number} consumed {exc.consumed}/{exc.recorded} "
@@ -719,7 +816,7 @@ class IndexerReplay:
     def finish_step(cls, expect_backward: bool) -> None:
         for layer_number, replay in cls._layers.items():
             try:
-                replay.manager.check_consumed(replay.key, expect_backward=expect_backward)
+                replay.channel.check_consumed(expect_backward=expect_backward)
             except ConsumerConsumptionError as exc:
                 phase = "training-forward" if exc.phase == "replay_forward" else "recompute-backward"
                 raise RuntimeError(
@@ -740,7 +837,7 @@ class IndexerReplay:
         error = None
         for layer in cls._layers.values():
             try:
-                layer.manager.release_sources()
+                layer.channel.release_sources()
             except Exception as exc:
                 error = error or exc
         if error is not None:

@@ -112,8 +112,9 @@ class RayTrainGroup:
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
-        # We cannot do routing replay for critic.
-        if self.args.use_routing_replay and self.role == "actor":
+        if self.args.use_routing_replay and (
+            self.role == "actor" or (self.role == "actor_fwd" and self.args.use_rollout_routing_replay)
+        ):
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
         actor_impl = _resolve_train_actor_class(self.args)

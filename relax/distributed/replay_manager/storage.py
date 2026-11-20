@@ -630,9 +630,6 @@ class TQReplayStorage:
         read = getattr(self._backend, "read_encoded", self._backend.read)
         return read(keys)
 
-    def remap_tokens(self, ref: ReplayRef, captured: list[int], training: list[int]) -> ReplayRef:
-        return self.invoke("remap_tokens", ref, captured, training)
-
     def attach(self, refs: list[ReplayRef], partition: str) -> None:
         if partition.startswith(BODY_PARTITION_PREFIX):
             raise ValueError("Replay sample partition cannot use the body namespace")
@@ -643,6 +640,19 @@ class TQReplayStorage:
 
     def discard(self, refs: list[ReplayRef]) -> None:
         self.invoke("discard", refs)
+
+    async def invoke_async(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if os.getpid() != self._pid:
+            raise RuntimeError("Replay transport must be constructed in the current process")
+        if self._inventory is not None:
+            return await asyncio.to_thread(self.invoke, method, *args, **kwargs)
+        registry = self._registry_handle
+        if registry is None:
+            registry = await asyncio.to_thread(self._registry)
+        return await getattr(registry, method).remote(*args, **kwargs)
+
+    async def discard_async(self, refs: list[ReplayRef]) -> None:
+        await self.invoke_async("discard", refs)
 
     def validate_partition(self, refs: list[ReplayRef], partition: str) -> None:
         self.invoke("validate_partition", refs, partition)

@@ -91,9 +91,10 @@ def paged_decode(
     selected = dsa_topk_indices(scores)
     ordered, counts = compact_indices(selected, selected < lengths[:, None])
     if layer_id is not None:
-        from .replay import capture_compacted
+        from .replay import active_capturer
 
-        capture_compacted(layer_id, ordered, counts)
+        if (capturer := active_capturer()) is not None:
+            capturer.capture_compacted(layer_id, ordered, counts)
     slots = table[requests.long()[:, None], ordered.long()].int().contiguous()
     return sparse_attention(query, key, value, slots, counts).flatten(1)
 

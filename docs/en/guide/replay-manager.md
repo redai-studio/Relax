@@ -39,6 +39,8 @@ Replay reuses Relax's resolved TQ connection; it does not start a second TQ clus
 
 A producer seals a record after its body writes finish. Queue publication attaches a partition hold, then transfers producer ownership after a successful sample write. Consumers acquire leases before reading. Retiring a sample partition does not delete a body still held by a reader. Releases drain pending reads before dropping leases; bodies become reclaimable after publisher, partition and reader ownership are gone. Global recovery creates a new replay run identity so stale references cannot cross into the restarted generation.
 
+When a rollout engine is replaced, its retired generation can no longer publish new records. Replacement reclaims acknowledged, unsealed bodies and preserves sealed references for in-flight responses and training. Unacknowledged writes prevent in-place recovery and require a new replay run.
+
 Token identity, kind, codec, layer and partition checks reject incompatible references. Channel cursors also detect missing or extra consumption during forward and recomputation. The manager owns these contracts; each model adapter owns capture placement, block coordinates and parallel-layout semantics.
 
 ## Enabling replay
@@ -49,9 +51,11 @@ Add the following to a supported online, colocated Megatron recipe:
 --use-rollout-indexer-replay
 ```
 
-This flag automatically enables `RELAX_REPLAY_REFERENCES=1`, allocates a run ID when needed, and forwards the reference environment to workers. There is no second reference-mode switch to configure.
+Indexer replay defaults to references. DeepSeek-V4 supports explicit full delivery. Keye and QSA require references.
 
-MoE replay is independently enabled with `--use-rollout-routing-replay`; `--use-routing-replay` controls training-side routing replay. `--optimize-routing-replay` selects the existing routing replay optimizations. These flags do not enable QSA. When indexer replay and rollout routing replay are combined, both kinds use the same reference infrastructure.
+A reference dump retains manifests for inspection. Debug and forge can reuse text samples with the corresponding replay kinds disabled. To replay the captured routes in another run, save the dump with full delivery. Multimodal samples need their original pixel tensors or a reference body from the same run.
+
+MoE replay is independently enabled with `--use-rollout-routing-replay`; `--use-routing-replay` controls training-side routing replay. `--optimize-routing-replay` selects the existing routing replay optimizations. These flags do not enable QSA. With reference delivery enabled, indexer replay and rollout routing replay share the same reference infrastructure.
 
 ### Frozen multimodal embedding replay
 
@@ -63,9 +67,11 @@ This flag also selects reference delivery automatically. The Qwen3.8 adapter req
 
 Capture occurs after the visual merger and before visual embeddings are combined with text embeddings. Newly computed features, embedding-cache hits, precomputed features and chunked prefill all refer to the complete media body. The deduplication key is the engine's image hash: the first published body is reused for that hash, without comparing subsequent feature values. Conflicting grid or modality metadata is rejected.
 
-The `bf16-raw-v1` codec transports the original BF16 bits as bytes, with no quantization. A body uses `N_visual × 2560 × 2` bytes: 1024 visual tokens occupy 5 MiB. Multiple responses reference the same body instead of each carrying a copy. The sample queue carries only references and layout metadata; raw pixel tensors are removed after their grids are validated. Existing TQ storage, reader leases and partition retirement manage ownership.
+The `bf16-raw-v1` codec transports the original BF16 bits as bytes, with no quantization. A body uses `N_visual × 2560 × 2` bytes: 1024 visual tokens occupy 5 MiB. Multiple responses share one body. The sample queue carries references and layout metadata. Runs with a KL reference policy also retain the pixel tensors so the reference forward can compute embeddings with its own vision weights. Existing TQ storage, reader leases and partition retirement manage ownership.
 
 Training loads the body on the input pipeline stage, reads once per tensor-parallel group and broadcasts to its peers. A bounded cache reuses embeddings for log-probability and training forwards; the original placeholder scatter, MRoPE and language-model gradients are preserved. Disabling the flag leaves the original visual computation path in use.
+
+A replacement rollout engine releases unfinished media claims and local cache leases from its predecessor. In-flight responses and queued training data keep their own holds. If a previous write is still unacknowledged, engine recovery reports an error so global recovery can rebuild the replay run and its TQ storage.
 
 ## Replay support by model
 
@@ -79,13 +85,13 @@ Training loads the body on the input pipeline stage, reads once per tensor-paral
 | DeepSeek-V4 (`deepseek_v4`) | Supported via MoE routing. | **DSA supported.** CP>1, TP1, SP off, contiguous partitioning and allgather-CP. Enable rollout DP attention. Captures configured C4 layers as `int32`. Indexer MXFP4 QAT cannot be combined with replay. | Unsupported |
 | Keye-VL2 (`KeyeVL2`) | Supported via standard MoE routing. The Keye recipes leave R3 off by default. | **DSA supported in text-only runs.** CP>1, TP1, PP1, SP off, zigzag, no allgather-CP. Disable rollout DP attention, overlap scheduling and radix cache. Top-k 2048, `keye-bitmap-v1`, capture context up to 32,768 tokens. Replay freezes the indexer. | Unsupported |
 
-R3 uses the generic SGLang expert capture and Megatron top-k replay path. Other MoE models can use it when both hooks cover the same expert layers. R3 excludes partial rollout. For R3 alone, set `RELAX_REPLAY_REFERENCES=1` to select reference delivery, which requires colocated Megatron training.
+R3 uses the generic SGLang expert capture and Megatron top-k replay path. Other MoE models can use it when both hooks cover the same expert layers. R3 excludes partial rollout. With the built-in SGLang or Agentic rollout and a local PP1 or external rollout engine, `--use-rollout-routing-replay` defaults to reference delivery in colocate, fully async and hybrid Megatron training. Reference R3 requires packed THD and static CP, with combined 1F1B MoE overlap disabled. In all three modes, set `RELAX_REPLAY_REFERENCES=0` to use full tensors for R3 when no other enabled replay kind requires references.
 
 Indexer replay requires online colocated Megatron with packed THD, zero indexer loss and static CP. It excludes multimodal input, fully async/hybrid, agentic/custom rollout paths, partial rollout, MTP/speculative decoding, hierarchical cache and combined-1f1b MoE overlap. Use the uniform method for full activation recomputation.
 
 For Keye replay, leave `--dsa-indexer-loss-coeff` unset or set it to `0`. A Keye checkpoint saved with a trainable indexer has a different optimizer layout. To switch that checkpoint to frozen indexer replay, use `--no-load-optim` for the migration and save a checkpoint with the new optimizer layout.
 
-Multimodal embedding replay requires the multimodal input mapping and a single input pipeline chunk. It also excludes agentic rollout, the Slime router and OPD. Keep indexer replay off in multimodal runs.
+Multimodal embedding replay requires a multimodal input mapping, a single input pipeline chunk, and a locally launched SGLang engine with the capture hook. It excludes external or custom rollout engines, Prefill/Decode disaggregation, agentic rollout, the Slime router, and OPD. Keep indexer replay off in multimodal runs.
 
 Use a compatible Relax training image with the SGLang capture and Megatron integration patches. Runtime adapters install process-local hooks; source changes alone cannot supply missing engine APIs. There is no additional Megatron source edit for the bitmap attention operator itself.
 

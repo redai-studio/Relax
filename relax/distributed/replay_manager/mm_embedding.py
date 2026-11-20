@@ -34,11 +34,12 @@ class MMPublisher:
     initialize CUDA or copy tensors from the model's execution stream.
     """
 
-    def __init__(self, store: Any, *, pending_timeout: float = 60.0) -> None:
+    def __init__(self, store: Any, *, pending_timeout: float = 60.0, publisher: tuple[int, str] | None = None) -> None:
         if pending_timeout <= 0:
             raise ValueError("Media publication timeout must be positive")
         self.store = store
         self.pending_timeout = pending_timeout
+        self.publisher = publisher
 
     @staticmethod
     def _entry(image_hash: str, grid: list[int], modality: str, result: dict) -> dict:
@@ -59,7 +60,7 @@ class MMPublisher:
         # can roll back the exact hold, as in TQReplayStorage.acquire_many.
         lease = new_data_id()
         try:
-            return self.store.invoke(method, *args, lease=lease)
+            return self.store.invoke(method, *args, lease=lease, publisher=self.publisher)
         except BaseException as error:
             try:
                 self.store.invoke("rollback_acquire", [lease])
@@ -126,7 +127,12 @@ class MMPublisher:
             ):
                 raise ValueError("Media snapshot must contain BF16 raw bytes [visual tokens, 5120]")
             publication = self.store.begin_publication(
-                kind="mm_embedding", layers=1, topk=BF16_RAW.topk, codec=BF16_RAW.name, record=record
+                kind="mm_embedding",
+                layers=1,
+                topk=BF16_RAW.topk,
+                codec=BF16_RAW.name,
+                record=record,
+                media_hash=image_hash,
             )
             for start in range(0, rows, publication.chunk_rows):
                 stop = min(start + publication.chunk_rows, rows)

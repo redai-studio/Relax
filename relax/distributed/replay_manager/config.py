@@ -74,20 +74,61 @@ def rollout_kinds(args: Any) -> frozenset[str]:
     )
 
 
+def _supports_reference_training(args: Any, kinds: frozenset[str]) -> bool:
+    if getattr(args, "train_backend", None) != "megatron":
+        return False
+    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        return kinds == {"moe"}
+    return getattr(args, "colocate", False)
+
+
+def _r3_unsupported_layout(args: Any) -> str | None:
+    if getattr(args, "qkv_format", "thd") != "thd":
+        return "QKV layouts other than packed THD"
+    if getattr(args, "dynamic_context_parallel", False):
+        return "dynamic context parallelism"
+    if getattr(args, "overlap_moe_expert_parallel_comm", False):
+        return "combined 1F1B MoE overlap"
+    return None
+
+
+def default_reference_r3(args: Any) -> bool:
+    """Select reference delivery for online R3 when the user leaves it
+    unset."""
+    from relax.engine.sft.runtime import is_offline_mode
+
+    return (
+        getattr(args, "use_rollout_routing_replay", False)
+        and not os.environ.get("RELAX_REPLAY_REFERENCES", "").strip()
+        and _supports_reference_training(args, rollout_kinds(args))
+        and _r3_unsupported_layout(args) is None
+        and not is_offline_mode(args)
+        and not getattr(args, "debug_train_only", False)
+        and not getattr(args, "load_forge_rollout_data", None)
+        and getattr(args, "rollout_function_path", "relax.engine.rollout.sglang_rollout.generate_rollout")
+        in {"relax.engine.rollout.sglang_rollout.generate_rollout", "relax.agentic.rollout.generate_rollout"}
+        and not getattr(args, "custom_generate_function_path", None)
+        and not getattr(args, "custom_convert_samples_to_train_data_path", None)
+        and (getattr(args, "rollout_external", False) or getattr(args, "sglang_pp_size", 1) == 1)
+    )
+
+
 def validate_reference_training(args: Any) -> None:
     """Reject deployment paths whose reference consumers are not wired."""
-    if not references_enabled() or not rollout_kinds(args):
+    kinds = rollout_kinds(args)
+    if not references_enabled():
+        if "moe" in kinds and getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+            if (layout := _r3_unsupported_layout(args)) is not None:
+                raise ValueError(f"Fully async R3 does not support {layout}")
         return
-    if (
-        getattr(args, "train_backend", None) != "megatron"
-        or not getattr(args, "colocate", False)
-        or getattr(args, "fully_async", False)
-        or getattr(args, "hybrid", False)
-    ):
+    if not kinds:
+        return
+    if not _supports_reference_training(args, kinds):
         raise ValueError(
-            "Reference replay currently requires colocated Megatron training; "
-            "hybrid and fully-async reference consumption are not implemented"
+            "Reference replay requires colocated Megatron training, or hybrid/fully-async Megatron for R3 alone"
         )
+    if "moe" in kinds and (layout := _r3_unsupported_layout(args)) is not None:
+        raise ValueError(f"Reference R3 does not support {layout}")
 
 
 def replay_fields(fields: list[str]) -> list[str]:

@@ -17,6 +17,7 @@ from relax.distributed.replay_manager.validation import (
 def valid_args(model_type, monkeypatch):
     import relax.utils.misc as misc
 
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
     monkeypatch.setattr(misc, "get_hf_config", lambda _: SimpleNamespace(model_type=model_type))
     keye = model_type == "KeyeVL2"
     return SimpleNamespace(
@@ -113,6 +114,13 @@ def test_keye_capture_rejects_trainable_model_indexer():
     assert indexer_capture_layout(config) == (2048, (0, 1, 2))
 
 
+def test_keye_replay_rejects_full_delivery_at_launch(monkeypatch):
+    args = valid_args("KeyeVL2", monkeypatch)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    with pytest.raises(ValueError, match="reference delivery"):
+        validate_indexer_replay_args(args, is_offline=False)
+
+
 def test_keye_replay_accepts_default_and_rejects_nonzero_indexer_loss(monkeypatch):
     args = valid_args("KeyeVL2", monkeypatch)
     args.dsa_indexer_loss_coeff = None
@@ -142,6 +150,7 @@ def test_codec_contract_rejects_wrong_kind_topk_and_width():
 
 def test_dsv4_does_not_inherit_keye_only_restrictions(monkeypatch):
     args = valid_args("deepseek_v4", monkeypatch)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
     args.pipeline_model_parallel_size = 2
     args.sglang_disable_overlap_schedule = False
     args.sglang_disable_radix_cache = False

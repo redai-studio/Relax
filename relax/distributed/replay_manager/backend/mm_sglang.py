@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+import os
 import sys
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -207,7 +209,7 @@ class MMCapture:
             )
         return entry
 
-    def ready(self, rid: str) -> bool:
+    def response_futures(self, rid: str) -> list[Future]:
         media = self.requests.get(rid)
         if media is None:
             raise RuntimeError("MM replay request was not registered before generation")
@@ -215,7 +217,10 @@ class MMCapture:
             if item.future is None:
                 cached = self.cache.get(item.digest)
                 item.future = self._worker.submit(self._acquire, item, None if cached is None else cached[2])
-        return all(item.future.done() for item in media)
+        return [item.future for item in media]
+
+    def ready(self, rid: str) -> bool:
+        return all(future.done() for future in self.response_futures(rid))
 
     def finish(self, rid: str) -> list[dict]:
         if not self.ready(rid):
@@ -269,8 +274,9 @@ class MMCapture:
             self._release_future(future)
 
 
-def accept_mm_response(sample: Any, meta: dict) -> dict:
-    """Validate CPU layout before removing raw pixels from the sample queue."""
+def accept_mm_response(sample: Any, meta: dict, *, keep_pixels: bool = False) -> dict:
+    """Validate CPU layout and retain pixels when a reference policy needs
+    them."""
     from ..ref_data import validate_sample
 
     if (meta.get("finish_reason") or {}).get("type") == "abort":
@@ -295,9 +301,10 @@ def accept_mm_response(sample: Any, meta: dict) -> dict:
             raise ValueError("Rollout MM replay and training media grids differ")
     if any(key in inputs for key in ("pixel_values", "pixel_values_videos")) and not entries:
         raise ValueError("MM replay response omitted visual embeddings")
-    sample.multimodal_train_inputs = {
-        key: value for key, value in inputs.items() if key not in ("pixel_values", "pixel_values_videos")
-    }
+    if not keep_pixels:
+        sample.multimodal_train_inputs = {
+            key: value for key, value in inputs.items() if key not in ("pixel_values", "pixel_values_videos")
+        }
     return envelope
 
 
@@ -376,6 +383,9 @@ def install_capture_patch(manager: Any) -> None:
 
     if getattr(Scheduler, "_relax_mm_replay", False):
         return
+    from ..mm_embedding import MMPublisher
+
+    slot, generation = json.loads(os.environ["RELAX_REPLAY_ENGINE_PUBLISHER"])
 
     def owner() -> bool:
         parallel = get_parallel()
@@ -394,7 +404,8 @@ def install_capture_patch(manager: Any) -> None:
         if runtime is None and owner():
             import atexit
 
-            runtime = MMCapture(manager.store())
+            store = manager.store()
+            runtime = MMCapture(store, publisher=MMPublisher(store, publisher=(slot, generation)))
             atexit.register(runtime.close)
         return runtime
 
@@ -490,39 +501,14 @@ def install_capture_patch(manager: Any) -> None:
             for req in batch.reqs:
                 if not getattr(req, "finished_output", False) and not _aborted(req):
                     active.bind(req.rid, req.multimodal_inputs)
+                    if req.rid.startswith(REQUEST_PREFIX):
+                        req._relax_replay_media = active
         return original_run(self, batch, *args, **kwargs)
 
     Scheduler.run_batch = run
 
-    def cleanup_request(req: Any) -> None:
-        from .sglang import _abort_request_publication
-
-        if runtime is not None:
-            runtime.abort(req.rid)
-        # A combined MM+R3 request can be parked before the ordinary replay
-        # output wrapper has registered it in its own pending dictionary.
-        _abort_request_publication(req)
-
-    def request_ready(req: Any) -> bool:
-        try:
-            return runtime.ready(req.rid)
-        except BaseException as primary:
-            try:
-                cleanup_request(req)
-            except Exception as cleanup:
-                primary.add_note(f"MM request cleanup failed: {cleanup!r}")
-            raise
-
-    def finish_request(req: Any) -> list[dict]:
-        try:
-            return runtime.finish(req.rid)
-        except BaseException as primary:
-            try:
-                cleanup_request(req)
-            except Exception as cleanup:
-                primary.add_note(f"MM request cleanup failed: {cleanup!r}")
-            raise
-
+    # Scheduler owns pending terminal outputs for every capture kind. The
+    # media adapter supplies only the native response's additional field.
     original_streamer = Scheduler.get_output_streamer_class
 
     def streamer(scheduler: Any) -> type:
@@ -531,113 +517,18 @@ def install_capture_patch(manager: Any) -> None:
         class MMOutputStreamer(base):
             has_additional_customized_info = True
 
-            def stream_output(self, reqs: Any, return_logprob: Any, skip_req: Any = None) -> Any:
-                if get_runtime() is None:
-                    return super().stream_output(reqs, return_logprob, skip_req)
-                pending = getattr(scheduler, "_relax_mm_pending", {})
-                scheduler._relax_mm_pending = pending
-                immediate = []
-                for req in reqs:
-                    # The native scheduler may revisit a completed request while
-                    # its asynchronous publication is parked here.
-                    if req.finished_output:
-                        pending.pop(req.rid, None)
-                        continue
-                    if _aborted(req):
-                        cleanup_request(req)
-                        immediate.append(req)
-                    elif (
-                        req is not skip_req
-                        and not req.finished_output
-                        and req.rid.startswith(REQUEST_PREFIX)
-                        and req.finished()
-                        and not request_ready(req)
-                    ):
-                        if len(pending) >= scheduler.max_running_requests:
-                            oldest = next(iter(pending))
-                            for media in runtime.requests[oldest]:
-                                if media.future is not None:
-                                    media.future.result()
-                            drain(scheduler)
-                        pending[req.rid] = (req, return_logprob)
-                    else:
-                        pending.pop(req.rid, None)
-                        immediate.append(req)
-                if immediate:
-                    return super().stream_output(immediate, return_logprob, skip_req)
-                return None
-
             def build_additional_customized_info(self, reqs: Any) -> dict:
                 result = super().build_additional_customized_info(reqs)
-                result[META_FIELD] = [
-                    finish_request(req)
-                    if runtime is not None
-                    and req.rid.startswith(REQUEST_PREFIX)
-                    and req.finished()
-                    and not _aborted(req)
-                    else []
-                    for req in reqs
-                ]
+                result[META_FIELD] = [getattr(req, "_relax_mm_output", []) for req in reqs]
                 return result
 
         return MMOutputStreamer
 
     Scheduler.get_output_streamer_class = streamer
+    from .sglang import _install_abort_patch, _install_response_patch
 
-    def drain(scheduler: Any) -> None:
-        if runtime is None:
-            return
-        pending = getattr(scheduler, "_relax_mm_pending", {})
-        for rid, (req, return_logprob) in tuple(pending.items()):
-            if req.finished_output:
-                pending.pop(rid, None)
-                continue
-            if _aborted(req):
-                pending.pop(rid)
-                cleanup_request(req)
-                scheduler.output_streamer.stream_output([req], return_logprob)
-            elif request_ready(req):
-                pending.pop(rid)
-                scheduler.output_streamer.stream_output([req], return_logprob)
-
-    original_input = Scheduler.process_input_requests
-
-    @wraps(original_input)
-    def process_input(self: Any, *args: Any, **kwargs: Any) -> Any:
-        result = original_input(self, *args, **kwargs)
-        drain(self)
-        return result
-
-    Scheduler.process_input_requests = process_input
-    original_idle = Scheduler.maybe_sleep_on_idle
-
-    @wraps(original_idle)
-    def idle(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if getattr(self, "_relax_mm_pending", None):
-            import time
-
-            time.sleep(0.001)
-            return None
-        return original_idle(self, *args, **kwargs)
-
-    Scheduler.maybe_sleep_on_idle = idle
-    original_cancel = Scheduler.abort_request
-
-    @wraps(original_cancel)
-    def cancel(self: Any, recv_req: Any, *args: Any, **kwargs: Any) -> Any:
-        if runtime is not None:
-            for rid in tuple(runtime.requests):
-                if recv_req.abort_all or rid.startswith(recv_req.rid):
-                    runtime.abort(rid)
-            pending = getattr(self, "_relax_mm_pending", {})
-            for rid, (req, _) in tuple(pending.items()):
-                if recv_req.abort_all or rid.startswith(recv_req.rid):
-                    cleanup_request(req)
-                    pending.pop(rid)
-                    req.finished_output = True
-        return original_cancel(self, recv_req, *args, **kwargs)
-
-    Scheduler.abort_request = cancel
+    _install_response_patch(lambda _: runtime is not None)
+    _install_abort_patch()
     original_abort = Req.set_finish_with_abort
 
     @wraps(original_abort)
@@ -651,12 +542,6 @@ def install_capture_patch(manager: Any) -> None:
 
     @wraps(original_flush)
     def flush(self: Any, *args: Any, **kwargs: Any) -> Any:
-        # Finished requests awaiting publication are outside native queues.
-        # A successful native KV flush must not invalidate their MM holds.
-        if getattr(self, "_relax_mm_pending", None):
-            drain(self)
-        if getattr(self, "_relax_mm_pending", None) or getattr(self, "_relax_replay_pending", None):
-            return False
         result = original_flush(self, *args, **kwargs)
         if result and runtime is not None:
             runtime.flush()

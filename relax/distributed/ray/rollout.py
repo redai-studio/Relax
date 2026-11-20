@@ -1442,6 +1442,7 @@ class RolloutManager(ReloadableMixin):
             self._dynamic_global_batch_size = len(
                 {sample.index for sample_group in output.samples for sample in sample_group}
             )
+        return output.partition_complete
 
     async def eval(self, rollout_id):
         self._begin_generation()

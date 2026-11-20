@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     import torch
     from numpy.typing import NDArray
 
-    from .core import ReplayManager, ReplayRegion
+    from .core import ConsumerChannel, ReplayManager, ReplayRegion
 
 
 @dataclass(frozen=True)
@@ -110,8 +110,7 @@ class ConsumerLayerBinding:
     here."""
 
     capture_layer: int
-    manager: "ReplayManager"
-    channel: ConsumerChannelKey
+    channel: ConsumerChannel
 
 
 @dataclass(frozen=True)
@@ -902,7 +901,7 @@ def bind_read_task(
         )
         source = ConsumerExecutor.bind(request, reader=reader, cache=cache)
         try:
-            binding.manager.bind(binding.channel, ConsumerRecord(task.model.kind, task.microbatch, source))
+            binding.channel.bind(ConsumerRecord(task.model.kind, task.microbatch, source))
         except BaseException as primary:
             try:
                 source.release()

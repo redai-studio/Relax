@@ -5,21 +5,18 @@ state."""
 
 import importlib
 import uuid
-from collections.abc import Callable, Iterable, Iterator, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, MutableMapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 from .config import ReplayConfig, get_store
 from .consumer import (
     ConsumerChannelKey,
-    ConsumerExecutor,
     ConsumerRecord,
-    ConsumerRequest,
     ConsumerSource,
 )
-from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, register_kind, token_digest
+from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, register_kind
 
 
 if TYPE_CHECKING:
@@ -28,7 +25,15 @@ if TYPE_CHECKING:
     from .storage import TQReplayStorage
 
 
-def refs_from_samples(samples: list[Any]) -> list[ReplayRef]:
+def _sample_media(samples: Sequence[Any]) -> list[dict]:
+    return [
+        entry
+        for sample in samples
+        for entry in (sample.rollout_replay_refs or {}).get("mm_embedding", {}).get("media", [])
+    ]
+
+
+def refs_from_samples(samples: Sequence[Any]) -> list[ReplayRef]:
     return [ref for sample in samples for ref in iter_refs(sample.rollout_replay_refs or {})]
 
 
@@ -74,10 +79,59 @@ class ConsumerConsumptionError(RuntimeError):
 
 @dataclass
 class ConsumerChannel:
+    kind: str
     entries: list[Any] = field(default_factory=list)
     microbatch_ids: dict[int, int] = field(default_factory=dict)
     forward_index: int = 0
     backward_index: int = 0
+
+    def bind(self, record: ConsumerRecord) -> None:
+        """Append one source in schedule order."""
+        if record.kind != self.kind or record.microbatch_id != len(self.entries):
+            raise ValueError("Replay kind or microbatch order does not match the channel")
+        self.microbatch_ids[len(self.entries)] = record.microbatch_id
+        self.entries.append(record.payload)
+
+    def consume(
+        self,
+        phase: str,
+        *,
+        microbatch_id: int | None = None,
+        advance_before_lookup: bool = False,
+        materialize: bool = True,
+    ) -> Any:
+        if phase not in ("replay_forward", "replay_backward"):
+            raise ValueError(f"Cannot consume replay in stage {phase!r}")
+        cursor = "forward_index" if phase == "replay_forward" else "backward_index"
+        index = getattr(self, cursor)
+        if microbatch_id is not None:
+            recorded_id = self.microbatch_ids.get(index)
+            if recorded_id is None or recorded_id != microbatch_id:
+                raise RuntimeError(f"Replay microbatch mismatch: expected={microbatch_id}, cursor={index}")
+        # Legacy Indexer advances even on overrun; MoE advances only on success.
+        if advance_before_lookup:
+            setattr(self, cursor, index + 1)
+        payload = self.entries[index]
+        if payload is None:
+            raise ValueError("Bind a reference request before executing it")
+        if materialize and isinstance(payload, ConsumerSource):
+            payload = payload.read()
+        if not advance_before_lookup:
+            setattr(self, cursor, index + 1)
+        return payload
+
+    def reset_forward(self, *, require_consumed: bool = False) -> None:
+        if require_consumed and self.forward_index != len(self.entries):
+            raise ConsumerConsumptionError("replay_forward", self.forward_index, len(self.entries))
+        self.forward_index = 0
+
+    def check_consumed(self, *, expect_backward: bool = False) -> None:
+        cursors = ("forward_index", "backward_index") if expect_backward else ("forward_index",)
+        for cursor in cursors:
+            count = getattr(self, cursor)
+            if count != len(self.entries):
+                phase = "replay_forward" if cursor == "forward_index" else "replay_backward"
+                raise ConsumerConsumptionError(phase, count, len(self.entries))
 
     def release_sources(self) -> None:
         # Inline tensors retain Python's original ownership semantics. A bound
@@ -329,22 +383,30 @@ class ReplayManager:
             raise ValueError("Replay region requires an explicit TQ partition identity")
         return ReplayRegion(self, partition)
 
+    async def on_partition_cleared(self, partition: str) -> None:
+        if self.uses_references and not self._run_stopped:
+            await self.store().invoke_async("retire_partition", partition)
+
     def sample_refs(self, samples: Sequence[Any]) -> list["ReplayRef"]:
         return refs_from_samples(samples) if self.uses_references else []
 
     def discard(self, samples: Sequence[Any]) -> None:
         refs = self.sample_refs(samples)
         if refs:
-            self.store().discard([ref for ref in refs if ref.kind != "mm_embedding"])
-            from .mm_embedding import release_media_entries
+            self.store().invoke(
+                "discard", [ref for ref in refs if ref.kind != "mm_embedding"], media=_sample_media(samples)
+            )
 
-            release_media_entries(
-                self.store(),
-                [
-                    item
-                    for sample in samples
-                    for item in (sample.rollout_replay_refs or {}).get("mm_embedding", {}).get("media", [])
-                ],
+    async def discard_async(self, samples: Sequence[Any]) -> None:
+        refs = self.sample_refs(samples)
+        if refs:
+            from relax.utils.async_utils import finish_before_cancellation
+
+            await finish_before_cancellation(
+                self.store().invoke_async(
+                    "discard", [ref for ref in refs if ref.kind != "mm_embedding"], media=_sample_media(samples)
+                ),
+                "replay-discard",
             )
 
     def _ensure_open(self) -> None:
@@ -458,7 +520,7 @@ class ReplayManager:
         self._ensure_open()
         if key in self._channels:
             raise ValueError(f"Replay channel already registered: {key}")
-        channel = ConsumerChannel()
+        channel = ConsumerChannel(key.kind)
         self._channels[key] = channel
         return channel
 
@@ -467,13 +529,7 @@ class ReplayManager:
         return self._channels[key]
 
     def bind(self, key: ConsumerChannelKey, record: ConsumerRecord) -> None:
-        """Bind an already laid-out layer/microbatch to its consumer
-        channel."""
-        channel = self._channel(key)
-        if record.kind != key.kind or record.microbatch_id != len(channel.entries):
-            raise ValueError("Replay kind or microbatch order does not match the channel")
-        channel.microbatch_ids[len(channel.entries)] = record.microbatch_id
-        channel.entries.append(record.payload)
+        self._channel(key).bind(record)
 
     def consume(
         self,
@@ -484,45 +540,18 @@ class ReplayManager:
         advance_before_lookup: bool = False,
         materialize: bool = True,
     ) -> Any:
-        channel = self._channel(key)
-        if phase is None:
-            phase = self.phase.get()
-        if phase not in ("replay_forward", "replay_backward"):
-            raise ValueError(f"Cannot consume replay in stage {phase!r}")
-        cursor = "forward_index" if phase == "replay_forward" else "backward_index"
-        index = getattr(channel, cursor)
-        if microbatch_id is not None:
-            recorded_id = channel.microbatch_ids.get(index)
-            if recorded_id is None or recorded_id != microbatch_id:
-                raise RuntimeError(f"Replay microbatch mismatch: expected={microbatch_id}, cursor={index}")
-        # Legacy Indexer advances even on overrun; MoE advances only on success.
-        if advance_before_lookup:
-            setattr(channel, cursor, index + 1)
-        payload = channel.entries[index]
-        if payload is None:
-            raise ValueError("Bind a reference request before executing it")
-        if materialize:
-            payload = ConsumerExecutor.execute(
-                ConsumerRequest(kind=key.kind, layer=key.layer, microbatch_id=index, payload=payload)
-            )
-        if not advance_before_lookup:
-            setattr(channel, cursor, index + 1)
-        return payload
+        return self._channel(key).consume(
+            phase if phase is not None else self.phase.get(),
+            microbatch_id=microbatch_id,
+            advance_before_lookup=advance_before_lookup,
+            materialize=materialize,
+        )
 
     def reset_forward(self, key: ConsumerChannelKey, *, require_consumed: bool = False) -> None:
-        channel = self._channel(key)
-        if require_consumed and channel.forward_index != len(channel.entries):
-            raise ConsumerConsumptionError("replay_forward", channel.forward_index, len(channel.entries))
-        channel.forward_index = 0
+        self._channel(key).reset_forward(require_consumed=require_consumed)
 
     def check_consumed(self, key: ConsumerChannelKey, *, expect_backward: bool = False) -> None:
-        channel = self._channel(key)
-        cursors = ("forward_index", "backward_index") if expect_backward else ("forward_index",)
-        for cursor in cursors:
-            count = getattr(channel, cursor)
-            if count != len(channel.entries):
-                phase = "replay_forward" if cursor == "forward_index" else "replay_backward"
-                raise ConsumerConsumptionError(phase, count, len(channel.entries))
+        self._channel(key).check_consumed(expect_backward=expect_backward)
 
     def clear(self) -> None:
         error = None
@@ -557,8 +586,7 @@ class ReplayRegion:
     manager: "ReplayManager"
     partition: str
 
-    @contextmanager
-    def queue_ownership(self, samples: Sequence[Any]) -> Iterator[None]:
+    async def put(self, samples: Sequence[Any], write: Callable[[], Awaitable[Any]]) -> None:
         """Hold reference bodies around the caller's queue write.
 
         Transfer publisher ownership only on success. An exception or
@@ -566,21 +594,35 @@ class ReplayRegion:
         """
         self.manager._ensure_open()
         refs = self.manager.sample_refs(samples)
-        if refs:
-            self.manager.store().attach(refs, self.partition)
-        yield
-        if refs:
-            self.manager.store().commit(refs)
-            from .mm_embedding import release_media_entries
+        if not refs:
+            await write()
+            return
+        import asyncio
 
-            release_media_entries(
-                self.manager.store(),
-                [
-                    item
-                    for sample in samples
-                    for item in (sample.rollout_replay_refs or {}).get("mm_embedding", {}).get("media", [])
-                ],
-            )
+        from relax.utils.async_utils import finish_before_cancellation
+
+        store = self.manager.store()
+        reservation = new_data_id()
+        attach = asyncio.create_task(store.invoke_async("attach", refs, self.partition, reservation=reservation))
+        try:
+            await asyncio.shield(attach)
+        except BaseException as error:
+            # No sample put was issued. Settle the metadata RPC before removing
+            # just this writer's hold, including a lost acknowledgement.
+            async def undo() -> None:
+                await asyncio.gather(attach, return_exceptions=True)
+                await store.invoke_async("cancel_attach", refs, self.partition, reservation)
+
+            try:
+                await finish_before_cancellation(undo(), "replay-cancel-attach")
+            except Exception as cleanup:
+                error.add_note(f"Replay attach rollback failed: {cleanup!r}")
+            raise
+        await write()
+        await finish_before_cancellation(
+            store.invoke_async("commit", refs, self.partition, reservation, media=_sample_media(samples)),
+            "replay-commit",
+        )
 
     def retire(self) -> None:
         self.manager._ensure_open()
@@ -613,9 +655,12 @@ class ReplayInventory:
         self.run = self.owner = config.run_id
         self.capacity_bytes = config.capacity_bytes
         self._delete = delete
+        self._used_bytes = 0
         self._lock = RLock()
         self.state = {"objects": {}, "closed_partitions": [], "closed": False}
         self._media: dict[str, dict] = {}
+        self._engine_publishers: dict[int, str] = {}
+        self._retired_publishers: set[tuple[int, str]] = set()
 
     @contextmanager
     def _state(self, *, write: bool = True):
@@ -625,7 +670,9 @@ class ReplayInventory:
     def finish_publication(self, record: str, rows: int, token_identity: str) -> ReplayRef:
         if self.state["closed"] or self.state.get("closing"):
             raise RuntimeError("Replay run is closing")
-        item = self.state["objects"][record]
+        item = self.state["objects"].get(record)
+        if item is None or item["engine_publisher"] in self._retired_publishers:
+            raise RuntimeError("Replay publication no longer exists")
         ref = ReplayRef(
             2,
             self.owner,
@@ -639,25 +686,50 @@ class ReplayInventory:
             token_identity,
             item.get("codec", "int32"),
         )
+        if ref.kind == "mm_embedding":
+            media = self._media.get(ref.tokens)
+            if media is None or media["record"] != record:
+                raise RuntimeError("Media publication no longer owns its claim")
         self.seal(ref)
         if ref.kind == "mm_embedding":
             # Seal and install the first publisher/cache reader hold in this
             # same inventory transaction, before any other producer can drop it.
-            lease = self._media[ref.tokens]["initial_lease"]
+            lease = media["initial_lease"]
             if lease not in item["readers"]:
                 item["readers"].append(lease)
-            if lease not in item["media_producer_readers"]:
-                item["media_producer_readers"].append(lease)
+            item["media_producer_readers"].setdefault(lease, media["publisher"])
+            item["publisher"] = False  # The cache lease now protects the sealed body.
         return ref
 
-    def begin(self, record: str, kind: str, layers: int, topk: int, chunk_rows: int, codec: str = "int32") -> None:
+    def begin(
+        self,
+        record: str,
+        kind: str,
+        layers: int,
+        topk: int,
+        chunk_rows: int,
+        codec: str = "int32",
+        *,
+        media_hash: str | None = None,
+        engine_publisher: tuple[int, str] | None = None,
+    ) -> None:
         if self.state["closed"] or self.state.get("closing"):
             raise RuntimeError("Replay run is closed")
+        if engine_publisher is not None and self._engine_publishers.get(engine_publisher[0]) != engine_publisher[1]:
+            raise RuntimeError("Replay publisher generation has been retired")
+        if kind == "mm_embedding" and self._media.get(media_hash, {}).get("record") != record:
+            raise RuntimeError("Media publication no longer owns its claim")
         if record in self.state["objects"]:
             item = self.state["objects"][record]
             if any(
                 item[name] != value
-                for name, value in (("kind", kind), ("layers", layers), ("topk", topk), ("chunk_rows", chunk_rows))
+                for name, value in (
+                    ("kind", kind),
+                    ("layers", layers),
+                    ("topk", topk),
+                    ("chunk_rows", chunk_rows),
+                    ("engine_publisher", engine_publisher),
+                )
             ):
                 raise ValueError("Replay record already exists with another shape")
             return  # Idempotent metadata retry; never rewrite a body.
@@ -667,9 +739,11 @@ class ReplayInventory:
             ready=False,
             writing=True,
             publisher=True,
+            engine_publisher=engine_publisher,
+            media_hash=media_hash,
             partitions=[],
             readers=[],
-            media_producer_readers=[],
+            media_producer_readers={},
             blocks={},
             kind=kind,
             codec=codec,
@@ -682,7 +756,7 @@ class ReplayInventory:
         self, record: str, chunk: int, layers: tuple[int, ...], count: int, encoded_bytes: int | None = None
     ) -> None:
         item = self.state["objects"][record]
-        if not item["writing"] or self.state.get("closing"):
+        if not item["writing"] or not item["publisher"] or self.state.get("closing"):
             raise RuntimeError("Replay publication is not writable")
         if (
             not layers
@@ -709,18 +783,22 @@ class ReplayInventory:
             if encoded_bytes is None or not 0 < encoded_bytes <= maximum:
                 raise ValueError("Invalid encoded replay reservation")
             size = encoded_bytes
-        used = sum(obj["bytes"] for obj in self.state["objects"].values())
-        if used + size > self.capacity_bytes:
+        if self._used_bytes + size > self.capacity_bytes:
             raise BufferError("Replay store capacity exhausted during publication")
         # Validate the entire batch before changing inventory.
         item["blocks"].update({key: {"count": count, "ready": False} for key in keys})
         item["bytes"] += size
+        self._used_bytes += size
 
     def written_layers(self, record: str, chunk: int, layers: tuple[int, ...]) -> None:
-        blocks = self.state["objects"][record]["blocks"]
+        item = self.state["objects"][record]
+        blocks = item["blocks"]
         selected = [blocks[f"{record}:{chunk}:{layer}"] for layer in layers]
         for block in selected:
             block["ready"] = True
+        if not item["publisher"] and all(block["ready"] for block in blocks.values()):
+            item["writing"] = False
+            self._collect(self.state, (record,))
 
     def seal(self, ref: ReplayRef) -> None:
         if self.state["closed"] or self.state.get("closing"):
@@ -745,12 +823,12 @@ class ReplayInventory:
         item = self.state["objects"].get(record)
         if item is None:
             return
-        if item["readers"] or item["partitions"]:
+        if item.get("response_owner") or item["readers"] or item["partitions"]:
             raise RuntimeError("Cannot abort adopted replay")
         if any(not block["ready"] for block in item["blocks"].values()):
             raise RuntimeError("Replay write acknowledgement is uncertain; retain publication for recovery")
         item.update(publisher=False, writing=False)
-        self._collect(self.state)
+        self._collect(self.state, (record,))
 
     def authorize_read(self, ref: ReplayRef, lease: str) -> None:
         if lease not in self._object(self.state, ref)["readers"]:
@@ -760,14 +838,19 @@ class ReplayInventory:
         for ref, lease in zip(refs, leases, strict=True):
             self.authorize_read(ref, lease)
 
-    def _collect(self, state: dict) -> None:
-        for record, item in list(state["objects"].items()):
+    def _collect(self, state: dict, records: Iterable[str] | None = None) -> None:
+        objects = state["objects"]
+        for record in tuple(objects) if records is None else records:
+            item = objects.get(record)
+            if item is None:
+                continue
             if not item["writing"] and not item["publisher"] and not item["partitions"] and not item["readers"]:
                 self._delete(list(item["blocks"]))
+                self._used_bytes -= item["bytes"]
                 del state["objects"][record]
-                for key, media in tuple(self._media.items()):
-                    if media["record"] == record:
-                        del self._media[key]
+                media_hash = item.get("media_hash")
+                if media_hash is not None and self._media.get(media_hash, {}).get("record") == record:
+                    del self._media[media_hash]
 
     def close(self) -> None:
         self.state["closing"] = True
@@ -777,7 +860,7 @@ class ReplayInventory:
             if item["writing"] and all(block["ready"] for block in item["blocks"].values()):
                 item["writing"] = False
         if any(
-            item["writing"] or item["partitions"] or set(item["readers"]) - set(item.get("media_producer_readers", []))
+            item["writing"] or item["partitions"] or set(item["readers"]) - item["media_producer_readers"].keys()
             for item in self.state["objects"].values()
         ):
             raise RuntimeError("Replay run still has writers, readers or queue holds")
@@ -786,9 +869,9 @@ class ReplayInventory:
             # MM cache/response leases are producer holds, not training readers;
             # SIGKILL cannot run their process-exit cleanup. Never drop leases
             # acquired by generic acquire_many for active training consumers.
-            producer_readers = set(item.get("media_producer_readers", []))
+            producer_readers = item["media_producer_readers"]
             item["readers"] = [lease for lease in item["readers"] if lease not in producer_readers]
-            item["media_producer_readers"] = []
+            producer_readers.clear()
             item["publisher"] = False
         self._collect(self.state)
         self.state["closed"] = True
@@ -802,40 +885,84 @@ class ReplayInventory:
         if ref.owner != self.owner or ref.run != self.run:
             raise RuntimeError("Replay reference belongs to another replay run; wrong replay registry")
         item = state["objects"].get(ref.record)
-        if item is None or not item["ready"] or ref.to_dict() not in (item["manifest"], item.get("capture_manifest")):
+        if item is None or not item["ready"] or ref.to_dict() != item["manifest"]:
             raise RuntimeError("Replay reference is missing, not ready, or has different metadata")
         return item
 
-    def remap_tokens(self, ref: ReplayRef, captured: list[int], training: list[int]) -> ReplayRef:
-        """Bind a validated, length-preserving token normalization before TQ.
-
-        Body rows stay unchanged. Preserve the capture identity so failed/lost
-        acknowledgements can still discard or retry using the original ref. A
-        record accepts only one training identity, never arbitrary rebinding.
-        """
-        if len(captured) != ref.rows + 1 or len(training) != len(captured) or token_digest(captured) != ref.tokens:
-            raise ValueError("Replay token mapping does not match captured identity or row count")
-        mapped = replace(ref, tokens=token_digest(training))
+    def adopt_response(self, refs: list[ReplayRef], owner: str) -> None:
         with self._state() as state:
-            item = self._object(state, ref)
-            if not item["publisher"] or item["partitions"] or item["readers"] or item.get("retired_partitions"):
-                raise RuntimeError("Replay token mapping must precede queue and reader ownership")
-            if item.get("capture_manifest") is not None:
-                if item["capture_manifest"] != ref.to_dict() or item["manifest"] != mapped.to_dict():
-                    raise RuntimeError("Replay training token identity is already bound")
-            elif mapped != ref:
-                item["capture_manifest"] = ref.to_dict()
-                item["manifest"] = mapped.to_dict()
-        return mapped
+            items = [self._object(state, ref) for ref in refs]
+            if any(not item["publisher"] or item.get("response_owner") not in (None, owner) for item in items):
+                raise RuntimeError("Replay response already transferred to another owner")
+            for item in items:
+                item["response_owner"] = owner
+
+    def register_engine_publisher(self, slot: int, generation: str) -> None:
+        """Fence the replaced engine before reusing its capacity."""
+        with self._state() as state:
+            if (slot, generation) in self._retired_publishers:
+                raise RuntimeError("Replay publisher generation has been retired")
+            previous = self._engine_publishers.get(slot)
+            self._engine_publishers[slot] = generation
+            if previous is not None and previous != generation:
+                retired = (slot, previous)
+                self._retired_publishers.add(retired)
+                for item in state["objects"].values():
+                    # A sealed manifest may already belong to a response.
+                    if not item["ready"] and item["engine_publisher"] == retired:
+                        item["publisher"] = False
+                        item["writing"] = not all(block["ready"] for block in item["blocks"].values())
+                for digest, media in tuple(self._media.items()):
+                    item = state["objects"].get(media["record"])
+                    if item is not None and item["ready"]:
+                        # Responses may already be in transit. Only leases tied
+                        # to the retired engine's local cache can be removed here.
+                        for lease, owner in tuple(item["media_producer_readers"].items()):
+                            if owner == retired:
+                                del item["media_producer_readers"][lease]
+                                item["readers"].remove(lease)
+                        continue
+                    if media["publisher"] != retired:
+                        continue
+                    del self._media[digest]
+                    if item is not None:
+                        item["publisher"] = False
+                        # Reserved keys may still receive writes. Hold them
+                        # until acknowledgement or teardown of the old TQ run.
+                        if all(block["ready"] for block in item["blocks"].values()):
+                            item["writing"] = False
+            self._collect(state)
+            if any(item["writing"] and not item["publisher"] for item in state["objects"].values()):
+                raise RuntimeError("Retired replay publisher has unacknowledged writes; restart the replay run")
+            if any(
+                item["ready"]
+                and item["publisher"]
+                and not item["partitions"]
+                and not item["readers"]
+                and not item.get("response_owner")
+                and item["engine_publisher"] in self._retired_publishers
+                for item in state["objects"].values()
+            ):
+                raise RuntimeError("Retired replay publisher has sealed references without a confirmed handoff")
 
     def claim_media(
-        self, image_hash: str, grid: list[int], record: str, modality: str, *, lease: str | None = None
+        self,
+        image_hash: str,
+        grid: list[int],
+        record: str,
+        modality: str,
+        *,
+        lease: str | None = None,
+        publisher: tuple[int, str] | None = None,
+        cache: bool = True,
     ) -> dict:
         """Choose one publisher by image hash, and retain every ready lookup
         atomically."""
         with self._state() as state:
             if state["closed"] or state.get("closing"):
                 raise RuntimeError("Replay run is closing")
+            if publisher is not None and self._engine_publishers.get(publisher[0]) != publisher[1]:
+                raise RuntimeError("Media publisher generation has been retired")
             lease = uuid.uuid4().hex if lease is None else lease
             if not isinstance(lease, str) or len(lease) != 32 or any(c not in "0123456789abcdef" for c in lease):
                 raise ValueError("Invalid media reader lease")
@@ -846,6 +973,7 @@ class ReplayInventory:
                     "grid": grid,
                     "modality": modality,
                     "initial_lease": lease,
+                    "publisher": publisher,
                 }
                 return {"status": "claimed", "lease": lease}
             if previous["grid"] != grid or previous["modality"] != modality:
@@ -856,18 +984,25 @@ class ReplayInventory:
             ref = ReplayRef.from_dict(item["manifest"])
             if lease not in item["readers"]:
                 item["readers"].append(lease)
-            if lease not in item["media_producer_readers"]:
-                item["media_producer_readers"].append(lease)
+            item["media_producer_readers"].setdefault(lease, publisher if cache else None)
             return {"status": "ready", "ref": ref.to_dict(), "lease": lease}
 
     def lookup_media(
-        self, image_hash: str, grid: list[int], modality: str, *, lease: str | None = None
+        self,
+        image_hash: str,
+        grid: list[int],
+        modality: str,
+        *,
+        lease: str | None = None,
+        publisher: tuple[int, str] | None = None,
     ) -> dict | None:
         with self._state():
             previous = self._media.get(image_hash)
             if previous is None:
                 return None
-            result = self.claim_media(image_hash, grid, previous["record"], modality, lease=lease)
+            result = self.claim_media(
+                image_hash, grid, previous["record"], modality, lease=lease, publisher=publisher, cache=False
+            )
             return result if result["status"] == "ready" else None
 
     def abort_media_claim(self, image_hash: str, record: str) -> None:
@@ -888,10 +1023,9 @@ class ReplayInventory:
                     item = self._object(state, ref)
                     if lease in item["readers"]:
                         item["readers"].remove(lease)
-                    if lease in item["media_producer_readers"]:
-                        item["media_producer_readers"].remove(lease)
+                    item["media_producer_readers"].pop(lease, None)
                     item["publisher"] = False
-            self._collect(state)
+            self._collect(state, (ref.record for ref in refs))
 
     def acquire_many(
         self, refs: list[ReplayRef], *, partition: str | None = None, leases: list[str] | None = None
@@ -919,9 +1053,9 @@ class ReplayInventory:
         identities = set(leases)
         for item in self.state["objects"].values():
             item["readers"] = [lease for lease in item["readers"] if lease not in identities]
-            item["media_producer_readers"] = [
-                lease for lease in item.get("media_producer_readers", []) if lease not in identities
-            ]
+            item["media_producer_readers"] = {
+                lease: owner for lease, owner in item["media_producer_readers"].items() if lease not in identities
+            }
         self._collect(self.state)
 
     def _partition_items(self, state: dict, refs: list[ReplayRef], partition: str | None) -> list[dict]:
@@ -942,8 +1076,12 @@ class ReplayInventory:
         with self._state(write=False) as state:
             self._partition_items(state, refs, partition)
 
-    def attach(self, refs: list[ReplayRef], partition: str) -> None:
+    def attach(self, refs: list[ReplayRef], partition: str, *, reservation: str | None = None) -> None:
         """Reserve a queue hold before put; retain it on an uncertain put."""
+        from .storage import BODY_PARTITION_PREFIX
+
+        if partition.startswith(BODY_PARTITION_PREFIX):
+            raise ValueError("Replay sample partition cannot use the body namespace")
         with self._state() as state:
             if partition in state["closed_partitions"] or state["closed"] or state.get("closing"):
                 raise RuntimeError("Cannot attach replay to a closed partition/run")
@@ -951,19 +1089,55 @@ class ReplayInventory:
             for item in items:
                 if partition not in item["partitions"]:
                     item["partitions"].append(partition)
+                item.setdefault("partition_writers", {}).setdefault(partition, set()).add(reservation)
 
-    def commit(self, refs: list[ReplayRef]) -> None:
+    def cancel_attach(self, refs: list[ReplayRef], partition: str, reservation: str) -> None:
+        for ref in refs:
+            item = self.state["objects"].get(ref.record)
+            if item is None:
+                continue
+            writers = item.get("partition_writers", {}).get(partition)
+            if writers and reservation in writers:
+                writers.remove(reservation)
+                if not writers:
+                    del item["partition_writers"][partition]
+                    item["partitions"].remove(partition)
+        self._collect(self.state, (ref.record for ref in refs))
+
+    def commit(
+        self,
+        refs: list[ReplayRef],
+        partition: str | None = None,
+        reservation: str | None = None,
+        *,
+        media: Sequence[dict] = (),
+    ) -> None:
         with self._state() as state:
             items = [self._object(state, m) for m in refs]
             if any(not item["partitions"] and not item.get("retired_partitions") for item in items):
                 raise RuntimeError("Cannot commit replay without a queue hold")
             for item in items:
+                if partition in item.get("partition_writers", {}):
+                    writers = item["partition_writers"][partition]
+                    writers.discard(reservation)
+                    writers.add(None)  # A confirmed sample keeps the partition hold until retirement.
                 item["publisher"] = False
+            if media:
+                self.release_media(
+                    [ReplayRef.from_dict(item["ref"]) for item in media], [item["lease"] for item in media]
+                )
             # A successful put can be acknowledged after consumers retire its
             # partition. Reader holds still prevent collection through recompute.
-            self._collect(state)
+            self._collect(state, (ref.record for ref in refs))
 
-    def discard(self, refs: list[ReplayRef]) -> None:
+    def discard(
+        self,
+        refs: list[ReplayRef],
+        *,
+        unadopted: bool = False,
+        owner: str | None = None,
+        media: Sequence[dict] = (),
+    ) -> None:
         """Release known discarded samples before queue ownership transfers."""
         with self._state() as state:
             items = []
@@ -972,12 +1146,20 @@ class ReplayInventory:
                     raise RuntimeError("Cannot discard replay from another replay run")
                 if ref.record in state["objects"]:
                     item = self._object(state, ref)
+                    if unadopted and (item.get("response_owner") or item["partitions"]):
+                        continue
+                    if owner is not None and item.get("response_owner") not in (None, owner):
+                        continue
                     if item["partitions"]:
                         raise RuntimeError("Cannot discard queued replay; retire its partition instead")
                     items.append(item)
             for item in items:
                 item["publisher"] = False
-            self._collect(state)
+            if media:
+                self.release_media(
+                    [ReplayRef.from_dict(item["ref"]) for item in media], [item["lease"] for item in media]
+                )
+            self._collect(state, (ref.record for ref in refs))
 
     def release_many(self, refs: list[ReplayRef], leases: list[str]) -> None:
         """Idempotent batch release, including retries after partial
@@ -993,9 +1175,8 @@ class ReplayInventory:
             for item, lease in items:
                 if lease in item["readers"]:
                     item["readers"].remove(lease)
-                if lease in item.get("media_producer_readers", []):
-                    item["media_producer_readers"].remove(lease)
-            self._collect(state)
+                item["media_producer_readers"].pop(lease, None)
+            self._collect(state, (ref.record for ref in refs))
 
     def retire_partition(self, partition: str) -> None:
         with self._state() as state:
@@ -1004,6 +1185,7 @@ class ReplayInventory:
             for item in state["objects"].values():
                 if partition in item["partitions"]:
                     item["partitions"].remove(partition)
+                    item.get("partition_writers", {}).pop(partition, None)
                     item.setdefault("retired_partitions", []).append(partition)
             self._collect(state)
 
@@ -1030,38 +1212,3 @@ def enable_reference_replay() -> None:
         manager.config = replace(manager.config, delivery="reference", run_id=manager.config.run_id or new_data_id())
     os.environ["RELAX_REPLAY_REFERENCES"] = "1"
     os.environ["RELAX_REPLAY_RUN_ID"] = manager.config.run_id
-    # The package may have been imported while reference mode was still off.
-    install_tq_cleanup_hook()
-
-
-def install_tq_cleanup_hook() -> None:
-    """Link TQ partition cleanup to Replay once, before clients are created.
-
-    TQ's synchronous client binds this same async method at construction.
-    Partial sample deletion is not a partition boundary and stays unchanged.
-    """
-    if not replay_data_manager.uses_references:
-        return
-
-    from ._tq_compat import install_tq_topology_cache
-
-    install_tq_topology_cache()
-    from transfer_queue.client import AsyncTransferQueueClient
-
-    original = AsyncTransferQueueClient.async_clear_partition
-    if getattr(original, "_relax_replay_cleanup", False):
-        return
-
-    @wraps(original)
-    async def clear_partition(client: Any, partition_id: str) -> Any:
-        # A failed/cancelled TQ clear must keep its reference bodies live.
-        result = await original(client, partition_id=partition_id)
-        # Retirement removes the partition hold, never an active reader lease.
-        from .storage import BODY_PARTITION_PREFIX
-
-        if not partition_id.startswith(BODY_PARTITION_PREFIX) and not replay_data_manager._run_stopped:
-            replay_data_manager.region(partition_id).retire()
-        return result
-
-    clear_partition._relax_replay_cleanup = True
-    AsyncTransferQueueClient.async_clear_partition = clear_partition

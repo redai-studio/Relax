@@ -12,6 +12,7 @@ from relax.distributed.replay_manager.backend.mm_megatron import (
     bind_mm_replay_batch,
     close_mm_replay,
     install_vision_replay,
+    native_vision_forward,
     replay_layout,
 )
 
@@ -57,7 +58,7 @@ class _FrozenVision(torch.nn.Module):
     def forward(self, hidden_states, grid_thw):
         self.calls += 1
         rows = sum(t * h * w // 4 for t, h, w in grid_thw.tolist())
-        return hidden_states.new_full((rows, 2560), 2), []
+        return (2 * self.weight).to(hidden_states).expand(rows, 2560), []
 
 
 def reorganize_inputs(input_ids, image_grid_thw=None, pixel_values=None):
@@ -106,8 +107,38 @@ def test_frozen_vision_injection_skips_encoder_and_preserves_language_gradient(m
     assert model.vision_model.calls == 1
 
 
-@pytest.mark.parametrize("field", ["freeze_vision_model", "freeze_vision_projection", "context_parallel_size"])
-def test_mm_validation_rejects_trainable_vision_or_cp(monkeypatch, field):
+def test_reference_forward_uses_its_own_visual_weights(monkeypatch):
+    import sys
+
+    monkeypatch.setattr(sys.modules[__name__], "reorganize_inputs", reorganize_inputs)
+    model = _VisualModel()
+    tokens = torch.tensor([[7, 31, 31, 31, 31]])
+    grids = torch.tensor([[1, 4, 4]])
+    pixels = torch.ones(16, 4, dtype=torch.bfloat16)
+    actor_embedding, _ = model.vision_model(pixels, grids)
+    actor_payload = VisionReplayInput(actor_embedding, ({"grid": [1, 4, 4], "modality": "image"},))
+    model.vision_model.weight.fill_(2)
+    expected = model(tokens, image_grid_thw=grids, pixel_values=pixels)
+
+    install_vision_replay(model)
+    with native_vision_forward():
+        actual = model(tokens, image_grid_thw=grids, pixel_values=pixels)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actor = model(tokens, image_grid_thw=grids, _relax_mm_embedding_replay=actor_payload)
+    assert not torch.equal(actor, actual)
+    with pytest.raises(RuntimeError, match="has no replay embeddings"):
+        model(tokens, image_grid_thw=grids)
+
+
+@pytest.mark.parametrize(
+    "field, value, reason",
+    [
+        ("freeze_vision_model", False, "frozen vision"),
+        ("freeze_vision_projection", False, "frozen vision"),
+        ("context_parallel_size", 2, "CP1"),
+    ],
+)
+def test_mm_validation_rejects_unsupported_training_and_capture(monkeypatch, field, value, reason):
     from relax.distributed.replay_manager.validation import validate_mm_embedding_replay_args
 
     vision = SimpleNamespace(out_hidden_size=2560, spatial_merge_size=2, deepstack_visual_indexes=[])
@@ -125,8 +156,8 @@ def test_mm_validation_rejects_trainable_vision_or_cp(monkeypatch, field):
         multimodal_keys={"image": "images"},
     )
     validate_mm_embedding_replay_args(args, is_offline=False)
-    setattr(args, field, 2 if field == "context_parallel_size" else False)
-    with pytest.raises(ValueError, match="use-rollout-mm-embedding-replay"):
+    setattr(args, field, value)
+    with pytest.raises(ValueError, match=reason):
         validate_mm_embedding_replay_args(args, is_offline=False)
 
 

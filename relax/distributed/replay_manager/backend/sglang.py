@@ -5,6 +5,8 @@
 import ast
 import importlib
 import importlib.util
+import json
+import os
 from collections.abc import Callable
 from contextlib import contextmanager
 from copy import copy
@@ -22,6 +24,7 @@ from ..ref_data import ReplayRef, decode_refs, encode_refs, validate_sample
 
 
 _CAPTURE_FIELDS = {"moe": "routed_experts", "indexer": "indexer_topk"}
+AGENTIC_R3_REQUEST_PREFIX = "relax-agentic-r3-"
 
 
 def _response_references(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -108,14 +111,18 @@ class SGLangProducer(Producer):
                     meta[field] = value
                 if capture != sample.tokens:
                     validate_sample({kind: value}, capture)
-                    mapped = self.manager.store().remap_tokens(ReplayRef.from_dict(value), capture, sample.tokens)
-                    value = mapped.to_dict()
-                    meta[field] = value
+                    from ..ref_data import token_digest
+
+                    value = {**value, "training_tokens": token_digest(sample.tokens)}
                 refs[kind] = value
             if "mm_embedding" in self.kinds:
                 from .mm_sglang import accept_mm_response
 
-                refs["mm_embedding"] = accept_mm_response(sample, meta)
+                refs["mm_embedding"] = accept_mm_response(
+                    sample,
+                    meta,
+                    keep_pixels=getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False),
+                )
             validate_sample(refs, sample.tokens)
             sample.rollout_replay_refs = refs
         else:
@@ -126,6 +133,64 @@ class SGLangProducer(Producer):
             if "indexer" in self.kinds and not evaluation:
                 sample.rollout_indexer_topk = decode_indexer_topk(meta, len(sample.tokens) - 1)
 
+    def response_refs(self, meta: dict) -> list[ReplayRef]:
+        return [
+            ReplayRef.from_dict(ref)
+            for field in _CAPTURE_FIELDS.values()
+            if isinstance(value := meta.get(field), dict)
+            for ref in _response_references(value).values()
+        ]
+
+    async def adopt_response(self, refs: list[ReplayRef], owner: str) -> None:
+        """Settle any in-flight adoption before compensating a cancelled
+        receiver."""
+        import asyncio
+
+        if not refs:
+            return
+        store = self.manager.store()
+        adoption = asyncio.create_task(store.invoke_async("adopt_response", refs, owner))
+        try:
+            await asyncio.shield(adoption)
+        except BaseException as error:
+            try:
+                await asyncio.gather(adoption, return_exceptions=True)
+                await store.invoke_async("discard", refs, owner=owner)
+            except Exception as cleanup:
+                error.add_note(f"Replay response handoff cleanup failed: {cleanup!r}")
+            raise
+
+    def discard_response(self, meta: dict, *, evaluation: bool = False) -> None:
+        """Release each kind's ownership in a discarded response."""
+        if not self.manager.uses_references or evaluation:
+            return
+        errors = []
+        if "mm_embedding" in self.kinds:
+            from ..mm_embedding import release_media_entries
+            from .mm_sglang import META_FIELD
+
+            entries = meta.get(META_FIELD, [])
+            if entries:
+                try:
+                    release_media_entries(self.manager.store(), entries)
+                except Exception as cleanup:
+                    errors.append(cleanup)
+        for field in _CAPTURE_FIELDS.values():
+            value = meta.get(field)
+            if isinstance(value, dict):
+                try:
+                    refs = _response_references(value)
+                    self.manager.store().invoke(
+                        "discard", [ReplayRef.from_dict(ref) for ref in refs.values()], unadopted=True
+                    )
+                except Exception as cleanup:
+                    errors.append(cleanup)
+        if errors:
+            error, *others = errors
+            for other in others:
+                error.add_note(f"Additional replay response cleanup failure: {other!r}")
+            raise error
+
     @contextmanager
     def response(self, meta: dict, *, evaluation: bool = False):
         """Hold response ownership until parsing succeeds; failed responses
@@ -133,25 +198,10 @@ class SGLangProducer(Producer):
         try:
             yield
         except BaseException as error:
-            if self.manager.uses_references and not evaluation:
-                if "mm_embedding" in self.kinds:
-                    from ..mm_embedding import release_media_entries
-                    from .mm_sglang import META_FIELD
-
-                    entries = meta.get(META_FIELD, [])
-                    if entries:
-                        try:
-                            release_media_entries(self.manager.store(), entries)
-                        except Exception as cleanup:
-                            error.add_note(f"MM replay response cleanup failed: {cleanup!r}")
-                for field in _CAPTURE_FIELDS.values():
-                    value = meta.get(field)
-                    if isinstance(value, dict):
-                        try:
-                            refs = _response_references(value)
-                            self.manager.store().discard([ReplayRef.from_dict(ref) for ref in refs.values()])
-                        except Exception as cleanup:
-                            error.add_note(f"Replay response cleanup failed: {cleanup!r}")
+            try:
+                self.discard_response(meta, evaluation=evaluation)
+            except Exception as cleanup:
+                error.add_note(f"Replay response cleanup failed: {cleanup!r}")
             raise
 
 
@@ -181,9 +231,16 @@ def decode_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np.ndarray:
 
 
 def decode_routed_experts(meta_info: dict[str, Any], num_rows: int, num_layers: int, topk: int) -> np.ndarray:
-    return np.frombuffer(pybase64.b64decode(meta_info["routed_experts"].encode("ascii")), dtype=np.int32).reshape(
-        num_rows, num_layers, topk
-    )
+    values = np.frombuffer(pybase64.b64decode(meta_info["routed_experts"], validate=True), dtype=np.int32)
+    expected_shape = (num_rows, num_layers, topk)
+    if values.size != num_rows * num_layers * topk:
+        raise ValueError(
+            f"Routed-expert alignment mismatch: {values.size=} {expected_shape=}, "
+            f"finish_reason={meta_info.get('finish_reason')}, prompt_tokens={meta_info.get('prompt_tokens')}, "
+            f"completion_tokens={meta_info.get('completion_tokens')}, "
+            f"output_logprobs={len(meta_info.get('output_token_logprobs') or [])}"
+        )
+    return values.reshape(expected_shape)
 
 
 def _scheduler_contract() -> tuple[str, str, str]:
@@ -223,22 +280,35 @@ def _validate_capture_api(kinds: frozenset[str]) -> None:
             raise RuntimeError(f"Installed SGLang lacks the {kind} replay capture/publication API")
 
 
-def _abort_request_publication(req: Any) -> None:
+def _abort_request_publication(req: Any, *, keep_moe: bool = False) -> None:
     """Drop only this request's unpublished bodies, after all writes drain."""
     error = None
-    for publication in getattr(req, "_relax_replay_streams", {}).values():
+    media = getattr(req, "_relax_replay_media", None)
+    if media is not None:
+        try:
+            media.abort(req.rid)
+        except Exception as exc:
+            error = exc
+    streams = getattr(req, "_relax_replay_streams", {})
+    for kind, publication in streams.items():
+        if keep_moe and kind == "moe":
+            continue
         try:
             publication.abort()
         except Exception as exc:
             error = error or exc
     if error is not None:
         raise error
-    req._relax_replay_streams = {}
+    req._relax_replay_streams = {"moe": streams["moe"]} if keep_moe and "moe" in streams else {}
     req._relax_replay_finish = None
 
 
 def _request_aborted(req: Any) -> bool:
     return any(type(getattr(req, name, None)).__name__ == "FINISH_ABORT" for name in ("finished_reason", "to_finish"))
+
+
+def _keep_aborted_moe(req: Any) -> bool:
+    return getattr(req, "_relax_replay_keep_aborted_moe", False)
 
 
 def _install_abort_patch() -> None:
@@ -261,17 +331,32 @@ def _install_abort_patch() -> None:
         requests = list(self.waiting_queue) + cancelled
         if getattr(self, "chunked_req", None) is not None:
             requests.append(self.chunked_req)
+        inactive = {id(req) for req in requests}
         for name in ("running_batch", "last_batch"):
             batch = getattr(self, name, None)
             if batch is not None:
                 requests.extend(batch.reqs)
         targets = {id(req): req for req in requests if recv_req.abort_all or req.rid.startswith(recv_req.rid)}
 
-        def cleanup():
+        def cleanup(*, resumable: bool = False):
             error = None
             for req in targets.values():
                 try:
-                    _abort_request_publication(req)
+                    finish = getattr(req, "to_finish", None)
+                    # Keep only scheduler pauses that can still return tokens
+                    # over HTTP. Error-status aborts never deliver a manifest.
+                    keep_moe = (
+                        resumable
+                        and id(req) not in inactive
+                        and not getattr(req, "finished_output", False)
+                        and not getattr(req, "is_retracted", False)
+                        and req.rid.startswith(AGENTIC_R3_REQUEST_PREFIX)
+                        and getattr(req, "return_routed_experts", False)
+                        and type(finish).__name__ == "FINISH_ABORT"
+                        and getattr(finish, "status_code", None) is None
+                    )
+                    req._relax_replay_keep_aborted_moe = keep_moe
+                    _abort_request_publication(req, keep_moe=keep_moe)
                 except Exception as exc:
                     error = error or exc
             if error is not None:
@@ -285,7 +370,7 @@ def _install_abort_patch() -> None:
             except Exception as secondary:
                 primary.add_note(f"Replay abort cleanup failed: {secondary!r}")
             raise
-        cleanup()
+        cleanup(resumable=True)
         if cancelled:
             from sglang.srt.managers.io_struct import AbortReq
 
@@ -321,7 +406,14 @@ def _snapshot_layer(buffer: Any, slots: Any, layer: int) -> np.ndarray:
 
 
 def _advance_publication(
-    processor: Any, req: Any, target: int, capturers: dict[str, Any], *, final: bool, asynchronous: bool = False
+    processor: Any,
+    req: Any,
+    target: int,
+    capturers: dict[str, Any],
+    *,
+    final: bool,
+    asynchronous: bool = False,
+    engine_publisher: tuple[int, str] | None = None,
 ) -> dict:
     """Publish newly stable whole chunks; seal the remaining tail only at
     finish."""
@@ -332,10 +424,16 @@ def _advance_publication(
     if not hasattr(req, "_relax_replay_streams"):
         req._relax_replay_streams = {}
     streams = req._relax_replay_streams
+    agentic_r3 = getattr(req, "rid", "").startswith(AGENTIC_R3_REQUEST_PREFIX)
+    moe_start = getattr(req, "routed_experts_start_len", 0) if agentic_r3 else 0
     try:
         for kind, getter in capturers.items():
             field = _CAPTURE_FIELDS[kind]
             if not getattr(req, "return_" + field, False):
+                continue
+            start_row = moe_start if kind == "moe" else 0
+            captured_rows = max(0, target - start_row)
+            if not captured_rows and kind not in streams:
                 continue
             capturer = getter()
             if capturer is None:
@@ -351,11 +449,12 @@ def _advance_publication(
                     layers=buffer.shape[1],
                     topk=capturer.topk_size if codec is not None else buffer.shape[2],
                     codec=codec.name if codec is not None else "int32",
+                    engine_publisher=engine_publisher,
                 )
             publication = streams[kind]
-            if target < publication.rows:
+            if captured_rows < publication.rows:
                 raise RuntimeError("Finalized token range overlaps already published replay chunks")
-            end = target if final else target // publication.chunk_rows * publication.chunk_rows
+            end = captured_rows if final else captured_rows // publication.chunk_rows * publication.chunk_rows
             if end > publication.rows:
                 # Relax's older async D2H patch defers the CPU slot scatter until
                 # the legacy getter. Streaming bypasses that getter, so drain it here.
@@ -366,7 +465,11 @@ def _advance_publication(
                 # Transfer the lightweight stable slot range once. Body copies
                 # remain chunked and admitted by the writer before KV reuse.
                 kv = getattr(req, "kv", req)
-                slots = processor.req_to_token_pool.req_to_token[kv.req_pool_idx][first:end].cpu().numpy()
+                slots = (
+                    processor.req_to_token_pool.req_to_token[kv.req_pool_idx][first + start_row : end + start_row]
+                    .cpu()
+                    .numpy()
+                )
                 if len(slots) != end - first or np.any(slots < 0) or np.any(slots >= len(buffer)):
                     raise ValueError("Replay capture slot range is invalid")
                 cache = buffer.numpy()
@@ -384,10 +487,20 @@ def _advance_publication(
         if not final:
             return {}
         output_ids = req.output_ids_through_stop if hasattr(req, "output_ids_through_stop") else req.output_ids
-        tokens = list(req.origin_input_ids) + list(output_ids)
+        prompt_ids = req.origin_input_ids
+        unpadded = getattr(req, "origin_input_ids_unpadded", prompt_ids)
+        if len(unpadded) == len(prompt_ids):
+            prompt_ids = unpadded
+        tokens = list(prompt_ids) + list(output_ids)
         if asynchronous:
-            return {kind: publication.finish_async(tokens) for kind, publication in streams.items()}
-        refs = {kind: publication.finish(tokens).to_dict() for kind, publication in streams.items()}
+            return {
+                kind: publication.finish_async(tokens[moe_start:] if kind == "moe" else tokens)
+                for kind, publication in streams.items()
+            }
+        refs = {
+            kind: publication.finish(tokens[moe_start:] if kind == "moe" else tokens).to_dict()
+            for kind, publication in streams.items()
+        }
         return refs
     except BaseException as primary:
         try:
@@ -397,7 +510,11 @@ def _advance_publication(
         raise
 
 
-def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: frozenset[str] | None = None) -> None:
+def install_scheduler_patch(
+    manager: ReplayManager | None = None,
+    *,
+    kinds: frozenset[str] | None = None,
+) -> None:
     """Intercept completed batch copies and finished responses in SGLang only.
 
     The intermediate layer owns publication. SGLang still owns capture, token
@@ -420,6 +537,8 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
     replay_data_manager = selected
     cls._relax_replay_manager = selected
     cls._relax_replay_kinds = selected_kinds
+    raw_publisher = os.environ.get("RELAX_REPLAY_ENGINE_PUBLISHER")
+    engine_publisher = tuple(json.loads(raw_publisher)) if raw_publisher is not None else None
     capturers = {
         kind: getattr(upstream, name)
         for kind, name in (("moe", "get_global_experts_capturer"), ("indexer", "get_global_indexer_capturer"))
@@ -430,7 +549,10 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
     def native_request(req):
         # Keep upstream's partial-range and old speculative-stop semantics.
         # These requests use its collector and are published at rollout ingress.
-        return bool(getattr(req, "routed_experts_start_len", 0)) or (
+        return (
+            bool(getattr(req, "routed_experts_start_len", 0))
+            and not getattr(req, "rid", "").startswith(AGENTIC_R3_REQUEST_PREFIX)
+        ) or (
             not prefix
             and hasattr(req, "output_ids_through_stop")
             and len(req.output_ids_through_stop) != len(req.output_ids)
@@ -445,7 +567,9 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
             parallel = self
         # Match the response-producing rank within each attention-DP replica.
         # Global TP0 would omit every other DP replica's requests.
-        rank = getattr(parallel, "attn_tp_rank", parallel.tp_rank)
+        rank = getattr(parallel, "attn_tp_rank", None)
+        if rank is None:
+            rank = parallel.tp_rank
         return rank == 0 and getattr(parallel, "attn_cp_rank", 0) == 0 and getattr(parallel, "pp_rank", 0) == 0
 
     if prefix and "moe" in capturers:
@@ -463,9 +587,13 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
             return
         if not kinds <= capturers.keys():
             raise RuntimeError("SGLang lacks a requested replay capturer")
+        output_ids = req.output_ids_through_stop if hasattr(req, "output_ids_through_stop") else req.output_ids
         if _request_aborted(req):
-            _abort_request_publication(req)
-            return
+            if not (_keep_aborted_moe(req) and output_ids and "moe" in kinds):
+                _abort_request_publication(req)
+                return
+            _abort_request_publication(req, keep_moe=True)
+            kinds = {"moe"}
         if not owner(self):
             for kind in kinds:
                 setattr(req, _CAPTURE_FIELDS[kind], None)
@@ -476,16 +604,16 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
                 collectors[kind](self, req)
             req._relax_replay_native_collected = True
             return
-        output_ids = req.output_ids_through_stop if hasattr(req, "output_ids_through_stop") else req.output_ids
         refs = _advance_publication(
             self,
             req,
             len(req.origin_input_ids) + len(output_ids) - 1,
-            capturers,
+            {kind: capturers[kind] for kind in kinds},
             final=True,
             asynchronous=asynchronous,
+            engine_publisher=engine_publisher,
         )
-        if asynchronous:
+        if asynchronous and refs:
             req._relax_replay_finish = refs
             return
         for kind, ref in refs.items():
@@ -511,13 +639,16 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
                         setattr(result, field, None)
                 for i, req in enumerate(batch.reqs):
                     if _request_aborted(req):
-                        _abort_request_publication(req)
+                        if not _keep_aborted_moe(req):
+                            _abort_request_publication(req)
                     elif not req.finished() and not req.is_retracted and not native_request(req):
                         # Only the already accepted prefix is stable. A verify
                         # batch may also contain speculative tokens not accepted yet.
                         accepted = len(req.origin_input_ids) + len(req.output_ids)
                         target = min(int(batch.seq_lens_cpu[i]), accepted) - 1
-                        _advance_publication(self, req, max(0, target), capturers, final=False)
+                        _advance_publication(
+                            self, req, max(0, target), capturers, final=False, engine_publisher=engine_publisher
+                        )
                 return original(self, batch, result, *args, **kwargs)
             except BaseException as primary:
                 for req in batch.reqs:
@@ -531,8 +662,9 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
 
     for kind in capturers:
         setattr(cls, prefix + "maybe_collect_" + _CAPTURE_FIELDS[kind], collect)
-    for method in ("process_batch_result_prefill", "process_batch_result_decode"):
-        setattr(cls, method, wrap_result(getattr(cls, method)))
+    if capturers:
+        for method in ("process_batch_result_prefill", "process_batch_result_decode"):
+            setattr(cls, method, wrap_result(getattr(cls, method)))
     from sglang.srt.managers.schedule_batch import Req
 
     _install_abort_patch()
@@ -540,8 +672,11 @@ def install_scheduler_patch(manager: ReplayManager | None = None, *, kinds: froz
         original = getattr(Req, method)
 
         def reset(req, *args, _original=original, **kwargs):
+            req._relax_replay_keep_aborted_moe = False
             _abort_request_publication(req)
-            return _original(req, *args, **kwargs)
+            result = _original(req, *args, **kwargs)
+            req._relax_replay_generation = getattr(req, "retraction_count", 0)
+            return result
 
         if not getattr(original, "_relax_replay_cleanup", False):
             reset._relax_replay_cleanup = True
@@ -583,7 +718,7 @@ def _install_owner_capture_patch(owner: Callable[[], bool]) -> None:
     cls._relax_replay_owner_capture = True
 
 
-def _install_response_patch(owner: Any) -> bool:
+def _install_response_patch(owner: Callable) -> bool:
     """Send completed references from the scheduler thread, never the
     writer."""
     from sglang.srt.managers.scheduler import Scheduler
@@ -613,28 +748,28 @@ def _install_response_patch(owner: Any) -> bool:
 
     def drain(self, *, wait: bool = False):
         pending = getattr(self, "_relax_replay_pending", {})
-        for key, (req, _) in list(pending.items()):
-            if req._relax_replay_finish is None:
-                pending.pop(key)
-        if wait and pending:
-            req, _ = next(iter(pending.values()))
-            # Bounded response metadata: only apply this backpressure when the
-            # engine's outstanding-request limit has already been reached.
-            for future in req._relax_replay_finish.values():
-                try:
-                    future.result()
-                except Exception:
-                    pass  # Drain every kind, then propagate below after cleanup.
-        completed = []
-        for key, (req, return_logprob) in list(pending.items()):
-            futures = req._relax_replay_finish
-            if futures is None:
+        ready = {False: [], True: []}
+        for key, (req, return_logprob) in tuple(pending.items()):
+            if getattr(req, "finished_output", False):
                 pending.pop(key)
                 continue
-            if not all(future.done() for future in futures.values()):
-                continue
+            ordinary = getattr(req, "_relax_replay_finish", None) or {}
+            media = getattr(req, "_relax_replay_media", None)
             try:
-                refs = {kind: future.result().to_dict() for kind, future in futures.items()}
+                if _request_aborted(req) and not _keep_aborted_moe(req):
+                    _abort_request_publication(req)
+                    ordinary, media = {}, None
+                else:
+                    # Check every producer before releasing either kind's hold.
+                    futures = list(ordinary.values())
+                    if media is not None:
+                        futures.extend(media.response_futures(req.rid))
+                    if not wait and not all(future.done() for future in futures):
+                        continue
+                    for future in futures:
+                        future.result()
+                wait = False  # Backpressure waits for at most one request.
+                ready[bool(return_logprob)].append((key, req, ordinary, media))
             except BaseException as primary:
                 pending.pop(key)
                 try:
@@ -642,21 +777,24 @@ def _install_response_patch(owner: Any) -> bool:
                 except Exception as cleanup:
                     primary.add_note(f"Replay publication cleanup failed: {cleanup!r}")
                 raise
-            completed.append((key, req, return_logprob, refs))
-        # Resolve every ready Future before handing off any request. If another
-        # kind/request fails, unsent publications remain owned by the queue.
-        ready = {False: [], True: []}
-        for key, req, return_logprob, refs in completed:
-            for kind, ref in refs.items():
-                setattr(req, _CAPTURE_FIELDS[kind], ref)
-            req._relax_replay_streams = {}
-            req._relax_replay_finish = None
-            req._relax_replay_published = True
-            pending.pop(key)
-            ready[bool(return_logprob)].append(req)
-        for return_logprob, reqs in ready.items():
-            if reqs:
-                original_output(self, reqs, return_logprob)
+
+        for return_logprob, batch in ready.items():
+            if not batch:
+                continue
+            for key, req, ordinary, media in batch:
+                for kind, future in ordinary.items():
+                    setattr(req, _CAPTURE_FIELDS[kind], future.result().to_dict())
+                if media is not None:
+                    req._relax_mm_output = media.finish(req.rid)
+                pending.pop(key)
+            # A failed native send has uncertain delivery. Preserve the bodies
+            # for receiver adoption or teardown of this run.
+            original_output(self, [req for _, req, _, _ in batch], return_logprob)
+            for _, req, ordinary, _ in batch:
+                if ordinary:
+                    req._relax_replay_streams = {}
+                    req._relax_replay_finish = None
+                    req._relax_replay_published = True
 
     @wraps(original_output)
     def output(self, reqs, return_logprob, skip_req=None):
@@ -667,11 +805,23 @@ def _install_response_patch(owner: Any) -> bool:
             pending = self._relax_replay_pending = {}
         immediate = []
         for req in reqs:
-            if req is not skip_req and getattr(req, "_relax_replay_finish", None) is not None:
-                if id(req) not in pending:
+            key = id(req)
+            if getattr(req, "finished_output", False):
+                pending.pop(key, None)
+                continue
+            if req is skip_req:
+                immediate.append(req)
+            elif _request_aborted(req) and not _keep_aborted_moe(req):
+                pending.pop(key, None)
+                _abort_request_publication(req)
+                immediate.append(req)
+            elif getattr(req, "_relax_replay_finish", None) is not None or (
+                getattr(req, "_relax_replay_media", None) is not None and req.finished()
+            ):
+                if key not in pending:
                     if len(pending) >= self.max_running_requests:
                         drain(self, wait=True)
-                    pending[id(req)] = (req, return_logprob)
+                    pending[key] = (req, return_logprob)
             else:
                 immediate.append(req)
         if immediate:
@@ -696,6 +846,18 @@ def _install_response_patch(owner: Any) -> bool:
             time.sleep(0.001)
             return None
         return original_idle(self, *args, **kwargs)
+
+    if hasattr(Scheduler, "flush_cache"):
+        original_flush = Scheduler.flush_cache
+
+        @wraps(original_flush)
+        def flush(self, *args, **kwargs):
+            # Pending terminal requests are outside the native scheduler queues.
+            if getattr(self, "_relax_replay_pending", None):
+                return False
+            return original_flush(self, *args, **kwargs)
+
+        Scheduler.flush_cache = flush
 
     if hasattr(Scheduler, "stream_output"):
         Scheduler.stream_output = output
@@ -779,18 +941,18 @@ def run_reference_scheduler(*args, **kwargs):
         if not Envs.RELAX_REPLAY_RAY_ADDRESS:
             raise RuntimeError("Scheduler needs its parent replay Ray address; refusing automatic cluster discovery")
         ray.init(address=Envs.RELAX_REPLAY_RAY_ADDRESS, namespace="relax-replay", log_to_driver=False)
-    import json
-    import os
-
     registration = os.environ.get("RELAX_REPLAY_REGISTRATION")
     if registration is None:
         raise RuntimeError("Scheduler requires its parent's replay registration")
-    if any(kind["name"] == "indexer" for kind in json.loads(registration)["kinds"]):
+    if "RELAX_REPLAY_ENGINE_PUBLISHER" not in os.environ:
+        raise RuntimeError("Scheduler requires its replay publisher generation")
+    definitions = json.loads(registration)
+    if any(kind["name"] == "indexer" for kind in definitions["kinds"]):
         from .qwen38 import install_capture_patch
 
         install_capture_patch()
     _install_tq_topology_cache()
-    replay_data_manager.initialize_worker(json.loads(registration), engine="sglang")
+    replay_data_manager.initialize_worker(definitions, engine="sglang")
     from sglang.srt.managers.scheduler import run_scheduler_process
 
     return run_scheduler_process(*args, **kwargs)
@@ -803,10 +965,14 @@ def run_reference_detokenizer(*args, **kwargs):
     return run_detokenizer_process(*args, **kwargs)
 
 
-def validate_configuration(args: Any, server_args: dict) -> None:
+def validate_configuration(args: Any, server_args: dict, *, local_publication: bool = True) -> None:
     from ..config import rollout_kinds
 
     kinds = rollout_kinds(args)
+    if not local_publication:
+        if "mm_embedding" in kinds:
+            raise ValueError("MM embedding replay requires local SGLang capture without Prefill/Decode disaggregation")
+        return
     if server_args.get("pp_size", 1) > 1:
         raise RuntimeError(
             "SGLang reference publication needs a PP stage-aggregation adapter; "

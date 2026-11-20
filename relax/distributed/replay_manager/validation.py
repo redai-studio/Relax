@@ -149,13 +149,15 @@ def validate_indexer_replay_args(args: Any, *, is_offline: bool) -> None:
         unsupported.append(f"context_parallel_size={args.context_parallel_size}")
     if not capabilities.qsa and (args.tensor_model_parallel_size != 1 or args.sequence_parallel):
         unsupported.append("TP>1/sequence parallel")
-    if capabilities.qsa:
-        from relax.utils.env import Envs
-
+    if capabilities.qsa or model_type == "KeyeVL2":
         from .config import references_enabled
 
         if not references_enabled():
-            unsupported.append("QSA replay requires reference delivery (RELAX_REPLAY_REFERENCES=1)")
+            name = "QSA" if capabilities.qsa else "Keye"
+            unsupported.append(f"{name} replay requires reference delivery (RELAX_REPLAY_REFERENCES=1)")
+    if capabilities.qsa:
+        from relax.utils.env import Envs
+
         if Envs.RELAX_QWEN38_QSA_COMMUNITY_BACKEND != "mixed" or Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
             unsupported.append("QSA replay requires mixed attention with fused attention disabled")
         if not Envs.RELAX_QWEN38_QSA_TP_SELECTOR or Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:

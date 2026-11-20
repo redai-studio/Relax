@@ -83,7 +83,8 @@ def test_mm_embedding_roundtrip_preserves_raw_bf16_bits_and_capacity(media_store
     assert inventory.state["objects"] == {}
 
 
-def test_mm_embedding_hash_dedup_survives_discard_queue_retirement_and_reader(media_store):
+@pytest.mark.asyncio
+async def test_mm_embedding_hash_dedup_survives_discard_queue_retirement_and_reader(media_store):
     store, inventory, body = media_store
     publisher = MMPublisher(store)
     first = publisher.publish("b" * 64, bits(), [1, 4, 4])
@@ -94,8 +95,9 @@ def test_mm_embedding_hash_dedup_survives_discard_queue_retirement_and_reader(me
     manager = ReplayManager(config=store.config, store_factory=lambda: store)
     manager.discard([sample(first)])
     assert body.values
-    with manager.region("train_0").queue_ownership([sample(second)]):
-        pass
+    from unittest.mock import AsyncMock
+
+    await manager.region("train_0").put([sample(second)], AsyncMock())
     ref = ReplayRef.from_dict(second["ref"])
     reader_lease = store.acquire_many([ref], partition="train_0")[0]
     manager.region("train_0").retire()
@@ -130,6 +132,85 @@ def test_mm_embedding_concurrent_publishers_share_first_media_body(media_store):
     assert len(inventory.state["objects"]) == 1
     release_media_entries(store, entries)
     assert not inventory.state["objects"]
+
+
+@pytest.mark.parametrize("writing", [False, True], ids=["claim-only", "in-flight-write"])
+def test_mm_replacement_republishes_unfinished_claim_and_preserves_sealed_media(media_store, writing):
+    store, _, body = media_store
+    original = (0, "original-engine")
+    replacement = (0, "replacement-engine")
+    store.invoke("register_engine_publisher", *original)
+    old = MMPublisher(store, publisher=original)
+    sealed = old.publish("a" * 64, bits()[:1], [1, 2, 2])
+    handoff = old.lookup("a" * 64, [1, 2, 2])
+    digest, record = "b" * 64, "f" * 32
+    assert store.invoke("claim_media", digest, [1, 2, 2], record, "image", publisher=original)["status"] == "claimed"
+
+    entered, resume = Event(), Event()
+    write = body.write_many
+
+    def pause_original_write(keys, values):
+        if keys[0].startswith(f"{record}:"):
+            entered.set()
+            assert resume.wait(5)
+        write(keys, values)
+
+    body.write_many = pause_original_write
+    try:
+        if writing:
+            publication = store.begin_publication(
+                kind="mm_embedding", layers=1, topk=2560, codec="bf16-raw-v1", record=record, media_hash=digest
+            )
+            publication.append(1, lambda _: bits()[:1].copy())
+            assert entered.wait(5)
+            with pytest.raises(RuntimeError, match="unacknowledged writes; restart the replay run"):
+                store.invoke("register_engine_publisher", *replacement)
+            with pytest.raises(RuntimeError, match="unacknowledged writes; restart the replay run"):
+                store.invoke("register_engine_publisher", *replacement)
+            resume.set()
+            with pytest.raises(RuntimeError, match="no longer"):
+                publication.finish_media(digest)
+
+        store.invoke("register_engine_publisher", *replacement)
+        new = MMPublisher(store, publisher=replacement, pending_timeout=0.1)
+        entry = new.publish(digest, np.zeros_like(bits()[:1]), [1, 2, 2])
+        assert entry["ref"]["record"] != record
+        assert torch.count_nonzero(read_mm_embedding(store, entry).view(torch.uint8)) == 0
+        with pytest.raises(RuntimeError, match="active reader lease"):
+            read_mm_embedding(store, sealed)
+        np.testing.assert_array_equal(read_mm_embedding(store, handoff).view(torch.uint8).numpy(), bits()[:1])
+        with pytest.raises(RuntimeError, match="generation has been retired"):
+            old.publish(digest, bits()[:1], [1, 2, 2])
+    finally:
+        resume.set()
+
+    assert not any(key.startswith(f"{record}:") for key in body.values)
+    release_media_entries(store, [entry, handoff])
+    assert not body.values
+
+
+@pytest.mark.parametrize("inherited", [False, True], ids=["original-cache", "deduplicated-cache"])
+def test_mm_replacement_reclaims_cache_only_body_capacity(media_store, inherited):
+    store, _, body = media_store
+    original = (0, "original-engine")
+    store.invoke("register_engine_publisher", *original)
+    old = MMPublisher(store, publisher=original)
+    digest, grid = "a" * 64, [1, 4, 4]
+    if inherited:
+        another_engine = (1, "surviving-engine")
+        store.invoke("register_engine_publisher", *another_engine)
+        another_cache = MMPublisher(store, publisher=another_engine).publish(digest, bits(), grid)
+    old_cache = old.publish(digest, bits(), grid)
+    if inherited:
+        assert old_cache["ref"] == another_cache["ref"]
+        release_media_entries(store, [another_cache])
+
+    replacement = (0, "replacement-engine")
+    store.invoke("register_engine_publisher", *replacement)
+    assert not body.values
+    new_cache = MMPublisher(store, publisher=replacement).publish("b" * 64, bits(), grid)
+    np.testing.assert_array_equal(read_mm_embedding(store, new_cache).view(torch.uint8).numpy(), bits())
+    release_media_entries(store, [new_cache])
 
 
 def test_mm_embedding_geometry_mismatch_and_failed_snapshot_do_not_poison_hash(media_store):

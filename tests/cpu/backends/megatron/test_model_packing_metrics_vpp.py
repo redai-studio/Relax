@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.utils.training.indexer_replay import IndexerReplay
+from relax.distributed.replay_manager.backend.megatron import IndexerReplay
 
 
 class _FakeModel:

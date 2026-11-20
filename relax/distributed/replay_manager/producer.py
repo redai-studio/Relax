@@ -21,10 +21,20 @@ class Producer:
     manager: "ReplayManager"
     kinds: frozenset[str]
 
-    def begin(self, *, kind: str, layers: int, topk: int, codec: str = "int32") -> "ProducerPublication":
+    def begin(
+        self,
+        *,
+        kind: str,
+        layers: int,
+        topk: int,
+        codec: str = "int32",
+        engine_publisher: tuple[int, str] | None = None,
+    ) -> "ProducerPublication":
         if kind not in self.kinds:
             raise ValueError("Replay kind is not registered with this producer")
-        return self.manager.store().begin_publication(kind=kind, layers=layers, topk=topk, codec=codec)
+        return self.manager.store().begin_publication(
+            kind=kind, layers=layers, topk=topk, codec=codec, engine_publisher=engine_publisher
+        )
 
     def _publish_response(self, values: Any, *, kind: str, tokens: list[int]) -> dict:
         import numpy as np
@@ -156,6 +166,8 @@ class ProducerPublication:
         topk: int,
         codec: str = "int32",
         record: str | None = None,
+        media_hash: str | None = None,
+        engine_publisher: tuple[int, str] | None = None,
     ):
         from .core import new_data_id
 
@@ -175,7 +187,17 @@ class ProducerPublication:
         self._futures = []
         self._sealed = self._aborted = False
         self._finish_future = None
-        store.invoke("begin", self.record, kind, layers, topk, self.chunk_rows, codec)
+        store.invoke(
+            "begin",
+            self.record,
+            kind,
+            layers,
+            topk,
+            self.chunk_rows,
+            codec,
+            media_hash=media_hash,
+            engine_publisher=engine_publisher,
+        )
 
     def append(self, count: int, snapshot_layer: Callable[[int], Any], *, encoded_width: int | None = None) -> None:
         import numpy as np

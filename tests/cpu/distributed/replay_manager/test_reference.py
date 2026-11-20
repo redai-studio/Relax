@@ -2,10 +2,9 @@
 
 import asyncio
 import os
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +14,25 @@ from relax.distributed.replay_manager.config import ReplayConfig, validate_refer
 from relax.distributed.replay_manager.consumer import ConsumerBatchLayout, ConsumerLayerReader, ConsumerTensorCache
 from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
 from relax.distributed.replay_manager.storage import TQReplayStorage, _clear_simple_storage_samples
+
+
+def test_debug_dump_replay_uses_self_contained_fields(tmp_path):
+    from relax.utils.training.train_dump_utils import load_debug_rollout_samples
+    from relax.utils.types import Sample
+
+    path = tmp_path / "rollout.pt"
+    sample = Sample(tokens=[1, 2], rollout_replay_refs={"moe": {"ref": "old-run"}})
+    torch.save({"samples": [sample.to_dict()]}, path)
+    [restored] = load_debug_rollout_samples(path, SimpleNamespace())
+    assert restored.tokens == [1, 2] and not restored.rollout_replay_refs
+    with pytest.raises(ValueError, match="moe.*another run"):
+        load_debug_rollout_samples(path, SimpleNamespace(use_rollout_routing_replay=True))
+
+    sample.rollout_replay_refs = {"mm_embedding": {"media": [{"modality": "video"}]}}
+    sample.multimodal_train_inputs = {"pixel_values": torch.ones(2)}
+    torch.save({"samples": [sample.to_dict()]}, path)
+    with pytest.raises(ValueError, match="lacks pixel_values_videos"):
+        load_debug_rollout_samples(path, SimpleNamespace())
 
 
 class MemoryBody:
@@ -40,46 +58,33 @@ class MemoryBody:
 
 
 @pytest.mark.parametrize("configured", [None, "0"])
-def test_cli_reference_enable_preserves_early_manager_and_installs_cleanup_once(monkeypatch, configured):
-    from relax.distributed.replay_manager import _tq_compat, core
+def test_cli_reference_enable_preserves_manager_and_retires_after_successful_tq_clear(monkeypatch, configured):
+    from unittest.mock import AsyncMock
+
+    from relax.distributed import replay_manager
+    from relax.distributed.replay_manager import core
+    from relax.utils.tq.lifecycle import clear_training_partition
 
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", configured or "0")
     monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "")
     if configured is None:
-        monkeypatch.delenv("RELAX_REPLAY_REFERENCES", raising=False)
+        monkeypatch.delenv("RELAX_REPLAY_REFERENCES")
     config = ReplayConfig(delivery="full", run_id="abcd", capacity_bytes=123456)
-    retired = []
-    manager = ReplayManager(config=config, store_factory=lambda: SimpleNamespace(retire_partition=retired.append))
-    early_import = manager
+    store = SimpleNamespace(invoke_async=AsyncMock())
+    manager = ReplayManager(config=config, store_factory=lambda: store)
     monkeypatch.setattr(core, "replay_data_manager", manager)
-    monkeypatch.setattr(_tq_compat, "install_tq_topology_cache", lambda: None)
-
-    class Client:
-        async def async_clear_partition(self, partition_id):
-            return partition_id
-
-    client_module = ModuleType("transfer_queue.client")
-    client_module.AsyncTransferQueueClient = Client
-    monkeypatch.setitem(sys.modules, client_module.__name__, client_module)
-    original = Client.async_clear_partition
+    monkeypatch.setattr(replay_manager, "replay_data_manager", manager)
     core.enable_reference_replay()
-    assert core.replay_data_manager is early_import
-    assert early_import.uses_references
-    assert early_import.config.run_id == config.run_id
-    assert early_import.config.capacity_bytes == config.capacity_bytes
-    assert os.environ["RELAX_REPLAY_REFERENCES"] == "1"
+    assert core.replay_data_manager is manager and manager.uses_references
+    assert manager.config.run_id == config.run_id and manager.config.capacity_bytes == config.capacity_bytes
     assert os.environ["RELAX_REPLAY_RUN_ID"] == config.run_id
-    installed = Client.async_clear_partition
-    assert installed is not original
-    assert installed._relax_replay_cleanup
-    # Re-entering after reference initialization is also safe; workers can
-    # import the same entry points several times before creating TQ clients.
-    manager.initialize(kinds=["indexer"])
-    core.enable_reference_replay()
-    assert Client.async_clear_partition is installed
-    assert core.replay_data_manager is early_import
-    assert asyncio.run(Client().async_clear_partition("train_0")) == "train_0"
-    assert retired == ["train_0"]  # One wrapper, one successful retirement.
+
+    client = SimpleNamespace(async_clear_partition=AsyncMock(side_effect=[RuntimeError("TQ clear failed"), 1]))
+    with pytest.raises(RuntimeError, match="TQ clear failed"):
+        asyncio.run(clear_training_partition(client, "train_0"))
+    store.invoke_async.assert_not_awaited()
+    assert asyncio.run(clear_training_partition(client, "train_0")) == 1
+    store.invoke_async.assert_awaited_once_with("retire_partition", "train_0")
 
 
 def test_cli_reference_enable_refuses_initialized_full_manager_without_mutation(monkeypatch):
@@ -107,7 +112,6 @@ def test_cli_reference_enable_generates_storage_identity_before_initialization(m
     monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "")
     manager = ReplayManager(config=ReplayConfig(delivery=delivery, run_id="", capacity_bytes=123456))
     monkeypatch.setattr(core, "replay_data_manager", manager)
-    monkeypatch.setattr(core, "install_tq_cleanup_hook", lambda: None)
     early_import = manager
     core.enable_reference_replay()
     identity = manager.config.run_id
@@ -129,7 +133,8 @@ def test_cli_reference_enable_generates_storage_identity_before_initialization(m
 
 
 @pytest.mark.parametrize("mode", ["colocate", "hybrid", "fully_async", "separate", "fsdp"])
-def test_reference_training_rejects_unwired_consumers_before_startup(monkeypatch, mode):
+@pytest.mark.parametrize("indexer", [False, True])
+def test_reference_training_rejects_unwired_consumers_before_startup(monkeypatch, mode, indexer):
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
     args = SimpleNamespace(
         train_backend="fsdp" if mode == "fsdp" else "megatron",
@@ -137,14 +142,28 @@ def test_reference_training_rejects_unwired_consumers_before_startup(monkeypatch
         hybrid=mode == "hybrid",
         fully_async=mode == "fully_async",
         use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=indexer,
     )
-    if mode == "colocate":
+    if mode == "colocate" or (mode in {"hybrid", "fully_async"} and not indexer):
         validate_reference_training(args)
     else:
         with pytest.raises(ValueError, match="colocated Megatron"):
             validate_reference_training(args)
     args.use_rollout_routing_replay = False
+    args.use_rollout_indexer_replay = False
     validate_reference_training(args)
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [("dynamic_context_parallel", "dynamic context"), ("overlap_moe_expert_parallel_comm", "combined 1F1B")],
+)
+def test_reference_r3_rejects_unsupported_router_layout(monkeypatch, field, reason):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    args = SimpleNamespace(train_backend="megatron", fully_async=True, use_rollout_routing_replay=True)
+    setattr(args, field, True)
+    with pytest.raises(ValueError, match=reason):
+        validate_reference_training(args)
 
 
 @pytest.fixture
@@ -161,6 +180,57 @@ def published():
     ref = publication.finish([10, 11, 12, 13, 14])
     yield config, store, body, inventory, ref, values
     store._writer.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_queue_put_releases_only_this_writer(published, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    config, store, body, inventory, ref, _ = published
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    sample = SimpleNamespace(rollout_replay_refs={"moe": ref.to_dict()})
+    attached, acknowledge = asyncio.Event(), asyncio.Event()
+    invoke = store.invoke_async
+
+    async def delay_ack(method, *args, **kwargs):
+        result = await invoke(method, *args, **kwargs)
+        if method == "attach":
+            attached.set()
+            await acknowledge.wait()
+        return result
+
+    monkeypatch.setattr(store, "invoke_async", delay_ack)
+    write = AsyncMock()
+    task = asyncio.create_task(manager.region("train_0").put([sample], write))
+    await asyncio.wait_for(attached.wait(), 5)
+    # Another sample sharing the same body can finish while the first waits.
+    store.attach([ref], "train_0")
+    store.commit([ref])
+    task.cancel()
+    acknowledge.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    write.assert_not_awaited()
+    assert inventory.state["objects"][ref.record]["partitions"] == ["train_0"]
+    store.retire_partition("train_0")
+    assert not body.blocks
+
+
+def test_normalized_sample_roundtrip_keeps_capture_manifest(published):
+    from relax.distributed.replay_manager.ref_data import decode_refs, encode_refs, iter_refs, validate_sample
+    from relax.utils.types import Sample
+
+    config, store, _, inventory, ref, _ = published
+    producer = ReplayManager(config=config, store_factory=lambda: store).register_producer(["moe"])
+    sample = Sample(tokens=[10, 99, 12, 13, 14])
+    meta = {"routed_experts": ref.to_dict()}
+    producer.accept_response(sample, meta, SimpleNamespace(), captured_tokens=[10, 11, 12, 13, 14])
+    received = decode_refs(encode_refs(sample.rollout_replay_refs))
+    validate_sample(received, sample.tokens)
+    assert list(iter_refs(received)) == [ref]
+    assert meta["routed_experts"] == inventory.state["objects"][ref.record]["manifest"] == ref.to_dict()
+    with pytest.raises(ValueError, match="tokens"):
+        validate_sample(received, [10, 77, 12, 13, 14])
 
 
 @pytest.mark.parametrize("capacity", [0, 8, 4096])
@@ -323,6 +393,168 @@ def test_reference_wire_round_trip_validates_token_identity_without_body_reads(p
         consumer.receive_references(batch)
 
 
+@pytest.fixture
+def r3_batches(published, monkeypatch):
+    from megatron.core import mpu
+
+    from relax.distributed.replay_manager.backend import megatron
+
+    config, store, body, _, first, values = published
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    publication = store.begin_publication(kind="moe", layers=3, topk=2)
+    for start in (0, 2):
+        publication.append(2, lambda layer, start=start: values[start : start + 2, layer] + 100)
+    second = publication.finish([20, 21, 22, 23, 24])
+    refs = [first, second]
+    store.attach(refs, "train_0")
+    store.commit(refs)
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(megatron, "replay_data_manager", manager)
+    monkeypatch.setattr(megatron.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(megatron.RoutingReplay, "all_routing_replays", [])
+    routers = [megatron.RoutingReplay() for _ in range(3)]
+    args = SimpleNamespace(
+        num_layers=3,
+        moe_router_topk=2,
+        num_experts=256,
+        sequence_parallel=False,
+        qkv_format="thd",
+        allgather_cp=False,
+        data_pad_size_multiplier=1,
+    )
+    batches = [
+        {
+            "tokens": [torch.arange(start, start + 5)],
+            "total_lengths": [5],
+            "rollout_replay_refs": [{"moe": ref.to_dict()}],
+        }
+        for start, ref in zip((10, 20), refs, strict=True)
+    ]
+    try:
+        yield manager, store, body, routers, args, batches, values
+    finally:
+        megatron.RoutingReplay.clear_all()
+        store.retire_partition("train_0")
+        assert not body.blocks
+
+
+def test_streaming_r3_keeps_virtual_chunks_microbatches_and_recompute_in_order(r3_batches):
+    from relax.distributed.replay_manager.backend import megatron
+
+    _, store, body, routers, args, batches, values = r3_batches
+
+    def model(layers):
+        return SimpleNamespace(
+            modules=lambda: [SimpleNamespace(layer_number=i + 1, routing_replay=routers[i]) for i in layers]
+        )
+
+    models = [model((0,)), model((2, 1))]
+    batches = [{**batch, "unconcat_tokens": batch["tokens"]} for batch in batches]
+    bind = megatron.streaming_moe_replay(args, models, "train_0")
+    # The first chunk can be ahead of the next chunk on the same rank.
+    for model, layer_indices in zip(models, ((0,), (1, 2)), strict=True):
+        for batch, offset in zip([*batches, {**batches[1], "__is_dummy__": True}], (0, 100, 100), strict=True):
+            bind(model, batch)
+            for layer in layer_indices:
+                expected = np.concatenate((values[:, layer] + offset, [[2 * layer, 2 * layer + 1]]))
+                np.testing.assert_array_equal(routers[layer].pop_forward().numpy(), expected)
+    store.retire_partition("train_0")
+    assert body.blocks
+    for layer, router in enumerate(routers):
+        for offset in (0, 100, 100):
+            expected = np.concatenate((values[:, layer] + offset, [[2 * layer, 2 * layer + 1]]))
+            np.testing.assert_array_equal(router.pop_backward().numpy(), expected)
+
+
+@pytest.mark.parametrize("mode", ["fixed", "streaming", "hybrid"])
+def test_r3_forward_uses_each_batch_routes_and_writes_only_real_rows(r3_batches, monkeypatch, mode):
+    from megatron.core import mpu
+
+    from relax.backends.megatron import actor as backend
+
+    manager, store, body, routers, args, batches, values = r3_batches
+    actor = object.__new__(backend.MegatronTrainRayActor)
+    actor.model = [
+        SimpleNamespace(
+            modules=lambda: [SimpleNamespace(layer_number=i + 1, routing_replay=r) for i, r in enumerate(routers)]
+        )
+    ]
+    actor.prof = SimpleNamespace(step=lambda **_: None)
+    actor.weights_backuper = SimpleNamespace(backup_tags=["actor"])
+    actor._switch_model = actor.recv_weight_fully_async = lambda _: None
+    actor.data_system_client = None
+    actor.args = args
+    vars(args).update(
+        use_routing_replay=True,
+        use_rollout_routing_replay=True,
+        use_dynamic_batch_size=False,
+        global_batch_size=1,
+        num_iters_per_train_update=1,
+        max_tokens_per_gpu=8,
+        log_probs_max_tokens_per_gpu=8,
+        multimodal_keys=None,
+        compute_advantages_and_returns=True,
+        keep_old_actor=False,
+        use_rollout_logprobs=False,
+    )
+    monkeypatch.setattr(backend, "replay_data_manager", manager)
+    monkeypatch.setattr(backend, "log_perf_data_fwd", lambda *_: None)
+    monkeypatch.setattr(mpu, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpu, "get_data_parallel_world_size", lambda **_: 1)
+    monkeypatch.setattr(
+        backend,
+        "get_data_iterator",
+        lambda args, model, data, **_: ([backend.DataIterator(data, micro_batch_size=1)], [1]),
+    )
+
+    observed, written = [], []
+
+    def forward(iterators, _, *, store_prefix):
+        batch = iterators[0].get_next(["tokens"])
+        start = batch["tokens"][0][0].item()
+        observed.append(start)
+        for layer, router in enumerate(routers):
+            expected = np.concatenate((values[:, layer] + (0 if start == 10 else 100), [[2 * layer, 2 * layer + 1]]))
+            np.testing.assert_array_equal(router.pop_forward().numpy(), expected)
+        return {"log_probs": [start]}
+
+    actor.compute_log_prob = forward
+    actor._put_data_to_transfer_queue = lambda output, meta, data: written.extend(output["log_probs"])
+    if mode == "hybrid":
+        region = manager.region("train_0")
+        cache = ConsumerTensorCache(manager.config.materialization_bytes)
+        for batch in batches:
+            actor._hybrid_forward_subbatch(batch, replay_region=region, replay_cache=cache)
+        assert [batch["log_probs"] for batch in batches] == [[10], [20]]
+        assert observed == [10, 20]
+        return
+
+    def fetched(fields):
+        assert manager.register_consumer().fields(fields)[-1] == "rollout_replay_refs"
+
+    def fetch(_, rollout_id, fields, size, index):
+        assert rollout_id == 0 and size == 1
+        fetched(fields)
+        return batches[index], index
+
+    def streaming(**kwargs):
+        fetched(kwargs["data_fields"])
+        return [(batches[0], 0), (batches[1], 1), ({**batches[-1], "__is_dummy__": True}, 1)]
+
+    actor._use_streaming_fwd = lambda: mode == "streaming"
+    actor.all_consumed = lambda *_: len(written) == len(batches)
+    actor._get_data_from_transfer_queue = fetch
+    monkeypatch.setattr(backend, "StreamingTQIterator", streaming)
+    actor.compute_actor_log_prob(0)
+    assert written == [10, 20]
+    assert observed == ([10, 20, 20] if mode == "streaming" else [10, 20])
+    store.retire_partition("train_0")
+    assert not body.blocks
+
+
 @pytest.mark.asyncio
 async def test_reference_delete_failure_drains_units_and_preserves_retry_metadata(published):
     _, _, _, inventory, ref, _ = published
@@ -424,7 +656,11 @@ def test_reference_capture_reads_modern_request_kv_slots(published, monkeypatch)
         origin_input_ids=[10, 11],
         output_ids_through_stop=[12, 13, 14],
     )
-    refs = sglang._advance_publication(processor, req, 4, {"moe": lambda: capturer}, final=True)
+    publisher = (0, "engine")
+    store.invoke("register_engine_publisher", *publisher)
+    refs = sglang._advance_publication(
+        processor, req, 4, {"moe": lambda: capturer}, final=True, engine_publisher=publisher
+    )
     ref = sglang.ReplayRef.from_dict(refs["moe"])
     with store.reader([ref]) as reader:
         for layer in range(3):
@@ -433,6 +669,22 @@ def test_reference_capture_reads_modern_request_kv_slots(published, monkeypatch)
             np.testing.assert_array_equal(output, buffer[[4, 1, 5, 0], layer].numpy())
     store.discard([ref])
     assert all(not key.startswith(ref.record) for key in body.blocks)
+
+
+def test_dense_routed_expert_decode_preserves_alignment_diagnostics():
+    import base64
+    import binascii
+
+    from relax.distributed.replay_manager.backend.sglang import decode_routed_experts
+
+    values = np.array([1, 2], dtype=np.int32)
+    payload = base64.b64encode(values.tobytes()).decode("ascii")
+    meta = {"routed_experts": payload, "finish_reason": {"type": "stop"}, "prompt_tokens": 2}
+    np.testing.assert_array_equal(decode_routed_experts(meta, 2, 1, 1).reshape(-1), values)
+    with pytest.raises(ValueError, match=r"Routed-expert alignment mismatch: .*prompt_tokens=2"):
+        decode_routed_experts(meta, 3, 1, 1)
+    with pytest.raises(binascii.Error):
+        decode_routed_experts({**meta, "routed_experts": payload + "!"}, 2, 1, 1)
 
 
 @pytest.mark.parametrize("codec,topk,width", [("keye-bitmap-v1", 2048, 65), ("qsa-r4-bitmap-v1", 512, 2049)])

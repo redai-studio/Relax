@@ -3,6 +3,8 @@
 """Frozen Qwen3.8 vision outputs consumed through reference replay."""
 
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -18,7 +20,22 @@ from ..ref_data import ReplayRef, validate_mm_envelope
 
 _active_reader: ContextVar[Any] = ContextVar("mm_embedding_replay_reader", default=None)
 _vision_input: ContextVar[Any] = ContextVar("mm_embedding_replay_input", default=None)
+_native_vision: ContextVar[bool] = ContextVar("native_vision_forward", default=False)
 _INPUT_KEY = "_relax_mm_embedding_replay"
+
+
+def uses_native_vision() -> bool:
+    return _native_vision.get()
+
+
+@contextmanager
+def native_vision_forward() -> Iterator[None]:
+    """Use the current model's visual weights for the reference policy."""
+    token = _native_vision.set(True)
+    try:
+        yield
+    finally:
+        _native_vision.reset(token)
 
 
 @dataclass(frozen=True)
@@ -83,7 +100,7 @@ def install_vision_replay(model: Any) -> None:
     def forward(_model: Any, *args: Any, **kwargs: Any) -> Any:
         replay = kwargs.pop(_INPUT_KEY, None)
         has_media = kwargs.get("image_grid_thw") is not None or kwargs.get("video_grid_thw") is not None
-        if replay is None and has_media:
+        if replay is None and has_media and not uses_native_vision():
             raise RuntimeError("MM replay is enabled but this visual batch has no replay embeddings")
         token = _vision_input.set(replay)
         try:

@@ -3,7 +3,6 @@
 import os
 import socket
 from argparse import Namespace
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -518,9 +517,7 @@ def post_process_env(args, env):
     from relax.distributed.replay_manager import reference_environment
 
     for name, value in reference_environment().items():
-        if getattr(args, "use_rollout_indexer_replay", False) or getattr(
-            args, "use_rollout_mm_embedding_replay", False
-        ):
+        if Envs.RELAX_REPLAY_REFERENCES and rollout_kinds(args):
             env["env_vars"][name] = value
         else:
             env["env_vars"].setdefault(name, value)
@@ -591,12 +588,9 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     Returns:
         A dictionary containing the debug data for the specified rollout ID.
     """
+    from relax.utils.training.train_dump_utils import load_debug_rollout_samples
 
-    data = torch.load(
-        open(args.load_debug_rollout_data.format(rollout_id=rollout_id), "rb"),
-        weights_only=False,
-    )["samples"]
-    data = [Sample.from_dict(sample) for sample in data]
+    data = load_debug_rollout_samples(args.load_debug_rollout_data.format(rollout_id=rollout_id), args)
     if (ratio := args.load_debug_rollout_data_subsample) is not None:
         original_num_rows = len(data)
         if (
@@ -670,15 +664,16 @@ async def transfer_batch_to_data_system(
 
         # Pass sampler metadata inline so it lands atomically with ready samples.
         custom_meta = build_rollout_custom_meta(rollout_batch)
-        ownership = (
-            replay_data_manager.region(f"train_{rollout_id}").queue_ownership(batch_samples)
-            if replay_data_manager.uses_references
-            else nullcontext()
-        )
-        with ownership:
+
+        async def write() -> None:
             await data_system_client.async_put(
                 data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
             )
+
+        if replay_data_manager.uses_references:
+            await replay_data_manager.region(f"train_{rollout_id}").put(batch_samples, write)
+        else:
+            await write()
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
         logger.error(f"Error transferring batch {batch_count}: {e}")

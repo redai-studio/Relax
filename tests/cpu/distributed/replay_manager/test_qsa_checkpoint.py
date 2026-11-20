@@ -92,7 +92,7 @@ def bind(layers, microbatches):
         layer = IndexerReplay._layers[owner.layer_number]
         for microbatch in range(microbatches):
             source = Source(10 * microbatch + owner.layer_number)
-            layer.manager.bind(layer.key, ConsumerRecord("indexer", microbatch, source))
+            layer.channel.bind(ConsumerRecord("indexer", microbatch, source))
             sources.append(source)
     return owners, sources
 

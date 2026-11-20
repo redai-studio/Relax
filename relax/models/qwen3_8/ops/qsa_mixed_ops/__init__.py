@@ -33,6 +33,13 @@ def attention_for_selection(
     bounds = getattr(selection, "_relax_qsa_mixed_bounds", None) if is_thd else (0, length)
     if bounds is None or bounds[0] != 0 or bounds[-1] != length:
         raise ValueError("Mixed packed QSA requires producer CPU document boundaries")
+    if selection.selected_ids is None and long_backend == "cudnn_pr1765":
+        from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import _block_ids_from_bits
+
+        if selection.bits_per_row % 4 or selection.selected_bits.dtype != torch.uint8:
+            raise ValueError("Mixed QSA replay requires int32-aligned bitmap bytes")
+        bits = selection.selected_bits.view(torch.int32).reshape(-1, selection.bits_per_row // 4)
+        selection = replace(selection, selected_ids=_block_ids_from_bits(bits))
     if long_backend == "cute":
         from relax.models.qwen3_8.ops.qsa_cute.adapter import attention_for_selection as cute_mixed
 
@@ -40,11 +47,6 @@ def attention_for_selection(
     if long_backend == "cudnn_pr1765":
         from relax.models.qwen3_8.ops.qsa_mixed_ops.cudnn import attention_for_selection as cudnn_mixed
 
-        if selection.selected_ids is None:
-            from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import _block_ids_from_bits
-
-            bits = selection.selected_bits.view(torch.int32).reshape(-1, selection.bits_per_row // 4)
-            selection = replace(selection, selected_ids=_block_ids_from_bits(bits))
         return cudnn_mixed(query, key, value, selection, scale, bounds)
     if selection.selected_ids is None:
         from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import attention_from_bits

@@ -207,27 +207,32 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     assert args.rollout_num_gpus == 4
 
 
-def test_indexer_flag_enables_reference_before_model_validation(arguments_module, monkeypatch):
+@pytest.mark.parametrize(
+    ("model_type", "requested", "reference"),
+    [("KeyeVL2", False, True), ("deepseek_v4", False, False), ("deepseek_v4", True, True)],
+)
+def test_indexer_flag_selects_delivery_before_model_validation(
+    arguments_module, monkeypatch, model_type, requested, reference
+):
     from relax.distributed.replay_manager import core, validation
     from relax.distributed.replay_manager.config import ReplayConfig
 
-    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1" if requested else "0")
     monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "")
     manager = core.ReplayManager(config=ReplayConfig(delivery="full", run_id="abcd"))
     monkeypatch.setattr(core, "replay_data_manager", manager)
-    # Cleanup installation itself is exercised against a fake external TQ
-    # client in test_reference; this test owns argument-validation ordering.
-    monkeypatch.setattr(core, "install_tq_cleanup_hook", lambda: None)
+    monkeypatch.setattr("relax.utils.misc.get_hf_config", lambda checkpoint: SimpleNamespace(model_type=model_type))
     checked = []
 
     def validate_indexer(args, *, is_offline):
-        assert manager.uses_references
-        assert os.environ["RELAX_REPLAY_REFERENCES"] == "1"
-        assert os.environ["RELAX_REPLAY_RUN_ID"] == "abcd"
+        assert manager.uses_references is reference
+        assert os.environ["RELAX_REPLAY_REFERENCES"] == ("1" if reference else "0")
+        assert os.environ["RELAX_REPLAY_RUN_ID"] == ("abcd" if reference else "")
         checked.append((args.use_rollout_indexer_replay, is_offline))
 
     monkeypatch.setattr(validation, "validate_indexer_replay_args", validate_indexer)
     args = _opd_args()
+    args.hf_checkpoint = "model"
     args.use_rollout_indexer_replay = True
     arguments_module.relax_validate_args(args)
     assert checked == [(True, False)]

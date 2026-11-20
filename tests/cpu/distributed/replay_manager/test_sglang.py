@@ -48,6 +48,41 @@ def test_reference_non_owner_keeps_capture_but_skips_routing_snapshot(monkeypatc
         np.testing.assert_array_equal(captured, routes)
 
 
+def test_multimodal_r3_hashes_the_original_placeholder_tokens(monkeypatch):
+    import torch
+
+    from relax.distributed.replay_manager.backend import sglang
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2)
+    body = MemoryBody()
+    store = TQReplayStorage(config, inventory=ReplayInventory(config, body.delete))
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(sglang, "replay_data_manager", manager)
+    prompt = [10, 11, 12]
+    request = SimpleNamespace(
+        rid="multimodal",
+        origin_input_ids=[10, 300, 12],
+        origin_input_ids_unpadded=prompt,
+        output_ids=[13],
+        req_pool_idx=0,
+        return_routed_experts=True,
+    )
+    processor = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(3).reshape(1, 3)))
+    capturer = SimpleNamespace(host_cache=SimpleNamespace(buffer=torch.arange(6, dtype=torch.int32).reshape(3, 1, 2)))
+    try:
+        refs = sglang._advance_publication(processor, request, 3, {"moe": lambda: capturer}, final=True)
+        sample = SimpleNamespace(tokens=[*prompt, 13])
+        manager.register_producer({"moe"}).accept_response(sample, {"routed_experts": refs["moe"]}, SimpleNamespace())
+        assert sample.rollout_replay_refs == refs
+    finally:
+        store.close_run()
+
+
 @pytest.mark.parametrize("component_output", [False, True], ids=["legacy", "component"])
 def test_reference_response_waits_for_publication_and_drains_on_empty_input(monkeypatch, component_output):
     # Match SGLang's independent, slotted output component. It intentionally
@@ -100,6 +135,143 @@ def test_reference_response_waits_for_publication_and_drains_on_empty_input(monk
     assert req._relax_replay_finish is None and req._relax_replay_streams == {}
     assert scheduler.maybe_sleep_on_idle() == "idle"
     assert not scheduler._relax_replay_pending
+
+
+@pytest.mark.parametrize("abort_mode", ["running", "suffix", "waiting", "error"])
+def test_agentic_reference_abort_seals_only_active_moe_routes(monkeypatch, abort_mode):
+    import torch
+
+    from relax.distributed.replay_manager.backend import sglang
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.ref_data import token_digest
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    class FINISH_ABORT:
+        def __init__(self, status_code=None):
+            self.status_code = status_code
+
+    class Req:
+        rid = sglang.AGENTIC_R3_REQUEST_PREFIX + "test"
+        origin_input_ids = [10, 11, 12]
+        return_routed_experts = return_indexer_topk = True
+        is_retracted = False
+        req_pool_idx = 0
+        finished_reason = to_finish = None
+
+        def __init__(self):
+            self.output_ids = []
+
+        def finished(self):
+            return self.finished_reason is not None
+
+        def reset_for_retract(self):
+            self.is_retracted = True
+
+        def set_finish_with_abort(self):
+            self.finished_reason = FINISH_ABORT()
+
+    class Scheduler:
+        max_running_requests = 4
+        tp_rank = 0
+
+        def abort_request(self, notice):
+            if self.waiting_queue:
+                self.waiting_queue.pop()
+            else:
+                self.running_batch.reqs[0].to_finish = FINISH_ABORT(503 if abort_mode == "error" else None)
+
+        def maybe_collect_routed_experts(self, req):
+            raise AssertionError("The native collector cannot seal a reference")
+
+        maybe_collect_indexer_topk = maybe_collect_routed_experts
+
+        def process_batch_result_decode(self, batch, result):
+            for req in batch.reqs:
+                req.output_ids.append(13)
+                if req.to_finish is not None:
+                    req.finished_reason, req.to_finish = req.to_finish, None
+                    self.maybe_collect_routed_experts(req)
+                    self.maybe_collect_indexer_topk(req)
+                    self.stream_output([req], True)
+
+        process_batch_result_prefill = process_batch_result_decode
+
+        def stream_output(self, reqs, return_logprob, skip_req=None):
+            self.emitted.extend(reqs)
+
+        def process_input_requests(self, reqs):
+            pass
+
+        def maybe_sleep_on_idle(self):
+            pass
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, publication_bytes=4096)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(sglang, "replay_data_manager", manager)
+    monkeypatch.setattr(sglang, "_scheduler_contract", lambda: ("sglang.srt.managers.scheduler", "Scheduler", ""))
+    module = ModuleType("sglang.srt.managers.scheduler")
+    module.Scheduler = Scheduler
+    values = torch.arange(8, dtype=torch.int32).reshape(4, 1, 2)
+    module.get_global_experts_capturer = module.get_global_indexer_capturer = lambda: SimpleNamespace(
+        host_cache=SimpleNamespace(buffer=values)
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    schedule_batch = ModuleType("sglang.srt.managers.schedule_batch")
+    schedule_batch.Req = Req
+    monkeypatch.setitem(sys.modules, schedule_batch.__name__, schedule_batch)
+    req = Req()
+    req.routed_experts_start_len = 1 if abort_mode == "suffix" else 0
+    scheduler = Scheduler()
+    scheduler.emitted = []
+    active = abort_mode != "waiting"
+    scheduler.waiting_queue = [] if active else [req]
+    scheduler.running_batch = SimpleNamespace(reqs=[req] if active else [], seq_lens_cpu=[3])
+    scheduler.req_to_token_pool = SimpleNamespace(req_to_token=torch.arange(4).reshape(1, 4))
+
+    try:
+        sglang.install_scheduler_patch(manager, kinds=frozenset({"moe", "indexer"}))
+        # Leave one progressive chunk in each stream before the abort.
+        sglang._advance_publication(
+            scheduler,
+            req,
+            2,
+            {"moe": module.get_global_experts_capturer, "indexer": module.get_global_indexer_capturer},
+            final=False,
+        )
+        scheduler.abort_request(SimpleNamespace(rid=req.rid, abort_all=False))
+        if not active:
+            assert not req._relax_replay_streams and not inventory.state["objects"]
+            return
+
+        scheduler.process_batch_result_decode(scheduler.running_batch, SimpleNamespace())
+        if abort_mode == "error":
+            assert scheduler.emitted == [req]
+            assert not hasattr(req, "routed_experts") and not inventory.state["objects"]
+            return
+        if scheduler._relax_replay_pending:
+            req._relax_replay_finish["moe"].result(timeout=5)
+            scheduler.process_input_requests([])
+        assert scheduler.emitted == [req]
+        assert not hasattr(req, "indexer_topk")
+        ref = ReplayRef.from_dict(req.routed_experts)
+        start = req.routed_experts_start_len
+        assert ref.rows == 3 - start and ref.tokens == token_digest([10, 11, 12, 13][start:])
+        with store.reader([ref]) as reader:
+            rows = np.arange(ref.rows)
+            output = np.zeros((ref.rows, 2), dtype=np.int32)
+            reader.read_into(0, 0, rows, output, rows)
+            np.testing.assert_array_equal(output, values[start:3, 0].numpy())
+        assert len(inventory.state["objects"]) == 1
+        store.discard([ref])
+        assert not body.blocks
+    finally:
+        store._writer.close()
 
 
 def test_reference_tq_topology_cache_preserves_thread_restore_and_fallback(monkeypatch) -> None:
