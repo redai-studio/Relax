@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
+import numpy as np
+import pybase64
 import pytest
 
 from relax.utils.types import Sample
@@ -15,6 +19,69 @@ from relax.utils.types import Sample
 
 sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
 _post_generation = sglang_rollout._post_generation
+
+
+@pytest.mark.parametrize("finish_reason", ["abort", "stop"])
+async def test_routing_replay_abort_does_not_cache_logprob_placeholder(monkeypatch, finish_reason):
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_slime_router=False,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
+        sglang_router_policy="round_robin",
+        sglang_speculative_algorithm="NEXTN",
+        custom_generate_function_path=None,
+        num_layers=46,
+        moe_router_topk=8,
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1] * 1532),
+        processor=None,
+        opd_manager=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
+    output = {
+        "text": "",
+        "output_ids": [],
+        "meta_info": {
+            "finish_reason": {"type": finish_reason},
+            "output_token_logprobs": [[None, 42, None]],
+            "routed_experts": pybase64.b64encode(np.arange(563408, dtype=np.int32).tobytes()).decode(),
+        },
+    }
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "_post_generation", AsyncMock(return_value=output))
+    sample = Sample(prompt="prompt", tokens=[1] * 1532, rollout_tokens=[1] * 1532)
+    if finish_reason != "abort":
+        with pytest.raises(ValueError):
+            await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+        return
+
+    result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+    assert result.status == Sample.Status.ABORTED
+    assert result.tokens == result.rollout_tokens == [1] * 1532
+    assert result.response == "" and result.response_length == 0
+    assert result.rollout_log_probs is None and result.rollout_routed_experts is None
+    assert not state.semaphore.locked()
+
+    routes = np.arange(1532 * 46 * 8, dtype=np.int32).reshape(1532, 46, 8)
+    output.update(text="answer", output_ids=[42])
+    output["meta_info"].update(
+        finish_reason={"type": "stop"},
+        output_token_logprobs=[[-0.3, 42, None]],
+        routed_experts=pybase64.b64encode(routes.tobytes()).decode(),
+    )
+    result = await sglang_rollout._dispatch_generate(state, args, sample, {"max_new_tokens": 8})
+    assert result.status == Sample.Status.COMPLETED
+    assert result.response_length == 1 and result.rollout_log_probs == [-0.3]
+    np.testing.assert_array_equal(result.rollout_routed_experts, routes)
 
 
 def _status_error(status_code: int, *, body) -> httpx.HTTPStatusError:

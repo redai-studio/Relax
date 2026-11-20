@@ -511,6 +511,15 @@ async def generate(
     output = await _post_generation(args, state, url, payload, headers, evaluation)
     _t_generate = monotonic() - _t_generate_start
 
+    # Interrupted requests may have incomplete replay/logprob metadata. Handle
+    # them like pre-dispatch 499s before mutating the cached sample prefix.
+    if (
+        not evaluation
+        and args.use_rollout_routing_replay
+        and output["meta_info"].get("finish_reason", {}).get("type") == "abort"
+    ):
+        raise GenerationAborted
+
     sc_result = None
     if sc_sampling_mode is not None:
         sc_result = parse_score_centering_response(
@@ -629,14 +638,20 @@ async def generate(
             state.opd_manager.after_rollout(sample, output)
 
     if "routed_experts" in output["meta_info"]:
-        sample.rollout_routed_experts = np.frombuffer(
+        routed_experts = np.frombuffer(
             pybase64.b64decode(output["meta_info"]["routed_experts"], validate=True),
             dtype=np.int32,
-        ).reshape(
-            len(sample.tokens) - 1,
-            args.num_layers,
-            args.moe_router_topk,
         )
+        expected_shape = (len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
+        if routed_experts.size != expected_shape[0] * expected_shape[1] * expected_shape[2]:
+            meta = output["meta_info"]
+            raise ValueError(
+                f"Routed-expert alignment mismatch: {routed_experts.size=} {expected_shape=}, "
+                f"finish_reason={meta.get('finish_reason')}, prompt_tokens={meta.get('prompt_tokens')}, "
+                f"completion_tokens={meta.get('completion_tokens')}, output_ids={len(output.get('output_ids', []))}, "
+                f"output_logprobs={len(meta.get('output_token_logprobs', []))}"
+            )
+        sample.rollout_routed_experts = routed_experts.reshape(expected_shape)
 
     if args.use_rollout_indexer_replay and not evaluation:
         setattr(
@@ -1028,8 +1043,8 @@ async def _generate_rollout_async(
     transfer_tasks = []
     batch_to_transfer = []
     aborted_samples = []
-    # Completed groups beyond target_data_size (over-sampling surplus). Carried back to
-    # the buffer for the next step instead of being dropped, so no samples are lost.
+    # Collect completed surplus until this step ends. Plain synchronous mode
+    # discards it before the next weight update; off-policy modes may carry it.
     oversample_surplus = []
     total_transfer_samples = 0
     get_samples_times: list[float] = []
@@ -1100,8 +1115,8 @@ async def _generate_rollout_async(
 
             # An aborted group (e.g. a weight-sync pre-dispatch 499) is incomplete:
             # recognize it BEFORE the dynamic filter so it is never dropped as
-            # "filtered out" and lost. It is carried to the resume buffer below and
-            # finished under the next weight version. Only completed groups are filtered.
+            # "filtered out". Explicit off-policy modes retain partial groups;
+            # plain synchronous mode replaces them within the current step.
             group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
             if not group_aborted:
                 dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
@@ -1110,10 +1125,8 @@ async def _generate_rollout_async(
                     state.remaining_batch_size -= 1
                     continue
 
-            # Classify each finished group. Nothing is dropped: aborted groups carry to
-            # the buffer for partial resume; completed groups beyond target_data_size are
-            # over-sampling surplus carried to the buffer (reused next step); completed
-            # groups within target are committed to the transfer queue.
+            # Commit completed groups up to the target. Surplus and aborted
+            # groups may survive this step only in explicit off-policy modes.
             should_commit = (
                 total_transfer_samples < target_data_size
                 if is_final_backfill or strict_fill_current
@@ -1125,17 +1138,17 @@ async def _generate_rollout_async(
                         sample.abort_count += 1
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
-                aborted_samples.append(group)
+                if args.fully_async or args.partial_rollout:
+                    aborted_samples.append(group)
                 state.remaining_batch_size -= 1
             elif should_commit:
                 batch_to_transfer.append(group)
                 total_transfer_samples += 1
             else:
-                # Over-sampling surplus: target already met. Keep it for the next step
-                # (added back to the buffer after this step) instead of dropping it.
+                # Apply the mode-specific carry/discard policy after draining tasks.
                 oversample_surplus.append(group)
 
-            if is_final_backfill or strict_fill_current:
+            if not args.fully_async or is_final_backfill or strict_fill_current:
                 append_to_data = should_commit and not group_aborted
             else:
                 append_to_data = len(data) < target_data_size
@@ -1288,7 +1301,7 @@ async def _generate_rollout_async(
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
     new_aborted, completed_protected = await abort(args, rollout_id)
-    for group in new_aborted + completed_protected:
+    for group in (new_aborted + completed_protected) if args.fully_async or args.partial_rollout else []:
         # Groups completed during abort have not passed the main-loop filter.
         if (
             args.partial_rollout
@@ -1318,14 +1331,16 @@ async def _generate_rollout_async(
     else:
         state.last_step_current_deficit = 0
 
-    # Carry over-sampling surplus back to the buffer (reused next step, committed first
-    # via the completed-group fast path in generate_and_rm_group). Surplus groups are
-    # complete (length == n_samples_per_prompt), satisfying add_samples' assertion.
-    aborted_samples.extend(oversample_surplus)
+    # Plain synchronous updates must generate every batch with the current
+    # weights. Only explicitly off-policy modes may reuse completed surplus.
+    carried_surplus = oversample_surplus if args.fully_async or args.partial_rollout else []
+    aborted_samples.extend(carried_surplus)
     logger.info(
         f"Rollout step {rollout_id} carry-over: committed_current={committed_current} "
         f"next_step_deficit={state.last_step_current_deficit} "
-        f"oversample_surplus={len(oversample_surplus)} aborted={len(aborted_samples) - len(oversample_surplus)}"
+        f"oversample_surplus={len(carried_surplus)} "
+        f"discarded_surplus={len(oversample_surplus) - len(carried_surplus)} "
+        f"aborted={len(aborted_samples) - len(carried_surplus)}"
     )
 
     # When dynamic global batch size is enabled, extract fully-completed groups

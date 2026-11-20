@@ -117,7 +117,7 @@ def generate_rollout(
             len(samples),
             rollout_id,
             data_system_client,
-            is_last=bool(getattr(args, "fully_async", False)),
+            is_last=bool(args.fully_async),
         )
     )
     return RolloutFnTrainOutput(samples=groups)
