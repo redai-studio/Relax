@@ -399,7 +399,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 router.replicated_bytes,
             )
 
-    def get_hf_weight_chunks(self, megatron_local_weights):
+    def get_hf_weight_chunks(
+        self,
+        megatron_local_weights,
+        *,
+        retained_ordinary_ipc: bool = False,
+        backup_done: torch.cuda.Event | None = None,
+    ):
         if self._bf16_expert_buckets is not None:
             if self._packed_expert_sync:
                 yield from _chunk_with_mla_pairing(
@@ -417,8 +423,15 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         if self._expert_router is not None:
             yield from self._iter_routed_expert_chunks(megatron_local_weights)
         yield from _chunk_with_mla_pairing(
-            self._iter_hf_params(megatron_local_weights, include_experts=self._expert_router is None),
+            self._iter_hf_params(
+                megatron_local_weights,
+                include_experts=self._expert_router is None,
+                retained_ordinary_ipc=retained_ordinary_ipc,
+                backup_done=backup_done,
+            ),
             chunk_size=self.args.update_weight_buffer_size,
+            yield_full_buckets=retained_ordinary_ipc,
+            yield_large_singletons=backup_done is not None and bool(self.quantization_config),
         )
 
     def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
@@ -449,7 +462,14 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             yield gathered
             del gathered
 
-    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
+    def _iter_hf_params(
+        self,
+        megatron_local_weights,
+        *,
+        include_experts=True,
+        retained_ordinary_ipc: bool = False,
+        backup_done: torch.cuda.Event | None = None,
+    ):
         """Yield individual (name, tensor) pairs for all params.
 
         Expert weights: load → TP gather + convert (src_rank only) →
@@ -465,6 +485,24 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         t_start = time.monotonic()
         device = device_utils.make_current_torch_device()
         rank = dist.get_rank()
+        # Inspect the shared source once, including ranks with no owned weights in a bucket.
+        full_device_sync = device.type != "cpu" and any(
+            weight.device.type == "cpu" for weight in megatron_local_weights.values()
+        )
+        gather_options = {}
+        if retained_ordinary_ipc and self._async_weight_gather:
+            gather_options["contiguous_output_min_bytes"] = self.args.update_weight_buffer_size
+        trim_quantized_cache = backup_done is not None and bool(self.quantization_config)
+        if (
+            (gather_options or trim_quantized_cache)
+            and backup_done is not None
+            and device.type == "cuda"
+            and torch.version.hip is None
+            and torch.cuda.memory.get_allocator_backend() == "native"
+        ):
+            trim_tp_size = mpu.get_tensor_model_parallel_world_size()
+        else:
+            trim_tp_size = 0
         # Eagerly init bridge converter so all ranks are ready before broadcast.
         self._bridge_converter.init_tasks()
         self._bridge_converter.broadcast_and_apply_configs()
@@ -483,7 +521,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
-                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+                bucket_infos,
+                megatron_local_weights,
+                self._vanilla_key_map,
+                device,
+                rank,
+                full_device_sync=full_device_sync,
+                merge_fn=merge_fn,
             )
             all_converted = []
             for info, param in zip(bucket_infos, params, strict=True):
@@ -505,9 +549,39 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
         # --- Non-expert weights: original path ---
         for bucket_infos in self._non_expert_buckets:
+            if trim_tp_size and backup_done is not None:
+                for info in bucket_infos:
+                    if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                        continue
+                    sharded = (
+                        info.attrs.get("tensor_model_parallel", False)
+                        and info.attrs.get("parallel_mode") != "duplicated"
+                    )
+                    size = info.size * (trim_tp_size if sharded else 1)
+                    if trim_quantized_cache:
+                        large = info.dtype == torch.bfloat16 and 2 * size >= self.args.update_weight_buffer_size
+                    else:
+                        large = (
+                            len(bucket_infos) == 1
+                            and sharded
+                            and trim_tp_size > 1
+                            and size > self.args.update_weight_buffer_size
+                        )
+                    if large:
+                        if backup_done.query():
+                            # Clear inactive export storage before PP broadcast or TP gather grows the next bucket.
+                            torch.cuda.empty_cache()
+                            trim_tp_size = 0
+                        break
             t_b0 = time.monotonic()
             params = _load_and_broadcast(
-                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+                bucket_infos,
+                megatron_local_weights,
+                self._vanilla_key_map,
+                device,
+                rank,
+                full_device_sync=full_device_sync,
+                merge_fn=merge_fn,
             )
             t_b1 = time.monotonic()
             t_bcast_total += t_b1 - t_b0
@@ -523,6 +597,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                             if not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
                         ],
                         gdn_split_sizes=self._gdn_split_sizes,
+                        **gather_options,
                     )
                 )
                 t_gather_total += time.monotonic() - t_g0
@@ -544,9 +619,19 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                     continue
 
                 t_g0 = time.monotonic()
-                gathered = (
-                    all_gather_param(self.args, info.name, param) if gathered_params is None else next(gathered_params)
-                )
+                if gathered_params is not None:
+                    gathered = next(gathered_params)
+                elif (
+                    trim_quantized_cache
+                    and rank != info.src_rank
+                    and param.dtype == torch.bfloat16
+                    and 2 * param.nbytes >= self.args.update_weight_buffer_size
+                ):
+                    # The PP broadcast already populated this temporary buffer.
+                    # TP=1 needs no second full-sized copy for ordinary layouts.
+                    gathered = all_gather_param(self.args, info.name, param, reuse_tp1_buffer=True)
+                else:
+                    gathered = all_gather_param(self.args, info.name, param)
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 
@@ -801,7 +886,9 @@ def _bucket_by_size(infos, args, *, buffer_size: int | None = None):
     return buckets
 
 
-def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
+def _load_to_gpu(
+    bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, *, full_device_sync: bool, merge_fn=None
+):
     """Load params from CPU dict to GPU.
 
     No broadcast. When ``merge_fn`` is given (LoRA merge mode), each owned
@@ -822,7 +909,13 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
         if merge_fn is not None and rank == info.src_rank:
             param = merge_fn(info, param, megatron_local_weights, device)
         params.append(param)
-    device_module.synchronize()
+    # CPU snapshots retain the native full-device fence on every rank.
+    # Retained GPU sources only wait for export preparation, leaving D2H backup in flight.
+    if device.type != "cpu":
+        if full_device_sync:
+            device_module.synchronize()
+        else:
+            device_module.current_stream().synchronize()
     return params
 
 
@@ -858,7 +951,9 @@ def _ep_broadcast(bucket_infos, params):
         handle.wait()
 
 
-def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
+def _load_and_broadcast(
+    bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, *, full_device_sync: bool, merge_fn=None
+):
     """Load params from CPU dict, PP-broadcast, EP-broadcast.
 
     After this call every rank holds all params from all PP stages and all EP
@@ -868,7 +963,15 @@ def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, d
     LoRA adapters are merged at load time (before broadcast) so the merged base
     weight is what propagates to the non-owning PP/EP ranks.
     """
-    params = _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=merge_fn)
+    params = _load_to_gpu(
+        bucket_infos,
+        megatron_local_weights,
+        vanilla_key_map,
+        device,
+        rank,
+        full_device_sync=full_device_sync,
+        merge_fn=merge_fn,
+    )
     _pp_broadcast(bucket_infos, params)
     _ep_broadcast(bucket_infos, params)
     return params
@@ -1127,7 +1230,7 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group,
     return result
 
 
-def _chunk_with_mla_pairing(named_params, chunk_size):
+def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=False, yield_large_singletons=False):
     """Chunk weights by size while keeping fused weight pairs together.
 
     SGLang fuses ``q_a_proj`` + ``kv_a_proj_with_mqa`` into
@@ -1160,6 +1263,8 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
 
                 bucket.extend(pair)
                 bucket_size += pair_size
+                if yield_full_buckets or yield_large_singletons:
+                    del pair, partner_tensor
             else:
                 pending_pairs[pair_key] = (name, tensor)
         else:
@@ -1171,6 +1276,22 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
 
             bucket.append((name, tensor))
             bucket_size += obj_size
+
+        # Retained quantized export sends large ordinary tensors before asking
+        # Bridge to allocate the next one. Fused dependencies stay together.
+        large_singleton = (
+            yield_large_singletons
+            and pair_key is None
+            and len(bucket) == 1
+            and tensor.dtype == torch.bfloat16
+            and 2 * bucket_size >= chunk_size
+        )
+        if (yield_full_buckets and bucket and bucket_size >= chunk_size) or large_singleton:
+            yield bucket
+            bucket = []
+            bucket_size = 0
+        if yield_full_buckets or yield_large_singletons:
+            del tensor
 
     for pair_key, (name, tensor) in pending_pairs.items():
         if dist.get_rank() == 0:

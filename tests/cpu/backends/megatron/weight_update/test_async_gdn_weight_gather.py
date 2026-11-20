@@ -92,6 +92,73 @@ def test_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped, async_mode
     assert result[-1].data_ptr() == replicated.data_ptr()
 
 
+@pytest.mark.parametrize(("tp", "reuse"), [(1, True), (1, False), (2, True)])
+def test_tp1_can_reuse_an_ordinary_broadcast_buffer(monkeypatch, tp, reuse):
+    from relax.backends.megatron.weight_update import common
+
+    source = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
+    source.tensor_model_parallel = True
+    source.partition_dim = 0
+    calls = []
+
+    def gather(outputs, local, *, group, async_op):
+        calls.append(group)
+        for part in outputs:
+            part.copy_(local)
+
+    monkeypatch.setattr(common.dist, "all_gather", gather)
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_world_size", lambda: tp)
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_group", lambda: "tp")
+    output = common.all_gather_param(None, "embedding.word_embeddings.weight", source, reuse_tp1_buffer=reuse)
+    expect_reuse = tp == 1 and reuse
+    assert calls == ([] if expect_reuse else ["tp"])
+    assert (output.data_ptr() == source.data_ptr()) == expect_reuse
+    assert torch.equal(output, source.repeat(tp, 1))
+
+
+@pytest.mark.parametrize(
+    ("partition_dim", "backend", "min_bytes", "use_direct"),
+    [(0, "nccl", 1, True), (0, "nccl", 128, False), (1, "nccl", 1, False), (0, "gloo", 1, False)],
+)
+def test_oversized_row_gather_writes_the_final_layout(monkeypatch, partition_dim, backend, min_bytes, use_direct):
+    from relax.backends.megatron.weight_update import common
+
+    local = torch.arange(6, dtype=torch.bfloat16).view(2, 3).T
+    peer = local + 10
+    local.tensor_model_parallel = True
+    local.partition_dim = partition_dim
+    calls = []
+
+    def gather_direct(output, source, *, group, async_op):
+        assert group == "tp" and async_op and source.is_contiguous()
+        assert output.shape == (6, 2)
+        calls.append(("direct", output))
+        return SimpleNamespace(wait=lambda: output.copy_(torch.cat([local, peer], dim=0)))
+
+    def gather_shards(outputs, source, *, group, async_op):
+        assert group == "tp" and async_op
+        calls.append(("list", outputs))
+
+        def wait():
+            outputs[0].copy_(source)
+            outputs[1].copy_(peer)
+
+        return SimpleNamespace(wait=wait)
+
+    monkeypatch.setattr(common.dist, "all_gather_into_tensor", gather_direct)
+    monkeypatch.setattr(common.dist, "all_gather", gather_shards)
+    monkeypatch.setattr(common.dist, "get_backend", lambda group: backend)
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_group", lambda: "tp")
+    (result,) = common.all_gather_params_async(
+        [(SimpleNamespace(name="weight"), local)], contiguous_output_min_bytes=min_bytes
+    )
+    assert torch.equal(result, torch.cat([local, peer], dim=partition_dim))
+    assert [method for method, _ in calls] == ["direct" if use_direct else "list"]
+    if use_direct:
+        assert result is calls[0][1]
+
+
 @pytest.mark.parametrize("kind", ["replicated", "duplicated", "buffer"])
 def test_non_sharded_gdn_named_tensor_needs_no_gdn_config(monkeypatch, kind):
     from relax.backends.megatron.weight_update import common

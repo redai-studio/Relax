@@ -27,6 +27,7 @@ class IpcBucketAllocator:
     """
 
     def __init__(self, device: torch.device) -> None:
+        self.source_allocations_shareable = False
         self._enabled = False
         self._depth = 0
         self._getter: Callable[[], str] | None = None
@@ -63,6 +64,7 @@ class IpcBucketAllocator:
             raise RuntimeError("CUDA allocator settings getter did not return a string")
         self._settings = settings
         self._enabled = enabled
+        self.source_allocations_shareable = not enabled
         if not enabled:
             return
         if _EXPANDABLE.search(settings):
