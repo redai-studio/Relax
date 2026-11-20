@@ -177,8 +177,7 @@ def _create_sft_train_dataset(
             tokenizer=tokenizer,
             prompt_key=config.input_key,
             metadata_key=config.metadata_key,
-            # As in SFT, --max-tokens-per-gpu bounds dynamic batches; fixed microbatches fall back to --seq-length.
-            capacity=capacity,
+            capacity=capacity if config.use_dynamic_batch_size else config.seq_length,
             seed=config.seed,
         )
     if is_preference_mode(config):

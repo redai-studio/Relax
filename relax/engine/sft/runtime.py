@@ -136,6 +136,9 @@ def validate_lightning_opd_args(args: Namespace) -> None:
             "lightning_opd rejects over-length trajectories while loading and does not support --sft-oversize-strategy"
         )
     conflicts = (
+        "debug_rollout_only",
+        "debug_train_only",
+        "load_debug_rollout_data",
         "use_opd",
         "opd_type",
         "opd_teacher_url",
