@@ -26,16 +26,42 @@ export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 MULTIMODAL_KEYS="${MULTIMODAL_KEYS:-}"
 SFT_MODE="${SFT_MODE:-lora}"
 SAVE_INTERVAL=1
+GLOBAL_BATCH_SIZE=16
+MAX_TOKENS=4096
+checkpoint_name=MiniMax-M3.1-Flash-4L-BF16
+layer_count=4
+moe_layer_freq='[0,0,1,1]'
 case "$SFT_MODE" in
     lora) TP=2; EP=4; LR=1e-4; PARITY_NAME=minimax-m3.1-flash-4l-parity ;;
     full) TP=4; EP=8; LR=1e-5; PARITY_NAME=minimax-m3.1-flash-4l-full-parity ;;
     *) echo "Set SFT_MODE to lora or full" >&2; exit 1 ;;
 esac
+if [[ "${MINIMAX_TEXT_PARITY:-0}" == 1 ]]; then
+    if [[ "$SFT_MODE" != lora || -n "$MULTIMODAL_KEYS" || "${MINIMAX_MSA_IMPL:-relax}" != relax ]]; then
+        echo "Text parity requires language LoRA, text inputs, and Relax MSA" >&2
+        exit 1
+    fi
+    MINIMAX_PARITY=1
+    layer_count="${MINIMAX_TEXT_PARITY_LAYERS:-4}"
+    case "$layer_count" in
+        4) ;;
+        60)
+            checkpoint_name=MiniMax-M3.1-Flash-BF16
+            moe_layer_freq="$(jq -cn '[range(60) | if . < 3 then 0 else 1 end]')"
+            ;;
+        *) echo "Set MINIMAX_TEXT_PARITY_LAYERS to 4 or 60" >&2; exit 1 ;;
+    esac
+    TP=4
+    EP=16
+    GLOBAL_BATCH_SIZE=4
+    MAX_TOKENS=9216
+    PARITY_NAME="minimax-m3.1-flash-${layer_count}l-text-parity"
+fi
 if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
     : "${SFT_CHAT_TEMPLATE:?Prepare a verified parity template with scripts.tools.minimax_m31_sft_parity}"
     EXP_NAME="${EXP_NAME:-${PARITY_NAME}-${MINIMAX_MSA_IMPL:-relax}}"
     TRAIN_STEPS="${TRAIN_STEPS:-10}"
-    if [[ "$SFT_MODE" == full ]]; then
+    if [[ "$SFT_MODE" == full || "${MINIMAX_TEXT_PARITY:-0}" == 1 ]]; then
         SAVE_INTERVAL="$TRAIN_STEPS"
     else
         KEEP_CHECKPOINTS="$TRAIN_STEPS"
@@ -53,11 +79,11 @@ fi
 TRAIN_STEPS="${TRAIN_STEPS:-2}"
 now="$(date +%Y%m%d-%H%M%S)"
 SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}}"
-source "${SCRIPT_DIR}/../../models/minimax-m3.1-flash-4layer.sh"
+source "${SCRIPT_DIR}/../../models/minimax-m3.1-flash-4layer.sh" "$layer_count" "$moe_layer_freq"
 
 CKPT_ARGS=(
-   --hf-checkpoint "${MODEL_DIR}/MiniMax-M3.1-Flash-4L-BF16"
-   --ref-load "${MODEL_DIR}/MiniMax-M3.1-Flash-4L-BF16"
+   --hf-checkpoint "${MODEL_DIR}/${checkpoint_name}"
+   --ref-load "${MODEL_DIR}/${checkpoint_name}"
    --megatron-to-hf-mode bridge
    --save "${SAVE_DIR}/${EXP_NAME}"
    --load "${SAVE_DIR}/${EXP_NAME}"
@@ -82,11 +108,11 @@ SFT_ARGS=(
    --loss-type sft
    --prompt-data "${DATA_DIR}/minimax-m3.1-flash-sft.jsonl"
    --input-key messages
-   --global-batch-size 16
+   --global-batch-size "$GLOBAL_BATCH_SIZE"
    --num-rollout "${TRAIN_STEPS}"
-   --rollout-max-context-len 4096
+   --rollout-max-context-len "$MAX_TOKENS"
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   --max-tokens-per-gpu "$MAX_TOKENS"
    --calculate-per-token-loss
 )
 if [[ -n "$MULTIMODAL_KEYS" ]]; then
@@ -124,10 +150,25 @@ MISC_ARGS=(
    --no-rope-fusion
    --attention-dropout 0.0
    --hidden-dropout 0.0
-   --sft-chunked-logits
-   --sft-logits-chunk-size 256
    --use-health-check
 )
+if [[ "${MINIMAX_TEXT_PARITY:-0}" == 1 ]]; then
+    SFT_ARGS+=(
+        --tool-key tools
+        --seq-length "$MAX_TOKENS"
+    )
+    MISC_ARGS+=(
+        --recompute-granularity full
+        --recompute-method uniform
+        --recompute-num-layers 1
+        --log-probs-chunk-size 256
+    )
+else
+    MISC_ARGS+=(
+        --sft-chunked-logits
+        --sft-logits-chunk-size 256
+    )
+fi
 if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
     OPTIMIZER_ARGS+=(
         --seed "${SEED:-1234}"
@@ -147,6 +188,7 @@ if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
     RUNTIME_ENV_JSON=$(jq -c \
         --arg implementation "${MINIMAX_MSA_IMPL:-relax}" \
         --arg seed "${SEED:-1234}" \
+        --arg text_parity "${MINIMAX_TEXT_PARITY:-0}" \
         '.env_vars += {
             "NCCL_ALGO": "Ring",
             "NCCL_PROTO": "Simple",
@@ -156,7 +198,8 @@ if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
             "PYTHONHASHSEED": "0",
             "RELAX_PROCESSOR_POOL_SIZE": "4",
             "MINIMAX_MSA_IMPL": $implementation,
-            "MINIMAX_PARITY_SEED": $seed
+            "MINIMAX_PARITY_SEED": $seed,
+            "MINIMAX_TEXT_PARITY": $text_parity
         }' <<< "$RUNTIME_ENV_JSON")
 elif [[ "$SFT_MODE" == full && -n "$MULTIMODAL_KEYS" ]]; then
     RUNTIME_ENV_JSON=$(jq -c \

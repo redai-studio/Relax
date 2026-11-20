@@ -176,6 +176,14 @@ def configure_worker(args: argparse.Namespace) -> None:
     assert torch.backends.cudnn.deterministic and not torch.backends.cudnn.benchmark
 
     implementation = os.environ["MINIMAX_MSA_IMPL"]
+    if os.environ.get("MINIMAX_TEXT_PARITY") == "1":
+        if implementation != "relax" or args.loss_type != "sft" or not args.calculate_per_token_loss:
+            raise ValueError("Text parity requires Relax MSA and per-token SFT.")
+        from relax.backends.megatron import loss
+        from scripts.tools.minimax_m31_text_parity import relax_sft_loss
+
+        loss.sft_loss_function = relax_sft_loss
+
     if implementation == "miles":
         from relax.models.minimax_m31 import bridge
 

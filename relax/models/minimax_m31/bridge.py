@@ -11,10 +11,12 @@ from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.minimax_m3.minimax_m3_bridge import (
     MiniMaxM3Bridge,
+    MiniMaxM3TopKRouter,
     MiniMaxM3VLModelProvider,
     minimax_m3_block_spec,
 )
 from megatron.bridge.models.minimax_m3.modeling_minimax_m3_vl import MiniMaxM3VLModel
+from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
@@ -63,6 +65,13 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
             post_process=post_process is not False,
             vp_stage=vp_stage,
         )
+        # Relax calls provide() directly, bypassing Bridge's pre-wrap hooks.
+        # Keep the router in FP32 before the mixed-precision wrapper and weight loading.
+        for module in model.modules():
+            if isinstance(module, MiniMaxM3TopKRouter):
+                module.weight.data = module.weight.data.float()
+                mark_keep_in_fp32(module.weight)
+
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
             model.freeze(
                 freeze_language_model=self.freeze_language_model,

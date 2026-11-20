@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 MODEL_ARGS=(
-   --num-layers 4
+   --num-layers "${1:-4}"
    --hidden-size 6144
    --ffn-hidden-size 3072
    --num-attention-heads 64
@@ -19,7 +19,7 @@ MODEL_ARGS=(
    --untie-embeddings-and-output-weights
    --swiglu
    --num-experts 128
-   --moe-layer-freq '[0,0,1,1]'
+   --moe-layer-freq "${2:-[0,0,1,1]}"
    --moe-router-topk 4
    --moe-ffn-hidden-size 3072
    --moe-shared-expert-intermediate-size 3072

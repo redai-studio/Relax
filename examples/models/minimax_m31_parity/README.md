@@ -48,6 +48,38 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m scripts.tools.minimax_m31_sft_pari
 
 The comparison checks loss, gradient norm, global batch size, mean packed token count, and every stored adapter and optimizer tensor at each of the ten steps.
 
+## Independent text-only SFT runs
+
+The text recipe uses each framework's own training entry point. Both loss callbacks use Megatron's vocabulary-parallel cross entropy in FP32 on the same supervised predictor rows, in chunks of 256. Use the same BF16 checkpoint, chat template, and ordered batches of four samples with binary supervision masks. Check token IDs and supervised positions before launching. The tested input was a 40-row text-only selection of OpenSearch-VL. Supply the dataset as `$DATA_DIR/minimax-m3.1-flash-sft.jsonl` and the matching `SFT_CHAT_TEMPLATE`.
+
+Run Relax on two eight-GPU nodes with TP=4, EP=16 and PP=CP=1. Use `MINIMAX_TEXT_PARITY_LAYERS=4` for the checkpoint with source layers 0, 1, 3 and 4. For 60 layers, convert the complete checkpoint to `$MODEL_DIR/MiniMax-M3.1-Flash-BF16` by omitting `--layers` from the converter command above.
+
+```bash
+unset MULTIMODAL_KEYS
+export MINIMAX_TEXT_PARITY=1 MINIMAX_TEXT_PARITY_LAYERS=60
+export MINIMAX_MSA_IMPL=relax SFT_MODE=lora SEED=1234 TRAIN_STEPS=10
+export RELAX_SKIP_CLUSTER_CLEANUP=1 RAY_NO_WAIT=
+EXP_NAME=text-parity-relax SUBMISSION_ID=text-parity-relax +    bash scripts/entrypoint/ray-job.sh scripts/training/sft/run-minimax-m3.1-flash-4l-lora-sft-16xgpu.sh
+```
+
+With the pinned Miles checkout and its MiniMax VLM Bridge provider, launch the same checkpoint through `train_async.py` in train-only mode. Keep the Miles attention and optimizer. Add Relax's `scripts/tools` directory to the Miles workers' `PYTHONPATH` and set these Miles flags:
+
+```text
+--loss-type sft_loss
+--custom-megatron-init-path minimax_m31_text_parity.configure_miles_worker
+--calculate-per-token-loss
+--deterministic-mode
+--seed 1234
+```
+
+Use text batches with one THD sample per DP rank, a 9,216-token limit, and seed-matched data order and length balancing. Match rank-16 language attention QKV and output LoRA, alpha 32, zero dropout and Adam with learning rate `1e-4`, betas `(0.9, 0.999)`, zero weight decay and gradient clipping at 1. Use the same Megatron and Transformer Engine builds, including NCCL Ring/Simple, disabled NVLS, `CUBLAS_WORKSPACE_CONFIG=:4096:8` and `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`. Set `MILES_FILL_UNINIT=1` in the Miles worker environment. Use full activation recomputation with one layer per group and disable MoE permutation fusion for both runs.
+
+```bash
+python -m scripts.tools.minimax_m31_text_parity --logs relax.log miles.log --steps 10
+```
+
+The four-layer experiment compared the first-step logits gradients, reduced LoRA gradients, Adam master parameters, and updated model parameters bitwise. The 60-layer run compared the first-step logits and per-token loss, then the reported loss and gradient norm at each of ten steps.
+
 ## Full-parameter SFT
 
 Set `SFT_MODE=full` for both launches and use separate experiment and submission names. The four-layer checkpoint and inputs are the same. The recipe uses TP=4, EP=8, and a learning rate of `1e-5`. It trains the language model, vision tower, and projectors. The MSA block indexer stays frozen because it produces discrete block selections outside autograd.
