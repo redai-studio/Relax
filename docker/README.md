@@ -111,6 +111,20 @@ The CUDA 13 Blackwell final image also builds and installs MoK for SM103.
 There is no separate MoK Dockerfile. See [MoK usage and limitations](mok/README.md).
 Hopper and CUDA 12 retain their existing backend selection.
 
+### Running Relax from source in an existing CUDA image
+
+Mounting or installing Relax source in an existing image keeps the image's TorchMemorySaver (TMS). The CUDA Dockerfiles install a TMS build that separates allocation pools by tag and CPU backup policy.
+
+For colocated SGLang rollout with MTP, check the TMS used by the rollout worker before reusing a training image:
+
+```bash
+python -c 'import inspect; from torch_memory_saver import entrypoint; print(entrypoint.__file__); print(inspect.getsource(entrypoint._TorchMemorySaverImpl.region))'
+```
+
+Check that the pool key includes both the tag and the CPU backup setting. An older build using one `_primary_mem_pool` can put target weights with backup disabled and frozen draft weights with backup enabled in the same segment. On resume, the draft can lose its contents before the actor's first weight transfer. The actor reloads the target, so generation can continue with a sharp drop in MTP tokens per verification pass.
+
+If you see the single-pool implementation, use the Relax CUDA image or update the existing image with a runtime-compatible TMS build that includes [pool isolation](https://github.com/fzyzcjy/torch_memory_saver/commit/6b4ac82b707187c5a6eebecf57067ab02f0bb1e6).
+
 ## Build the ROCm Image
 
 `docker/Dockerfile.rocm` targets AMD Instinct GPUs; `GPU_ARCH` selects the variant:
