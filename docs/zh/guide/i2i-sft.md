@@ -5,9 +5,13 @@
 head 无需挂载模型和原始图片。模型目录、metadata 和图片必须在所有训练 worker 上可见，
 checkpoint 输出目录必须跨 worker 共享。
 
-当前模型适配为 SenseNova U1.5 MoT Edit，支持全参或 LoRA、单张 source 条件图，
-以及按顺序提供 source 和 glyph 两张条件图。target 图片是监督目标，不计入条件图数量。
-1024² 是像素预算，图片保持长宽比并对齐到模型 patch 大小。
+图像编辑 SFT 路径支持两种模型适配，均提供全参数或 LoRA 训练：
+
+- **SenseNova U1.5 MoT Edit**（默认，`relax.models.sensenova.adapter.SenseNovaSFTAdapter`）
+- **Qwen-Image-Edit**（通过 `--model-adapter-path relax.models.qwen_image.sft_adapter.QwenImageEditSFTAdapter` 指定）
+
+输入支持单张条件图或两张条件图（SenseNova 按顺序提供 source 和 glyph）。
+target 图片是监督目标，不计入条件图数量。1024² 是像素预算，图片保持长宽比并按模型 patch 大小取整。
 
 ## 数据
 
@@ -40,9 +44,16 @@ MODE=lora CONDITIONING_IMAGES=1 STEPS=5 RAY_NO_WAIT=1 \
 bash scripts/entrypoint/ray-job.sh scripts/training/diffusion/run-sensenova-i2i-sft-8xgpu.sh
 ```
 
-`MODE=full CONDITIONING_IMAGES=2` 选择全参加 glyph。示例使用 BF16 计算、FP32
+`MODE=full CONDITIONING_IMAGES=2` 选择全参数加 glyph。示例使用 BF16 计算、FP32
 梯度归约与 optimizer master，线性 warmup 200 个 optimizer steps，之后保持固定学习率。
-默认 LoRA rank/alpha 为 32、学习率 1e-4；全参文字替换学习率为 1e-6。
+默认 LoRA rank/alpha 为 32、学习率 1e-4；全参数文字替换学习率为 1e-6。
+
+训练 Qwen-Image-Edit（例如 diffusers 格式的 `Qwen/Qwen-Image-Edit-2509`，目录包含
+`transformer`、`text_encoder`、`vae` 与 `processor`）时，在 `relax.entrypoints.train`
+中指定 `--model-adapter-path relax.models.qwen_image.sft_adapter.QwenImageEditSFTAdapter`。
+该适配类在 LoRA 与全参数模式下均保持 `text_encoder` 和 `vae` 冻结并处于 `eval()` 状态，
+在 `--i2i-sft-config` 中通过 `transformer_gradient_checkpointing`（布尔值，默认 `true`）
+控制 DiT 激活检查点；SenseNova 对应配置项为 `prefix_gradient_checkpointing`（布尔值，默认 `true`）。
 
 ## 恢复与约束
 
@@ -55,13 +66,13 @@ Controller 用 Actor 恢复的步数重设 producer，因此预取不会改变�
 每个 epoch 的末尾重复开头样本补齐全局 batch。只支持同步纯 FSDP 数据并行；
 文本 packing、文本 PPL/predict、RL rollout/reward 和 TP/PP/CP 不参与此路径。
 
-SenseNova 适配包含原生模型及预处理，不依赖 DiffSynth 运行时。
+SenseNova 与 Qwen-Image-Edit 适配均不依赖 DiffSynth 运行时。
 改编源码的文件头保留上游版权和来源说明，Apache-2.0 许可证见仓库根目录 `LICENSE`。
 模型权重与 tokenizer 由用户另行提供，仍遵循各自的许可证。
 
 ## 导出
 
-在独立 CPU 进程中导出已提交 checkpoint：
+在独立 CPU 进程中导出已提交的 SenseNova checkpoint：
 
 ```bash
 python examples/diffusion/export_i2i_sft.py \

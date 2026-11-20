@@ -7,9 +7,17 @@ the model or raw images mounted. The model directory, metadata, and images must 
 accessible to every training worker; the checkpoint output directory must be
 shared across workers.
 
-The current model adapter supports SenseNova U1.5 MoT Edit with full-parameter or
-LoRA training. Inputs can contain one source conditioning image, or two
-conditioning images ordered as source then glyph. The target image provides
+The image-edit SFT path supports two model adapters with full-parameter or LoRA
+training:
+
+- **SenseNova U1.5 MoT Edit** (default,
+  `relax.models.sensenova.adapter.SenseNovaSFTAdapter`)
+- **Qwen-Image-Edit**
+  (`relax.models.qwen_image.sft_adapter.QwenImageEditSFTAdapter`, passed via
+  `--model-adapter-path`)
+
+Inputs can contain one source conditioning image, or two conditioning images
+(for SenseNova, ordered as source then glyph). The target image provides
 supervision and does not count toward the conditioning-image limit. The default
 1024² pixel budget is not a fixed square resolution: images retain their aspect
 ratio and are aligned to the model's patch size.
@@ -54,6 +62,16 @@ optimizer master weights, and a 200-optimizer-step linear warmup followed by a
 constant learning rate. Its default LoRA rank and alpha are both 32, with a
 learning rate of 1e-4; full-parameter text replacement uses 1e-6.
 
+For Qwen-Image-Edit (for example `Qwen/Qwen-Image-Edit-2509` in diffusers
+format with `transformer`, `text_encoder`, `vae`, and `processor`
+subdirectories), pass `--model-adapter-path
+relax.models.qwen_image.sft_adapter.QwenImageEditSFTAdapter` to
+`relax.entrypoints.train`. The adapter keeps `text_encoder` and `vae` frozen in
+`eval()` mode in both LoRA and full-parameter modes, and accepts
+`transformer_gradient_checkpointing` (boolean, default `true`) in
+`--i2i-sft-config`. SenseNova uses `prefix_gradient_checkpointing` (boolean,
+default `true`) instead.
+
 ## Resume and Constraints
 
 Set `LOAD_DIR` to the previous output directory. `STEPS` is the total step count to
@@ -70,15 +88,15 @@ epoch, samples from the beginning are repeated to fill the final global batch.
 This path supports synchronous FSDP data parallelism only. Text packing, text
 PPL evaluation or prediction, RL rollout/reward, and TP/PP/CP are not part of it.
 
-The SenseNova adapter includes the native model and preprocessing; it does not
-depend on the DiffSynth runtime. Adapted source files retain the upstream copyright
-and source attribution in their headers; the Apache-2.0 license is provided in the
+The SenseNova and Qwen-Image-Edit adapters do not depend on the DiffSynth
+runtime. Adapted source files retain the upstream copyright and source
+attribution in their headers; the Apache-2.0 license is provided in the
 repository root `LICENSE`. Model weights and tokenizers are supplied separately
 and remain subject to their own licenses.
 
 ## Export
 
-Export a committed checkpoint in a separate CPU process:
+Export a committed SenseNova checkpoint in a separate CPU process:
 
 ```bash
 python examples/diffusion/export_i2i_sft.py \
