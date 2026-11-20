@@ -31,9 +31,13 @@ else
     args+=(--num-epoch "${NUM_EPOCH:-1}")
 fi
 if [[ -n ${LOAD_DIR:-} ]]; then
+    LOAD_DIR=$(realpath -e -- "$LOAD_DIR")
+    export LOAD_DIR
     args+=(--load "$LOAD_DIR")
 fi
 if [[ -n ${SAVE_HF_DIR:-} ]]; then
+    SAVE_HF_DIR=$(realpath -m -- "$SAVE_HF_DIR")
+    export SAVE_HF_DIR
     args+=(--save-hf "$SAVE_HF_DIR")
 fi
 
