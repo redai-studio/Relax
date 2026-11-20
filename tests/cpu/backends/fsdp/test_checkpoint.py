@@ -560,7 +560,8 @@ def test_export_hf_reads_the_full_ft_checkpoint(_dist, tmp_path):
     assert torch.allclose(exported["weight"], model.weight.detach())
 
 
-def test_full_checkpoint_restores_lazy_optimizer_state(tmp_path, _dist) -> None:
+@pytest.mark.parametrize("initialized", [False, True])
+def test_full_checkpoint_restores_lazy_optimizer_state(tmp_path, _dist, initialized) -> None:
     model = torch.nn.Linear(3, 2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     model.weight.square().sum().backward()
@@ -578,6 +579,10 @@ def test_full_checkpoint_restores_lazy_optimizer_state(tmp_path, _dist) -> None:
     )
     restored = torch.nn.Linear(3, 2)
     restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.01)
+    if initialized:
+        restored.weight.square().sum().backward()
+        restored_optimizer.step()
+        restored_optimizer.zero_grad(set_to_none=True)
     ckpt.load_checkpoint(str(tmp_path), "lazy", 1, restored, restored_optimizer)
     assert not restored_optimizer.state.get(restored.bias)
     for candidate, optim in ((model, optimizer), (restored, restored_optimizer)):

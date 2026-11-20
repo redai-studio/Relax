@@ -517,11 +517,12 @@ def load_checkpoint(
         # legitimately have no state. Request only saved entries from DCP,
         # while retaining strict checks for every field of initialized entries.
         metadata_keys = dcp.FileSystemReader(fsdp_dir).read_metadata().state_dict_metadata
-        for name in list(optim_sd.get("state", {})):
+        parameter_names = {name for group in optim_sd["param_groups"] for name in group["params"]}
+        for name in sorted(parameter_names):
             prefix = f"optim.state.{name}"
             if not any(key == prefix or key.startswith(prefix + ".") for key in metadata_keys):
                 uninitialized_optimizer_params.append(name)
-                del optim_sd["state"][name]
+                optim_sd["state"].pop(name, None)
         state_dict["optim"] = optim_sd
     dcp.load(state_dict, checkpoint_id=fsdp_dir)
     for name in uninitialized_optimizer_params:

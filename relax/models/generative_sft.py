@@ -12,6 +12,14 @@ class GenerativeSFTAdapter(Protocol):
     family: str
     supported_tasks: tuple[str, ...]
     lora_target_modules: tuple[str, ...]
+    image_tier_policy: bool
+    cpu_only_prepare_sample: bool
+    frozen_module_prefixes: tuple[str, ...]
+
+    @staticmethod
+    def validate_sft_config(config: dict[str, Any]) -> list[str]:
+        """Return model-specific configuration errors."""
+        ...
 
     def load_train_model(self, args: Any) -> torch.nn.Module:
         """Return the complete forward root: model(sample) yields scalar

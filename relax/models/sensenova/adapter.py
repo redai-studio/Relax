@@ -148,6 +148,20 @@ class SenseNovaSFTAdapter:
     supported_tasks = ("i2i",)
     lora_target_modules = LORA_TARGETS
     lora_task_type = "FEATURE_EXTRACTION"
+    image_tier_policy = True
+    cpu_only_prepare_sample = True
+    frozen_module_prefixes = ()
+
+    @staticmethod
+    def validate_sft_config(config: dict[str, Any]) -> list[str]:
+        """Validate SenseNova-specific options in ``i2i_sft_config``."""
+        errors: list[str] = []
+        if "transformer_gradient_checkpointing" in config:
+            errors.append("SenseNova does not support transformer_gradient_checkpointing")
+        config.setdefault("prefix_gradient_checkpointing", True)
+        if type(config["prefix_gradient_checkpointing"]) is not bool:
+            errors.append("prefix_gradient_checkpointing must be boolean")
+        return errors
 
     def load_train_model(self, args: Any) -> SenseNovaSFTModel:
         from .pipeline import SenseNovaU1ImagePipeline
