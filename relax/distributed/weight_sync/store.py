@@ -1278,6 +1278,7 @@ class VersionStore:
                 prior = self.manifest(stream, version)
                 if prior != m:
                     raise ValueError("Version identity reused with different publication")
+                sync_directory(self.manifest_path(stream, version).parent)
                 return prior
             # Persist the exact logical target before making its manifest visible.
             # FULL repair is independent of the source process and older anchors.
@@ -1358,6 +1359,8 @@ class VersionStore:
                 jobs = ((tensor, chunk) for tensor in original["tensors"] for chunk in tensor["chunks"])
                 for _ in ordered_map(repair_object, jobs, 4):
                     pass
+                path = self.full_path(stream, version)
+                sync_directory(path.parent if path.exists() else self.manifest_path(stream, version).parent)
                 return original
             self._materialize(stream, version)
             full = load_json(canonical(original))

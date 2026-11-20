@@ -210,12 +210,15 @@ class QwenImageAdapter:
                 sampling.get("_sample_id") or f"sample:{sample_index if sample_index is not None else seed}"
             )
             rollout_id = int(sampling.get("_rollout_id", 0))
+            noise_id = f"r{rollout_id}:{sample_id}"
+            if sampling.get("_evaluation", False):
+                noise_id = f"eval:{sampling['_eval_dataset_id']}:{sample_id}"
             extra.update(
                 {
-                    "initial_noise_group_ids": [f"r{rollout_id}:{sample_id}"],
+                    "initial_noise_group_ids": [noise_id],
                     "initial_noise_latent_shape": [int(v) for v in latent_shape],
                     "initial_noise_seed": int(sampling.get("_base_seed", seed)),
-                    "denoise_seeds": [sample_id],
+                    "denoise_seeds": [noise_id if sampling.get("_evaluation", False) else sample_id],
                 }
             )
         if extra:

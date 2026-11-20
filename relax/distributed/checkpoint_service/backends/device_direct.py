@@ -189,6 +189,7 @@ class DeviceDirectBackend(CommBackend):
         self._pending_recvs: Dict[str, asyncio.Future] = {}
         self._model_update_groups = None
         self._model_update_groups_for_actor_fwd_ref = None
+        self._skip_empty_actor_fwd_ref_sync = False
 
         # World size for process group initialization
         self.world_size: Optional[int] = None
@@ -676,6 +677,12 @@ class DeviceDirectBackend(CommBackend):
         mode = topology_data["includes_reference"]
         cache = getattr(self, "_forward_group_cache", {})
         self._forward_group_cache = cache
+        self._skip_empty_actor_fwd_ref_sync = (
+            self.role_info.role_name == "actor" and topology_data.get("world_size") == 1
+        )
+        if self._skip_empty_actor_fwd_ref_sync:
+            self._model_update_groups_for_actor_fwd_ref = None
+            return
         previous = cache.get(mode)
         if previous and previous[0] == self._forward_topology_id:
             self._model_update_groups_for_actor_fwd_ref = previous[1]
@@ -696,7 +703,7 @@ class DeviceDirectBackend(CommBackend):
             group = init_process_group(
                 backend=self.backend_type,
                 init_method=endpoint,
-                world_size=topology_data["world_size"],
+                world_size=topology_data.get("world_size", 1),
                 rank=topology_data["global_rank"],
                 group_name=name,
                 timeout=timedelta(seconds=180),
@@ -705,7 +712,9 @@ class DeviceDirectBackend(CommBackend):
                 groups = group
             else:
                 groups[name] = group
-            logger.info("Initialized forward/reference group %s with %s members", name, topology_data["world_size"])
+            logger.info(
+                "Initialized forward/reference group %s with %s members", name, topology_data.get("world_size", 1)
+            )
         cache[mode] = (self._forward_topology_id, groups)
         self._model_update_groups_for_actor_fwd_ref = groups
 
@@ -847,7 +856,7 @@ class DeviceDirectBackend(CommBackend):
         else:
             self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar)
         dist.barrier(group=get_gloo_group())
-        if not rollout_only:
+        if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
 
             def finish_actor_fwd_sync() -> None:
                 payload = {
@@ -879,9 +888,9 @@ class DeviceDirectBackend(CommBackend):
         #
         # The failure is captured rather than propagated on the spot: generation is currently
         # PAUSED (see /pause_generation above) and only rank 0 can fail here, so an immediate
-        # raise would strand the engines paused forever AND leave every other rank blocked in
-        # the barrier below waiting for a rank that already unwound. The verdict is shared
-        # across ranks first, generation is resumed, and only then does everyone raise together.
+        # raise would leave every other rank blocked in the collective below. Share the
+        # verdict first, then fail on every rank while keeping generation paused: the
+        # Controller/entrypoint tears down engines whose weights may be partially updated.
         push_error: Exception | None = None
         if managed and not actor_fwd_only:
             if pause_rollout:
@@ -901,22 +910,24 @@ class DeviceDirectBackend(CommBackend):
         elif self._lora_adapter_mode and not actor_fwd_only:
             try:
                 self._push_lora_adapter_distributed(first_sync=not self._lora_sync.adapter_loaded)
-            except Exception as e:  # noqa: BLE001 - re-raised below, after the engines are resumed
-                logger.exception("LoRA adapter push failed; resuming generation before aborting")
+            except Exception as e:  # noqa: BLE001 - shared with the other ranks below
+                logger.exception("LoRA adapter push failed; keeping generation paused for shutdown")
                 push_error = e
-            else:
-                self._lora_sync.adapter_loaded = True
-                self._lora_sync.base_sync_done = True
 
         if not actor_fwd_only and not managed:
             # MAX over gloo: rank 0 is the only rank that can observe the push failure, so
             # without this the other ranks would take the success path and desync. Gated on
             # the (rank-uniform) adapter-mode flag so no other path pays for the collective.
-            push_failed = False
             if self._lora_adapter_mode:
                 flag = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
-                push_failed = bool(flag.item())
+                if bool(flag.item()):
+                    raise RuntimeError(
+                        "LoRA adapter push to the rollout engines failed; generation remains paused "
+                        "until the failed weight update is shut down."
+                    ) from push_error
+                self._lora_sync.adapter_loaded = True
+                self._lora_sync.base_sync_done = True
             if reload_quantized_base:
                 self._rollout_control_request(
                     "/post_process_weights",
@@ -924,15 +935,6 @@ class DeviceDirectBackend(CommBackend):
                 )
             self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
-            if push_failed:
-                # Abort rather than roll out with a stale/absent adapter: in adapter mode the
-                # engine's base weights are frozen, so a dropped adapter means the rollout
-                # policy silently stops tracking the trained one.
-                raise RuntimeError(
-                    "LoRA adapter push to the rollout engines failed; aborting the weight update "
-                    "instead of generating with a stale or missing adapter. Generation has been "
-                    "resumed so the engines are not left paused."
-                ) from push_error
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
             # group) when the topology is unchanged. They are torn down only when the
@@ -1294,6 +1296,10 @@ class DeviceDirectBackend(CommBackend):
         receiving nodes can allocate buffers, then weights are broadcast using
         the process group set up for actor_fwd reception.
         """
+        if self._skip_empty_actor_fwd_ref_sync:
+            return
+        if self._model_update_groups_for_actor_fwd_ref is None:
+            raise RuntimeError("Actor_fwd/reference weight-update group is not initialized")
         # Prepare metadata for weight transfer
         pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
         group_name = f"update_actor_pp_{pp_rank}_{self._forward_topology_id}"
@@ -1441,7 +1447,7 @@ class DeviceDirectBackend(CommBackend):
 
         ``param`` is the already-TP-gathered full base weight; the paired adapter tensors were
         gathered to full in ``_collect_full_adapter_tensors``. Uses ``LoRAMerge`` with
-        ``tp_size=1`` so no collective runs here (safe on the PP-src-only path). Never mutates
+        ``tp_group=None`` so no collective runs here (safe on the PP-src-only path). Never mutates
         ``param`` (which may alias the model's live weight when TP=1). Unpaired weights
         (layernorm/embed/router) pass through unchanged.
 
@@ -1480,7 +1486,6 @@ class DeviceDirectBackend(CommBackend):
                 linear_in,
                 self.args.lora_alpha,
                 self.args.lora_rank,
-                tp_size=1,
                 tp_group=None,
             )
             .to(param.dtype)

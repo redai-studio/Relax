@@ -128,16 +128,26 @@ class PublicationRoutingTests(unittest.TestCase):
                 module.create_version_publisher = create
                 actor = SimpleNamespace(
                     args=SimpleNamespace(offload_train=True, distributed_timeout_minutes=3),
-                    _per_step_rollout=True,
+                    _per_step_rollout=False,
                     _flush_resident_sft_parameters=Mock(),
                     _train_state_offloader=SimpleNamespace(disable_during_update=protected),
                     _backup_published_actor=lambda: events.append("backup"),
                 )
+
+                @contextmanager
+                def export_groups(*, offload_train, timeout_minutes):
+                    self.assertTrue(offload_train)
+                    self.assertEqual(timeout_minutes, 3)
+                    events.append("reload")
+                    try:
+                        yield
+                    finally:
+                        events.append("destroy")
+
                 method = actor_method(
                     "publish_weight_version",
                     __package__="relax.backends.megatron",
-                    reload_process_groups=lambda **kwargs: events.append("reload"),
-                    destroy_process_groups=lambda: events.append("destroy"),
+                    weight_export_groups=export_groups,
                     get_gloo_group=lambda: "source-group",
                 )
                 with patch.dict(sys.modules, {module.__name__: module}):
