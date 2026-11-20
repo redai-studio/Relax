@@ -235,6 +235,7 @@ def test_sft_custom_hook_keeps_existing_arguments(monkeypatch, accepts_kwargs):
 @pytest.mark.asyncio
 async def test_muon_producer_keeps_boundary_sample_and_rejects_overflow_before_put(monkeypatch):
     from relax.components.sft import SFT
+    from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
     from relax.models.qwen3_5 import recipe
 
     dataset, tokenizer = _patch_pipeline_dependencies(monkeypatch)
@@ -243,6 +244,8 @@ async def test_muon_producer_keeps_boundary_sample_and_rejects_overflow_before_p
     args.optimizer = "muon"
     args.tensor_model_parallel_size = 4
     args.data_pad_size_multiplier = 1024
+    args.train_backend = "megatron"
+    configure_sft_data_pipeline(args)
     actor = SFT.func_or_class.__new__(SFT.func_or_class)
     actor.config, actor._dataset, actor._tokenizer = args, dataset, tokenizer
     actor.step, actor._train_size, actor._logger_instance = 0, 2, None

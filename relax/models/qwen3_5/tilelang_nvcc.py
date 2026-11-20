@@ -3,7 +3,6 @@
 """Isolate DeepEP and TileLang compiler preloads in the Qwen training
 worker."""
 
-import filecmp
 import os
 import shlex
 import shutil
@@ -11,6 +10,19 @@ from argparse import Namespace
 from pathlib import Path
 
 from relax.utils.logging_utils import get_logger
+
+
+def _is_image_wrapper(compiler: Path) -> bool:
+    # The Blackwell image installs a shell wrapper and renames NVCC to nvcc.real.
+    if (
+        not os.access(compiler.with_name("nvcc.real"), os.X_OK)
+        or not compiler.is_file()
+        or not os.access(compiler, os.X_OK)
+    ):
+        return False
+    with compiler.open("rb") as stream:
+        header = stream.read(1024)
+    return header.startswith(b"#!") and b"unset LD_PRELOAD" in header.splitlines()
 
 
 def _configure_deepep_nvcc() -> None:
@@ -23,17 +35,17 @@ def _configure_deepep_nvcc() -> None:
     compiler = Path(os.environ.get("EP_JIT_NVCC_COMPILER") or default).absolute()
     if compiler.resolve() == wrapper.resolve():
         underlying = os.environ.get("RELAX_DEEPEP_NVCC")
-        if not underlying or Path(underlying).resolve() == wrapper.resolve():
+        if not underlying:
             raise ValueError("EP_JIT_NVCC_COMPILER must select the underlying compiler")
-        return
-
-    image_wrapper = root / "docker/scripts/nvcc-without-preload.sh"
-    if (
-        os.access(compiler.resolve().with_name("nvcc.real"), os.X_OK)
-        and compiler.is_file()
-        and image_wrapper.is_file()
-        and filecmp.cmp(compiler, image_wrapper, shallow=False)
+        # A bare command uses PATH; a path with a directory belongs to the worker's
+        # current checkout. DeepEP later changes cwd before cold compilation.
+        compiler = Path(shutil.which(underlying) or underlying).absolute()
+        if compiler.resolve() == wrapper.resolve():
+            raise ValueError("EP_JIT_NVCC_COMPILER must select the underlying compiler")
+    elif (
+        compiler.resolve() == Path(default).resolve()
         and shlex.quote(str(compiler)) == str(compiler)
+        and _is_image_wrapper(compiler.resolve())
     ):
         os.environ["EP_JIT_NVCC_COMPILER"] = str(compiler)
         return

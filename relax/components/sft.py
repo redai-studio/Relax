@@ -57,7 +57,6 @@ from relax.engine.sft.runtime import (
     sft_tq_num_shards,
     should_run_sft_eval,
 )
-from relax.models.qwen3_5.recipe import validate_dispatch_samples
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -231,6 +230,17 @@ def _create_sft_train_dataset(
         processor_pool=processor_pool,
         pad_token_ids=pad_token_ids,
     )
+
+
+def _validate_sample_lengths(samples: list[ProcessedSample], limit: int | None) -> None:
+    if limit is None:
+        return
+    for sample in samples:
+        if sample.total_length > limit:
+            raise ValueError(
+                f"SFT sample idx={sample.source_idx}: expanded length {sample.total_length} exceeds "
+                f"the dispatch limit of {limit} tokens"
+            )
 
 
 def _prepare_sft_tq_payload(
@@ -505,7 +515,6 @@ class _SFTBatchProducerActor:
                 "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
             )
 
-        validate_dispatch_samples(self.config, samples)
         if step == 0 and self._shard_id == 0 and samples:
             s = samples[0]
             try:
@@ -1073,7 +1082,7 @@ class SFT(Base):
                 "after bounded refill attempts. Refusing to push a partial TQ partition because the Megatron "
                 "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
             )
-        validate_dispatch_samples(self.config, samples)
+        _validate_sample_lengths(samples, getattr(self.config, "sft_dispatch_token_limit", None))
         if isinstance(self._dataset, streaming_dataset.SFTStreamingDataset):
             save_data_state(self.config, self._dataset, self.step + 1, self._train_size, samples)
         self._maybe_print_first_sample(samples)
@@ -1142,7 +1151,7 @@ class SFT(Base):
                 "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
                 "skip warnings."
             )
-        validate_dispatch_samples(self.config, samples)
+        _validate_sample_lengths(samples, getattr(self.config, "sft_dispatch_token_limit", None))
         # Causal eval zero-masks padding because its consumer requests a fixed
         # batch size. Preference eval uses actual partial-chunk sizes and
         # must preserve every evaluation pair without padding.
