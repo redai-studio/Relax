@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# Backport NVCC preload isolation to an existing Blackwell Muon delivery image.
+# The pipeline supplies the parent by digest and publishes the train and relax stages.
+ARG BASE_IMAGE=scratch
+ARG TRAIN_IMAGE=train
+FROM ${BASE_IMAGE} AS train
+FROM ${TRAIN_IMAGE} AS relax
+
+RUN --mount=type=bind,source=docker/scripts/nvcc-without-preload.sh,target=/tmp/nvcc-wrapper \
+    set -eu; \
+    /opt/sglang/bin/python3 -B -c 'from importlib.metadata import version; assert version("emerging-optimizers") == "0.3.0"'; \
+    nvcc=/usr/local/cuda/bin/nvcc; \
+    if [ -e "$nvcc.real" ]; then \
+        cmp /tmp/nvcc-wrapper "$nvcc"; \
+    else \
+        test -x "$nvcc"; \
+        mv "$nvcc" "$nvcc.real"; \
+        install -m 755 /tmp/nvcc-wrapper "$nvcc"; \
+    fi; \
+    cublas=/opt/relax/cublas13.3/nvidia/cu13/lib; \
+    packages=/opt/sglang/lib/python3.12/site-packages; \
+    for lib in "$cublas/libcublasLt.so.13" "$cublas/libcublas.so.13" "$packages/nvidia/nccl/lib/libnccl.so.2" "$packages/ray/core/libjemalloc.so"; do test -r "$lib"; done; \
+    printf '%s\n' 'extern "C" __global__ void smoke() {}' > /tmp/nvcc-smoke.cu; \
+    LD_PRELOAD="$cublas/libcublasLt.so.13:$cublas/libcublas.so.13:$packages/nvidia/nccl/lib/libnccl.so.2:$packages/ray/core/libjemalloc.so" \
+        "$nvcc" --cubin -arch=sm_103a /tmp/nvcc-smoke.cu -o /tmp/nvcc-smoke.cubin; \
+    test -s /tmp/nvcc-smoke.cubin; \
+    rm /tmp/nvcc-smoke.cu /tmp/nvcc-smoke.cubin

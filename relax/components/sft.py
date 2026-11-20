@@ -232,6 +232,17 @@ def _create_sft_train_dataset(
     )
 
 
+def _validate_sample_lengths(samples: list[ProcessedSample], limit: int | None) -> None:
+    if limit is None:
+        return
+    for sample in samples:
+        if sample.total_length > limit:
+            raise ValueError(
+                f"SFT sample idx={sample.source_idx}: expanded length {sample.total_length} exceeds "
+                f"the dispatch limit of {limit} tokens"
+            )
+
+
 def _prepare_sft_tq_payload(
     samples: list[ProcessedSample] | list[ProcessedPreferencePair],
     *,
@@ -1071,6 +1082,7 @@ class SFT(Base):
                 "after bounded refill attempts. Refusing to push a partial TQ partition because the Megatron "
                 "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
             )
+        _validate_sample_lengths(samples, getattr(self.config, "sft_dispatch_token_limit", None))
         if isinstance(self._dataset, streaming_dataset.SFTStreamingDataset):
             save_data_state(self.config, self._dataset, self.step + 1, self._train_size, samples)
         self._maybe_print_first_sample(samples)
@@ -1139,6 +1151,7 @@ class SFT(Base):
                 "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
                 "skip warnings."
             )
+        _validate_sample_lengths(samples, getattr(self.config, "sft_dispatch_token_limit", None))
         # Causal eval zero-masks padding because its consumer requests a fixed
         # batch size. Preference eval uses actual partial-chunk sizes and
         # must preserve every evaluation pair without padding.
