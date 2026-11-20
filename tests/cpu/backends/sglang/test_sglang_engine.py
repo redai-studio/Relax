@@ -163,6 +163,47 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
     response.raise_for_status.assert_called_once()
 
 
+@pytest.mark.parametrize("location", ["root", "text", "server_override"])
+def test_expert_sync_layout_reports_effective_fp8(monkeypatch, expert_sync_engine_module, location):
+    from relax.utils import misc
+
+    module = expert_sync_engine_module
+    engine = object.__new__(module.SGLangEngine)
+    engine.node_rank, engine.worker_type = 0, "regular"
+    engine.server_host, engine.server_port = "localhost", 1234
+    fp8 = {"quant_method": "fp8"}
+    config = SimpleNamespace(text_config=SimpleNamespace())
+    info = {
+        "model_path": "/test/model",
+        "device": "cuda",
+        "tp_size": 1,
+        "quantization": None,
+    }
+    load_hf_config = Mock(return_value=config)
+    monkeypatch.setattr(misc, "get_hf_config", load_hf_config)
+    if location == "text":
+        config.text_config.quantization_config = fp8
+    elif location == "root":
+        config.quantization_config = fp8
+    else:
+        info.update(json_model_override_args='{"quantization_config": {"quant_method": "fp8"}}', revision="frozen")
+        runtime_config = ModuleType("sglang.srt.utils.hf_transformers_utils")
+        runtime_config.get_config = Mock(
+            return_value=SimpleNamespace(quantization_config=fp8, text_config=config.text_config)
+        )
+        monkeypatch.setitem(sys.modules, runtime_config.__name__, runtime_config)
+    monkeypatch.setattr(module.requests, "get", Mock(return_value=Mock(json=Mock(return_value=info))))
+
+    layout = engine.get_expert_weight_sync_layout()
+
+    assert layout["quantization_config"] == fp8
+    if location == "server_override":
+        load_hf_config.assert_not_called()
+        runtime_config.get_config.assert_called_once_with(
+            "/test/model", trust_remote_code=True, revision="frozen", model_override_args={"quantization_config": fp8}
+        )
+
+
 def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
     engine = object.__new__(sglang_engine_module.SGLangEngine)
     request = Mock(return_value={"success": True})
