@@ -28,7 +28,7 @@ def test_minimax_packed_vision_keeps_media_from_each_sample_together():
     model.patch_merge_mlp = bridge_vision.MiniMaxM3ProjectorMLP(96, 32, 24, bias=True)
     model.eval()
     pixels = torch.randn(20, 24, generator=torch.Generator().manual_seed(42))
-    grids = [[[1, 2, 2], [1, 2, 4]], [[2, 2, 2]]]
+    grids = [[[1, 2, 2], [1, 2, 4]], [[1, 2, 4]]]
 
     with torch.no_grad():
         packed = model._project_vision(pixels, grids)

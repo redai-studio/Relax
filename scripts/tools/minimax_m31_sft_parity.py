@@ -17,57 +17,41 @@ from types import SimpleNamespace
 
 
 def _generate_fixture_media(media: Path) -> None:
-    import numpy as np
-    from imageio.v2 import get_writer
     from PIL import Image, ImageDraw
 
-    def frame(red: int, left: int, top: int) -> Image.Image:
+    def draw_square(red: int, left: int, top: int) -> Image.Image:
         image = Image.new("RGB", (112, 112), (red, 0, 0))
         ImageDraw.Draw(image).rectangle((left, top, left + 39, top + 43), fill=(red, 230, 0))
         return image
 
     media.mkdir(exist_ok=True)
-    frame(60, 18, 22).save(media / "green.png")
-    frame(120, 38, 34).save(media / "red.png")
-    with get_writer(
-        media / "green.mp4",
-        fps=4,
-        codec="libx264",
-        pixelformat="yuv420p",
-        quality=None,
-        macro_block_size=1,
-    ) as writer:
-        for index in range(8):
-            writer.append_data(np.asarray(frame(30 + 15 * index, 10 + 4 * index, 16 + 3 * index)))
+    draw_square(60, 18, 22).save(media / "green.png")
+    draw_square(120, 38, 34).save(media / "red.png")
 
 
 def make_fixture(data: Path) -> None:
     media = data.parent / "media"
     with data.open("x") as output:
         _generate_fixture_media(media)
-        green, red, video = (str((media / name).resolve()) for name in ("green.png", "red.png", "green.mp4"))
+        green, red = (str((media / name).resolve()) for name in ("green.png", "red.png"))
         note = "The red square is to the left of the blue circle. "
         long_question = (
             "<image>Notes: " + (note * 196).rstrip() + "\nWhat is 0 plus seven? Answer with only the number."
         )
         cases = [
-            ("<image>What color is the square?", "It is green.", [green], []),
-            ("<video>Does the shape move?", "Yes, it moves.", [], [video]),
+            ("<image>What color is the square?", "It is green.", [green]),
             (
-                "Compare <image> and <image>. Then watch <video>.",
-                "The square changes position.",
+                "Compare <image> and <image>. Are the squares in the same position?",
+                "No, they are in different positions.",
                 [green, red],
-                [video],
             ),
-            (long_question, "7", [green], []),
-            ("What is two plus two?", "Four.", [], []),
-            ("<video>Watch again <video>.", "The square moves to the right.", [], [video, video]),
+            (long_question, "7", [green]),
+            ("What is two plus two?", "Four.", []),
         ]
-        for prompt, answer, images, videos in cases * 28:
+        for prompt, answer, images in cases * 42:
             row = {
                 "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}],
                 "images": images,
-                "videos": videos,
             }
             output.write(json.dumps(row) + "\n")
 
@@ -92,7 +76,7 @@ def verify_inputs(checkpoint: Path, data: Path, template_out: Path) -> None:
     from relax.engine.sft.dataset.streaming import SFTStreamingDataset
     from relax.utils.data import processor_pool
     from relax.utils.data.image_refs import SFT_HF_IMAGE_REBUILD_SUPPORTED
-    from relax.utils.data.minimax import IMAGE_TOKEN, VIDEO_TOKEN
+    from relax.utils.data.minimax import IMAGE_TOKEN
     from relax.utils.data.processing_utils import load_tokenizer
     from relax.utils.logging_utils import get_logger
 
@@ -109,7 +93,7 @@ def verify_inputs(checkpoint: Path, data: Path, template_out: Path) -> None:
             prompt_key="messages",
             tokenizer=tokenizer,
             processor_pool=SimpleNamespace(executor=executor),
-            multimodal_keys={"image": "images", "video": "videos"},
+            multimodal_keys={"image": "images"},
             apply_chat_template_kwargs={"chat_template": template},
             prefetch_max_cached=0,
         )
@@ -121,15 +105,13 @@ def verify_inputs(checkpoint: Path, data: Path, template_out: Path) -> None:
             answer = messages[1]
             if "mm:think" in answer["content"] or answer.get("reasoning_content") or answer.get("tool_calls"):
                 raise ValueError("Parity data requires assistant answers without reasoning or tool calls.")
-            messages[0]["content"] = (
-                messages[0]["content"].replace("<image>", IMAGE_TOKEN).replace("<video>", VIDEO_TOKEN)
-            )
-            images, videos = row.get("images") or [], row.get("videos") or []
+            messages[0]["content"] = messages[0]["content"].replace("<image>", IMAGE_TOKEN)
+            images = row.get("images") or []
             key = json.dumps(row, sort_keys=True)
             if key in verified:
                 continue
             verified.add(key)
-            layouts.add((bool(images), bool(videos)))
+            layouts.add(bool(images))
 
             short_ids, short_mask = miles_mask.get_loss_mask(messages)
             target = [token for token, learn in zip(short_ids, short_mask, strict=True) if learn]
@@ -139,10 +121,8 @@ def verify_inputs(checkpoint: Path, data: Path, template_out: Path) -> None:
             assert tokenizer(text, add_special_tokens=False).input_ids == short_ids, f"Row {idx}: mixed prompt render"
             expected = short_ids
             media = {}
-            if images or videos:
-                expected, media = processor_pool.process_sample_from_paths_in_worker(
-                    text, {"image": images, "video": videos}, {}
-                )
+            if images:
+                expected, media = processor_pool.process_sample_from_paths_in_worker(text, {"image": images}, {})
                 media.pop(SFT_HF_IMAGE_REBUILD_SUPPORTED, None)
             if expected[-len(target) :] != target:
                 raise ValueError(f"Row {idx}: processor modified the Miles supervised suffix.")
@@ -156,8 +136,8 @@ def verify_inputs(checkpoint: Path, data: Path, template_out: Path) -> None:
             for name, value in media.items():
                 torch.testing.assert_close(actual.multimodal_train_inputs[name], value, rtol=0, atol=0)
             logger.info("Row %d: %d tokens, %d supervised, pixels and grids match", idx, len(expected), len(target))
-    if (True, False) not in layouts or (False, True) not in layouts or (True, True) not in layouts:
-        raise ValueError("Parity data must include image-only, video-only and joint image/video samples.")
+    if True not in layouts:
+        raise ValueError("Image parity data must include at least one image sample.")
     template_out.write_text(template)
     logger.info("Verified %d distinct samples across %d input layouts", len(verified), len(layouts))
 

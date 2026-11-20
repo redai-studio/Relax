@@ -7,8 +7,8 @@
 # python scripts/tools/convert_minimax_m3_to_bf16.py --model-dir "$MODEL_DIR/MiniMax-M3.1-Flash" \
 #   --layers 0,1,3,4 --save-dir "$MODEL_DIR/MiniMax-M3.1-Flash-4L-BF16" --device cpu
 # Provide "$DATA_DIR/minimax-m3.1-flash-sft.jsonl" with messages.
-# For image/video training, set MULTIMODAL_KEYS='{"image":"images","video":"videos"}'.
-# Use <image>/<video> in messages and put the matching media paths in those fields.
+# For image training, set MULTIMODAL_KEYS='{"image":"images"}'.
+# Use <image> in messages and put the matching image paths in the images field.
 # For Relax/Miles parity, set MINIMAX_NATIVE_PARITY=1 and provide the shared SFT_CHAT_TEMPLATE.
 # Use MINIMAX_PARITY_LAYERS=4 for LoRA or full SFT, or 60 for full-depth LoRA.
 # Launch through scripts/entrypoint/ray-job.sh on a running 2x8 GPU Ray cluster.

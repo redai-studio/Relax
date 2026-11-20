@@ -1555,19 +1555,18 @@ def test_gemma4_dataset_aligns_image_wrappers_and_disables_row_token_types(tmp_p
 
 
 @pytest.mark.parametrize(("prefix", "response"), [("Compare", "Answer."), ("Cafe\u0301", "Re\u0301ponse.")])
-def test_minimax_dataset_masks_wrapped_images_and_timestamped_video_frames(tmp_path, monkeypatch, prefix, response):
+def test_minimax_dataset_masks_wrapped_images(tmp_path, monkeypatch, prefix, response):
     from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
     from transformers import PreTrainedTokenizerFast
 
-    image, video, start, end = "]<]image[>[", "]<]video[>[", "]<]start of image[>[", "]<]end of image[>["
-    short_text = f"{prefix} {image} with {video}. {response}"
-    frames = "".join(f"]<]{timestamp} seconds[>[{start}{video * 2}{end}" for timestamp in ("0.0", "0.5"))
-    expanded_text = f"{prefix} {start}{image * 2}{end} with {frames}. {response}"
+    image, start, end = "]<]image[>[", "]<]start of image[>[", "]<]end of image[>["
+    short_text = f"{prefix} {image} with {image}. {response}"
+    expanded_text = f"{prefix} {start}{image * 2}{end} with {start}{image * 3}{end}. {response}"
     backend = Tokenizer(models.BPE())
     backend.normalizer = normalizers.NFC()
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     backend.decoder = decoders.ByteLevel()
-    special_tokens = [image, video, start, end]
+    special_tokens = [image, start, end]
     backend.train_from_iterator(
         [short_text, expanded_text],
         trainers.BpeTrainer(initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), special_tokens=special_tokens),
@@ -1585,11 +1584,10 @@ def test_minimax_dataset_masks_wrapped_images_and_timestamped_video_frames(tmp_p
         [
             {
                 "messages": [
-                    {"role": "user", "content": "Compare <image> with <video>."},
+                    {"role": "user", "content": "Compare <image> with <image>."},
                     {"role": "assistant", "content": "Answer"},
                 ],
-                "images": ["/test.png"],
-                "videos": ["/test.mp4"],
+                "images": ["/first.png", "/second.png"],
             }
         ],
     )
@@ -1603,14 +1601,14 @@ def test_minimax_dataset_masks_wrapped_images_and_timestamped_video_frames(tmp_p
     monkeypatch.setattr(
         streaming_module,
         "preprocess_multimodal",
-        lambda *args, **kwargs: (expanded, {"video_grid_thw": torch.tensor([[2, 2, 4]])}),
+        lambda *args, **kwargs: (expanded, {"image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 6]])}),
     )
     dataset = SFTStreamingDataset(
         str(path),
         tokenizer=tokenizer,
         processor_pool=MagicMock(),
         prompt_key="messages",
-        multimodal_keys={"image": "images", "video": "videos"},
+        multimodal_keys={"image": "images"},
         prefetch_max_cached=0,
     )
     try:

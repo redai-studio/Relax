@@ -57,14 +57,14 @@ def validate_image_input_ids(
         raise ValueError("Native image OPD processor must only expand image placeholders and preserve text IDs.")
 
 
-def validate_prompt_token_ids(response: dict, expected_ids: list[int], *, context: str = "Native image OPD") -> None:
+def validate_prompt_token_ids(response: dict, expected_ids: list[int]) -> None:
     actual_ids = response.get("prompt_token_ids")
     if actual_ids is None:
-        raise ValueError(f"{context} requires SGLang v0.5.17 return_prompt_token_ids through the router.")
+        raise ValueError("Native image OPD requires SGLang v0.5.17 return_prompt_token_ids through the router.")
     if actual_ids != expected_ids:
         mismatch = next((i for i, (a, b) in enumerate(zip(actual_ids, expected_ids)) if a != b), None)
         raise ValueError(
-            f"{context} expanded input IDs differ from the client processor: "
+            "Native image OPD expanded input IDs differ from the client processor: "
             f"actual_length={len(actual_ids)}, expected_length={len(expected_ids)}, first_mismatch={mismatch}. "
             "Check tokenizer/processor compatibility and SGLANG_MM_AVOID_RETOKENIZE=true."
         )

@@ -47,9 +47,9 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
     def configure_runtime(self, args: Namespace) -> None:
         if args.loss_type != "sft":
             raise ValueError("MiniMax-M3.1-Flash requires SFT.")
-        if set(args.multimodal_keys or ()) - {"image", "video"}:
-            raise ValueError("MiniMax-M3.1-Flash supports image and video inputs, with text outputs.")
-        args.multimodal_host_grid_keys = ("image_grid_thw", "video_grid_thw")
+        if set(args.multimodal_keys or ()) - {"image"}:
+            raise ValueError("MiniMax-M3.1-Flash SFT supports text and image inputs.")
+        args.multimodal_host_grid_keys = ("image_grid_thw",)
         if args.context_parallel_size != 1 or args.pipeline_model_parallel_size != 1 or args.dynamic_context_parallel:
             raise ValueError("MiniMax-M3.1-Flash requires PP=CP=1 and static context parallelism.")
         if args.qkv_format != "thd" or args.allgather_cp:

@@ -1,4 +1,4 @@
-# MiniMax-M3.1-Flash multimodal SFT parity
+# MiniMax-M3.1-Flash text and image SFT parity
 
 This recipe compares Relax and Miles MSA on the same four-layer BF16 model with language-only rank-16 LoRA. Both runs use Relax's SFT loop, the same frozen vision model, and the official MiniMax processor. The Miles run selects the upstream Miles attention and indexer. The input preflight uses Miles' `MultiTurnLossMaskGenerator` as the reference for supervision.
 
@@ -6,7 +6,7 @@ Use the same two-node, 16-GPU Ray cluster for both runs. The tested Megatron Cor
 
 ## Prepare the same inputs
 
-Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` to shared directories and `RAY_ADDRESS` to the Ray Jobs dashboard. Start with a fresh `DATA_DIR` for the synthetic inputs. The `--make-fixture` option generates the PNG and MP4 files in `$DATA_DIR/media` with Pillow and ImageIO's FFmpeg backend.
+Set `MODEL_DIR`, `DATA_DIR`, and `SAVE_DIR` to shared directories and `RAY_ADDRESS` to the Ray Jobs dashboard. Start with a fresh `DATA_DIR` for the synthetic inputs. The `--make-fixture` option generates PNG files in `$DATA_DIR/media` with Pillow.
 
 ```bash
 export PYTHONPATH="$MILES_CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"
@@ -21,7 +21,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m scripts.tools.minimax_m31_sft_pari
     --make-fixture
 ```
 
-Use a complete official checkpoint so the converter copies the processor modules and chat template. Generate the fixture once and share it between the two runs because video encoding can vary by FFmpeg build. The fixture includes image-only, video-only, mixed, text-only, and long image samples that exercise sparse block selection. Preparation confirms that the full token sequence and mask match for each distinct row, along with the media pixel tensors and grids. It writes an experiment-specific template that includes `</mm:think>` in the supervised suffix, as Miles does on these single-turn answers.
+Use a complete official checkpoint so the converter copies the processor modules and chat template. Share one fixture between both runs. It contains text-only, single-image, two-image, and long image samples that exercise sparse block selection. Preparation checks the full token sequence, mask, image tensors, and grids for each distinct row. It writes an experiment-specific template that includes `</mm:think>` in the supervised suffix, as Miles does on these single-turn answers.
 
 ## Run and compare
 
@@ -29,7 +29,7 @@ Submit the jobs in sequence on the same cluster. Use fresh experiment names to s
 
 ```bash
 export MINIMAX_PARITY=1 SEED=1234 TRAIN_STEPS=10
-export MULTIMODAL_KEYS='{"image":"images","video":"videos"}'
+export MULTIMODAL_KEYS='{"image":"images"}'
 export SFT_CHAT_TEMPLATE="$DATA_DIR/miles-mask.jinja"
 export RELAX_SKIP_CLUSTER_CLEANUP=1 RAY_NO_WAIT=
 recipe=scripts/training/sft/run-minimax-m3.1-flash-4l-lora-sft-16xgpu.sh
@@ -59,7 +59,8 @@ unset MULTIMODAL_KEYS
 export MINIMAX_TEXT_PARITY=1 MINIMAX_TEXT_PARITY_LAYERS=60
 export MINIMAX_MSA_IMPL=relax SFT_MODE=lora SEED=1234 TRAIN_STEPS=10
 export RELAX_SKIP_CLUSTER_CLEANUP=1 RAY_NO_WAIT=
-EXP_NAME=text-parity-relax SUBMISSION_ID=text-parity-relax +    bash scripts/entrypoint/ray-job.sh scripts/training/sft/run-minimax-m3.1-flash-4l-lora-sft-16xgpu.sh
+EXP_NAME=text-parity-relax SUBMISSION_ID=text-parity-relax \
+    bash scripts/entrypoint/ray-job.sh scripts/training/sft/run-minimax-m3.1-flash-4l-lora-sft-16xgpu.sh
 ```
 
 With the pinned Miles checkout and its MiniMax VLM Bridge provider, launch the same checkpoint through `train_async.py` in train-only mode. Keep the Miles attention and optimizer. Add Relax's `scripts/tools` directory to the Miles workers' `PYTHONPATH` and set these Miles flags:
