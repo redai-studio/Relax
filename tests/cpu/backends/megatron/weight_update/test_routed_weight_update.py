@@ -274,14 +274,14 @@ def test_retained_sync_fences_before_closing_receiver_session(module, quant_meth
     expected = ["pause_generation", "flush_cache"]
     if quant_method == "compressed-tensors":
         expected.append("restore")
-    expected.extend(["begin_weight_update", "send", "data_ack"])
+    expected.extend(["begin_weight_update", "send", "data_ack", "update_weights_from_tensor"])
     if quant_method == "compressed-tensors":
         expected.append("repack")
     if not failed_stage:
-        expected.extend(["update_weights_from_tensor", "end_weight_update"])
-        engine.update_weights_from_tensor.remote.assert_called_once_with(
-            serialized_named_tensors=["empty"], load_format=module.NATIVE_SYNC_FENCE_LOADER, flush_cache=False
-        )
+        expected.append("end_weight_update")
+    engine.update_weights_from_tensor.remote.assert_called_once_with(
+        serialized_named_tensors=["empty"], load_format=module.NATIVE_SYNC_FENCE_LOADER, flush_cache=False
+    )
     assert [method for method, _ in events] == expected
     engine.continue_generation.remote.assert_not_called()
 

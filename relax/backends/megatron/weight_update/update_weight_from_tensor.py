@@ -658,13 +658,6 @@ class UpdateWeightFromTensor:
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
             self._routed_engine_call(all_engines, "continue_generation")
         elif self._has_retained_actor_weights():
-            if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
-                self._routed_engine_call(
-                    all_engines,
-                    "post_process_weights",
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                )
             serialized_empty = [
                 MultiprocessingSerializer.serialize([], output_str=True)
             ] * self.args.rollout_num_gpus_per_engine
@@ -675,6 +668,14 @@ class UpdateWeightFromTensor:
                 load_format=NATIVE_SYNC_FENCE_LOADER,
                 flush_cache=False,
             )
+            if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
+                # The fence uses the tensor-update RPC, which clears the receiver's post-process marker.
+                self._routed_engine_call(
+                    all_engines,
+                    "post_process_weights",
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                )
             self._routed_engine_call(all_engines, "end_weight_update")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
