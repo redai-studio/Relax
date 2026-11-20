@@ -145,13 +145,14 @@ def install_routed_expert_qat(module: torch.nn.Module, *, module_name: str, comp
     The caller is responsible for selecting a routed expert. Prefer the tree
     installer below in training. Calling twice on the same module is harmless.
     ``stock_fp8`` keeps TE's original workspace and precision context; ``fp8``
-    is the native mode's weight-only P2 override.
+    is the native mode's weight-only P2 override. ``global_bf16`` uses the
+    existing BF16 GEMM and materializes only the effective expert weights.
     """
     import torch
     from megatron.core.extensions.transformer_engine import TEGroupedLinear, TEQuantizationParams, TEQuantizationRecipe
 
-    if compute not in ("bf16", "fp8", "stock_fp8"):
-        raise ValueError("DeepSeek-V4 MXFP4 expert compute must be bf16, fp8 or stock_fp8")
+    if compute not in ("bf16", "fp8", "stock_fp8", "global_bf16"):
+        raise ValueError("Unsupported MXFP4 expert compute mode: " + compute)
     if not isinstance(module, TEGroupedLinear):
         raise TypeError(f"{module_name}: routed QAT currently supports MCore TEGroupedLinear only")
     if hasattr(module, "_relax_mxfp4_qat"):
@@ -163,7 +164,10 @@ def install_routed_expert_qat(module: torch.nn.Module, *, module_name: str, comp
     config = module.config
     if getattr(config, "use_transformer_engine_op_fuser", False):
         raise ValueError(f"{module_name}: TE op fuser bypasses MXFP4 module precision hooks")
-    if not getattr(config, "fp8", None) or getattr(config, "fp8_recipe", None) != "blockwise":
+    if compute == "global_bf16":
+        if not config.bf16 or config.fp8 or getattr(config, "fp4", None):
+            raise ValueError(f"{module_name}: global_bf16 MXFP4 QAT requires BF16 execution")
+    elif not getattr(config, "fp8", None) or getattr(config, "fp8_recipe", None) != "blockwise":
         raise ValueError(f"{module_name}: MXFP4 workspace QAT requires configured blockwise FP8 training")
     if getattr(module, "te_quant_params", None) is not None:
         raise ValueError(

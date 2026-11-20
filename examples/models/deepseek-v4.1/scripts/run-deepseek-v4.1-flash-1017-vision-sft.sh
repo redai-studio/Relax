@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Frozen-vision OpenSearch-VL THD SFT. Set HF_CKPT to the prepared composite BF16 checkpoint.
 # A four-layer proxy uses one H800 node by default. The full model defaults to 16 nodes.
+# V41_MXFP4_QAT=1 enables routed-expert QAT and appends -mxfp4-qat to the run directory.
 # Run on an existing Ray cluster via scripts/entrypoint/ray-job.sh <this script>.
 set -eo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +38,16 @@ SEQ_LENGTH="${SEQ_LENGTH:-32768}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((SEQ_LENGTH / CP_SIZE))}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 EXP_NAME="${EXP_NAME:-deepseek-v41-1017-${layers}l-frozen-vision-sft-${GPU_COUNT}gpu}"
+QAT_ARGS=()
+case "${V41_MXFP4_QAT:-0}" in
+    0) ;;
+    1)
+        EXP_NAME="${EXP_NAME}-mxfp4-qat"
+        QAT_ARGS=(--custom-megatron-init-path relax.models.deepseekv41.qat.enable_routed_mxfp4_qat)
+        ;;
+    *) echo "V41_MXFP4_QAT must be 0 or 1" >&2; exit 1 ;;
+esac
+
 RUN_NAME="${EXP_NAME}-$(date +%Y%m%d-%H%M%S)"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 if [[ -n "${NUM_STEPS:-}" ]]; then
@@ -48,7 +59,10 @@ else
 fi
 SAVE_ARGS=()
 if [[ "${SAVE_INTERVAL}" != 0 ]]; then
-    SAVE_ARGS=(--save-interval "${SAVE_INTERVAL}")
+    SAVE_ARGS=(
+        --save "${SAVE_DIR}/${EXP_NAME}"
+        --save-interval "${SAVE_INTERVAL}"
+    )
 fi
 if [[ "${NUM_NODES}" == 1 ]]; then
     MOE_DISPATCHER="${MOE_DISPATCHER:-deepep}"
@@ -100,8 +114,8 @@ TRAIN_ARGS=(
     "${MODEL_ARGS[@]}"
     --hf-checkpoint "${HF_CKPT}"
     --megatron-to-hf-mode bridge
+    "${QAT_ARGS[@]}"
     --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
     "${SAVE_ARGS[@]}"
     --max-actor-ckpt-to-keep "${MAX_ACTOR_CKPT_TO_KEEP:-1}"
     "${RESUME_ARGS[@]}"
@@ -144,10 +158,10 @@ TRAIN_ARGS=(
     "${DISPATCH_ARGS[@]}"
     --optimizer adam
     --lr "${LR:-1e-6}"
-    --lr-decay-style constant
+    --lr-decay-style "${LR_DECAY_STYLE:-constant}"
     --weight-decay 0.1
     --adam-beta1 0.9
-    --adam-beta2 0.98
+    --adam-beta2 "${ADAM_BETA2:-0.98}"
     --adam-eps 1e-8
     --clip-grad 1.0
     --optimizer-cpu-offload
