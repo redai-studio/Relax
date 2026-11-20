@@ -482,6 +482,13 @@ def get_model_provider_func(
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
 
+        # Match MCore's CLI conversion: interleaved P2P overlap and batched
+        # communication are mutually exclusive. Parser validation already
+        # disables overlap for schedules without virtual pipeline stages.
+        if getattr(args, "overlap_p2p_comm", None) is not None:
+            provider.overlap_p2p_comm = args.overlap_p2p_comm
+            provider.batch_p2p_comm = not args.overlap_p2p_comm
+
         if callable(getattr(provider, "configure_runtime", None)):
             provider.configure_runtime(args)
 
@@ -563,6 +570,11 @@ def get_model_provider_func(
                 )
                 provider.num_layers_in_first_pipeline_stage = None
                 provider.num_layers_in_last_pipeline_stage = None
+
+        # Preserve the provider default unless the launch explicitly selects a
+        # backend for models with provider-owned DSA defaults.
+        if getattr(args, "dsa_kernel_backend", None) is not None:
+            provider.dsa_kernel_backend = args.dsa_kernel_backend
 
         # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
         # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
@@ -875,6 +887,10 @@ def wrap_model_provider_with_freeze(original_provider, args):
         )
 
         freeze_model_params(model, args)
+        if getattr(args, "task_type", "causal_lm") == "embedding":
+            from relax.utils.training.embedding import freeze_embedding_unused_heads
+
+            freeze_embedding_unused_heads(model)
         ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
         return model

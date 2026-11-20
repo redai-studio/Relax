@@ -77,6 +77,7 @@ def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
+        task_type="causal_lm",
         eval_config=None,
         eval_prompt_data=None,
         disable_thinking=False,
@@ -182,6 +183,7 @@ def _opd_args() -> SimpleNamespace:
         colocate=False,
         hybrid=False,
         fully_async=False,
+        sft_chunked_logits=False,
     )
 
 

@@ -62,14 +62,9 @@ def kernel_source(root: Path, version: str) -> Path:
     raise FileNotFoundError(f"SGLang kernel build sources missing; checked: {', '.join(map(str, candidates))}")
 
 
-def add_sm103_target(cmake: Path) -> None:
-    content = cmake.read_text()
-    if "compute_103" not in content:
-        anchor = '"-gencode=arch=compute_120a,code=sm_120a"'
-        if anchor not in content:
-            raise RuntimeError("sglang-kernel build flags changed; inspect upstream CMake")
-        content = content.replace(anchor, anchor + '\n        "-gencode=arch=compute_103a,code=sm_103a"', 1)
-        cmake.write_text(content)
+def require_sm103_target(cmake: Path) -> None:
+    if '"-gencode=arch=compute_103a,code=sm_103a"' not in cmake.read_text():
+        raise RuntimeError("SGLang patch is missing the SM103 build target")
 
 
 def main() -> None:
@@ -85,7 +80,7 @@ def main() -> None:
     else:
         before = md.version("sglang-kernel")
         source = kernel_source(SGLANG_SOURCE, before)
-        add_sm103_target(source / "CMakeLists.txt")
+        require_sm103_target(source / "CMakeLists.txt")
         env = dict(
             os.environ,
             CUDA_HOME="/usr/local/cuda",

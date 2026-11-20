@@ -4,6 +4,7 @@
 
 from argparse import Namespace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -109,3 +110,27 @@ def test_forward_only_does_not_merge_dynamic_cp_aggregate_outputs(monkeypatch, m
     assert result["num_tokens"][0].item() == 2
     assert fake_model.training is True
     assert events == ["forward"] + (["release"] if memory_level else [])
+
+
+def test_dynamic_cp_writes_full_logprobs_to_transfer_queue(monkeypatch):
+    from relax.backends.megatron import actor as actor_module
+
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = Namespace(dynamic_context_parallel=True, qkv_format="thd")
+    actor.data_system_client = SimpleNamespace(async_put=AsyncMock())
+    monkeypatch.setattr(actor_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(actor_module.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(actor_module.mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(actor_module.mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(actor_module.mpu, "get_context_parallel_group", lambda: None)
+
+    policy = [torch.tensor([-0.1, -0.2]), torch.tensor([-0.3, -0.4, -0.5])]
+    output = {"log_probs": policy, "ref_log_probs": [row - 1 for row in policy]}
+    actor._put_data_to_transfer_queue(
+        output, SimpleNamespace(samples=[7, 3]), {"total_lengths": [6, 9], "response_lengths": [2, 3]}
+    )
+
+    written = actor.data_system_client.async_put.await_args.kwargs["data"]
+    for key, rows in output.items():
+        for actual, expected in zip(written[key].unbind(), rows, strict=True):
+            torch.testing.assert_close(actual, expected)

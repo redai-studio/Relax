@@ -1,7 +1,66 @@
+diff --git a/csrc/legacy/buffer.hpp b/csrc/legacy/buffer.hpp
+index 39ddcee..7a7ba2c 100644
+--- a/csrc/legacy/buffer.hpp
++++ b/csrc/legacy/buffer.hpp
+@@ -1760,7 +1760,7 @@ static void register_apis(pybind11::module_& m) {
+         .def("get_rdma_buffer_size_hint", &Config::get_rdma_buffer_size_hint);
+     m.def("get_low_latency_rdma_size_hint", &get_low_latency_rdma_size_hint);
+ 
+-    pybind11::class_<EventHandle>(m, "EventHandle")
++    pybind11::class_<EventHandle>(m, "EventHandle", pybind11::module_local())
+         .def(pybind11::init<>())
+         .def("current_stream_wait", &EventHandle::current_stream_wait);
+ 
+diff --git a/csrc/utils/event.hpp b/csrc/utils/event.hpp
+index f019948..d5350e9 100644
+--- a/csrc/utils/event.hpp
++++ b/csrc/utils/event.hpp
+@@ -7,25 +7,27 @@
+ 
+ namespace deep_ep {
+ 
+-struct EventHandle {
++struct RelaxV2EventHandle {
+     std::shared_ptr<torch::Event> event;
+     std::vector<std::optional<torch::Tensor>> tensors_to_record;
+ 
+-    EventHandle() {
++    RelaxV2EventHandle() {
+         event = std::make_shared<torch::Event>(torch::kCUDA);
+         event->record(at::cuda::getCurrentCUDAStream());
+     }
+ 
+-    explicit EventHandle(const at::cuda::CUDAStream& stream) {
++    explicit RelaxV2EventHandle(const at::cuda::CUDAStream& stream) {
+         event = std::make_shared<torch::Event>(torch::kCUDA);
+         event->record(stream);
+     }
+ 
+-    EventHandle(const EventHandle& other) = default;
++    RelaxV2EventHandle(const RelaxV2EventHandle& other) = default;
+ 
+     void current_stream_wait() const { at::cuda::getCurrentCUDAStream().unwrap().wait(*event); }
+ };
+ 
++using EventHandle = RelaxV2EventHandle;
++
+ static torch::Event create_event(const at::cuda::CUDAStream& s) {
+     auto event = torch::Event(torch::kCUDA);
+     event.record(s);
 diff --git a/deep_ep/__init__.py b/deep_ep/__init__.py
+index 708a9ee..b73a24f 100644
 --- a/deep_ep/__init__.py
 +++ b/deep_ep/__init__.py
-@@ -73,7 +73,7 @@
+@@ -54,7 +54,7 @@ def check_nccl_so():
+     # PyTorch may load another NCCL library, which is different to the linked one
+     with open('/proc/self/maps', 'r') as f:
+         loaded_nccl_so = None
+-        for so in [line.strip().split(' ')[-1] for line in f if 'libnccl' in line]:
++        for so in [line.strip().split(' ')[-1] for line in f if os.path.basename(line.strip().split(' ')[-1]).startswith('libnccl.so')]:
+             loaded_nccl_so = so if loaded_nccl_so is None else loaded_nccl_so
+             assert so == loaded_nccl_so, f'Duplicate NCCL runtime found in the current system: {so} and {loaded_nccl_so}'
+     linked_nccl_so_candidates = sorted(glob.glob(f'{find_nccl_root()}/lib/libnccl.so*'))
+@@ -73,7 +73,7 @@ def init_jit():
      Initialize the JIT compilation runtime. Sets up CUDA and NCCL root paths for the JIT compiler.
      """
      # noinspection PyUnresolvedReferences
@@ -10,7 +69,7 @@ diff --git a/deep_ep/__init__.py b/deep_ep/__init__.py
      library_root_path = os.path.dirname(os.path.abspath(__file__))
      _C.init_jit(library_root_path,  # Library root directory path
                  find_cuda_home(),   # CUDA home
-@@ -92,6 +92,6 @@
+@@ -92,6 +92,6 @@ from .utils.event import EventOverlap, EventHandle
  from .utils.envs import get_physical_domain_size, get_logical_domain_size
  
  # noinspection PyUnresolvedReferences
@@ -18,25 +77,11 @@ diff --git a/deep_ep/__init__.py b/deep_ep/__init__.py
 +from _relax_deep_ep_v2._C import Config, topk_idx_t
  
  __version__ = '2.1.0'
-diff --git a/deep_ep/buffers/legacy.py b/deep_ep/buffers/legacy.py
---- a/deep_ep/buffers/legacy.py
-+++ b/deep_ep/buffers/legacy.py
-@@ -4,9 +4,9 @@
- from typing import Callable, List, Tuple, Optional, Union
- 
- # noinspection PyUnresolvedReferences
--import deep_ep._C as _C
-+import _relax_deep_ep_v2._C as _C
- # noinspection PyUnresolvedReferences
--from deep_ep._C import Config, EventHandle
-+from _relax_deep_ep_v2._C import Config, EventHandle
- from ..utils.event import EventOverlap
- from ..utils.envs import check_nvlink_connections, check_torch_deterministic
- 
 diff --git a/deep_ep/buffers/elastic.py b/deep_ep/buffers/elastic.py
+index a2862c0..a85e416 100644
 --- a/deep_ep/buffers/elastic.py
 +++ b/deep_ep/buffers/elastic.py
-@@ -7,9 +7,9 @@
+@@ -7,9 +7,9 @@ from typing import Callable, Optional, Tuple, Union, List, Sequence
  from contextlib import contextmanager
  
  # noinspection PyUnresolvedReferences
@@ -48,34 +93,27 @@ diff --git a/deep_ep/buffers/elastic.py b/deep_ep/buffers/elastic.py
  
  from ..utils.event import EventOverlap
  from ..utils.math import align
-diff --git a/deep_ep/utils/event.py b/deep_ep/utils/event.py
---- a/deep_ep/utils/event.py
-+++ b/deep_ep/utils/event.py
-@@ -2,7 +2,7 @@
- from typing import Any, Optional, Tuple, Callable
- 
- # noinspection PyUnresolvedReferences
--from deep_ep._C import EventHandle
-+from _relax_deep_ep_v2._C import EventHandle
- 
- 
- class EventOverlap:
-diff --git a/deep_ep/utils/envs.py b/deep_ep/utils/envs.py
---- a/deep_ep/utils/envs.py
-+++ b/deep_ep/utils/envs.py
-@@ -9,7 +9,7 @@
- from typing import Tuple
+diff --git a/deep_ep/buffers/legacy.py b/deep_ep/buffers/legacy.py
+index e4f92ab..da041f9 100644
+--- a/deep_ep/buffers/legacy.py
++++ b/deep_ep/buffers/legacy.py
+@@ -4,9 +4,9 @@ import torch.distributed as dist
+ from typing import Callable, List, Tuple, Optional, Union
  
  # noinspection PyUnresolvedReferences
 -import deep_ep._C as _C
 +import _relax_deep_ep_v2._C as _C
- 
- from .comm import get_nccl_comm_handle
+ # noinspection PyUnresolvedReferences
+-from deep_ep._C import Config, EventHandle
++from _relax_deep_ep_v2._C import Config, EventHandle
+ from ..utils.event import EventOverlap
+ from ..utils.envs import check_nvlink_connections, check_torch_deterministic
  
 diff --git a/deep_ep/utils/comm.py b/deep_ep/utils/comm.py
+index c9eca50..9949fd8 100644
 --- a/deep_ep/utils/comm.py
 +++ b/deep_ep/utils/comm.py
-@@ -5,7 +5,7 @@
+@@ -5,7 +5,7 @@ import torch
  import torch.distributed as dist
  
  # noinspection PyUnresolvedReferences
@@ -84,10 +122,37 @@ diff --git a/deep_ep/utils/comm.py b/deep_ep/utils/comm.py
  
  
  class NCCLCommHandle:
+diff --git a/deep_ep/utils/envs.py b/deep_ep/utils/envs.py
+index f6e34d9..60be718 100644
+--- a/deep_ep/utils/envs.py
++++ b/deep_ep/utils/envs.py
+@@ -9,7 +9,7 @@ import torch.distributed as dist
+ from typing import Tuple
+ 
+ # noinspection PyUnresolvedReferences
+-import deep_ep._C as _C
++import _relax_deep_ep_v2._C as _C
+ 
+ from .comm import get_nccl_comm_handle
+ 
+diff --git a/deep_ep/utils/event.py b/deep_ep/utils/event.py
+index e26d489..2257fad 100644
+--- a/deep_ep/utils/event.py
++++ b/deep_ep/utils/event.py
+@@ -2,7 +2,7 @@ import torch
+ from typing import Any, Optional, Tuple, Callable
+ 
+ # noinspection PyUnresolvedReferences
+-from deep_ep._C import EventHandle
++from _relax_deep_ep_v2._C import EventHandle
+ 
+ 
+ class EventOverlap:
 diff --git a/setup.py b/setup.py
+index 81a1e26..0d3e2d0 100644
 --- a/setup.py
 +++ b/setup.py
-@@ -13,7 +13,7 @@
+@@ -13,7 +13,7 @@ current_dir = os.path.dirname(os.path.realpath(__file__))
  persistent_env_names = ('EP_JIT_CACHE_DIR', 'EP_JIT_PRINT_COMPILER_COMMAND', 'EP_NUM_TOPK_IDX_BITS', 'EP_NCCL_ROOT_DIR')
  
  # Load discover module without triggering `deep_ep.__init__`
@@ -96,7 +161,7 @@ diff --git a/setup.py b/setup.py
  find_pkgs = importlib.util.module_from_spec(find_pkgs_spec)
  find_pkgs_spec.loader.exec_module(find_pkgs)
  
-@@ -48,7 +48,7 @@
+@@ -48,7 +48,7 @@ def get_nccl_lib_name(base_dir):
  
  
  def get_package_version():
@@ -105,7 +170,7 @@ diff --git a/setup.py b/setup.py
          version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
      public_version = ast.literal_eval(version_match.group(1))
  
-@@ -83,9 +83,9 @@
+@@ -83,9 +83,9 @@ class CustomBuildPy(build_py):
              code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
  
          # Create temporary build directory
@@ -117,7 +182,7 @@ diff --git a/setup.py b/setup.py
              f.write(code)
  
  
-@@ -98,7 +98,7 @@
+@@ -98,7 +98,7 @@ if __name__ == '__main__':
      cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
      nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
      sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
@@ -126,7 +191,7 @@ diff --git a/setup.py b/setup.py
                      f'{current_dir}/third-party/fmt/include',
                      '/usr/local/cuda/include/cccl']
      library_dirs = []
-@@ -195,16 +195,16 @@
+@@ -195,16 +195,16 @@ if __name__ == '__main__':
      print()
  
      setuptools.setup(
@@ -147,25 +212,3 @@ diff --git a/setup.py b/setup.py
                            include_dirs=include_dirs,
                            library_dirs=library_dirs,
                            sources=sources,
---- a/csrc/utils/event.hpp
-+++ b/csrc/utils/event.hpp
-@@ -10 +10 @@
--struct EventHandle {
-+struct RelaxV2EventHandle {
-@@ -14 +14 @@
--    EventHandle() {
-+    RelaxV2EventHandle() {
-@@ -19 +19 @@
--    explicit EventHandle(const at::cuda::CUDAStream& stream) {
-+    explicit RelaxV2EventHandle(const at::cuda::CUDAStream& stream) {
-@@ -24 +24 @@
--    EventHandle(const EventHandle& other) = default;
-+    RelaxV2EventHandle(const RelaxV2EventHandle& other) = default;
-@@ -27,0 +28,2 @@
-+
-+using EventHandle = RelaxV2EventHandle;
---- a/csrc/legacy/buffer.hpp
-+++ b/csrc/legacy/buffer.hpp
-@@ -1763 +1763 @@
--    pybind11::class_<EventHandle>(m, "EventHandle")
-+    pybind11::class_<EventHandle>(m, "EventHandle", pybind11::module_local())

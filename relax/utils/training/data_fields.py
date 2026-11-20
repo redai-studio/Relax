@@ -3,7 +3,7 @@
 from argparse import Namespace
 
 from relax.distributed.replay_manager import replay_fields
-from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.image_refs import sft_multimodal_data_fields
@@ -63,6 +63,9 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
+        if is_embedding_sft_mode(args) and "multimodal_train_inputs" not in fields:
+            # One TQ row retains both tokenized branches even for text-only PT.
+            fields.append("multimodal_train_inputs")
         return replay_fields(fields)
 
     from relax.algorithms import algorithm_needs_critic
@@ -96,7 +99,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces
         # ``advantages``/``returns``, actor just pulls the finished tensors.
-        if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+        if args.fully_async and not getattr(args, "hybrid", False):
             fields.extend(["advantages", "returns"])
         else:
             fields.append("values")

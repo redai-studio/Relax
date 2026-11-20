@@ -485,6 +485,10 @@ def _estimate_fallback_flops(config, tokens_sum, batch_seqlens, delta_time):
     """Fallback for unknown model types using standard dense transformer
     formula."""
     text_config = config.text_config if hasattr(config, "text_config") else config
+    # Heterogeneous configs reject global attention dimensions. A dense
+    # estimate would also misrepresent their per-layer attention/MoE costs.
+    if getattr(text_config, "per_layer_config", None) is not None:
+        return float("nan")
     required = ("hidden_size", "vocab_size", "num_hidden_layers", "num_attention_heads", "intermediate_size")
     if not all(hasattr(text_config, attr) for attr in required):
         return 0

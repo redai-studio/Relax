@@ -10,6 +10,7 @@ They do not emulate distributed MTP boundary communication.
 import __future__
 
 import ast
+import os
 import sys
 from argparse import Namespace
 from collections.abc import Callable, Sequence
@@ -42,6 +43,7 @@ def production_namespace(cp_size, rank, tp_size=2):
 
     namespace = {
         "Envs": Envs,
+        "os": os,
         "torch": torch,
         "F": F,
         "Namespace": Namespace,

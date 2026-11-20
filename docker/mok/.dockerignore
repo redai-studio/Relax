@@ -1,9 +1,0 @@
-.git
-__pycache__
-**/__pycache__
-*.pyc
-**/*.pyc
-*.so
-*.whl
-build-result.json
-validation-result.json
