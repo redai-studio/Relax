@@ -163,6 +163,16 @@ class SenseNovaSFTAdapter:
             errors.append("prefix_gradient_checkpointing must be boolean")
         return errors
 
+    @staticmethod
+    def tracker_schema() -> Any:
+        from relax.engine.sft.condition_tracker import SENSENOVA_TRACKER_SCHEMA
+
+        return SENSENOVA_TRACKER_SCHEMA
+
+    def bind_tracker(self, model: SenseNovaSFTModel, tracker: Any | None) -> None:
+        model.pipe.tracker = tracker
+        model.pipe.dit.tracker = tracker
+
     def load_train_model(self, args: Any) -> SenseNovaSFTModel:
         from .pipeline import SenseNovaU1ImagePipeline
 
