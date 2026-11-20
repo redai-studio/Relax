@@ -54,6 +54,18 @@ actor 卡池（一整块 placement group，大小 = ACTOR_GPUS）
 
 每个 teacher 内部按 `--teacher-num-gpus-per-engine` 拆成多副本，round-robin 分担同一 data_source 的请求量。
 
+### 多个 Teacher 共用一组副本
+
+同一 BF16 基座微调出的 Teacher 可以共用引擎。各 checkpoint 需要有相同的模型配置、tokenizer 和输入处理方式。先用与在线引擎相同的 TP 大小制包，把初始 Teacher 放在第一位。更新 Teacher 权重后需要重新制包。
+
+```bash
+python -m examples.on_policy_distillation.mopd.pack_teacher_pair \
+  --checkpoints /models/audit /models/evidence /models/evaluation \
+  --tp-size 2 --output /models/teacher-bank-tp2
+```
+
+训练时沿用 `--opd-teacher-routes` 中各数据源对应的 checkpoint，加上 `--opd-teacher-delta-dir /models/teacher-bank-tp2` 和 `--teacher-num-gpus-per-engine 2`。包目录和 checkpoint 路径需要对 Teacher 节点可读。分配 8 张 Teacher 卡时，共享池启动 4 个 TP2 副本。每个副本优先处理当前驻留 Teacher 的请求；换权时只等这个副本已发出的打分返回，其他副本继续工作。
+
 ## 数据准备
 
 用 `prepare_data.py`（本目录下）把原始数据转成统一 schema：`prompt`（str）、`label`（str）、`data_source`（str，路由键）、`images`（VL 内嵌 base64，可选）、`extra_info`（固定 `{"rm_type": "mopd", "source": ...}`）。

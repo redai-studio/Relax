@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from contextlib import nullcontext
 
 import aiohttp
 import numpy as np
@@ -217,6 +218,7 @@ class TeacherResponseStats:
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        self.use_shared_teacher = bool(getattr(args, "opd_teacher_delta_dir", None))
         routes = args.opd_teacher_routes_map
         self.response_stats = TeacherResponseStats(routes) if routes else None
         self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
@@ -350,11 +352,22 @@ class OpdManager:
         if self.opsd_worker is not None:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
-        async with _create_teacher_client_session(self.args) as session:
-            successes = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, successes)
+        query_student = self.topk_worker is not None and self.topk_worker.spec.student_at_teacher
+        needs_http = query_student or not self.use_shared_teacher
+        async with _create_teacher_client_session(self.args) if needs_http else nullcontext() as session:
+            requests = [self._teacher_prefill(s, session) for s in sample_list]
+            if self.use_shared_teacher:
+                # Let every queued score settle before propagating a scheduler or validation error.
+                results = await asyncio.gather(*requests, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                if not all(results):
+                    raise RuntimeError("Shared Teacher failed to produce complete logprobs for this batch")
+            else:
+                self._raise_if_all_failed(sample_list, await asyncio.gather(*requests))
 
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
+            if query_student:
                 await asyncio.gather(
                     *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
                 )
@@ -388,6 +401,26 @@ class OpdManager:
                 raise RuntimeError(f"Native image OPD {err_tag} failed for sample_index={sample.index}") from exc
             return None
 
+        response = opd_main_worker.LogprobResponse(data)
+        if expected_input_ids is not None:
+            response.validate_native_prefill(expected_input_ids, int(sample.response_length))
+        return response
+
+    async def _score_shared_teacher(
+        self, sample: Sample, payload: dict, expected_input_ids: list[int] | None
+    ) -> opd_main_worker.LogprobResponse:
+        import ray
+
+        score_ref = self.args._opd_shared_teacher_manager.score.remote(sample.metadata["teacher_id"], payload)
+        try:
+            data = await score_ref
+        except asyncio.CancelledError:
+            # Cancel this caller's queued score; the manager drains already dispatched HTTP work.
+            try:
+                ray.cancel(score_ref, recursive=False)
+            except Exception:
+                logger.warning("Could not cancel shared Teacher score for sample %s", sample.index, exc_info=True)
+            raise
         response = opd_main_worker.LogprobResponse(data)
         if expected_input_ids is not None:
             response.validate_native_prefill(expected_input_ids, int(sample.response_length))
@@ -477,10 +510,12 @@ class OpdManager:
         if native:
             payload["return_prompt_token_ids"] = True
 
-        teacher_url = _pick_teacher_url(self.args, sample)
-        resp_obj = await self._post_logprob(
-            session, teacher_url, payload, sample, "teacher prefill", expanded_ids if native else None
-        )
+        expected_ids = expanded_ids if native else None
+        if self.use_shared_teacher:
+            resp_obj = await self._score_shared_teacher(sample, payload, expected_ids)
+        else:
+            teacher_url = _pick_teacher_url(self.args, sample)
+            resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill", expected_ids)
         if resp_obj is None:
             return False
 

@@ -13,6 +13,7 @@ import json
 import sys
 from argparse import Namespace
 from types import ModuleType
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -217,3 +218,85 @@ def test_multi_teacher_rejects_invalid_route_budgets(routes: object, total: int,
 
     with pytest.raises(ValueError, match=message):
         opd_utils._parse_teacher_routes(json.dumps(routes), total, tp)
+
+
+@pytest.mark.parametrize("fail_start", [False, True])
+def test_shared_teacher_starts_one_pool_for_three_routes(monkeypatch, tmp_path, fail_start):
+    import ray
+
+    from relax.backends.sglang.adts import LOADER
+    from relax.utils.opd import opd_utils
+
+    actors = MagicMock()
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.teacher_manager", actors)
+    spawn = actors.TeacherManager.options.return_value.remote
+    shared = actors.SharedTeacherManager.options.return_value.remote
+    physical, owner = spawn.return_value, shared.return_value
+    pg = ("pg", list(range(16)), list(range(16)))
+    monkeypatch.setattr("relax.core.service.create_placement_group", lambda **kwargs: pg)
+    remove = MagicMock()
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", remove)
+    monkeypatch.setattr(ray, "get", lambda value, **kwargs: value)
+    monkeypatch.setattr(ray, "kill", MagicMock())
+    urls = ["http://replica-1/generate", "http://replica-2/generate"]
+    physical.get_urls.remote.return_value = urls
+    routes = {key: str(tmp_path / key) for key in ("audit", "evidence", "eval")}
+    for key in routes:
+        (tmp_path / key).mkdir()
+    route_ids = {key: key.upper() for key in routes}
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "tp_size": 4,
+                "initial_teacher": "EVAL",
+                "teachers": {name: {"checkpoint_path": key} for key, name in route_ids.items()},
+            }
+        )
+    )
+    args = _base_args(
+        opd_teacher_delta_dir=str(tmp_path),
+        opd_teacher_routes=json.dumps(routes),
+        teacher_num_gpus_per_engine=4,
+        offload_rollout=True,
+    )
+    if fail_start:
+        owner.initialize.remote.side_effect = RuntimeError("engine unavailable")
+        with pytest.raises(RuntimeError, match="engine unavailable"):
+            opd_utils.maybe_start_managed_opd_teacher(args)
+        physical.shutdown.remote.assert_called_once()
+        remove.assert_called_once_with(pg[0])
+        return
+
+    assert opd_utils.maybe_start_managed_opd_teacher(args) == (pg, [owner])
+    engine_args, replicas, tp = spawn.call_args.args
+    assert (engine_args.teacher_hf_checkpoint, replicas, tp) == (routes["eval"], 2, 4)
+    settings = opd_utils.build_teacher_overrides(engine_args, colocate_sync=True)
+    assert (settings["dtype"], settings["custom_weight_loader"]) == ("bfloat16", [LOADER])
+    shared.assert_called_once_with(
+        args, physical, urls, initial_teacher="eval", teacher_to_adts_id=route_ids, tp_size=4
+    )
+    owner.offload.remote.assert_called_once()
+    assert args.opd_teacher_routes_map == dict.fromkeys(routes, urls)
+
+
+def test_only_rollout_configuration_receives_shared_teacher_handle(monkeypatch):
+    from relax.core import controller
+
+    ctrl = controller.Controller.__new__(controller.Controller)
+    ctrl.config = Namespace(opd_teacher_delta_dir="bank")
+    ctrl.runtime_env = None
+    ctrl._health_manager = Namespace(status=None)
+    owner = object()
+    ctrl._teacher_manager = [owner]
+    service = MagicMock()
+    monkeypatch.setattr(controller, "Service", service)
+    for role in ("rollout", "actor"):
+        _, _, error = ctrl._create_service_task(role, object(), 1, None, None, defer_deploy=True)
+        assert error is None
+        config = service.call_args.kwargs["config"]
+        if role == "rollout":
+            assert config is not ctrl.config
+            assert config._opd_shared_teacher_manager is owner
+        else:
+            assert config is ctrl.config
+    assert not hasattr(ctrl.config, "_opd_shared_teacher_manager")
