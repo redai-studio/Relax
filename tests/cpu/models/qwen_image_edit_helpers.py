@@ -27,6 +27,8 @@ from relax.models.qwen_image.sft_adapter import (
     TEXT_INPUT_FIELDS,
     QwenImageEditSFTAdapter,
     QwenImageEditSFTModel,
+    _digest_text_inputs,
+    image_digest,
     load_image,
     preprocess_pixels,
 )
@@ -133,6 +135,8 @@ def build_model(mode: str = "full", dtype: torch.dtype = torch.float32) -> QwenI
                 if ".lora_B." in name:
                     parameter.normal_(std=0.01)
         model.to(dtype)
+    model._condition_config = dict(CONFIG)
+    model._condition_model_path = str(FIXTURES)
     model.train()
     return model
 
@@ -152,6 +156,18 @@ def small_sample(adapter: QwenImageEditSFTAdapter, index: int = 0, count: int = 
             "target_pixels": preprocess_pixels(target),
             "edit_pixels": tuple(preprocess_pixels(image) for image in edits),
             "text_inputs": {name: outputs[name] for name in TEXT_INPUT_FIELDS},
+            "text_inputs_digest": _digest_text_inputs(outputs),
+            "digests": {
+                "target": image_digest(target),
+                "vae": [image_digest(x) for x in edits],
+                "vl": [image_digest(x) for x in edits],
+            },
             "edit_shapes": tuple((1, 2, 2) for _ in edits),
+            "tracker_keys": {
+                "prompt_key": f"prompt-{index}",
+                "ref_vae_image_keys": [f"ref-{i}" for i in range(count)],
+                "target_image_key": f"target-{index}",
+            },
+            "sample_preprocess_ms": 0.1,
         }
     )

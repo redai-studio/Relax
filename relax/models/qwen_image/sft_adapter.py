@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
+from relax.engine.sft.condition_cache import ConditionFieldSpec, ConditionRequest
 from relax.engine.sft.condition_tracker import EncodeSpec, EvidenceSpec, TrackerSchema, TransferSpec
 from relax.engine.sft.image import image_tier_budget, load_sft_image
 from relax.models.qwen_image.scheduler import QwenImageTrainingSchedule
@@ -209,6 +210,7 @@ class QwenImageEditSFTModel(torch.nn.Module):
         self.device = next(transformer.parameters()).device
         self.schedule = QwenImageTrainingSchedule()
         self.tracker = None
+        self._condition_cache = None
         text_encoder.requires_grad_(False).eval()
         vae.requires_grad_(False).eval()
         transformer.requires_grad_(training_mode == "full").train()
@@ -331,10 +333,22 @@ class QwenImageEditSFTModel(torch.nn.Module):
         timestep_id: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode frozen conditions and compute the SFT loss."""
+        """Run condition encoding or cache reuse, then compute the SFT loss."""
         if self.tracker is not None:
             self.tracker.add_host_time("sample_preprocess_ms", data["sample_preprocess_ms"])
-        condition = {**self.encode_conditions(data), "edit_shapes": data["edit_shapes"]}
+        cache = self._condition_cache
+        condition = cache.values.get("edit_inputs") if cache is not None else None
+        started = time.monotonic() if cache is not None else 0.0
+        if condition is None:
+            condition = self.encode_conditions(data)
+            if cache is not None:
+                cache.counters["build_host_ms"] += (time.monotonic() - started) * 1000
+                cache.put("edit_inputs", condition)
+        else:
+            cache.counters["restore_ms"] += (time.monotonic() - started) * 1000
+            for name in QwenImageEditSFTAdapter.condition_skip_counters:
+                cache.counters[name] += 1
+        condition = {**condition, "edit_shapes": data["edit_shapes"]}
         # DiffSynth's NoiseInitializer consumes one RNG draw before the loss draws training noise.
         torch.randn(condition["target_latents"].shape, device=self.device, dtype=self.torch_dtype)
         return self.flow_matching_loss(condition, timestep_id=timestep_id, noise=noise)
@@ -350,6 +364,7 @@ class QwenImageEditSFTAdapter:
     image_tier_policy = True
     cpu_only_prepare_sample = True
     frozen_module_prefixes = ("text_encoder.", "vae.")
+    condition_skip_counters = ("skipped_prompt_encodes", "skipped_ref_vae_encodes", "skipped_target_vae_encodes")
 
     def __init__(self) -> None:
         self.processor = None
@@ -471,7 +486,10 @@ class QwenImageEditSFTAdapter:
             raise ValueError(f"Unsupported Qwen attention implementation: {implementation}")
         if config.get("transformer_gradient_checkpointing", True):
             transformer.enable_gradient_checkpointing()
-        return QwenImageEditSFTModel(transformer, text_encoder, vae, training_mode=args.fsdp_trainable_mode)
+        model = QwenImageEditSFTModel(transformer, text_encoder, vae, training_mode=args.fsdp_trainable_mode)
+        model._condition_config = dict(config)
+        model._condition_model_path = str(Path(args.model_path).resolve())
+        return model
 
     def prepare_for_sharding(self, model: QwenImageEditSFTModel) -> None:
         """Verify LoRA targets and cast the root module to BF16 before FSDP."""
@@ -539,3 +557,78 @@ class QwenImageEditSFTAdapter:
         )
         data["sample_preprocess_ms"] = (time.perf_counter() - started) * 1000
         return data
+
+    def condition_field_specs(self, model: QwenImageEditSFTModel) -> tuple[ConditionFieldSpec, ...]:
+        """Declare the single cacheable ``edit_inputs`` condition field."""
+        return (
+            ConditionFieldSpec(
+                name="edit_inputs",
+                fields=("prompt_embeds", "edit_latents", "target_latents"),
+                dependency_paths=("text_encoder", "vae"),
+                input_dependencies=("prompt", "edit_images", "target_image"),
+                preprocessing_dependencies=("preprocessing",),
+                max_tensors=2 + model._condition_config["conditioning_images"],
+                max_depth=2,
+            ),
+        )
+
+    def bind_condition_cache(self, model: QwenImageEditSFTModel, cache: Any | None) -> None:
+        """Attach ``cache`` and capture frozen text and adapter identities."""
+        model._condition_cache = cache
+        if cache is None:
+            model._condition_text_identity = None
+            model._condition_adapter_identity = None
+            return
+        with self.processor_lock:
+            self._text_identity = self._processor_identity()
+            model._condition_text_identity = self._text_identity
+        active = []
+        for prefix in ("text_encoder", "vae"):
+            for name, module in model.get_submodule(prefix).named_modules():
+                if getattr(module, "peft_config", None):
+                    adapters = module.active_adapters
+                    active.append(
+                        {"module": f"{prefix}.{name}", "active": adapters() if callable(adapters) else adapters}
+                    )
+        model._condition_adapter_identity = active
+
+    def prepare_condition_request(
+        self,
+        model: QwenImageEditSFTModel,
+        data: Mapping[str, Any],
+    ) -> dict[str, ConditionRequest]:
+        """Build the cache key metadata for one prepared micro-batch."""
+        config = model._condition_config
+        metadata = {
+            "weights": {
+                "source": model._condition_model_path,
+                "active_adapters": model._condition_adapter_identity,
+                "adapter_version": model._condition_cache.version_tags["edit_inputs"],
+            },
+            "text": {"processor": model._condition_text_identity, "inputs": data["text_inputs_digest"]},
+            "prompt": data["prompt"],
+            "edit_images": {"vae": data["digests"]["vae"], "vl": data["digests"]["vl"]},
+            "target_image": data["digests"]["target"],
+            "preprocessing": {
+                "max_pixels": config["max_pixels"],
+                "fixed_pixels_tiers": config.get("fixed_pixels_tiers"),
+                "fixed_pixels_budget": data["fixed_pixels_budget"],
+                "division": 16,
+                "condition_areas": (1024 * 1024, 384 * 384),
+                "condition_rounding": 32,
+                "resize_order": "crop_then_vae_then_vl",
+                "crop_interpolation": "BILINEAR",
+                "condition_interpolation": "PIL_default_BICUBIC",
+                "height": data["image"].height,
+                "width": data["image"].width,
+            },
+            "precision": {
+                "compute": str(model.torch_dtype),
+                "fields": str(model.torch_dtype),
+                "attention": model.text_encoder.config._attn_implementation,
+                "deterministic_attention": config.get("deterministic_attention", False),
+                "latents_mean": model.vae.config.latents_mean,
+                "latents_std": model.vae.config.latents_std,
+            },
+        }
+        return {"edit_inputs": ConditionRequest(metadata)}

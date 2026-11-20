@@ -15,7 +15,7 @@ from tests.models.qwen_image_edit_fsdp import run_fsdp_processes
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires one CUDA device for real FSDP2 execution")
 @pytest.mark.parametrize("mode", ["full", "lora"])
-def test_qwen_single_gpu_fsdp_and_checkpoint(tmp_path: Path, mode: str) -> None:
+def test_qwen_single_gpu_fsdp_cache_and_checkpoint(tmp_path: Path, mode: str) -> None:
     run_fsdp_processes(tmp_path, 1, mode)
 
 

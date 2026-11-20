@@ -12,7 +12,9 @@ import torch.distributed as dist
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from relax.backends.fsdp.checkpoint import load_checkpoint, save_checkpoint
+from relax.backends.fsdp.condition_cache import ConditionCacheBinding
 from relax.backends.fsdp.runtime import fsdp2_wrap
+from relax.backends.fsdp.sft import FSDPSFTTrainer
 from relax.utils.distributed_utils import init_gloo_group
 from tests.cpu.models.qwen_image_edit_helpers import build_adapter, build_model, small_sample
 
@@ -32,139 +34,211 @@ def fsdp_worker(rank: int, world: int, directory: str, mode: str) -> None:
         world_size=world,
         timeout=timedelta(seconds=90),
     )
-    init_gloo_group()
+    control = init_gloo_group()
+    histories = []
     try:
         with sdpa_kernel(SDPBackend.MATH):
-            adapter, model = build_adapter(), build_model(mode, torch.bfloat16)
-            data = small_sample(adapter)
-            model.transformer.enable_gradient_checkpointing()
-            model = fsdp2_wrap(model, master_dtype="fp32")
-            adapter.on_device_ready(model, device)
-            counters = {}
-            handles = []
-            watched = (
-                "text_encoder.model.language_model.layers.0",
-                "text_encoder.model.visual.blocks.0",
-                "vae.encoder",
-                "text_encoder.lm_head",
-                "vae.decoder",
-            )
-            for name in watched:
-                counters[name] = 0
+            for enabled in (False, True):
+                adapter, model = build_adapter(), build_model(mode, torch.bfloat16)
+                data = small_sample(adapter)
+                model.transformer.enable_gradient_checkpointing()
+                model = fsdp2_wrap(model, master_dtype="fp32")
+                adapter.on_device_ready(model, device)
+                counters = {}
+                handles = []
+                watched = (
+                    "text_encoder.model.language_model.layers.0",
+                    "text_encoder.model.visual.blocks.0",
+                    "vae.encoder",
+                    "text_encoder.lm_head",
+                    "vae.decoder",
+                )
+                for name in watched:
+                    counters[name] = 0
 
-                def count(module, args, name=name):
-                    counters[name] += 1
+                    def count(module, args, name=name):
+                        counters[name] += 1
 
-                handles.append(model.get_submodule(name).register_forward_pre_hook(count))
-            parameters = [p for p in model.parameters() if p.requires_grad]
-            assert all(p.dtype == torch.float32 for p in parameters)
-            optimizer = torch.optim.AdamW(parameters, lr=1e-3, foreach=mode != "full")
-            torch.manual_seed(1991 + rank)
-            for _ in range(2):
+                    handles.append(model.get_submodule(name).register_forward_pre_hook(count))
+                cache = (
+                    ConditionCacheBinding(model, adapter, device, {"condition_cache_max_entries": 2 - rank})
+                    if enabled
+                    else None
+                )
+                trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
+                trainer.world, trainer.control_group, trainer.condition_cache = world, control, cache
+                parameters = [p for p in model.parameters() if p.requires_grad]
+                assert all(p.dtype == torch.float32 for p in parameters)
+                optimizer = torch.optim.AdamW(parameters, lr=1e-3, foreach=mode != "full")
+                torch.manual_seed(1991 + rank)
+                history = []
+                for step in range(6):
+                    if enabled and step == 2 and rank == 0:
+                        cache.cache.clear()
+                    if step == 4:
+                        with torch.no_grad():
+                            next(model.text_encoder.parameters()).add_(0.001)
+                        if enabled and rank == 0:
+                            cache.bump_encoder_version(version_tag="updated")
+                    optimizer.zero_grad(set_to_none=True)
+                    before = [p.to_local().detach().clone() for p in parameters]
+                    counters.update(dict.fromkeys(counters, 0))
+                    if enabled:
+                        trainer._prepare_conditions(data, step, 0, 1)
+                    reused = enabled and bool(cache.values)
+                    loss = model(data)
+                    loss.backward()
+                    gradients = [
+                        p.grad.to_local().detach().cpu().clone() if p.grad is not None else None for p in parameters
+                    ]
+                    optimizer.step()
+                    history.append(
+                        [
+                            loss.detach().cpu(),
+                            *gradients,
+                            *((p.to_local().detach() - old).cpu() for p, old in zip(parameters, before, strict=True)),
+                            torch.get_rng_state(),
+                            torch.cuda.get_rng_state(device),
+                        ]
+                    )
+                    for name in watched[:2]:
+                        assert counters[name] == (0 if reused else 1)
+                    assert counters["vae.encoder"] == (0 if reused else 2)
+                    assert counters["text_encoder.lm_head"] == counters["vae.decoder"] == 0
+                    assert data["target_pixels"].device.type == "cpu"
+                    assert data["text_inputs"]["pixel_values"].device.type == "cpu"
+                    if enabled:
+                        cache.end_micro()
+                if enabled:
+                    stats = cache.stats()
+                    assert stats["effective_reuses"] == 3
+                    assert stats["peak_entries"] <= 2 - rank
+                    assert stats["peak_charged_bytes"] <= cache.cache.max_bytes
+                adapter_only = mode == "lora"
+                output = str(Path(directory) / f"checkpoint-{enabled}")
+                expected_step6 = [p.to_local().detach().clone() for p in parameters]
+                expected_step6_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state(device).clone()
+                expected_moments = [
+                    (
+                        optimizer.state[p]["exp_avg"].to_local().detach().clone(),
+                        optimizer.state[p]["exp_avg_sq"].to_local().detach().clone(),
+                    )
+                    for p in parameters
+                    if p in optimizer.state and "exp_avg" in optimizer.state[p]
+                ]
+                assert expected_moments
+                assert any(bool((m != 0).any()) for m, _ in expected_moments)
+                save_checkpoint(
+                    output,
+                    "qwen",
+                    6,
+                    model,
+                    optimizer,
+                    trainer_state={"completed_steps": 6},
+                    weight_sync_manifest={},
+                    adapter_contract={"trainable_mode": mode},
+                    adapter_only=adapter_only,
+                    is_rank0=rank == 0,
+                    require_rng_state=True,
+                )
                 optimizer.zero_grad(set_to_none=True)
-                counters.update(dict.fromkeys(counters, 0))
-                loss = model(data)
-                assert torch.isfinite(loss)
-                loss.backward()
+                if enabled:
+                    trainer._prepare_conditions(data, 6, 0, 1)
+                continuous_loss = model(data)
+                assert torch.isfinite(continuous_loss)
+                continuous_loss.backward()
                 optimizer.step()
-                for name in watched[:2]:
-                    assert counters[name] == 1
-                assert counters["vae.encoder"] == 2
-                assert counters["text_encoder.lm_head"] == counters["vae.decoder"] == 0
-                assert data["target_pixels"].device.type == "cpu"
-                assert data["text_inputs"]["pixel_values"].device.type == "cpu"
-            adapter_only = mode == "lora"
-            output = str(Path(directory) / "checkpoint")
-            expected_step2 = [p.to_local().detach().clone() for p in parameters]
-            expected_step2_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state(device).clone()
-            expected_moments = [
-                (
-                    optimizer.state[p]["exp_avg"].to_local().detach().clone(),
-                    optimizer.state[p]["exp_avg_sq"].to_local().detach().clone(),
+                if enabled:
+                    cache.end_micro()
+                expected_step7_loss = continuous_loss.detach().clone()
+                expected_step7 = [p.to_local().detach().clone() for p in parameters]
+                expected_step7_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state(device).clone()
+
+                histories.append(history)
+                for handle in handles:
+                    handle.remove()
+                if cache is not None:
+                    cache.close()
+                del model, parameters, optimizer, cache, trainer
+                gc.collect()
+
+                # 构建全新模型和未初始化的 AdamW 优化器，验证恢复后优化器状态与第 7 步更新一致。
+                resumed_model = build_model(mode, torch.bfloat16)
+                resumed_model.transformer.enable_gradient_checkpointing()
+                resumed_model = fsdp2_wrap(resumed_model, master_dtype="fp32")
+                adapter.on_device_ready(resumed_model, device)
+                if mode == "lora":
+                    # LoRA 仅保存适配器权重，需要重放第 4 步对冻结 text_encoder 权重的修改。
+                    with torch.no_grad():
+                        next(resumed_model.text_encoder.parameters()).add_(0.001)
+                resumed_cache = (
+                    ConditionCacheBinding(resumed_model, adapter, device, {"condition_cache_max_entries": 2 - rank})
+                    if enabled
+                    else None
                 )
-                for p in parameters
-                if p in optimizer.state and "exp_avg" in optimizer.state[p]
-            ]
-            assert expected_moments
-            assert any(bool((m != 0).any()) for m, _ in expected_moments)
-            save_checkpoint(
-                output,
-                "qwen",
-                2,
-                model,
-                optimizer,
-                trainer_state={"completed_steps": 2},
-                weight_sync_manifest={},
-                adapter_contract={"trainable_mode": mode},
-                adapter_only=adapter_only,
-                is_rank0=rank == 0,
-                require_rng_state=True,
-            )
-            # 连续执行第 3 步，作为从第 2 步 checkpoint 恢复后首步更新的基准。
-            optimizer.zero_grad(set_to_none=True)
-            continuous_loss = model(data)
-            assert torch.isfinite(continuous_loss)
-            continuous_loss.backward()
-            optimizer.step()
-            expected_step3_loss = continuous_loss.detach().clone()
-            expected_step3 = [p.to_local().detach().clone() for p in parameters]
-            expected_step3_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state(device).clone()
-
-            for handle in handles:
-                handle.remove()
-            del model, parameters, optimizer
-            gc.collect()
-
-            # 构建全新模型和未初始化的 AdamW 优化器，验证分片权重与优化器状态恢复后的续训一致性。
-            resumed_model = build_model(mode, torch.bfloat16)
-            resumed_model.transformer.enable_gradient_checkpointing()
-            resumed_model = fsdp2_wrap(resumed_model, master_dtype="fp32")
-            adapter.on_device_ready(resumed_model, device)
-            resumed_parameters = [p for p in resumed_model.parameters() if p.requires_grad]
-            with torch.no_grad():
-                for p in resumed_parameters:
-                    p.add_(1)
-            resumed_optimizer = torch.optim.AdamW(resumed_parameters, lr=1e-3, foreach=mode != "full")
-            restored = load_checkpoint(
-                output,
-                "qwen",
-                2,
-                resumed_model,
-                resumed_optimizer,
-                adapter_only=adapter_only,
-                require_rng_state=True,
-            )
-            assert restored["completed_steps"] == 2
-            for actual, original in zip(resumed_parameters, expected_step2, strict=True):
-                assert torch.equal(actual.to_local(), original)
-            assert torch.equal(torch.get_rng_state(), expected_step2_rng[0])
-            assert torch.equal(torch.cuda.get_rng_state(device), expected_step2_rng[1])
-            restored_moments = [
-                (
-                    resumed_optimizer.state[p]["exp_avg"].to_local(),
-                    resumed_optimizer.state[p]["exp_avg_sq"].to_local(),
+                resumed_parameters = [p for p in resumed_model.parameters() if p.requires_grad]
+                with torch.no_grad():
+                    for p in resumed_parameters:
+                        p.add_(1)
+                resumed_optimizer = torch.optim.AdamW(resumed_parameters, lr=1e-3, foreach=mode != "full")
+                restored = load_checkpoint(
+                    output,
+                    "qwen",
+                    6,
+                    resumed_model,
+                    resumed_optimizer,
+                    adapter_only=adapter_only,
+                    require_rng_state=True,
                 )
-                for p in resumed_parameters
-                if p in resumed_optimizer.state and "exp_avg" in resumed_optimizer.state[p]
-            ]
-            assert len(restored_moments) == len(expected_moments)
-            for (act_m, act_v), (exp_m, exp_v) in zip(restored_moments, expected_moments, strict=True):
-                assert torch.equal(act_m, exp_m)
-                assert torch.equal(act_v, exp_v)
-
-            resumed_optimizer.zero_grad(set_to_none=True)
-            resumed_loss = resumed_model(data)
-            assert torch.equal(resumed_loss.detach(), expected_step3_loss)
-            resumed_loss.backward()
-            resumed_optimizer.step()
-            for actual, expected in zip(resumed_parameters, expected_step3, strict=True):
-                assert torch.equal(actual.to_local(), expected)
-            assert torch.equal(torch.get_rng_state(), expected_step3_rng[0])
-            assert torch.equal(torch.cuda.get_rng_state(device), expected_step3_rng[1])
-
-            del resumed_model, resumed_parameters, resumed_optimizer
-            gc.collect()
-            torch.cuda.empty_cache()
+                assert restored["completed_steps"] == 6
+                for actual, original in zip(resumed_parameters, expected_step6, strict=True):
+                    assert torch.equal(actual.to_local(), original)
+                assert torch.equal(torch.get_rng_state(), expected_step6_rng[0])
+                assert torch.equal(torch.cuda.get_rng_state(device), expected_step6_rng[1])
+                if enabled:
+                    assert resumed_cache.stats()["entries"] == 0
+                restored_moments = [
+                    (
+                        resumed_optimizer.state[p]["exp_avg"].to_local(),
+                        resumed_optimizer.state[p]["exp_avg_sq"].to_local(),
+                    )
+                    for p in resumed_parameters
+                    if p in resumed_optimizer.state and "exp_avg" in resumed_optimizer.state[p]
+                ]
+                assert len(restored_moments) == len(expected_moments)
+                for (act_m, act_v), (exp_m, exp_v) in zip(restored_moments, expected_moments, strict=True):
+                    assert torch.equal(act_m, exp_m)
+                    assert torch.equal(act_v, exp_v)
+                resumed_trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
+                resumed_trainer.world, resumed_trainer.control_group, resumed_trainer.condition_cache = (
+                    world,
+                    control,
+                    resumed_cache,
+                )
+                resumed_optimizer.zero_grad(set_to_none=True)
+                if enabled:
+                    resumed_trainer._prepare_conditions(data, 6, 0, 1)
+                resumed_loss = resumed_model(data)
+                assert torch.equal(resumed_loss.detach(), expected_step7_loss)
+                resumed_loss.backward()
+                resumed_optimizer.step()
+                if enabled:
+                    resumed_cache.end_micro()
+                    resumed_cache.close()
+                for actual, expected in zip(resumed_parameters, expected_step7, strict=True):
+                    assert torch.equal(actual.to_local(), expected)
+                assert torch.equal(torch.get_rng_state(), expected_step7_rng[0])
+                assert torch.equal(torch.cuda.get_rng_state(device), expected_step7_rng[1])
+                del resumed_model, resumed_parameters, resumed_optimizer, resumed_cache, resumed_trainer
+                gc.collect()
+                torch.cuda.empty_cache()
+            for online, cached in zip(*histories, strict=True):
+                for expected, actual in zip(online, cached, strict=True):
+                    if expected is None:
+                        assert actual is None
+                    else:
+                        assert torch.isfinite(actual).all()
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
