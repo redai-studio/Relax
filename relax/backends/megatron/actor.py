@@ -2558,7 +2558,7 @@ class MegatronTrainRayActor(TrainRayActor):
         has no pipelined meta tracking across stages.
         """
         return (
-            getattr(self.args, "fully_async", False)
+            self.args.fully_async
             and getattr(self.args, "use_dynamic_batch_size", False)
             and mpu.get_pipeline_model_parallel_world_size() == 1
             and (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) == 1
@@ -3939,7 +3939,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "opd_reverse_kl",
         }
         if getattr(self.args, "dynamic_context_parallel", False):
-            # forward_only already reconstructed these responses in their original sample order.
+            # forward_only already restored these responses in their original sample order.
             token_fields -= {"log_probs", "ref_log_probs"}
         fields_to_gather = [
             key for key, value in output_dict.items() if key in token_fields and isinstance(value, List)

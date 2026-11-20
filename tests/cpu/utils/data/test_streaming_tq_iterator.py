@@ -387,7 +387,7 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     events = [
         ({"tokens": [torch.tensor([0])]}, _Meta({})),
         (None, _Meta({})),  # empty poll must not consume a microbatch ordinal
-        ({"tokens": [torch.tensor([1])]}, _Meta({})),
+        ({"tokens": [torch.tensor([1, 2, 3])], "log_probs": [torch.tensor([-1.0, -2.0])]}, _Meta({})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"dummy_round": True})),
         (None, _Meta({"stream_end": True})),
@@ -405,9 +405,16 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
         per_round_dummy=True,
     )
 
-    slots = [(mb["replay_micro_batch_index"], mb.get("__is_dummy__", False)) for mb, _ in iterator]
+    first, _ = next(iterator)
+    real, _ = next(iterator)
+    # get_batch replaces full response fields with CP-local slices during training.
+    real["log_probs"] = [real["log_probs"][0][:1]]
+    padding = [mb for mb, _ in iterator]
+    slots = [(mb["replay_micro_batch_index"], mb.get("__is_dummy__", False)) for mb in (first, real, *padding)]
     assert slots == [(0, False), (1, False), (2, True), (3, True)]
-    assert len(iterator.get_buffer()) == 2  # Only real batches enter the rollout log.
+    assert padding[0]["log_probs"][0].tolist() == [-1.0, -2.0]
+    assert len(iterator.get_buffer()) == 2
+    assert iterator.get_buffer()[-1][0]["log_probs"][0].tolist() == [-1.0, -2.0]
 
 
 @pytest.mark.parametrize("dense_ids", [False, True])
