@@ -23,6 +23,7 @@ from relax.utils.logging_utils import get_logger
 
 from . import target_shard
 from .expert_gather import OwnerExpert
+from .shard_snapshot import CudaShardBackup, CudaShardInputs, shard_layout
 
 
 logger = get_logger(__name__)
@@ -118,6 +119,12 @@ class ShardDeltaExporter:
         self.snapshot_budget_bytes = snapshot_budget_bytes
         self._acknowledged: dict[str, torch.Tensor] = {}
         self._pending: dict[str, torch.Tensor] | None = None
+        self._live_inputs: CudaShardInputs | None = None
+        self._backup: CudaShardBackup | None = None
+        self._live_read_done: torch.cuda.Event | None = None
+        self._ack_bank: torch.Tensor | None = None
+        self._spare_bank: torch.Tensor | None = None
+        self._supports_live_shards = False
         self._exported = False
         self._force_full = True
         self._attempt: object | None = None
@@ -146,7 +153,30 @@ class ShardDeltaExporter:
             HfWeightIteratorBase.create(args, model, model_name=model_name, quantization_config=quantization_config)
             for _ in range(2)
         ]
-        return cls(current, baseline, **kwargs)
+        exporter = cls(current, baseline, **kwargs)
+        exporter._supports_live_shards = (
+            getattr(args, "fully_async", False)
+            and not getattr(args, "hybrid", False)
+            and args.megatron_to_hf_mode == "bridge"
+        )
+        return exporter
+
+    @property
+    def sender_pipeline_active(self) -> bool:
+        return self._live_inputs is not None
+
+    def _can_read_live(self, shards: Mapping[str, torch.Tensor]) -> bool:
+        if not self._supports_live_shards or not shards:
+            return False
+        device = next(iter(shards.values())).device
+        return (
+            device.type == "cuda"
+            and device.index == torch.cuda.current_device()
+            and all(
+                value.device == device and value.layout == torch.strided and not value.is_quantized
+                for value in shards.values()
+            )
+        )
 
     @staticmethod
     def supports_recipients(engines: list, gpu_counts: list[int], *, group: dist.ProcessGroup) -> bool:
@@ -245,13 +275,36 @@ class ShardDeltaExporter:
             self._target_shards = status[1] is True and not seed
             constraints = set()
 
+            def drain_previous_frame() -> None:
+                # Called by every rank at the same point in the export. A TCP
+                # consumer error must reach the whole group before we admit
+                # another frame or publish the final version.
+                error = None
+                if rank == 0:
+                    try:
+                        constraints.update(self.transfer.drain_frame())
+                    except Exception as exc:
+                        error = exc
+                agree(error)
+
             error = None
             try:
                 if seed:
                     self.invalidate()
-                self.begin(weights_getter())
+                shards = weights_getter()
+                live = bool(getattr(self.config, "sender_pipeline", False)) and self._can_read_live(shards)
             except Exception as exc:
                 error = exc
+            if getattr(self.config, "sender_pipeline", False):
+                agree(error)
+                eligible = [None] * world
+                dist.all_gather_object(eligible, live, group=group)
+                live = all(eligible)
+            if error is None:
+                try:
+                    self.begin(shards, live_locked=live)
+                except Exception as exc:
+                    error = exc
             agree(error)
             error = None
             if rank == 0:
@@ -292,16 +345,23 @@ class ShardDeltaExporter:
                     except Exception as exc:
                         error = exc
                 agree(error)
+                if self.sender_pipeline_active:
+                    drain_previous_frame()
                 error = None
                 if rank == 0:
                     try:
-                        constraints.update(self.transfer.send(metadata, raw, defer_ordered=True))
+                        if self.sender_pipeline_active:
+                            constraints.update(self.transfer.submit_frame(metadata, raw))
+                        else:
+                            constraints.update(self.transfer.send(metadata, raw, defer_ordered=True))
                     except Exception as exc:
                         error = exc
                 agree(error)
                 if rank == 0:
                     del raw, metadata
                 del chunk
+            if self.sender_pipeline_active:
+                drain_previous_frame()
             source_peaks = [None] * world
             dist.all_gather_object(source_peaks, workspace_peak(), group=group)
             status = [None]
@@ -331,6 +391,11 @@ class ShardDeltaExporter:
             return status[0]
         except BaseException:
             self.failed = True
+            if rank == 0 and self.sender_pipeline_active and self.transfer is not None:
+                try:
+                    self.transfer.drain_frame()
+                except Exception:
+                    logger.exception("Pending TCP frame also failed during delta cleanup")
             self.abort()
             raise
 
@@ -359,16 +424,32 @@ class ShardDeltaExporter:
             raise RuntimeError(f"Delta disconnect failed: {error[0]}")
         self.invalidate()
 
-    def begin(self, local_shards: Mapping[str, torch.Tensor]) -> None:
+    def begin(self, local_shards: Mapping[str, torch.Tensor], *, live_locked: bool = False) -> None:
         if self._pending is not None:
             raise RuntimeError("A delta snapshot is already pending acknowledgement")
-        required = sum(t.numel() * t.element_size() for t in local_shards.values())
-        required += sum(t.numel() * t.element_size() for t in self._acknowledged.values())
-        if required > self.snapshot_budget_bytes:
-            raise ValueError("Acknowledged and pending local shard snapshots exceed their host budget")
-        # Blocking copies establish a stable target before a converter or the
-        # optimizer can reuse the source. No pending tensor aliases live state.
-        self._pending = {name: tensor.detach().to(device="cpu", copy=True) for name, tensor in local_shards.items()}
+        acknowledged_bytes = (
+            self._ack_bank.numel()
+            if self._ack_bank is not None
+            else sum(t.numel() * t.element_size() for t in self._acknowledged.values())
+        )
+        available = self.snapshot_budget_bytes - acknowledged_bytes
+        if live_locked:
+            # The synchronous Actor publication owns the model through commit/abort.
+            # Keep the converter's mutable temporaries separate from these inputs.
+            entries, size = shard_layout(local_shards.items())
+            if self._spare_bank is not None and self._spare_bank.numel() != size:
+                self._spare_bank = None
+            self._backup = CudaShardBackup(entries, size, self._spare_bank, available, self.config.bucket_bytes)
+            self._spare_bank = None
+            self._pending = self._backup.targets
+            self._live_inputs = CudaShardInputs(local_shards, next(iter(local_shards.values())).device)
+        else:
+            self._spare_bank = None
+            if sum(t.numel() * t.element_size() for t in local_shards.values()) > available:
+                raise ValueError("Acknowledged and pending local shard snapshots exceed their host budget")
+            self._pending = {
+                name: tensor.detach().to(device="cpu", copy=True) for name, tensor in local_shards.items()
+            }
         self._attempt = object()
         self._stream = None
         self._exported = False
@@ -404,42 +485,44 @@ class ShardDeltaExporter:
             raise RuntimeError("The delta export attempt is no longer active")
         full = full or self._force_full or not self._acknowledged
         payload_group = None
-        if self._target_shards and not full and metadata_group is not None:
+        owner_diff = self._target_shards or self._owner_local_diff or self.sender_pipeline_active
+        if owner_diff and not full and metadata_group is not None:
             error = None
+            selector = "_target_shard_group" if self._target_shards else "_owner_delta_group"
             try:
-                choose = getattr(self.current_iterator, "_target_shard_group", None)
+                choose = getattr(self.current_iterator, selector, None)
                 payload_group = choose(metadata_group) if choose else None
                 if (
                     payload_group is not None
-                    and self.baseline_iterator._target_shard_group(metadata_group) is not payload_group
+                    and getattr(self.baseline_iterator, selector)(metadata_group) is not payload_group
                 ):
                     payload_group = None
             except Exception as exc:
                 error = exc
+            # No rank enters the collective-bearing owner path alone, including
+            # when a local converter rejects the group or its layout.
             states = [None] * dist.get_world_size(metadata_group)
             dist.all_gather_object(
                 states, (payload_group is not None, str(error) if error else None), group=metadata_group
             )
             if any(message is not None for _, message in states):
-                raise RuntimeError(f"Target shard source eligibility failed: {states}") from error
+                raise RuntimeError(f"Owner delta source eligibility failed: {states}") from error
             if not all(ok for ok, _ in states):
                 payload_group = None
-        elif self._owner_local_diff and not full and metadata_group is not None:
-            select = getattr(self.current_iterator, "_owner_delta_group", None)
-            if select is not None:
-                payload_group = select(metadata_group)
-                if (
-                    payload_group is not None
-                    and self.baseline_iterator._owner_delta_group(metadata_group) is not payload_group
-                ):
-                    payload_group = None
+        current_shards = self._live_inputs if self.sender_pipeline_active else pending
+        previous = self._acknowledged
+        if self.sender_pipeline_active and not full:
+            # Two slots share at most half the exporter GPU budget; the caller's
+            # measured peak gate still covers conversion, encoding, and transport.
+            limit = min(self.config.bucket_bytes, self.config.gpu_budget_bytes // 4)
+            previous = CudaShardInputs(previous, self._live_inputs.device, limit)
         if payload_group is None:
-            current = iter(self.current_iterator.get_hf_weight_chunks(pending))
-            baseline = iter(()) if full else iter(self.baseline_iterator.get_hf_weight_chunks(self._acknowledged))
+            current = iter(self.current_iterator.get_hf_weight_chunks(current_shards))
+            baseline = iter(()) if full else iter(self.baseline_iterator.get_hf_weight_chunks(previous))
         else:
             options = {"target_shards": True} if self._target_shards else {}
-            current = iter(self.current_iterator._owner_delta_chunks(pending, metadata_group, **options))
-            baseline = iter(self.baseline_iterator._owner_delta_chunks(self._acknowledged, metadata_group, **options))
+            current = iter(self.current_iterator._owner_delta_chunks(current_shards, metadata_group, **options))
+            baseline = iter(self.baseline_iterator._owner_delta_chunks(previous, metadata_group, **options))
         try:
             while True:
                 # Check before advancing either collective-bearing iterator.
@@ -470,13 +553,25 @@ class ShardDeltaExporter:
                     )
             if self._attempt is not attempt:
                 raise RuntimeError("A retired export cannot complete a new pending snapshot")
-            self._exported = True
         finally:
             # In particular, restore converters' cross-yield process-group scopes.
-            for iterator in (current, baseline):
-                close = getattr(iterator, "close", None)
-                if close is not None:
-                    close()
+            try:
+                for iterator in (current, baseline):
+                    close = getattr(iterator, "close", None)
+                    if close is not None:
+                        close()
+            finally:
+                if self._live_inputs is not None:
+                    compute = torch.cuda.current_stream(self._live_inputs.device)
+                    if isinstance(previous, CudaShardInputs):
+                        previous.join_prefetch(compute)
+                    self._live_read_done = compute.record_event()
+        # This final iterator advance is inside synchronize()'s existing
+        # all-rank error agreement. A delayed copy failure must reach every
+        # rank before receiver acknowledgement and the local bank swaps.
+        if self._backup is not None:
+            self._finish_live_reads()
+        self._exported = True
 
     @staticmethod
     def _encode_chunk(
@@ -648,6 +743,11 @@ class ShardDeltaExporter:
         """Called once after the final common receiver completion gate."""
         if self._pending is None or not self._exported:
             raise RuntimeError("Cannot commit an incomplete or absent delta export")
+        if self._backup is not None:
+            self._spare_bank, self._ack_bank = self._ack_bank, self._backup.storage
+        else:
+            self._ack_bank = None
+        self._backup = self._live_inputs = None
         self._acknowledged = self._pending
         self._pending = None
         self._exported = False
@@ -660,14 +760,30 @@ class ShardDeltaExporter:
             self._sequence += 1
         self._seed_after_commit = False
 
+    def _finish_live_reads(self) -> None:
+        try:
+            self._backup.finish()
+        finally:
+            if self._live_read_done is not None:
+                self._live_read_done.synchronize()
+                self._live_read_done = None
+
     def abort(self) -> None:
         """Discard the failed target; keep the last acknowledged baseline."""
         self._attempt = None
-        if self._stream is not None:
-            self._stream.close()
-        self._stream = None
-        self._pending = None
-        self._exported = False
-        self._force_full = True
-        self._pending_version = None
-        self._seed_after_commit = False
+        try:
+            try:
+                if self._stream is not None:
+                    self._stream.close()
+            finally:
+                if self._backup is not None:
+                    self._finish_live_reads()
+                    self._spare_bank = self._backup.storage
+        finally:
+            self._backup = self._live_inputs = self._live_read_done = None
+            self._stream = None
+            self._pending = None
+            self._exported = False
+            self._force_full = True
+            self._pending_version = None
+            self._seed_after_commit = False

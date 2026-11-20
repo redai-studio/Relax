@@ -91,14 +91,15 @@ def identity_down_projection(name: str, raw: torch.Tensor, converted: Sequence[N
     """Accept only the exact canonical HF name and the same complete word
     sequence."""
     source = re.fullmatch(
-        r"(?:module\.|vp_stages\.0\.)*decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc2\.weight(\d+)", name
+        r"(?:module\.|vp_stages\.0\.)*(language_model\.)?decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc2\.weight(\d+)",
+        name,
     )
     if source is None or len(converted) != 1:
         return False
-    layer, expert = source.groups()
+    language, layer, expert = source.groups()
     target, out = converted[0]
     return (
-        target == f"model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+        target == f"model.{language or ''}layers.{layer}.mlp.experts.{expert}.down_proj.weight"
         and raw.dtype == out.dtype == torch.bfloat16
         and raw.ndim == out.ndim == 2
         and 0 < raw.numel() == out.numel() < 2**31

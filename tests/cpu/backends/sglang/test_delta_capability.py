@@ -245,3 +245,33 @@ def test_duplicate_name_for_same_parameter_follows_sg_named_parameter_deduplicat
     model.lm_head = model.model.embed_tokens
     assert full_loader_inputs(model) == frozenset()
     assert sparse_loader_identity(model) is not None
+
+
+def test_conditional_moe_sparse_scope_keeps_gated_attention_dense(monkeypatch):
+    import sys
+
+    from relax.backends.sglang.delta_capability import requires_full_input
+
+    class ConditionalMoe(torch.nn.Module):
+        def load_weights(self, weights):
+            raise AssertionError("Admission must not execute a loader")
+
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.models.qwen3_5", SimpleNamespace(Qwen3_5MoeForConditionalGeneration=ConditionalMoe)
+    )
+    model = ConditionalMoe()
+    model.config = SimpleNamespace(num_hidden_layers=40, num_experts=256)
+    for name in (
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+        "model.language_model.layers.39.mlp.experts.255.down_proj.weight",
+        "model.language_model.layers.39.mlp.experts.gate_up_proj",
+    ):
+        assert not requires_full_input(model, name)
+    for name in (
+        "model.layers.0.linear_attn.in_proj_a.weight",
+        "model.layers.0.mlp.shared_expert.gate_proj.weight",
+        "model.layers.0.mlp.experts.256.up_proj.weight",
+        "model.layers.40.mlp.experts.down_proj",
+        "model.visual.layers.0.mlp.experts.down_proj",
+    ):
+        assert requires_full_input(model, name)

@@ -9,6 +9,7 @@ Inherited reviewed loaders reuse the same capability without size/name flags.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import fields
 from typing import Any
@@ -163,6 +164,37 @@ def _trivial_expert_layout(metadata: Any) -> tuple | None:
     return id(metadata), metadata.logical_to_all_physical.__func__, ep_size, tuple(identity)
 
 
+_ROUTED_INPUT = re.compile(
+    r"model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(?:(\d+)\.(?:gate|up|down)_proj\.weight|(?:gate_up|down)_proj)"
+)
+_ROUTED_MODULE = re.compile(r"model\.layers\.\d+\.mlp\.experts")
+
+
+def _routed_only(model: Any) -> bool:
+    module = sys.modules.get("sglang.srt.models.qwen3_5")
+    cls = getattr(module, "Qwen3_5MoeForConditionalGeneration", None)
+    return type(model) is cls and getattr(model.load_weights, "__func__", None) is cls.load_weights
+
+
+def requires_full_input(model: Any, name: str) -> bool:
+    """Only routed expert inputs of the Qwen3.5 conditional loader are
+    reviewed.
+
+    Gated DeltaNet, vision, shared experts and fused attention retain their
+    ordinary dense inputs, including the original invocation and ordering.
+    """
+    if not _routed_only(model):
+        return False
+    match = _ROUTED_INPUT.fullmatch(name)
+    if match is None:
+        return True
+    layer, expert = match.groups()
+    return not (
+        int(layer) < model.config.num_hidden_layers and (expert is None or int(expert) < model.config.num_experts)
+    )
+
+
 def sparse_loader_identity(model: Any) -> tuple | None:
     loader = getattr(model, "load_weights", None)
     function = getattr(loader, "__func__", None)
@@ -180,10 +212,27 @@ def sparse_loader_identity(model: Any) -> tuple | None:
         cls = getattr(module, class_name, None)
         if cls is not None:
             known.append(cls.load_weights)
-    if function not in known or getattr(model, "quant_config", None) is not None:
+    routed_only = _routed_only(model)
+    if (function not in known and not routed_only) or getattr(model, "quant_config", None) is not None:
         return None
     aliased = full_loader_inputs(model)
-    if aliased - {"model.embed_tokens.weight", "lm_head.weight"}:
+    if routed_only:
+        # The conditional loader explicitly keeps duplicate parameter names.
+        # A separately loaded dense alias must never overwrite a sparse target.
+        tensors = (*model.named_parameters(remove_duplicate=False), *model.named_buffers(remove_duplicate=False))
+        seen = set()
+        repeated = set()
+        routed = set()
+        for name, tensor in tensors:
+            key = storage_identity(tensor)
+            if key in seen:
+                repeated.add(key)
+            seen.add(key)
+            if _ROUTED_MODULE.fullmatch(name.rpartition(".")[0]):
+                routed.add(key)
+        if repeated & routed:
+            return None
+    elif aliased - {"model.embed_tokens.weight", "lm_head.weight"}:
         # Unknown aliases may name fused destinations rather than HF inputs.
         # Only ordinary direct embedding/head inputs have a reviewed mapping.
         return None
@@ -207,9 +256,29 @@ def sparse_loader_identity(model: Any) -> tuple | None:
         return None  # AITER post-load shuffling is a different storage contract.
     methods = (UnquantizedEmbeddingMethod, UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
     identity = [function, getattr(getattr(model, "config", None), "tie_word_embeddings", None)]
+    if routed_only:
+        if (
+            model.enable_shared_expert_fusion
+            or model.config.encoder_only
+            or model.named_parameters.__func__ is not torch.nn.Module.named_parameters
+        ):
+            return None
+        identity.extend(
+            (
+                model.config.num_experts,
+                model.config.num_hidden_layers,
+                getattr(model, "start_layer", None),
+                getattr(model, "end_layer", None),
+            )
+        )
     expert_layout_checked = False
     metadata = None
     for name, module in model.named_modules():
+        if routed_only:
+            if _ROUTED_MODULE.fullmatch(name) is None:
+                continue
+            if type(module) is not FusedMoE:
+                return None
         if any(callable(value) and callable(getattr(type(module), key, None)) for key, value in vars(module).items()):
             return None  # An instance helper override changes the reviewed loader call graph.
         method = getattr(module, "quant_method", None)
@@ -273,6 +342,8 @@ def sparse_loader_identity(model: Any) -> tuple | None:
                 getattr(method, "load_up_proj_weight_first", False),
             )
         )
+    if routed_only and not expert_layout_checked:
+        return None
     allowed = {
         cls.weight_loader: cls
         for cls in (
@@ -286,6 +357,12 @@ def sparse_loader_identity(model: Any) -> tuple | None:
         )
     }
     for name, parameter in model.named_parameters(remove_duplicate=False):
+        if routed_only:
+            parent, _, leaf = name.rpartition(".")
+            if _ROUTED_MODULE.fullmatch(parent) is None:
+                continue
+            if leaf not in {"w13_weight", "w2_weight"}:
+                return None
         if type(parameter) is not torch.nn.Parameter or parameter.dtype not in (torch.bfloat16, torch.float32):
             return None
         if parameter.numel() == 1:
@@ -307,6 +384,8 @@ def sparse_loader_identity(model: Any) -> tuple | None:
         bound = getattr(parameter, "weight_loader", default_weight_loader)
         operation = getattr(bound, "__func__", bound)
         owner = getattr(bound, "__self__", None)
+        if routed_only and (operation is not FusedMoE.weight_loader or getattr(owner, leaf, None) is not parameter):
+            return None
         if operation is not default_weight_loader:
             expected = allowed.get(operation)
             if expected is None or (

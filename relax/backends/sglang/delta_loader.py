@@ -25,7 +25,7 @@ from torch.utils._pytree import tree_leaves
 from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, tensors, validate_directory
 from relax.utils.sparse_tensor import FullTensorRequired, SparseTensor, storage_identity
 
-from .delta_capability import full_loader_inputs, sparse_loader_identity
+from .delta_capability import full_loader_inputs, requires_full_input, sparse_loader_identity
 from .delta_shard_layout import ExpertTargets, ShardFrame, marked_ordinals, validate_transport_storage
 
 
@@ -417,6 +417,8 @@ class DeltaReceiver:
         for i, (entry, positions, _values) in enumerate(entries):
             if entry["name"] in self.active["schema"]:
                 raise ValueError("Duplicate HF input across delta frames")
+            if self.active["control"]["seed"] and requires_full_input(self.model, entry["name"]):
+                self.full_only.add(entry["name"])
             if self.active["control"]["seed"] and not entry["full"]:
                 raise ValueError("A FULL seed cannot contain omitted values")
             signature = (tuple(entry["shape"]), entry["dtype"])

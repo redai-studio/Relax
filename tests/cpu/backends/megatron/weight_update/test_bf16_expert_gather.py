@@ -138,6 +138,12 @@ def test_owner_down_projection_requires_exact_storage_and_canonical_coordinates(
     target = "model.layers.2.mlp.experts.7.down_proj.weight"
     check = module.identity_down_projection
     assert check(source, raw, [(target, raw.reshape(2, 8))])
+    multimodal_source = source.replace("decoder.", "language_model.decoder.")
+    multimodal_target = target.replace("model.layers.", "model.language_model.layers.")
+    assert check(multimodal_source, raw, [(multimodal_target, raw.reshape(2, 8))])
+    assert not check(multimodal_source, raw, [(target, raw)])
+    assert not check(source, raw, [(multimodal_target, raw)])
+    assert not check(multimodal_source, raw, [(multimodal_target, raw.clone())])
     for output in (raw.t(), raw.clone(), raw.exp(), raw[:, :-1], raw.reshape(-1), raw.float(), raw._neg_view()):
         assert not check(source, raw, [(target, output)])
     for name in (target.replace(".7.", ".1."), target.replace(".2.", ".3."), target.replace("down_", "up_")):

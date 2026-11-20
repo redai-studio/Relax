@@ -43,6 +43,7 @@ from .expert_gather import (
 from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .shard_snapshot import CudaShardInputs
 
 
 logger = get_logger(__name__)
@@ -469,11 +470,17 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         ):
             yield from chunk
 
+    def _shard_buckets(self, buckets, weights, rank):
+        if isinstance(weights, CudaShardInputs):
+            return weights.prefetch(buckets, self._vanilla_key_map, rank)
+        return buckets
+
     def _iter_bf16_expert_chunks(self, megatron_local_weights, *, metadata_group=None, target_shards=False):
         group = mpu.get_expert_model_parallel_group()
         rank = dist.get_rank(group=dist.group.WORLD)
         device = device_utils.make_current_torch_device()
-        for infos, gather in zip(self._bf16_expert_buckets, self._bf16_expert_gathers, strict=True):
+        buckets = self._shard_buckets(self._bf16_expert_buckets, megatron_local_weights, rank)
+        for infos, gather in zip(buckets, self._bf16_expert_gathers, strict=True):
             converted, sources = [], []
             error = None
             try:
@@ -538,7 +545,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             if include_experts
             else getattr(self, "_unrouted_expert_broadcast_caches", [])
         )
-        for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
+        for bucket_infos, phase_caches in zip(
+            self._shard_buckets(expert_buckets, megatron_local_weights, rank), caches, strict=True
+        ):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
                 bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
@@ -562,7 +571,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             del all_converted, results
 
         # --- Non-expert weights: original path ---
-        for bucket_infos in self._non_expert_buckets:
+        for bucket_infos in self._shard_buckets(self._non_expert_buckets, megatron_local_weights, rank):
             t_b0 = time.monotonic()
             params = _load_and_broadcast(
                 bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
@@ -880,7 +889,8 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
         if merge_fn is not None and rank == info.src_rank:
             param = merge_fn(info, param, megatron_local_weights, device)
         params.append(param)
-    device_module.synchronize()
+    if not isinstance(megatron_local_weights, CudaShardInputs):
+        device_module.synchronize()
     return params
 
 

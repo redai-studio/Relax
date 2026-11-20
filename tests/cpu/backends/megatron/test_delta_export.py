@@ -217,6 +217,14 @@ def _compare_owner_export(rank, world, rendezvous):
         if rank == 0:
             assert all(entry.full for entry in retry[0])
         candidate.commit()
+        # One rank declines the owner layout. Both must take the ordinary
+        # converter rather than entering incompatible collective sequences.
+        candidate.current_iterator._owner_delta_group = lambda _: group if rank == 0 else None
+        candidate.begin(updated)
+        unchanged = list(candidate.export(emit=rank == 0, _owner_group=group))
+        if rank == 0:
+            assert all(not item.full and item.values.numel() == 0 for item in unchanged[0])
+        candidate.commit()
     finally:
         dist.destroy_process_group()
 
@@ -298,3 +306,102 @@ def test_owner_target_lanes_reconstruct_every_original_word(tmp_path):
     mp.start_processes(
         _check_owner_target_lanes, args=(8, (tmp_path / "lane-owners").as_uri()), nprocs=8, start_method="fork"
     )
+
+
+def test_aligned_shard_bank_reuses_bytes_without_changing_payload_bits():
+    from relax.backends.megatron.weight_update.shard_snapshot import _view, shard_layout
+
+    shards = {
+        "byte": torch.tensor(231, dtype=torch.uint8),
+        "nan": torch.tensor([0x7FC00001, -2147483648], dtype=torch.int32).view(torch.float32),
+        "empty": torch.empty(0, dtype=torch.bfloat16),
+        "integer": torch.tensor(2**60, dtype=torch.int64),
+    }
+    entries, size = shard_layout(shards.items())
+    assert size == 24
+    bank = torch.zeros(size, dtype=torch.uint8)
+    for name, value, offset, length in entries:
+        target = _view(bank, value, offset, length)
+        assert target.shape == value.shape
+        target.copy_(value)
+        assert torch.equal(bank[offset : offset + length], shards[name].reshape(-1).view(torch.uint8))
+
+
+def test_pipeline_inputs_isolate_inplace_converter_and_preserve_unlocked_snapshot():
+    from relax.backends.megatron.weight_update.shard_snapshot import CudaShardInputs
+
+    original = torch.tensor([1, 5, 13])
+    mapping = CudaShardInputs({"w": original}, original.device)
+    mapping["w"].zero_()
+    assert original.tolist() == [1, 5, 13]
+    s = exporter()
+    s._supports_live_shards = True
+    assert not s._can_read_live({"w": original})
+    assert not s.sender_pipeline_active
+
+
+def test_live_publication_reads_source_until_ack_and_preserves_last_bank_on_abort(monkeypatch):
+    from types import SimpleNamespace
+
+    from relax.backends.megatron.weight_update import delta_export
+    from relax.backends.megatron.weight_update.shard_snapshot import _view
+
+    class DelayedCopy:
+        def __init__(self, entries, size, spare, budget, _bucket):
+            assert size <= budget
+            self.storage = spare if spare is not None else torch.empty(size, dtype=torch.uint8)
+            self.targets = {n: _view(self.storage, t, offset, length) for n, t, offset, length in entries}
+            self.inputs = {n: t.clone() for n, t, _, _ in entries}
+            self.storage.zero_()
+
+        def finish(self):
+            for n, copy in self.inputs.items():
+                self.targets[n].copy_(copy)
+
+    # Deterministic copy completion at the owner's final gate; physical
+    # cross-stream behavior is exercised separately in the single-GPU test.
+    monkeypatch.setattr(delta_export, "CudaShardBackup", DelayedCopy)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(record_event=lambda: SimpleNamespace(synchronize=lambda: None)),
+    )
+    s = exporter()
+    s.config = SimpleNamespace(bucket_bytes=256, gpu_budget_bytes=4096)
+    live = {"weight": torch.arange(12.0).view(3, 4), "derived": torch.ones(2)}
+    s.begin(live, live_locked=True)
+    assert s.sender_pipeline_active
+    assert s._pending["weight"].count_nonzero() == 0
+    seed = [item for chunk in s.export() for item in chunk]
+    assert torch.equal(seed[0].values, live["weight"].T.contiguous().flatten())
+    s.commit()
+    prior = s._ack_bank
+    saved = s._acknowledged["weight"].clone()
+    live["weight"][0, 0] = 30
+    s.begin(live, live_locked=True)
+    attempt = s._backup.storage
+    stream = s.export()
+    assert next(stream)[0].positions.tolist() == [0]
+    s.abort()
+    assert not s.sender_pipeline_active and s._ack_bank is prior
+    assert torch.equal(s._acknowledged["weight"], saved)
+    s.begin(live, live_locked=True)
+    assert s._backup.storage is attempt
+    assert all(item.full for chunk in s.export() for item in chunk)
+    s.commit()
+    assert s._ack_bank is attempt and s._spare_bank is prior
+    assert torch.equal(s._acknowledged["weight"], live["weight"])
+
+    s.begin(live, live_locked=True)
+
+    def copy_failure():
+        raise RuntimeError("delayed copy error")
+
+    monkeypatch.setattr(s._backup, "finish", copy_failure)
+    with pytest.raises(RuntimeError, match="delayed copy error"):
+        list(s.export())
+    with pytest.raises(RuntimeError, match="incomplete"):
+        s.commit()
+    with pytest.raises(RuntimeError, match="delayed copy error"):
+        s.abort()
+    assert s._ack_bank is attempt and not s.sender_pipeline_active and s._pending is None

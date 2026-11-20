@@ -546,3 +546,59 @@ def test_ordered_target_consume_fences_each_frame_and_byte(fault, monkeypatch):
             torch.equal(p.view(torch.uint8), q.view(torch.uint8))
             for p, q in zip(model.parameters(), ref.parameters(), strict=True)
         )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_conditional_moe_ordinary_sparse_loader_keeps_raw_tp_words(monkeypatch, fused):
+    module = pytest.importorskip("sglang.srt.models.qwen3_5")
+    Qwen3_5MoeForConditionalGeneration = module.Qwen3_5MoeForConditionalGeneration
+
+    def conditional():
+        template, experts = model_at(1)
+        model = Qwen3_5MoeForConditionalGeneration.__new__(Qwen3_5MoeForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.model, model.config = template.model, template.config
+        model.model.start_layer, model.model.end_layer = 0, 1
+        model.config.encoder_only = model.config.tie_word_embeddings = False
+        model.enable_shared_expert_fusion = False
+        return model, experts
+
+    model, actual = conditional()
+    reference, expected = conditional()
+    fixture_admission(monkeypatch)
+    prefix = "model.language_model.layers.0.mlp.experts."
+    if fused:
+        shapes = {prefix + "gate_up_proj": (3, 16, 4), prefix + "down_proj": (3, 4, 8)}
+    else:
+        shapes = {
+            prefix + "1.gate_proj.weight": (8, 4),
+            prefix + "1.up_proj.weight": (8, 4),
+            prefix + "1.down_proj.weight": (4, 8),
+        }
+
+    words = {name: torch.arange(torch.Size(shape).numel(), dtype=torch.int16) for name, shape in shapes.items()}
+    for seed in (True, False):
+        version = 1 if seed else 2
+        begin(model, 1, version, seed, requested=False)
+        entries = []
+        dense = []
+        for name, shape in shapes.items():
+            flat = words[name]
+            indices = torch.arange(0, flat.numel(), 2, dtype=torch.int32)
+            if not seed:
+                flat[indices.long()] = -32768
+                flat[indices[::2].long()] = 32705
+            values = flat.view(torch.bfloat16)
+            entries.append(
+                (name, shape, values.dtype, None if seed else indices, values if seed else values[indices.long()])
+            )
+            dense.append((name, values.view(shape)))
+        metadata, raw = encode(entries, max_bytes=1 << 20)
+        assert not apply_frame(model, version, metadata, raw).any()
+        finish(model, version, requested=False)
+        reference.load_weights(dense)
+        for weight, oracle in ((actual.w13_weight, expected.w13_weight), (actual.w2_weight, expected.w2_weight)):
+            assert torch.equal(weight.view(torch.int16), oracle.view(torch.int16))
+        if not seed:
+            assert (actual.w13_weight.view(torch.int16) < 0).any()
+            assert (actual.w2_weight.view(torch.int16) < 0).any()

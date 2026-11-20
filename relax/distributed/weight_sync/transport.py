@@ -14,6 +14,7 @@ import struct
 import sys
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import groupby
 from time import monotonic
 from typing import Any
@@ -37,6 +38,10 @@ class DeltaTransfer:
         self.frame = 0
         self.version: str | None = None
         self.metrics: dict = {}
+        self._sender: ThreadPoolExecutor | None = None
+        self._pending_frame: Future[set[str]] | None = None
+        self._copy_stream: Any = None
+        self._host_slab: Any = None
         self._active_raw: Any = None
         self._staged: list[tuple[int, dict | list]] = []
         self._staged_bytes = [0] * 4
@@ -149,6 +154,7 @@ class DeltaTransfer:
         return True
 
     def begin(self, *, version: str, base: str | None, seed: bool) -> None:
+        self._require_drained()
         if self._staged or self._active_raw is not None:
             raise RuntimeError("Cannot begin with unresolved receiver storage")
         self.frame, self.version = 0, version
@@ -185,6 +191,7 @@ class DeltaTransfer:
         window."""
         import ray
 
+        self._require_drained()
         if self._control is None or self._applying:
             raise RuntimeError("A publication may enter its apply window only once")
         replies = ray.get(
@@ -227,6 +234,7 @@ class DeltaTransfer:
         ]
 
     def can_stage(self, metadata: dict | list, raw: Any) -> bool:
+        self._require_drained()
         return self._fits(metadata, self._staged_after(raw), self._retained_directory_size(metadata))
 
     def _fits(self, metadata: dict | list, charged: list[int], retained: int) -> bool:
@@ -432,9 +440,81 @@ class DeltaTransfer:
             required.update(self.apply())
         return required
 
+    def _require_drained(self) -> None:
+        if self._pending_frame is not None:
+            raise RuntimeError("Drain the pending delta frame before accessing receiver state")
+
+    def drain_frame(self) -> set[str]:
+        """Wait for the previous submission, including its requested consume
+        ACKs."""
+        if self._pending_frame is None:
+            return set()
+        # Leave a failed future in place. It may represent a partially installed
+        # frame and must never permit replay, a new publication or final ACK.
+        try:
+            required = self._pending_frame.result()
+        except BaseException:
+            if self._sender is not None:
+                self._sender.shutdown(wait=True)
+                self._sender = None
+            raise
+        self._pending_frame = None
+        return required
+
+    def submit_frame(self, metadata: dict | list, raw: Any) -> set[str]:
+        """Transfer ownership of a sealed frame until drain_frame().
+
+        Only pure TCP can run independently of the source ranks' collectives.
+        The owner may export the next bucket before draining this submission.
+        """
+        import torch
+
+        self._require_drained()
+        if not self._applying:
+            raise RuntimeError("Delta submission disagrees with the owner's apply window")
+        if self.tcp is None or self.group is not None:
+            return self.send(metadata, raw, defer_ordered=True)
+        if (
+            isinstance(metadata, list)
+            or not isinstance(raw, torch.Tensor)
+            or raw.dtype != torch.uint8
+            or raw.ndim != 1
+            or not raw.is_contiguous()
+            or raw.numel() > self.config.staging_budget_bytes
+        ):
+            raise ValueError("TCP submission requires an admitted contiguous byte frame")
+
+        done = None
+        if raw.is_cuda and raw.numel():
+            if self._host_slab is None:
+                self._host_slab = torch.empty(self.config.staging_budget_bytes, dtype=torch.uint8, pin_memory=True)
+                self._copy_stream = torch.cuda.Stream(device=raw.device)
+            host = self._host_slab[: raw.numel()]
+            self._copy_stream.wait_stream(torch.cuda.current_stream(raw.device))
+            with torch.cuda.stream(self._copy_stream):
+                host.copy_(raw, non_blocking=True)
+                raw.record_stream(self._copy_stream)
+                done = self._copy_stream.record_event()
+        else:
+            host = raw.to(device="cpu", copy=True)
+
+        self.metrics["sender_pinned_bytes"] = self._host_slab.numel() if self._host_slab is not None else 0
+
+        def deliver() -> set[str]:
+            if done is not None:
+                done.synchronize()
+            self.stage(metadata, host)
+            return self.apply()
+
+        if self._sender is None:
+            self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="delta-tcp-send")
+        self._pending_frame = self._sender.submit(deliver)
+        return set()
+
     def finalize(self) -> dict:
         import ray
 
+        self._require_drained()
         if not self._applying or self._staged:
             raise RuntimeError("Cannot finalize before staged payload consumption")
         replies = ray.get(
@@ -462,8 +542,16 @@ class DeltaTransfer:
     def close(self) -> None:
         import ray
 
+        # A caller that already observed a failed consume may still retire
+        # the connection. A live worker or unresolved read keeps its owner.
+        if self._sender is not None:
+            self._require_drained()
         if self._active_raw is not None:
             raise RuntimeError("Cannot retire unresolved source transport storage")
+        if self._sender is not None:
+            self._sender.shutdown(wait=True)
+            self._sender = None
+        self._host_slab = self._copy_stream = None
         closes = [
             engine.delta_weight_sync.remote("close", timeout=self.config.sync_timeout_s) for engine in self.engines
         ]
@@ -475,4 +563,5 @@ class DeltaTransfer:
             self.tcp = None
         if closes:
             ray.get(closes, timeout=self.config.sync_timeout_s)
+        self._pending_frame = None
         self.engines, self.signature, self.connection = (), (), None

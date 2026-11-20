@@ -24,6 +24,7 @@ class DeltaSyncConfig:
     anchor_interval: int = 20
     full_only: bool = False
     transport: str = "tcp"
+    sender_pipeline: bool = False
     target_shard_delta: bool = False
 
     @classmethod
@@ -58,6 +59,7 @@ class DeltaSyncConfig:
                 raise ValueError(f"Delta setting {name} must be a positive integer")
         if (
             type(config.full_only) is not bool
+            or type(config.sender_pipeline) is not bool
             or type(config.target_shard_delta) is not bool
             or config.transport not in ("tcp", "nccl")
         ):

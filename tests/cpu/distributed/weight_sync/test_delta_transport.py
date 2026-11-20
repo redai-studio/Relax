@@ -57,6 +57,72 @@ def test_wire_retains_mixed_dtype_full_values_and_rejects_overlapping_ranges():
         validate_directory(metadata, max_bytes=1024)
 
 
+@pytest.mark.parametrize("fail_consume", [False, True])
+def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch, fail_consume):
+    from threading import Event
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+
+    receiving, release = Event(), Event()
+    delivered, actions = [], []
+
+    def remote(action, **kw):
+        actions.append(action)
+        if action == "receive":
+            receiving.set()
+            assert release.wait(5)
+            delivered.append(receive(kw["descriptor"], "1", timeout_s=3, max_bytes=16))
+        elif action == "consume":
+            if fail_consume:
+                raise RuntimeError("receiver failed to install frame")
+            return {"full_required": [f"name{kw['round_id']}"]}
+        elif action == "finalize":
+            return {"success": True}
+
+    monkeypatch.setattr(ray, "get", lambda refs, **kw: refs)
+    transfer = DeltaTransfer(DeltaSyncConfig(stream="test", staging_budget_bytes=16), "cpu")
+    transfer.engines = (SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=remote)),)
+    transfer.ranks, transfer.tcp_members = [[1]], {"1"}
+    transfer.routes, transfer.connection = [], {"world_size": 1}
+    transfer.tcp = TcpFrameSource("127.0.0.1", timeout_s=3, host_budget_bytes=16)
+    try:
+        transfer.begin(version="2", base="1", seed=False)
+        metadata, raw = encode([("w", (2,), torch.float32, None, torch.ones(2))], max_bytes=16)
+        first = raw.numpy().tobytes()
+        assert not transfer.submit_frame(metadata, raw)
+        assert receiving.wait(3)
+        # Produce the next frame on the main thread while the socket is pending.
+        raw.zero_()
+        with pytest.raises(RuntimeError, match="Drain"):
+            transfer.submit_frame(metadata, raw)
+        with pytest.raises(RuntimeError, match="Drain"):
+            transfer.finalize()
+        release.set()
+        if fail_consume:
+            with pytest.raises(RuntimeError, match="failed to install"):
+                transfer.drain_frame()
+            with pytest.raises(RuntimeError, match="Drain"):
+                transfer.finalize()
+            assert actions == ["begin", "receive", "ready", "consume"]
+        else:
+            assert transfer.drain_frame() == {"name0"}
+            assert not transfer.submit_frame(metadata, raw)
+            assert transfer.drain_frame() == {"name1"}
+            assert transfer.finalize()["frames"] == 2
+            assert actions == ["begin", "receive", "ready", "consume", "receive", "ready", "consume", "finalize"]
+            assert delivered == [first, bytes(8)]
+        transfer.close()
+        assert actions[-1] == "close"
+    finally:
+        release.set()
+        if transfer.tcp is not None:
+            transfer.tcp.close()
+
+
 def test_empty_staged_groups_still_consume_directory_admission():
     from relax.distributed.weight_sync.config import DeltaSyncConfig
     from relax.distributed.weight_sync.transport import DeltaTransfer
