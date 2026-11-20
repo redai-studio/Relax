@@ -43,7 +43,6 @@ def _declare_router_precision(model: Module) -> None:
 @dataclass
 class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
     msa_config: dict[str, Any] = field(default_factory=dict)
-    relax_minimax_external_sft_loss: bool = field(default=True, init=False)
 
     def configure_runtime(self, args: Namespace) -> None:
         if args.loss_type != "sft":

@@ -1045,8 +1045,6 @@ def forward_only(
         else:
             forward_attention_mask = None
             forward_loss_mask = batch["full_loss_masks"]
-        if getattr(get_model_config(model), "relax_minimax_external_sft_loss", False):
-            forward_loss_mask = None
 
         # Dynamic CP: the VL bridge (Qwen3VLModel.forward) reads pg_collection.cp
         # directly, so point it at this mb's dynamic CP sub-group for the forward and
@@ -1465,11 +1463,6 @@ def train_one_step(
             if needs_unsplit and "vlm_packed_seq_params" in batch:
                 forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
                 forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
-                forward_kwargs["loss_mask"] = None
-
-            if getattr(get_model_config(model), "relax_minimax_external_sft_loss", False):
-                # MiniMax Bridge returns a (tensor, mask) pair with an input mask.
-                # CP=1 SFT uses the unchanged batch mask in the loss callback.
                 forward_kwargs["loss_mask"] = None
 
             # VL model with text-only batch has is_vl_model=True but no
