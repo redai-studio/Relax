@@ -106,7 +106,13 @@ def test_actor_early_stop_is_not_success_or_health_failure(health):
 def controller_fixture():
     from relax.utils.fault_events.recovery import GlobalStartup
 
-    ns = dict(logger=logging.getLogger(__name__), run=asyncio.run, asyncio=asyncio, Optional=Optional)
+    ns = dict(
+        logger=logging.getLogger(__name__),
+        run=asyncio.run,
+        asyncio=asyncio,
+        Optional=Optional,
+        ROLES=SimpleNamespace(rollout="rollout"),
+    )
     ns["GlobalStartup"] = GlobalStartup
     cls = load_methods(
         "relax/core/controller.py", "Controller", {"restart_serve", "training_loop", "_consume_restart_cycle"}, ns

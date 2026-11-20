@@ -40,7 +40,7 @@ ROLLOUT_ARGS=(
     --input-key prompt
     --metadata-key extra_info
     --use-agentic-rollout
-    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-command "bash ${SCRIPT_DIR}/run_agent_app.sh"
     --agent-cwd "${SCRIPT_DIR}"
     --agent-env
         "SEARCH_R1_MODE=${SEARCH_R1_MODE}"

@@ -658,10 +658,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 # Slice on CPU before moving to device: only this expert's slice is used.
                 linear_in = linear_in[local_idx]
                 linear_out = linear_out[local_idx]
-            tp_size = mpu.get_expert_tensor_parallel_world_size()
             tp_group = mpu.get_expert_tensor_parallel_group()
         else:
-            tp_size = mpu.get_tensor_model_parallel_world_size()
             tp_group = mpu.get_tensor_model_parallel_group()
 
         linear_in = linear_in.to(device=device).float()
@@ -672,7 +670,11 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         # Bridge 0.6 derives the TP size from the process group. Older builds
         # require both arguments; keep the adapter's actual TP group in either API.
         if "tp_size" in inspect.signature(merge).parameters:
-            merge_options["tp_size"] = tp_size
+            merge_options["tp_size"] = (
+                mpu.get_expert_tensor_parallel_world_size()
+                if ".experts." in info.name
+                else mpu.get_tensor_model_parallel_world_size()
+            )
         merged = merge(
             param.data.float(),
             linear_out,

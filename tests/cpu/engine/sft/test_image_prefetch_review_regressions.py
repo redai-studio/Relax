@@ -40,7 +40,7 @@ def test_worker_capability_controls_hf_reference_transport(processor, supported)
     worker = load_definition(
         "relax/utils/data/processor_pool.py",
         "process_sample_from_paths_in_worker",
-        _load_media_for_worker=lambda paths: paths,
+        _load_media_for_worker=lambda paths, *, use_audio_in_video=False: paths,
         prepare_mm_inputs_for_ipc=lambda media: media,
         process_sample_in_worker=lambda *args: ([1], {"pixel_values": pixels, "image_grid_thw": grid}),
         get_worker_processor=lambda: processor,

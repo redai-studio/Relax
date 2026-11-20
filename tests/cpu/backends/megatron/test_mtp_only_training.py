@@ -131,7 +131,12 @@ def test_mtp_only_trainable_validation_allows_pp_rank_without_local_mtp(monkeypa
     ],
 )
 def test_mtp_only_or_chunked_sft_bypasses_main_output_layer(mtp_only, loss_type, sft_chunked, expected):
-    args = Namespace(mtp_only_training=mtp_only, loss_type=loss_type, sft_chunked_logits=sft_chunked)
+    args = Namespace(
+        mtp_only_training=mtp_only,
+        loss_type=loss_type,
+        task_type="causal_lm",
+        sft_chunked_logits=sft_chunked,
+    )
 
     assert should_bypass_main_output_layer(args) is expected
 

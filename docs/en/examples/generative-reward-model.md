@@ -601,6 +601,29 @@ Every instance in `--genrm-instances` must state its own `num_gpus` explicitly â
 
 The reward function (or direct HTTP caller) passed a `route_key` that doesn't match any key in `--genrm-instances`. Check for a typo, or confirm the service was actually started with `--genrm-instances` rather than the legacy `--genrm-model-path` (which only exposes the `"__default__"` key â€” passing any other `route_key` against a single-instance deployment fails the same way).
 
+## Partial Judge rollout
+
+With the default SGLang rollout, `--partial-rollout` can also carry unfinished local GenRM requests across steps. Keep your GenRM deployment settings and `--custom-rm-path`, and opt in by adding an explicit `genrm_generate=None` parameter to an async, per-sample reward:
+
+```python
+from relax.utils.genrm_client import get_genrm_client
+
+
+async def reward(args, sample, *, genrm_generate=None):
+    generate = genrm_generate or get_genrm_client().generate
+    messages = build_judge_messages(sample)  # Your existing business prompt.
+    text = await generate(messages)
+    return parse_judgement(text)  # Your existing score parser.
+```
+
+The callback accepts `messages`, optional `sampling_params`, and optional `route_key`, like `GenRMClient.generate`. At the rollout cutoff, active Judge requests are aborted together with policy requests. Generated Judge token IDs and text are saved on the sample. On the next step, the policy response is reused and the Judge continues from its prefix with the remaining token budget. Successfully scored samples discard this checkpoint.
+
+For stopping, use EOS or `stop_token_ids`. Non-empty `stop` and `stop_regex` request parameters are rejected before dispatch: this minimal integration does not carry string/regex stop-matching state across requests. Evaluation and non-partial rollout keep the normal client's sampling behavior.
+
+Reward execution can be replayed: await Judge calls sequentially and keep their order, routes, messages and sampling parameters identical on resume. Completed calls are cached separately; unfinished calls resume. Business prompts and score parsing remain in your reward function. Evaluation and non-partial rollout use the `None` fallback and run the regular GenRM client to completion.
+
+This opt-in supports inline per-sample async custom rewards with managed local GenRM instances. Group rewards, custom generation functions, deferred post-process rewards, and rewards marked `supports_async_eval` are rejected. Existing rewards without the explicit parameter keep their current behavior. The existing abort-count protection and off-policy masking also remain: protected groups finish naturally, and a Judge-only resumed response can have an entirely masked policy loss. GPU throughput and precision should be validated for your workload.
+
 ## File Structure
 
 ```

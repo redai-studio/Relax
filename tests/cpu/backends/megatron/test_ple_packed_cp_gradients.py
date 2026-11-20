@@ -9,41 +9,23 @@ reductions. This tests gradient ownership, not a distributed transport
 implementation.
 """
 
-import ast
-import math
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 
-PATCH = Path(__file__).resolve().parents[4] / "docker/patch/megatron/20261016-qwen38-models.patch"
+def _load_ple(parallel_state, monkeypatch):
+    from megatron.core.transformer import per_layer_embedding
 
-
-def _added_source(relative: str) -> str:
-    text = PATCH.read_text()
-    section = text.split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
-    return "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++"))
-
-
-def _load_ple(parallel_state):
-    namespace = {"torch": torch, "Tensor": torch.Tensor, "F": F, "math": math, "parallel_state": parallel_state}
-    hyper = ast.parse(_added_source("megatron/core/transformer/hyper_connection.py"))
-    norm = next(
-        node
-        for node in hyper.body
-        if isinstance(node, ast.FunctionDef) and node.name == "gated_residual_group_rmsnorm"
+    monkeypatch.setattr(per_layer_embedding, "parallel_state", parallel_state)
+    methods = ("forward", "_local_positions", "_causal_dilated_conv")
+    return type(
+        "CpuPLE",
+        (torch.nn.Module,),
+        {name: getattr(per_layer_embedding.PerLayerEmbedding, name) for name in methods},
     )
-    exec(compile(ast.Module(body=[norm], type_ignores=[]), str(PATCH), "exec"), namespace)
-    source = ast.parse(_added_source("megatron/core/transformer/per_layer_embedding.py"))
-    cls = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "PerLayerEmbedding")
-    names = {"forward", "_local_positions", "_causal_dilated_conv"}
-    methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    exec(compile(ast.Module(body=methods, type_ignores=[]), str(PATCH), "exec"), namespace)
-    return type("PatchedPLE", (torch.nn.Module,), {name: namespace[name] for name in names})
 
 
 class _GatheringScatter(torch.autograd.Function):
@@ -68,7 +50,7 @@ class _GatheringScatter(torch.autograd.Function):
 def test_packed_cp_sp_preserves_input_and_parameter_gradients(monkeypatch, tp_size, frozen):
     state = SimpleNamespace(cp_size=1, cp_rank=0, tp_rank=0)
     parallel_state = SimpleNamespace(get_context_parallel_world_size=lambda: state.cp_size)
-    ple_class = _load_ple(parallel_state)
+    ple_class = _load_ple(parallel_state, monkeypatch)
 
     # Two packed documents, each split into 2*CP pieces in zigzag order.
     documents = (8, 24)

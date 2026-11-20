@@ -13,14 +13,20 @@ random subset of ``--prompt-data``). Argparse guarantees one of them is set when
 ``--sft-predict-interval`` is set.
 """
 
+import asyncio
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from relax.engine.sft.dataset.sample import CanonicalSample
 from relax.engine.sft.runtime import resolve_sft_split_indices
 from relax.utils.logging_utils import get_logger
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.training.eval_config import build_named_prompt_data_configs
+
+
+if TYPE_CHECKING:
+    from relax.utils.types import Sample
 
 
 logger = get_logger(__name__)
@@ -79,7 +85,7 @@ def split_prompt_and_reference(sample: CanonicalSample) -> tuple[list[dict], str
     return prompt_messages, reference
 
 
-def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
+def render_eval_prompts(config, *, samples: list["Sample"] | None = None) -> list[tuple[str, str, dict | None]]:
     """Build the eval dataset and render each sample to ``(prompt, reference,
     multimodal_inputs)``.
 
@@ -174,7 +180,22 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
         except Exception:
             logger.exception(f"render_eval_prompts: chat_template failed for idx={idx}; skipping.")
             continue
-        out.append((prompt, reference, _build_multimodal_inputs(sample)))
+        multimodal_inputs = _build_multimodal_inputs(sample)
+        out.append((prompt, reference, multimodal_inputs))
+        if samples is not None:
+            from relax.utils.types import Sample
+
+            samples.append(
+                Sample(
+                    index=len(samples),
+                    group_index=len(samples),
+                    prompt=prompt,
+                    label=reference,
+                    tokens=tokenizer.encode(prompt, add_special_tokens=False),
+                    multimodal_inputs=multimodal_inputs,
+                    metadata=dict(sample.metadata),
+                )
+            )
 
     dataset.stop()
     return out
@@ -184,6 +205,8 @@ async def generate_and_write_predictions(
     rollout_manager,
     prompts_and_refs: list[tuple[str, str, dict | None]],
     out_path: Path,
+    *,
+    samples: list["Sample"] | None = None,
 ) -> None:
     """Generate all completions concurrently and write a JSONL of ``{prompt,
     reference, completion}`` rows to ``out_path``.
@@ -194,8 +217,13 @@ async def generate_and_write_predictions(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompts = [p for p, _, _ in prompts_and_refs]
     mm_inputs_list = [m for _, _, m in prompts_and_refs]
-    completions = await rollout_manager.generate_predict(prompts, mm_inputs_list)
+    if samples is None:
+        completions = await rollout_manager.generate_predict(prompts, mm_inputs_list)
+    else:
+        completions = await rollout_manager.generate_predict(prompts, mm_inputs_list, samples=samples)
     if len(completions) != len(prompts):
+        if samples is not None:
+            raise ValueError("SFT reward evaluation requires one completion per prompt")
         logger.warning(
             f"generate_predict returned {len(completions)} completions for {len(prompts)} prompts; "
             "padding/truncating to align."
@@ -215,6 +243,51 @@ async def generate_and_write_predictions(
     out_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
+async def score_predictions(rollout_manager: Any, config: Any, train_step: int, samples: list["Sample"]) -> None:
+    """Reuse the eval reward executor, background queue and result
+    reporting."""
+    from relax.engine.rewards import async_rm, batched_async_rm
+    from relax.engine.rewards.async_eval import collect_eval_rewards
+    from relax.engine.rollout.base_types import RolloutFnEvalOutput
+    from relax.utils.types import Sample
+
+    async def score_sample(sample: Sample) -> None:
+        if getattr(config, "group_rm", False):
+            rewards = await batched_async_rm(config, [sample], evaluation=True)
+            if len(rewards) != 1:
+                raise ValueError("SFT group reward must return one reward for its single-response prompt group")
+            sample.reward = rewards[0]
+        else:
+            sample.reward = await async_rm(config, sample, evaluation=True)
+
+    with collect_eval_rewards(config) as pending:
+        tasks = [asyncio.create_task(score_sample(sample)) for sample in samples]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    reward_key = getattr(config, "eval_reward_key", None) or getattr(config, "reward_key", None)
+    result = RolloutFnEvalOutput(
+        data={
+            "sft_predict": {
+                "samples": samples,
+                "rewards": [
+                    sample.reward[reward_key] if reward_key and sample.reward is not None else sample.reward
+                    for sample in samples
+                ],
+                "num_prompts": len(samples),
+                "num_valid_prompts": len(samples),
+                "group_size": 1,
+                "truncated": [sample.status == Sample.Status.TRUNCATED for sample in samples],
+            }
+        }
+    )
+    await rollout_manager.submit_eval_result(train_step, result, pending.calls if pending is not None else [])
+
+
 async def run_predict_loop(rollout_manager, config, train_step: int) -> None:
     """Render eval prompts, batch-generate, write
     ``<config.save>/predict/predictions_step_<train_step>.jsonl``.
@@ -226,11 +299,22 @@ async def run_predict_loop(rollout_manager, config, train_step: int) -> None:
     assert getattr(config, "save", None), "run_predict_loop requires config.save"
     out_path = Path(config.save) / "predict" / f"predictions_step_{train_step}.jsonl"
 
-    prompts_and_refs = render_eval_prompts(config)
+    scoring = bool(getattr(config, "custom_rm_path", None) or getattr(config, "rm_type", None))
+    samples = [] if scoring else None
+    if scoring:
+        if getattr(config, "n_samples_per_eval_prompt", 1) != 1:
+            raise ValueError("SFT predict reward evaluation supports --n-samples-per-eval-prompt 1")
+        prompts_and_refs = render_eval_prompts(config, samples=samples)
+    else:
+        prompts_and_refs = render_eval_prompts(config)
     if not prompts_and_refs:
         logger.warning(f"SFT predict @ step {train_step}: 0 prompts after rendering; skipping.")
         return
 
     logger.info(f"SFT predict @ step {train_step}: generating {len(prompts_and_refs)} completions → {out_path}")
-    await generate_and_write_predictions(rollout_manager, prompts_and_refs, out_path)
+    if scoring:
+        await generate_and_write_predictions(rollout_manager, prompts_and_refs, out_path, samples=samples)
+        await score_predictions(rollout_manager, config, train_step, samples)
+    else:
+        await generate_and_write_predictions(rollout_manager, prompts_and_refs, out_path)
     logger.info(f"SFT predict @ step {train_step}: wrote {len(prompts_and_refs)} lines to {out_path}")

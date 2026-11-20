@@ -354,6 +354,7 @@ def test_router_cleanup_retains_failed_process_for_retry(rollout_module):
 def test_rollout_owner_releases_tq_and_router_on_disposal(monkeypatch, rollout_module, failure):
     cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
     manager = object.__new__(cls)
+    manager._eval_judge = None
     manager._stop_eviction_monitor = Mock()
     manager._health_monitors = [Mock()]
     manager.data_system_client = Mock()
@@ -526,6 +527,7 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
 def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_module):
     cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
     manager = object.__new__(cls)
+    manager._eval_judge = None
     events = []
 
     def stop(name, timeout):

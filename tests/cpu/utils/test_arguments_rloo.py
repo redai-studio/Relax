@@ -21,7 +21,7 @@ arguments_module = _arguments_module_fixture
 
 
 def _rloo_args(**overrides) -> SimpleNamespace:
-    """Return a complete ``slime_validate_args`` input with valid RLOO
+    """Return a complete ``relax_validate_args`` input with valid RLOO
     defaults."""
     args = _opd_args()
     defaults = {
@@ -49,7 +49,7 @@ def _rloo_args(**overrides) -> SimpleNamespace:
 
 def _validate(arguments_module, **overrides) -> SimpleNamespace:
     args = _rloo_args(**overrides)
-    arguments_module.slime_validate_args(args)
+    arguments_module.relax_validate_args(args)
     return args
 
 
