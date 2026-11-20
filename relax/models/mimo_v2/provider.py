@@ -15,6 +15,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import ModuleSpec
 
+from relax.utils.env import Envs
+
 from .attention import MiMoV2SelfAttention, MiMoV2TEDotProductAttention
 
 
@@ -69,6 +71,8 @@ class MiMoV2ModelProvider(GPTModelProvider):
         config.num_query_groups = self.swa_num_query_groups if swa else self.full_attn_num_query_groups
         sink = self.swa_attention_sink if swa else self.full_attention_sink
         config.softmax_type = "learnable" if sink else "vanilla"
+        if Envs.RELAX_MIMO_V2_FUSED_ROUTED_SWIGLU and self.moe_layer_freq[layer_number - 1]:
+            config.bias_activation_fusion = True
         return config
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> GPTModel:

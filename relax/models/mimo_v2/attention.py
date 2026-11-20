@@ -10,6 +10,7 @@ import dataclasses
 import torch
 from megatron.bridge.models.conversion.param_mapping import AutoMapping
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.transformer.attention import SelfAttention
 
 
@@ -105,6 +106,10 @@ class MiMoV2TEDotProductAttention(TEDotProductAttention):
             v_channels=config.v_head_dim,
             **kwargs,
         )
+        # The sink is initialized per head on each TP rank. Bridge needs the
+        # partition metadata to reconstruct the full tensor when exporting.
+        if config.softmax_type == "learnable" and not hasattr(self.softmax_offset, "tensor_model_parallel"):
+            set_tensor_model_parallel_attributes(self.softmax_offset, True, 0, 1)
         self.attention_value_scale = config.attention_value_scale
 
     def forward(self, query, key, value, attention_mask, attn_mask_type, **kwargs):
