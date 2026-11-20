@@ -734,3 +734,6 @@ We thank the UniRL authors for the Qwen-Image / PickScore reference recipe and m
 
 - [Architecture](./architecture.md) — the controller / service / component model the generative path plugs into
 - [OOM Troubleshooting](./oom-troubleshooting.md) — general memory-pressure playbook
+
+
+[SenseNova image-edit ART RL](./diffusion-art.md) reuses the merged SFT model implementation.

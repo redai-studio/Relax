@@ -56,6 +56,16 @@ Apply these checks to every review and to all suggested fixes:
 
 Load [development checks](references/development-checklist.md) first to establish necessity and user contracts, then the separate, unchanged [SOLID checklist](references/solid-checklist.md) for architecture prompts. A proposed refactor needs a concrete benefit and a minimal safe change; use an incremental plan when needed.
 
+### Framework Architecture
+
+For framework architecture, cross-layer changes, or responsibility refactoring, fully read the current workspace's `.codex/agents/arch-expert.md` and apply that expert's guidance. Verify the file was actually read; its presence or a table entry does not establish loading. Follow any loading verification required by `AGENTS.md`.
+
+Review whether each added responsibility or layer is needed before choosing its location. Trace its callers, resource owners, and existing equivalents; distinguish confirmed user contracts from organization or restrictions introduced by the patch itself. A helper that merely relocates the same coupling does not establish an improved boundary.
+
+Review the entire affected responsibility chain, including changes outside the initially reported helper; resolving one local violation does not establish that the surrounding module has the right responsibilities.
+
+Give a separate architecture conclusion: is code ownership reasonable, and is the resulting design simple and elegant for the actual requirement? Support that judgment with concrete call paths, dependency direction, and maintenance consequences. Explain justified remaining coupling and any unresolved placement or unnecessary layer. Passing tests establish behavior within their exercised boundary; they do not establish architecture quality. Do not demand abstractions or moves solely for style.
+
 Load the following references when their scope is affected:
 
 | Scope | Reference and focus |

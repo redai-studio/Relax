@@ -209,10 +209,27 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 默认情况下，`--save` 写入常规的完整 Megatron 分布式 checkpoint。增加 `--save-lora-only` 后，改为写入更小、可续训的 actor checkpoint：其中包含 LoRA 张量以及 optimizer、scheduler、RNG、iteration 和 common state；恢复时，冻结的基座权重从 `--hf-checkpoint` 重新加载。
 
-`--save-lora-only` 与全量 checkpoint 导出互斥：它要求同步 BF16 `torch_dist` checkpoint，不能与 `--async-save`、`--rotate-ckpt`、`--no-save-optim`、`--no-save-rng`、`--fp16`、`--fp8` 或 `--save-hf` 同时使用。如果存在任何非 LoRA 的可训练模型参数，也会直接报错，防止生成无法完整续训的产物。
+`--save-lora-only` 要求同步 BF16 `torch_dist` checkpoint，不能与 `--async-save`、`--rotate-ckpt`、`--no-save-optim`、`--no-save-rng`、`--fp16` 或 `--fp8` 同时使用。如果存在任何非 LoRA 的可训练模型参数，也会直接报错，防止生成无法完整续训的产物。
+
+可以组合使用 `--save-lora-only` 和 `--save-hf`，在每次保存时同时生成轻量训练 checkpoint 和完整合并后的 HF 模型。在已有 LoRA 训练命令中加入以下参数，并分别指定两个输出目录：
+
+```bash
+--hf-checkpoint /path/to/base-hf \
+--save /path/to/run/native \
+--save-interval 200 \
+--ckpt-format torch_dist \
+--bf16 \
+--save-lora-only \
+--save-hf /path/to/run/hf \
+--save-hf-dtype bf16
+```
+
+原生 checkpoint 保存完成后，HF 导出直接读取内存中的完整模型。`--save-lora-only` 减小的是原生 checkpoint，不会降低完整 HF 导出的内存和磁盘需求。
+
+续训时，让 `--hf-checkpoint` 继续指向原始底模，并设置 `--load /path/to/run/native`。Relax 会先加载底模，再恢复 LoRA 参数和训练状态，不需要离线合并。底模、LoRA 配置和并行拓扑须与保存时一致。轻量 checkpoint 当前按完整续训方式恢复，不要添加 `--finetune`、`--no-load-optim` 或 `--no-load-rng`。
 
 ::: tip
-轻量 checkpoint 是分片的 Megatron 续训产物，不是可移植的 HF-PEFT adapter。显式使用 `--save-hf` 时仍可导出包含 `adapter_config.json`、`adapter_model.safetensors` 和 `relax_lora_meta.json` 的 `lora_adapter/`；该目录仅供外部或推理使用，不是续训来源。
+轻量 checkpoint 是分片的 Megatron 续训产物，不是可移植的 HF-PEFT adapter。启用 LoRA 时，`--save-hf` 还会在 HF 导出目录内写入 `lora_adapter/`，其中包含 `adapter_config.json`、`adapter_model.safetensors` 和 `relax_lora_meta.json`。Megatron 训练加载器不能通过 `--load` 加载这个 adapter 目录；续训应使用原生 checkpoint。如果只保留了这个 adapter，可按下文先与原始底模合并，再用合并后的 HF 模型初始化新训练，但无法恢复原来的训练状态。
 :::
 
 ### 离线合并为独立 HF checkpoint

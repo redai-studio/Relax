@@ -357,6 +357,10 @@ def native_generate(monkeypatch):
         sglang_router_port=1,
         use_slime_router=False,
         use_rollout_routing_replay=False,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        lora_adapter_mode=False,
+        slime_router_sticky=False,
         sglang_router_policy="round_robin",
         sglang_speculative_algorithm=None,
     )

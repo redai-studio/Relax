@@ -55,12 +55,13 @@ def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
     for mm_input in inputs:
         if mm_input is None:
             continue
-        grid = mm_input.get("image_grid_thw")
-        if grid is None:
-            continue
-        if isinstance(grid, torch.Tensor):
-            grid = grid.tolist()
-        grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
+        for key in ("image_grid_thw", "video_grid_thw"):
+            grid = mm_input.get(key)
+            if grid is None:
+                continue
+            if isinstance(grid, torch.Tensor):
+                grid = grid.tolist()
+            grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
     return grids
 
 
@@ -496,7 +497,7 @@ def post_process_env(args, env):
     # Dynamic-batch streaming ends via the producer's is_last signal, not a
     # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
     # The non-dynamic path still pre-allocates the exact count for its .all() check.
-    if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
+    if args.fully_async and getattr(args, "use_dynamic_batch_size", False):
         env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(
             args.rollout_batch_size * args.n_samples_per_prompt
         )  ## * args.max_num_agents
@@ -782,6 +783,7 @@ def recovery_load_path(args: Namespace) -> Optional[str]:
         args.finetune = False
         # A save may finish before teardown; use the backend's actual loaded step.
         args.start_rollout_id = None
+        args._start_rollout_id_explicit = False
         args.load = args.save
 
 

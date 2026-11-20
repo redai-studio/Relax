@@ -171,6 +171,38 @@ class PublicationTests(unittest.TestCase):
             self.store.commit = original
             publisher.close()
 
+    def test_retry_waits_for_manifest_directory_before_confirming(self):
+        from relax.distributed.weight_sync import store as storage
+
+        scratch = self.root / "scratch"
+        publisher = VersionPublisher(self.store, "run", scratch, model_config={}, converter_revision="test")
+        target = self.store.manifest_path("run", 0)
+        sync = storage.sync_directory
+
+        def fail(directory):
+            if target.is_file() and directory == target.parent:
+                raise OSError("directory unavailable")
+            sync(directory)
+
+        try:
+            with patch.object(storage, "sync_directory", side_effect=fail):
+                handle = publisher.submit("u0", self.table(0))
+                with self.assertRaisesRegex(OSError, "directory unavailable"):
+                    publisher.wait_committed(handle)
+                self.assertTrue(target.exists())
+                publisher.retry(handle)
+                with self.assertRaisesRegex(OSError, "directory unavailable"):
+                    publisher.finalize_pending(handle)
+                self.assertEqual(publisher.pending, handle)
+                self.assertTrue((scratch / "publisher-run.json").exists())
+            publisher.retry(handle)
+            self.assertEqual(publisher.finalize_pending(handle).update_id, "u0")
+            record = load_json((self.store.root / "publications/run/0.json").read_bytes())
+            self.assertEqual((record["phase"], record["attempt"]), ("SOURCE_CONFIRMED", 3))
+            self.assertFalse((scratch / "publisher-run.json").exists())
+        finally:
+            publisher.close(finalize=False)
+
     def test_close_finalizes_last_candidate(self):
         publisher = VersionPublisher(
             self.store, "run", self.root / "scratch", model_config={}, converter_revision="test"

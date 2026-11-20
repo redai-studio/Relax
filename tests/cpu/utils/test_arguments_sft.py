@@ -16,6 +16,15 @@ from tests.cpu.utils.test_arguments_opd_teacher_colocate import (
 arguments_module = _arguments_module_fixture
 
 
+def test_sft_reasoning_mask_is_opt_in(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = arguments_module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    assert parser.parse_args([]).sft_mask_reasoning is False
+    args = parser.parse_args(["--loss-type", "sft", "--sft-mask-reasoning"])
+    assert args.sft_mask_reasoning is True
+    arguments_module._validate_sft_mask_reasoning_args(args)
+
+
 def test_sft_legacy_prepack_allows_single_in_flight_step(arguments_module):
     args = SimpleNamespace(sft_max_in_flight_steps=1, sft_async_prepack=True, max_staleness=0)
 
@@ -187,3 +196,40 @@ def test_sft_packing_preserves_default_and_archived_recipe(arguments_module, cli
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
     assert parser.parse_args(cli).sft_packing_strategy == expected
+
+
+def test_sft_epoch_interval_overrides_native_megatron_parser_type(arguments_module):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save-interval", type=int)
+    parser.add_argument("--eval-interval", type=int)
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    arguments_module.get_slime_extra_args_provider()(parser)
+    args = parser.parse_args(["--loss-type", "sft", "--save-interval", "epoch", "--eval-interval", "epoch"])
+    assert args.save_interval == args.eval_interval == "epoch"
+    arguments_module._validate_sft_epoch_eval_args(args)
+
+
+@pytest.mark.parametrize("mode", ["bridge", "raw"])
+@pytest.mark.parametrize("configured", [None, 7])
+def test_art_preserves_native_checkpoint_and_defers_the_cursor_to_its_backend(
+    arguments_module, tmp_path, mode, configured
+):
+    args = _opd_args()
+    vars(args).update(
+        generation_task="i2i",
+        train_backend="fsdp",
+        sampling_config={"algorithm": "art"},
+        use_opd=False,
+        load=str(tmp_path / "art"),
+        ref_load=None,
+        ref_ckpt_step=None,
+        start_rollout_id=configured,
+        megatron_to_hf_mode=mode,
+        no_load_optim=False,
+        no_load_rng=False,
+        finetune=False,
+    )
+    arguments_module.relax_validate_args(args)
+    assert args.load == str(tmp_path / "art")
+    assert args.start_rollout_id == configured
+    assert not args.no_load_optim and not args.no_load_rng and not args.finetune
