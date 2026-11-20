@@ -47,7 +47,8 @@ def test_versioned_memory_restore_uses_remaining_operation_budget():
     engine = object.__new__(SGLangEngine)
     engine.node_rank, engine.server_host, engine.server_port = 0, "localhost", 1
     engine._weight_consumer_enabled = True
-    engine._get_version_consumer = lambda: Mock(session=Mock(engines=Mock(installation_identity={"epoch": 1})))
+    group = Mock(installation_identity={"epoch": 1}, control_headers={})
+    engine._get_version_consumer = lambda: Mock(session=Mock(engines=group))
     clock = [100.0]
     with patch("relax.distributed.weight_sync.deadline.time.monotonic", side_effect=lambda: clock[0]):
         with time_budget(10), patch("requests.post", return_value=Mock()) as post:

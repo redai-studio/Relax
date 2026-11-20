@@ -769,7 +769,10 @@ class SGLangEngine(RayActor):
             from relax.distributed.weight_sync.store import canonical
 
             group = self._get_version_consumer().session.engines
-            request_options["headers"] = {"X-Relax-Installation": canonical(group.installation_identity).decode()}
+            request_options["headers"] = {
+                **group.control_headers,
+                "X-Relax-Installation": canonical(group.installation_identity).decode(),
+            }
         response = requests.post(url, json=payload or {}, timeout=timeout, **request_options)
         try:
             response.raise_for_status()
@@ -1066,7 +1069,10 @@ class SGLangEngine(RayActor):
             from relax.distributed.weight_sync.store import canonical
 
             group = self._get_version_consumer().session.engines
-            request_options["headers"] = {"X-Relax-Installation": canonical(group.installation_identity).decode()}
+            request_options["headers"] = {
+                **group.control_headers,
+                "X-Relax-Installation": canonical(group.installation_identity).decode(),
+            }
         # flush cache will not return status_code 200 when there are pending requests
         while True:
             try:

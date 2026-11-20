@@ -7,6 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.engine.sft.runtime import is_embedding_sft_mode
+
 
 @pytest.fixture
 def partitioner():
@@ -95,6 +97,7 @@ def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner
         dist=SimpleNamespace(all_reduce=lambda *a, **kw: None, ReduceOp=torch.distributed.ReduceOp),
         device_utils=SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
         is_preference_mode=lambda args: False,
+        is_embedding_sft_mode=is_embedding_sft_mode,
         ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY="global_counts",
         ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY="local_counts",
         DataIterator=lambda data, micro_batch_size, indices, **kw: SimpleNamespace(indices=indices, **kw),
@@ -161,6 +164,7 @@ def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strate
         dist=SimpleNamespace(all_reduce=all_reduce, ReduceOp=torch.distributed.ReduceOp),
         device_utils=SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
         is_preference_mode=lambda args: False,
+        is_embedding_sft_mode=is_embedding_sft_mode,
         ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY="global_counts",
         ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY="local_counts",
         DataIterator=lambda data, micro_batch_size, indices, **kw: SimpleNamespace(indices=indices, **kw),

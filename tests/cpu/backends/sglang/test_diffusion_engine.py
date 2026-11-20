@@ -459,6 +459,7 @@ def test_compute_server_args_maps_model_ports_and_overrides():
     assert sa["enable_torch_compile"] is True
     assert "revision" not in sa
     assert "ulysses_degree" not in sa
+    assert "text_encoder_cpu_offload" not in sa and "vae_cpu_offload" not in sa
 
 
 def test_compute_server_args_rejects_an_invalid_scheduler_rendezvous_address():

@@ -233,3 +233,37 @@ def test_existing_manifest_retry_repeats_directory_sync(tmp_path, monkeypatch):
         store.commit(manifest)
     store.commit(manifest)
     assert len(attempts) == 2
+
+
+def test_public_retries_require_a_durable_manifest(tmp_path, monkeypatch):
+    import pytest
+
+    from relax.distributed.weight_sync import store as module
+
+    store = VersionStore(tmp_path / "store", disk_budget=100_000, max_weight_bytes=64)
+    source = tmp_path / "input"
+    source.write_bytes(bytes(range(64)))
+    tensors = {"w": ("U8", [64], source)}
+    sync = module.sync_directory
+
+    def exercise(operation, target):
+        def fail_after_rename(directory):
+            if target.exists() and directory == target.parent:
+                raise OSError("directory sync unavailable")
+            return sync(directory)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "sync_directory", fail_after_rename)
+            for _ in range(2):
+                with pytest.raises(OSError, match="directory sync unavailable"):
+                    operation()
+                assert target.is_file()
+        return operation()
+
+    primary = exercise(lambda: store.publish("s", 0, tensors), store.manifest_path("s", 0))
+    assert exercise(lambda: store.ensure_full("s", 0), store.manifest_path("s", 0)) == primary
+    source.write_bytes(bytes([99]) + bytes(range(1, 64)))
+    delta = store.publish("s", 1, tensors)
+    assert delta["kind"] == "delta"
+    full = exercise(lambda: store.ensure_full("s", 1), store.full_path("s", 1))
+    assert full["kind"] == "full" and full["root"] == delta["root"]

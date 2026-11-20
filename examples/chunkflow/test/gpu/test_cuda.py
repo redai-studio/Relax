@@ -399,6 +399,7 @@ def test_pp1_native_loss_callback_preserves_head_gradients_and_token_count(monke
         qkv_format="thd",
         allgather_cp=False,
         loss_type="sft",
+        task_type="causal_lm",
         sft_chunked_logits=True,
         sft_logits_chunk_size=32,
         recompute_loss_function=True,
