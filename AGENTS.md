@@ -97,9 +97,17 @@ CRITICAL: 以下规则不可违反。
 - 禁止猜测集群配置或重建 CUDA/驱动栈
 - 调试时直接修改 `scripts/training/` 下的训练脚本来调整参数，启动入口遵循下方 Configuration & Launching 规则
 - 禁止做与目标无关的代码改动，如 code format 等
-- 集成测试需要多节点 GPU 硬件——必须显式说明跳过原因
 - 修改前先读相关文件；提交前跑 `pre-commit run --all-files`
 - 遵循最小变更原则：只碰需求直接涉及的文件和行
+
+## Docker Patch Management
+
+- 尽量不新建 `.patch` 文件。修改前先检查目标依赖的版本、现有 patch 和 Dockerfile 的应用顺序；同一依赖、同一版本的修复优先合入已有 patch，避免按功能不断叠加增量 patch。
+- Megatron 和 SGLang 的相关修复统一收敛到对应版本的主 patch。沿用 `docker/patch/latest/` 的现有软链接并修改其实际目标文件，不另建 CUDA 专用目录或重复副本。升级依赖版本或确实无法共用时才新增 patch，并说明不能合并的原因。
+- 保留历史版本的 Megatron、SGLang patch。区分历史版本 patch 与已合入当前主 patch 的增量文件；仅在确认内容完整迁移、所有引用已更新后，删除被替代的增量文件。
+- 其他依赖也优先按依赖和版本合并 patch；不能为了减少文件数而混合不同依赖或不兼容版本。确有运行配置差异时，优先沿用主 patch 内的分段应用机制，保持各配置原有的生效范围和顺序。
+- patch 代码保留在 `.patch` 文件中，不搬入 Dockerfile 的内联脚本或字符串替换。Dockerfile 尽量小改，只调整必要的复制、应用和构建步骤；现有镜像能力应保留在输出镜像内，不能改为要求用户在容器启动后手动补丁。
+- 合并时列明旧文件内容的新位置，检查 Dockerfile、脚本、测试、文档和校验清单中的引用。对固定版本源码验证 patch 能按实际构建顺序干净应用，并核对各受影响配置合并前后的源码结果；不能仅凭 patch 文本拼接成功判断无冲突。未完成的镜像构建或 GPU 验证须明确说明。
 
 ## Ask First
 
@@ -118,38 +126,51 @@ CRITICAL: 以下规则不可违反。
 pip install -e .                    # 以开发模式安装
 pip install -r requirements.txt
 pre-commit run --all-files           # lint + format（等同 make format）
-pytest tests/                        # 测试
-pytest tests/<test_file>.py::<test_name>  # 运行单个测试
-make test                           # 等同 pytest tests/
 make docs-dev                       # 启动 VitePress 文档开发服务器
 ```
 
 - 提交遵循 Conventional Commits（`feat:`, `fix:`, `docs:`），详见 `git-commit` skill
 - 默认仅创建本地 commit；用户授权 push 或创建 PR 时，遵循 `relax-github-workflow` skill
-- 测试命名：`test_<module>_<behavior>()`，GPU 测试用 `@pytest.mark.skipif` 优雅跳过
+- 测试要求与执行入口统一见下方 Testing。
 
-## Test Scope & Placement
+## Testing
 
-验证改动不等于新增永久测试。先搜索并运行已有相关测试；已有覆盖足够时，可以不新增测试，并简述依据。
+新增、修改或审查测试前，必须应用本节和 [测试质量准则](skills/code-review/references/test-quality-checklist.md)。以下要求同时适用于人工和 coding agent。
 
-新增永久测试必须：
+### 准入与有效性
 
-- 指向一个具体的行为契约或真实故障风险；
-- 执行实际项目实现，而非在测试中重写被测逻辑；mock 用于隔离外部边界，不替换被测行为本身；
-- 说明已有测试为何不能覆盖，以及新增测试的 CI 成本；
-- 检查可观察结果，避免锁定源码文本、私有命名或无关调用顺序。
+- 验证改动不等于新增永久测试。先查已有覆盖；仅为真实 bug、可推导的独立性质或必要对外契约增加用例，并说明现有测试为何不足、维护与 CI 成本是否值得。
+- 每个永久用例必须回答“哪个具体的生产代码错误会使它失败”。测试数量、断言数量、覆盖率和全绿都不能单独证明价值。
+- 执行实际产品实现，以结果、状态、输出、必要交互或真实错误为证据。mock 只隔离外部或昂贵边界，不实现被声称验证的计算、恢复、调度或同步能力。
+- 期望来自独立参考、手算、外部规范或已确认契约；不得同步复制当前产品算法、复用可能出错的关键 helper，或把实际输出抄为答案。固定历史版本的兼容性参考须注明来源与边界，不能冒充算法正确性证明。
+- 不收录脚本 dry-run 后逐项核对默认参数、GPU 数、环境变量、路径或日志文本的配置镜像测试，也不以源码字符串、AST 抽取、补丁拼装、私有名字/布局快照替代行为验证。真实解析器、源码转换器或补丁工具自身的输入输出契约除外。
+- 按独立故障模式选择用例和参数行，不机械穷举配置。优先保护数值与梯度、分布式通信、状态恢复、并发和资源清理等真实风险。
 
-修复 bug 时，优先扩展已有测试，验证修复前失败、修复后通过。探索实验、原理演示、文档措辞检查不默认进入长期测试集。
+### 验证与维护
 
-无法在当前硬件验证的行为，应明确留下验证缺口，不得用源码字符串检查冒充运行验证，也不得用 AST 检查替代运行行为验证。
+- bug 回归优先扩展已有用例；条件允许时确认旧实现因目标 bug 失败、新实现通过。需要时在隔离副本中注入具体错误验证断言；未实际运行的旧版本对照或 mutation 不得声称通过。
+- 竞态使用事件、受控交错或真实进程协议触发；慢测试和多进程测试需要合理的成本、超时与清理边界。不用不确定等待或无有效断言的循环制造覆盖。
+- 一次性 smoke、探索实验、原理演示和文案检查不默认进入永久测试库。记录实际版本、命令、结果、跳过原因与能力边界；硬件或依赖不足时明确未验证，不改用源码/AST 检查冒充运行。
+- 删除或合并前，说明失去什么保护、哪个保留用例覆盖同一故障，或旧契约为何失效。混合文件按用例处理；不能因命中某个静态模式就整文件删除。
+- 不为变绿或提速而删除有效断言、mock 掉被测能力或无依据放宽容差。无行为变化的搬迁、重命名和重构优先复用现有回归与静态检查。
 
-禁止把脚本修改翻译成字符串断言，例如 `assert "NEW_ENV=value" in script.read_text()`；环境变量、参数在脚本文本中出现，不代表它们在运行时正确生效。纯搬迁、重命名、文案或无行为变化的重构，优先复用现有回归与静态检查。
+### 分类与运行
 
-按不同故障模式选择用例，不机械穷举参数组合。优先覆盖用户可见行为、真实缺陷回归、数值与梯度正确性，以及分布式通信、状态恢复和资源清理等高风险路径。新增慢测试或多进程测试时，说明为什么现有轻量测试不足，并限制进程数和超时。
+- 测试命名为 `test_<module>_<behavior>()`。真实 GPU、多卡或多节点测试须声明所需资源，并在资源不足时用 `@pytest.mark.skipif` 等方式说明跳过原因；集成测试按实际依赖判断，不一概视为多节点 GPU 测试。
+- 测试按实际运行需求归类：纯 CPU 测试放入 `tests/cpu/<module>/`，需要真实 GPU 的测试保留在对应的 `tests/<module>/`，需要 2–4 卡的测试放入 `tests/gpux4/`。CPU/GPU 混合文件应拆开，不在 workflow 维护文件清单或逐用例排除。
+- CPU 分类检查真实调用及间接 fixture 的设备依赖，包括 CUDA tensor 搬运、设备探测和可见设备环境变量；不以名称或 mock 判断，也不为迁入 CPU 新增 skip/mock 掩盖真实 GPU 依赖。
+- CPU 套件须支持隐藏 GPU 后执行 `pytest tests/cpu`。单卡 CI 运行 `pytest tests/ --ignore=tests/cpu --ignore=tests/gpux4`，多卡 CI 运行 `pytest tests/gpux4`；CI 另外执行的示例测试也纳入审查。依赖不全导致的 skip 不算回归通过。
 
-- 测试按实际运行需求归类：纯 CPU 测试放入 `tests/cpu/<module>/`，需要真实 GPU 的测试保留在对应的 `tests/<module>/`。CPU/GPU 混合文件应拆开，不在 workflow 维护文件清单或逐用例排除。
-- CPU 分类必须检查间接调用和 fixture 的设备依赖，包括 CUDA tensor 搬运、设备探测和可见设备环境变量；不能仅凭测试名称或使用 mock 判断，也不能为迁入 CPU 而新增 skip/mock 掩盖真实 GPU 依赖。
-- CPU 套件须支持隐藏 GPU 后执行 `pytest tests/cpu`。单卡 CI 运行 `pytest tests/ --ignore=tests/cpu --ignore=tests/gpux4`，多卡 CI 运行 `pytest tests/gpux4`。依赖不全导致的 skip 不算回归通过，应明确验证限制。
+按改动涉及的行为选择检查，不默认执行整个 GPU 套件：
+
+```bash
+pytest tests/<path>/test_<module>.py::test_<behavior>  # 定向验证
+CUDA_VISIBLE_DEVICES="" pytest tests/cpu examples/chunkflow/test/cpu
+pytest tests/ examples/chunkflow/test/gpu --ignore=tests/cpu --ignore=tests/gpux4
+pytest tests/gpux4
+```
+
+`pytest tests/`（`make test`）覆盖不同资源需求的套件，只在环境满足对应要求时运行。
 
 ## Distributed Code Rules
 
@@ -168,21 +189,28 @@ make docs-dev                       # 启动 VitePress 文档开发服务器
 
 ## Domain experts & skills
 
+### Codex 架构专家入口
+
+执行框架架构评审、职责划分或分层重构任务时，先完整读取当前工作区的
+`.codex/agents/arch-expert.md`，并将其作为本任务的专家工作指引。该文件不取代用户指令或本文件的约束。
+Codex 的子代理名称为 `arch_expert`；Claude/OpenCode 使用文件名对应的 `arch-expert`。
+
 Fire the appropriate **expert subagent** or **load a skill** based on what you're working on. Experts are read-only consultants with deep domain knowledge; skills are step-by-step implementation guides.
 
-| Working on...                                | Fire subagent      | Load skill              |
-| -------------------------------------------- | ------------------ | ----------------------- |
-| Megatron backend (TP/PP/CP/EP)               | `megatron-expert`  |                         |
-| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)      | `algorithm-expert` |                         |
-| Task Launch & service deployment             | `launcher-expert`  |                         |
-| Ray framework (Core, Serve, Jobs, placement) | `ray-expert`       |                         |
-| Development & code changes                   | `ray-expert`       | `dev`                   |
-| Agentic rollout integration, runtime & hangs | `agentic-expert`   | `agentic-rollout`       |
-| Distributed training hang debugging          | `ray-expert`       | `debug-hang`            |
-| Code review of git changes                   | --                 | `code-review`           |
-| Creating new skills                          | --                 | `creating-skills`       |
-| Git commits                                  | --                 | `git-commit`            |
-| GitHub contribution, PRs & review follow-up  | --                 | `relax-github-workflow` |
-| GitHub required checks & CI operations       | --                 | `relax-github-ci`       |
+| Working on...                                     | Fire subagent                          | Load skill              |
+| ------------------------------------------------- | -------------------------------------- | ----------------------- |
+| Framework architecture, responsibility & layering | `arch-expert`                          | --                      |
+| Megatron backend (TP/PP/CP/EP)                    | `megatron-expert`                      |                         |
+| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)           | `algorithm-expert`                     |                         |
+| Task Launch & service deployment                  | `launcher-expert`                      |                         |
+| Ray framework (Core, Serve, Jobs, placement)      | `ray-expert`                           |                         |
+| Development & code changes                        | `ray-expert`                           | `dev`                   |
+| Agentic rollout integration, runtime & hangs      | `agentic-expert`                       | `agentic-rollout`       |
+| Distributed training hang debugging               | `ray-expert`                           | `debug-hang`            |
+| Code review of git changes                        | `arch-expert` for architecture changes | `code-review`           |
+| Creating new skills                               | --                                     | `creating-skills`       |
+| Git commits                                       | --                                     | `git-commit`            |
+| GitHub contribution, PRs & review follow-up       | --                                     | `relax-github-workflow` |
+| GitHub required checks & CI operations            | --                                     | `relax-github-ci`       |
 
 **How to fire an expert**: task(subagent_type="megatron-expert", load_skills=\[\], run_in_background=true, prompt="...")

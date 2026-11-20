@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import os
+import signal
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -253,11 +254,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     args = parse_args()
     session_input = read_session_input(args.input_json)
     metadata = session_input.get("metadata") or {}
     output = asyncio.run(run_session(messages=session_input["messages"], metadata=metadata))
     write_session_output(args.output_json, output)
+
+
+def _handle_sigterm(signum: int, _frame: Any) -> None:
+    # Unwind the normal finally path, including while synchronous tool I/O runs.
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Build the pinned MoK wheel and apply the Megatron adapter."""
+"""Build the pinned MoK wheel for the image-installed Megatron adapter."""
 
 import argparse
 import hashlib
@@ -59,12 +59,8 @@ def checkout(root: Path, spec: dict) -> None:
         raise RuntimeError(f"Unexpected checkout: {head}")
 
 
-def patch_transformer_engine(root: Path, manifest: dict) -> None:
+def check_transformer_engine(root: Path, manifest: dict) -> None:
     spec = manifest["transformer_engine"]
-    path = root / spec["path"]
-    if digest(path) != spec["after_sha256"]:
-        check_files(root, {spec["path"]: spec["before_sha256"]})
-        apply_patches(root, [spec["patch"]], manifest)
     check_files(root, {spec["path"]: spec["after_sha256"]})
 
 
@@ -76,7 +72,7 @@ def main() -> None:
     parser.add_argument("--check-base-only", action="store_true")
     args = parser.parse_args()
     manifest = json.loads((PACKAGE / "manifest.json").read_text())
-    check_megatron(args.megatron_root, manifest["megatron"], "before")
+    check_megatron(args.megatron_root, manifest["megatron"], "after")
     print("Megatron patch-target fingerprints verified.", flush=True)
     if args.check_base_only:
         return
@@ -99,7 +95,7 @@ def main() -> None:
     if re.search(r"release\s+13\.0\b", nvcc) is None:
         raise RuntimeError("The compiler must match Torch's CUDA 13.0; do not rebuild or replace the CUDA stack")
 
-    # Fetch/verify all sources before modifying the image's Megatron tree.
+    # Fetch and verify the pinned sources before compiling the wheel.
     checkout(args.mok_root, manifest["mok"])
     thunderkittens = args.mok_root / "third_party/ThunderKittens"
     # Git creates an empty directory for the uninitialized gitlink.
@@ -110,12 +106,11 @@ def main() -> None:
     apply_patches(thunderkittens, manifest["patch_order"]["thunderkittens"], manifest)
     check_files(args.mok_root, manifest["mok"]["after_sha256"])
     check_files(thunderkittens, manifest["thunderkittens"]["after_sha256"])
-    apply_patches(args.megatron_root, manifest["patch_order"]["megatron"], manifest)
     check_megatron(args.megatron_root, manifest["megatron"], "after")
     te = manifest["transformer_engine"]
     if metadata.version(te["distribution"]) != te["version"]:
         raise RuntimeError(f"Expected Transformer Engine {te['version']}")
-    patch_transformer_engine(Path(metadata.distribution(te["distribution"]).locate_file("")), manifest)
+    check_transformer_engine(Path(metadata.distribution(te["distribution"]).locate_file("")), manifest)
 
     env = dict(
         os.environ,

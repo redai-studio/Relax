@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "scope": "Incremental MoK image over a compatible CUDA13 training image; verify patch targets without dependency upgrades.",
+  "scope": "MoK shipped by Dockerfile.cu13 Blackwell; Megatron adapter is part of the complete CUDA patch.",
   "megatron": {
     "baseline": "Existing image /root/Megatron-LM snapshot (no git history)",
     "upstream_port_pr": 8497,
@@ -90,23 +90,18 @@
     "sequence_parallel": true
   },
   "patch_order": {
-    "megatron": ["megatron-mok.patch"],
-    "mok": ["mok-640-tail.patch", "mok-pr10-scheduler.patch"],
+    "mok": ["mok.patch"],
     "thunderkittens": ["thunderkittens-mn-major.patch"]
   },
   "patch_sha256": {
-    "megatron-mok.patch": "2240ee8af68b5ade259914f6c52a50302b6ce29d751ed1ab6b40d700f334058d",
-    "mok-640-tail.patch": "dcf2516f6ee1552b305c3206e4d5a1b8ce900aae8566beb200feb7dea7718a97",
-    "mok-pr10-scheduler.patch": "7c8b649f5f4d7584387c63637a54b9a6c5bd1b4f3a56c52de3d6d972ce1a5c5b",
     "thunderkittens-mn-major.patch": "e001b2d0b6e4088bcedb5cef49bf6811d1757b9e9e9835ae50744ee54b8f633d",
-    "transformer-engine-fused-adam-bounded.patch": "30f8865d4ae17ef13c17f88ac03fe93b59475bef3dba74dbd89eb97a575041c7"
+    "mok.patch": "6ccc61da96f39a37a92655e24ba713dbdc680680317cafdc8f8ea0a065ab59f6"
   },
   "transformer_engine": {
     "distribution": "transformer-engine",
     "version": "2.18.0",
     "path": "transformer_engine/pytorch/optimizers/fused_adam.py",
     "before_sha256": "e7d493f0bc05f4c64dd7dd192b3f5c9bc951588c7a3358017ee2fe8a6a04f3ce",
-    "after_sha256": "b4621f62840a9ce0d7c1360d2c63f45e90104729125841a3b8f7e8c94dca3fff",
-    "patch": "transformer-engine-fused-adam-bounded.patch"
+    "after_sha256": "b4621f62840a9ce0d7c1360d2c63f45e90104729125841a3b8f7e8c94dca3fff"
   }
 }

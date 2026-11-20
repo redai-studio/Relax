@@ -142,6 +142,54 @@ def test_lora_model_load_allows_missing_base_but_requires_adapter():
             model.load_state_dict({}, strict=False)
 
 
+def test_lora_only_save_keeps_full_model_for_hf_export(monkeypatch, tmp_path):
+    import megatron.training.checkpointing as mcore_checkpointing
+    from megatron.bridge import AutoBridge
+
+    from relax.backends.megatron import model as model_mod
+
+    args = _runtime_args()
+    args.save_lora_only = True
+    args.save_hf = str(tmp_path / "hf")
+    args.save_hf_dtype = "bf16"
+    model = [_AdapterModel()]
+    original = {name: tensor.clone() for name, tensor in model[0].state_dict().items()}
+    captured = {}
+
+    def generate_state_dict(*_args, **_kwargs):
+        return {"args": args, "model": model[0].state_dict(), "optimizer": {"step": 7}}
+
+    def save_native(*_args, **_kwargs):
+        captured["native"] = mcore_checkpointing.generate_state_dict()
+
+    class ExportBridge:
+        def save_hf_pretrained(self, chunks, path, strict):
+            captured["hf"] = {name: tensor.clone() for name, tensor in chunks[0].state_dict().items()}
+
+    def save_adapter(chunks, path, runtime_args, bridge):
+        captured["adapter"] = chunks[0].layer.adapter.linear_in.weight.detach().clone()
+
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    monkeypatch.setattr(mcore_checkpointing, "generate_state_dict", generate_state_dict)
+    monkeypatch.setattr(checkpoint, "_save_checkpoint_megatron", save_native)
+    monkeypatch.setattr(AutoBridge, "from_hf_pretrained", lambda *_args, **_kwargs: ExportBridge())
+    monkeypatch.setattr(model_mod, "patch_megatron_model", lambda _model: nullcontext())
+    monkeypatch.setattr(model_mod, "_save_lora_to_checkpoint", save_adapter)
+
+    checkpoint.save_checkpoint(7, model, None, None, lora_only=args.save_lora_only)
+    model_mod.save_hf_model(args, 7, model)
+
+    assert set(captured["native"]["model"]) == {"layer.adapter.linear_in.weight"}
+    assert captured["native"]["optimizer"] == {"step": 7}
+    assert set(captured["hf"]) == set(original)
+    for name, tensor in original.items():
+        torch.testing.assert_close(captured["hf"][name], tensor)
+        torch.testing.assert_close(model[0].state_dict()[name], tensor)
+    torch.testing.assert_close(captured["adapter"], original["layer.adapter.linear_in.weight"])
+    assert set(mcore_checkpointing.generate_state_dict()["model"]) == set(original)
+    assert not hasattr(args, checkpoint._LORA_CHECKPOINT_METADATA_ATTR)
+
+
 def test_hf_checkpoint_identity_detects_shard_replacement(tmp_path):
     shard = tmp_path / "model-00001-of-00001.safetensors"
     shard.write_bytes(b"first")

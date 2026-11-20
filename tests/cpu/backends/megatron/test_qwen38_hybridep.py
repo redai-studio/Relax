@@ -124,11 +124,12 @@ def test_bad_group_fails_collectively(preflight, monkeypatch, failure):
         detect.assert_not_called()
 
 
-@pytest.mark.parametrize("cp", [2, 4])
+@pytest.mark.parametrize("tp,pp,cp", [(2, 4, 2), (2, 4, 4), (1, 2, 8), (1, 2, 16)])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkeypatch, cp, enabled):
+def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkeypatch, tp, pp, cp, enabled):
     module, mpu, _, detect, expert, _ = preflight
-    mpu.get_tensor_model_parallel_world_size = lambda: 2
+    mpu.get_tensor_model_parallel_world_size = lambda: tp
+    mpu.get_pipeline_model_parallel_world_size = lambda: pp
     mpu.get_context_parallel_world_size = lambda: cp
     monkeypatch.setenv("RELAX_QWEN38_QSA_CP", str(int(enabled)))
     monkeypatch.setenv("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", "mixed")
@@ -145,28 +146,32 @@ def test_qsa_cp_requires_opt_in_and_keeps_physical_peer_checks(preflight, monkey
         detect.assert_not_called()
 
 
+@pytest.mark.parametrize("tp,pp,cp,ep,world", [(1, 2, 4, 4, 16), (2, 1, 1, 8, 8)])
 @pytest.mark.parametrize("failure", [None, "cross_node", "detected_peers", "world_size"])
-def test_35b_ep4_requires_exact_layout_and_four_accessible_peers(preflight, failure):
+def test_hybridep_requires_exact_layout_and_accessible_peers(preflight, failure, tp, pp, cp, ep, world):
     module, mpu, dist, detect, expert, logger = preflight
-    for name, value in [("tensor_model", 1), ("pipeline_model", 2), ("context", 4), ("expert_model", 4)]:
+    for name, value in [("tensor_model", tp), ("pipeline_model", pp), ("context", cp), ("expert_model", ep)]:
         setattr(mpu, "get_" + name + "_parallel_world_size", lambda value=value: value)
-    dist.get_world_size = lambda group: (32 if failure == "world_size" else 16) if group is dist.group.WORLD else 4
+    dist.get_world_size = lambda group: (7 if failure == "world_size" else world) if group is dist.group.WORLD else ep
 
     def gather(output, value, group):
-        assert group is expert and len(output) == 4
+        assert group is expert and len(output) == ep
         output[:] = [
-            dict(value, rank=i, hostname=f"node-{i // 2}" if failure == "cross_node" else "node-0")
+            dict(value, rank=i, hostname=f"node-{i // (ep // 2)}" if failure == "cross_node" else "node-0")
             if isinstance(value, dict)
             else value
-            for i in range(4)
+            for i in range(ep)
         ]
 
     dist.all_gather_object.side_effect = gather
-    detect.return_value = 3 if failure == "detected_peers" else 4
+    detect.return_value = ep - 1 if failure == "detected_peers" else ep
     if failure:
-        with pytest.raises(RuntimeError):
+        message = "accessible peers" if failure == "detected_peers" else "intranode preflight rejected"
+        with pytest.raises(RuntimeError, match=message):
             module.validate_hybridep_worker_group()
-        if failure != "detected_peers":
+        if failure == "detected_peers":
+            detect.assert_called_once_with(expert)
+        else:
             detect.assert_not_called()
     else:
         module.validate_hybridep_worker_group()

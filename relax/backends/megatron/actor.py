@@ -99,6 +99,7 @@ from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
+from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -266,11 +267,7 @@ def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
     """Avoid retaining the next prefetched window across memory-heavy step
     boundaries."""
     next_rollout_id = rollout_id + 1
-    is_train_done = next_rollout_id == args.num_rollout
-    should_save_after_step = args.save is not None and (
-        args.rotate_ckpt
-        or (args.save_interval is not None and (next_rollout_id % args.save_interval == 0 or is_train_done))
-    )
+    should_save_after_step = should_save_checkpoint(args, next_rollout_id)
     completed_steps = evaluation_step_for_rollout(args, rollout_id)
     return (
         should_run_sft_eval(args, completed_steps)
@@ -603,7 +600,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             else:
                 update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-                # Push-side repack is decided by the HF config: an FP8 release auto-routes
+                # Push-side repack uses the effective rollout config: FP8 auto-routes
                 # through quantize_params_fp8, a compressed-tensors release through
                 # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
                 # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
@@ -613,12 +610,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 # mm_projector — without augment_compressed_tensors_ignore the bridge
                 # would try to INT4-pack those BF16 tensors and SGLang would reject
                 # them with "weight_packed not found in params_dict".
-                from relax.utils.quant_cast import augment_compressed_tensors_ignore
-
-                push_quant_config = augment_compressed_tensors_ignore(
-                    getattr(self.hf_config, "quantization_config", None),
-                    args.hf_checkpoint,
-                )
+                push_quant_config = self._resolve_push_quantization_config()
                 self.weight_updater = update_weight_cls(
                     self.args,
                     self.model,
@@ -999,6 +991,40 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.non_persistent_ckpt_type = old_non_persistent_ckpt_type
             self._switch_model("actor")
 
+    def _resolve_push_quantization_config(self) -> dict | None:
+        """Resolve one sender format for all engines receiving this
+        publication."""
+        from relax.utils.quant_cast import resolve_receiver_quantization_config
+
+        args = self.args
+        default_path = getattr(args, "sglang_hf_checkpoint", None) or args.hf_checkpoint
+        global_overrides = getattr(args, "sglang_json_model_override_args", None)
+        global_quantization = getattr(args, "sglang_quantization", None)
+        recipients = [("default", default_path, global_overrides, global_quantization)]
+        if getattr(args, "sglang_config", None) is not None:
+            from relax.distributed.ray.rollout import _resolve_sglang_config
+
+            config = _resolve_sglang_config(args)
+            # Tensor updates target the first model. DCS registers every YAML
+            # model's engines under the shared rollout role.
+            models = config.models if args.fully_async or args.hybrid else config.models[:1]
+            recipients = []
+            for model in models:
+                model.resolve(args)
+                for index, group in enumerate(model.engine_groups):
+                    if group.worker_type == "placeholder":
+                        continue
+                    recipients.append(
+                        (
+                            f"{model.name}/{index}:{group.worker_type}",
+                            group.overrides["model_path"],
+                            group.overrides.get("json_model_override_args", global_overrides),
+                            group.overrides.get("quantization", global_quantization),
+                        )
+                    )
+
+        return resolve_receiver_quantization_config(args, self.hf_config, recipients)
+
     def _create_checkpoint_engine_client(self, role, weights_getter=None):
         is_pp_src_rank = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
@@ -1022,12 +1048,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "master_address": master_address,
             "master_port": master_port,
         }
-        from relax.utils.quant_cast import augment_compressed_tensors_ignore
-
-        push_quant_config = augment_compressed_tensors_ignore(
-            getattr(self.hf_config, "quantization_config", None),
-            self.args.hf_checkpoint,
-        )
+        push_quant_config = self._resolve_push_quantization_config()
         return run(
             create_client(
                 args=self.args,
@@ -2081,13 +2102,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # ran with tms.paused and hit `CUDA error: invalid argument` on the
         # first cudaMalloc (e.g. all_gather_object's byte tensor).
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or (
-                self.args.save_interval is not None
-                and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-            )
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         # Mirror train_actor's post-train sleep so critic frees GPU before the
         # next rollout's SGLang resume tries to alloc KV pages.
@@ -2340,11 +2355,7 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
@@ -2547,7 +2558,7 @@ class MegatronTrainRayActor(TrainRayActor):
         has no pipelined meta tracking across stages.
         """
         return (
-            getattr(self.args, "fully_async", False)
+            self.args.fully_async
             and getattr(self.args, "use_dynamic_batch_size", False)
             and mpu.get_pipeline_model_parallel_world_size() == 1
             and (mpu.get_virtual_pipeline_model_parallel_world_size() or 1) == 1
@@ -2813,11 +2824,7 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
+        if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
 
         if self.args.offload_train:
@@ -3925,6 +3932,9 @@ class MegatronTrainRayActor(TrainRayActor):
             "returns",
             "opd_reverse_kl",
         }
+        if getattr(self.args, "dynamic_context_parallel", False):
+            # forward_only already restored these responses in their original sample order.
+            token_fields -= {"log_probs", "ref_log_probs"}
         fields_to_gather = [
             key for key, value in output_dict.items() if key in token_fields and isinstance(value, List)
         ]
