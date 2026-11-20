@@ -487,10 +487,18 @@ class UpdateWeightFromTensor:
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
 
         rank = dist.get_rank()
-        if getattr(self, "delta_exporter", None) is not None:
+        delta_overlap = (
+            getattr(self, "delta_exporter", None) is not None and self.delta_exporter.config.receive_overlap
+        )
+
+        def pause_delta_apply() -> None:
             self._routed_engine_call(all_engines, "pause_generation")
             self._routed_engine_call(all_engines, "flush_cache")
             self._routed_engine_call(all_engines, "begin_weight_update")
+
+        if getattr(self, "delta_exporter", None) is not None:
+            if not delta_overlap:
+                pause_delta_apply()
         elif self._route_experts:
             self._routed_engine_call(all_engines, "pause_generation")
             self._routed_engine_call(all_engines, "flush_cache")
@@ -557,6 +565,7 @@ class UpdateWeightFromTensor:
                     version=str(self.weight_version),
                     group=get_gloo_group(),
                     force_full=self.args.offload_rollout,
+                    before_first_apply=pause_delta_apply if delta_overlap else None,
                 )
             else:
                 with export_ctx:
