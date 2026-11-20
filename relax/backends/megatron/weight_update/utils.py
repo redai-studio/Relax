@@ -102,7 +102,7 @@ def agree_actor_weight_retention(
 
 
 def validate_sglang_weight_sync_support(
-    actor_nodes, engine_nodes, counts, offsets, receivers, engine_size: int
+    actor_nodes, engine_nodes, counts, offsets, receivers, engine_size: int, *, quantization_config: dict | None = None
 ) -> str | None:
     """Check local IPC placement and completion support for Actor retention.
 
@@ -133,6 +133,9 @@ def validate_sglang_weight_sync_support(
         return "CUDA IPC requires each engine and its Actor ranks on the same node"
     if len(receivers) != len(counts):
         return "receiver capability inventory is incomplete"
+    quant_method = (quantization_config or {}).get("quant_method")
+    if quantization_config and quant_method not in ("fp8", "compressed-tensors"):
+        return "export quantization is not connected to the native completion protocol"
     for receiver, count in zip(receivers, counts, strict=True):
         if (
             receiver.get("device") != "cuda"
@@ -140,10 +143,13 @@ def validate_sglang_weight_sync_support(
             or NATIVE_SYNC_FENCE_LOADER not in (receiver.get("custom_weight_loader") or [])
         ):
             return "receiver lacks the CUDA IPC completion-fence contract"
-        # Current gaps: these receiver protocols have separate load/post-process paths.
+        # SGLang can infer quantization from the checkpoint when its server option is unset.
+        receiver_quant_method = (receiver.get("quantization_config") or {}).get("quant_method")
+        if receiver_quant_method != quant_method or receiver.get("quantization") not in (None, quant_method):
+            return "receiver quantization does not match the native weight export"
+        # These receiver protocols have separate load/post-process paths.
         if (
-            receiver.get("quantization") is not None
-            or receiver.get("pp_size", 1) != 1
+            receiver.get("pp_size", 1) != 1
             or receiver.get("enable_lora", False)
             or receiver.get("speculative_algorithm") is not None
         ):

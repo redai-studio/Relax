@@ -54,7 +54,14 @@ def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
     return torch.cat(partitions, dim=partition_dim)
 
 
-def _gather_tp_weights(named_params, *, split_sizes, async_op, contiguous_output_min_bytes: int | None = None):
+def _gather_tp_weights(
+    named_params,
+    *,
+    split_sizes,
+    async_op,
+    contiguous_output_min_bytes: int | None = None,
+    reuse_tp1_buffer: bool = False,
+):
     tasks, handles = [], []
     gather_inputs = []
     for name, param in named_params:
@@ -77,6 +84,15 @@ def _gather_tp_weights(named_params, *, split_sizes, async_op, contiguous_output
         if "linear_fc1" not in name:
             assert getattr(param, "partition_stride", 1) == 1, f"Unsupported partition stride for {name}"
         partition_dim = param.partition_dim
+        if (
+            reuse_tp1_buffer
+            and size == 1
+            and name not in split_sizes
+            and "linear_fc1.weight" not in name
+            and "linear_fc2.weight" not in name
+        ):
+            tasks.append((name, param.data, None, None))
+            continue
         if (
             contiguous_output_min_bytes is not None
             and size > 1
@@ -110,7 +126,7 @@ def _gather_tp_weights(named_params, *, split_sizes, async_op, contiguous_output
     ]
 
 
-def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
+def all_gather_param(args, name: str, param: torch.Tensor, *, reuse_tp1_buffer: bool = False) -> torch.Tensor:
     """Gather one parameter using the same layout rules as batched export."""
     name = name.replace(".to_wrap.", ".")
     split_sizes = {}
@@ -122,7 +138,9 @@ def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
         split_sizes[name] = gdn_component_sizes(
             get_hf_config(args.hf_checkpoint), mpu.get_tensor_model_parallel_world_size(), name
         )
-    return _gather_tp_weights([(name, param)], split_sizes=split_sizes, async_op=False)[0]
+    return _gather_tp_weights(
+        [(name, param)], split_sizes=split_sizes, async_op=False, reuse_tp1_buffer=reuse_tp1_buffer
+    )[0]
 
 
 def all_gather_params_async(

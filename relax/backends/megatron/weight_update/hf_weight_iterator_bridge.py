@@ -431,6 +431,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             ),
             chunk_size=self.args.update_weight_buffer_size,
             yield_full_buckets=retained_ordinary_ipc,
+            yield_large_singletons=backup_done is not None and bool(self.quantization_config),
         )
 
     def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
@@ -491,15 +492,17 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         gather_options = {}
         if retained_ordinary_ipc and self._async_weight_gather:
             gather_options["contiguous_output_min_bytes"] = self.args.update_weight_buffer_size
+        trim_quantized_cache = backup_done is not None and bool(self.quantization_config)
         if (
-            gather_options
+            (gather_options or trim_quantized_cache)
+            and backup_done is not None
             and device.type == "cuda"
             and torch.version.hip is None
             and torch.cuda.memory.get_allocator_backend() == "native"
         ):
             trim_tp_size = mpu.get_tensor_model_parallel_world_size()
         else:
-            trim_tp_size = 1
+            trim_tp_size = 0
         # Eagerly init bridge converter so all ranks are ready before broadcast.
         self._bridge_converter.init_tasks()
         self._bridge_converter.broadcast_and_apply_configs()
@@ -546,19 +549,30 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
         # --- Non-expert weights: original path ---
         for bucket_infos in self._non_expert_buckets:
-            if trim_tp_size > 1 and len(bucket_infos) == 1:
-                info = bucket_infos[0]
-                if (
-                    not info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX)
-                    and info.attrs.get("tensor_model_parallel", False)
-                    and info.attrs.get("parallel_mode") != "duplicated"
-                    and info.size * trim_tp_size > self.args.update_weight_buffer_size
-                    and backup_done is not None
-                    and backup_done.query()
-                ):
-                    # cudaFree can wait for D2H. Retry on a later oversized bucket while backup is pending.
-                    trim_tp_size = 1
-                    torch.cuda.empty_cache()
+            if trim_tp_size and backup_done is not None:
+                for info in bucket_infos:
+                    if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                        continue
+                    sharded = (
+                        info.attrs.get("tensor_model_parallel", False)
+                        and info.attrs.get("parallel_mode") != "duplicated"
+                    )
+                    size = info.size * (trim_tp_size if sharded else 1)
+                    if trim_quantized_cache:
+                        large = info.dtype == torch.bfloat16 and 2 * size >= self.args.update_weight_buffer_size
+                    else:
+                        large = (
+                            len(bucket_infos) == 1
+                            and sharded
+                            and trim_tp_size > 1
+                            and size > self.args.update_weight_buffer_size
+                        )
+                    if large:
+                        if backup_done.query():
+                            # Clear inactive export storage before PP broadcast or TP gather grows the next bucket.
+                            torch.cuda.empty_cache()
+                            trim_tp_size = 0
+                        break
             t_b0 = time.monotonic()
             params = _load_and_broadcast(
                 bucket_infos,
@@ -605,9 +619,19 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                     continue
 
                 t_g0 = time.monotonic()
-                gathered = (
-                    all_gather_param(self.args, info.name, param) if gathered_params is None else next(gathered_params)
-                )
+                if gathered_params is not None:
+                    gathered = next(gathered_params)
+                elif (
+                    trim_quantized_cache
+                    and rank != info.src_rank
+                    and param.dtype == torch.bfloat16
+                    and 2 * param.nbytes >= self.args.update_weight_buffer_size
+                ):
+                    # The PP broadcast already populated this temporary buffer.
+                    # TP=1 needs no second full-sized copy for ordinary layouts.
+                    gathered = all_gather_param(self.args, info.name, param, reuse_tp1_buffer=True)
+                else:
+                    gathered = all_gather_param(self.args, info.name, param)
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 
@@ -1209,7 +1233,7 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group,
     return result
 
 
-def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=False):
+def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=False, yield_large_singletons=False):
     """Chunk weights by size while keeping fused weight pairs together.
 
     SGLang fuses ``q_a_proj`` + ``kv_a_proj_with_mqa`` into
@@ -1242,7 +1266,7 @@ def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=Fals
 
                 bucket.extend(pair)
                 bucket_size += pair_size
-                if yield_full_buckets:
+                if yield_full_buckets or yield_large_singletons:
                     del pair, partner_tensor
             else:
                 pending_pairs[pair_key] = (name, tensor)
@@ -1256,12 +1280,20 @@ def _chunk_with_mla_pairing(named_params, chunk_size, *, yield_full_buckets=Fals
             bucket.append((name, tensor))
             bucket_size += obj_size
 
-        if yield_full_buckets:
-            # A full bucket would be flushed before any following tensor or pair.
-            if bucket and bucket_size >= chunk_size:
-                yield bucket
-                bucket = []
-                bucket_size = 0
+        # Retained quantized export sends large ordinary tensors before asking
+        # Bridge to allocate the next one. Fused dependencies stay together.
+        large_singleton = (
+            yield_large_singletons
+            and pair_key is None
+            and len(bucket) == 1
+            and tensor.dtype == torch.bfloat16
+            and 2 * bucket_size >= chunk_size
+        )
+        if (yield_full_buckets and bucket and bucket_size >= chunk_size) or large_singleton:
+            yield bucket
+            bucket = []
+            bucket_size = 0
+        if yield_full_buckets or yield_large_singletons:
             del tensor
 
     for pair_key, (name, tensor) in pending_pairs.items():

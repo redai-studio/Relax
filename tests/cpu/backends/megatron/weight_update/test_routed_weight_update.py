@@ -164,7 +164,54 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
             engine.update_weight_version.remote.assert_called_once_with(weight_version="1")
 
 
-def test_retained_sync_fences_before_closing_receiver_session(module):
+@pytest.mark.parametrize(
+    "sender,receiver,server_quantization,has_fence,enabled",
+    [
+        ("compressed-tensors", "compressed-tensors", None, True, True),
+        ("fp8", "fp8", "fp8", True, True),
+        ("gptq", "gptq", "gptq", True, False),
+        ("fp8", "compressed-tensors", None, True, False),
+        ("fp8", "fp8", "gptq", True, False),
+        ("compressed-tensors", "compressed-tensors", None, False, False),
+    ],
+)
+def test_retained_sync_requires_matching_native_quantization(
+    module, sender, receiver, server_quantization, has_fence, enabled
+):
+    from types import SimpleNamespace
+
+    engine = Mock()
+    engine.get_expert_weight_sync_layout.remote.return_value = {
+        "device": "cuda",
+        "tp_size": 1,
+        "quantization": server_quantization,
+        "quantization_config": {"quant_method": receiver},
+        "custom_weight_loader": [module.NATIVE_SYNC_FENCE_LOADER] if has_fence else [],
+    }
+    updater = object.__new__(module.UpdateWeightFromTensor)
+    updater.actor_weight_retention_requested = True
+    updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = False
+    updater.lora_enabled = updater._route_experts = False
+    updater.quantization_config = {"quant_method": sender}
+    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
+    updater.rollout_engines = [engine]
+    with (
+        patch.object(module.ray, "get", side_effect=lambda refs: refs),
+        patch.object(module.dist, "get_rank", return_value=0),
+        patch.object(module.dist, "get_world_size", return_value=1),
+        patch.object(module.dist, "broadcast_object_list"),
+        patch.object(module.dist, "all_gather_object", side_effect=lambda out, local, **kw: out.__setitem__(0, local)),
+        patch.object(module, "get_gloo_group"),
+    ):
+        updater._check_receivers_for_actor_weight_retention(["node"], ["node"], [1], [0])
+    assert updater.actor_weight_retention_enabled is enabled
+
+
+@pytest.mark.parametrize(
+    "quant_method,failed_stage",
+    [(None, None), ("fp8", None), ("compressed-tensors", None), ("compressed-tensors", "repack")],
+)
+def test_retained_sync_fences_before_closing_receiver_session(module, quant_method, failed_stage):
     from types import SimpleNamespace
 
     events = []
@@ -183,15 +230,33 @@ def test_retained_sync_fences_before_closing_receiver_session(module):
     updater._route_experts = False
     updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = True
     updater.lora_enabled = updater.lora_adapter_mode = False
-    updater.quantization_config = None
+    updater.quantization_config = {"quant_method": quant_method} if quant_method else None
     updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
     updater.rollout_engines, updater.distributed_rollout_engines = [engine], []
     updater.weight_version = 0
     updater.weights_getter = lambda: {}
     updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=lambda weights: iter([[("weight", object())]]))
-    updater._send_hf_params = lambda tensors, **kw: ([{"success": True}], None)
+    weight_ack = {"success": True}
+
+    def get(refs):
+        if isinstance(refs, list) and any(ref is weight_ack for ref in refs):
+            events.append(("data_ack", {}))
+        return refs
+
+    def post_process(**kwargs):
+        stage = "restore" if kwargs["restore_weights_before_load"] else "repack"
+        assert kwargs["post_process_quantization"] == (stage == "repack")
+        events.append((stage, kwargs))
+        return {"success": stage != failed_stage}
+
+    def send(tensors, **kwargs):
+        events.append(("send", {}))
+        return [weight_ack], None
+
+    engine.post_process_weights.remote.side_effect = post_process
+    updater._send_hf_params = send
     with (
-        patch.object(module.ray, "get", side_effect=lambda refs: refs),
+        patch.object(module.ray, "get", side_effect=get),
         patch.object(module.MultiprocessingSerializer, "serialize", return_value="empty"),
         patch.object(module.dist, "get_rank", return_value=0),
         patch.object(module.dist, "all_reduce"),
@@ -201,18 +266,38 @@ def test_retained_sync_fences_before_closing_receiver_session(module):
         patch.object(module, "get_gloo_group"),
         patch.object(module.device_utils, "maybe_backend_barrier_on_weight_chunk"),
     ):
-        updater.update_weights()
-    assert [method for method, _ in events] == [
-        "pause_generation",
-        "flush_cache",
-        "begin_weight_update",
-        "update_weights_from_tensor",
-        "end_weight_update",
-    ]
-    assert events[3][1]["load_format"] == module.NATIVE_SYNC_FENCE_LOADER
+        if failed_stage:
+            with pytest.raises(RuntimeError, match="Routed weight load failed"):
+                updater.update_weights()
+        else:
+            updater.update_weights()
+    expected = ["pause_generation", "flush_cache"]
+    if quant_method == "compressed-tensors":
+        expected.append("restore")
+    expected.extend(["begin_weight_update", "send", "data_ack"])
+    if quant_method == "compressed-tensors":
+        expected.append("repack")
+    if not failed_stage:
+        expected.extend(["update_weights_from_tensor", "end_weight_update"])
+        engine.update_weights_from_tensor.remote.assert_called_once_with(
+            serialized_named_tensors=["empty"], load_format=module.NATIVE_SYNC_FENCE_LOADER, flush_cache=False
+        )
+    assert [method for method, _ in events] == expected
+    engine.continue_generation.remote.assert_not_called()
 
 
-@pytest.mark.parametrize("mode", ["retained", "retained_pending", "noop_gpu", "bf16_expert_hf"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "retained",
+        "retained_pending",
+        "retained_quantized",
+        "retained_quantized_pending",
+        "noop_gpu",
+        "noop_quantized",
+        "bf16_expert_hf",
+    ],
+)
 def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch, mode):
     from types import SimpleNamespace
 
@@ -221,15 +306,21 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
     from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
 
     events = []
+    inflight = set()
+    inflight_before_send = []
     budget = 8
     cuda = torch.device("cuda", 0)
+    quantized = "quantized" in mode
+    backup_pending = mode.endswith("_pending")
     info = [
-        SimpleNamespace(name=name, attrs={"tensor_model_parallel": True}, size=8) for name in ("embedding", "head")
+        SimpleNamespace(name=name, attrs={"tensor_model_parallel": True}, size=8, dtype=torch.bfloat16)
+        for name in ("embedding", "head")
     ]
     standalone = mode == "bf16_expert_hf"
     iterator = object.__new__(bridge.HfWeightIteratorBridge)
     iterator.args = SimpleNamespace(colocate=True, update_weight_buffer_size=budget)
     iterator._expert_router = iterator._direct_expert_layout = None
+    iterator.quantization_config = {"quant_method": "fp8"} if quantized else None
     iterator._bf16_expert_buckets = [[info[0]]] if standalone else None
     iterator._packed_expert_sync = iterator.lora_merge_mode = False
     iterator._expert_buckets = iterator._expert_broadcast_caches = []
@@ -246,23 +337,30 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
     def gather(pairs, *, gdn_split_sizes, contiguous_output_min_bytes=None):
         ((param, _),) = pairs
         events.append(("gather", param.name, contiguous_output_min_bytes))
-        return [torch.zeros(4)]
+        return [torch.zeros(4, dtype=torch.bfloat16)]
 
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater._hf_weight_iterator = iterator
     updater._route_experts = updater.use_distribute = updater.lora_enabled = False
-    updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = mode != "noop_gpu"
-    updater.quantization_config = None
+    updater.actor_weight_retention_enabled = updater.actor_weight_retention_active = not mode.startswith("noop_")
+    updater.quantization_config = iterator.quantization_config
     updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
     updater.weights_getter = lambda: {"backing": SimpleNamespace(device=cuda)}
     updater.rollout_engines = updater.distributed_rollout_engines = []
     updater.weight_version = 0
     updater._routed_engine_call = Mock()
-    updater._wait_for_ipc = Mock()
+
+    def wait(refs, *, error=None):
+        inflight.difference_update(refs)
+
+    updater._wait_for_ipc = wait
 
     def send(chunk, *, dispatch_errors):
         events.append(("send", *(name for name, _ in chunk)))
-        return [], None
+        refs = [chunk[0][0]]
+        inflight_before_send.append(len(inflight))
+        inflight.update(refs)
+        return refs, None
 
     updater._send_hf_params = send
     monkeypatch.setenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", "1")
@@ -273,7 +371,7 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
     monkeypatch.setattr(module.device_utils, "maybe_backend_barrier_on_weight_chunk", Mock())
     monkeypatch.setattr(module.MultiprocessingSerializer, "serialize", Mock(return_value="fence"))
     monkeypatch.setattr(bridge.device_utils, "make_current_torch_device", lambda: cuda)
-    monkeypatch.setattr(bridge.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(bridge.mpu, "get_tensor_model_parallel_world_size", lambda: 1 if quantized else 2)
     monkeypatch.setattr(bridge, "_load_and_broadcast", lambda *args, **kwargs: [torch.zeros(2)])
     monkeypatch.setattr(bridge, "all_gather_params_async", gather)
     monkeypatch.setattr(torch.version, "hip", None)
@@ -281,28 +379,66 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append(("trim",)))
 
     backup_done = Mock()
-    backup_done.query.side_effect = [False, True] if mode == "retained_pending" else [True]
+    backup_done.query.side_effect = [False, True] if backup_pending else [True]
     updater.update_weights(backup_done=backup_done)
+    assert not inflight
 
-    if mode in ("retained", "retained_pending"):
+    if mode.startswith("retained"):
+        contiguous_min_bytes = None if quantized else budget
         expected = [
-            ("gather", "embedding", budget),
+            ("gather", "embedding", contiguous_min_bytes),
             ("send", "embedding"),
-            ("gather", "head", budget),
+            ("gather", "head", contiguous_min_bytes),
             ("send", "head"),
         ]
-        expected.insert(2 if mode == "retained_pending" else 0, ("trim",))
+        expected.insert(2 if backup_pending else 0, ("trim",))
         assert events == expected
-        assert backup_done.query.call_count == (2 if mode == "retained_pending" else 1)
+        assert backup_done.query.call_count == (2 if backup_pending else 1)
+        assert inflight_before_send == [0, 1]
     else:
         backup_done.query.assert_not_called()
-        assert events[:4] == [
+        expected = [
             ("gather", "embedding", None),
             ("gather", "head", None),
             ("send", "embedding"),
             ("send", "head"),
         ]
-        assert events[4:] == ([("send", "experts.weight")] if standalone else [])
+        if mode == "noop_quantized":
+            assert inflight_before_send == [0, 1]
+        if standalone:
+            expected.append(("send", "experts.weight"))
+        assert events == expected
+
+
+def test_retained_quantized_large_tensor_flush_preserves_fused_pair(module):
+    import torch
+
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _chunk_with_mla_pairing
+
+    first = "layers.0.attn.compressor.wkv.weight"
+    second = "layers.0.attn.compressor.wgate.weight"
+    tensor = torch.zeros(4, dtype=torch.bfloat16)
+    weights = [(first, tensor), ("embedding", tensor), (second, tensor)]
+    buckets = _chunk_with_mla_pairing(weights, chunk_size=12, yield_large_singletons=True)
+    assert [[name for name, _ in chunk] for chunk in buckets] == [["embedding"], [first, second]]
+
+
+@pytest.mark.parametrize("shareable,transposed", [(True, False), (False, False), (True, True)])
+def test_native_large_bf16_singleton_can_use_export_storage(module, shareable, transposed):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import torch
+
+    tensor = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    if transposed:
+        tensor = tensor.T
+    allocator = SimpleNamespace(source_allocations_shareable=shareable, allocation=nullcontext)
+    payload = module._pack_native_bucket([("weight", tensor)], allocator, reuse_singleton_min_bytes=12)
+    aliases = payload["flattened_tensor"].untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+    assert aliases == (shareable and not transposed)
+    [(name, restored)] = module.FlattenedTensorBucket(**payload).reconstruct_tensors()
+    assert name == "weight" and torch.equal(restored, tensor)
 
 
 @pytest.mark.parametrize("version", [None, 3])

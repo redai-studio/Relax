@@ -30,7 +30,7 @@ from relax.utils.megatron_peft_utils import (
 )
 from relax.utils.reloadable_process_group import retain_process_groups
 
-from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from ..sglang import FlattenedTensorBucket, FlattenedTensorMetadata, MultiprocessingSerializer
 from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice_chunk
 from .expert_routing import ExpertLayout, validate_bf16_server_layout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -496,9 +496,8 @@ class UpdateWeightFromTensor:
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
         conversion + serialization + Gloo gather.  At most two chunks'
         GPU tensors are alive simultaneously (bounded by
-        ``update_weight_buffer_size``). Routed expert mode instead completes
-        each IPC before advancing the iterator, so conversion failures cannot
-        release buffers that a receiver is still reading.
+        ``update_weight_buffer_size``). Routed experts complete each IPC before
+        advancing the iterator to agree on failures before the next collective.
 
         In LoRA merge mode the adapters are folded into the base weights during
         HF export so the rollout engine serves one merged model; otherwise all
@@ -529,8 +528,16 @@ class UpdateWeightFromTensor:
                     post_process_quantization=False,
                 )
         elif self._has_retained_actor_weights():
-            for method in ("pause_generation", "flush_cache", "begin_weight_update"):
+            for method in ("pause_generation", "flush_cache"):
                 self._routed_engine_call(all_engines, method)
+            if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
+                self._routed_engine_call(
+                    all_engines,
+                    "post_process_weights",
+                    restore_weights_before_load=True,
+                    post_process_quantization=False,
+                )
+            self._routed_engine_call(all_engines, "begin_weight_update")
         elif rank == 0:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
             ray.get([engine.flush_cache.remote() for engine in all_engines])
@@ -569,17 +576,18 @@ class UpdateWeightFromTensor:
             export_ctx = nullcontext()
 
         iterator = self._hf_weight_iterator
-        retained_ordinary_ipc = False
+        retained_bridge_ipc = False
         if self._has_retained_actor_weights() and not self._route_experts:
             from .hf_weight_iterator_bridge import HfWeightIteratorBridge
 
-            retained_ordinary_ipc = (
+            retained_bridge_ipc = (
                 isinstance(iterator, HfWeightIteratorBridge)
                 and not self.use_distribute
                 and getattr(self, "_direct_expert_layout", None) is None
                 and iterator._bf16_expert_buckets is None
                 and iterator._expert_router is None
             )
+        retained_ordinary_ipc = retained_bridge_ipc and not self.quantization_config
 
         # Pipeline: when chunk N's IPC refs are in-flight on the engine,
         # chunk N+1's HF conversion + serialize + gather can proceed in
@@ -593,9 +601,9 @@ class UpdateWeightFromTensor:
             with export_ctx:
                 hf_chunks = (
                     iterator.get_hf_weight_chunks(
-                        megatron_local_weights, retained_ordinary_ipc=True, backup_done=backup_done
+                        megatron_local_weights, retained_ordinary_ipc=retained_ordinary_ipc, backup_done=backup_done
                     )
-                    if retained_ordinary_ipc
+                    if retained_bridge_ipc
                     else iterator.get_hf_weight_chunks(megatron_local_weights)
                 )
                 for hf_named_tensors in hf_chunks:
@@ -603,9 +611,6 @@ class UpdateWeightFromTensor:
                     current_refs, long_lived_tensors = self._send_hf_params(
                         hf_named_tensors, dispatch_errors=dispatch_errors
                     )
-                    # Routed export agrees on failures before advancing its
-                    # collective generator. Ordinary export keeps two chunks
-                    # overlapped, including the previous chunk's storage.
                     if self._route_experts:
                         self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
                         current_refs = []
@@ -621,8 +626,8 @@ class UpdateWeightFromTensor:
                     prev_refs, current_refs = current_refs, []
                     if self._route_experts:
                         prev_long_lived_tensors = long_lived_tensors = None
-                    if self._route_experts or retained_ordinary_ipc:
-                        # Ordinary IPC owns the flattened copy in prev_long_lived_tensors.
+                    if self._route_experts or retained_bridge_ipc:
+                        # The IPC payload keeps its backing storage alive until ACK.
                         del hf_named_tensors
                     device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
                 self._wait_for_ipc(prev_refs)
@@ -653,6 +658,13 @@ class UpdateWeightFromTensor:
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
             self._routed_engine_call(all_engines, "continue_generation")
         elif self._has_retained_actor_weights():
+            if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
+                self._routed_engine_call(
+                    all_engines,
+                    "post_process_weights",
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                )
             serialized_empty = [
                 MultiprocessingSerializer.serialize([], output_str=True)
             ] * self.args.rollout_num_gpus_per_engine
@@ -716,10 +728,16 @@ class UpdateWeightFromTensor:
         dist.broadcast_object_list(status, src=0, group=group)
         receivers, reason = status[0]
         reason = reason or validate_sglang_weight_sync_support(
-            actor_nodes, engine_nodes, counts, offsets, receivers, self.args.rollout_num_gpus_per_engine
+            actor_nodes,
+            engine_nodes,
+            counts,
+            offsets,
+            receivers,
+            self.args.rollout_num_gpus_per_engine,
+            quantization_config=self.quantization_config,
         )
-        if self.quantization_config or (self.lora_enabled and self.lora_adapter_mode) or self._route_experts:
-            reason = "quantization, LoRA adapters or explicit expert routing requires the original lifecycle"
+        if (self.lora_enabled and self.lora_adapter_mode) or self._route_experts:
+            reason = "LoRA adapters or explicit expert routing requires the original lifecycle"
         enabled = agree_actor_weight_retention(
             reason,
             group,
@@ -1040,6 +1058,10 @@ class UpdateWeightFromTensor:
             if self._ipc_allocator_version != self.weight_version:
                 self._ipc_bucket_allocator = IpcBucketAllocator(make_current_torch_device())
                 self._ipc_allocator_version = self.weight_version
+            retaining = self._has_retained_actor_weights()
+            reuse_singleton_min_bytes = None
+            if retaining and self.quantization_config and not self._route_experts and not self.use_distribute:
+                reuse_singleton_min_bytes = (self.args.update_weight_buffer_size + 1) // 2
             refs_colocated, long_lived_tensors = _send_to_colocated_engine(
                 hf_named_tensors,
                 ipc_engine=self._ipc_engine,
@@ -1049,7 +1071,8 @@ class UpdateWeightFromTensor:
                 weight_version=None if self._route_experts else self.weight_version,
                 dispatch_errors=dispatch_errors,
                 direct_layout=getattr(self, "_direct_expert_layout", None),
-                pack_error_group=get_gloo_group() if self._has_retained_actor_weights() else None,
+                pack_error_group=get_gloo_group() if retaining else None,
+                reuse_singleton_min_bytes=reuse_singleton_min_bytes,
             )
             all_refs.extend(refs_colocated)
 
@@ -1098,6 +1121,7 @@ def _send_to_colocated_engine(
     dispatch_errors: list[str] | None = None,
     direct_layout: DirectExpertLayout | None = None,
     pack_error_group=None,
+    reuse_singleton_min_bytes: int | None = None,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -1151,13 +1175,7 @@ def _send_to_colocated_engine(
             if direct_chunk is not None:
                 payload, load_format = named_tensors, direct_format
             else:
-                # Bucket-owned allocations use ordinary CUDA storage for inexpensive IPC.
-                with bucket_allocator.allocation():
-                    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-                payload = {
-                    "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-                    "metadata": flattened_tensor_bucket.get_metadata(),
-                }
+                payload = _pack_native_bucket(named_tensors, bucket_allocator, reuse_singleton_min_bytes)
                 load_format = "flattened_bucket"
             long_live_tensors.append(payload)
             serialized = MultiprocessingSerializer.serialize(payload, output_str=True)
@@ -1189,6 +1207,32 @@ def _send_to_colocated_engine(
             _drain_ipc_refs(refs)
             raise RuntimeError(f"Weight dispatch failed: {errors}")
     return refs, long_live_tensors
+
+
+def _pack_native_bucket(named_tensors, bucket_allocator, reuse_singleton_min_bytes):
+    with bucket_allocator.allocation():
+        if (
+            reuse_singleton_min_bytes is not None
+            and FlattenedTensorMetadata is not None
+            and bucket_allocator.source_allocations_shareable
+            and len(named_tensors) == 1
+        ):
+            name, tensor = named_tensors[0]
+            if (
+                tensor.dtype == torch.bfloat16
+                and tensor.is_contiguous()
+                and tensor.nbytes >= reuse_singleton_min_bytes
+            ):
+                # The native receiver still sees the same flattened format.
+                # The retained sender keeps this view alive until the bucket ACK.
+                return {
+                    "flattened_tensor": tensor.reshape(-1).view(torch.uint8),
+                    "metadata": [
+                        FlattenedTensorMetadata(name, tensor.shape, tensor.dtype, 0, tensor.nbytes, tensor.nbytes)
+                    ],
+                }
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+    return {"flattened_tensor": bucket.get_flattened_tensor(), "metadata": bucket.get_metadata()}
 
 
 def _empty_flattened_tensor_data(device):
