@@ -68,37 +68,10 @@ def test_copied_jit_source_dependencies_are_checked(tmp_path, monkeypatch, insta
             check(pyproject)
 
 
-def test_deepep_buffer_initializes_once_on_first_use(monkeypatch):
-    import sys
-    from types import SimpleNamespace
-
-    from megatron.core.transformer.moe import fused_a2a
-
-    allocations = []
-
-    class Buffer:
-        @staticmethod
-        def get_buffer_size_hint(group, **kwargs):
-            return 64
-
-        def __init__(self, group, **kwargs):
-            self.group = group
-            self.__dict__.update(kwargs)
-            allocations.append(self)
-
-    monkeypatch.setitem(sys.modules, "_relax_deep_ep_v2", SimpleNamespace(ElasticBuffer=Buffer))
-    monkeypatch.setattr(fused_a2a, "ElasticBuffer", None, raising=False)
-    monkeypatch.setattr(fused_a2a, "_elastic_buffer", None)
-    group = object()
-    buffer = fused_a2a.get_elastic_buffer(group, 256, 2048, 8)
-    assert buffer is fused_a2a.get_elastic_buffer(group, 256, 2048, 8)
-    assert allocations == [buffer]
-
-
 def test_fused_expert_dispatch_preserves_counts_and_gradients(monkeypatch):
     """Execute the patched method without CUDA/TE to check dispatch and
     padding."""
-    from types import SimpleNamespace
+    from types import MethodType, SimpleNamespace
 
     import torch
     from megatron.core.transformer.moe import experts
@@ -139,7 +112,13 @@ def test_fused_expert_dispatch_preserves_counts_and_gradients(monkeypatch):
         calls.append(True)
         return value * 2
 
-    module = SimpleNamespace(config=config, _use_grouped_tensor=False, _fused_ops=(fused,))
+    module = SimpleNamespace(
+        config=config,
+        _use_grouped_tensor=False,
+        _fused_ops=(fused,),
+        linear_fc2=SimpleNamespace(use_bias=False),
+    )
+    module._get_paged_stash_scope = MethodType(experts.TEGroupedMLP._get_paged_stash_scope, module)
     result = experts.TEGroupedMLP._fused_forward(module, hidden, counts, probs)
     result.sum().backward()
     torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 2))

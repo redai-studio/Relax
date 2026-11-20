@@ -3,9 +3,10 @@
 # GPU_ARCH selects the target: gfx950 (MI350X/MI355X, default) or gfx942 (MI300X/MI325X).
 # The base is SGLang's official ROCm 10 image (docker/rocm.Dockerfile, SGL_BRANCH=v0.5.21,
 # GPU_ARCH=<arch>-rocm1000): Ubuntu 24.04, ROCm 10 SDK wheels, torch 2.11, aiter and SGLang.
-# SGLang, the router and Megatron receive the same Relax patches as Dockerfile.cu13, plus the ROCm
-# fix in docker/patch/rocm. Transformer Engine, apex and flash-attn come from the prebuilt wheels
-# of radixark/miles' ROCm image (docker/Dockerfile.rocm, variants rocm10-mi35x/mi30x).
+# SGLang and the router share the Relax patches used by Dockerfile.cu13. SGLang also applies
+# the fix in docker/patch/rocm. Megatron uses docker/patch/megatron/20260915-4a4de8657.patch
+# for the pinned ROCm Bridge/Core checkout. Transformer Engine, apex and flash-attn come
+# from prebuilt wheels of radixark/miles' ROCm image (variants rocm10-mi35x/mi30x).
 ARG GPU_ARCH=gfx950
 ARG BASE_IMAGE_GFX950=lmsysorg/sglang:v0.5.21-rocm10-mi35x@sha256:69616267bbeac9c70b69463a9a900e8101dcffa26f5d3fc321e769cb307c78be
 ARG BASE_IMAGE_GFX942=lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d

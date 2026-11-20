@@ -592,6 +592,14 @@ def get_batch(
         tokens = torch.cat(
             [slice_with_cp(t, pad_token_id, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank) for t in padded_tokens]
         ).unsqueeze(0)
+        if valid_lengths != padded_lengths:
+            positions = torch.arange(max_seqlen, device=batch_device)
+            batch["padding_mask"] = torch.cat(
+                [
+                    slice_with_cp(positions[:padded] >= valid, True, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank)
+                    for valid, padded in zip(valid_lengths, padded_lengths, strict=True)
+                ]
+            ).unsqueeze(0)
         pad = 0
 
     elif qkv_format == "thd":

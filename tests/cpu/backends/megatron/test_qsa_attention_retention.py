@@ -263,6 +263,34 @@ def test_hybrid_mtp_forward_preserves_checkpoint_policy_and_metadata(retention, 
     assert calls == expected_calls
 
 
+@pytest.mark.parametrize("gated_mixer", [True, False])
+def test_mtp_postprocess_contracts_residual_streams_once(gated_mixer):
+    from megatron.core.transformer.hyper_connection import GatedResidualOutputMixer
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+    config = SimpleNamespace(
+        hidden_size=4,
+        num_residual_streams=2,
+        mhc_num_residual_streams=2,
+        mhc_gated_residual_rank=2,
+        mhc_learned_output_contract=False,
+        params_dtype=torch.float32,
+        layernorm_epsilon=1e-5,
+        perform_initialization=False,
+        sequence_parallel=False,
+    )
+    norm = GatedResidualOutputMixer(config) if gated_mixer else torch.nn.Identity()
+    layer = SimpleNamespace(config=config, mhc_enabled=True, final_layernorm=norm)
+    hidden = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8).requires_grad_()
+
+    output = MultiTokenPredictionLayer._postprocess(layer, hidden)
+    expected = norm(hidden) if gated_mixer else hidden.unflatten(-1, (2, 4)).mean(dim=-2)
+
+    assert output.shape == (2, 1, config.hidden_size)
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(torch.autograd.grad(output.sum(), hidden), torch.autograd.grad(expected.sum(), hidden))
+
+
 def test_checkpoint_closures_keep_each_microbatch_metadata(retention, monkeypatch):
     original = Mock(return_value="output")
     layer = SimpleNamespace(

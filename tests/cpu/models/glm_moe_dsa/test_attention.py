@@ -244,9 +244,15 @@ def test_glm_full_recompute_preserves_two_microbatch_outputs_and_gradients(atten
     block = TransformerBlock.__new__(TransformerBlock)
     nn.Module.__init__(block)
     block.config = SimpleNamespace(
-        recompute_method="uniform", recompute_num_layers=1, fp8=None, fp4=None, distribute_saved_activations=False
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        fp8=None,
+        fp4=None,
+        distribute_saved_activations=False,
+        enable_mhc_connections=False,
     )
     block.layers = nn.ModuleList([Layer(layer) for layer in layers])
+    block.pg_collection = SimpleNamespace(tp=None)
     block.num_layers_per_pipeline_rank = len(layers)
     batches = []
     for _ in range(2):

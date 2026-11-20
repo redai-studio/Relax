@@ -95,13 +95,18 @@ def _expert_registry(qwen35: bool):
         "model.language_model.layers.0.mlp.experts.down_proj",
     ]
     source = SimpleNamespace(get_all_keys=lambda: keys)
-    bridge = SimpleNamespace(hf_pretrained=SimpleNamespace(state=SimpleNamespace(source=source)))
+    bridge = SimpleNamespace(
+        hf_pretrained=SimpleNamespace(state=SimpleNamespace(source=source)),
+        hf_config=SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=28)),
+    )
     bridge_cls = Qwen35VLMoEBridge if qwen35 else Qwen3VLMoEBridge
     return bridge_cls.mapping_registry(bridge)
 
 
 def _expert_mapping(layer_idx: int, expert_id: int, fc: int, qwen35: bool = False):
-    name = f"language_model.decoder.layers.{layer_idx}.mlp.experts.linear_fc{fc}.weight{expert_id}"
+    # Qwen3.5 Hybrid splits each HF block into attention and FFN positions.
+    megatron_layer = 2 * layer_idx + 1 if qwen35 else layer_idx
+    name = f"language_model.decoder.layers.{megatron_layer}.mlp.experts.linear_fc{fc}.weight{expert_id}"
     mapping = _expert_registry(qwen35).megatron_to_hf_lookup(name)
     expected_type = FusedGatedExpertMapping if fc == 1 else FusedExpertMapping
     assert isinstance(mapping, expected_type)
@@ -633,8 +638,9 @@ class TestQwen35PostProcessingCorrectness:
             mapping = _make_qwen35_expert_gate_up_mapping(layer_idx=0, expert_id=expert_id)
             bridge_output = mapping.megatron_to_hf(megatron_param, None)
 
-        megatron_name = f"language_model.decoder.layers.0.mlp.experts.linear_fc1.weight{expert_id}"
-        postprocessed = _convert_mapping_output(bridge_output, megatron_name, bridge_expert_transposes_down=False)
+        postprocessed = _convert_mapping_output(
+            bridge_output, mapping.megatron_param, bridge_expert_transposes_down=False
+        )
 
         assert len(postprocessed) == 2
         assert postprocessed[0][0].endswith(f".experts.{expert_id}.gate_proj.weight")
@@ -654,8 +660,9 @@ class TestQwen35PostProcessingCorrectness:
             mapping = _make_qwen35_expert_down_mapping(layer_idx=0, expert_id=expert_id)
             bridge_output = mapping.megatron_to_hf(megatron_param, None)
 
-        megatron_name = f"language_model.decoder.layers.0.mlp.experts.linear_fc2.weight{expert_id}"
-        postprocessed = _convert_mapping_output(bridge_output, megatron_name, bridge_expert_transposes_down=False)
+        postprocessed = _convert_mapping_output(
+            bridge_output, mapping.megatron_param, bridge_expert_transposes_down=False
+        )
 
         assert len(postprocessed) == 1
         assert postprocessed[0][0].endswith(f".experts.{expert_id}.down_proj.weight")

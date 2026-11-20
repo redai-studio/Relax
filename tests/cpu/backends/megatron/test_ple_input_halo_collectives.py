@@ -178,9 +178,12 @@ def _check_block_interleaving(rank, *, implementation):
             recompute_method="uniform",
             recompute_num_layers=1,
             distribute_saved_activations=False,
+            enable_mhc_connections=False,
         ),
         pre_process=False,
         num_layers_per_pipeline_rank=1,
+        pg_collection=SimpleNamespace(tp=None),
+        layers=[layer],
         _get_layer=lambda index: layer,
     )
     pending = []
@@ -278,8 +281,11 @@ def test_native_checkpoint_without_ple():
             recompute_method="uniform",
             recompute_num_layers=1,
             distribute_saved_activations=False,
+            enable_mhc_connections=False,
         ),
         num_layers_per_pipeline_rank=1,
+        pg_collection=SimpleNamespace(tp=None),
+        layers=[layer],
         _get_layer=lambda index: layer,
     )
     x = torch.tensor([2.0, 3.0], requires_grad=True)

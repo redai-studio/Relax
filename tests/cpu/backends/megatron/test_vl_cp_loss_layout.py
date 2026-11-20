@@ -278,6 +278,72 @@ def test_glm_cp_vision_matches_full_insertion_and_gradients():
         torch.testing.assert_close(grad, expected)
 
 
+def test_glm_packed_cp_excludes_alignment_padding_from_moe_aux_loss(monkeypatch):
+    try:
+        from megatron.bridge.models.glm5next.glm53flash_bridge import GLM53FlashModel
+        from megatron.core.transformer.moe.moe_utils import (
+            compute_routing_scores_for_aux_loss,
+            get_tokens_per_expert_and_token_count,
+            switch_load_balancing_loss_func,
+        )
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"Requires the pinned GLM Bridge runtime: {exc}")
+
+    args = Namespace(glm53_packed_cp=True, qkv_format="thd", loss_type="sft")
+    monkeypatch.setattr(data, "get_args", lambda: args)
+    monkeypatch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: 2)
+    # Real token ID zero and unsupervised prompt tokens must both reach the router.
+    documents = [torch.arange(5), torch.arange(11, 28)]
+    valid_indices = torch.cat((torch.arange(5), torch.arange(16, 33)))
+    logits = torch.randn(48, 4, generator=torch.Generator().manual_seed(13), requires_grad=True)
+
+    def aux_loss(logits, padding_mask=None):
+        routing, scores = compute_routing_scores_for_aux_loss(logits, 2, "sigmoid", padding_mask=padding_mask)
+        counts, _, total = get_tokens_per_expert_and_token_count(
+            routing, reduce_group=(), topk=2, with_padding_mask=padding_mask is not None
+        )
+        assert total == 22
+        return switch_load_balancing_loss_func(scores, counts, total, 2, 4, 0.1)
+
+    model = GLM53FlashModel.__new__(GLM53FlashModel)
+    torch.nn.Module.__init__(model)
+    model.pre_process = False
+    model.language_model = SimpleNamespace(forward=lambda input_ids, padding_mask, **_: (input_ids, padding_mask))
+    rank_indices = (
+        torch.cat((torch.arange(4), torch.arange(12, 24), torch.arange(40, 48))),
+        torch.cat((torch.arange(4, 12), torch.arange(24, 40))),
+    )
+    local_logits, local_masks = [], []
+    for rank, indices in enumerate(rank_indices):
+        monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda r=rank: r)
+        monkeypatch.setattr(model, "_packed_cp_index", lambda *_: indices)
+        batch = dict(
+            tokens=documents,
+            total_lengths=[5, 17],
+            response_lengths=[5, 17],
+            loss_masks=[torch.tensor([0, 0, 1, 1, 1]), torch.zeros(17, dtype=torch.int)],
+        )
+        packed = data.get_batch(iter([(batch, None)]), list(batch), pack_device=torch.device("cpu"))
+        input_ids, padding_mask = model(
+            input_ids=packed["unsplit_tokens"],
+            packed_seq_params=packed["vlm_packed_seq_params"],
+            padding_mask=packed["padding_mask"],
+        )
+        torch.testing.assert_close(input_ids, packed["tokens"])
+        torch.testing.assert_close(padding_mask.squeeze(0), ~torch.isin(indices, valid_indices))
+        local_logits.append(logits.index_select(0, indices))
+        local_masks.append(padding_mask.squeeze(0))
+
+    actual = aux_loss(torch.cat(local_logits), torch.cat(local_masks))
+    expected = aux_loss(logits.index_select(0, valid_indices))
+    torch.testing.assert_close(actual, expected)
+    actual_grad = torch.autograd.grad(actual, logits)[0]
+    expected_grad = torch.autograd.grad(expected, logits)[0]
+    torch.testing.assert_close(actual_grad, expected_grad)
+    assert actual_grad[0].abs().sum() > 0
+
+
 def test_glm_frozen_tp_vision_shards_complete_images_and_keeps_order(monkeypatch):
     try:
         from megatron.bridge.models.glm5next.glm53flash_bridge import GLM53FlashModel

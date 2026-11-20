@@ -65,7 +65,7 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
         model_bytes = sum(parameter.numel() * parameter.element_size() for parameter in source.parameters())
         assert model_bytes < 1024**2
         models, optimizers = [], []
-        for _ in range(2):
+        for offloaded in (False, True):
             model = TinyMLP().to(device="cuda", dtype=torch.bfloat16)
             model.load_state_dict(source.state_dict())
             for parameter in model.parameters():
@@ -100,8 +100,8 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
                     main_grads_dtype=torch.float32,
                     exp_avg_dtype=torch.float32,
                     exp_avg_sq_dtype=torch.float32,
-                    chunked_optimizer_state_offload=True,
-                    optimizer_state_offload_fraction=1.0,
+                    chunked_optimizer_state_offload=offloaded,
+                    optimizer_state_offload_fraction=1.0 if offloaded else 0.0,
                     optimizer_state_offload_chunk_size_mb=0,
                 ),
                 [ddp],
@@ -111,13 +111,11 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
             child = optimizer.chained_optimizers[0]
             assert isinstance(child, DistributedOptimizer)
             assert isinstance(child.optimizer, FusedAdam)
-            assert child.optimizer.master_weights and child._optimizer_state_offloader is not None
+            assert child.optimizer.master_weights
+            assert (child._optimizer_state_offloader is not None) == offloaded
             models.append(ddp)
             optimizers.append(optimizer)
 
-        # Both paths retain chunked state execution. Only the baseline omits the
-        # newly connected optimizer-to-forward master offload lifecycle call.
-        monkeypatch.setattr(optimizers[0], "offload_optimizer_state_for_forward", Mock())
         args = Namespace(
             empty_unused_memory_level=0,
             custom_megatron_before_train_step_hook_path=None,
@@ -139,13 +137,18 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
         context = {}
         losses = [[], []]
 
+        def assert_residency(variant: int) -> None:
+            optimizer = optimizers[variant].chained_optimizers[0]
+            states = optimizer.optimizer.state.values()
+            assert states
+            for state in states:
+                for key in ("master_param", "exp_avg", "exp_avg_sq"):
+                    assert state[key].device.type == ("cuda" if variant == 0 else "cpu")
+
         def forward_backward(**_):
             variant, step = context["variant"], context["step"]
-            optimizer = optimizers[variant].chained_optimizers[0]
             if step:
-                states = optimizer.optimizer.state.values()
-                assert states
-                assert all(state["master_param"].is_cuda == (variant == 0) for state in states)
+                assert_residency(variant)
             prediction = models[variant](context["inputs"])
             loss = (prediction.float() - context["targets"]).square().mean()
             losses[variant].append(loss.detach())
@@ -177,6 +180,7 @@ def test_distributed_optimizer_forward_offload_matches_resident_master(
                     args, 0, step, [], [models[variant]], optimizers[variant], schedulers[variant], 1, 8
                 )
                 norms.append(norm)
+                assert_residency(variant)
                 # Complete the actual DistOpt gather before comparing published
                 # weights; next forward still exercises DDP's normal pre-hooks.
                 models[variant].start_param_sync(force_sync=True)
