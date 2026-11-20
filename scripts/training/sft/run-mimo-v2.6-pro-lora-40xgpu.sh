@@ -134,7 +134,6 @@ if [[ "$dry_run" == 1 ]]; then
     exit 0
 fi
 
-export RAY_NO_WAIT=${RAY_NO_WAIT-}
 export RELAX_MIMO_V2_FUSED_ROUTED_SWIGLU=1
 export RELAX_SFT_SELECTIVE_LOGITS=1
 export RELAX_LORA_SHARE_EXPERT_ADAPTERS=false
