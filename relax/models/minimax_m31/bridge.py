@@ -11,14 +11,14 @@ from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.minimax_m3.minimax_m3_bridge import (
     MiniMaxM3Bridge,
-    MiniMaxM3TopKRouter,
     MiniMaxM3VLModelProvider,
+    _promote_router_weights_to_float32,
     minimax_m3_block_spec,
 )
 from megatron.bridge.models.minimax_m3.modeling_minimax_m3_vl import MiniMaxM3VLModel
-from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from torch.nn import Module
 
 from .vlm import MiniMaxM31VLModel
 
@@ -34,6 +34,10 @@ def _get_msa_config(config: Any) -> dict[str, Any] | None:
     if not sparse or not sparse.get("sparse_attention_freq") or not all(sparse["sparse_attention_freq"]):
         return None
     return sparse
+
+
+def _declare_router_precision(model: Module) -> None:
+    _promote_router_weights_to_float32([model])
 
 
 @dataclass
@@ -65,13 +69,6 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
             post_process=post_process is not False,
             vp_stage=vp_stage,
         )
-        # Relax calls provide() directly, bypassing Bridge's pre-wrap hooks.
-        # Keep the router in FP32 before the mixed-precision wrapper and weight loading.
-        for module in model.modules():
-            if isinstance(module, MiniMaxM3TopKRouter):
-                module.weight.data = module.weight.data.float()
-                mark_keep_in_fp32(module.weight)
-
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
             model.freeze(
                 freeze_language_model=self.freeze_language_model,
@@ -115,6 +112,7 @@ class MiniMaxM31Bridge(MiniMaxM3Bridge):
         sparse = _get_msa_config(hf_config)
         provider = super().provider_bridge(hf_pretrained)
         if sparse is None:
+            provider.declare_fp32_tensors = _declare_router_precision
             return provider
         if getattr(hf_config, "quantization_config", None):
             raise ValueError(
@@ -130,7 +128,9 @@ class MiniMaxM31Bridge(MiniMaxM3Bridge):
         provider_values = {f.name: getattr(provider, f.name) for f in fields(MiniMaxM3VLModelProvider) if f.init}
         provider_values["lightning_indexer_layers"] = []
         provider_values["transformer_layer_spec"] = minimax_m31_block_spec
-        return MiniMaxM31ModelProvider(**provider_values, msa_config=dict(sparse))
+        provider = MiniMaxM31ModelProvider(**provider_values, msa_config=dict(sparse))
+        provider.declare_fp32_tensors = _declare_router_precision
+        return provider
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         upstream = super().mapping_registry()
