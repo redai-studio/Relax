@@ -205,6 +205,33 @@ The transport of the adapter itself differs by deployment:
 
 Both set `--expert-tensor-parallel-size 1`.
 
+## GLM-5.3 SFT
+
+`scripts/training/sft/run-glm5.3-744B-A40B-lora-40k-32xgpu.sh` is the shared 32-GPU SFT entrypoint. It uses the full 78-layer model, 40K sequences, TP4 / PP2 / CP4 / EP16 and LoRA rank16 / alpha32. Supply the dataset paths through environment variables; the script does not select a corpus.
+
+Run from the repository root in a Relax training image, using an available 32-GPU Ray cluster. Replace the model, data, checkpoint and cluster paths below. Each JSONL record must provide a `messages` conversation. The base model and data must be visible on all nodes.
+
+```bash
+export MODEL_DIR=/path/to/models
+export MODEL_NAME=GLM-5.3
+export SAVE_DIR=/path/to/checkpoints
+export PROMPT_DATA=/path/to/train.jsonl
+export EVAL_DATA=/path/to/heldout.jsonl
+export EXP_NAME=glm53-sft-run1
+export LEARNING_RATE=2e-6 NUM_ROLLOUT=50 SAVE_INTERVAL=50 EVAL_INTERVAL=50
+export RAY_ADDRESS=ray-head:6379
+export RAY_JOB_ADDRESS=http://ray-head:8265
+export WORKING_DIR=.
+export RELAX_SKIP_CLUSTER_CLEANUP=1
+export RAY_NO_WAIT=
+bash scripts/entrypoint/ray-job.sh \
+    scripts/training/sft/run-glm5.3-744B-A40B-lora-40k-32xgpu.sh
+```
+
+`PROMPT_DATA` is required. `EVAL_DATA` is optional: when supplied, the resident trainer evaluates held-out loss/PPL every `EVAL_INTERVAL` steps (default 50); omitting it or setting `EVAL_INTERVAL=0` disables evaluation. `EVAL_DATASET_NAME` defaults to `heldout`. Use question-disjoint training and validation files.
+
+The command waits for training to finish. Checkpoints are saved under `$SAVE_DIR/$EXP_NAME`; keep these values unchanged to resume, and select a different experiment name for a fresh run. ClearML prints the new task URL in the logs; `PROJECT_NAME` defaults to `Relax/sft/glm5.3`. Export the saved LoRA checkpoint using the command below.
+
 ## Checkpointing and Export
 
 By default, `--save` writes the regular full Megatron distributed checkpoint. Add `--save-lora-only` to write a smaller, resumable actor checkpoint instead. This mode stores the LoRA tensors together with optimizer, scheduler, RNG, iteration, and common state, while restoring frozen base weights from `--hf-checkpoint` on resume.
@@ -243,7 +270,20 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
 
-It merges at the **tensor** level rather than via `peft.merge_and_unload()`, on purpose: `AutoModelForCausalLM` silently resolves a multimodal checkpoint to its text-only class (dropping `vision_config` and the vision tower on re-save), and PEFT matches *modules* by name so it cannot see grouped MoE experts, which are 3-D `nn.Parameter` tensors — the bulk of the trained capacity on an A3B MoE. The tool streams one shard at a time (memory is bounded by the largest shard), copies `config.json` and auxiliary files verbatim, and treats an adapter tensor that fails to pair with a base tensor as a hard error rather than a silent drop.
+It merges at the **tensor** level rather than via `peft.merge_and_unload()`, on purpose: `AutoModelForCausalLM` silently resolves a multimodal checkpoint to its text-only class (dropping `vision_config` and the vision tower on re-save), and PEFT matches *modules* by name so it cannot see grouped MoE experts, which are 3-D `nn.Parameter` tensors — the bulk of the trained capacity on an A3B MoE. For unquantized PEFT input, the tool streams one shard at a time, preserves the base tensor dtypes, copies `config.json` and auxiliary files verbatim, and treats an adapter tensor that fails to pair with a base tensor as a hard error rather than a silent drop.
+
+For GLM-5.3 checkpoints saved with `--save-lora-only`, use `--checkpoint` instead of `--adapter-dir`. It accepts an iteration directory or a checkpoint root with `latest_checkpointed_iteration.txt`:
+
+```bash
+python scripts/tools/merge_lora_adapter_to_hf.py \
+    --base-hf-dir /path/to/GLM-5.3 \
+    --checkpoint /path/to/save/iter_0000049 \
+    --output-dir /path/to/GLM-5.3-merged
+```
+
+DCP input currently supports only `glm_moe_dsa` version-1 LoRA-only checkpoints with zero adapter dropout. Use the exact training base: its configuration, index and shard metadata must match the identity recorded at training time. Expert and gate/up layouts are mapped to HF keys before using the shared merge pipeline.
+
+Both input formats support block-128 FP8 bases: weights are dequantized and rounded to BF16 before adding LoRA, scale tensors are removed, and the output configuration drops `quantization_config`. Other quantization schemes are rejected. Memory use includes one base shard, arithmetic buffers, and up to four adapter pairs for DCP. `--cpu-threads` defaults to 16; `--device` controls merge matmuls. `--dry-run` checks metadata and mappings without writing outputs or validating all tensor values. DCP exports require a new output directory and publish from `.partial` only after validation; `--force` remains available only for PEFT exports.
 
 ## Troubleshooting
 

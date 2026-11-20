@@ -129,8 +129,10 @@ def configure(args: Any, chunks: Any) -> list[dict[str, Any]]:
     bridge_stacks = []
     # Complete validation before changing any object or module binding.
     for path, module in modules:
-        if isinstance(module, MultiTokenPredictionLayer) and module.mtp_layer_pattern is None:
-            raise RuntimeError("Legacy MTP outer checkpoint is unsupported")
+        if isinstance(module, MultiTokenPredictionLayer):
+            is_hybrid_mtp = getattr(module, "is_hybrid_mtp", getattr(module, "mtp_layer_pattern", None) is not None)
+            if not is_hybrid_mtp:
+                raise RuntimeError("Legacy MTP outer checkpoint is unsupported")
         if isinstance(module, (hybrid_block.HybridStack, Qwen3VLTransformerBlock)):
             config = module.config
             if (config.recompute_granularity, config.recompute_method, config.recompute_num_layers) != (
@@ -213,7 +215,7 @@ def configure(args: Any, chunks: Any) -> list[dict[str, Any]]:
         layer._relax_qsa_attention_retained = True
     if full_decoder is not None:
         full_decoder._relax_qsa_full_layer_retained = True
-        # HybridStack uses the attention marker to select the split forward.
+        # The retention marker skips the outer checkpoint for the MTP layer.
         full_mtp._relax_qsa_attention_retained = True
         full_mtp._relax_qsa_full_layer_retained = True
         manifest.extend(

@@ -7,7 +7,7 @@ import torch.distributed as dist
 from megatron.core import mpu, tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
-from megatron.training.global_vars import _build_tokenizer, set_args
+from megatron.training import global_vars
 
 from relax.utils.logging_utils import get_logger
 
@@ -75,7 +75,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 
 def init(args):
-    set_args(args)
+    global_vars.set_args(args)
 
     if getattr(args, "disable_jit_fuser", False):
         from megatron.core.jit import disable_jit_fuser
@@ -114,7 +114,21 @@ def init(args):
         args.te_rng_tracker,
         args.inference_rng_tracker,
     )
-    _build_tokenizer(args)
+    if hasattr(global_vars, "set_run_config"):
+        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+
+        # Relax owns model construction and the training loop. Newer MCore
+        # still needs its run config for tokenization, model wrapping and DCP.
+        run_config = pretrain_cfg_container_from_args(args)
+        run_config.finalize()
+        # Relax's optimizer scheduler still reads these derived values from args.
+        args.start_weight_decay = run_config.scheduler.start_weight_decay
+        args.end_weight_decay = run_config.scheduler.end_weight_decay
+        global_vars.set_run_config(run_config)
+        global_vars._set_train_state()
+        global_vars._build_tokenizer(run_config, args)
+    else:
+        global_vars._build_tokenizer(args)
     # We won't use this. initialize to pass some validation in megatron.
     init_num_microbatches_calculator(
         args.rank,

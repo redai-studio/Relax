@@ -210,6 +210,31 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+def test_glm53_flash_sft_preserves_bridge_layout_and_omits_draft_block(monkeypatch):
+    class GLM53FlashModelProvider(_FakeProvider):
+        pass
+
+    provider = GLM53FlashModelProvider()
+    provider.num_layers = 90
+    provider.hybrid_layer_pattern = "K-" * 3 + "DE" * 42
+    provider.moe_layer_freq = [0, 0] * 3 + [0, 1] * 42
+    provider.mtp_num_layers = 1
+    provider.mtp_hybrid_override_pattern = "DE"
+    provider.mtp_use_repeated_layer = True
+    module, _ = _load_model_provider(monkeypatch, provider)
+
+    args = _bridge_args(loss_type="sft", num_layers=45, moe_layer_freq=[0] * 3 + [1] * 42, qkv_format="thd")
+    module.get_model_provider_func(args)
+
+    assert provider.finalized
+    assert args.hybrid_layer_pattern == provider.hybrid_layer_pattern
+    assert provider.num_layers == len(provider.moe_layer_freq) == 90
+    assert provider.moe_layer_freq[-2:] == [0, 1]
+    assert provider.mtp_num_layers is None
+    assert provider.mtp_hybrid_override_pattern is None
+    assert not provider.mtp_use_repeated_layer
+
+
 @pytest.mark.parametrize("inherited_backend", ["none", "cudnn"])
 @pytest.mark.parametrize(
     "backend,legacy_fusion,expected_backend",

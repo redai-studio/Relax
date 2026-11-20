@@ -140,7 +140,7 @@ def _validate_linear_cp_mode(args: Namespace, config: Optional[object] = None) -
     model_config = config if config is not None else args
     mode = getattr(model_config, "linear_cp_mode", "chunkwise")
     allowed_modes = {"headwise", "chunkwise", "all_gather"}
-    if mode not in allowed_modes:
+    if (mode is not None or config is not None) and mode not in allowed_modes:
         raise ValueError(
             f"--linear-cp-mode must be one of {sorted(allowed_modes)!r}; got {mode!r}. Resolve 'auto' before construction."
         )

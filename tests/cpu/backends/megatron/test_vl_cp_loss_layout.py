@@ -4,6 +4,7 @@
 alignment."""
 
 from argparse import Namespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 
 
 try:
-    from relax.backends.megatron import cp_utils
+    from relax.backends.megatron import cp_utils, data
     from relax.backends.megatron import loss as loss_module
     from relax.engine.sft.eval.ppl import compute_sft_eval_step
     from relax.utils.sft_utils import align_loss_mask_for_sft
@@ -30,15 +31,22 @@ def _local_hidden(hidden, lengths, padded, cp_size, rank):
     return torch.cat(result).unsqueeze(0)
 
 
-@pytest.mark.parametrize("cp_size", [1, 2, 4])
-@pytest.mark.parametrize("chunked,recompute", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "cp_size,chunked,recompute,selective",
+    [(cp, c, r, False) for cp in (1, 2, 4) for c, r in [(False, False), (True, False), (True, True)]]
+    + [(4, True, False, True), (4, True, True, True)],
+)
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_size, chunked, recompute, dynamic):
+def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(
+    monkeypatch, cp_size, chunked, recompute, selective, dynamic
+):
     """Include padding, empty supervision, a one-token document and span
     ends."""
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: cp_size)
     monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
     monkeypatch.setattr(loss_module, "validate_opd_topk_gather", lambda *_: None)
+    monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", str(int(selective)))
+    monkeypatch.setenv("RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS", str(int(selective)))
 
     def fail_redistribution(*_, **__):
         raise AssertionError("Bridge output is already zigzag; no contiguous redistribution is valid")
@@ -88,16 +96,30 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(monkeypatch, cp_s
         reducer = cp_utils.get_sum_of_sample_mean(**metadata, calculate_per_token_loss=True)
         local_hidden = _local_hidden(hidden, lengths, padded, cp_size, rank)
         local_logits = local_hidden @ weight.T
-        if chunked:
-            value, _ = loss_module.sft_loss_function_chunked(
-                args, batch, local_hidden, reducer, lm_head_forward=lambda h: (h @ weight.T, None)
-            )
-        else:
-            value, _ = loss_module.sft_loss_function(args, batch, local_logits, reducer)
-        actual = actual + value
         _, result = compute_sft_eval_step(local_logits, args=args, **batch)
         eval_loss += result["sum_neg_log_prob"][0].item()
         eval_count += result["num_tokens"][0].item()
+        if chunked:
+            projected_rows = []
+
+            def project(h):
+                projected_rows.append(h.size(0))
+                return h @ weight.T, None
+
+            if selective:
+                from relax.backends.megatron.selective_logits import prepare_glm53_cp_selective_logits
+
+                batch["tokens"] = local_hidden.new_empty((1, local_hidden.size(1)), dtype=torch.long)
+                prepare_glm53_cp_selective_logits(batch, cp_size, rank)
+            value, _ = loss_module.sft_loss_function_chunked(
+                args, batch, local_hidden, reducer, lm_head_forward=project
+            )
+            if selective:
+                rows = batch["selective_logit_rows"]
+                assert sum(projected_rows) == sum(max(1, idx.numel()) for full, idx in rows if full)
+        else:
+            value, _ = loss_module.sft_loss_function(args, batch, local_logits, reducer)
+        actual = actual + value
     if recompute:
         actual.backward()
         actual_grads = (hidden.grad, weight.grad)
@@ -132,3 +154,177 @@ def test_contiguous_allgather_layout_is_preserved_without_bridge_metadata(monkey
     assert chunks[0][0].numel() == 0
     assert chunks[1][0].flatten().tolist() == [11, 12, 13, 14]
     assert chunks[1][1].tolist() == [12, 13, 14, 15]
+
+
+@pytest.mark.parametrize("cp_size,linear_cp_mode", [(1, "chunkwise"), (2, "headwise"), (4, "chunkwise")])
+def test_glm_packed_batch_matches_unsplit_next_token_loss(monkeypatch, cp_size, linear_cp_mode):
+    monkeypatch.setenv("RELAX_SFT_SELECTIVE_LOGITS", "1")
+    args = Namespace(
+        qkv_format="thd",
+        loss_type="sft",
+        allgather_cp=False,
+        rollout_temperature=1.0,
+        glm53_packed_cp=True,
+        sft_chunked_logits=True,
+        linear_cp_mode=linear_cp_mode,
+    )
+    monkeypatch.setattr(data, "get_args", lambda: args)
+    monkeypatch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: cp_size)
+    documents = [torch.arange(1, 6), torch.arange(11, 28)]
+    lengths = [doc.numel() for doc in documents]
+    masks = [torch.tensor([0, 0, 1, 0, 1]), torch.zeros(17, dtype=torch.int)]
+    expected = [(3, 2), (5, 4)]
+    supervised = []
+    for rank in range(cp_size):
+        monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda r=rank: r)
+        batch = dict(
+            tokens=documents,
+            total_lengths=lengths,
+            response_lengths=lengths,
+            loss_masks=masks,
+            multimodal_train_inputs=[{"pixel_values": torch.ones(2, 3)}, None],
+        )
+        packed = data.get_batch(
+            iter([(batch, None)]), list(batch), pad_multiplier=8, is_vl_model=True, pack_device=torch.device("cpu")
+        )
+        local_ids = packed["tokens"]
+        if cp_size > 1:
+            padded = packed["padded_total_lengths"]
+            padded_documents = [F.pad(doc, (0, size - len(doc))) for doc, size in zip(documents, padded, strict=True)]
+            assert packed["unsplit_tokens"].tolist() == [torch.cat(padded_documents).tolist()]
+            for key in ("packed_seq_params", "vlm_packed_seq_params"):
+                assert packed[key].cu_seqlens_q.tolist() == [0, padded[0], sum(padded)]
+            if linear_cp_mode == "chunkwise":
+                from megatron.core.context_parallel_layout.routes import get_thd_cp_partition_route
+
+                route = get_thd_cp_partition_route(packed["vlm_packed_seq_params"], "zigzag", "contiguous")
+                assert route is not None
+                assert sum(route.zigzag_split_sizes) == local_ids.numel()
+                assert sum(route.contiguous_split_sizes) == local_ids.numel()
+            torch.testing.assert_close(
+                local_ids.squeeze(0),
+                _local_hidden(torch.cat(documents).unsqueeze(-1), lengths, padded, cp_size, rank).flatten(),
+            )
+        else:
+            assert "unsplit_tokens" not in packed
+        assert "unsplit_attention_mask" not in packed
+        assert packed["multimodal_train_inputs"]["pixel_values"].shape == (2, 3)
+        metadata = dict(
+            total_lengths=lengths,
+            response_lengths=lengths,
+            padded_total_lengths=packed.get("padded_total_lengths"),
+        )
+        local_masks = cp_utils.get_cp_local_loss_masks(loss_masks=packed["loss_masks"], **metadata)
+        if cp_size > 1:
+            plans = packed["selective_logit_rows"]
+            assert len(plans) == len(local_masks)
+            for (full, indices), mask in zip(plans, local_masks, strict=True):
+                assert full == mask.numel()
+                torch.testing.assert_close(indices, mask.nonzero().flatten())
+        responses = loss_module.get_responses(
+            local_ids.float().unsqueeze(-1),
+            args=args,
+            unconcat_tokens=packed["unconcat_tokens"],
+            cp_output_is_zigzag=packed.get("cp_output_is_zigzag", False),
+            **metadata,
+        )
+        for (predictors, labels), mask in zip(responses, local_masks, strict=True):
+            supervised.extend(
+                zip(labels[mask.bool()].tolist(), predictors[mask.bool()].flatten().tolist(), strict=True)
+            )
+        assert packed["full_loss_masks"].sum() == sum(mask.sum() for mask in local_masks)
+    assert sorted(supervised) == expected
+
+
+def test_glm_cp_vision_matches_full_insertion_and_gradients():
+    try:
+        from megatron.bridge.models.glm5next.glm53flash_bridge import GLM53FlashModel
+        from transformers.models.glm5_next.modeling_glm5_next import Glm5NextModel
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"Requires the pinned GLM Bridge runtime: {exc}")
+
+    class Vision(torch.nn.Module):
+        dtype = torch.float32
+
+        def forward(self, pixels, grid_thw):
+            return SimpleNamespace(pooler_output=pixels * 2)
+
+    model = GLM53FlashModel.__new__(GLM53FlashModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(image_token_id=28, video_start_token_id=29, video_end_token_id=30)
+    model.get_placeholder_mask = MethodType(Glm5NextModel.get_placeholder_mask, model)
+    model.visual = Vision()
+    model.get_image_features = lambda pixels, grid: SimpleNamespace(pooler_output=(pixels * 2,))
+    model.get_video_features = lambda pixels, grid: SimpleNamespace(pooler_output=(pixels * 3,))
+
+    # GLM uses the same placeholder ID in both modalities. The image straddles
+    # two zigzag shards and the video is entirely on rank 1.
+    tokens = torch.tensor([[1, 2, 3, 28, 28, 28, 29, 28, 28, 30, 4, 5, 6, 0, 0, 0]])
+    embeds = torch.randn(1, 16, 5, requires_grad=True)
+    images = torch.randn(3, 5, requires_grad=True)
+    video = torch.randn(2, 5, requires_grad=True)
+    inputs = dict(pixel_values=images, pixel_values_videos=video, image_grid_thw=None, video_grid_thw=None)
+    reference = model._insert_vision_features(tokens, embeds, **inputs)
+    variables = (embeds, images, video)
+    expected_grads = torch.autograd.grad(reference.square().sum(), variables)
+    local_loss = 0
+    for indices in ([0, 1, 2, 3, 12, 13, 14, 15], [4, 5, 6, 7, 8, 9, 10, 11]):
+        index = torch.tensor(indices)
+        local = model._insert_cp_vision_features(tokens, embeds.index_select(1, index), index, **inputs)
+        torch.testing.assert_close(local, reference.index_select(1, index))
+        local_loss += local.square().sum()
+    for grad, expected in zip(torch.autograd.grad(local_loss, variables), expected_grads, strict=True):
+        torch.testing.assert_close(grad, expected)
+
+
+def test_glm_frozen_tp_vision_shards_complete_images_and_keeps_order(monkeypatch):
+    try:
+        from megatron.bridge.models.glm5next.glm53flash_bridge import GLM53FlashModel
+        from transformers import Glm5NextVisionConfig
+    except (ImportError, AttributeError) as exc:
+        pytest.skip(f"Requires the pinned GLM Bridge runtime: {exc}")
+
+    class Vision(torch.nn.Module):
+        dtype = torch.float32
+        spatial_merge_size = 2
+        config = Glm5NextVisionConfig(out_hidden_size=2)
+
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.ones(()), requires_grad=False)
+            self.rows = []
+
+        def forward(self, pixels, grid_thw, **kwargs):
+            self.rows.append(pixels.size(0))
+            return SimpleNamespace(pooler_output=pixels.view(-1, 4, 2).mean(dim=1) * self.scale)
+
+    model = GLM53FlashModel.__new__(GLM53FlashModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(vision_dp_when_tp=True)
+    model.visual = Vision()
+    grid = torch.tensor([[1, 2, 2], [1, 4, 2], [1, 2, 2]])
+    pixels = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+    expected = model.visual(pixels, grid).pooler_output
+    model.visual.rows.clear()
+    contributions = []
+    for rank in range(4):
+        group = SimpleNamespace(rank=lambda rank=rank: rank, size=lambda: 4)
+        model.language_model = SimpleNamespace(tp_group=group)
+
+        def all_reduce(features, *, group):
+            assert group is model.language_model.tp_group
+            contributions.append(features.clone())
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+        model._encode_images(pixels, grid, grid.tolist())
+
+    assert sorted(model.visual.rows) == [4, 4, 8]
+    assert len(contributions) == 4
+    torch.testing.assert_close(torch.stack(contributions).sum(dim=0), expected)
+
+    model.visual.scale.requires_grad_(True)
+    actual = model._encode_images(pixels.clone(), grid, grid.tolist())
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert len(contributions) == 4 and model.visual.scale.grad is not None

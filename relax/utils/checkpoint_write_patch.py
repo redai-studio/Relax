@@ -208,13 +208,22 @@ def patch_checkpoint_write():
 
     This function is idempotent — calling it multiple times is safe.
     """
-    from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
-
     global _patched
+    if _patched:
+        return
+
+    try:
+        from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+    except ModuleNotFoundError as exc:
+        if exc.name != "megatron.core.dist_checkpointing.strategies.filesystem_async":
+            raise
+        # Newer MCore uses the NVRx writer and has no legacy fork-based writer.
+        return
+
     # NOTE(wuhuan): the latest Megatron-LM of 20260506 use write_preloaded_data_multithread instead of
     # write_preloaded_data_multiproc, which has solved this issue.
     can_patch = hasattr(FileSystemWriterAsync, "write_preloaded_data_multiproc")
-    if _patched or not can_patch:
+    if not can_patch:
         return
 
     _patch_write_preloaded_data_multiproc()

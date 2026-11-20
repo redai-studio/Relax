@@ -63,9 +63,10 @@ def _parse_megatron_args(monkeypatch, *argv):
     )
 
 
-def test_linear_cp_mode_flag_defaults_to_chunkwise(monkeypatch):
+def test_unspecified_linear_cp_mode_uses_model_default(monkeypatch):
     args = _parse_megatron_args(monkeypatch)
-    assert args.linear_cp_mode == "chunkwise"
+    _validate_linear_cp_mode(args)
+    assert _gdn_config(linear_cp_mode=args.linear_cp_mode).linear_cp_mode == "chunkwise"
 
 
 @pytest.mark.parametrize("mode", ["headwise", "chunkwise", "all_gather"])

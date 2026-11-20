@@ -1034,12 +1034,10 @@ def forward_only(
             forward_input_ids = tokens
             forward_packed_seq_params = packed_seq_params
 
-        # thd bridge+CP: bridge needs per-sample attention_mask + matching thd
-        # packed_seq_params (align_size = tp*cp*2).  loss_mask is None because
-        # labels=None means GPTModel won't run internal loss; Relax's loss is
-        # computed externally from full_loss_masks.
+        # The Bridge takes global THD boundaries. Only bridges that pack dense
+        # input rows need a keep mask. Relax computes the loss from local logits.
         if needs_unsplit and "vlm_packed_seq_params" in batch:
-            forward_attention_mask = batch["unsplit_attention_mask"]
+            forward_attention_mask = batch.get("unsplit_attention_mask")
             forward_packed_seq_params = batch["vlm_packed_seq_params"]
             forward_loss_mask = None
         else:
@@ -1456,12 +1454,10 @@ def train_one_step(
             if batch.get("padding_mask") is not None:
                 forward_kwargs["padding_mask"] = batch["padding_mask"]
 
-            # thd VL+CP: bridge needs per-sample attention_mask + matching thd
-            # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
-            # because labels=None means GPTModel won't run internal loss;
-            # Relax's loss is computed externally from full_loss_masks.
+            # The Bridge takes global THD boundaries. Its loss mask would
+            # also be global, while Relax uses its rank-local mask externally.
             if needs_unsplit and "vlm_packed_seq_params" in batch:
-                forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
+                forward_kwargs["attention_mask"] = batch.get("unsplit_attention_mask")
                 forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
                 forward_kwargs["loss_mask"] = None
 
@@ -1828,7 +1824,10 @@ def train(
         )
 
         # Fused accumulation writes main_grad; remove the eager grad hooks before backward.
+        from relax.utils.training.lora_grad_sync import mark_expert_adapter_optimizer_replicas
+
         enable_expert_parallel_grad_sync_in_finalize(model)
+        mark_expert_adapter_optimizer_replicas(optimizer, expert_group=mpu.get_expert_model_parallel_group())
         finalize_grads_func = finalize_model_grads_with_expert_adapter_sync
     config.finalize_model_grads_func = (
         partial(_finalize_model_grads_with_memory_release, finalize_grads_func=finalize_grads_func)

@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -127,6 +129,9 @@ def test_last_stage_retention_preserves_h800_recipe_layers(retention, monkeypatc
     class HybridStack(SimpleNamespace):
         pass
 
+    class MultiTokenPredictionLayer(SimpleNamespace):
+        pass
+
     def qsa_layer(number):
         return TransformerLayer(
             layer_number=number,
@@ -147,7 +152,7 @@ def test_last_stage_retention_preserves_h800_recipe_layers(retention, monkeypatc
             hybrid_block=SimpleNamespace(HybridStack=HybridStack, checkpointed_forward=checkpointed_forward),
         ),
         "megatron.core.transformer.multi_token_prediction": SimpleNamespace(
-            MultiTokenPredictionLayer=type("MTP", (), {})
+            MultiTokenPredictionLayer=MultiTokenPredictionLayer
         ),
         "megatron.core.transformer.transformer_layer": SimpleNamespace(TransformerLayer=TransformerLayer),
         "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block": SimpleNamespace(
@@ -163,7 +168,7 @@ def test_last_stage_retention_preserves_h800_recipe_layers(retention, monkeypatc
         decoder_layers.insert(0, qsa_layer(44))
     decoder = BridgeBlock(config=args, layers=decoder_layers)
     mtp = HybridStack(config=args, layers=[qsa_layer(1)], is_mtp_layer=True)
-    modules = [("decoder", decoder), ("mtp", mtp)]
+    modules = [("decoder", decoder), ("mtp", mtp), ("mtp_wrapper", MultiTokenPredictionLayer(is_hybrid_mtp=True))]
     modules.extend((f"decoder.layers.{layer.layer_number}", layer) for layer in decoder_layers)
     modules.append(("mtp.layers.0", mtp.layers[0]))
 
@@ -188,6 +193,74 @@ def test_full_mtp_retention_uses_native_mlp(retention, monkeypatch):
         "h", inference_context=None, padding_mask=None, input_ids="ids", packed_seq_params=None
     )
     checkpoint.assert_not_called()
+
+
+@pytest.mark.parametrize(("policy", "expected_calls"), [("none", [2, 2]), ("attention", [1, 2]), ("full", [1, 1])])
+def test_hybrid_mtp_forward_preserves_checkpoint_policy_and_metadata(retention, monkeypatch, policy, expected_calls):
+    hybrid = pytest.importorskip("megatron.core.models.hybrid.hybrid_block")
+    from megatron.core import recompute, tensor_parallel
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    def checkpoint(run, *inputs):
+        return torch_checkpoint(run, *inputs, use_reentrant=True)
+
+    monkeypatch.setattr(
+        recompute, "precision_aware_checkpoint", lambda run, cfg, tp, *args, **kw: checkpoint(run, *args)
+    )
+    monkeypatch.setattr(tensor_parallel, "checkpoint", lambda run, distributed, *inputs: checkpoint(run, *inputs))
+    mask = torch.tensor([[False, True]])
+    ids = torch.tensor([[1, 2]])
+    packed = object()
+    calls = [0, 0]
+
+    class Layer(TransformerLayer):
+        __call__ = torch.nn.Module.__call__
+
+        def forward(self, hidden_states, **kwargs):
+            calls[0] += 1
+            hidden_states = hidden_states * 2
+            metadata = {name: kwargs[name] for name in ("padding_mask", "input_ids", "packed_seq_params")}
+            if policy == "none":
+                return self._relax_native_forward_mlp(hidden_states, **metadata), None
+            return retention.retained_mlp(self, hidden_states, **metadata), None
+
+        def _relax_native_forward_mlp(self, hidden_states, *, padding_mask, input_ids, packed_seq_params, **kwargs):
+            calls[1] += 1
+            torch.testing.assert_close(padding_mask, mask)
+            torch.testing.assert_close(input_ids, ids)
+            assert packed_seq_params is packed
+            return hidden_states.square()
+
+    stack = hybrid.HybridStack.__new__(hybrid.HybridStack)
+    torch.nn.Module.__init__(stack)
+    stack.config = arguments()
+    stack.config.__dict__.update(
+        enable_mhc_connections=False,
+        cuda_graph_impl="none",
+        flash_decode=False,
+        fp8=None,
+        fp4=None,
+        distribute_saved_activations=False,
+    )
+    stack.pre_process, stack.post_process, stack.is_mtp_layer = True, False, True
+    stack._cp_layout_manager = stack.residual_stream_readout = None
+    stack.uses_wide_residual_stream = stack._has_linear_layer_with_chunkwise_cp = False
+    stack.pg_collection = SimpleNamespace(tp=None)
+    layer = Layer.__new__(Layer)
+    torch.nn.Module.__init__(layer)
+    layer.config = stack.config
+    layer.mlp = SimpleNamespace(router=SimpleNamespace(is_hash_layer=True))
+    layer._relax_qsa_attention_retained = policy != "none"
+    layer._relax_qsa_full_layer_retained = policy == "full"
+    stack.layers = torch.nn.ModuleList([layer])
+    stack.num_layers_per_pipeline_rank = 1
+
+    hidden = torch.ones(2, 1, 1, requires_grad=True)
+    output = stack.forward(hidden, attention_mask=None, packed_seq_params=packed, padding_mask=mask, input_ids=ids)
+    output.sum().backward()
+    torch.testing.assert_close(output, torch.full_like(hidden, 4))
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 8))
+    assert calls == expected_calls
 
 
 def test_checkpoint_closures_keep_each_microbatch_metadata(retention, monkeypatch):

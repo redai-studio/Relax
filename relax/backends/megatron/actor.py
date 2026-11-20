@@ -634,7 +634,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
-            if self._per_step_rollout:
+            # SFT prediction initializes a colocated engine before the first
+            # train call, even when prediction is deferred until the last step.
+            self._sft_startup_offloaded = (
+                is_sft_mode(self.args) and getattr(self.args, "sft_predict_interval", None) is not None
+            )
+            if self._per_step_rollout or self._sft_startup_offloaded:
                 self.sleep()
 
         self.rollout_engines = None
@@ -884,6 +889,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 raise RuntimeError("RELAX_DEBUG_DSV4_CP_P2P_WARMUP only supports static context parallelism")
             warmup_static_cp_forward_neighbor_p2p()
         print_memory("after wake_up model")
+        self._sft_startup_offloaded = False
 
     def _switch_model(self, target_tag: str) -> None:
         self._flush_resident_sft_parameters()
@@ -1488,7 +1494,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_rollout and (self.genrm_manager is not None or has_managed_opd_teacher_manager(self)):
             dist.barrier(group=get_gloo_group())
 
-        if self.args.offload_train and self._per_step_rollout:
+        if self.args.offload_train and (self._per_step_rollout or getattr(self, "_sft_startup_offloaded", False)):
             self.wake_up()
 
         if self.args.debug_train_only:
@@ -3316,16 +3322,21 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return rollout_only, actor_fwd_only
 
-    def _wait_for_previous_eval(self, max_wait_seconds: int = 1800) -> None:
+    def _wait_for_previous_eval(self, max_wait_seconds: float | None = None) -> None:
         """Block until the rollout service's previous evaluation has finished.
 
         Only rank 0 polls the rollout HTTP endpoint; all ranks synchronise via
         a barrier afterwards so they proceed together.
         Args:
             max_wait_seconds: Maximum time (in seconds) to wait for eval
-                completion before giving up and proceeding. Defaults to 300.
+                completion before giving up and proceeding. Uses
+                final_eval_wait_timeout from custom config, or 1800 seconds.
         """
-        if dist.get_rank() == 0:
+        if max_wait_seconds is None:
+            configured_timeout = getattr(self.args, "final_eval_wait_timeout", None)
+            max_wait_seconds = float(1800 if configured_timeout is None else configured_timeout)
+        process_group = get_gloo_group()
+        if dist.get_rank(group=process_group) == 0:
             try:
                 rollout_serve_url = get_serve_url("rollout")
                 start_time = time.monotonic()
@@ -3345,7 +3356,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     time.sleep(10)
             except Exception as e:
                 logger.warning(f"Error checking eval status: {e}, proceeding with weight update.")
-        dist.barrier(group=get_gloo_group())
+        dist.barrier(group=process_group)
 
     @timer
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:

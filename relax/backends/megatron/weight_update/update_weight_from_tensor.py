@@ -29,7 +29,7 @@ from relax.utils.megatron_peft_utils import (
 )
 from relax.utils.reloadable_process_group import retain_process_groups
 
-from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from ..sglang import FlattenedTensorBucket, FlattenedTensorMetadata, MultiprocessingSerializer
 from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice_chunk
 from .expert_routing import ExpertLayout, validate_bf16_server_layout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -449,10 +449,10 @@ class UpdateWeightFromTensor:
 
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
         conversion + serialization + Gloo gather.  At most two chunks'
-        GPU tensors are alive simultaneously (bounded by
-        ``update_weight_buffer_size``). Routed expert mode instead completes
-        each IPC before advancing the iterator, so conversion failures cannot
-        release buffers that a receiver is still reading.
+        GPU tensors are alive simultaneously. Chunks reaching
+        ``update_weight_buffer_size`` and routed expert chunks complete their
+        IPC before advancing the iterator. Individual tensors and fused pairs
+        can exceed the budget and must not overlap the next conversion.
 
         In LoRA merge mode the adapters are folded into the base weights during
         HF export so the rollout engine serves one merged model; otherwise all
@@ -530,6 +530,13 @@ class UpdateWeightFromTensor:
         try:
             with export_ctx:
                 for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                    drain_chunk = self._route_experts or (
+                        sum(tensor.nbytes for _, tensor in hf_named_tensors) >= self.args.update_weight_buffer_size
+                    )
+                    if drain_chunk and not self._route_experts:
+                        self._wait_for_ipc(prev_refs)
+                        prev_refs = []
+                        prev_long_lived_tensors = long_lived_tensors = None
                     dispatch_errors = []
                     current_refs, long_lived_tensors = self._send_hf_params(
                         hf_named_tensors, dispatch_errors=dispatch_errors
@@ -537,7 +544,7 @@ class UpdateWeightFromTensor:
                     # Routed export agrees on failures before advancing its
                     # collective generator. Ordinary export keeps two chunks
                     # overlapped, including the previous chunk's storage.
-                    if self._route_experts:
+                    if drain_chunk:
                         self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
                         current_refs = []
                     else:
@@ -547,7 +554,7 @@ class UpdateWeightFromTensor:
                             self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
                     prev_long_lived_tensors = long_lived_tensors
                     prev_refs, current_refs = current_refs, []
-                    if self._route_experts:
+                    if drain_chunk:
                         prev_long_lived_tensors = long_lived_tensors = None
                         del hf_named_tensors
                     device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
@@ -897,6 +904,7 @@ class UpdateWeightFromTensor:
                 weight_version=None if self._route_experts else self.weight_version,
                 dispatch_errors=dispatch_errors,
                 direct_layout=getattr(self, "_direct_expert_layout", None),
+                reuse_tensor_min_bytes=self.args.update_weight_buffer_size,
             )
             all_refs.extend(refs_colocated)
 
@@ -924,6 +932,7 @@ def _send_to_colocated_engine(
     bucket_allocator: IpcBucketAllocator | None = None,
     dispatch_errors: list[str] | None = None,
     direct_layout: DirectExpertLayout | None = None,
+    reuse_tensor_min_bytes: int | None = None,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -973,13 +982,7 @@ def _send_to_colocated_engine(
         if direct_chunk is not None:
             payload, load_format = named_tensors, direct_format
         else:
-            # Bucket-owned allocations use ordinary CUDA storage for inexpensive IPC.
-            with bucket_allocator.allocation():
-                flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            payload = {
-                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-                "metadata": flattened_tensor_bucket.get_metadata(),
-            }
+            payload = _flattened_ipc_payload(named_tensors, bucket_allocator, reuse_tensor_min_bytes)
             load_format = "flattened_bucket"
         long_live_tensors.append(payload)
         serialized = MultiprocessingSerializer.serialize(payload, output_str=True)
@@ -1011,6 +1014,32 @@ def _send_to_colocated_engine(
             _drain_ipc_refs(refs)
             raise RuntimeError(f"Weight dispatch failed: {errors}")
     return refs, long_live_tensors
+
+
+def _flattened_ipc_payload(
+    named_tensors: list[tuple[str, torch.Tensor]],
+    allocator: IpcBucketAllocator,
+    reuse_tensor_min_bytes: int | None,
+) -> dict[str, Any]:
+    if (
+        len(named_tensors) == 1
+        and reuse_tensor_min_bytes is not None
+        and FlattenedTensorMetadata is not None
+        and getattr(FlattenedTensorBucket, "supports_multi_dtypes", False)
+    ):
+        name, tensor = named_tensors[0]
+        if tensor.nbytes >= reuse_tensor_min_bytes and tensor.is_contiguous() and allocator.can_share(tensor):
+            # The byte view keeps source storage alive through the receiver ACK.
+            # Reuse only confirmed ordinary allocations, never expandable ones.
+            return {
+                "flattened_tensor": tensor.view(-1).view(torch.uint8),
+                "metadata": [
+                    FlattenedTensorMetadata(name, tensor.shape, tensor.dtype, 0, tensor.nbytes, tensor.nbytes)
+                ],
+            }
+    with allocator.allocation():
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+    return {"flattened_tensor": bucket.get_flattened_tensor(), "metadata": bucket.get_metadata()}
 
 
 def _empty_flattened_tensor_data(device):
