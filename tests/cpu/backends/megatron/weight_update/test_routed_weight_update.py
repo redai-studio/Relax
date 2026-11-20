@@ -212,7 +212,7 @@ def test_retained_sync_fences_before_closing_receiver_session(module):
     assert events[3][1]["load_format"] == module.NATIVE_SYNC_FENCE_LOADER
 
 
-@pytest.mark.parametrize("mode", ["retained", "noop_gpu", "bf16_expert_hf"])
+@pytest.mark.parametrize("mode", ["retained", "retained_pending", "noop_gpu", "bf16_expert_hf"])
 def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch, mode):
     from types import SimpleNamespace
 
@@ -280,17 +280,22 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
     monkeypatch.setattr(torch.cuda.memory, "get_allocator_backend", lambda: "native")
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append(("trim",)))
 
-    updater.update_weights()
+    backup_done = Mock()
+    backup_done.query.side_effect = [False, True] if mode == "retained_pending" else [True]
+    updater.update_weights(backup_done=backup_done)
 
-    if mode == "retained":
-        assert events == [
-            ("trim",),
+    if mode in ("retained", "retained_pending"):
+        expected = [
             ("gather", "embedding", budget),
             ("send", "embedding"),
             ("gather", "head", budget),
             ("send", "head"),
         ]
+        expected.insert(2 if mode == "retained_pending" else 0, ("trim",))
+        assert events == expected
+        assert backup_done.query.call_count == (2 if mode == "retained_pending" else 1)
     else:
+        backup_done.query.assert_not_called()
         assert events[:4] == [
             ("gather", "embedding", None),
             ("gather", "head", None),

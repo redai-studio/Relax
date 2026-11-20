@@ -68,6 +68,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
     actor._flush_resident_sft_parameters = Mock()
     events = []
     onload_handle = object()
+    backup_event = object()
 
     def get_result(value):
         if value is onload_handle or (isinstance(value, list) and value == [onload_handle]):
@@ -78,8 +79,10 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         assert overlap == (mode == "overlap")
         assert set(weights) == set(expected)
         events.append("begin")
+        return backup_event
 
-    def update():
+    def update(*, backup_done=None):
+        assert backup_done is (backup_event if retain_actor_weights else None)
         # Simulate a checkpoint having destroyed NCCL groups before this call.
         assert "reload_groups" in events
         assert set(actor.weight_updater.weights_getter()) == set(expected)

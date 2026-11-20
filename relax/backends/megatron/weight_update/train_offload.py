@@ -313,7 +313,7 @@ class _SelectiveOffloadStrategy:
         device_module.empty_cache()
 
     @torch.no_grad()
-    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> None:
+    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> torch.cuda.Event:
         """Back up Actor weights to CPU while keeping their GPU storage
         readable.
 
@@ -374,6 +374,7 @@ class _SelectiveOffloadStrategy:
         self._cpu_weight_snapshot = snapshot
         if not overlap:
             self._cpu_backup_done.synchronize()
+        return self._cpu_backup_done
 
     @torch.no_grad()
     def finish_weight_sync(self) -> dict[str, torch.Tensor]:
@@ -545,12 +546,12 @@ class MegatronTrainStateOffloader:
         if self.enabled:
             self._strategy.reload()
 
-    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> None:
+    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> torch.cuda.Event:
         """Prepare the CPU backup and retain Actor GPU weights for the
         sender."""
         if not self.enabled or self.uses_tms:
             raise RuntimeError("Source weight sync requires selective train-state offload")
-        self._strategy.begin_weight_sync(weights, overlap=overlap)
+        return self._strategy.begin_weight_sync(weights, overlap=overlap)
 
     def validate_actor_weight_retention(self) -> str | None:
         """Check selective offload, CUDA and optimizer support without changing

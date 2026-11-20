@@ -490,7 +490,7 @@ class UpdateWeightFromTensor:
             )
 
     @torch.no_grad()
-    def update_weights(self) -> None:
+    def update_weights(self, *, backup_done: torch.cuda.Event | None = None) -> None:
         """version++, flush caches, process buckets with pipelining.
 
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
@@ -592,7 +592,9 @@ class UpdateWeightFromTensor:
         try:
             with export_ctx:
                 hf_chunks = (
-                    iterator.get_hf_weight_chunks(megatron_local_weights, retained_ordinary_ipc=True)
+                    iterator.get_hf_weight_chunks(
+                        megatron_local_weights, retained_ordinary_ipc=True, backup_done=backup_done
+                    )
                     if retained_ordinary_ipc
                     else iterator.get_hf_weight_chunks(megatron_local_weights)
                 )

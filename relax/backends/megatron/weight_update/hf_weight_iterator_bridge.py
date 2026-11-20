@@ -399,7 +399,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 router.replicated_bytes,
             )
 
-    def get_hf_weight_chunks(self, megatron_local_weights, *, retained_ordinary_ipc: bool = False):
+    def get_hf_weight_chunks(
+        self,
+        megatron_local_weights,
+        *,
+        retained_ordinary_ipc: bool = False,
+        backup_done: torch.cuda.Event | None = None,
+    ):
         if self._bf16_expert_buckets is not None:
             if self._packed_expert_sync:
                 yield from _chunk_with_mla_pairing(
@@ -421,6 +427,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 megatron_local_weights,
                 include_experts=self._expert_router is None,
                 retained_ordinary_ipc=retained_ordinary_ipc,
+                backup_done=backup_done,
             ),
             chunk_size=self.args.update_weight_buffer_size,
             yield_full_buckets=retained_ordinary_ipc,
@@ -454,7 +461,14 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             yield gathered
             del gathered
 
-    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True, retained_ordinary_ipc: bool = False):
+    def _iter_hf_params(
+        self,
+        megatron_local_weights,
+        *,
+        include_experts=True,
+        retained_ordinary_ipc: bool = False,
+        backup_done: torch.cuda.Event | None = None,
+    ):
         """Yield individual (name, tensor) pairs for all params.
 
         Expert weights: load → TP gather + convert (src_rank only) →
@@ -539,9 +553,10 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                     and info.attrs.get("tensor_model_parallel", False)
                     and info.attrs.get("parallel_mode") != "duplicated"
                     and info.size * trim_tp_size > self.args.update_weight_buffer_size
+                    and backup_done is not None
+                    and backup_done.query()
                 ):
-                    # Return unused segments before the first oversized TP output is allocated.
-                    # The previous bucket's refs and read completion remain owned by the updater.
+                    # cudaFree can wait for D2H. Retry on a later oversized bucket while backup is pending.
                     trim_tp_size = 1
                     torch.cuda.empty_cache()
             t_b0 = time.monotonic()

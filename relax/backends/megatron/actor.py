@@ -3110,12 +3110,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Finish optimizer/parameter-gather writes before the CPU backup
                 # and weight sender read the same GPU parameters.
                 device_module.synchronize()
-                self._train_state_offloader.begin_weight_sync(
+                backup_done = self._train_state_offloader.begin_weight_sync(
                     weights, overlap=Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
                 )
-                return weights
+                return weights, backup_done
 
-            weights = run_with_distributed_error_check(prepare_actor_weights_for_sync, get_gloo_group())
+            weights, backup_done = run_with_distributed_error_check(prepare_actor_weights_for_sync, get_gloo_group())
             # Send from the unchanged GPU weights. The CPU backup may still be
             # copying on another stream when overlap is enabled.
             self.weight_updater.weights_getter = lambda: weights
@@ -3199,8 +3199,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
             if retain_actor_weights:
+                self.weight_updater.update_weights(backup_done=backup_done)
+
                 # Receiver ACKs cover CUDA completion and closing source mappings.
                 def release_actor_weights_after_sync():
                     snapshot = self._train_state_offloader.finish_weight_sync()
@@ -3210,6 +3211,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weight_updater.weights_getter = lambda: self.weights_backuper.get("actor")
                 self.weight_updater.actor_weight_retention_active = False
                 self._actor_weights_pending_sync = False
+            else:
+                self.weight_updater.update_weights()
             light_cleanup = retain_actor_weights and Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
             if light_cleanup:
                 # finish_weight_sync already frees parameters and empties the
