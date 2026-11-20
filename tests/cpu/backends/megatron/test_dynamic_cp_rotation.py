@@ -106,7 +106,6 @@ def test_dynamic_cp_rotation_round_trip(tmp_path):
 @pytest.mark.parametrize("prefix", ["ref_", ""])
 def test_streaming_forward_preserves_ordinals_and_full_logprobs(monkeypatch, prefix):
     from relax.backends.megatron import actor as actor_module
-    from relax.utils.data import stream_dataloader
 
     actor = object.__new__(actor_module.MegatronTrainRayActor)
     actor.args = SimpleNamespace(max_tokens_per_gpu=16, dynamic_context_parallel=True, qkv_format="thd")
@@ -124,7 +123,11 @@ def test_streaming_forward_preserves_ordinals_and_full_logprobs(monkeypatch, pre
         data = dict(ids=ids, total_lengths=[6, 6], response_lengths=[2, 2])
         stream.append((data, SimpleNamespace(samples=ids)))
     pending = iter(stream)
-    monkeypatch.setattr(stream_dataloader, "get_data_from_transfer_queue", lambda *_, **__: next(pending))
+    monkeypatch.setitem(
+        actor_module.StreamingTQIterator.__next__.__globals__,
+        "get_data_from_transfer_queue",
+        lambda *_, **__: next(pending),
+    )
 
     ordinals = []
 
