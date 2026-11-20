@@ -25,6 +25,7 @@ def test_forward_only_update_without_rollout_group(monkeypatch):
     backend._use_bridge = False
     backend._lora_merge_mode = False
     backend._lora_adapter_mode = False
+    backend._skip_empty_actor_fwd_ref_sync = False
     backend._is_pp_src_rank = True
     backend._megatron = Mock()
     backend._megatron.named_params_and_buffers.return_value = []
