@@ -9,6 +9,8 @@
 # Provide "$DATA_DIR/minimax-m3.1-flash-sft.jsonl" with messages.
 # For image/video training, set MULTIMODAL_KEYS='{"image":"images","video":"videos"}'.
 # Use <image>/<video> in messages and put the matching media paths in those fields.
+# For Relax/Miles parity, set MINIMAX_NATIVE_PARITY=1 and provide the shared SFT_CHAT_TEMPLATE.
+# Use MINIMAX_PARITY_LAYERS=4 for LoRA or full SFT, or 60 for full-depth LoRA.
 # Launch through scripts/entrypoint/ray-job.sh on a running 2x8 GPU Ray cluster.
 set -eo pipefail
 
@@ -25,6 +27,7 @@ fi
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 MULTIMODAL_KEYS="${MULTIMODAL_KEYS:-}"
 SFT_MODE="${SFT_MODE:-lora}"
+native_parity="${MINIMAX_NATIVE_PARITY:-${MINIMAX_TEXT_PARITY:-0}}"
 SAVE_INTERVAL=1
 GLOBAL_BATCH_SIZE=16
 MAX_TOKENS=4096
@@ -36,32 +39,44 @@ case "$SFT_MODE" in
     full) TP=4; EP=8; LR=1e-5; PARITY_NAME=minimax-m3.1-flash-4l-full-parity ;;
     *) echo "Set SFT_MODE to lora or full" >&2; exit 1 ;;
 esac
-if [[ "${MINIMAX_TEXT_PARITY:-0}" == 1 ]]; then
-    if [[ "$SFT_MODE" != lora || -n "$MULTIMODAL_KEYS" || "${MINIMAX_MSA_IMPL:-relax}" != relax ]]; then
-        echo "Text parity requires language LoRA, text inputs, and Relax MSA" >&2
+if [[ "$native_parity" == 1 ]]; then
+    if [[ "${MINIMAX_MSA_IMPL:-relax}" != relax ]]; then
+        echo "Native framework parity requires Relax MSA" >&2
         exit 1
     fi
     MINIMAX_PARITY=1
-    layer_count="${MINIMAX_TEXT_PARITY_LAYERS:-4}"
+    layer_count="${MINIMAX_PARITY_LAYERS:-${MINIMAX_TEXT_PARITY_LAYERS:-4}}"
     case "$layer_count" in
         4) ;;
         60)
+            if [[ "$SFT_MODE" == full ]]; then
+                echo "The two-node native parity recipe uses four layers for full SFT" >&2
+                exit 1
+            fi
             checkpoint_name=MiniMax-M3.1-Flash-BF16
             moe_layer_freq="$(jq -cn '[range(60) | if . < 3 then 0 else 1 end]')"
             ;;
-        *) echo "Set MINIMAX_TEXT_PARITY_LAYERS to 4 or 60" >&2; exit 1 ;;
+        *) echo "Set MINIMAX_PARITY_LAYERS to 4 or 60" >&2; exit 1 ;;
     esac
     TP=4
-    EP=16
+    if [[ "$SFT_MODE" == lora ]]; then
+        EP=16
+    fi
     GLOBAL_BATCH_SIZE=4
     MAX_TOKENS=9216
-    PARITY_NAME="minimax-m3.1-flash-${layer_count}l-text-parity"
+    if [[ -n "$MULTIMODAL_KEYS" ]]; then
+        PARITY_NAME="minimax-m3.1-flash-${layer_count}l-${SFT_MODE}-vl-parity"
+    elif [[ "$SFT_MODE" == lora ]]; then
+        PARITY_NAME="minimax-m3.1-flash-${layer_count}l-text-parity"
+    else
+        PARITY_NAME="minimax-m3.1-flash-4l-full-text-parity"
+    fi
 fi
 if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
     : "${SFT_CHAT_TEMPLATE:?Prepare a verified parity template with scripts.tools.minimax_m31_sft_parity}"
     EXP_NAME="${EXP_NAME:-${PARITY_NAME}-${MINIMAX_MSA_IMPL:-relax}}"
     TRAIN_STEPS="${TRAIN_STEPS:-10}"
-    if [[ "$SFT_MODE" == full || "${MINIMAX_TEXT_PARITY:-0}" == 1 ]]; then
+    if [[ "$SFT_MODE" == full || "$native_parity" == 1 ]]; then
         SAVE_INTERVAL="$TRAIN_STEPS"
     else
         KEEP_CHECKPOINTS="$TRAIN_STEPS"
@@ -152,11 +167,14 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --use-health-check
 )
-if [[ "${MINIMAX_TEXT_PARITY:-0}" == 1 ]]; then
+if [[ "$native_parity" == 1 ]]; then
     SFT_ARGS+=(
         --tool-key tools
         --seq-length "$MAX_TOKENS"
     )
+    if [[ -n "$MULTIMODAL_KEYS" ]]; then
+        SFT_ARGS+=(--image-resize-scale-factor 0)
+    fi
     MISC_ARGS+=(
         --recompute-granularity full
         --recompute-method uniform
@@ -180,7 +198,7 @@ if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
         --deterministic-mode
         --custom-megatron-init-path scripts.tools.minimax_m31_sft_parity.configure_worker
     )
-    if [[ "$SFT_MODE" == full ]]; then
+    if [[ "$SFT_MODE" == full && "$native_parity" != 1 ]]; then
         MISC_ARGS+=(
             --custom-megatron-before-train-step-hook-path scripts.tools.minimax_m31_sft_parity_state.record_full_sft_step
         )
@@ -188,7 +206,7 @@ if [[ "${MINIMAX_PARITY:-0}" == 1 ]]; then
     RUNTIME_ENV_JSON=$(jq -c \
         --arg implementation "${MINIMAX_MSA_IMPL:-relax}" \
         --arg seed "${SEED:-1234}" \
-        --arg text_parity "${MINIMAX_TEXT_PARITY:-0}" \
+        --arg text_parity "$native_parity" \
         '.env_vars += {
             "NCCL_ALGO": "Ring",
             "NCCL_PROTO": "Simple",
