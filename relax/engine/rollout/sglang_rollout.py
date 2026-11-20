@@ -35,9 +35,11 @@ from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
     async_encode_video_tensor_for_rollout_engine,
+    cast_encoder_input_for_transport,
     configure_encode_executor,
     load_processor,
     load_tokenizer,
+    supports_preprocessed_video,
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
 from relax.utils.http_utils import (
@@ -104,6 +106,11 @@ class GenerateState(metaclass=SingletonMeta):
         prepare_model_maybe_update_args(args, completeness="metadata")
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+        self.use_preprocessed_video = False
+        if supports_preprocessed_video(self.processor) and not args.rollout_external:
+            from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+
+            self.use_preprocessed_video = hasattr(BaseMultimodalProcessor, "unpack_video_processor_output")
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
 
@@ -328,6 +335,26 @@ async def _encode_multimodal_inputs(multimodal_inputs: dict) -> tuple[dict[str, 
     return encoded, monotonic() - t_start
 
 
+def _uses_preprocessed_video(state: GenerateState, media: dict | None) -> bool:
+    return bool(
+        getattr(state, "use_preprocessed_video", False)
+        and media
+        and media.get("video_metadata")
+        and not media.get("audio")
+    )
+
+
+def _pack_video_processor_output(train_inputs: dict) -> dict:
+    from safetensors.torch import save
+
+    keys = ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts")
+    tensors = {key: train_inputs[key].contiguous() for key in keys if key in train_inputs}
+    if "pixel_values_videos" not in tensors or "video_grid_thw" not in tensors:
+        raise ValueError("Video processor output requires pixel_values_videos and video_grid_thw.")
+    # One entry carries both image and video grids from the same processor call.
+    return {"format": "processor_output", "tensor_data": pybase64.b64encode(save(tensors)).decode("ascii")}
+
+
 def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np.ndarray:
     """Decode SGLang's shape-less DSV4 indexer payload.
 
@@ -405,6 +432,7 @@ async def generate(
     _has_media = sample.multimodal_inputs is not None and any(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
+    preprocessed_video = _uses_preprocessed_video(state, sample.multimodal_inputs)
     native_image_opd = opd_enabled and _has_media
     if native_image_opd:
         image_inputs(sample.multimodal_inputs)
@@ -427,6 +455,12 @@ async def generate(
         processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
             state, args, sample.prompt, sample.multimodal_inputs
         )
+        if preprocessed_video:
+            for key, tensor in sample.multimodal_train_inputs.items():
+                if isinstance(tensor, torch.Tensor):
+                    sample.multimodal_train_inputs[key] = cast_encoder_input_for_transport(
+                        state.processor, key, tensor
+                    )
     else:
         processor_prompt_ids = tokenizer_prompt_ids
 
@@ -463,7 +497,15 @@ async def generate(
         payload["lora_path"] = LORA_ADAPTER_NAME
 
     _t_mm_encode: float | None = None
-    if _has_media:
+    if preprocessed_video:
+        encode_start = monotonic()
+        packed_video = await asyncio.get_running_loop().run_in_executor(
+            state.encode_executor, _pack_video_processor_output, sample.multimodal_train_inputs
+        )
+        _t_mm_encode = monotonic() - encode_start
+        payload["video_data"] = [packed_video]
+        payload["return_prompt_token_ids"] = True
+    elif _has_media:
         # Use pre-encoded data from group-level de-dup if available; otherwise encode inline.
         pre_encoded = getattr(sample, "_pre_encoded_mm", None)
         if pre_encoded is not None:
@@ -477,7 +519,16 @@ async def generate(
         payload.update(encoded_mm)
 
     # Use existing tokens for multi-turn or tokenize the new prompt
-    if len(sample.response) > 0:
+    if preprocessed_video:
+        if sample.response_length:
+            if sample.tokens[: -sample.response_length] != processor_prompt_ids:
+                raise ValueError("Video rollout continuation requires the same expanded prompt as its first request.")
+            payload["input_ids"] = sample.tokens
+        else:
+            sample.tokens = processor_prompt_ids
+            sample.rollout_tokens = processor_prompt_ids
+            payload["input_ids"] = processor_prompt_ids
+    elif len(sample.response) > 0:
         payload["input_ids"] = sample.rollout_tokens
     else:
         payload["input_ids"] = tokenizer_prompt_ids
@@ -532,6 +583,8 @@ async def generate(
         )
     if native_image_opd:
         validate_prompt_token_ids(output, sample.tokens)
+    if preprocessed_video:
+        validate_prompt_token_ids(output, payload["input_ids"], context="Preprocessed video rollout")
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -833,7 +886,11 @@ async def generate_and_rm_group(
     # data_source), encode once and attach the result to every sample so that
     # generate() picks up the pre-encoded data instead of re-encoding per sample.
     first_mm = getattr(group[0], "multimodal_inputs", None)
-    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
+    if (
+        first_mm is not None
+        and not _uses_preprocessed_video(state, first_mm)
+        and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:])
+    ):
         encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
         for sample in group:
             sample._pre_encoded_mm = encoded_mm

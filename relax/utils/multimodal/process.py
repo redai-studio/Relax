@@ -58,6 +58,7 @@ def process_multimodal_info(
     Optional[List[Image.Image]],
     Optional[List[Union[torch.Tensor, List[Image.Image]]]],
     Optional[List[Any]],
+    List[Dict[str, Any]],
 ]:
     """Load and preprocess all multimodal inputs from conversations.
 
@@ -70,19 +71,27 @@ def process_multimodal_info(
 
     image_inputs: List[Image.Image] = []
     video_inputs: List[Union[torch.Tensor, List[Image.Image]]] = []
+    video_metadata: List[Dict[str, Any]] = []
     audio_inputs: List[Any] = []
 
     for vision_info in vision_infos:
         if "image" in vision_info or "image_url" in vision_info:
             image_inputs.append(fetch_image(vision_info, image_patch_size=image_patch_size, config=config))
         elif "video" in vision_info:
-            video_input, _, video_audio, _ = fetch_video(
+            video_input, meta, video_audio, _ = fetch_video(
                 vision_info,
                 image_patch_size=image_patch_size,
                 use_audio_in_video=use_audio_in_video,
                 config=config,
             )
             video_inputs.append(video_input)
+            video_metadata.append(
+                {
+                    "fps": meta["fps"],
+                    "total_num_frames": meta["total_num_frames"],
+                    "frames_indices": meta["frames_indices"].tolist(),
+                }
+            )
 
             if video_audio is not None:
                 audio_inputs.append(video_audio)
@@ -98,4 +107,4 @@ def process_multimodal_info(
     if len(audio_inputs) == 0:
         audio_inputs = None
 
-    return image_inputs, video_inputs, audio_inputs
+    return image_inputs, video_inputs, audio_inputs, video_metadata
