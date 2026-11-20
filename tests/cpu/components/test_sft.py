@@ -2,6 +2,7 @@
 
 """Unit tests for SFT producer component (loop-only, no Ray runtime)."""
 
+import asyncio
 import json
 import sys
 from types import ModuleType, SimpleNamespace
@@ -229,6 +230,38 @@ def test_sft_custom_hook_keeps_existing_arguments(monkeypatch, accepts_kwargs):
     )
     assert configured is hook
     assert result[0] is tokens and result[1] is tokens
+
+
+@pytest.mark.asyncio
+async def test_muon_producer_keeps_boundary_sample_and_rejects_overflow_before_put(monkeypatch):
+    from relax.components.sft import SFT
+    from relax.models.qwen3_5 import recipe
+
+    dataset, tokenizer = _patch_pipeline_dependencies(monkeypatch)
+    args = _make_args(global_batch_size=1, max_tokens_per_gpu=262144)
+    args.custom_megatron_before_train_step_hook_path = recipe.ENTRY
+    args.optimizer = "muon"
+    args.tensor_model_parallel_size = 4
+    args.data_pad_size_multiplier = 1024
+    actor = SFT.func_or_class.__new__(SFT.func_or_class)
+    actor.config, actor._dataset, actor._tokenizer = args, dataset, tokenizer
+    actor.step, actor._train_size, actor._logger_instance = 0, 2, None
+    actor._stop_event = asyncio.Event()
+    actor.data_system_client = AsyncMock()
+    actor.data_system_client.async_get_partition_list.return_value = []
+
+    def batch(length, idx):
+        tokens = torch.ones(1, dtype=torch.long).expand(length)
+        return [ProcessedSample(tokens, tokens, length, None, idx)], False
+
+    dataset.get_batch_async.side_effect = [batch(524288, 0), batch(524289, 1)]
+    await actor._produce_one_step()
+    pushed = actor.data_system_client.async_put.await_args.kwargs
+    assert pushed["custom_meta"] == [{"total_lengths": 524288}]
+    assert pushed["data"]["tokens"][0].numel() == pushed["data"]["loss_masks"][0].numel() == 524288
+    with pytest.raises(ValueError, match=r"idx=1.*524289.*524288"):
+        await actor._produce_one_step()
+    assert actor.data_system_client.async_put.await_count == 1
 
 
 @pytest.mark.asyncio

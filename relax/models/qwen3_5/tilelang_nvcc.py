@@ -1,12 +1,47 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Megatron initialization hook for TileLang JIT in the Qwen multimodal
-recipe."""
+"""Isolate DeepEP and TileLang compiler preloads in the Qwen training
+worker."""
 
+import filecmp
 import os
+import shlex
+import shutil
 from argparse import Namespace
+from pathlib import Path
 
 from relax.utils.logging_utils import get_logger
+
+
+def _configure_deepep_nvcc() -> None:
+    """Select the isolated compiler in the checkout actually loaded by this
+    worker."""
+    root = Path(__file__).resolve().parents[3]
+    wrapper = root / "scripts/tools/nvcc-without-preload.sh"
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    default = Path(cuda_home) / "bin/nvcc" if cuda_home else shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    compiler = Path(os.environ.get("EP_JIT_NVCC_COMPILER") or default).absolute()
+    if compiler.resolve() == wrapper.resolve():
+        underlying = os.environ.get("RELAX_DEEPEP_NVCC")
+        if not underlying or Path(underlying).resolve() == wrapper.resolve():
+            raise ValueError("EP_JIT_NVCC_COMPILER must select the underlying compiler")
+        return
+
+    image_wrapper = root / "docker/scripts/nvcc-without-preload.sh"
+    if (
+        os.access(compiler.resolve().with_name("nvcc.real"), os.X_OK)
+        and compiler.is_file()
+        and image_wrapper.is_file()
+        and filecmp.cmp(compiler, image_wrapper, shallow=False)
+        and shlex.quote(str(compiler)) == str(compiler)
+    ):
+        os.environ["EP_JIT_NVCC_COMPILER"] = str(compiler)
+        return
+    # DeepEP passes the wrapper path unquoted to a shell. The wrapper itself quotes the underlying compiler.
+    if not os.access(wrapper, os.X_OK) or shlex.quote(str(wrapper)) != str(wrapper):
+        raise RuntimeError(f"DeepEP needs an executable NVCC wrapper at a shell-safe worker path: {wrapper}")
+    os.environ["RELAX_DEEPEP_NVCC"] = str(compiler)
+    os.environ["EP_JIT_NVCC_COMPILER"] = str(wrapper)
 
 
 def install(args: Namespace) -> None:
@@ -14,6 +49,7 @@ def install(args: Namespace) -> None:
     kernel."""
     from tilelang.contrib import nvcc
 
+    _configure_deepep_nvcc()
     original = getattr(nvcc, "get_nvcc_subprocess_env", None)
     if not callable(original):
         raise RuntimeError("TileLang lacks get_nvcc_subprocess_env; cannot isolate NVCC preloads")

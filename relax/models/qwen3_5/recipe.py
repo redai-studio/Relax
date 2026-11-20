@@ -2,16 +2,41 @@
 """Install the Qwen TP4 optimization recipe."""
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from relax.utils.data import wholepack_policy
 
 
+if TYPE_CHECKING:
+    from relax.engine.sft.dataset.streaming import ProcessedSample
+
+
 ENTRY = "relax.models.qwen3_5.recipe.before_step"
+EXPANDED_ROWS_PER_RANK = 131072
 
 
 def enabled(args: Any) -> bool:
     return getattr(args, "custom_megatron_before_train_step_hook_path", None) == ENTRY
+
+
+def validate_dispatch_samples(args: Any, samples: list["ProcessedSample"]) -> None:
+    """Reject an impossible padded microbatch before the SFT producer publishes
+    it."""
+    if not enabled(args) or args.optimizer != "muon" or args.loss_type != "sft":
+        return
+    # CP1/sequence parallel splits the padded sequence across TP ranks.
+    align = args.data_pad_size_multiplier
+    if align <= 0:
+        raise ValueError("The Qwen dispatch padding multiplier must be positive")
+    limit = (EXPANDED_ROWS_PER_RANK // align) * align * args.tensor_model_parallel_size
+    if args.max_tokens_per_gpu > limit:
+        raise ValueError(f"SFT packing budget {args.max_tokens_per_gpu} exceeds the DeepEP limit of {limit} tokens")
+    for sample in samples:
+        if sample.total_length > limit:
+            raise ValueError(
+                f"SFT sample idx={sample.source_idx}: expanded length {sample.total_length} exceeds "
+                f"the DeepEP limit of {limit} tokens"
+            )
 
 
 def _check_args(args: Any) -> None:
