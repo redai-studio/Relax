@@ -7,6 +7,7 @@ Heavy loading boundaries are replaced in both modes.
 """
 
 import ast
+import inspect
 import os
 import re
 import string
@@ -25,7 +26,9 @@ def _load_functions(filename, names):
     selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in selected} == set(names)
     module = ModuleType("_checkpoint_routing_" + path.stem)
-    module.__dict__.update(Path=Path, os=os, re=re, string=string, Namespace=Namespace, nullcontext=nullcontext)
+    module.__dict__.update(
+        Path=Path, os=os, re=re, string=string, Namespace=Namespace, nullcontext=nullcontext, inspect=inspect
+    )
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), vars(module))
     return module
 

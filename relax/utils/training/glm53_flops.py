@@ -90,8 +90,7 @@ def estimate_glm53_flops(
         moe_width = text.moe_intermediate_size * (text.num_experts_per_tok + text.n_shared_experts)
         weights += moe_layers * hidden * (3 * moe_width + text.n_routed_experts)
     weights += hidden * text.vocab_size  # Embedding lookups do not contribute matmul FLOPs.
-    if getattr(text, "mhc", False):
-        streams = text.hc_mult
+    if streams := getattr(text, "hc_mult", 0):
         weights += 2 * layers * hidden * streams * (2 * streams + streams**2)
 
     attention = indexer = 0

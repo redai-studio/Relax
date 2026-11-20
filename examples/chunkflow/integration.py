@@ -141,7 +141,10 @@ def _adaptation_root(model: nn.Module) -> nn.Module:
     # Bridge uses the same attention class for its causal text decoder and
     # bidirectional vision encoder. Only the text subtree is chunk-scheduled.
     model_type = f"{type(model).__module__}.{type(model).__qualname__}"
-    if model_type == "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model.Qwen3VLModel":
+    if model_type in (
+        "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model.Qwen3VLModel",
+        "megatron.bridge.models.qwen_vl.modeling_qwen35.hybrid_model.Qwen35VLHybridModel",
+    ):
         language_model = getattr(model, "language_model", None)
         if not isinstance(language_model, nn.Module):
             raise NotImplementedError("ChunkFlow requires a language_model on this Qwen3VL pipeline stage")

@@ -394,6 +394,7 @@ def glm53_config():
         hidden_size=8,
         vocab_size=16,
         num_hidden_layers=2,
+        hc_mult=2,
         layer_types=["linear_attention", "indexed_attention"],
         mlp_layer_types=["dense", "sparse"],
         intermediate_size=12,
@@ -430,11 +431,11 @@ def glm53_config():
 def test_glm53_counts_hybrid_decoder_and_pooled_dsa_per_document(glm53_config):
     counter = FlopsCounter(glm53_config)
     # Lengths 2 and 7 give 27 selected token pairs and 13 scored pool pairs.
-    # Decoder forward costs 20,304 FLOPs; frozen indexer adds 1,200.
+    # Decoder forward costs 29,520 FLOPs; frozen indexer adds 1,200.
     forward, _ = counter.estimate([2, 7], delta_time=1, forward_only=True)
     train, _ = counter.estimate([2, 7], delta_time=2, lora_rank=16)
-    assert forward * 1e12 == pytest.approx(21_504)
-    assert train * 2e12 == pytest.approx(62_112)
+    assert forward * 1e12 == pytest.approx(30_720)
+    assert train * 2e12 == pytest.approx(89_760)
 
 
 def test_glm53_counts_frozen_vision_forward_once(glm53_config):
@@ -443,9 +444,9 @@ def test_glm53_counts_frozen_vision_forward_once(glm53_config):
     kwargs = dict(image_grid_thw=[(1, 2, 2)], has_image_inputs=True, freeze_vision_model=True, lora_rank=16)
     train, _ = counter.estimate([2, 7], delta_time=1, **kwargs)
     forward, _ = counter.estimate([2, 7], delta_time=1, forward_only=True, **kwargs)
-    assert train * 1e12 == pytest.approx(64_768)
-    assert forward * 1e12 == pytest.approx(24_160)
+    assert train * 1e12 == pytest.approx(92_416)
+    assert forward * 1e12 == pytest.approx(33_376)
     train_projector, _ = counter.estimate([2, 7], delta_time=1, **(kwargs | {"lora_rank": 0}))
-    assert train_projector * 1e12 == pytest.approx(66_496)
+    assert train_projector * 1e12 == pytest.approx(94_144)
     missing_vision, _ = counter.estimate([2, 7], delta_time=1, has_image_inputs=True)
     assert math.isnan(missing_vision)

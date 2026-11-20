@@ -20,6 +20,10 @@ SAVE_DIR="${SAVE_DIR:-${RELAX_ROOT}/../../ckpt/relax-sft}"
 MODEL_NAME="${MODEL_NAME:-GLM-5.3-Flash}"
 HF_CHECKPOINT="${MODEL_DIR}/${MODEL_NAME}"
 ACTOR_GPUS="${ACTOR_GPUS:-32}"
+if [[ ! "${ACTOR_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ACTOR_GPUS must be a positive integer" >&2
+    exit 1
+fi
 TP_SIZE="${TP_SIZE:-4}"
 PP_SIZE="${PP_SIZE:-4}"
 CP_SIZE="${CP_SIZE:-2}"
@@ -41,7 +45,22 @@ if [[ ! -f "${DATA_DIR}/${TRAIN_FILE}" ]]; then
 fi
 
 if [[ -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
-    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
+    if [[ -n "${RAY_ADDRESS:-}" ]] && timeout 5 ray status >/dev/null 2>&1; then
+        source "${SCRIPT_DIR}/../../entrypoint/ray-job.sh"
+    else
+        if ! visible_gpus=$(python3 -c 'import torch; print(torch.cuda.device_count())'); then
+            echo "Cannot detect local CUDA GPUs. Check the training environment or use an existing Ray cluster." >&2
+            exit 1
+        fi
+        NUM_GPUS="${NUM_GPUS:-${visible_gpus}}"
+        if [[ ! "${NUM_GPUS}" =~ ^[0-9]+$ ]] ||
+            (( ACTOR_GPUS > 10#${NUM_GPUS} || 10#${NUM_GPUS} > visible_gpus )); then
+            echo "Local Flash SFT requests ${ACTOR_GPUS} GPUs (NUM_GPUS=${NUM_GPUS}, visible CUDA GPUs=${visible_gpus})." >&2
+            echo "Configure enough local GPUs or use an existing Ray cluster via scripts/entrypoint/ray-job.sh." >&2
+            exit 1
+        fi
+        source "${SCRIPT_DIR}/../../entrypoint/local.sh"
+    fi
 fi
 if [[ "${RELAX_ENTRYPOINT_MODE}" == "local" ]]; then
     RAY_JOB_ADDRESS="${RAY_JOB_ADDRESS:-http://${MASTER_ADDR}:8265}"

@@ -85,15 +85,12 @@ See the [English installation guide](../docs/en/guide/installation.md) or [ä¸­æ–
 
 ### CUDA Patches and MoK
 
-CUDA and ROCm builds use `patch/latest/megatron.patch`, a symlink to
-`patch/megatron/20260915-4a4de8657.patch`. This versioned file contains the complete
-Bridge/MCore changes, with `common`, `cu13`, and `blackwell` sections selected in
-order. ROCm retains its existing Kimi/checkpoint fixes by applying `common` and
-`cu13`; the section name does not install CUDA dependencies. Keep new Megatron
-changes in this file rather than adding feature patches. Historical versioned
-Megatron and SGLang patches remain available.
+CUDA 12.9 and CUDA 13 default to `patch/latest/megatron.patch`, a symlink to
+`patch/megatron/20261118-f78809f6d.patch` for Megatron Bridge `137121984` and
+Megatron Core `f78809f6d`. Both apply `common` and `cu13` in order. CUDA 13
+Blackwell also applies `blackwell`. Keep CUDA fixes in this versioned patch.
 
-`PATCH_VERSION` defaults to `latest` and continues to select
+On CUDA, `PATCH_VERSION` defaults to `latest` and selects
 `patch/${PATCH_VERSION}/megatron.patch`. Custom patch sets must supply the
 complete merged patch with the same sections. CUDA 12 also selects
 `patch/${PATCH_VERSION}/sglang.patch`, which must include the `relax` and
@@ -112,6 +109,11 @@ There is no separate MoK Dockerfile. See [MoK usage and limitations](mok/README.
 Hopper and CUDA 12 retain their existing backend selection.
 
 ## Build the ROCm Image
+
+ROCm pins Megatron Bridge `6862ee170`, Megatron Core `4a4de8657`, and
+`patch/megatron/20260915-4a4de8657.patch`. Keep changes for this checkout in
+that versioned patch. The build applies its `common` and `cu13` sections in
+order to retain the Kimi and checkpoint fixes.
 
 `docker/Dockerfile.rocm` targets AMD Instinct GPUs; `GPU_ARCH` selects the variant:
 

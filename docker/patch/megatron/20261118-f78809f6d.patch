@@ -149,7 +149,7 @@ index faa198b..73e0daf 100644
                  return result
              if output_gate:
 diff --git a/megatron/bridge/models/glm5next/glm53flash_bridge.py b/megatron/bridge/models/glm5next/glm53flash_bridge.py
-index 902588e..103d918 100644
+index 902588e..a6aa167 100644
 --- a/megatron/bridge/models/glm5next/glm53flash_bridge.py
 +++ b/megatron/bridge/models/glm5next/glm53flash_bridge.py
 @@ -28,9 +28,11 @@
@@ -208,15 +208,22 @@ index 902588e..103d918 100644
      scatter_embedding_sequence_parallel: bool = False
      # Required by HF's can_return_tuple-decorated feature extraction methods.
      return_dict: bool = True
-@@ -503,6 +517,7 @@
+@@ -503,6 +517,8 @@
          packed_seq_params: Optional["PackedSeqParams"] = None,
          *,
          loss_mask: Optional[Tensor] = None,
++        padding_mask: Optional[Tensor] = None,
 +        image_grid_thw_cpu: Optional[list[list[int]]] = None,
      ) -> Tensor | tuple[Tensor, Tensor]:
          """Insert vision features, then run the language model on a THD token stream.
 
-@@ -519,8 +534,8 @@
+@@ -515,12 +531,13 @@
+           mask is returned with the output.
+         * A ``[1, total_tokens]`` stream that is already packed, with ``packed_seq_params``
+           and ``attention_mask=None`` (Bridge collate-time packing). Its boundaries are
+-          kept and only this context-parallel rank's tokens are selected.
++          kept and only this context-parallel rank's tokens are selected. An optional
++          ``padding_mask`` marks alignment padding in the CP-local packed token layout.
 
          The language model applies no positional embedding, so ``position_ids`` is not
          read; per-sequence positions in the packed layout are derived for MTP instead.
@@ -227,7 +234,7 @@ index 902588e..103d918 100644
          Only the pre-process stage embeds tokens and runs the vision tower. Later stages
          read activations from ``set_input_tensor`` and use token IDs only for layout.
          """
-@@ -544,9 +559,7 @@
+@@ -544,9 +561,7 @@
                  )
              cp_index = self._packed_cp_index(packed_seq_params, input_ids)
              lm_input_ids = _select_tokens(input_ids, cp_index)
@@ -238,7 +245,7 @@ index 902588e..103d918 100644
              if cp_index is not None:
                  labels = _select_tokens(labels, cp_index)
                  if loss_mask is not None:
-@@ -569,21 +582,25 @@
+@@ -569,21 +584,25 @@
          decoder_input = None
          if self.pre_process:
              if inputs_embeds is None:
@@ -271,7 +278,15 @@ index 902588e..103d918 100644
              # Megatron expects [seq, batch, hidden]; THD uses batch 1.
              decoder_input = decoder_input.transpose(0, 1).contiguous()
              if self.config.sequence_parallel:
-@@ -614,11 +631,12 @@
+@@ -598,6 +617,7 @@
+             decoder_input=decoder_input,
+             labels=labels,
+             loss_mask=loss_mask,
++            padding_mask=padding_mask,
+             runtime_gather_output=runtime_gather_output,
+             packed_seq_params=packed_seq_params,
+         )
+@@ -614,11 +634,12 @@
          image_grid_thw: Optional[Tensor],
          pixel_values_videos: Optional[Tensor],
          video_grid_thw: Optional[Tensor],
@@ -286,7 +301,7 @@ index 902588e..103d918 100644
              image_mask, _ = self.get_placeholder_mask(
                  input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
              )
-@@ -632,6 +650,101 @@
+@@ -632,6 +653,101 @@
              )
              inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
          return inputs_embeds
@@ -388,7 +403,7 @@ index 902588e..103d918 100644
 
      def _pack_rows(self, tensor: Tensor, keep_mask: Tensor) -> tuple[Tensor, "PackedSeqParams"]:
          """Pack the kept tokens of dense rows into this rank's TP/CP/FP8-aligned THD stream."""
-@@ -716,7 +829,16 @@
+@@ -716,7 +832,16 @@
          main_pattern, moe_layer_freq = _glm5next_hybrid_layout(hf_config)
          lin = text_config.linear_attn_config
          num_mtp = int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)
@@ -1980,7 +1995,7 @@ index fb268a0..fbe5970 100644
  
          return output, bias
 diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
-index cd7f896..10f3f39 100644
+index cd7f896..86ad7eb 100644
 --- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
 +++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
 @@ -90,6 +90,24 @@ def _scatter_padding_mask_to_sequence_parallel_region(
@@ -2021,8 +2036,8 @@ index cd7f896..10f3f39 100644
                  share_embeddings_and_output_weights=settings.share_embeddings_and_output_weights,
                  scatter_embedding_sequence_parallel=False,
                  mtp_block_spec=mtp_block_spec,
-+                mtp_layer_pattern=mtp_layer_pattern,
-+                mtp_hybrid_submodules=mtp_hybrid_submodules,
++                **({"mtp_layer_pattern": mtp_layer_pattern} if mtp_layer_pattern is not None else {}),
++                **({"mtp_hybrid_submodules": mtp_hybrid_submodules} if mtp_hybrid_submodules is not None else {}),
                  vp_stage=vp_stage,
                  pg_collection=pg_collection,
                  **(language_model_kwargs or {}),
@@ -2400,6 +2415,19 @@ index b06476e..dfaf5bd 100644
  
  
  # copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py
+diff --git a/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py b/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py
+index cc3901e..df3f584 100644
+--- a/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py
++++ b/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py
+@@ -569,6 +569,8 @@ def _qwen35_provider_model_config(provider: GPTModelProvider) -> Qwen35VLModelConfig:
+     transformer_class = Qwen35VLModelConfig.transformer_config_class
+     transformer_fields = {item.name for item in fields(transformer_class) if item.init}
+     kwargs = {name: getattr(provider, name) for name in outer_fields | transformer_fields if hasattr(provider, name)}
++    # Re-run CP inference for the Hybrid layout using the original unset inputs.
++    kwargs.update(provider._inferred_cp_inputs())
+     kwargs.pop("transformer_layer_spec", None)
+     configure_qwen35_hybrid(
+         kwargs,
 diff --git a/megatron/bridge/peft/recompute.py b/megatron/bridge/peft/recompute.py
 index 14cdb55..6290796 100644
 --- a/megatron/bridge/peft/recompute.py
@@ -7872,7 +7900,7 @@ index bdf9145..785f7ca 100644
                  num_local_experts=self.num_local_experts,
                  router_topk=self.tp_size * self.config.moe_router_topk,
 diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
-index 0be6203..8b87f5a 100644
+index 0be6203..4d8f562 100644
 --- a/megatron/core/transformer/multi_token_prediction.py
 +++ b/megatron/core/transformer/multi_token_prediction.py
 @@ -1778,7 +1778,10 @@ def _compute_mtp_acceptance_counts(
@@ -8169,6 +8197,12 @@ index 0be6203..8b87f5a 100644
          # checkpointing requires at least one differentiable tensor input, so keep
          # MTP parameter gradients enabled explicitly.
          if not hidden_states.requires_grad:
+@@ -3137,4 +3183,4 @@ class MultiTokenPredictionLayer(MegatronModule):
+-        if self.mhc_enabled:
++        if self.mhc_enabled and not getattr(self.final_layernorm, 'contracts_mhc_streams', False):
+             if self.config.mhc_learned_output_contract:
+                 hidden_states = learned_output_contract(
+                     hidden_states,
 @@ -3973,8 +4019,11 @@ class MultiTokenPredictionBlock(MegatronModule):
          else:
              hidden_states = hidden_states_list[offset]

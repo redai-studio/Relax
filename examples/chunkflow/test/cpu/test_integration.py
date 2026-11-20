@@ -168,13 +168,13 @@ def test_install_rejects_deferred_weight_gradients_before_mutation():
     assert [layer.core_attention.forward for layer in model] == originals
 
 
-def _qwen3_vl_container():
+def _qwen3_vl_container(name, module_name):
     # CPU coverage of the explicit container contract; the GPU test constructs
     # the real Bridge model, including its native vision and GDN/MoE branches.
     model_type = type(
-        "Qwen3VLModel",
+        name,
         (torch.nn.Module,),
-        {"__module__": "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model"},
+        {"__module__": module_name},
     )
     model = model_type()
     for name in ("language_model", "vision_model"):
@@ -189,8 +189,16 @@ def _qwen3_vl_container():
 
 
 @pytest.mark.parametrize("invalid", ["no_mask", "unknown_attention", "missing_language", "unknown_container"])
-def test_qwen3_vl_subtree_selection_keeps_validation_strict(invalid):
-    model = _qwen3_vl_container()
+@pytest.mark.parametrize(
+    "name,module_name",
+    [
+        ("Qwen3VLModel", "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model"),
+        ("Qwen35VLHybridModel", "megatron.bridge.models.qwen_vl.modeling_qwen35.hybrid_model"),
+    ],
+    ids=["qwen3-vl", "qwen35-vl-hybrid"],
+)
+def test_qwen3_vl_subtree_selection_keeps_validation_strict(invalid, name, module_name):
+    model = _qwen3_vl_container(name, module_name)
     if invalid == "no_mask":
         model.language_model.attn_mask_type = "no_mask"
         match = "mask type no_mask"
