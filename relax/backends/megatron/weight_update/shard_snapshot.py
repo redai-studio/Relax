@@ -25,6 +25,23 @@ def _view(storage: torch.Tensor, tensor: torch.Tensor, offset: int, length: int)
     return storage.narrow(0, offset, length).view(tensor.dtype).view(tensor.shape)
 
 
+def _copy_bank_slices(bank: torch.Tensor, slot: torch.Tensor, layout: list) -> None:
+    """Copy adjacent typed views in one DMA, including their alignment
+    padding."""
+    src, dst, end = 0, 0, 0
+    for _, host, offset, length in layout:
+        if not length:
+            continue
+        start = host.storage_offset() * host.element_size()
+        if end == dst or start - src != offset - dst:
+            if end > dst:
+                slot[dst:end].copy_(bank[src : src + end - dst], non_blocking=True)
+            src, dst = start, offset
+        end = offset + length
+    if end > dst:
+        slot[dst:end].copy_(bank[src : src + end - dst], non_blocking=True)
+
+
 class CudaShardBackup:
     """Copy stable local shards into the next pinned bank on a private
     stream."""
@@ -79,13 +96,21 @@ class CudaShardInputs(Mapping[str, torch.Tensor]):
     boundary as independent per-input tensors on the converter's stream.
     """
 
-    def __init__(self, shards: Mapping[str, torch.Tensor], device: torch.device, slot_bytes: int = 0) -> None:
+    def __init__(
+        self,
+        shards: Mapping[str, torch.Tensor],
+        device: torch.device,
+        slot_bytes: int = 0,
+        *,
+        bank: torch.Tensor | None = None,
+    ) -> None:
         self.shards = shards
         self.device = device
         self.slot_bytes = slot_bytes
+        self._bank = bank
         self.active = {}
         self._slots = [None, None]
-        self._released = [None, None]
+        self._slot_capacity = [0, 0]
         self._copies = None
 
     def __len__(self) -> int:
@@ -108,6 +133,37 @@ class CudaShardInputs(Mapping[str, torch.Tensor]):
             # owner must fence even these copies before recycling host storage.
             compute.wait_stream(self._copies)
 
+    def _prefetch_bucket(self, index: int, group: Sequence[Any], vanilla: Mapping[str, str], rank: int) -> tuple:
+        items = [(vanilla[i.name], self.shards[vanilla[i.name]]) for i in group if i.src_rank == rank]
+        # Bridge's lexical ordering can differ from the packed bank's storage
+        # order. Converter lookup is by name, so coalesce adjacent bank slices.
+        if self._bank is not None:
+            items.sort(key=lambda item: item[1].storage_offset() * item[1].element_size())
+        elif not all(t.is_pinned() for _, t in items):
+            return {}, None
+        layout, size = shard_layout(items)
+        if not size or size > self.slot_bytes:
+            return {}, None
+        slot = index % 2
+        capacity = self._slot_capacity[slot]
+        with torch.cuda.stream(self._copies):
+            buf = self._slots[slot]
+            if buf is not None and capacity != buf.numel():
+                self._slots[slot] = buf = None
+            if buf is None:
+                try:
+                    self._slots[slot] = buf = torch.empty(capacity, dtype=torch.uint8, device=self.device)
+                except torch.OutOfMemoryError:
+                    # The original per-input H2D remains available to Bridge.
+                    return {}, None
+            views = {name: _view(buf, host, offset, length) for name, host, offset, length in layout}
+            if self._bank is None:
+                for name, host, _, _ in layout:
+                    views[name].copy_(host, non_blocking=True)
+            else:
+                _copy_bank_slices(self._bank, buf, layout)
+            return views, self._copies.record_event()
+
     def prefetch(self, buckets: Sequence[Sequence[Any]], vanilla: Mapping[str, str], rank: int) -> Iterator:
         if not self.slot_bytes or not buckets:
             yield from buckets
@@ -115,44 +171,28 @@ class CudaShardInputs(Mapping[str, torch.Tensor]):
         compute = torch.cuda.current_stream(self.device)
         if self._copies is None:
             self._copies = torch.cuda.Stream(device=self.device)
-        copies, slots, released = self._copies, self._slots, self._released
-
-        def post(index):
-            group = buckets[index]
-            items = [(vanilla[i.name], self.shards[vanilla[i.name]]) for i in group if i.src_rank == rank]
-            layout, size = shard_layout(items)
-            if not size or size > self.slot_bytes or not all(t.is_pinned() for _, t in items):
-                return {}, None
-            slot = index % 2
-            views = {}
-            with torch.cuda.stream(copies):
-                if released[slot] is not None:
-                    copies.wait_event(released[slot])
-                if slots[slot] is None:
-                    try:
-                        slots[slot] = torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device)
-                    except torch.OutOfMemoryError:
-                        # Only this optional lookahead is skipped. The original
-                        # per-input H2D still runs inside the converter.
-                        return {}, None
-                for name, host, offset, length in layout:
-                    value = _view(slots[slot], host, offset, length)
-                    value.copy_(host, non_blocking=True)
-                    views[name] = value
-                ready = copies.record_event()
-            return views, ready
-
-        current = post(0)
+        # Plan each parity slot once per Bridge phase. Include at most one
+        # alignment gap per input, independent of the bank's storage order.
+        self._slot_capacity = [0, 0]
         for i, group in enumerate(buckets):
-            following = post(i + 1) if i + 1 < len(buckets) else None
+            local = [self.shards[vanilla[info.name]] for info in group if info.src_rank == rank]
+            size = sum(t.nbytes for t in local)
+            if 0 < size <= self.slot_bytes:
+                alignment = sum(t.element_size() - 1 for t in local)
+                capacity = min(size + alignment, self.slot_bytes)
+                self._slot_capacity[i % 2] = max(self._slot_capacity[i % 2], capacity)
+        current = self._prefetch_bucket(0, buckets[0], vanilla, rank)
+        for i, group in enumerate(buckets):
+            following = self._prefetch_bucket(i + 1, buckets[i + 1], vanilla, rank) if i + 1 < len(buckets) else None
             self.active, ready = current
             if ready is not None:
                 compute.wait_event(ready)
-                slots[i % 2].record_stream(compute)
             try:
                 yield group
             finally:
                 self.active = {}
                 if ready is not None:
-                    released[i % 2] = compute.record_event()
+                    # Slots are allocated and retired on the copy stream.
+                    # Fence the last consumer there before reuse or resize.
+                    self._copies.wait_stream(compute)
             current = following

@@ -120,11 +120,13 @@ def canonical_owner_projection(name: str, raw: torch.Tensor, converted: Sequence
     if identity_down_projection(name, raw, converted):
         return True
     source = re.fullmatch(
-        r"(?:module\.|vp_stages\.0\.)*decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc1\.weight(\d+)", name
+        r"(?:module\.|vp_stages\.0\.)*(language_model\.)?decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc1\.weight(\d+)",
+        name,
     )
     if source is None or len(converted) != 2 or raw.ndim != 2 or raw.dtype != torch.bfloat16:
         return False
-    prefix = f"model.layers.{source[1]}.mlp.experts.{source[2]}."
+    language, layer, expert = source.groups()
+    prefix = f"model.{language or ''}layers.{layer}.mlp.experts.{expert}."
     names = {n for n, _ in converted}
     if names != {prefix + "gate_proj.weight", prefix + "up_proj.weight"}:
         return False

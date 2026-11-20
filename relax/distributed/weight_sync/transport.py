@@ -41,7 +41,9 @@ class DeltaTransfer:
         self._sender: ThreadPoolExecutor | None = None
         self._pending_frame: Future[set[str]] | None = None
         self._copy_stream: Any = None
-        self._host_slab: Any = None
+        self._host_slabs: list[Any] = [None, None]
+        self._host_slot = 0
+        self._prepared: tuple[Any, Any, Any] | None = None
         self._active_raw: Any = None
         self._staged: list[tuple[int, dict | list]] = []
         self._staged_bytes = [0] * 4
@@ -155,7 +157,7 @@ class DeltaTransfer:
 
     def begin(self, *, version: str, base: str | None, seed: bool) -> None:
         self._require_drained()
-        if self._staged or self._active_raw is not None:
+        if self._staged or self._active_raw is not None or self._prepared is not None:
             raise RuntimeError("Cannot begin with unresolved receiver storage")
         self.frame, self.version = 0, version
         self.ordered_target_consume = False
@@ -266,7 +268,7 @@ class DeltaTransfer:
                 pending.extend(value)
         return size + sys.getsizeof((self.frame, metadata)) + sys.getsizeof(self.frame) + 4 * struct.calcsize("P")
 
-    def stage(self, metadata: dict | list, raw: Any) -> None:
+    def stage(self, metadata: dict | list, raw: Any, *, owned_host: bool = False) -> None:
         """Receive immutable bytes without invoking the live model loader."""
         import ray
 
@@ -313,8 +315,12 @@ class DeltaTransfer:
         if self.tcp is not None:
             # Compatibility transport uses the same wire; only its delivery
             # moves immutable raw bytes through host memory.
-            payload = raw.cpu().numpy().tobytes()
-            descriptor = self.tcp.publish(payload, self.tcp_members)
+            if owned_host:
+                # This worker owns the slot through finish() and all ACKs.
+                descriptor = self.tcp.publish_slot(memoryview(raw.numpy()).toreadonly(), self.tcp_members)
+            else:
+                self._host_slabs = [None, None]
+                descriptor = self.tcp.publish(raw.cpu().numpy().tobytes(), self.tcp_members)
         batches = [dict(bytes=size, entries=[dict(frame=0, offset=0, bytes=size, owner=0)]) for size in sizes]
         if sharded:
             for batch in batches:
@@ -461,22 +467,17 @@ class DeltaTransfer:
         self._pending_frame = None
         return required
 
-    def submit_frame(self, metadata: dict | list, raw: Any) -> set[str]:
-        """Transfer ownership of a sealed frame until drain_frame().
-
-        Only pure TCP can run independently of the source ranks' collectives.
-        The owner may export the next bucket before draining this submission.
-        """
+    def prepare_frame(self, raw: Any) -> None:
+        """Seal the next TCP frame while the worker delivers the previous
+        slot."""
         import torch
 
-        self._require_drained()
-        if not self._applying:
-            raise RuntimeError("Delta submission disagrees with the owner's apply window")
         if self.tcp is None or self.group is not None:
-            return self.send(metadata, raw, defer_ordered=True)
+            return
+        if self._prepared is not None:
+            raise RuntimeError("A sealed TCP frame is already waiting for submission")
         if (
-            isinstance(metadata, list)
-            or not isinstance(raw, torch.Tensor)
+            not isinstance(raw, torch.Tensor)
             or raw.dtype != torch.uint8
             or raw.ndim != 1
             or not raw.is_contiguous()
@@ -486,10 +487,14 @@ class DeltaTransfer:
 
         done = None
         if raw.is_cuda and raw.numel():
-            if self._host_slab is None:
-                self._host_slab = torch.empty(self.config.staging_budget_bytes, dtype=torch.uint8, pin_memory=True)
+            slot = self._host_slot
+            if self._host_slabs[slot] is None:
+                self._host_slabs[slot] = torch.empty(
+                    self.config.staging_budget_bytes, dtype=torch.uint8, pin_memory=True
+                )
+            host = self._host_slabs[slot][: raw.numel()]
+            if self._copy_stream is None:
                 self._copy_stream = torch.cuda.Stream(device=raw.device)
-            host = self._host_slab[: raw.numel()]
             self._copy_stream.wait_stream(torch.cuda.current_stream(raw.device))
             with torch.cuda.stream(self._copy_stream):
                 host.copy_(raw, non_blocking=True)
@@ -498,12 +503,42 @@ class DeltaTransfer:
         else:
             host = raw.to(device="cpu", copy=True)
 
-        self.metrics["sender_pinned_bytes"] = self._host_slab.numel() if self._host_slab is not None else 0
+        self._prepared = (raw, host, done)
+        self.metrics["sender_pinned_bytes"] = sum(slab.numel() for slab in self._host_slabs if slab is not None)
+
+    def discard_prepared(self) -> None:
+        """Fence an unsubmitted outbound copy when its publication aborts."""
+        if self._prepared is not None:
+            _, _, done = self._prepared
+            if done is not None:
+                done.synchronize()
+            self._prepared = None
+
+    def submit_frame(self, metadata: dict | list, raw: Any) -> set[str]:
+        """Transfer ownership of a sealed frame until drain_frame().
+
+        Only pure TCP can run independently of the source ranks' collectives.
+        The owner may export the next bucket before draining this submission.
+        """
+        self._require_drained()
+        if not self._applying:
+            raise RuntimeError("Delta submission disagrees with the owner's apply window")
+        if self.tcp is None or self.group is not None:
+            return self.send(metadata, raw, defer_ordered=True)
+        if isinstance(metadata, list):
+            raise ValueError("TCP submission requires a single frame directory")
+        if self._prepared is None:
+            self.prepare_frame(raw)
+        source, host, done = self._prepared
+        if source is not raw:
+            raise RuntimeError("TCP submission differs from its sealed frame")
+        self._prepared = None
+        self._host_slot = 1 - self._host_slot
 
         def deliver() -> set[str]:
             if done is not None:
                 done.synchronize()
-            self.stage(metadata, host)
+            self.stage(metadata, host, owned_host=True)
             return self.apply()
 
         if self._sender is None:
@@ -515,7 +550,7 @@ class DeltaTransfer:
         import ray
 
         self._require_drained()
-        if not self._applying or self._staged:
+        if not self._applying or self._staged or self._prepared is not None:
             raise RuntimeError("Cannot finalize before staged payload consumption")
         replies = ray.get(
             [
@@ -551,7 +586,9 @@ class DeltaTransfer:
         if self._sender is not None:
             self._sender.shutdown(wait=True)
             self._sender = None
-        self._host_slab = self._copy_stream = None
+        self.discard_prepared()
+        self._host_slabs = [None, None]
+        self._copy_stream = None
         closes = [
             engine.delta_weight_sync.remote("close", timeout=self.config.sync_timeout_s) for engine in self.engines
         ]

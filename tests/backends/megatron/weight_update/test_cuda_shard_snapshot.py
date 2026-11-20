@@ -15,6 +15,7 @@ class BucketReader:
     def __init__(self):
         self.staged = []
         self.direct = []
+        self.slot_bytes = []
 
     def get_hf_weight_chunks(self, shards):
         assert isinstance(shards, CudaShardInputs)
@@ -24,6 +25,7 @@ class BucketReader:
         for group in shards.prefetch(buckets, keys, rank=0):
             name = group[0].name
             self.staged.append(name in shards.active)
+            self.slot_bytes.extend(slot.numel() for slot in shards._slots if slot is not None)
             yield [(name, shards[name])]
 
 
@@ -54,6 +56,7 @@ def test_direct_device_export_cuda_prefetch_slot_reuse_and_failed_ack():
     delta = [item for group in s.export() for item in group]
     assert all(old.staged) and all(d == "cpu" for d in old.direct[-1].values())
     assert all(d == "cuda" for d in cur.direct[-1].values())
+    assert max(old.slot_bytes) < config.bucket_bytes
     for i, item in enumerate(delta[:4]):
         assert item.positions.tolist() == [9]
         assert item.values.view(torch.int16).tolist() == ([-32768] if i % 2 else [0x7FC1])

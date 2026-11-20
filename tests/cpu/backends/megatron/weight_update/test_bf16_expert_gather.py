@@ -153,12 +153,13 @@ def test_owner_down_projection_requires_exact_storage_and_canonical_coordinates(
     assert not check(source, raw[1:], [(target, raw[1:])])
 
 
-def test_fc1_owner_uses_actual_complete_canonical_bridge_outputs():
+@pytest.mark.parametrize("language", ["", "language_model."])
+def test_fc1_owner_uses_actual_complete_canonical_bridge_outputs(language):
     from relax.backends.megatron.weight_update.expert_gather import canonical_owner_projection
 
     raw = torch.arange(64, dtype=torch.bfloat16).reshape(16, 4)
-    name = "decoder.layers.7.mlp.experts.linear_fc1.weight3"
-    prefix = "model.layers.7.mlp.experts.3."
+    name = f"module.{language}decoder.layers.7.mlp.experts.linear_fc1.weight3"
+    prefix = f"model.{language}layers.7.mlp.experts.3."
     gate, up = raw[:8].clone(), raw[8:].clone()
     actual = [(prefix + "up_proj.weight", up), (prefix + "gate_proj.weight", gate)]
     assert canonical_owner_projection(name, raw, actual)

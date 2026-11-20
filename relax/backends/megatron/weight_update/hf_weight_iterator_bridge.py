@@ -480,6 +480,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         rank = dist.get_rank(group=dist.group.WORLD)
         device = device_utils.make_current_torch_device()
         buckets = self._shard_buckets(self._bf16_expert_buckets, megatron_local_weights, rank)
+        # Owner-local comparisons use the actual converted BF16 values. A TCP
+        # publication can keep gate/up local even with ordinary HF wire format.
+        qualifies = (
+            canonical_owner_projection
+            if target_shards or isinstance(megatron_local_weights, CudaShardInputs)
+            else identity_down_projection
+        )
         for infos, gather in zip(buckets, self._bf16_expert_gathers, strict=True):
             converted, sources = [], []
             error = None
@@ -493,7 +500,6 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                         )
                         items = self._bridge_converter.convert(info.name, tensor)
                         if metadata_group is not None:
-                            qualifies = canonical_owner_projection if target_shards else identity_down_projection
                             source = info.name if qualifies(info.name, tensor, items) else None
                             sources.extend([source] * len(items))
                         converted.extend(items)

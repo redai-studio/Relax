@@ -97,6 +97,10 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
         assert receiving.wait(3)
         # Produce the next frame on the main thread while the socket is pending.
         raw.zero_()
+        transfer.prepare_frame(raw)
+        raw.fill_(99)
+        with pytest.raises(RuntimeError, match="already waiting"):
+            transfer.prepare_frame(raw)
         with pytest.raises(RuntimeError, match="Drain"):
             transfer.submit_frame(metadata, raw)
         with pytest.raises(RuntimeError, match="Drain"):

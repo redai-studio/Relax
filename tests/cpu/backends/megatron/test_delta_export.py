@@ -327,6 +327,44 @@ def test_aligned_shard_bank_reuses_bytes_without_changing_payload_bits():
         assert torch.equal(bank[offset : offset + length], shards[name].reshape(-1).view(torch.uint8))
 
 
+def test_packed_bank_copies_adjacent_mixed_types_and_skips_nonowners():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from relax.backends.megatron.weight_update.shard_snapshot import _copy_bank_slices, _view, shard_layout
+
+    raw = {
+        "bf16": torch.tensor([0x7FC1], dtype=torch.int16).view(torch.bfloat16),
+        "fp32": torch.tensor([-2147483648], dtype=torch.int32).view(torch.float32),
+        "unused": torch.ones(13, dtype=torch.uint8),
+        "int": torch.tensor([2**60 + 3], dtype=torch.int64),
+        "empty": torch.empty(0, dtype=torch.int64),
+    }
+    entries, size = shard_layout(raw.items())
+    bank = torch.full((size,), 17, dtype=torch.uint8)
+    selected = []
+    for name, tensor, offset, length in entries:
+        host = _view(bank, tensor, offset, length)
+        host.copy_(tensor)
+        if name != "unused":
+            selected.append((name, host))
+    layout, size = shard_layout(selected)
+    slot = torch.empty(size, dtype=torch.uint8)
+    copies = []
+
+    class CountCopies(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func is torch.ops.aten.copy_.default:
+                copies.append(args[1].numel())
+            return func(*args, **(kwargs or {}))
+
+    with CountCopies():
+        _copy_bank_slices(bank, slot, layout)
+    assert copies == [8, 8]
+    for name, host, offset, length in layout:
+        actual = _view(slot, host, offset, length)
+        assert torch.equal(actual.view(torch.uint8), raw[name].view(torch.uint8))
+
+
 def test_pipeline_inputs_isolate_inplace_converter_and_preserve_unlocked_snapshot():
     from relax.backends.megatron.weight_update.shard_snapshot import CudaShardInputs
 

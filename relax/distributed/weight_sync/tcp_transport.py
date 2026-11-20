@@ -43,7 +43,7 @@ def _header(sock: socket.socket, deadline: float) -> dict:
     return value
 
 
-def _send(sock: socket.socket, data: bytes, deadline: float) -> None:
+def _send(sock: socket.socket, data: bytes | memoryview, deadline: float) -> None:
     if deadline <= monotonic():
         raise TimeoutError("Weight-sync TCP deadline expired")
     sock.settimeout(deadline - monotonic())
@@ -81,8 +81,22 @@ class TcpFrameSource:
         self._thread.start()
 
     def publish(self, payload: bytes, members: set[str]) -> dict:
-        if type(payload) is not bytes or len(payload) > self.host_budget_bytes or not members:
-            raise ValueError("TCP frame requires immutable bounded bytes and fixed recipients")
+        if type(payload) is not bytes:
+            raise ValueError("TCP frame requires immutable bytes")
+        return self.publish_slot(memoryview(payload), members)
+
+    def publish_slot(self, payload: memoryview, members: set[str]) -> dict:
+        """Borrow the worker's sealed byte slot until finish() fences every
+        reader."""
+        if (
+            not payload.readonly
+            or not payload.c_contiguous
+            or payload.format != "B"
+            or payload.ndim != 1
+            or len(payload) > self.host_budget_bytes
+            or not members
+        ):
+            raise ValueError("TCP frame requires a bounded read-only byte view and fixed recipients")
         token = secrets.token_hex(32)
         digest = hashlib.sha256(payload).hexdigest()
         with self._condition:

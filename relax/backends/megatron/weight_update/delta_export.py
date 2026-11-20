@@ -59,8 +59,8 @@ def create_delta_exporter(args: Any, model: Any, *, model_name: str, quantizatio
     config = delta_sync_config(args, quantization_config)
     if config is None:
         return None
-    # Rank zero may concurrently materialize a CPU tensor and immutable TCP
-    # bytes, including the same-source-GPU fallback of an NCCL connection.
+    # Rank zero may hold two pipelined host slots or a CPU tensor and its
+    # immutable bytes on the mixed NCCL/TCP fallback.
     # Leave bounded control metadata room as well; do not spend this same host
     # budget in full independently in snapshots and delivery.
     snapshots = config.host_budget_bytes - 2 * config.staging_budget_bytes - (16 << 20)
@@ -342,6 +342,8 @@ class ShardDeltaExporter:
                             )
                         if workspace_peak() > self.config.gpu_budget_bytes:
                             raise ValueError("Measured source conversion/encoding workspace exceeds its GPU budget")
+                        if self.sender_pipeline_active:
+                            self.transfer.prepare_frame(raw)
                     except Exception as exc:
                         error = exc
                 agree(error)
@@ -396,6 +398,10 @@ class ShardDeltaExporter:
                     self.transfer.drain_frame()
                 except Exception:
                     logger.exception("Pending TCP frame also failed during delta cleanup")
+                try:
+                    self.transfer.discard_prepared()
+                except Exception:
+                    logger.exception("Unsubmitted TCP frame also failed during delta cleanup")
             self.abort()
             raise
 
@@ -515,7 +521,7 @@ class ShardDeltaExporter:
             # Two slots share at most half the exporter GPU budget; the caller's
             # measured peak gate still covers conversion, encoding, and transport.
             limit = min(self.config.bucket_bytes, self.config.gpu_budget_bytes // 4)
-            previous = CudaShardInputs(previous, self._live_inputs.device, limit)
+            previous = CudaShardInputs(previous, self._live_inputs.device, limit, bank=self._ack_bank)
         if payload_group is None:
             current = iter(self.current_iterator.get_hf_weight_chunks(current_shards))
             baseline = iter(()) if full else iter(self.baseline_iterator.get_hf_weight_chunks(previous))
@@ -551,6 +557,7 @@ class ShardDeltaExporter:
                     yield self._encode_chunk(
                         current_chunk, baseline_chunk, full=full, full_names=full_names, emit=emit
                     )
+                del current_chunk, baseline_chunk
             if self._attempt is not attempt:
                 raise RuntimeError("A retired export cannot complete a new pending snapshot")
         finally:
