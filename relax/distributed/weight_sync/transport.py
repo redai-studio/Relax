@@ -61,6 +61,9 @@ class DeltaTransfer:
             raise ValueError("Delta transport requires the original owner's nonempty GPU recipient layout")
         return tuple((engine._actor_id.hex(), count) for engine, count in zip(engines, counts, strict=True))
 
+    def can_reuse(self, engines: list, counts: list[int]) -> bool:
+        return self.signature == self._signature(engines, counts)
+
     def connect(self, engines: list, counts: list[int], *, reconnect: bool = False) -> bool:
         """Return whether receiver identities changed and a FULL seed is
         needed."""
@@ -155,7 +158,7 @@ class DeltaTransfer:
         self.joined = joined
         return True
 
-    def begin(self, *, version: str, base: str | None, seed: bool) -> None:
+    def begin(self, *, version: str, base: str | None, seed: bool, defer_apply: bool = False) -> None:
         self._require_drained()
         if self._staged or self._active_raw is not None or self._prepared is not None:
             raise RuntimeError("Cannot begin with unresolved receiver storage")
@@ -169,6 +172,8 @@ class DeltaTransfer:
             transfer_apply_s=0.0,
             receive_s=0.0,
             apply_s=0.0,
+            prestaged_bytes=0,
+            prestaged_frames=0,
             proxy_receive_memory=[],
         )
         self._control = dict(
@@ -186,7 +191,8 @@ class DeltaTransfer:
                 target_shard_entries=0,
                 target_shard_changed_words=0,
             )
-        self.activate()
+        if not defer_apply:
+            self.activate()
 
     def activate(self) -> None:
         """Called only after the original owner establishes its apply
@@ -377,6 +383,9 @@ class DeltaTransfer:
             for tp, size in enumerate(sizes):
                 self.metrics["target_shard_lane_bytes"][tp] += size
         self.metrics["frames"] += 1
+        if not self._applying:
+            self.metrics["prestaged_bytes"] += sum(sizes)
+            self.metrics["prestaged_frames"] += 1
         self.frame += 1
 
     def apply(self) -> set[str]:
@@ -514,17 +523,20 @@ class DeltaTransfer:
                 done.synchronize()
             self._prepared = None
 
-    def submit_frame(self, metadata: dict | list, raw: Any) -> set[str]:
+    def submit_frame(self, metadata: dict | list, raw: Any, *, applying: bool) -> set[str]:
         """Transfer ownership of a sealed frame until drain_frame().
 
         Only pure TCP can run independently of the source ranks' collectives.
         The owner may export the next bucket before draining this submission.
         """
         self._require_drained()
-        if not self._applying:
+        if applying != self._applying:
             raise RuntimeError("Delta submission disagrees with the owner's apply window")
         if self.tcp is None or self.group is not None:
-            return self.send(metadata, raw, defer_ordered=True)
+            if applying:
+                return self.send(metadata, raw, defer_ordered=True)
+            self.stage(metadata, raw)
+            return set()
         if isinstance(metadata, list):
             raise ValueError("TCP submission requires a single frame directory")
         if self._prepared is None:
@@ -539,7 +551,7 @@ class DeltaTransfer:
             if done is not None:
                 done.synchronize()
             self.stage(metadata, host, owned_host=True)
-            return self.apply()
+            return self.apply() if applying else set()
 
         if self._sender is None:
             self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="delta-tcp-send")
