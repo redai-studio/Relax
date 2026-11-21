@@ -417,3 +417,42 @@ def test_mixed_fanout_retires_dead_group_before_raising(_patch_ray, monkeypatch)
     assert healthy.calls[-1] == "release_memory_occupation"
     manager.onload()
     assert manager.all_engines[0] is not None and manager.all_engines[0] is not dead
+
+
+@pytest.mark.parametrize("failed_step", ["shutdown", "kill"])
+def test_offload_retries_unconfirmed_follower_before_releasing_placement(_patch_ray, monkeypatch, failed_step):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=4, nodes_per_engine=2)
+    head, follower, *healthy = manager.all_engines
+    head.dead_methods = {"release_memory_occupation"}
+    group = ("shared-pg", [0, 1], [0, 1])
+    manager._engine_placements.update({0: (group, True), 1: (group, False)})
+    removed = []
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed.append)
+    get, kill = mem.ray.get, mem.ray.kill
+    fail = True
+
+    def shutdown(ref, **kwargs):
+        if fail and failed_step == "shutdown" and ref == (follower, "shutdown"):
+            raise TimeoutError("shutdown not confirmed")
+        return get(ref, **kwargs)
+
+    def kill_actor(engine):
+        if fail and engine is follower:
+            raise RuntimeError("kill not confirmed")
+        kill(engine)
+
+    monkeypatch.setattr(mem.ray, "get", shutdown)
+    monkeypatch.setattr(mem.ray, "kill", kill_actor)
+    with pytest.raises(Exception, match="not confirmed"):
+        manager.offload()
+    assert manager.all_engines[1] is follower
+    assert manager._engine_placements[0] == (group, True)
+    assert removed == []
+    assert manager._onloaded is None
+    fail = False
+    manager.offload()
+    assert manager.all_engines == [None, None, *healthy]
+    assert removed == ["shared-pg"]
+    assert manager._onloaded is False
