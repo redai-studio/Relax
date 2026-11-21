@@ -264,32 +264,32 @@ make docs-preview
 
 ## CI
 
-PR 会运行 pre-commit 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI 时，在新 PR 评论的首行写一条指令。PR 作者及拥有仓库写权限的贡献者可以重跑、取消 CI。
+PR 在一个 CI workflow 内运行 pre-commit 检查、CPU/GPU 单元测试和 GPU/NPU 集成测试。操作 CI 时，在新 PR 评论的首行写一条指令。PR 作者及拥有仓库写权限的贡献者可以重跑、取消 CI。
 
 | 指令 | 用途 |
 | --- | --- |
-| `/rerun` | 重跑当前提交对应的最新失败或超时 workflow 中失败的 job |
-| `/rerun <target>` | 重跑单个 workflow 或检查；`all` 表示所有已完成的 CI workflow |
-| `/cancel <workflow>` | 取消整个 workflow，包括其矩阵 job；`all` 表示所有运行中的 CI workflow |
+| `/rerun` | 重跑当前提交对应的最新失败或超时 CI 中失败的 job |
+| `/rerun <target>` | 重跑一个检查及其下游任务；`all` 重跑整套 CI，包括训练集成测试 |
+| `/cancel all` | 取消统一 CI workflow，包括其全部矩阵 job |
 | `/help` | 查看指令和 target |
 | `/cherry-pick <branch>` | 请求回移已合入 `main` 的 PR |
 | `/review` | 请求代码 review |
 
-Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑整个 pre-commit workflow，`/rerun ci/pre-commit` 选择其中的 pre-commit 检查；`all` 表示所有已配置的 workflow。
+窄范围重跑使用 job target，例如 `/rerun ci/pre-commit` 或 `/rerun gpu-unit/cpu`。
 
-| Target | Workflow / 检查 |
+| Target | 检查 |
 | --- | --- |
-| `ci` | 全部 pre-commit 检查 |
 | `ci/pre-commit` | Pre-commit 检查 |
-| `gpu-unit` | GPU 单元测试 |
-| `integration` | 全部 GPU/NPU 集成测试 |
-| `integration/gpu-async` | Qwen3-4B GPU 异步训练 |
-| `integration/gpu-vl` | Qwen3-VL-4B GPU 训练 |
-| `integration/npu-async` | Qwen3-4B NPU 异步训练 |
+| `gpu-unit/cpu` | CPU 单元测试 |
+| `gpu-unit/gpux1` | H20 单卡单元测试 |
+| `gpu-unit/gpux4` | H20 四卡单元测试 |
+| `integration/gpu-async` | Qwen3.5-4B GPU 异步训练 |
+| `integration/gpu-vl` | Qwen3.5-4B GPU 视觉语言训练 |
+| `integration/npu-async` | Qwen3.5-4B NPU 异步训练 |
 
-`/cancel` 仅支持工作流级别：只能取消整个工作流（可选 `ci`、`gpu-unit`、`integration` 或 `all`），不支持单独取消某一个子 Job（如 `integration/gpu-vl`）。
+旧 workflow 名称 `ci`、`gpu-unit`、`integration` 仍是独立 bypass scope（`ci` 只豁免 pre-commit），但不再是 rerun/cancel target。这些操作会明确拒绝旧名称，避免把原窄范围操作悄悄扩大成整套 CI。只有确实需要包含 GPU/NPU 训练的完整范围时，才使用显式 `all`。`/cancel` 不能单独取消一个 job 或套件。
 
-`/rerun` 仅针对已结束的 CI 记录：只能重跑当前 commit 已有的任务；若任务仍在运行中，需等待其结束或先将其取消后再重跑。
+`/rerun` 需要当前 commit 已有且结束的 CI 记录。若仍在运行，需等待结束，或在授权范围内取消。CI 由 push 和 pull request 自动触发，旧手动 workflow-dispatch 入口已退役。
 
 使用 agent 检查和操作 CI 时，可使用 [relax-github-ci skill](../../../skills/relax-github-ci/SKILL.md)。
 
