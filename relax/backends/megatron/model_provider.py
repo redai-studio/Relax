@@ -73,6 +73,40 @@ def configure_gdn_a_log_fp32(model: torch.nn.Module) -> None:
         mark_keep_in_fp32(module.A_log)
 
 
+def configure_model_fp32(model: torch.nn.Module, provider: Any = None) -> None:
+    """Make Bridge precision declarations visible to MCore's Float16Module."""
+    try:
+        from megatron.core.transformer.module import mark_keep_in_fp32
+    except ImportError:
+        # Older MCore builds still use the HF loader's expert-bias restoration.
+        return
+
+    declare_fp32_tensors = getattr(provider, "declare_fp32_tensors", None)
+    if callable(declare_fp32_tensors):
+        declare_fp32_tensors(model)
+
+    for module in model.modules():
+        parameter_names = vars(module).get("_keep_in_float32_parameter_names", ())
+        if not isinstance(parameter_names, (list, tuple)):
+            raise TypeError("_keep_in_float32_parameter_names must be a list or tuple")
+        for name in parameter_names:
+            parameter = getattr(module, name, None)
+            if not isinstance(parameter, torch.nn.Parameter):
+                raise TypeError(f"{type(module).__name__}.{name} must be a Parameter to remain in FP32")
+            parameter.data = parameter.data.float()
+            mark_keep_in_fp32(parameter)
+
+        keep_router_buffers = getattr(module, "_maintain_float32_expert_bias", None)
+        if callable(keep_router_buffers):
+            keep_router_buffers()
+            # Core creates these buffers on the current device, so the mark
+            # survives get_model's device placement before Float16Module.
+            for name in ("expert_bias", "qb_bin_bounds"):
+                buffer = getattr(module, name, None)
+                if buffer is not None:
+                    mark_keep_in_fp32(buffer)
+
+
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
     """Propagate MTP detach-path settings to every Megatron model config."""
     detach_paths = frozenset(getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head")))
@@ -330,6 +364,7 @@ def get_model_provider_func(
             for module in model.modules():
                 if getattr(module, "config", None) is not None:
                     _validate_linear_cp_mode(args, module.config)
+            configure_model_fp32(model)
             configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
@@ -422,6 +457,7 @@ def get_model_provider_func(
             "vision_dp_when_tp",
             "vision_dp_when_cp",
             "calculate_per_token_loss",
+            "deterministic_mode",
             "cross_entropy_loss_fusion",
             "cross_entropy_fusion_impl",
             "mtp_num_layers",
@@ -613,6 +649,7 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = _call_model_provider(original_provide, *p_args, **p_kwargs)
+            configure_model_fp32(model, provider)
             configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
@@ -748,6 +785,7 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        configure_model_fp32(model)
         configure_gdn_a_log_fp32(model)
         configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)

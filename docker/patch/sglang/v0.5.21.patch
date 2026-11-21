@@ -5379,13 +5379,62 @@ index 103e1600..d3ac4655 100644
          self.pre_fc_norm_embedding = GemmaRMSNorm(
              config.hidden_size, eps=config.rms_norm_eps
 diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
-index 7b9e979f..cad03306 100644
+index 7b9e979..d61016b 100644
 --- a/python/sglang/srt/multimodal/processors/base_processor.py
 +++ b/python/sglang/srt/multimodal/processors/base_processor.py
-@@ -1395,6 +1395,20 @@ class BaseMultimodalProcessor(ABC):
+@@ -1033,6 +1033,26 @@ class BaseMultimodalProcessor(ABC):
+         """returns if the data is already preprocessed (by the vlm processor)"""
+         return cls._get_preprocessed_input_format(data) is not None
+
++    @staticmethod
++    def unpack_video_processor_output(item: dict) -> dict:
++        """Decode Relax's JSON transport for an already expanded video prompt."""
++        from base64 import b64decode
++
++        from safetensors import SafetensorError
++        from safetensors.torch import load
++
++        try:
++            tensors = load(b64decode(item["tensor_data"], validate=True))
++        except (ValueError, TypeError, SafetensorError) as exc:
++            raise ValueError("Invalid video processor tensor payload") from exc
++        allowed = {
++            "pixel_values", "image_grid_thw", "pixel_values_videos",
++            "video_grid_thw", "second_per_grid_ts",
++        }
++        if not {"pixel_values_videos", "video_grid_thw"} <= tensors.keys() <= allowed:
++            raise ValueError("Unexpected fields in video processor tensor payload")
++        return {"format": item["format"], **tensors}
++
+     @classmethod
+     def _all_mm_data_is_preprocessed(cls, *data_lists):
+         has_mm_data = False
+@@ -1243,12 +1263,19 @@ class BaseMultimodalProcessor(ABC):
+         if input_ids is not None and self._all_mm_data_is_preprocessed(
+             image_data, video_data, audio_data
+         ):
+-            # fast path for preprocessed data: early return
++            # Reuse the supplied expanded input_ids and processor tensors.
++            videos = [
++                self.unpack_video_processor_output(video)
++                if self._get_preprocessed_input_format(video) == MultimodalInputFormat.PROCESSOR_OUTPUT
++                and "tensor_data" in video
++                else video
++                for video in video_data or []
++            ]
+             return BaseMultiModalProcessorOutput(
+                 input_text="",
+                 input_ids=input_ids,
+                 images=list(image_data or []),
+-                videos=list(video_data or []),
++                videos=videos,
+                 audios=list(audio_data or []),
+             )
+
+@@ -1395,6 +1422,20 @@ class BaseMultimodalProcessor(ABC):
              len(audios),
          )
- 
+
 +        # Decoded input_ids can contain image tokens already expanded by the
 +        # client processor. Raw images are processed again below, so restore
 +        # one placeholder per image, as in legacy_load_mm_data. Precomputed
@@ -5478,6 +5527,19 @@ index 105814e2..91ab21bc 100644
      def compute_mrope_positions(self, input_ids, mm_items):
          image_grid_thw = None
          video_grid_thw = None
+diff --git a/python/sglang/srt/multimodal/processors/minimax_m3_vl.py b/python/sglang/srt/multimodal/processors/minimax_m3_vl.py
+index 1a378e8..ba139fe 100644
+--- a/python/sglang/srt/multimodal/processors/minimax_m3_vl.py
++++ b/python/sglang/srt/multimodal/processors/minimax_m3_vl.py
+@@ -252,7 +252,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
+         )
+
+         video_metadata = None
+-        if base_output.videos:
++        if base_output.videos and not self._is_preprocessed_input(base_output.videos[0]):
+             image_factor, max_size = self._video_resize_config()
+             videos_processed = [
+                 await get_video_tensor(
 diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
 index 5af9cbc4..b766bb0b 100644
 --- a/python/sglang/srt/observability/req_time_stats.py

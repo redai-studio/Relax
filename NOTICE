@@ -1,0 +1,5 @@
+This product includes MiniMax sparse-attention and checkpoint conversion code
+adapted from Miles (https://github.com/radixark/miles), Apache License 2.0.
+Miles copyright 2025-2026 RadixArk, Inc.
+Miles includes software developed from Slime (https://github.com/THUDM/slime),
+copyright 2025 Zhipu AI, licensed under the Apache License, Version 2.0.

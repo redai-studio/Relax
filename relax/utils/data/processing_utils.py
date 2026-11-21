@@ -17,10 +17,27 @@ import soundfile as sf
 import torch
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
+from relax.utils.data.minimax import is_minimax_processor
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+# These large inputs are recast to the encoder weight dtype downstream.
+# Precision-sensitive metadata, such as video_second_per_grid, stays FP32.
+_BF16_DOWNCAST_KEYS = frozenset({"pixel_values", "pixel_values_videos", "input_features"})
+
+
+def cast_encoder_input_for_transport(processor: object, key: str, value: torch.Tensor) -> torch.Tensor:
+    # MiniMax's pretrained patch projection remains FP32 in BF16 training.
+    if key in _BF16_DOWNCAST_KEYS and value.dtype == torch.float32 and not is_minimax_processor(processor):
+        return value.to(torch.bfloat16)
+    return value
+
+
+def supports_preprocessed_video(processor: object) -> bool:
+    return is_minimax_processor(processor) or type(processor).__name__ in {"Qwen3VLProcessor", "Qwen3_5Processor"}
+
 
 # Shared thread pool for offloading CPU-intensive media encoding from the asyncio event loop.
 # PNG compression (libpng), H.264 encoding (libx264), and base64 encoding are all C-level
@@ -175,6 +192,15 @@ def adapt_processor_kwargs(
     extra = extra_kwargs or {}
 
     if not _is_kimi_k25_style_processor(processor):
+        if mm.get("video_metadata") and supports_preprocessed_video(processor):
+            extra = {
+                **extra,
+                "videos_kwargs": {
+                    **extra.get("videos_kwargs", {}),
+                    "do_sample_frames": False,
+                    "do_resize": False,
+                },
+            }
         return {**mm, **extra}
 
     medias: list[dict] = []
@@ -402,10 +428,12 @@ def process_vision_info(prompt, processor, use_audio_in_video, config=None):
         image_patch_size = processor.image_processor.patch_size
     else:
         image_patch_size = DEFAULT_PATCH_SIZE
-    images, videos, audios = process_multimodal_info(
+    images, videos, audios, video_metadata = process_multimodal_info(
         prompt, image_patch_size=image_patch_size, use_audio_in_video=use_audio_in_video, config=config
     )
     multimodal_inputs = {"images": images, "videos": videos, "audio": audios}
+    if video_metadata and supports_preprocessed_video(processor):
+        multimodal_inputs["video_metadata"] = video_metadata
     return multimodal_inputs
 
 
