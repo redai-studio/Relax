@@ -45,6 +45,7 @@ from .update_weight_from_distributed import (
 
 
 logger = get_logger(__name__)
+_COLOCATE_NCCL_TIMEOUT_SECS = 30.0
 
 
 class UpdateWeightFromTensor:
@@ -123,6 +124,8 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
+        self._colocate_remote_full = False
+        self._uncertain_group_removal: str | None = None
         self.distributed_rollout_engines: list[ActorHandle] = []
 
     def connect_rollout_engines(
@@ -131,6 +134,9 @@ class UpdateWeightFromTensor:
         rollout_engine_lock: ActorHandle,
         engine_gpu_counts: Sequence[int] | None = None,
         engine_gpu_offsets: Sequence[int] | None = None,
+        *,
+        shared_engine_count: int | None = None,
+        remote_group_name: str | None = None,
     ) -> None:
         """Split colocated/distributed engines.
 
@@ -155,49 +161,81 @@ class UpdateWeightFromTensor:
                 engine_gpu_offsets.append(offset)
                 offset += c
 
-        # Route via CUDA IPC only for engines on the same Ray node as the actor;
-        # cross-node IPC fails with cudaErrorMapBufferObjectFailed.
-        engine_node_ids = [
-            info.get("node_id", "")
-            for info in ray.get([engine.get_pid_and_node_id.remote() for engine in rollout_engines])
-        ]
-        local_actor_node_id = ray.get_runtime_context().get_node_id()
-        gathered_actor_node_ids: list[str | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered_actor_node_ids, local_actor_node_id, group=get_gloo_group())
-        actor_node_id_set = {nid for nid in gathered_actor_node_ids if nid}
+        if shared_engine_count is None:
+            # Route via CUDA IPC only for engines on the same Ray node as the actor;
+            # cross-node IPC fails with cudaErrorMapBufferObjectFailed.
+            engine_node_ids = [
+                info.get("node_id", "")
+                for info in ray.get([engine.get_pid_and_node_id.remote() for engine in rollout_engines])
+            ]
+            local_actor_node_id = ray.get_runtime_context().get_node_id()
+            gathered_actor_node_ids: list[str | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_actor_node_ids, local_actor_node_id, group=get_gloo_group())
+            actor_node_id_set = {nid for nid in gathered_actor_node_ids if nid}
 
-        colocate_engine_nums = 0
-        for engine_node_id in engine_node_ids:
-            if not engine_node_id or engine_node_id not in actor_node_id_set:
-                break
-            colocate_engine_nums += 1
+            colocate_engine_nums = 0
+            for engine_node_id in engine_node_ids:
+                if not engine_node_id or engine_node_id not in actor_node_id_set:
+                    break
+                colocate_engine_nums += 1
+        else:
+            # Engine ownership comes from their PG, even on the same Ray node.
+            colocate_engine_nums = shared_engine_count
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
+        self._colocate_remote_full = shared_engine_count is not None and self.use_distribute
         if self._route_experts and self.use_distribute:
             raise ValueError("Expert routing does not support mixed remote/colocated engines")
 
+        self.rollout_engines = rollout_engines[:colocate_engine_nums]
+        distributed_engines = rollout_engines[colocate_engine_nums:]
         if self.use_distribute:
-            self.rollout_engines = rollout_engines[:colocate_engine_nums]
-            self.distributed_rollout_engines = rollout_engines[colocate_engine_nums:]
-            distributed_gpu_counts = engine_gpu_counts[colocate_engine_nums:]
-            self._is_distributed_src_rank = (
-                mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-                and mpu.get_tensor_model_parallel_rank() == 0
-                and mpu.get_pipeline_model_parallel_rank() == 0
-            )
-            self._group_name = "slime"
-            if self._is_distributed_src_rank:
-                if self._model_update_groups is not None:
-                    disconnect_rollout_engines_from_distributed(
-                        self.args, self._group_name, self._model_update_groups, self.distributed_rollout_engines
-                    )
-
-                self._model_update_groups = connect_rollout_engines_from_distributed(
-                    self.args,
-                    self._group_name,
-                    self.distributed_rollout_engines,
-                    engine_gpu_counts=distributed_gpu_counts,
+            if shared_engine_count is None:
+                self._is_distributed_src_rank = (
+                    mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+                    and mpu.get_tensor_model_parallel_rank() == 0
+                    and mpu.get_pipeline_model_parallel_rank() == 0
                 )
+                self.disconnect_distributed_group()
+                self._group_name = "slime"
+            else:
+                # The training rank that owns the FULL lease also owns the remote group.
+                # Megatron's DP group can be unloaded during weight export.
+                self._is_distributed_src_rank = dist.get_rank(group=get_gloo_group()) == 0
+                if remote_group_name is None:
+                    raise ValueError("Independent engines require a weight-update group name")
+                if self._model_update_groups is not None and self._group_name != remote_group_name:
+                    raise RuntimeError("Old rollout weight-update group still connected")
+                self._group_name = remote_group_name
+
+            error = None
+            if self._is_distributed_src_rank and self._model_update_groups is None:
+                connection_options = (
+                    {
+                        "max_retries": 1,
+                        "timeout_secs": _COLOCATE_NCCL_TIMEOUT_SECS,
+                        "remember_group": lambda group: setattr(self, "_model_update_groups", group),
+                    }
+                    if self._colocate_remote_full
+                    else {}
+                )
+                try:
+                    self._model_update_groups = connect_rollout_engines_from_distributed(
+                        self.args,
+                        self._group_name,
+                        distributed_engines,
+                        engine_gpu_counts=engine_gpu_counts[colocate_engine_nums:],
+                        **connection_options,
+                    )
+                except Exception as exc:
+                    if shared_engine_count is None:
+                        raise
+                    error = str(exc)
+            if shared_engine_count is not None:
+                self._wait_for_ipc([], error=error)
+        elif shared_engine_count is None:
+            self.disconnect_distributed_group()
+        self.distributed_rollout_engines = distributed_engines
 
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
@@ -269,6 +307,34 @@ class UpdateWeightFromTensor:
             end = start + colocate_gpu_counts[i]
             if start <= dist.get_rank() < end:
                 self._ipc_engine = engine
+
+    def disconnect_distributed_group(self, group_name: str | None = None) -> None:
+        if group_name is not None and getattr(self, "_uncertain_group_removal", None) == group_name:
+            raise RuntimeError(f"Removal of weight-update group {group_name} failed without all acknowledgments")
+        if self._model_update_groups is None or (group_name is not None and self._group_name != group_name):
+            return
+        # Remote acknowledgments can fail after the local handle has been destroyed.
+        strict = group_name is not None
+        cleanup = {"on_local_destroy": lambda: setattr(self, "_model_update_groups", None)} if strict else {}
+        try:
+            disconnect_rollout_engines_from_distributed(
+                self.args,
+                self._group_name,
+                self._model_update_groups,
+                self.distributed_rollout_engines,
+                strict=strict,
+                **cleanup,
+            )
+        except Exception:
+            self._uncertain_group_removal = group_name
+            raise
+        self._model_update_groups = None
+
+    def abort_colocate_group(self, group_name: str) -> None:
+        if self._model_update_groups is not None and self._group_name == group_name:
+            self._model_update_groups.abort()
+            dist.destroy_process_group(self._model_update_groups)
+            self._model_update_groups = None
 
     def _configure_sync_process_groups(self) -> None:
         """Retain the audited iterator's communicator closure, independently of
@@ -468,6 +534,7 @@ class UpdateWeightFromTensor:
         # Pause/flush must cover both IPC and distributed-broadcast engines,
         # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
+        colocate_remote_full = getattr(self, "_colocate_remote_full", False)
 
         rank = dist.get_rank()
         if self._route_experts:
@@ -482,6 +549,17 @@ class UpdateWeightFromTensor:
                     restore_weights_before_load=True,
                     post_process_quantization=False,
                 )
+        elif colocate_remote_full:
+            self._routed_engine_call(all_engines, "pause_generation")
+            self._routed_engine_call(all_engines, "flush_cache")
+            if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
+                self._routed_engine_call(
+                    all_engines,
+                    "post_process_weights",
+                    restore_weights_before_load=True,
+                    post_process_quantization=False,
+                )
+            self._routed_engine_call(all_engines, "begin_weight_update")
         elif rank == 0:
             ray.get([engine.pause_generation.remote() for engine in all_engines])
             ray.get([engine.flush_cache.remote() for engine in all_engines])
@@ -541,9 +619,10 @@ class UpdateWeightFromTensor:
                         self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors) or None)
                         current_refs = []
                     else:
-                        self._wait_for_ipc(prev_refs)
+                        dispatch_error = ("; ".join(dispatch_errors) or None) if colocate_remote_full else None
+                        self._wait_for_ipc(prev_refs, error=dispatch_error)
                         prev_refs = []
-                        if dispatch_errors:
+                        if dispatch_errors and not colocate_remote_full:
                             self._wait_for_ipc(current_refs, error="; ".join(dispatch_errors))
                     prev_long_lived_tensors = long_lived_tensors
                     prev_refs, current_refs = current_refs, []
@@ -578,6 +657,16 @@ class UpdateWeightFromTensor:
                 )
             self._routed_engine_call(all_engines, "update_weight_version", weight_version=str(self.weight_version))
             self._routed_engine_call(all_engines, "continue_generation")
+        elif colocate_remote_full:
+            if self.quantization_config and self.quantization_config["quant_method"] == "compressed-tensors":
+                self._routed_engine_call(
+                    all_engines,
+                    "post_process_weights",
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                )
+            self._routed_engine_call(all_engines, "end_weight_update")
+            self._routed_engine_call(all_engines, "continue_generation")
         elif rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -611,7 +700,7 @@ class UpdateWeightFromTensor:
             # ray.get(list) may raise before other requests finish. Keep source
             # buffers alive until every submitted reader has completed/failed.
             _drain_ipc_refs(refs)
-        if not self._route_experts:
+        if not self._route_experts and not getattr(self, "_colocate_remote_full", False):
             if error is not None:
                 raise RuntimeError(f"Weight load failed: {error}")
             return
@@ -622,7 +711,8 @@ class UpdateWeightFromTensor:
         if failed.item():
             errors = [None] * dist.get_world_size(get_gloo_group())
             dist.all_gather_object(errors, error, group=get_gloo_group())
-            raise RuntimeError(f"Routed weight load failed: {errors}")
+            label = "Routed weight load" if self._route_experts else "Weight load"
+            raise RuntimeError(f"{label} failed: {errors}")
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -901,15 +991,27 @@ class UpdateWeightFromTensor:
             all_refs.extend(refs_colocated)
 
         if self.use_distribute and self._is_distributed_src_rank:
-            refs_distributed = update_weights_from_distributed(
-                self._group_name,
-                self._model_update_groups,
-                self.weight_version,
-                self.distributed_rollout_engines,
-                hf_named_tensors,
+            timeout_args = (
+                {"timeout_secs": _COLOCATE_NCCL_TIMEOUT_SECS} if getattr(self, "_colocate_remote_full", False) else {}
             )
-            if refs_distributed:
-                all_refs.extend(refs_distributed)
+            try:
+                remote_refs = update_weights_from_distributed(
+                    self._group_name,
+                    self._model_update_groups,
+                    self.weight_version,
+                    self.distributed_rollout_engines,
+                    hf_named_tensors,
+                    **timeout_args,
+                )
+            except Exception as exc:
+                # A failed broadcast can leave remote receivers waiting for data.
+                # Only the IPC readers already submitted here hold source storage.
+                if dispatch_errors is None or not getattr(self, "_colocate_remote_full", False):
+                    _drain_ipc_refs(all_refs)
+                    raise
+                dispatch_errors.append(str(exc))
+            else:
+                all_refs.extend(remote_refs)
 
         return all_refs, long_lived_tensors
 

@@ -221,6 +221,7 @@ def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, 
     updater._route_experts = False
     updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
     updater._configure_direct_experts = Mock()
+    updater._model_update_groups = None
     first, replacement = Mock(), Mock()
     monkeypatch.setattr(sync.ray, "get", lambda refs: [{"node_id": "local"} for _ in refs])
     monkeypatch.setattr(sync.ray, "get_runtime_context", lambda: SimpleNamespace(get_node_id=lambda: "local"))
@@ -238,6 +239,132 @@ def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, 
     assert updater._ipc_engine is (replacement if rank == 0 else None)
     with pytest.raises(ValueError, match="changed IPC GPU placement"):
         updater.connect_rollout_engines([replacement], None, [2], [1])
+
+
+def test_independent_engines_reuse_group_and_destroy_only_matching_generation(monkeypatch):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace()
+    updater._route_experts = False
+    updater._ipc_placement = updater._ipc_gather_group = updater._ipc_gather_src = updater._ipc_engine = None
+    updater._model_update_groups = None
+    updater._configure_direct_experts = Mock()
+    baseline, dynamic = Mock(), Mock()
+    connect = Mock(side_effect=["old-handle", "next-handle"])
+    disconnect = Mock()
+    monkeypatch.setattr(sync, "connect_rollout_engines_from_distributed", connect)
+    monkeypatch.setattr(sync, "disconnect_rollout_engines_from_distributed", disconnect)
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(sync.dist, "new_group", Mock(return_value="ipc"))
+    monkeypatch.setattr(sync.dist, "all_reduce", Mock())
+    monkeypatch.setattr(sync.mpu, "get_data_parallel_rank", Mock(side_effect=RuntimeError("DP group is offloaded")))
+
+    for _ in range(2):
+        updater.connect_rollout_engines(
+            [baseline, dynamic], None, [2, 2], [0, 0], shared_engine_count=1, remote_group_name="old"
+        )
+    assert updater._ipc_engine is baseline
+    assert connect.call_count == 1
+    assert connect.call_args.args == (updater.args, "old", [dynamic])
+    assert connect.call_args.kwargs["engine_gpu_counts"] == [2]
+    dynamic.get_pid_and_node_id.remote.assert_not_called()
+    updater.disconnect_distributed_group("old")
+    assert disconnect.call_args.args == (updater.args, "old", "old-handle", [dynamic])
+    assert disconnect.call_args.kwargs["strict"]
+    updater.connect_rollout_engines(
+        [baseline, dynamic], None, [2, 2], [0, 0], shared_engine_count=1, remote_group_name="next"
+    )
+    updater.disconnect_distributed_group("old")
+    assert updater._model_update_groups == "next-handle"
+    assert disconnect.call_count == 1
+
+
+def test_failed_retirement_ack_does_not_destroy_the_local_group_twice(monkeypatch):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace()
+    group = updater._model_update_groups = Mock()
+    updater._group_name = "full"
+    updater.distributed_rollout_engines = [Mock()]
+    destroy_group = Mock()
+    monkeypatch.setattr(sync.dist, "destroy_process_group", destroy_group)
+    monkeypatch.setattr(sync.ray, "get", Mock(return_value=[{"success": False}]))
+
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
+        updater.disconnect_distributed_group("full")
+    with pytest.raises(RuntimeError, match="without all acknowledgments"):
+        updater.disconnect_distributed_group("full")
+
+    updater.abort_colocate_group("full")
+    destroy_group.assert_called_once_with(group)
+    group.abort.assert_not_called()
+
+
+def test_failed_receiver_ack_keeps_the_sender_group_for_abort(monkeypatch):
+    from relax.backends.megatron.weight_update import update_weight_from_distributed as distributed
+
+    local_group, receiver = Mock(), Mock()
+    remember_group = Mock()
+    monkeypatch.setattr(distributed.device_utils, "get_dist_backend", lambda: "nccl")
+    monkeypatch.setattr(distributed.ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(distributed, "init_process_group", Mock(return_value=local_group))
+    monkeypatch.setattr(distributed.ray, "get", Mock(side_effect=TimeoutError("receiver ACK missing")))
+
+    with pytest.raises(RuntimeError, match="Failed to connect rollout engines"):
+        distributed.connect_rollout_engines_from_distributed(
+            SimpleNamespace(), "full", [receiver], [2], max_retries=1, timeout_secs=30, remember_group=remember_group
+        )
+
+    remember_group.assert_called_once_with(local_group)
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater._model_update_groups = local_group
+    updater._group_name = "full"
+    destroy_group = Mock()
+    monkeypatch.setattr(sync.dist, "destroy_process_group", destroy_group)
+    updater.abort_colocate_group("full")
+    local_group.abort.assert_called_once_with()
+    destroy_group.assert_called_once_with(local_group)
+    assert updater._model_update_groups is None
+
+
+@pytest.mark.parametrize("launch_fails", [False, True])
+def test_colocate_precheck_uses_sender_device_and_every_receiver_rank(monkeypatch, launch_fails):
+    from relax.backends.megatron.weight_update import update_weight_from_distributed as distributed
+
+    receivers = [Mock(), Mock()]
+    for receiver in receivers:
+        receiver.run_scale_weight_sync_precheck.remote.return_value = {
+            "success": True,
+            "stopped": True,
+            "fingerprint": {},
+        }
+    monkeypatch.setattr(distributed.device_utils, "get_dist_backend", lambda: "nccl")
+    monkeypatch.setattr(distributed.torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(distributed.torch.cuda, "mem_get_info", lambda device: (1 << 30, 1 << 30))
+    monkeypatch.setattr(distributed.ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(distributed.ray, "get", lambda refs, **kwargs: refs)
+    launch = Mock(return_value=Mock(wait=Mock(return_value=0), poll=Mock(return_value=0)))
+    monkeypatch.setattr(distributed, "launch_probe", launch)
+
+    if launch_fails:
+        launch.side_effect = OSError("FD limit")
+        assert distributed.precheck_colocate_receiver(receivers, 2, timeout=30) == (False, True, ())
+        for receiver in receivers:
+            receiver.run_scale_weight_sync_precheck.remote.assert_not_called()
+        return
+
+    monkeypatch.delenv("NCCL_IB_DISABLE", raising=False)
+    assert distributed.precheck_colocate_receiver(receivers, 2, timeout=30) == (True, True, ())
+    receivers[0].run_scale_weight_sync_precheck.remote.return_value["fingerprint"] = {"nccl_ib_disable": "1"}
+    assert distributed.precheck_colocate_receiver(receivers, 2, timeout=30) == (False, True, ())
+
+    _, port, rank, world_size, device, _, _ = launch.call_args.args
+    assert (rank, world_size, device) == (0, 5, 3)
+    receiver_calls = [receiver.run_scale_weight_sync_precheck.remote.call_args.kwargs for receiver in receivers]
+    assert [(call["group_rank"], call["tp_size"], call["world_size"]) for call in receiver_calls] == [
+        (1, 2, 5),
+        (3, 2, 5),
+    ]
+    assert all(call["ports"].split(",") == [port] * 2 for call in receiver_calls)
 
 
 @pytest.mark.parametrize("geometry", [(256, 2048, 512), (256, 7168, 2048)])
@@ -316,7 +443,7 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
         pass
 
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
-    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
+    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = updater.use_distribute = False
     updater.quantization_config = None
     updater.weight_version = 0
     updater.rollout_engines = updater.distributed_rollout_engines = []
@@ -358,6 +485,50 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
     with pytest.raises(RuntimeError):
         updater.update_weights()
     assert set(completed) == set(alive)
+
+
+@pytest.mark.parametrize("independent_pg", [False, True])
+def test_failed_nccl_dispatch_drains_ipc_reader_and_propagates_error(monkeypatch, independent_pg):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
+    updater.use_distribute = updater._is_distributed_src_rank = True
+    updater._colocate_remote_full = independent_pg
+    updater.weight_version = 0
+    updater._ipc_allocator_version = 1
+    updater._ipc_bucket_allocator = updater._ipc_gather_src = updater._ipc_gather_group = None
+    updater.quantization_config = None
+    updater._group_name = "independent" if independent_pg else "slime"
+    updater._model_update_groups = object()
+    updater.weights_getter = lambda: {}
+    updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=lambda weights: [[("p", torch.zeros(1))]])
+    ipc, receiver = Mock(), Mock()
+    updater._ipc_engine = ipc
+    updater.rollout_engines, updater.distributed_rollout_engines = [ipc], [receiver]
+    receiver.update_weights_from_distributed.remote.return_value = "nccl-ack"
+    read_refs = []
+
+    def get(ref):
+        read_refs.extend(ref if isinstance(ref, list) else [ref])
+        return [] if isinstance(ref, list) else None
+
+    monkeypatch.setattr(sync, "_send_to_colocated_engine", lambda *args, **kwargs: (["ipc-ack"], object()))
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(sync.dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(sync.dist, "barrier", Mock())
+    monkeypatch.setattr(sync.dist, "broadcast", Mock(side_effect=ValueError("sender failed")))
+    monkeypatch.setattr(sync.dist, "all_gather_object", lambda out, error, **kwargs: out.__setitem__(0, error))
+    reduce = Mock()
+    monkeypatch.setattr(sync.dist, "all_reduce", reduce)
+    monkeypatch.setattr(sync.ray, "get", get)
+
+    with pytest.raises(RuntimeError if independent_pg else ValueError, match="sender failed"):
+        updater.update_weights()
+
+    receiver.update_weights_from_distributed.remote.assert_called_once()
+    assert "ipc-ack" in read_refs
+    assert "nccl-ack" not in read_refs
+    assert reduce.called == independent_pg
 
 
 @pytest.mark.parametrize("kind", ["replicated", "duplicated", "buffer", "sharded"])

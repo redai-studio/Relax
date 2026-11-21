@@ -30,6 +30,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.lora_versions.training import run_on_training_rank_zero
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -155,7 +156,7 @@ from .reference_integrity import (
 from .resident_shared_expert import verify_resident_shared_readiness
 from .weight_update.common import named_params_and_buffers
 from .weight_update.train_offload import MegatronTrainStateOffloader
-from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
+from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed, precheck_colocate_receiver
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 
 
@@ -364,6 +365,15 @@ class _SFTPrepackedDeviceIterator:
 class MegatronTrainRayActor(TrainRayActor):
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         super().set_rollout_manager(rollout_manager)
+        self._colocate_elastic = (
+            self.args.colocate
+            and not self.args.fully_async
+            and not self.args.hybrid
+            and self._per_step_rollout
+            and isinstance(getattr(self, "weight_updater", None), UpdateWeightFromTensor)
+            and ray.get(rollout_manager.supports_colocate_scale_out.remote())
+        )
+        self._colocate_receivers = None
         config = ray.get(rollout_manager.get_lora_training_config.remote())
         self._managed_lora_publication = config is not None
         if config is not None:
@@ -3088,6 +3098,52 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             self.weights_backuper.backup("old_actor")
 
+    def disconnect_colocate_weight_group(self, name: str) -> None:
+        try:
+            self.weight_updater.disconnect_distributed_group(name)
+        except Exception:
+            self._report_failed_colocate_full(name)
+            raise
+        ray.get(self.rollout_manager.acknowledge_colocate_group_removed.remote(name))
+
+    def _report_failed_colocate_full(self, name: str) -> None:
+        try:
+            ray.get(self.rollout_manager.fail_colocate_full.remote(name), timeout=5)
+        except Exception:
+            logger.exception("[Colocate FULL] Could not report failure of %s", name)
+
+    def abort_colocate_weight_group(self, name: str) -> None:
+        self.weight_updater.abort_colocate_group(name)
+
+    def _acquire_colocate_full(self) -> dict:
+        source = ray.get_runtime_context().current_actor
+        probe_result = None
+        while True:
+            snapshot, obsolete = ray.get(self.rollout_manager.acquire_colocate_full.remote(source, probe_result))
+            probe_result = None
+            if snapshot is not None:
+                if precheck := snapshot.get("precheck"):
+                    rank_offset, engines, local_gpu_count, expires_at = precheck
+                    timeout = min(30.0, expires_at - time.time())
+                    success, sender_stopped, pending = precheck_colocate_receiver(engines, local_gpu_count, timeout)
+                    probe_result = rank_offset, success, sender_stopped, pending
+                    continue
+                return snapshot
+            if obsolete is not None:
+                self.disconnect_colocate_weight_group(obsolete)
+            else:
+                time.sleep(0.2)
+
+    def _publish_colocate_full(self, engines: list) -> None:
+        retired = ray.get(
+            self.rollout_manager.publish_colocate_full.remote(
+                self.weight_updater.weight_version, [engine._actor_id.hex() for engine in engines]
+            )
+        )
+        if retired is not None:
+            self.disconnect_colocate_weight_group(retired)
+        ray.get(self.rollout_manager.release_colocate_full.remote())
+
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
@@ -3141,9 +3197,39 @@ class MegatronTrainRayActor(TrainRayActor):
             if recovery_error[0] is not None:
                 raise RuntimeError(f"Rollout engine recovery failed: {recovery_error[0]}")
 
-        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
-        )
+        snapshot = None
+        if getattr(self, "_colocate_elastic", False):
+            snapshot = run_on_training_rank_zero(self._acquire_colocate_full, phase="Colocate FULL admission")
+        try:
+            self._sync_rollout_weights(snapshot)
+        except Exception:
+            if snapshot and snapshot["group_name"] and dist.get_rank(get_gloo_group()) == 0:
+                self._report_failed_colocate_full(snapshot["group_name"])
+            raise
+
+    def _sync_rollout_weights(self, snapshot: dict | None) -> None:
+        elastic_full = snapshot is not None and snapshot["group_name"] is not None
+        receivers = None
+        connect_kwargs = {}
+        if snapshot is not None:
+            rollout_engines = [engine for engine, _, _ in snapshot["receivers"]]
+            engine_gpu_counts = [count for _, count, _ in snapshot["receivers"]]
+            engine_gpu_offsets = [offset for _, _, offset in snapshot["receivers"]]
+            rollout_engine_lock = snapshot["lock"]
+            if elastic_full:
+                connect_kwargs = {
+                    "shared_engine_count": snapshot["shared_count"],
+                    "remote_group_name": snapshot["group_name"],
+                }
+                receivers = (
+                    tuple((engine._actor_id.hex(), count, offset) for engine, count, offset in snapshot["receivers"]),
+                    snapshot["group_name"],
+                )
+            num_new_engines = int(receivers != self._colocate_receivers or snapshot["num_new_engines"] > 0)
+        else:
+            rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
+                self.rollout_manager.get_rollout_engines_and_lock.remote()
+            )
 
         # Disaggregate PPO tears down the actor↔rollout NCCL groups on sleep(),
         # so we must wake_up() fully (not just reload_process_groups) and force
@@ -3164,9 +3250,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_engine_lock,
                 engine_gpu_counts=engine_gpu_counts,
                 engine_gpu_offsets=engine_gpu_offsets,
+                **connect_kwargs,
             )
             dist.barrier(group=get_gloo_group())
-            if dist.get_rank() == 0:
+            if snapshot is not None:
+                self._colocate_receivers = receivers
+            if elastic_full:
+                if snapshot["num_new_engines"] > 0:
+                    run_on_training_rank_zero(
+                        lambda: ray.get(self.rollout_manager.clear_num_new_engines.remote()),
+                        phase="Colocate receiver reconciliation",
+                    )
+            elif dist.get_rank(get_gloo_group()) == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
         with self._train_state_offloader.disable_during_update():
@@ -3174,6 +3269,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
 
+            if elastic_full:
+                run_on_training_rank_zero(
+                    lambda: self._publish_colocate_full(rollout_engines), phase="Colocate FULL publication"
+                )
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
                 engine_version = ray.get(engine.get_weight_version.remote())

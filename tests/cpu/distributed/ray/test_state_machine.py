@@ -27,6 +27,7 @@ class TestScaleOutStatus:
             "CREATING",
             "CONNECTING",
             "HEALTH_CHECKING",
+            "WAITING_FOR_WEIGHT_SYNC",
             "WEIGHT_SYNCING",
             "READY",
             "ACTIVE",

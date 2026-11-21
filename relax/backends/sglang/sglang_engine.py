@@ -8,7 +8,6 @@ import multiprocessing
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -31,6 +30,7 @@ except ImportError:
     # imports working, but fail closed if S3 streaming is requested.
     _SGLANG_LOAD_FORMAT_CHOICES = None
 
+from relax.backends.sglang._scale_weight_sync_precheck import launch_probe, transport_fingerprint
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
@@ -700,6 +700,23 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
+        if (
+            getattr(self, "_is_scaled_out", False)
+            and getattr(self.args, "colocate", False)
+            and not getattr(self.args, "hybrid", False)
+            and not getattr(self.args, "fully_async", False)
+        ):
+            # SGLang sets this inside the server process. The colocate probe
+            # runs from this wrapper and must use the same cuMem mode.
+            cumem = os.getenv("NCCL_CUMEM_ENABLE")
+            if server_args.enable_symm_mem:
+                cumem = "1"
+            elif cumem is None and server_args.nnodes > 1:
+                from sglang.srt import utils
+
+                if getattr(utils, "is_mnnvl_fabric_device", lambda: False)():
+                    cumem = "1"
+            self._colocate_probe_cumem = "0" if cumem is None else cumem
         self.process = launch_server_process(server_args)
 
         bootstrap_port = self._router_bootstrap_port
@@ -1047,17 +1064,30 @@ class SGLangEngine(RayActor):
                 raise TimeoutError("Timeout while flushing cache.")
             time.sleep(1)
 
-    def shutdown(self):
+    def shutdown(self, *, wait_for_exit: float | None = None):
         if self.args.rollout_external:
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         try:
-            self.unregister_from_router(timeout=5.0)
+            deferred_colocate = (
+                getattr(self, "_skip_router_registration", False)
+                and getattr(self, "_is_scaled_out", False)
+                and getattr(self.args, "colocate", False)
+                and not getattr(self.args, "hybrid", False)
+                and not getattr(self.args, "fully_async", False)
+            )
+            if not deferred_colocate:
+                self.unregister_from_router(timeout=5.0)
+            elif getattr(self, "_router_registration_pending", False) or self._router_worker_id is not None:
+                self.unregister_from_router(timeout=5.0, allow_already_absent=True)
         finally:
             process = getattr(self, "process", None)
             if process is not None:
-                kill_process_tree(process.pid)
+                if wait_for_exit is None:
+                    kill_process_tree(process.pid)
+                else:
+                    kill_process_tree(process.pid, wait_timeout=wait_for_exit)
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -1116,13 +1146,13 @@ class SGLangEngine(RayActor):
         self._skip_router_registration = False
         return True
 
-    def _wait_for_registered_pd_worker(self, timeout: float = 60.0) -> None:
-        """Recovery must reach a healthy registry entry before init
-        succeeds."""
+    def _wait_for_registered_worker(self, timeout: float = 60.0, *, healthy: bool = True) -> None:
+        """Wait for the Router to apply its asynchronous registration."""
         deadline = time.monotonic() + timeout
-        expected = self.get_pd_router_worker_spec()
-        if expected is None:
+        url = self.get_url()
+        if url is None:
             return
+        pd = self.worker_type in ("prefill", "decode")
         last_error = None
         while time.monotonic() < deadline:
             try:
@@ -1134,20 +1164,29 @@ class SGLangEngine(RayActor):
                 matches = [
                     worker
                     for worker in response.json().get("workers", [])
-                    if worker.get("url", "").rstrip("/") == expected["url"].rstrip("/")
+                    if worker.get("url", "").rstrip("/") == url.rstrip("/")
                 ]
                 if len(matches) > 1:
-                    raise ValueError("Duplicate PD worker URL in router registry")
-                if len(matches) == 1 and matches[0].get("is_healthy") is True:
+                    raise ValueError("Duplicate worker URL in router registry")
+                if len(matches) == 1 and (not healthy or matches[0].get("is_healthy") is True):
                     registered_id = self._router_worker_id
                     if registered_id is not None and matches[0].get("id") != registered_id:
-                        raise ValueError("PD worker registration ID changed before readiness")
-                    self.bind_registered_pd_worker(self.router_ip, self.router_port, matches[0])
+                        raise ValueError("Router worker registration ID changed before readiness")
+                    if pd:
+                        self.bind_registered_pd_worker(self.router_ip, self.router_port, matches[0])
+                    else:
+                        worker = matches[0]
+                        actor_id = ray.get_runtime_context().get_actor_id()
+                        if worker.get("metadata", {}).get("relax_actor_id") != actor_id or not worker.get("id"):
+                            raise ValueError("Router worker does not match the registering engine")
+                        self._router_worker_id = str(worker["id"])
+                        self._router_unregister_submitted = False
+                        self._skip_router_registration = False
                     return
             except requests.RequestException as error:
                 last_error = type(error).__name__
             time.sleep(0.25)
-        raise TimeoutError(f"PD worker did not become ready in the router: {last_error}")
+        raise TimeoutError(f"Worker registration was not confirmed by the router: {last_error}")
 
     def get_pid_and_node_id(self) -> dict:
         """Return the PID and Ray node ID of this engine.
@@ -1162,24 +1201,30 @@ class SGLangEngine(RayActor):
             pass
         return {"pid": os.getpid(), "node_id": node_id}
 
-    def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
+    def register_to_router(
+        self, bootstrap_port: int | None = None, strict: bool = True, *, confirm: bool = False
+    ) -> bool:
         required = getattr(self, "_require_router_registration", False)
         if self.node_rank != 0:
             return True
         if not self.router_ip or not self.router_port:
-            return not required
+            return not (required or confirm)
         if self.is_evicted():
             return False
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
+        tracked = required or (
+            confirm and not self.args.use_slime_router and parse(sglang_router.__version__) >= parse("0.3.0")
+        )
+        confirm_timeout = 15.0 if confirm else 60.0
         try:
-            if required and (
+            if tracked and (
                 getattr(self, "_router_registration_pending", False)
                 or (self._router_worker_id is not None and not self._router_unregister_submitted)
             ):
                 # A POST may be accepted before health registration completes.
                 # Retry its readiness check, not the mutation that creates a worker.
-                self._wait_for_registered_pd_worker()
+                self._wait_for_registered_worker(timeout=confirm_timeout)
                 self._router_registration_pending = False
                 return True
             if required and self.worker_type == "prefill" and bootstrap_port is None:
@@ -1206,7 +1251,7 @@ class SGLangEngine(RayActor):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
-                if required:
+                if tracked:
                     # The router may accept the worker before its HTTP response
                     # is lost. Reconcile that mutation instead of posting twice.
                     self._router_registration_pending = True
@@ -1215,13 +1260,13 @@ class SGLangEngine(RayActor):
                     response = requests.post(
                         f"http://{self.router_ip}:{self.router_port}/workers",
                         json=payload,
-                        timeout=30,
+                        timeout=10 if confirm else 30,
                     )
                 except ConnectTimeout:
-                    if required:
+                    if tracked:
                         self._router_registration_pending = False
                     raise
-                if required and response.status_code >= 400:
+                if tracked and response.status_code >= 400:
                     # Client rejections and the router's queue errors prove
                     # that no registration was submitted. A gateway timeout
                     # or an unrecognized server error can still hide acceptance.
@@ -1263,10 +1308,12 @@ class SGLangEngine(RayActor):
                 if self._router_worker_id is None:
                     logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
             self._router_unregister_submitted = False
-            if required:
+            if tracked:
                 self._router_registration_pending = True
-                self._wait_for_registered_pd_worker()
+                self._wait_for_registered_worker(timeout=confirm_timeout)
                 self._router_registration_pending = False
+            if confirm:
+                self._skip_router_registration = False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
@@ -1299,7 +1346,9 @@ class SGLangEngine(RayActor):
                 return False
             time.sleep(0.5)
 
-    def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
+    def unregister_from_router(
+        self, wait_for_removal: bool = False, timeout: float = 30.0, *, allow_already_absent: bool = False
+    ) -> bool:
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
         worker_url = f"http://{self.server_host}:{self.server_port}"
@@ -1313,6 +1362,11 @@ class SGLangEngine(RayActor):
             return removed
 
         try:
+            if allow_already_absent and getattr(self, "_router_registration_pending", False):
+                # An accepted or uncertain POST may still be queued. Resolve this
+                # generation before allowing absence to count as removal.
+                self._wait_for_registered_worker(timeout=timeout, healthy=False)
+                self._router_registration_pending = False
             if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
@@ -1335,6 +1389,13 @@ class SGLangEngine(RayActor):
                 )
                 workers_response.raise_for_status()
                 all_workers = workers_response.json().get("workers", [])
+                if allow_already_absent:
+                    actor_id = ray.get_runtime_context().get_actor_id()
+                    all_workers = [
+                        worker
+                        for worker in all_workers
+                        if isinstance(worker, dict) and worker.get("metadata", {}).get("relax_actor_id") == actor_id
+                    ]
                 exact_worker = None
                 dp_worker_found = False
                 for worker in all_workers:
@@ -1342,6 +1403,8 @@ class SGLangEngine(RayActor):
                         continue
                     listed_worker_url = worker.get("url")
                     if listed_worker_url == worker_url:
+                        if allow_already_absent and exact_worker is not None:
+                            return False
                         exact_worker = worker
                     elif (
                         isinstance(listed_worker_url, str) and router_worker_base_url(listed_worker_url) == worker_url
@@ -1354,6 +1417,8 @@ class SGLangEngine(RayActor):
                     )
                     return False
                 if exact_worker is None:
+                    if allow_already_absent:
+                        return True
                     logger.warning(f"Worker {worker_url} not found in router during unregister.")
                     return False
 
@@ -1405,7 +1470,17 @@ class SGLangEngine(RayActor):
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
-    def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+    def init_weights_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend,
+        *,
+        timeout: float | None = None,
+    ):
         return self._make_request(
             "init_weights_update_group",
             {
@@ -1416,22 +1491,34 @@ class SGLangEngine(RayActor):
                 "group_name": group_name,
                 "backend": backend,
             },
+            timeout=timeout,
         )
 
-    def destroy_weights_update_group(self, group_name):
+    def destroy_weights_update_group(self, group_name, *, strict: bool = False):
         try:
             return self._make_request(
                 "destroy_weights_update_group",
                 {
                     "group_name": group_name,
                 },
+                timeout=30 if strict else None,
             )
         except requests.exceptions.RequestException:
+            if strict:
+                raise
             # catch the case there the engine is just created and does not have the group.
             pass
 
     def update_weights_from_distributed(
-        self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        flush_cache=False,
+        weight_version: str | None = None,
+        *,
+        timeout: float | None = None,
     ):
         payload = {
             "names": names,
@@ -1447,6 +1534,7 @@ class SGLangEngine(RayActor):
         return self._make_request(
             "update_weights_from_distributed",
             payload,
+            timeout=timeout,
         )
 
     def init_weights_send_group_for_remote_instance(
@@ -1478,12 +1566,7 @@ class SGLangEngine(RayActor):
         """The engine's NCCL transport env — a cheap fingerprint (no NCCL, no
         subprocess) for the Stage-1 seed-vs-new compatibility gate before the
         real probe."""
-        return {
-            "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
-            "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
-            "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
-            "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
-        }
+        return transport_fingerprint()
 
     def run_scale_weight_sync_precheck(
         self,
@@ -1493,6 +1576,9 @@ class SGLangEngine(RayActor):
         run_token: str,
         tp_size: int,
         timeout_secs: float,
+        *,
+        world_size: int | None = None,
+        expires_at: float | None = None,
     ) -> dict:
         """Run an independent NCCL probe without touching ModelRunner groups.
 
@@ -1502,7 +1588,7 @@ class SGLangEngine(RayActor):
         verbatim, so socket-only mode is accepted only when both engine actors
         already received the same job-start environment.
         """
-        if self.node_rank != 0:
+        if self.node_rank != 0 and world_size is None:
             return {"success": False, "category": PrecheckProbeCategory.UNSUPPORTED_NODE_RANK.value, "results": []}
         local_gpu_count = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
         if tp_size != local_gpu_count:
@@ -1513,6 +1599,10 @@ class SGLangEngine(RayActor):
                 "results": [],
             }
 
+        if expires_at is not None:
+            timeout_secs = min(timeout_secs, expires_at - time.time())
+            if timeout_secs <= 0:
+                return {"success": False, "category": PrecheckProbeCategory.TIMEOUT.value, "results": []}
         port_list = ports.split(",")
         if len(port_list) != tp_size:
             return {
@@ -1552,6 +1642,8 @@ class SGLangEngine(RayActor):
         env["NCCL_DEBUG"] = "INFO"
         env["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
         env.pop("NCCL_DEBUG_FILE", None)
+        if world_size is not None:
+            env["NCCL_CUMEM_ENABLE"] = self._colocate_probe_cumem
 
         # Each probe creates a CUDA context next to the live ModelRunner. Check
         # every assigned device before launching any child so low headroom
@@ -1592,53 +1684,59 @@ class SGLangEngine(RayActor):
                 "results": [],
             }
 
+        if expires_at is not None:
+            timeout_secs = min(timeout_secs, expires_at - time.time())
+            if timeout_secs <= 0:
+                return {"success": False, "category": PrecheckProbeCategory.TIMEOUT.value, "results": []}
+        deadline = time.monotonic() + timeout_secs
+        terminate = scale_utils._terminate_probe_process
+        if world_size is not None:
+            terminate = functools.partial(terminate, grace_secs=0.1)
         processes = []
-        log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
-        started_at = time.monotonic()
+        try:
+            log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
+        except OSError:
+            logger.exception("Could not create the NCCL probe log directory")
+            return {"success": False, "stopped": True, "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value}
+
+        def cleanup_probe_logs() -> None:
+            try:
+                log_directory.cleanup()
+            except OSError:
+                logger.exception("Could not remove the NCCL probe log directory %s", log_directory.name)
+
         for local_rank, port in enumerate(port_list):
-            command = [
-                sys.executable,
-                "-m",
-                "relax.backends.sglang._scale_weight_sync_precheck",
-                "--master-address",
-                master_address,
-                "--master-port",
-                port,
-                "--rank",
-                str(group_rank),
-                "--device-id",
-                str(local_rank),
-                "--timeout-secs",
-                str(timeout_secs),
-                "--run-token",
-                f"{run_token}-{local_rank}",
-            ]
             try:
                 log_path = os.path.join(log_directory.name, f"rank-{local_rank}.log")
                 log_file = open(log_path, "w", encoding="utf-8")
-                process = subprocess.Popen(
-                    command,
+                process = launch_probe(
+                    master_address,
+                    port,
+                    group_rank if world_size is None else group_rank + local_rank,
+                    world_size or 2,
+                    local_rank,
+                    timeout_secs,
+                    f"{run_token}-{local_rank}",
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     env=env,
-                    start_new_session=True,
                 )
                 processes.append((local_rank, process, log_file, log_path))
             except Exception as exc:
                 if "log_file" in locals() and not log_file.closed:
                     log_file.close()
                 for _, process, process_log, _ in processes:
-                    scale_utils._terminate_probe_process(process)
+                    terminate(process)
                     process_log.close()
-                log_directory.cleanup()
+                cleanup_probe_logs()
                 return {
                     "success": False,
                     "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value,
                     "message": f"failed to launch rank {local_rank}: {type(exc).__name__}: {exc}",
+                    "stopped": all(process.poll() is not None for _, process, _, _ in processes),
                     "results": [],
                 }
 
-        deadline = started_at + timeout_secs
         # Wrap the entire post-launch body so an unexpected exception (e.g.
         # ``open`` failing during result collection) cannot leak running child
         # processes (CUDA context + NCCL group on the LIVE gpu) or the tempdir.
@@ -1651,14 +1749,14 @@ class SGLangEngine(RayActor):
             timed_out = {local_rank for local_rank, process, _, _ in processes if process.poll() is None}
             for local_rank, process, _, _ in processes:
                 if local_rank in timed_out:
-                    scale_utils._terminate_probe_process(process)
+                    terminate(process)
 
             results = []
             for local_rank, process, log_file, log_path in processes:
                 # A probe wedged in an uninterruptible (D) state can survive SIGKILL,
                 # so bound the join instead of blocking this actor thread forever.
                 try:
-                    process.wait(timeout=10)
+                    process.wait(timeout=0 if world_size is not None else 10)
                 except subprocess.TimeoutExpired:
                     logger.error(
                         f"NCCL precheck rank {local_rank} (pid {process.pid}) unresponsive after "
@@ -1670,10 +1768,16 @@ class SGLangEngine(RayActor):
                 parsed = None
                 for line in reversed(combined_output.splitlines()):
                     try:
-                        parsed = json.loads(line)
-                        break
+                        record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if (
+                        isinstance(record, dict)
+                        and record.get("run_token") == f"{run_token}-{local_rank}"
+                        and isinstance(record.get("success"), bool)
+                    ):
+                        parsed = record
+                        break
                 # Category is derived from structured signals only: the manager
                 # deadline, the subprocess exit code, and its JSON — never by
                 # scanning the NCCL log text.
@@ -1702,30 +1806,26 @@ class SGLangEngine(RayActor):
                 )
 
             failed = [result for result in results if not result["success"]]
-            return {
+            verdict = {
                 "success": not failed,
                 "category": failed[0]["category"] if failed else None,
                 "error_type": failed[0].get("error_type") if failed else None,
                 "error": failed[0].get("error") if failed else None,
                 "run_token": run_token,
                 "memory": memory_results,
-                "fingerprint": {
-                    "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
-                    "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
-                    "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
-                    "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
-                    "visible_devices": selected_visible,
-                },
+                "fingerprint": {**transport_fingerprint(), "visible_devices": selected_visible},
                 "results": results,
             }
         finally:
             for _, process, log_file, _ in processes:
-                scale_utils._terminate_probe_process(process)
+                terminate(process)
                 try:
                     log_file.close()
                 except Exception:
                     pass
-            log_directory.cleanup()
+            cleanup_probe_logs()
+        verdict["stopped"] = all(process.poll() is not None for _, process, _, _ in processes)
+        return verdict
 
     def pause_generation(self, timeout: float | None = None):
         response = requests.post(
