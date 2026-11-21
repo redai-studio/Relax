@@ -17,6 +17,7 @@ import sys
 import threading
 from argparse import Namespace
 from collections import deque
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,7 +31,13 @@ from relax.agentic.observability import (
     resolve_shard_ordinal,
     sample_reward_fields,
 )
-from relax.agentic.pipeline import GroupExport, SampleExport, SessionExport, TrainingFieldArtifact
+from relax.agentic.pipeline import (
+    GroupExport,
+    SampleExport,
+    SessionExport,
+    SessionExportTransport,
+    TrainingFieldArtifact,
+)
 from relax.agentic.pipeline.transfer import TransferDomain
 from relax.agentic.session.state import SessionForest, check_messages
 from relax.agentic.stage_recorder import (
@@ -2737,6 +2744,7 @@ def test_pre_request_failure_uses_terminal_metrics_without_training_samples(
         if shard._agent_cleanup_tasks:
             await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
         runtime = object.__new__(rollout_module.RuntimeDomain)
+        runtime.args = Namespace()
         runtime.rollout_mode = "train"
         runtime._admission_coordinator = None
         runtime._shards = (
@@ -2885,6 +2893,7 @@ def test_execution_terminal_preserves_valid_exports(tmp_path, rollout_module, ex
 def test_session_metrics_mark_partial_shard_coverage(rollout_module, missing_shards):
     async def scenario():
         runtime = object.__new__(rollout_module.RuntimeDomain)
+        runtime.args = Namespace()
         runtime.rollout_mode = "train"
         runtime._admission_coordinator = None
         snapshots = [
@@ -2914,5 +2923,72 @@ def test_session_metrics_mark_partial_shard_coverage(rollout_module, missing_sha
         assert metrics["agentic/sessions_completed"] == sum(
             snapshot["terminal/completed"] for snapshot in snapshots[missing_shards:]
         )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["train", "eval"])
+@pytest.mark.parametrize("missing_rounds", [1, 2])
+def test_session_metrics_recovery_reestablishes_shared_interval(tmp_path, rollout_module, mode, missing_rounds):
+    from relax.agentic.session import service
+
+    async def scenario():
+        shards = [_session_observation_fixture(tmp_path / str(i))[0] for i in range(2)]
+        args = Namespace()
+        round_number = 0
+
+        async def rpc(index, *, reset, rollout_mode):
+            if rollout_mode == mode and index == 1 and round_number <= missing_rounds:
+                # The unavailable RPC never executes, so this Shard retains its counts.
+                raise RuntimeError("shard temporarily unavailable")
+            return await shards[index].agentic_kv_metrics(reset=reset, rollout_mode=rollout_mode)
+
+        async def record_events(rollout_mode):
+            for index, shard in enumerate(shards):
+                key = f"{rollout_mode}-{round_number}-{index}"
+                group = service.ResidentGroup(rollout_mode, key, {}, [], ownership=service.GroupOwnership.RUNTIME)
+                session = service._SessionRecord(group, key, {}, service._SessionResultCell())
+                group.sessions.append(session)
+                shard._session_records[key] = session
+                await shard._finish_session(
+                    session,
+                    SessionExportTransport(exports=()),
+                    failure=("execution_failed", "execution", "test failure") if index else None,
+                )
+
+        async def collect(rollout_mode):
+            # Eval creates a fresh RuntimeDomain per dataset/round, using the same worker args.
+            bindings = [
+                SimpleNamespace(handle=SimpleNamespace(agentic_kv_metrics=SimpleNamespace(remote=partial(rpc, i))))
+                for i in range(2)
+            ]
+            runtime = rollout_module.RuntimeDomain(args, rollout_mode, bindings, concurrency=1)
+            return await runtime.collect_agentic_kv_metrics()
+
+        try:
+            for round_number in range(1, missing_rounds + 3):
+                await record_events(mode)
+                metrics = await collect(mode)
+                if round_number <= missing_rounds:
+                    assert "agentic/session_error_rate" not in metrics
+                    assert metrics["agentic/session_metrics_complete"] == 0
+                elif round_number == missing_rounds + 1:
+                    # All RPCs returned, but B's count spans more rounds than A's.
+                    assert "agentic/session_error_rate" not in metrics
+                    assert metrics["agentic/session_metrics_complete"] == 1
+                    assert metrics["agentic/sessions_failed"] == missing_rounds + 1
+                else:
+                    assert metrics["agentic/session_error_rate"] == 0.5
+                    assert metrics["agentic/sessions_completed"] == metrics["agentic/sessions_failed"] == 1
+                    assert metrics["agentic/session_metrics_interval_aligned"] == 1
+                if round_number == 1:
+                    other_mode = "eval" if mode == "train" else "train"
+                    await record_events(other_mode)
+                    assert (await collect(other_mode))["agentic/session_error_rate"] == 0.5
+        finally:
+            for shard in shards:
+                if shard._agent_cleanup_tasks:
+                    await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+                await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())

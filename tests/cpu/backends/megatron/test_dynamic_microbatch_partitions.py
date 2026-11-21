@@ -8,12 +8,13 @@ from unittest.mock import Mock
 import pytest
 
 from relax.engine.sft.runtime import is_embedding_sft_mode
+from relax.utils.training.data_fields import has_multimodal_inputs
 
 
 @pytest.fixture
 def partitioner():
     root = Path(__file__).resolve().parents[4]
-    namespace = {"logger": Mock()}
+    namespace = {"logger": Mock(), "has_multimodal_inputs": has_multimodal_inputs}
     names = {
         "get_first_fit_partitions",
         "get_binpack_partitions",

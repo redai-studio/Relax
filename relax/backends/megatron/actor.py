@@ -98,7 +98,7 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import build_data_fields, needs_multimodal_fields
+from relax.utils.training.data_fields import build_data_fields, has_multimodal_inputs, needs_multimodal_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.training.routing_replay import RoutingReplay
@@ -4007,7 +4007,7 @@ class MegatronTrainRayActor(TrainRayActor):
             total_lengths,
             self.args.qkv_format,
             getattr(self.args, "is_vl_model", False)
-            or any(mm is not None for mm in rollout_data.get("multimodal_train_inputs") or ())
+            or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
             or getattr(self.args, "uses_unsplit_forward", False),
         )
         if padded_total_lengths is None:

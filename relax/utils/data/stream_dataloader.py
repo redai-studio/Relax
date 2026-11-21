@@ -22,6 +22,7 @@ from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import Timer, timer
+from relax.utils.training.data_fields import has_multimodal_inputs
 
 
 logger = logging.getLogger(__name__)
@@ -1252,7 +1253,7 @@ def post_process_rollout_data(args, rollout_data):
         rollout_data["total_lengths"],
         args.qkv_format,
         getattr(args, "is_vl_model", False)
-        or "multimodal_train_inputs" in rollout_data
+        or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
         or getattr(args, "uses_unsplit_forward", False),
     )
 

@@ -78,6 +78,7 @@ class OSWorldEnv:
         self.cache_dir = cache_dir or os.environ.get("OSWORLD_CACHE_DIR", "/tmp/osworld_cache")
         self._env: Optional[DesktopEnv] = None
         self._lock = asyncio.Lock()
+        self.evaluation_error: str | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -196,10 +197,12 @@ class OSWorldEnv:
 
     def _evaluate_sync(self) -> float:
         assert self._env is not None, "reset() must be called before evaluate()"
+        self.evaluation_error = None
         try:
             raw = self._env.evaluate()
             return float(raw)
-        except Exception:
+        except Exception as exc:
+            self.evaluation_error = f"{type(exc).__name__}: {exc}"
             logger.exception("evaluate() raised; returning 0.0")
             return 0.0
 

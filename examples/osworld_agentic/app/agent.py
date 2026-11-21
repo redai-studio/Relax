@@ -316,6 +316,7 @@ async def run_session(
         # Final scoring lives with the env (VM-side postconfig + metrics).
         phase_start = time.monotonic()
         reward = await env.evaluate()
+        evaluation_error = getattr(env, "evaluation_error", None)
         timings["evaluate"] = time.monotonic() - phase_start
     finally:
         phase_start = time.monotonic()
@@ -336,6 +337,13 @@ async def run_session(
             "execution_status": (
                 {"status": "failed", "reason_code": "predict_error", "category": "execution", "reason": last_error}
                 if stop_reason == "predict_error"
+                else {
+                    "status": "failed",
+                    "reason_code": "evaluation_failed",
+                    "category": "execution",
+                    "reason": evaluation_error,
+                }
+                if evaluation_error is not None
                 else {"status": "completed"}
             ),
             "agent_turns": len(action_types),
@@ -344,7 +352,7 @@ async def run_session(
             "task_id": task_config.get("id"),
             "data_source": metadata.get("data_source"),
             "session_wallclock_s": elapsed,
-            "last_error": last_error,
+            "last_error": last_error or evaluation_error,
             "_session_metrics": {
                 "osworld/success_rate": float(reward >= 0.5),
                 "osworld/environment_steps": len(action_types),

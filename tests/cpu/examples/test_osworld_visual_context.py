@@ -14,6 +14,7 @@ import signal
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -215,6 +216,126 @@ def adapter_functions(**extras):
     ns = dict(asyncio=asyncio, signal=signal, logging=logging, os=os, json=json, Path=Path, **extras)
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), ns)
     return ns
+
+
+@pytest.mark.parametrize("mode", ["baseline", "vcs"])
+@pytest.mark.parametrize("evaluation_failed", [False, True], ids=["zero-score", "evaluation-timeout"])
+def test_evaluation_failure_preserves_exports_and_terminal_status(
+    monkeypatch, tmp_path, hybrid, mode, evaluation_failed
+):
+    from relax.agentic.pipeline import SessionExportTransport
+    from relax.agentic.runner.ipc import SessionOutput
+    from relax.agentic.session import service
+
+    # Only the external VM SDK import and VM I/O are replaced. Load the full adapters.
+    desktop = ModuleType("desktop_env.desktop_env")
+    desktop.DesktopEnv = object
+    monkeypatch.setitem(sys.modules, "desktop_env", ModuleType("desktop_env"))
+    monkeypatch.setitem(sys.modules, "desktop_env.desktop_env", desktop)
+    app = ModuleType("app")
+    app.__path__ = [str(ROOT / "examples/osworld_agentic/app")]
+    monkeypatch.setitem(sys.modules, "app", app)
+    monkeypatch.setitem(sys.modules, "app.hybrid_agent", hybrid)
+
+    def load(leaf):
+        spec = importlib.util.spec_from_file_location(f"app.{leaf}", Path(app.__path__[0]) / f"{leaf}.py")
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, f"app.{leaf}", module)
+        spec.loader.exec_module(module)
+        return module
+
+    load("task_setup_compat")
+    adapter = load("env_osworld")
+    driver = load("agent")
+    backend = MockBackend(monkeypatch, hybrid)
+    instances = []
+
+    def evaluate():
+        if evaluation_failed:
+            raise TimeoutError("guest evaluator timed out")
+        return 0.0
+
+    class Env(adapter.OSWorldEnv):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._env = SimpleNamespace(evaluate=evaluate)
+            instances.append(self)
+
+        async def reset(self):
+            return adapter.StepObs(screenshot_bytes=b"screen")
+
+        async def exec_pyautogui(self, action):
+            return adapter.StepObs(screenshot_bytes=b"screen")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(driver, "OSWorldEnv", Env)
+    monkeypatch.setattr(
+        driver,
+        "_load_config",
+        lambda: {
+            "max_turns": 2,
+            "context_mode": mode,
+            "vcs_keep_images": 2,
+            "vcs_prune_images": 1,
+        },
+    )
+    monkeypatch.setenv("RELAX_SESSION_ID", "session")
+    monkeypatch.setenv("RELAX_VCS", str(int(mode == "vcs")))
+    payload = asyncio.run(driver.run_session({"task_config": {"id": "task", "instruction": "task"}}, {}))
+    assert payload["reward"] == 0.0
+    status = payload["metadata"]["execution_status"]
+    assert status["status"] == ("failed" if evaluation_failed else "completed")
+    if evaluation_failed:
+        assert status["reason_code"] == "evaluation_failed" and "TimeoutError" in status["reason"]
+    path = tmp_path / "output.jsonl"
+    driver.write_session_output(path, payload)
+    output = SessionOutput.from_records([json.loads(line) for line in path.read_text().splitlines()])
+
+    async def finalize():
+        shard = backend.shard
+        shard.args.agentic_session_lifecycle = False
+        shard._notify_state_change = lambda *args: None
+        shard._agent_cleanup_tasks = set()
+        group = service.ResidentGroup("train", "g", {}, [], ownership=service.GroupOwnership.RUNTIME)
+        session = service._SessionRecord(group, "session", {}, service._SessionResultCell(), forest=backend.forest)
+        group.sessions.append(session)
+        shard._session_records = {session.session_id: session}
+        process_wait = asyncio.create_task(asyncio.sleep(0))
+        watcher = asyncio.create_task(asyncio.Event().wait())
+        session.resources = service.SessionResources(
+            SimpleNamespace(output=output, terminate_and_join=AsyncMock()),
+            process_wait,
+            watcher,
+        )
+        await shard._finalize_terminal_session(session)
+        transport = session.result_cell.payload
+        assert isinstance(transport, SessionExportTransport) and not group.drop_committed
+        samples = [
+            TrainingFieldArtifact(sample_payload=row["sample_payload"]).to_sample() for row in transport.exports
+        ]
+        assert len(samples) == (2 if mode == "baseline" else 1)
+        tokens = [
+            t for sample in samples for t, m in zip(sample.tokens[-sample.response_length :], sample.loss_mask) if m
+        ]
+        assert tokens == [token for ids, _ in backend.generated for token in ids]
+        probs = [p for sample in samples for p, m in zip(sample.rollout_log_probs, sample.loss_mask) if m]
+        assert probs == pytest.approx([prob for _, values in backend.generated for prob in values])
+        assert [s.reward for s in samples if s.reward is not None] == [{"score": 0.0}]
+        metrics = await shard.agentic_kv_metrics()
+        assert metrics["terminal/failed"] == int(evaluation_failed)
+        assert metrics["terminal/completed"] == int(not evaluation_failed)
+        if shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        await asyncio.gather(watcher, return_exceptions=True)
+        await shard._trajectory_recorder.aclose()
+
+    asyncio.run(finalize())
+    # A later successful evaluation must clear an earlier timeout diagnostic.
+    instances[0]._env.evaluate = lambda: 0.0
+    assert asyncio.run(instances[0].evaluate()) == 0.0
+    assert getattr(instances[0], "evaluation_error", None) is None
 
 
 def export_agent(agent, backend, tmp_path):

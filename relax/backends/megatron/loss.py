@@ -28,6 +28,7 @@ from relax.utils.opd.opd_utils import (
     validate_opd_topk_gather,
 )
 from relax.utils.replay import capture_hooks
+from relax.utils.training.data_fields import has_multimodal_inputs
 from relax.utils.training.dataset_metrics import dataset_loss_sums, finalize_dataset_loss_metrics
 from relax.utils.training.fused_ce import ce_implementation, te_cross_entropy
 from relax.utils.training.ppo_utils import (
@@ -731,7 +732,7 @@ def compute_advantages_and_returns(
         total_lengths,
         args.qkv_format,
         getattr(args, "is_vl_model", False)
-        or rollout_data.get("multimodal_train_inputs") is not None
+        or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
         or getattr(args, "uses_unsplit_forward", False),
     )
 

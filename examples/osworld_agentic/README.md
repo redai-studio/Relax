@@ -90,7 +90,7 @@ Actor 与 rollout colocate，共用检测到的 8 或 16 张物理 GPU。session
 
 基础设施与执行异常按 Session 终态统计：`agentic/sessions_completed`、`agentic/sessions_failed`、`agentic/sessions_cancelled`，以及 `agentic/session_error_rate = failed / (completed + failed)`。统计按采集区间累积，train/eval 隔离；选择性取消不进入异常率分母。首个模型请求前失败也计入，即使整组被丢弃、没有训练 Sample；原任务 evaluator 判负仍属于正常完成的 Session。丢弃日志保留 task 进程的 `stop_reason` 和 `last_error`，不从成功导出的 Sample 推算基础设施异常率。
 
-Agent 通过输出 metadata 中的 `execution_status` 对象上报执行终态：异常时 `status=failed`，并提供 `reason_code`、`category`（`execution` 或 `infra`）及 `reason`。已有有效回复的执行异常仍计为失败，但保留原有训练导出和奖励。`agentic/session_metrics_shards_total`、`agentic/session_metrics_shards_reported` 和 `agentic/session_metrics_complete` 标明统计覆盖；缺少 Shard 时只报告已采集计数，不发布全量异常率。
+Agent 通过输出 metadata 中的 `execution_status` 对象上报执行终态：异常时 `status=failed`，并提供 `reason_code`、`category`（`execution` 或 `infra`）及 `reason`。已有有效回复的执行异常仍计为失败，但保留原有训练导出和奖励。评分器异常仍回退零分，同时上报 `evaluation_failed`，与正常判零区分。`agentic/session_metrics_shards_total`、`agentic/session_metrics_shards_reported` 和 `agentic/session_metrics_complete` 标明统计覆盖；缺少 Shard 时只报告已采集计数，不发布全量异常率。恢复后的首次完整采集只重建共同基线，下一完整区间才恢复异常率；`agentic/session_metrics_interval_aligned` 标明区间是否对齐，train/eval 分别维护。
 
 baseline 的 `max_image_history_length=2` 限制单次模型上下文的图像历史，不表示一条轨迹只有两张截图。VCS 模式改用独立的 K/Δ 窗口，raw reward 仍按原始调用数加权。
 

@@ -30,7 +30,7 @@ from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.straggler import straggler_rollout_end
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
-from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
+from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS, has_multimodal_inputs
 from relax.utils.training.flops_counter import FlopsCounter
 from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
@@ -480,7 +480,7 @@ def get_batch(
 
     # Agentic rows always publish this nullable TQ column. An all-text
     # microbatch must still use GPT's normal CP packing, not Bridge's layout.
-    if "multimodal_train_inputs" in batch and not any(mm is not None for mm in batch["multimodal_train_inputs"] or ()):
+    if "multimodal_train_inputs" in batch and not has_multimodal_inputs(batch["multimodal_train_inputs"]):
         batch["multimodal_train_inputs"] = None
 
     if pack_device is not None:
@@ -571,7 +571,7 @@ def get_batch(
         # Routed by `is_vl_model` (set from hf_config) rather than presence of
         # multimodal_train_inputs, so VL models with text-only batches still
         # land here — bridge skips vision embedding when image_grid_thw is None.
-        has_mm_inputs = batch.get("multimodal_train_inputs") is not None
+        has_mm_inputs = has_multimodal_inputs(batch.get("multimodal_train_inputs"))
         needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -1439,7 +1439,7 @@ def get_data_iterator(
         needs_unsplit_input = (
             getattr(args, "is_vl_model", False)
             or getattr(args, "uses_unsplit_forward", False)
-            or any(mm is not None for mm in rollout_data.get("multimodal_train_inputs") or ())
+            or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
         )
         if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
@@ -1575,7 +1575,7 @@ def log_rollout_data(
             total_lengths,
             args.qkv_format,
             getattr(args, "is_vl_model", False)
-            or any(mm is not None for mm in rollout_data.get("multimodal_train_inputs") or ())
+            or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
             or getattr(args, "uses_unsplit_forward", False),
         )
 

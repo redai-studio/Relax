@@ -10,6 +10,63 @@ from relax.utils.sft_utils import align_loss_mask_for_sft
 
 
 @pytest.mark.parametrize("layout", ["text", "vl_text", "media", "unsplit_text"])
+def test_nullable_media_ingestion_matches_cp_masks_and_advantages(monkeypatch, layout):
+    from relax.backends.megatron import loss
+    from relax.utils.data import stream_dataloader
+
+    monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(cp_utils.mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(cp_utils.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(cp_utils.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(cp_utils.mpu, "get_data_parallel_group", lambda: None)
+    args = SimpleNamespace(
+        loss_type="policy_loss",
+        qkv_format="thd",
+        is_vl_model=layout == "vl_text",
+        uses_unsplit_forward=layout == "unsplit_text",
+        use_opd=False,
+        use_rollout_logprobs=True,
+        kl_coef=0.0,
+        advantage_estimator="grpo",
+        normalize_advantages=True,
+    )
+    whitened_masks = []
+
+    def whiten(values, masks, **kwargs):
+        whitened_masks.append(masks.clone())
+        return values
+
+    monkeypatch.setattr(loss, "distributed_masked_whiten", whiten)
+    total_mean = torch.tensor(0.0)
+    for rank in range(2):
+        monkeypatch.setattr(cp_utils.mpu, "get_context_parallel_rank", lambda: rank)
+        batch = {
+            "tokens": [list(range(11))],
+            "total_lengths": [11],
+            "response_lengths": [2],
+            "loss_masks": [[1, 1]],
+            "rollout_log_probs": [[-0.25, -0.75]],
+            "rewards": [1.0],
+            "multimodal_train_inputs": [{"pixel_values": torch.ones(4, 8)} if layout == "media" else None],
+        }
+        stream_dataloader.post_process_rollout_data(args, batch)
+        expected = ([-0.75], [-0.25]) if layout == "text" else ([], [-0.25, -0.75])
+        assert batch["rollout_log_probs"][0].tolist() == expected[rank]
+        # Independent physical boundaries: GPT pads to 12, Bridge to TP*CP*2=16.
+        padded = None if layout == "text" else [16]
+        masks = cp_utils.get_cp_local_loss_masks([11], [2], batch["loss_masks"], padded_total_lengths=padded)
+        assert masks[0].numel() == len(expected[rank])
+        reducer = cp_utils.get_sum_of_sample_mean([11], [2], batch["loss_masks"], padded_total_lengths=padded)
+        total_mean += reducer(batch["rollout_log_probs"][0])
+        whitened_masks.clear()
+        loss.compute_advantages_and_returns(args, batch)
+        torch.testing.assert_close(batch["advantages"][0], torch.ones(len(expected[rank])))
+        if expected[rank]:
+            torch.testing.assert_close(whitened_masks[0], masks[0])
+    assert total_mean.item() == pytest.approx(-0.5)
+
+
+@pytest.mark.parametrize("layout", ["text", "vl_text", "media", "unsplit_text"])
 def test_cp_output_gather_matches_nullable_multimodal_layout(monkeypatch, layout):
     from relax.backends.megatron import actor
 

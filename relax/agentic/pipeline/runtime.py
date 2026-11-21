@@ -1452,15 +1452,21 @@ class RuntimeDomain:
         result.update({f"agentic/sessions_{status}": value for status, value in terminal.items()})
         reported_shards = sum(not isinstance(snapshot, BaseException) for snapshot in shard_metrics)
         complete = reported_shards == len(self._shards)
+        # Eval reconnects its RuntimeDomain each time; the worker's args persist.
+        alignment = vars(self.args).setdefault("_agentic_session_metrics_alignment", {})
+        interval_aligned = complete and alignment.get(self.rollout_mode, True)
+        # After a missing RPC, the first complete reset only restores a baseline.
+        alignment[self.rollout_mode] = complete
         result.update(
             {
                 "agentic/session_metrics_shards_total": float(len(self._shards)),
                 "agentic/session_metrics_shards_reported": float(reported_shards),
                 "agentic/session_metrics_complete": float(complete),
+                "agentic/session_metrics_interval_aligned": float(interval_aligned),
             }
         )
         denominator = terminal["completed"] + terminal["failed"]
-        if complete and denominator:
+        if interval_aligned and denominator:
             result["agentic/session_error_rate"] = terminal["failed"] / denominator
         return result
 

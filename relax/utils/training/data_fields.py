@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from collections.abc import Sequence
+from typing import Any
 
 from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -19,6 +21,11 @@ PREFERENCE_DATA_FIELDS = (
     "chosen_total_lengths",
     "rejected_total_lengths",
 )
+
+
+def has_multimodal_inputs(rows: Sequence[dict[str, Any] | None] | None) -> bool:
+    """Distinguish actual media rows from a nullable transport column."""
+    return rows is not None and any(row is not None for row in rows)
 
 
 def needs_multimodal_fields(args: Namespace) -> bool:
