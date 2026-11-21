@@ -100,6 +100,18 @@ def _custom_reward_kwargs(function: Callable[..., Any], kwargs: dict[str, Any]) 
     return {key: value for key, value in kwargs.items() if key != "evaluation"}
 
 
+def resolve_sample_reward(args, sample: Sample):
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    return resolve_rm_type(
+        metadata_rm_type=metadata.get("rm_type"),
+        args_rm_type=getattr(args, "rm_type", None),
+        label=sample.label,
+        infer=getattr(args, "rm_type_infer", False),
+        fallback=getattr(args, "rm_type_fallback", None),
+        sample_index=getattr(sample, "index", None),
+    )
+
+
 def _sample_context(sample: Sample | list[Sample]) -> str:
     if isinstance(sample, list):
         displayed_samples = sample[:_MAX_GROUP_CONTEXT_SAMPLES]
@@ -423,15 +435,7 @@ class RewardExecutor:
         if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False):
             return await self._execute_custom_with_concurrency(args, sample, **kwargs)
 
-        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-        route = _resolved_route or resolve_rm_type(
-            metadata_rm_type=metadata.get("rm_type"),
-            args_rm_type=args.rm_type,
-            label=sample.label,
-            infer=getattr(args, "rm_type_infer", False),
-            fallback=getattr(args, "rm_type_fallback", None),
-            sample_index=getattr(sample, "index", None),
-        )
+        route = _resolved_route or resolve_sample_reward(args, sample)
         # Managed GenRM may share/offload policy GPUs; only independent
         # HTTP judges are safe to detach automatically. Capture before taking
         # a training-pool permit, and pin the resolved route for later scoring.
@@ -462,7 +466,9 @@ class RewardExecutor:
             if rm_type:
                 await self._ensure_workers(args)
                 worker = self._next_worker()
-                ref = worker.compute.remote(rm_type, response, label, metadata=metadata)
+                ref = worker.compute.remote(
+                    rm_type, response, label, metadata=sample.metadata if isinstance(sample.metadata, dict) else {}
+                )
                 return await ref
 
             # --- no rm_type specified -----------------------------------------

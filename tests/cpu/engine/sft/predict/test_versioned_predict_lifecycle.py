@@ -106,8 +106,25 @@ def test_partial_resume_settles_and_releases_before_training_wakes(monkeypatch, 
             release_slow.set()
 
 
-@pytest.mark.parametrize("deferred", [False, True])
-def test_managed_judge_scores_installed_weights_before_training_wakes(monkeypatch, trainer, deferred, tmp_path):
+async def placeholder_reward(args, sample, **kwargs):
+    return 0.0
+
+
+@pytest.mark.parametrize(
+    ("rm_type", "sample_type", "custom", "deferred", "uses_judge"),
+    [
+        ("dapo-genrm", None, None, False, True),
+        ("dapo-genrm", None, None, True, True),
+        ("dummy", None, None, True, False),
+        ("dummy", None, f"{__name__}.placeholder_reward", True, False),
+        ("dummy", "dapo-genrm", None, True, True),
+        ("dapo-genrm", "dummy", None, False, False),
+        ("dummy", None, "relax.engine.rewards.dapo_genrm.async_compute_score_genrm", False, True),
+    ],
+)
+def test_managed_judge_scores_installed_weights_before_training_wakes(
+    monkeypatch, trainer, rm_type, sample_type, custom, deferred, uses_judge, tmp_path
+):
     from ray import serve
 
     from relax.engine.sft.predict import loop
@@ -115,8 +132,9 @@ def test_managed_judge_scores_installed_weights_before_training_wakes(monkeypatc
 
     rollout_type = pytest.importorskip("relax.distributed.ray.rollout").RolloutManager.__ray_metadata__.modified_class
     args = trainer.args
-    args.loss_type, args.rm_type, args.custom_rm_path = "sft", "dapo-genrm", None
+    args.loss_type, args.rm_type, args.custom_rm_path = "sft", rm_type, custom
     args.defer_reward_to_post_process = deferred
+    args.custom_reward_post_process_path = "custom.post_process" if deferred else None
     args.save, args.weight_version_config = str(tmp_path), "source.json"
     args._genrm_instances_resolved = {"default": {}}
     events = []
@@ -154,7 +172,7 @@ def test_managed_judge_scores_installed_weights_before_training_wakes(monkeypatc
             raise httpx.ConnectError("judge is offloaded")
         return "Judgement: 1"
 
-    sample = Sample(prompt="1+1?", label="2")
+    sample = Sample(prompt="1+1?", label="2", metadata={"rm_type": sample_type} if sample_type else {})
 
     def prompts(config, *, samples):
         samples.append(sample)
@@ -166,6 +184,8 @@ def test_managed_judge_scores_installed_weights_before_training_wakes(monkeypatc
         args=args,
         onload=AsyncMock(),
         consume_weight_version=install,
+        _sft_predict_judge=None,
+        _offload_local=lambda: events.append("rollout-off"),
         generate_predict=generate,
         submit_eval_result=AsyncMock(),
     )
@@ -175,7 +195,7 @@ def test_managed_judge_scores_installed_weights_before_training_wakes(monkeypatc
         config=args,
         rollout_manager=SimpleNamespace(
             run_predict=SimpleNamespace(remote=lambda *a: rollout_type.run_predict(manager, *a)),
-            offload=SimpleNamespace(remote=AsyncMock(side_effect=lambda: events.append("rollout-off"))),
+            offload=SimpleNamespace(remote=lambda: rollout_type.offload(manager)),
         ),
     )
 
@@ -186,8 +206,12 @@ def test_managed_judge_scores_installed_weights_before_training_wakes(monkeypatc
     monkeypatch.setattr(runner.requests, "get", request)
     trainer.wake_up.side_effect = lambda: events.append("wake")
     runner.run_sft_predict(trainer, 3, published_version={"version": 1, "root": "r"})
-    assert sample.reward["score"] == 1.0
-    assert events == ["install", "generate", "judge-on", "score", "judge-off", "rollout-off", "wake"]
+    if uses_judge:
+        assert sample.reward["score"] == 1.0
+        assert events == ["install", "generate", "judge-on", "score", "judge-off", "rollout-off", "wake"]
+    else:
+        assert sample.reward == 0.0
+        assert events == ["install", "generate", "rollout-off", "wake"]
     trainer.update_weights.assert_not_called()
 
 
@@ -252,21 +276,23 @@ def test_training_barrier_waits_for_offload_retry(monkeypatch, sync):
 
 
 def test_judge_cleanup_failure_still_releases_rollout(monkeypatch, trainer):
-    from ray import serve
-
+    rollout_type = pytest.importorskip("relax.distributed.ray.rollout").RolloutManager.__ray_metadata__.modified_class
     args = trainer.args
-    args.loss_type, args.rm_type = "sft", "dapo-genrm"
-    args._genrm_instances_resolved = {"default": {}}
-    release = AsyncMock(side_effect=RuntimeError("judge still resident"))
-    monkeypatch.setattr(serve, "get_app_handle", lambda name: SimpleNamespace(offload=SimpleNamespace(remote=release)))
-    rollout_release = AsyncMock()
+    args.loss_type = "sft"
+    release = AsyncMock(side_effect=[RuntimeError("judge still resident"), None])
+    rollout_release = Mock()
+    manager = SimpleNamespace(
+        _sft_predict_judge=SimpleNamespace(offload=SimpleNamespace(remote=release)),
+        _offload_local=rollout_release,
+        status="offload",
+    )
     rollout = SimpleNamespace(
         _logger=Mock(),
         healthy=Mock(),
         config=args,
         rollout_manager=SimpleNamespace(
             run_predict=SimpleNamespace(remote=AsyncMock(side_effect=ValueError("prediction failed"))),
-            offload=SimpleNamespace(remote=rollout_release),
+            offload=SimpleNamespace(remote=lambda: rollout_type.offload(manager)),
         ),
     )
 
@@ -278,17 +304,8 @@ def test_judge_cleanup_failure_still_releases_rollout(monkeypatch, trainer):
     with pytest.raises(RuntimeError, match="prediction failed.*judge still resident"):
         runner.run_sft_predict(trainer, 1, published_version={"version": 0, "root": "r"})
     release.assert_awaited_once()
-    rollout_release.assert_awaited_once()
+    rollout_release.assert_called_once()
     trainer.wake_up.assert_not_called()
-
-
-def test_postprocessor_owned_custom_judge_keeps_its_lifecycle():
-    from relax.engine.sft.predict.loop import managed_predict_judge
-
-    args = SimpleNamespace(
-        offload_rollout=True,
-        _genrm_instances_resolved={"default": {}},
-        custom_rm_path="custom.score",
-        defer_reward_to_post_process=True,
-    )
-    assert managed_predict_judge(args) is None
+    assert rollout_type.get_status(manager) == "busy"
+    asyncio.run(rollout_type.offload(manager))
+    assert rollout_type.get_status(manager) == "offload"
