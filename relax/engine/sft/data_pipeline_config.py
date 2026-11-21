@@ -11,6 +11,8 @@ from relax.utils.data.wholepack_policy import enabled as wholepack_enabled
 
 
 def configure_sft_data_pipeline(args: Namespace) -> None:
+    # Non-SFT callers may pass a partial namespace (no loss_type at all), so this
+    # one read keeps its fallback.
     is_sft = is_sft_mode(args) or getattr(args, "loss_type", None) in ("sft_loss", "sft-loss")
     optimized_qwen = is_sft and qwen35_recipe.enabled(args)
     args.sft_dispatch_token_limit = (
@@ -33,15 +35,15 @@ def configure_sft_data_pipeline(args: Namespace) -> None:
             # Embedding pairs are packed by their task-specific forward path;
             # the generic prepacker cannot concatenate anchor/positive dicts.
             and not is_embedding_task(args)
-            and "image" not in (getattr(args, "multimodal_keys", None) or {})
+            and "image" not in (args.multimodal_keys or {})
             and args.distributed_backend == "nccl"
             and args.qkv_format == "thd"
             and args.pipeline_model_parallel_size == 1
             and args.context_parallel_size == 1
             and (getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) == 1
             and not getattr(args, "dynamic_context_parallel", False)
-            and not getattr(args, "use_routing_replay", False)
-            and not getattr(args, "use_rollout_routing_replay", False)
+            and not args.use_routing_replay
+            and not args.use_rollout_routing_replay
             and not getattr(args, "use_rollout_indexer_replay", False)
         )
         args.sft_train_data_prefetch = lookahead and not args.sft_async_prepack

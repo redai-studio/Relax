@@ -11,26 +11,44 @@ from types import SimpleNamespace
 import pytest
 
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
+from tests.cpu.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
+
+
+arguments_module = _arguments_module_fixture
 
 
 _SOURCE = Path(__file__).resolve().parents[4] / "relax/utils/arguments.py"
 
 
-def make_args(**overrides):
-    values = dict(
-        loss_type="sft",
-        task_type="causal_lm",
-        train_backend="megatron",
-        max_staleness=1,
-        per_rank_fetch=False,
-        sft_async_prepack=False,
-        sft_train_data_prefetch=False,
-        distributed_backend="nccl",
-        qkv_format="thd",
-        pipeline_model_parallel_size=1,
-        context_parallel_size=1,
-        virtual_pipeline_model_parallel_size=None,
-        multimodal_keys=None,
+@pytest.fixture
+def parser_defaults(arguments_module, monkeypatch):
+    monkeypatch.setattr(
+        arguments_module,
+        "RouterArgs",
+        SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser),
+    )
+    parser = arguments_module.get_slime_extra_args_provider()(argparse.ArgumentParser())
+    return vars(parser.parse_args([]))
+
+
+def make_args(parser_defaults, **overrides):
+    values = dict(parser_defaults)
+    values.update(
+        dict(
+            loss_type="sft",
+            task_type="causal_lm",
+            train_backend="megatron",
+            max_staleness=1,
+            per_rank_fetch=False,
+            sft_async_prepack=False,
+            sft_train_data_prefetch=False,
+            distributed_backend="nccl",
+            qkv_format="thd",
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            virtual_pipeline_model_parallel_size=None,
+            multimodal_keys=None,
+        )
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -58,8 +76,8 @@ def make_args(**overrides):
         ({"train_backend": "fsdp"}, False, False, False),
     ],
 )
-def test_pipeline_uses_capabilities_and_preserves_budget(overrides, prepack, prefetch, image):
-    args = make_args(**overrides)
+def test_pipeline_uses_capabilities_and_preserves_budget(parser_defaults, overrides, prepack, prefetch, image):
+    args = make_args(parser_defaults, **overrides)
     configure_sft_data_pipeline(args)
     assert args.per_rank_fetch is (args.train_backend == "megatron")
     assert args.sft_async_prepack is prepack
@@ -69,8 +87,10 @@ def test_pipeline_uses_capabilities_and_preserves_budget(overrides, prepack, pre
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_legacy_switches_do_not_override_automatic_selection(enabled):
-    args = make_args(per_rank_fetch=enabled, sft_async_prepack=enabled, sft_train_data_prefetch=enabled)
+def test_legacy_switches_do_not_override_automatic_selection(parser_defaults, enabled):
+    args = make_args(
+        parser_defaults, per_rank_fetch=enabled, sft_async_prepack=enabled, sft_train_data_prefetch=enabled
+    )
     configure_sft_data_pipeline(args)
     assert args.per_rank_fetch and args.sft_async_prepack
     assert not args.sft_train_data_prefetch
@@ -80,8 +100,8 @@ def test_legacy_switches_do_not_override_automatic_selection(enabled):
 
 
 @pytest.mark.parametrize("per_rank", [False, True])
-def test_rl_preserves_explicit_per_rank_fetch(per_rank):
-    args = make_args(loss_type="grpo", per_rank_fetch=per_rank)
+def test_rl_preserves_explicit_per_rank_fetch(parser_defaults, per_rank):
+    args = make_args(parser_defaults, loss_type="grpo", per_rank_fetch=per_rank)
     configure_sft_data_pipeline(args)
     assert args.per_rank_fetch is per_rank
     assert not args.sft_async_prepack
@@ -100,7 +120,13 @@ def test_pipeline_accepts_partial_non_sft_arguments():
 
 
 def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
-    args = SimpleNamespace(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
+    args = SimpleNamespace(
+        loss_type="sft",
+        generation_task="i2i",
+        train_backend="fsdp",
+        max_staleness=1,
+        multimodal_keys=None,
+    )
     configure_sft_data_pipeline(args)
     assert not args.per_rank_fetch
     assert not args.sft_async_prepack
@@ -108,7 +134,7 @@ def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
     assert not args.sft_image_preprocess_on_rank
 
 
-def test_pipeline_selection_runs_after_custom_and_backend_validation():
+def test_pipeline_selection_runs_after_custom_and_backend_validation(parser_defaults):
     tree = ast.parse(_SOURCE.read_text())
     parse = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_parse_args_impl")
     start = next(
@@ -127,7 +153,7 @@ def test_pipeline_selection_runs_after_custom_and_backend_validation():
         and isinstance(n.value.func, ast.Name)
         and n.value.func.id == "configure_sft_data_pipeline"
     )
-    args = make_args(debug_rollout_only=False)
+    args = make_args(parser_defaults, debug_rollout_only=False)
 
     def custom(args):
         args.sft_async_prepack = True
@@ -168,7 +194,7 @@ def test_legacy_flags_are_accepted_but_hidden():
 
 
 @pytest.mark.parametrize("steps,expected", [(1, 0), (2, 1), (4, 3)])
-def test_late_custom_budget_controls_automatic_pipeline(steps, expected):
+def test_late_custom_budget_controls_automatic_pipeline(parser_defaults, steps, expected):
     tree = ast.parse(_SOURCE.read_text())
     normalize = next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_normalize_sft_max_in_flight_steps"
@@ -183,7 +209,7 @@ def test_late_custom_budget_controls_automatic_pipeline(steps, expected):
         and isinstance(n.value.func, ast.Name)
         and n.value.func.id in names
     ]
-    args = make_args(sft_max_in_flight_steps=None)
+    args = make_args(parser_defaults, sft_max_in_flight_steps=None)
     namespace = dict(
         args=args,
         is_offline=True,
@@ -196,10 +222,11 @@ def test_late_custom_budget_controls_automatic_pipeline(steps, expected):
 
 
 @pytest.mark.parametrize("tp,capacity", [(2, 131072), (4, 262144)])
-def test_wholepack_recipe_keeps_raw_prefetch_and_valid_geometry(tp, capacity):
+def test_wholepack_recipe_keeps_raw_prefetch_and_valid_geometry(parser_defaults, tp, capacity):
     from relax.utils.data.wholepack import config_contract
 
     args = make_args(
+        parser_defaults,
         sft_wholepack=True,
         tensor_model_parallel_size=tp,
         global_batch_size=1600,
@@ -209,6 +236,7 @@ def test_wholepack_recipe_keeps_raw_prefetch_and_valid_geometry(tp, capacity):
         data_pad_size_multiplier=1024,
         max_tokens_per_gpu=capacity,
         use_dynamic_batch_size=True,
+        rollout_batch_size=1600,
     )
     configure_sft_data_pipeline(args)
     assert args.sft_async_prepack is False
