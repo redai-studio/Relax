@@ -13,6 +13,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from relax.backends.fsdp.checkpoint import load_checkpoint, save_checkpoint
 from relax.backends.fsdp.runtime import fsdp2_wrap
+from relax.utils.distributed_utils import init_gloo_group
 from tests.cpu.models.qwen_image_edit_helpers import build_adapter, build_model, small_sample
 
 
@@ -31,6 +32,7 @@ def fsdp_worker(rank: int, world: int, directory: str, mode: str) -> None:
         world_size=world,
         timeout=timedelta(seconds=90),
     )
+    init_gloo_group()
     try:
         with sdpa_kernel(SDPBackend.MATH):
             adapter, model = build_adapter(), build_model(mode, torch.bfloat16)
