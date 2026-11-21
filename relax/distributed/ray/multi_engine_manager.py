@@ -290,6 +290,7 @@ class MultiEngineManager:
             logger.info(f"{self._log_prefix} engines already offloaded; skipping")
             return
         logger.info(f"{self._log_prefix} engines offload started")
+        self._onloaded = None
         dead = self._fanout("release_memory_occupation")
         self._retire_engines(dead)
         # Unconditional: the surviving engines did release, so the manager
@@ -324,6 +325,7 @@ class MultiEngineManager:
                 else:
                     error = error or exc
         if error is not None:
+            self._retire_engines(dead)
             raise error
         return dead
 

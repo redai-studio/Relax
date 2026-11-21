@@ -243,6 +243,22 @@ async def generate_and_write_predictions(
     out_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
 
+def managed_predict_judge(config):
+    """Get the colocated GenRM service for direct SFT scoring."""
+    if not getattr(config, "offload_rollout", False) or not getattr(config, "_genrm_instances_resolved", None):
+        return None
+    custom = getattr(config, "custom_rm_path", None)
+    if not (custom or getattr(config, "rm_type", None)):
+        return None
+    if custom and getattr(config, "defer_reward_to_post_process", False):
+        return None
+    from ray import serve
+
+    from relax.core.optional_roles import GENRM_ROLE
+
+    return serve.get_app_handle(GENRM_ROLE)
+
+
 async def score_predictions(rollout_manager: Any, config: Any, train_step: int, samples: list["Sample"]) -> None:
     """Reuse the eval reward executor, background queue and result
     reporting."""
@@ -314,6 +330,9 @@ async def run_predict_loop(rollout_manager, config, train_step: int) -> None:
     logger.info(f"SFT predict @ step {train_step}: generating {len(prompts_and_refs)} completions → {out_path}")
     if scoring:
         await generate_and_write_predictions(rollout_manager, prompts_and_refs, out_path, samples=samples)
+        judge = managed_predict_judge(config)
+        if judge is not None:
+            await judge.onload.remote()
         await score_predictions(rollout_manager, config, train_step, samples)
     else:
         await generate_and_write_predictions(rollout_manager, prompts_and_refs, out_path)

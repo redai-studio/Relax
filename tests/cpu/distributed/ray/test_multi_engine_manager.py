@@ -390,3 +390,30 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
     assert manager.all_engines == [None, None, *healthy_engines]
     assert set(manager._engine_placements) == {2, 3}
     assert all(engine not in _patch_ray.killed for engine in healthy_engines)
+
+
+def test_mixed_fanout_retires_dead_group_before_raising(_patch_ray, monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=3, owns_pg=True)
+    dead, failed, healthy = manager.all_engines
+    removed = []
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed.append)
+    get = mem.ray.get
+
+    def mixed(ref, **kwargs):
+        if isinstance(ref, tuple) and ref[1] == "release_memory_occupation":
+            if ref[0] is dead:
+                raise ConnectionError("dead engine")
+            if ref[0] is failed:
+                raise ValueError("release RPC failed")
+        return get(ref, **kwargs)
+
+    monkeypatch.setattr(mem.ray, "get", mixed)
+    with pytest.raises(ValueError, match="release RPC failed"):
+        manager.offload()
+    assert manager.all_engines == [None, failed, healthy]
+    assert removed == ["pg-0"]
+    assert healthy.calls[-1] == "release_memory_occupation"
+    manager.onload()
+    assert manager.all_engines[0] is not None and manager.all_engines[0] is not dead
