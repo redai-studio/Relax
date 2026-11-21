@@ -327,10 +327,17 @@ def test_aligned_shard_bank_reuses_bytes_without_changing_payload_bits():
         assert torch.equal(bank[offset : offset + length], shards[name].reshape(-1).view(torch.uint8))
 
 
-def test_packed_bank_copies_adjacent_mixed_types_and_skips_nonowners():
+def test_packed_bank_copies_adjacent_mixed_types_and_skips_nonowners(monkeypatch):
     from torch.utils._python_dispatch import TorchDispatchMode
 
-    from relax.backends.megatron.weight_update.shard_snapshot import _copy_bank_slices, _view, shard_layout
+    from relax.backends.megatron.weight_update import shard_snapshot
+    from relax.backends.megatron.weight_update.shard_snapshot import (
+        PinnedShardBank,
+        _copy_bank_slices,
+        _view,
+        shard_bank_layout,
+        shard_layout,
+    )
 
     raw = {
         "bf16": torch.tensor([0x7FC1], dtype=torch.int16).view(torch.bfloat16),
@@ -339,14 +346,18 @@ def test_packed_bank_copies_adjacent_mixed_types_and_skips_nonowners():
         "int": torch.tensor([2**60 + 3], dtype=torch.int64),
         "empty": torch.empty(0, dtype=torch.int64),
     }
-    entries, size = shard_layout(raw.items())
-    bank = torch.full((size,), 17, dtype=torch.uint8)
+    entries, charged = shard_bank_layout(raw.items(), 16)
+    sizes = tuple(capacity for _, capacity in entries)
+    assert sizes == (8, 16, 8) and charged == 32
+    monkeypatch.setattr(shard_snapshot, "_allocate_bank", lambda size, **_: torch.full((size,), 17, dtype=torch.uint8))
+    bank = PinnedShardBank(sizes)
     selected = []
-    for name, tensor, offset, length in entries:
-        host = _view(bank, tensor, offset, length)
-        host.copy_(tensor)
-        if name != "unused":
-            selected.append((name, host))
+    for (group, _), slab in zip(entries, bank.slabs, strict=True):
+        for name, tensor, offset, length in group:
+            host = _view(slab, tensor, offset, length)
+            host.copy_(tensor)
+            if name != "unused":
+                selected.append((name, host))
     layout, size = shard_layout(selected)
     slot = torch.empty(size, dtype=torch.uint8)
     copies = []
@@ -365,6 +376,22 @@ def test_packed_bank_copies_adjacent_mixed_types_and_skips_nonowners():
         assert torch.equal(actual.view(torch.uint8), raw[name].view(torch.uint8))
 
 
+def test_shard_prefetch_splits_matching_offsets_in_distinct_host_slabs(monkeypatch):
+    from relax.backends.megatron.weight_update import shard_snapshot
+    from relax.backends.megatron.weight_update.shard_snapshot import PinnedShardBank, _copy_bank_slices, shard_layout
+
+    monkeypatch.setattr(shard_snapshot, "_allocate_bank", lambda size, **_: torch.arange(size, dtype=torch.uint8))
+    bank = PinnedShardBank((8, 8))
+    first, second = bank.slabs
+    second.add_(64)
+    # The source and destination offsets alone would allow a single DMA,
+    # accidentally reading the second word from the first slab.
+    layout, size = shard_layout([("a", first[:4]), ("b", second[4:])])
+    slot = torch.empty(size, dtype=torch.uint8)
+    _copy_bank_slices(bank, slot, layout)
+    assert slot.tolist() == [0, 1, 2, 3, 68, 69, 70, 71]
+
+
 def test_pipeline_inputs_isolate_inplace_converter_and_preserve_unlocked_snapshot():
     from relax.backends.megatron.weight_update.shard_snapshot import CudaShardInputs
 
@@ -381,16 +408,21 @@ def test_pipeline_inputs_isolate_inplace_converter_and_preserve_unlocked_snapsho
 def test_live_publication_reads_source_until_ack_and_preserves_last_bank_on_abort(monkeypatch):
     from types import SimpleNamespace
 
-    from relax.backends.megatron.weight_update import delta_export
-    from relax.backends.megatron.weight_update.shard_snapshot import _view
+    from relax.backends.megatron.weight_update import delta_export, shard_snapshot
+    from relax.backends.megatron.weight_update.shard_snapshot import PinnedShardBank, _view
+
+    monkeypatch.setattr(shard_snapshot, "_allocate_bank", lambda size, **_: torch.zeros(size, dtype=torch.uint8))
 
     class DelayedCopy:
         def __init__(self, entries, size, spare, budget, _bucket):
             assert size <= budget
-            self.storage = spare if spare is not None else torch.empty(size, dtype=torch.uint8)
-            self.targets = {n: _view(self.storage, t, offset, length) for n, t, offset, length in entries}
-            self.inputs = {n: t.clone() for n, t, _, _ in entries}
-            self.storage.zero_()
+            self.storage = spare if spare is not None else PinnedShardBank(tuple(capacity for _, capacity in entries))
+            self.targets, self.inputs = {}, {}
+            for (group, _), slab in zip(entries, self.storage.slabs, strict=True):
+                slab.zero_()
+                for n, t, offset, length in group:
+                    self.targets[n] = _view(slab, t, offset, length)
+                    self.inputs[n] = t.clone()
 
         def finish(self):
             for n, copy in self.inputs.items():
@@ -445,7 +477,22 @@ def test_live_publication_reads_source_until_ack_and_preserves_last_bank_on_abor
     assert s._ack_bank is attempt and not s.sender_pipeline_active and s._pending is None
 
 
-@pytest.mark.parametrize("case", ["reuse", "budget", "oom", "device_error", "transfer_error"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "reuse",
+        "budget",
+        "oom",
+        "device_error",
+        "transfer_error",
+        "socket_error",
+        "peer_error",
+        "empty",
+        "mixed",
+        "connection_reused",
+        "ordered",
+    ],
+)
 def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monkeypatch):
     from contextlib import nullcontext
     from threading import Event, current_thread
@@ -453,16 +500,32 @@ def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monk
 
     from relax.backends.megatron.weight_update import delta_export, shard_snapshot
     from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.transport import DeltaTransfer
 
     model = {"byte": torch.ones(1, dtype=torch.uint8), "weight": torch.ones(1, 1), "derived": torch.ones(1)}
     # The 9 model bytes require a 12-byte aligned bank.
     source = exporter(23 if case == "budget" else 24)
-    source.config = DeltaSyncConfig(stream="test", sender_pipeline=True)
+    transport = "tcp" if case == "transfer_error" else "nccl_socket"
+    source.config = DeltaSyncConfig(stream="test", sender_pipeline=True, transport=transport, staging_budget_bytes=8)
+    defer = case not in {"transfer_error", "mixed", "connection_reused", "ordered"}
+    if case == "empty":
+        monkeypatch.setattr(source.current_iterator, "get_hf_weight_chunks", lambda _: iter(()))
     monkeypatch.setattr(source, "_can_read_live", lambda _: True)
     monkeypatch.setattr(delta_export.dist, "get_rank", lambda group: 0)
-    monkeypatch.setattr(delta_export.dist, "get_world_size", lambda group: 1)
+    world = 2 if case == "peer_error" else 1
+    monkeypatch.setattr(delta_export.dist, "get_world_size", lambda group: world)
     monkeypatch.setattr(delta_export.dist, "get_process_group_ranks", lambda group: [0])
-    monkeypatch.setattr(delta_export.dist, "all_gather_object", lambda out, obj, group: out.__setitem__(0, obj))
+    submitted, agreed = Event(), Event()
+
+    def gather(out, obj, group):
+        out[:] = [obj] * world
+        if submitted.is_set() and obj is None:
+            if case == "peer_error":
+                out[1] = "peer rejected the frame"
+            else:
+                agreed.set()
+
+    monkeypatch.setattr(delta_export.dist, "all_gather_object", gather)
     monkeypatch.setattr(delta_export.dist, "broadcast_object_list", lambda *args, **kwargs: None)
 
     stream = SimpleNamespace(
@@ -480,13 +543,16 @@ def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monk
     allocations = []
 
     def allocate(size, *, spare=False):
-        assert size == 12
+        assert size in (8, 4)
         if spare:
             assert begun.is_set() and devices == [model["weight"].device]
-            worker.append(current_thread())
+            if defer and case != "empty":
+                assert agreed.is_set()
+            if not worker:
+                worker.append(current_thread())
             copying.set()
             assert release.wait(5)
-            if case == "oom":
+            if case == "oom" and size == 4:
                 raise torch.OutOfMemoryError("test host allocation")
             if case == "device_error":
                 raise RuntimeError("device unavailable")
@@ -497,46 +563,76 @@ def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monk
     monkeypatch.setattr(shard_snapshot, "_allocate_bank", allocate)
 
     def submit(*args, **kwargs):
-        if case != "budget":
+        assert case != "empty"
+        if defer and not submitted.is_set():
+            assert not copying.is_set()
+        elif not defer:
             assert copying.wait(5)
-        if case == "transfer_error":
+        if case in {"transfer_error", "socket_error"}:
             raise RuntimeError("delivery interrupted")
+        submitted.set()
         release.set()
         return set()
 
-    source.transfer = SimpleNamespace(
-        connect=lambda *args, **kwargs: True,
-        begin=lambda **kwargs: begun.set(),
-        prepare_frame=lambda _: None,
-        drain_frame=set,
-        discard_prepared=release.set,
-        submit_frame=submit,
-        ordered_target_consume=False,
-        finalize=lambda: {"receivers": [{"force_full_seed": False}]},
-    )
+    def begin(**kwargs):
+        source.transfer._applying = True
+        begun.set()
+
+    if case == "empty":
+        release.set()
+    source.transfer = DeltaTransfer(source.config, "cpu")
+    source.transfer.group = object()
+    source.transfer.tcp = object() if case == "mixed" else None
+    source.transfer.ordered_target_consume = case == "ordered"
+    source.transfer.connect = lambda *args, **kwargs: case != "connection_reused"
+    source.transfer.begin = begin
+    source.transfer.prepare_frame = lambda _: None
+    source.transfer.drain_frame = set
+    source.transfer.discard_prepared = release.set
+    source.transfer.submit_frame = submit
+    source.transfer.apply = set
+    source.transfer.finalize = lambda: {"receivers": [{"force_full_seed": False}]}
     args = dict(engines=[], gpu_counts=[], version="0", group=object())
-    if case in {"device_error", "transfer_error"}:
-        message = "device unavailable" if case == "device_error" else "delivery interrupted"
+    errors = {
+        "device_error": "device unavailable",
+        "transfer_error": "delivery interrupted",
+        "socket_error": "delivery interrupted",
+        "peer_error": "peer rejected the frame",
+    }
+    if case in errors:
+        message = errors[case]
         with pytest.raises(RuntimeError, match=message):
             source.synchronize(lambda: model, **args)
-        assert not worker[0].is_alive()
-        assert source._ack_bank is None and source._pending is None and source._spare_bank is allocations[0]
+        assert len(worker) == (case not in {"socket_error", "peer_error"})
+        assert all(not thread.is_alive() for thread in worker)
+        assert source._ack_bank is None and source._pending is None and source._spare_bank.slabs[0] is allocations[0]
         return
     source.synchronize(lambda: model, **args)
+    assert submitted.is_set() == (case != "empty")
     assert len(worker) == (case != "budget") and all(not thread.is_alive() for thread in worker)
     assert source._ack_bank is None and not source._acknowledged
     source.commit()
-    assert source._ack_bank is allocations[0]
+    assert source._ack_bank.slabs[0] is allocations[0]
     if case == "budget":
-        assert source._spare_bank is None and len(allocations) == 1
+        assert source._spare_bank is None and len(allocations) == 2
         with pytest.raises(ValueError, match="host budget"):
             source.begin(model, live_locked=True)
         return
     if case == "oom":
-        assert source._spare_bank is None and len(allocations) == 1
+        assert source._spare_bank is None and len(allocations) == 3
     else:
-        assert source._spare_bank is allocations[1]
+        assert source._spare_bank.slabs[0] is allocations[2]
     source.synchronize(lambda: model, **dict(args, version="1", force_full=True))
-    assert source._backup.storage is allocations[1] and len(allocations) == 2 and len(worker) == 1
+    second_bank = source._backup.storage
+    assert second_bank.slabs[0] is allocations[-2] and len(allocations) == (5 if case == "oom" else 4)
+    assert len(worker) == 1
     source.commit()
-    assert source._ack_bank is allocations[1] and source._spare_bank is allocations[0]
+    assert source._ack_bank is second_bank and source._spare_bank.slabs[0] is allocations[0]
+    if case == "reuse":
+        # Equal total bytes with different slab boundaries must replace the spare.
+        prior = source._spare_bank
+        source.begin({"a": torch.ones(4, dtype=torch.uint8), "b": torch.ones(6, dtype=torch.uint8)}, live_locked=True)
+        assert prior.sizes == (8, 4) and source._backup.storage.sizes == (4, 8)
+        assert source._backup.storage is not prior
+        source.abort()
+        assert source._ack_bank is second_bank

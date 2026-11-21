@@ -4,7 +4,7 @@
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from time import perf_counter
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -21,12 +21,22 @@ def _allocate_bank(size: int, *, spare: bool = False) -> torch.Tensor:
     return bank
 
 
-def preallocate_spare_bank(size: int, device: torch.device) -> torch.Tensor | None:
+class PinnedShardBank:
+    """Independent pinned slabs backing a complete rank-local snapshot."""
+
+    def __init__(self, sizes: tuple[int, ...], *, spare: bool = False) -> None:
+        self.sizes = sizes
+        self.nbytes = sum(sizes)
+        self.slabs = tuple(_allocate_bank(size, spare=spare) for size in sizes)
+        self.by_address = {slab.data_ptr(): slab for slab in self.slabs}
+
+
+def preallocate_spare_bank(sizes: tuple[int, ...], device: torch.device) -> PinnedShardBank | None:
     # CUDA's current device is thread-local. The host allocation belongs to
     # the same rank/device as the mandatory shard bank.
     with torch.cuda.device(device):
         try:
-            return _allocate_bank(size, spare=True)
+            return PinnedShardBank(sizes, spare=True)
         except (MemoryError, RuntimeError) as exc:
             # Some pinned allocators expose CUDA/OS exhaustion as a plain RuntimeError.
             if not isinstance(exc, (MemoryError, torch.OutOfMemoryError)) and not any(
@@ -34,7 +44,7 @@ def preallocate_spare_bank(size: int, device: torch.device) -> torch.Tensor | No
                 for text in ("out of memory", "cannot allocate memory", "can't allocate memory")
             ):
                 raise
-            logger.warning("Could not preallocate %d pinned shard bytes: %s", size, exc)
+            logger.warning("Could not preallocate %d pinned shard bytes: %s", sum(sizes), exc)
             return None
 
 
@@ -51,25 +61,60 @@ def shard_layout(items: Iterable[tuple[str, torch.Tensor]]) -> tuple[list[tuple[
     return entries, size
 
 
+class SlabLayout(NamedTuple):
+    entries: list[tuple[str, torch.Tensor, int, int]]
+    capacity: int
+
+
+def shard_bank_layout(items: Iterable[tuple[str, torch.Tensor]], bucket_bytes: int) -> tuple[list[SlabLayout], int]:
+    """Keep whole shards together and charge explicit power-of-two pinned
+    allocations."""
+    entries, total = shard_layout(items)
+    # PyTorch's pinned allocator can round each request up to a power of two.
+    # Bound ordinary slabs by the transfer bucket; a single larger tensor
+    # retains its contiguous typed view on a dedicated slab.
+    limit = 1 << (max(1, min(total, bucket_bytes)).bit_length() - 1)
+    slabs, group, size = [], [], 0
+    for name, tensor, _, length in entries:
+        width = tensor.element_size()
+        offset = (size + width - 1) // width * width
+        if size and length and offset + length > limit:
+            slabs.append(SlabLayout(group, 1 << (size - 1).bit_length()))
+            group, offset = [], 0
+        group.append((name, tensor, offset, length))
+        size = offset + length
+    if group:
+        slabs.append(SlabLayout(group, 1 << (size - 1).bit_length() if size else 0))
+    charged = sum(slab.capacity for slab in slabs)
+    single = 1 << (total - 1).bit_length() if total else 0
+    # Several nearly full indivisible shards can fragment the slab layout.
+    # Never charge more than the original contiguous bank in that case.
+    if charged > single:
+        return [SlabLayout(entries, single)], single
+    return slabs, charged
+
+
 def _view(storage: torch.Tensor, tensor: torch.Tensor, offset: int, length: int) -> torch.Tensor:
     return storage.narrow(0, offset, length).view(tensor.dtype).view(tensor.shape)
 
 
-def _copy_bank_slices(bank: torch.Tensor, slot: torch.Tensor, layout: list) -> None:
+def _copy_bank_slices(bank: PinnedShardBank, slot: torch.Tensor, layout: list) -> None:
     """Copy adjacent typed views in one DMA, including their alignment
     padding."""
+    slab = None
     src, dst, end = 0, 0, 0
     for _, host, offset, length in layout:
         if not length:
             continue
         start = host.storage_offset() * host.element_size()
-        if end == dst or start - src != offset - dst:
+        storage = bank.by_address[host.data_ptr() - start]
+        if storage is not slab or start - src != offset - dst:
             if end > dst:
-                slot[dst:end].copy_(bank[src : src + end - dst], non_blocking=True)
-            src, dst = start, offset
+                slot[dst:end].copy_(slab[src : src + end - dst], non_blocking=True)
+            slab, src, dst = storage, start, offset
         end = offset + length
     if end > dst:
-        slot[dst:end].copy_(bank[src : src + end - dst], non_blocking=True)
+        slot[dst:end].copy_(slab[src : src + end - dst], non_blocking=True)
 
 
 class CudaShardBackup:
@@ -78,16 +123,16 @@ class CudaShardBackup:
 
     def __init__(
         self,
-        entries: list[tuple[str, torch.Tensor, int, int]],
+        entries: list[SlabLayout],
         size: int,
-        spare: torch.Tensor | None,
+        spare: PinnedShardBank | None,
         budget: int,
         bucket_bytes: int,
     ) -> None:
         if size > budget:
             raise ValueError("Acknowledged and pending aligned shard banks exceed their host budget")
-        self.storage = spare if spare is not None and spare.numel() == size else _allocate_bank(size)
-        device = entries[0][1].device
+        self.storage = spare if spare is not None else PinnedShardBank(tuple(slab.capacity for slab in entries))
+        device = entries[0].entries[0][1].device
         self.stream = torch.cuda.Stream(device=device)
         self.targets = {}
         self.events = []
@@ -95,14 +140,15 @@ class CudaShardBackup:
         try:
             with torch.cuda.stream(self.stream):
                 copied = 0
-                for name, source, offset, length in entries:
-                    if copied and copied + length > bucket_bytes:
-                        self.events.append(self.stream.record_event())
-                        copied = 0
-                    target = _view(self.storage, source, offset, length)
-                    target.copy_(source.detach(), non_blocking=True)
-                    self.targets[name] = target
-                    copied += length
+                for (group, _), slab in zip(entries, self.storage.slabs, strict=True):
+                    for name, source, offset, length in group:
+                        if copied and copied + length > bucket_bytes:
+                            self.events.append(self.stream.record_event())
+                            copied = 0
+                        target = _view(slab, source, offset, length)
+                        target.copy_(source.detach(), non_blocking=True)
+                        self.targets[name] = target
+                        copied += length
                 self.events.append(self.stream.record_event())
         except BaseException:
             # A partial enqueue must finish before its inputs or bank can be reused.
@@ -128,7 +174,7 @@ class CudaShardInputs(Mapping[str, torch.Tensor]):
         device: torch.device,
         slot_bytes: int = 0,
         *,
-        bank: torch.Tensor | None = None,
+        bank: PinnedShardBank | None = None,
     ) -> None:
         self.shards = shards
         self.device = device
@@ -164,7 +210,7 @@ class CudaShardInputs(Mapping[str, torch.Tensor]):
         # Bridge's lexical ordering can differ from the packed bank's storage
         # order. Converter lookup is by name, so coalesce adjacent bank slices.
         if self._bank is not None:
-            items.sort(key=lambda item: item[1].storage_offset() * item[1].element_size())
+            items.sort(key=lambda item: item[1].data_ptr())
         elif not all(t.is_pinned() for _, t in items):
             return {}, None
         layout, size = shard_layout(items)
