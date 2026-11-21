@@ -499,7 +499,7 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
     engine._skip_router_registration = False
     engine.register_to_router = Mock(return_value=registered)
     process = SimpleNamespace(pid=123, is_alive=lambda: False)
-    launch = Mock(return_value=process)
+    launch = Mock(side_effect=lambda args, *, on_started: on_started(process) or process)
     monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
     monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
     monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
@@ -628,13 +628,13 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
     engine.args.rollout_external = False
     engine.process = SimpleNamespace(pid=123)
     unregister = Mock(side_effect=RuntimeError("router is unavailable"))
-    killed = Mock()
+    stopped = Mock()
     monkeypatch.setattr(engine, "unregister_from_router", unregister)
-    monkeypatch.setattr(sglang_engine_module, "kill_process_tree", killed)
+    monkeypatch.setattr(engine, "_stop_server_process", stopped)
     with pytest.raises(RuntimeError, match="router is unavailable"):
         engine.shutdown()
     unregister.assert_called_once_with(timeout=5.0)
-    killed.assert_called_once_with(123)
+    stopped.assert_called_once_with()
     engine.process = None  # Do not exercise the destructor with the fake pid.
 
 
