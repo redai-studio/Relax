@@ -1,0 +1,19 @@
+# Additional packages used by the inspected Kaggle CPU replay; reuse the Kaggle PyTorch image.
+# Record the newly allocated environment and preserve its provided torch build.
+ray[serve]==2.59.0
+pytest==8.4.2
+pytest-asyncio==1.4.1
+httpx[http2]==0.28.1
+pybase64==1.5.1
+tensordict==0.15.4
+pylatexenc==2.11
+colorlog==6.12.0
+math-verify==0.9.0
+mathruler==0.1.0
+boto3==1.41.5
+omegaconf==2.3.1
+sglang-router==0.3.2
+numpy==2.1.3
+pyarrow==23.0.1
+transformers==5.16.1
+tokenizers==0.23.1
