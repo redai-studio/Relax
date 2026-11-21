@@ -4,9 +4,9 @@ kernels.
 
 Based on:
   PPU source   https://github.com/flytiger-eco/TransformerEngine-for-sail
-               (tag 2.18+v0.1.0, commit efa9bf4b -- the wheel installed here)
+               (tag 2.18+v0.2.0, commit 3b555064 -- the wheel built here)
   Relax patch  docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch
-               -- applied on the CUDA line only; this wheel still carries TE's
+               -- applied on the CUDA line only; this build still carries TE's
                own `is_graph_capturing()` branch for that zero-fill, which is
                the sync-free path under capture, so it is not applied here and
                this script is the whole PPU delta.

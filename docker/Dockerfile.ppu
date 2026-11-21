@@ -45,14 +45,15 @@ ENV TARGETARCH=amd64 \
 
 # transformer_engine is not on the pip index (2.16 max there), and 2.18 is the
 # first release with the PPU CUTLASS grouped-GEMM kernels the MoE path needs.
-# Take the published wheel of flytiger-eco/TransformerEngine-for-sail instead of
-# rebuilding it: tag 2.18+v0.1.0 is the NVTE_FRAMEWORK=pytorch /
-# NVTE_WITH_NCCL_EP=0 / NVTE_CUDA_ARCHS="80;89" build its CI produces.
-ARG TE_VERSION=2.18.0+efa9bf4
-ARG TE_WHEEL_FILE=transformer_engine-2.18.0+efa9bf4-cp312-cp312-linux_x86_64.whl
-ARG TE_WHEEL_SHA256=30dc401b47a4bef9a39b6030c010a72c2d361c831c064a09e3e469255b4a66df
-ARG TE_WHEEL_URL=https://github.com/flytiger-eco/TransformerEngine-for-sail/releases/download/2.18%2Bv0.1.0/${TE_WHEEL_FILE}
-ARG TE_WHEEL_MIRROR=https://ghfast.top/
+# flytiger-eco/TransformerEngine-for-sail publishes no wheel for 2.18+v0.2.0, so
+# the train stage builds that tag from source under the env its own CI uses
+# (.github/workflows/ppu-build-890.yml): NVTE_FRAMEWORK=pytorch /
+# NVTE_WITH_NCCL_EP=0 / NVTE_CUDA_ARCHS="80;89".  TE_VERSION is what the build
+# stamps into the wheel -- 2.18.0 plus the short commit -- and the base stage
+# below pins it into PIP_CONSTRAINT, so the two must be kept in step.
+ARG TE_REPO=https://github.com/flytiger-eco/TransformerEngine-for-sail.git
+ARG TE_REF=3b55506454e65994a801a00acb255996e8a48764
+ARG TE_VERSION=2.18.0+3b55506
 ARG APEX_VERSION=25.9+v0.1.0.ppu2.2.0
 ARG FHT_VERSION=1.1.0.post2+v0.1.0.ppu2.2.0
 # The wheel ships include/cutlass3 where the CUTLASS-RTC resolver never looks.
@@ -111,18 +112,30 @@ FROM base AS train
 # fell back to the FA2 extension while the log still claimed 2.8.2.
 # te_fa3_dispatch.py also accepts "selected backend == installed FA3 version",
 # is idempotent, and prints "te_fa3_dispatch: patched OK".
-COPY docker/ppu_patch/transformer_engine/2.18.0-fa3-dispatch.py /tmp/te-wheel/te_fa3_dispatch.py
+COPY docker/ppu_patch/transformer_engine/2.18.0-fa3-dispatch.py /tmp/te-src/te_fa3_dispatch.py
+# common/util/logging.h includes nccl.h unconditionally, and the PCCL wrapper only
+# publishes it through a bash-only envsetup.sh, so CPATH / LIBRARY_PATH are pointed
+# at the wrapper by hand -- the same two lines the upstream CI runs after sourcing it.
 RUN set -eu ; \
-    whl="/tmp/te-wheel/${TE_WHEEL_FILE}" ; \
-    for src in "${TE_WHEEL_MIRROR}${TE_WHEEL_URL}" "${TE_WHEEL_URL}"; do \
-        [ -n "$src" ] || continue ; \
-        if curl -fSL --retry 3 --connect-timeout 20 -o "$whl" "$src"; then break ; else rm -f "$whl" ; fi ; \
-    done ; \
-    [ -f "$whl" ] || { echo "TE wheel ${TE_WHEEL_FILE} could not be downloaded" >&2 ; exit 1 ; } ; \
-    echo "${TE_WHEEL_SHA256}  ${whl}" | sha256sum -c - && \
-    pip install --no-cache-dir --no-deps --no-index "$whl" && \
-    rm -f "$whl" && \
-    python3 /tmp/te-wheel/te_fa3_dispatch.py && rm -rf /tmp/te-wheel
+    NCCL_HOME=/usr/local/pccl/nccl_wrapper ; \
+    [ -f "$NCCL_HOME/include/nccl.h" ] || { echo "PCCL nccl.h missing under $NCCL_HOME" >&2 ; exit 1 ; } ; \
+    git init --quiet /tmp/te-src/TransformerEngine-for-sail ; \
+    cd /tmp/te-src/TransformerEngine-for-sail ; \
+    git remote add origin "${TE_REPO}" ; \
+    git fetch --quiet --depth 1 origin "${TE_REF}" ; \
+    git checkout --quiet FETCH_HEAD ; \
+    [ "$(git rev-parse HEAD)" = "${TE_REF}" ] || { echo "TE source is not ${TE_REF}" >&2 ; exit 1 ; } ; \
+    git submodule update --init --recursive ; \
+    NVTE_FRAMEWORK=pytorch NVTE_WITH_NCCL_EP=0 NVTE_CUDA_ARCHS="80;89" \
+    NVTE_BUILD_THREADS_PER_JOB=4 MAX_JOBS=32 \
+    CPATH="$NCCL_HOME/include" LIBRARY_PATH="$NCCL_HOME/lib${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+    PIP_CONSTRAINT= pip3 wheel --quiet --no-build-isolation --no-deps . -w /tmp/te-src/dist ; \
+    whl="$(echo /tmp/te-src/dist/transformer_engine-*.whl)" ; \
+    [ -f "$whl" ] || { echo "TE built no wheel under /tmp/te-src/dist" >&2 ; exit 1 ; } ; \
+    pip install --no-cache-dir --no-deps --no-index "$whl" ; \
+    python3 -c "import importlib.metadata as m; v = m.version('transformer_engine'); assert v == '${TE_VERSION}', v" ; \
+    python3 /tmp/te-src/te_fa3_dispatch.py ; \
+    cd / ; rm -rf /tmp/te-src
 
 RUN pip install --no-cache-dir "apex==${APEX_VERSION}" "fast-hadamard-transform==${FHT_VERSION}"
 
@@ -267,6 +280,7 @@ COPY docker/patch/megatron/20261016-qwen38-models.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-qwen35-optimized.patch /root/Megatron-LM/
 COPY docker/patch/megatron/20261020-model-operators.patch /root/Megatron-LM/
 COPY docker/patch/megatron/mtp-cp-normalization.patch /root/Megatron-LM/
+COPY docker/patch/megatron/fully-reshardable-checkpoint-padding.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
@@ -278,9 +292,11 @@ RUN cd Megatron-LM && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
     patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
     patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
+    patch --batch --forward --fuzz=0 -p1 < fully-reshardable-checkpoint-padding.patch && \
     python -m compileall -q megatron && \
     rm megatron.patch sync-save-bounded-staging.patch 20261016-qwen38-models.patch \
-       20261020-qwen35-optimized.patch 20261020-model-operators.patch mtp-cp-normalization.patch && \
+       20261020-qwen35-optimized.patch 20261020-model-operators.patch mtp-cp-normalization.patch \
+       fully-reshardable-checkpoint-padding.patch && \
     apt update && apt install -y jq
 
 # torch_memory_saver ships in two lines; TMS_LINE picks one and nothing else in
