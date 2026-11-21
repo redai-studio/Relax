@@ -266,6 +266,27 @@ def test_backpressure_fails_without_publishing_data(tq_factory) -> None:
     assert getattr(meta, "size", None) == 0
 
 
+def test_agentic_audit_nested_spans_and_unknown_rows_round_trip(tq_factory) -> None:
+    import asyncio
+
+    from tensordict.tensorclass import NonTensorData
+
+    from examples.agentic_weight_audit.demo import run_demo
+    from relax.agentic.weight_audit import AUDIT_FIELD, diagnose
+    from relax.utils.utils import dict_to_tensordict
+
+    report = asyncio.run(run_demo())
+    payload = dict_to_tensordict({"tokens": [[1], [2, 3]], AUDIT_FIELD: [None, report]}, 2)
+    client = tq_factory()
+    client.put(payload, partition_id="agentic_audit")
+    _, received = _get(client, "agentic_audit", ["tokens", AUDIT_FIELD], 2)
+    rows = [item.data if isinstance(item, NonTensorData) else item for item in received[AUDIT_FIELD]]
+    assert rows == [None, report]
+    consumed = diagnose(rows[1], report["consumption"])
+    assert consumed["consumption_age_token_mean"] == 1.8
+    assert consumed["effective_tokens"] == 10
+
+
 def test_simple_storage_unbounded_capacity_accepts_rows(tq_factory) -> None:
     """A None capacity permits writing and reading physical rows."""
     client = tq_factory(capacity=None)

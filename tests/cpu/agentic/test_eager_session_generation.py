@@ -125,12 +125,14 @@ async def harness(*, mode="train", **overrides):
         held_permits.add(permit_id)
         return True
 
-    async def release(permit_id):
+    async def release(permit_id, audit_version=None, audit=False):
         held_permits.remove(permit_id)
 
     shard._sglang_request_limiter = SimpleNamespace(
         acquire_request_permit=SimpleNamespace(remote=lambda pid: asyncio.create_task(acquire(pid))),
-        release_request_permit=SimpleNamespace(remote=lambda pid: asyncio.create_task(release(pid))),
+        release_request_permit=SimpleNamespace(
+            remote=lambda pid, **kwargs: asyncio.create_task(release(pid, **kwargs))
+        ),
     )
 
     class Handle:
