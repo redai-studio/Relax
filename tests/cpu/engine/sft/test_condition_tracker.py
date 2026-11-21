@@ -578,8 +578,8 @@ def test_sensenova_pipeline_units_instrumentation_with_tracker(tmp_path: Path) -
     from relax.models.sensenova.pipeline import SenseNovaU1ImagePipeline
 
     configure_attention("torch")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    device = torch.device("cpu")
+    dtype = torch.float32
 
     pipe = SenseNovaU1ImagePipeline(device=device, torch_dtype=dtype)
     pipe.dit = SenseNovaU1DiT(

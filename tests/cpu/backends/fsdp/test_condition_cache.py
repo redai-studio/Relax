@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 import gc
+import json
 import multiprocessing as mp
 import weakref
+from argparse import Namespace
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -12,6 +14,7 @@ import torch.distributed as dist
 from relax.backends.fsdp.condition_cache import ConditionCacheBinding
 from relax.backends.fsdp.sft import FSDPSFTTrainer
 from relax.engine.sft.condition_cache import ConditionFieldSpec, ConditionRequest
+from relax.models.generative_sft import ConditionCacheAdapter
 
 
 class Adapter:
@@ -186,7 +189,8 @@ def test_two_rank_hits_misses_and_version_agreement(tmp_path) -> None:
             assert process.exitcode == 0
         results = sorted(queue.get(timeout=5) for _ in processes)
         assert all(result[1] == [False, True, False, True, False] for result in results)
-        assert results[1][2] >= 1
+        assert results[0][2] == 0
+        assert results[1][2] == 1
     finally:
         for process in processes:
             if process.is_alive():
@@ -345,3 +349,93 @@ def test_managed_dependency_replacement_restores_tensor_checks(tmp_path) -> None
     finally:
         cache.close()
         dist.destroy_process_group()
+
+
+def test_condition_cache_adapter_protocol_requires_skip_counters() -> None:
+    class MissingCountersAdapter:
+        def condition_field_specs(self, model: torch.nn.Module) -> tuple[ConditionFieldSpec, ...]:
+            return ()
+
+        def prepare_condition_request(self, model: torch.nn.Module, data: dict) -> dict[str, ConditionRequest]:
+            return {}
+
+        def bind_condition_cache(self, model: torch.nn.Module, cache: object) -> None:
+            return None
+
+    assert isinstance(Adapter(), ConditionCacheAdapter)
+    assert not isinstance(MissingCountersAdapter(), ConditionCacheAdapter)
+
+
+def test_trainer_init_closes_prefetch_when_tracker_setup_fails(tmp_path, monkeypatch) -> None:
+    from relax.engine.sft.image_prefetch import ImagePrefetch
+
+    metadata = tmp_path / "train.json"
+    metadata.write_text(json.dumps([{"prompt": "edit", "image": "t.png", "edit_image": ["r.png"]}]))
+    closed = []
+    original_close = ImagePrefetch.close
+
+    def record_close(self) -> None:
+        closed.append(self)
+        original_close(self)
+
+    monkeypatch.setattr(ImagePrefetch, "close", record_close)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr("relax.backends.fsdp.actor._collect_weight_sync_errors", lambda err: [err] if err else [])
+    monkeypatch.setattr("relax.backends.fsdp.actor._collect_rank_objects", lambda value: [value])
+
+    class FailingTrackerAdapter:
+        family = "test"
+        image_tier_policy = True
+        cpu_only_prepare_sample = True
+
+        def on_device_ready(self, model, device) -> None:
+            return None
+
+        def prepare_sample(self, row, root, config, index=0):
+            return row
+
+        def bind_tracker(self, model, tracker) -> None:
+            raise RuntimeError("bind_tracker failed")
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    optimizer.defaults.update({"betas": (0.9, 0.999), "eps": 1e-8, "foreach": False})
+    args = Namespace(
+        global_batch_size=1,
+        num_rollout=1,
+        seed=42,
+        lr_warmup_iters=0,
+        clip_grad=1.0,
+        model_adapter_path="test.Adapter",
+        model_path=str(tmp_path),
+        prompt_data=str(metadata),
+        load=None,
+        save=None,
+        fsdp_param_dtype="bf16",
+        fsdp_reduce_dtype="fp32",
+        fsdp_master_dtype="fp32",
+        use_pytorch_profiler=False,
+        record_memory_history=False,
+        i2i_sft_config={
+            "data_root": str(tmp_path),
+            "dataset_size": 1,
+            "conditioning_images": 1,
+            "image_prefetch_depth": 1,
+            "image_prefetch_workers": 1,
+            "condition_cache_enabled": False,
+        },
+    )
+    actor = SimpleNamespace(
+        args=args,
+        adapter=FailingTrackerAdapter(),
+        model=model,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        _trainable_mode="lora",
+        _device_group=lambda: None,
+        _lora_contract=lambda: {},
+    )
+    with pytest.raises(RuntimeError, match="bind_tracker failed"):
+        FSDPSFTTrainer(actor)
+    assert len(closed) == 1

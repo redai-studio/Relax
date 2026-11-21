@@ -21,7 +21,6 @@ class GenerativeSFTAdapter(Protocol):
     family: str
     supported_tasks: tuple[str, ...]
     lora_target_modules: tuple[str, ...]
-    condition_skip_counters: tuple[str, ...]
 
     def bind_tracker(self, model: torch.nn.Module, tracker: Any | None) -> None:
         """Attach the online encoding tracker to the model."""
@@ -64,6 +63,8 @@ class ConditionCacheAdapter(Protocol):
     and inserts online outputs into, the binding passed to
     ``bind_condition_cache``.
     """
+
+    condition_skip_counters: tuple[str, ...]
 
     def condition_field_specs(self, model: torch.nn.Module) -> tuple[ConditionFieldSpec, ...]:
         """Declare the cacheable condition fields and their dependencies."""

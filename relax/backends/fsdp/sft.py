@@ -168,45 +168,45 @@ class FSDPSFTTrainer:
                 raise FileExistsError("Output already contains SFT checkpoints; use --load or a fresh --save")
             seed_training(self.args.seed + self.rank)
         self.prefetch = None
+        self.tracker = None
+        self.condition_cache = None
         depth = config.get("image_prefetch_depth", 0)
         workers = config.get("image_prefetch_workers", 2)
         if type(depth) is not int or depth < 0 or type(workers) is not int or workers <= 0:
             raise ValueError("Image prefetch depth/workers must be nonnegative/positive integers")
-        if depth:
-            cpu_only_prepare = getattr(actor.adapter, "cpu_only_prepare_sample", actor.adapter.family == "sensenova")
-            if not cpu_only_prepare:
-                raise ValueError("Threaded image prefetch requires CPU-only sample preparation")
-            from relax.engine.sft.image_prefetch import ImagePrefetch
-
-            self.prefetch = ImagePrefetch(
-                self.dataset,
-                self.sampler,
-                self.rank,
-                self.world,
-                self.step,
-                self.args.num_rollout,
-                depth,
-                workers,
-            )
-        self.tracker = None
-        stats_dir = config.get("baseline_stats_dir")
-        if stats_dir:
-            from relax.engine.sft.condition_tracker import ConditionTracker
-
-            warmup_steps = int(config.get("baseline_warmup_steps", 5))
-            self.tracker = ConditionTracker(
-                rank=self.rank,
-                world_size=self.world,
-                micro_batches=self.args.global_batch_size // self.world,
-                dataset_size=int(config["dataset_size"]),
-                output_dir=Path(stats_dir),
-                warmup_steps=warmup_steps,
-                seed=int(self.args.seed),
-                schema=actor.adapter.tracker_schema(),
-            )
-        actor.adapter.bind_tracker(actor.model, self.tracker)
-        self.condition_cache = None
         try:
+            if depth:
+                cpu_only_prepare = getattr(actor.adapter, "cpu_only_prepare_sample", actor.adapter.family == "sensenova")
+                if not cpu_only_prepare:
+                    raise ValueError("Threaded image prefetch requires CPU-only sample preparation")
+                from relax.engine.sft.image_prefetch import ImagePrefetch
+
+                self.prefetch = ImagePrefetch(
+                    self.dataset,
+                    self.sampler,
+                    self.rank,
+                    self.world,
+                    self.step,
+                    self.args.num_rollout,
+                    depth,
+                    workers,
+                )
+            stats_dir = config.get("baseline_stats_dir")
+            if stats_dir:
+                from relax.engine.sft.condition_tracker import ConditionTracker
+
+                warmup_steps = int(config.get("baseline_warmup_steps", 5))
+                self.tracker = ConditionTracker(
+                    rank=self.rank,
+                    world_size=self.world,
+                    micro_batches=self.args.global_batch_size // self.world,
+                    dataset_size=int(config["dataset_size"]),
+                    output_dir=Path(stats_dir),
+                    warmup_steps=warmup_steps,
+                    seed=int(self.args.seed),
+                    schema=actor.adapter.tracker_schema(),
+                )
+            actor.adapter.bind_tracker(actor.model, self.tracker)
             if cache_enabled:
                 self._init_condition_cache()
             self.profiler.on_init_end()

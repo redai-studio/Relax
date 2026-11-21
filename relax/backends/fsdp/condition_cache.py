@@ -220,7 +220,7 @@ class ConditionCacheBinding:
             if reuse:
                 self.values[name] = self._hits[name]
                 self.counters["effective_reuses"] += 1
-            elif self._hits[name] is not None:
+            elif not changed and self._hits[name] is not None:
                 self.counters["group_forced_online"] += 1
         self._hits.clear()
         self.requests.clear()

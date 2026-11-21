@@ -13,6 +13,7 @@ from relax.backends.fsdp.condition_cache import ConditionCacheBinding
 from relax.backends.fsdp.runtime import fsdp2_wrap
 from relax.backends.fsdp.sft import FSDPSFTTrainer
 from relax.models.sensenova.adapter import SenseNovaSFTAdapter
+from relax.utils.distributed_utils import init_gloo_group
 from tests.cpu.models.test_sensenova_condition_cache import build_model, sample
 
 
@@ -29,7 +30,7 @@ def _worker(rank: int, directory: str) -> None:
         world_size=2,
         timeout=timedelta(seconds=90),
     )
-    control = dist.new_group(backend="gloo", timeout=timedelta(seconds=90))
+    control = init_gloo_group()
     device = torch.device("cuda", rank)
     root = Path(directory) / str(rank)
     root.mkdir()
