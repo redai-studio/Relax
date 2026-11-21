@@ -319,6 +319,7 @@ class MicroBatchListIterator:
         # Shallow-copy so injected scalar fields don't mutate the cached entry
         # (the same `mbs` list may be re-iterated via __iter__ → reset offset).
         out = dict(batch)
+        out["micro_batch_index"] = self.offset
         if self.loss_scale is not None:
             out["__loss_scale__"] = self.loss_scale
         if self.dummy_after is not None and self.offset >= self.dummy_after:
@@ -1564,6 +1565,7 @@ class StreamingTQIterator:
         dummy = dict(data)
         dummy["__is_dummy__"] = True
         dummy["__loss_scale__"] = self.loss_scale
+        dummy["micro_batch_index"] = self._mb_count - 1
         return dummy, meta
 
     def _emit_dummy_batch(self) -> Tuple[Dict[str, Any], Any]:
@@ -1573,7 +1575,6 @@ class StreamingTQIterator:
         Advances batch_index + mb_count for lockstep with other DPs; does NOT
         count toward sample_count or the log buffer (it carries no real data).
         """
-        dummy = self._make_dummy_batch()
         self._batch_index += 1
         self._mb_count += 1
         if self._mb_count % 20 == 0:
@@ -1585,7 +1586,7 @@ class StreamingTQIterator:
                 self._mb_count,
                 self._batch_index,
             )
-        return dummy
+        return self._make_dummy_batch()
 
     def _finish_real_batches(self, reason: str) -> Tuple[Dict[str, Any], Any]:
         # Real data exhausted. Align mb count across DP ranks: MAX-reduce the
@@ -1678,7 +1679,7 @@ class StreamingTQIterator:
         self._warm_next_batch_index(self._batch_index)
         # get_batch repacks tokens and replaces other top-level fields during training.
         # A shallow copy keeps the original rows intact for metrics and dummy padding.
-        return dict(data), meta
+        return {**data, "micro_batch_index": self._mb_count - 1}, meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
         # Dummy-padding phase: real data exhausted, emit dummies up to k_global.

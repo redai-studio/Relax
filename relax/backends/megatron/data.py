@@ -928,7 +928,7 @@ def get_batch(
 
     if (
         batch.get("selective_logit_rows") is not None
-        and batch.get("replay_micro_batch_index") == 0
+        and batch.get("micro_batch_index") == 0
         and mpu.is_pipeline_last_stage()
         and mpu.get_tensor_model_parallel_rank() == 0
     ):
@@ -1105,9 +1105,8 @@ class DataIterator:
             self.offset += 1
         else:
             self.offset += self.micro_batch_size
-        # DataIterator micro-batch ordinal (0-based). Trajectory replay stamps
-        # this onto each sample so --batch selects a real training micro-batch.
-        batch["replay_micro_batch_index"] = micro_batch_index
+        # A streamed microbatch already has its position in the enclosing stream.
+        batch["micro_batch_index"] = self.rollout_data.get("micro_batch_index", micro_batch_index)
         return batch
 
     def reset(self) -> "DataIterator":
