@@ -276,8 +276,16 @@ class DeltaTransfer:
                 pending.extend(value)
         return size + sys.getsizeof((self.frame, metadata)) + sys.getsizeof(self.frame) + 4 * struct.calcsize("P")
 
-    def stage(self, metadata: dict | list, raw: Any, *, owned_host: bool = False) -> None:
-        """Receive immutable bytes without invoking the live model loader."""
+    def stage(
+        self,
+        metadata: dict | list,
+        raw: Any,
+        *,
+        owned_host: bool = False,
+        install_worker: ThreadPoolExecutor | None = None,
+    ) -> None:
+        """Receive immutable bytes and optionally hand receiver completion to
+        the install worker."""
         import ray
 
         charged = self._staged_after(raw)
@@ -357,35 +365,53 @@ class DeltaTransfer:
         # Source bytes are no longer needed after every transport read fence;
         # SG consumers still hold independently allocated proxy-owned storage.
         self._active_raw = None
-        memory = ray.get(
+
+        def confirm() -> None:
+            memory = self._confirm_receivers()
+            elapsed = monotonic() - started
+            self.metrics["receive_s"] += elapsed
+            self.metrics["transfer_apply_s"] += elapsed
+            self.metrics["proxy_receive_memory"] = memory
+            self._staged.append((self.frame, metadata))
+            self._staged_bytes = charged
+            self._directory_bytes += retained
+            self.metrics["payload_bytes"] += sum(sizes)
+            self.metrics["logical_delivery_bytes"] += sum(sizes) * (
+                len(self.ranks) if sharded else sum(map(len, self.ranks))
+            )
+            if sharded:
+                self.metrics["target_shard_frames"] += 1
+                marked = metadata[0]["target_shard"]["entries"]
+                self.metrics["target_shard_entries"] += len(marked)
+                self.metrics["target_shard_changed_words"] += sum(
+                    d["tensors"][i]["count"] for d in metadata for i in marked
+                )
+                for tp, size in enumerate(sizes):
+                    self.metrics["target_shard_lane_bytes"][tp] += size
+            self.metrics["frames"] += 1
+            self.frame += 1
+
+        if install_worker is None:
+            confirm()
+        else:
+            # Only receiver RPCs remain. The producer can now convert the next
+            # bucket, but must drain this single slot before another admission.
+            def install() -> set[str]:
+                confirm()
+                return self.apply()
+
+            self._pending_frame = install_worker.submit(install)
+
+    def _confirm_receivers(self) -> list:
+        import ray
+
+        return ray.get(
             [
                 engine.delta_weight_sync.remote("ready", round_id=self.frame, timeout=self.config.sync_timeout_s)
                 for engine in self.engines
             ],
             timeout=self.config.sync_timeout_s,
         )
-        elapsed = monotonic() - started
-        self.metrics["receive_s"] += elapsed
-        self.metrics["transfer_apply_s"] += elapsed
-        self.metrics["proxy_receive_memory"] = memory
-        self._staged.append((self.frame, metadata))
-        self._staged_bytes = charged
-        self._directory_bytes += retained
-        self.metrics["payload_bytes"] += sum(sizes)
-        self.metrics["logical_delivery_bytes"] += sum(sizes) * (
-            len(self.ranks) if sharded else sum(map(len, self.ranks))
-        )
-        if sharded:
-            self.metrics["target_shard_frames"] += 1
-            marked = metadata[0]["target_shard"]["entries"]
-            self.metrics["target_shard_entries"] += len(marked)
-            self.metrics["target_shard_changed_words"] += sum(
-                d["tensors"][i]["count"] for d in metadata for i in marked
-            )
-            for tp, size in enumerate(sizes):
-                self.metrics["target_shard_lane_bytes"][tp] += size
-        self.metrics["frames"] += 1
-        self.frame += 1
 
     def apply(self) -> set[str]:
         """Consume staged groups in directory order inside the original
@@ -522,26 +548,34 @@ class DeltaTransfer:
                 done.synchronize()
             self._prepared = None
 
+    @property
+    def pipelined_socket_install(self) -> bool:
+        return (
+            self.config.transport == "nccl_socket"
+            and self.group is not None
+            and self.tcp is None
+            and self._applying
+            and not self.ordered_target_consume
+        )
+
     def submit_frame(self, metadata: dict | list, raw: Any) -> set[str]:
         """Transfer ownership of a sealed frame until drain_frame().
 
         Source collectives stay on the caller thread. After a socket broadcast
-        has fenced, receiver installation can run concurrently with conversion
-        of the next bucket.
+        has fenced, ordinary receiver readiness and installation can run
+        concurrently with conversion of the next bucket.
         """
         self._require_drained()
         if not self._applying:
             raise RuntimeError("Delta submission disagrees with the owner's apply window")
-        if (
-            self.config.transport == "nccl_socket"
-            and self.group is not None
-            and self.tcp is None
-            and not self.ordered_target_consume
-        ):
-            self.stage(metadata, raw)
+        if self.pipelined_socket_install:
             if self._sender is None:
                 self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="delta-install")
-            self._pending_frame = self._sender.submit(self.apply)
+            if isinstance(metadata, list):
+                self.stage(metadata, raw)
+                self._pending_frame = self._sender.submit(self.apply)
+            else:
+                self.stage(metadata, raw, install_worker=self._sender)
             return set()
         if self.tcp is None or self.group is not None:
             return self.send(metadata, raw, defer_ordered=True)

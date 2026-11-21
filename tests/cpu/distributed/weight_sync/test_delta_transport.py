@@ -127,8 +127,9 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
             transfer.tcp.close()
 
 
-@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("failure", [None, "ready", "consume"])
 def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, failure):
+    import weakref
     from threading import Event, get_ident
     from types import SimpleNamespace
 
@@ -139,18 +140,23 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
 
     entered, release = Event(), Event()
     producer = get_ident()
+    actions = []
 
     def broadcast(raw, *, deadline):
-        assert get_ident() == producer
+        assert get_ident() == producer and transfer._active_raw is raw
+        actions.append("broadcast")
 
     def operation(action, **kwargs):
-        if action == "consume":
+        actions.append(action)
+        if action in ("ready", "consume"):
             assert get_ident() != producer
-            entered.set()
-            assert release.wait(5)
-            if failure:
-                raise RuntimeError("injected install failure")
-            return {"full_required": ["ordinary"]}
+            if action == "ready":
+                entered.set()
+                assert release.wait(5)
+            if action == failure:
+                raise RuntimeError(f"injected {failure} failure")
+        if action == "consume":
+            return {"full_required": [f"ordinary{kwargs['round_id']}"]}
         return {}
 
     monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
@@ -164,17 +170,28 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
     try:
         assert not transfer.submit_frame(directory, raw)
         assert entered.wait(5)
+        previous = weakref.ref(raw)
+        del raw
+        assert previous() is None
+        directory, raw = encode([("next", (1,), torch.float32, None, torch.zeros(1))], max_bytes=8)
+        assert actions == ["begin", "receive", "broadcast", "ready"]
+        with pytest.raises(RuntimeError, match="Drain"):
+            transfer.submit_frame(directory, raw)
         with pytest.raises(RuntimeError, match="Drain"):
             transfer.finalize()
         release.set()
         if failure:
-            with pytest.raises(RuntimeError, match="injected install failure"):
+            with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
                 transfer.drain_frame()
             with pytest.raises(RuntimeError, match="Drain"):
                 transfer.finalize()
+            assert actions[-1] == failure
         else:
-            assert transfer.drain_frame() == {"ordinary"}
-            assert transfer.finalize()["frames"] == 1
+            assert transfer.drain_frame() == {"ordinary0"}
+            assert not transfer.submit_frame(directory, raw)
+            assert transfer.drain_frame() == {"ordinary1"}
+            assert transfer.finalize()["frames"] == 2
+            assert actions == ["begin"] + ["receive", "broadcast", "ready", "consume"] * 2 + ["finalize"]
     finally:
         release.set()
         transfer.close()

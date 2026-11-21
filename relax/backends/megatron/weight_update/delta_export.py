@@ -24,7 +24,13 @@ from relax.utils.logging_utils import get_logger
 
 from . import target_shard
 from .expert_gather import OwnerExpert
-from .shard_snapshot import CudaShardBackup, CudaShardInputs, preallocate_spare_bank, shard_layout
+from .shard_snapshot import (
+    CudaShardBackup,
+    CudaShardInputs,
+    PinnedShardBank,
+    preallocate_spare_bank,
+    shard_bank_layout,
+)
 
 
 logger = get_logger(__name__)
@@ -123,8 +129,8 @@ class ShardDeltaExporter:
         self._live_inputs: CudaShardInputs | None = None
         self._backup: CudaShardBackup | None = None
         self._live_read_done: torch.cuda.Event | None = None
-        self._ack_bank: torch.Tensor | None = None
-        self._spare_bank: torch.Tensor | None = None
+        self._ack_bank: PinnedShardBank | None = None
+        self._spare_bank: PinnedShardBank | None = None
         self._supports_live_shards = False
         self._exported = False
         self._force_full = True
@@ -309,23 +315,38 @@ class ShardDeltaExporter:
                 except Exception as exc:
                     error = exc
             agree(error)
+            first_live_seed = seed and live and self._sequence == 0
+            cold_socket_seed = first_live_seed and self.config.transport == "nccl_socket"
+            after_submit = [False]
             error = None
             if rank == 0:
                 try:
                     self.transfer.begin(version=version, base=self._version, seed=seed)
+                    if cold_socket_seed:
+                        after_submit[0] = changed and self.transfer.pipelined_socket_install
                 except Exception as exc:
                     error = exc
             agree(error)
-            first_live_seed = seed and live and self._sequence == 0
-            if first_live_seed:
+            if cold_socket_seed:
+                dist.broadcast_object_list(after_submit, src=source_rank, group=group)
+            defer_spare = after_submit[0]
+
+            def start_spare() -> None:
+                nonlocal warm_pool, warm_spare
+                error = None
                 try:
-                    size = self._backup.storage.numel()
+                    size = self._backup.storage.nbytes
                     if cold_banks and 0 < size <= self.snapshot_budget_bytes // 2:
                         warm_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard-spare")
-                        warm_spare = warm_pool.submit(preallocate_spare_bank, size, self._live_inputs.device)
+                        warm_spare = warm_pool.submit(
+                            preallocate_spare_bank, self._backup.storage.sizes, self._live_inputs.device
+                        )
                 except Exception as exc:
                     error = exc
                 agree(error)
+
+            if first_live_seed and not defer_spare:
+                start_spare()
 
             stream = self.export(full=seed, full_names=frozenset(self.full_names), emit=rank == 0, _owner_group=group)
             pack = self.config.transport == "nccl_socket" and not self._target_shards
@@ -390,11 +411,19 @@ class ShardDeltaExporter:
                     except Exception as exc:
                         error = exc
                 agree(error)
+                if defer_spare:
+                    # The FULL bucket has fenced its broadcast and handed the
+                    # ordinary receiver ACK to the install worker on rank zero.
+                    start_spare()
+                    defer_spare = False
                 if rank == 0:
                     del raw, metadata
                 if chunk is None:
                     break
                 del frame, chunk
+            if defer_spare:
+                # A converter can finish without yielding any wire frame.
+                start_spare()
             if self.sender_pipeline_active:
                 drain_previous_frame()
             if first_live_seed:
@@ -477,7 +506,7 @@ class ShardDeltaExporter:
         if self._pending is not None:
             raise RuntimeError("A delta snapshot is already pending acknowledgement")
         acknowledged_bytes = (
-            self._ack_bank.numel()
+            self._ack_bank.nbytes
             if self._ack_bank is not None
             else sum(t.numel() * t.element_size() for t in self._acknowledged.values())
         )
@@ -485,8 +514,8 @@ class ShardDeltaExporter:
         if live_locked:
             # The synchronous Actor publication owns the model through commit/abort.
             # Keep the converter's mutable temporaries separate from these inputs.
-            entries, size = shard_layout(local_shards.items())
-            if self._spare_bank is not None and self._spare_bank.numel() != size:
+            entries, size = shard_bank_layout(local_shards.items(), self.config.bucket_bytes)
+            if self._spare_bank is not None and self._spare_bank.sizes != tuple(slab.capacity for slab in entries):
                 self._spare_bank = None
             self._backup = CudaShardBackup(entries, size, self._spare_bank, available, self.config.bucket_bytes)
             self._spare_bank = None
