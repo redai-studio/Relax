@@ -1086,7 +1086,6 @@ def policy_loss_function(
 
     full_log_probs = None
     full_old_log_probs = None
-    # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering.
     if args.use_opsm or algorithm.needs_full_log_probs:
         padded_iter = padded_total_lengths if padded_total_lengths is not None else [None] * len(log_probs)
         # OPSM supports CP: reconstruct each sample's full response from its CP-local
@@ -1458,8 +1457,6 @@ def _sft_response_loss(
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     selective_logit_rows: list[tuple[int, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Full and chunked heads use the same response alignment, reduction and
-    metrics."""
     _, scores = get_log_probs_and_entropy(
         model_output,
         args=args,
@@ -1775,13 +1772,10 @@ def sft_loss_function_chunked(
     *,
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """SFT loss that defers lm_head into the loss to avoid materializing the
-    full [B, S, V/TP] logits tensor. ``hidden_states`` is [B, S, H] (the bypass
-    in forward_step gathers any SP-sharded hidden into full S);
-    ``lm_head_forward`` is the captured original output_layer.forward.
+    """Compute SFT loss without materializing full [B, S, V/TP] logits.
 
-    Each head + CE block handles its own checkpoint. The caller applies the
-    same gradient scaling and metric normalization as for ordinary SFT.
+    With sequence parallelism, forward_step gathers the full sequence before
+    passing [B, S, H] hidden states and the original output_layer.forward.
     """
     plans = batch.get("selective_logit_rows")
     if plans and Envs.RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS:
