@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import sys
 
 import pytest
 
@@ -165,3 +166,70 @@ class TestReadAdapterScaling:
         (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
         with pytest.raises(ValueError, match="missing 'r' / 'lora_alpha'"):
             merge_lora._read_adapter_scaling(tmp_path)
+
+
+def test_hf_merge_qwen38_hc_ple_and_normalized_experts(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    base_dir, adapter_dir, output_dir = (tmp_path / name for name in ("base", "adapter", "merged"))
+    base_dir.mkdir()
+    adapter_dir.mkdir()
+    (base_dir / "config.json").write_text(json.dumps({"model_type": "qwen4_exp_text"}))
+    (base_dir / "tokenizer.json").write_text("{}")
+    config = {"r": 4, "lora_alpha": 8, "rank_pattern": {"key_proj": 2}, "alpha_pattern": {"key_proj": 6}}
+    (adapter_dir / "adapter_config.json").write_text(json.dumps(config))
+    (adapter_dir / "relax_lora_meta.json").write_text(json.dumps({"lora_rank": 4, "lora_alpha": 8}))
+    base, adapters, expected = {}, {}, {}
+    for prefix, shape, rank, scale in (
+        ("model.layers.0.attn_hyper_connection.input_mix_weight_down", (3, 4), 4, 2),
+        ("model.layers.0.ple.key_proj", (3, 4), 2, 3),
+        ("model.layers.0.mlp.experts.gate_up_proj", (2, 6, 4), 2, 4),
+    ):
+        key = prefix if len(shape) == 3 else prefix + ".weight"
+        a = torch.arange(rank * shape[-1], dtype=torch.bfloat16).reshape(rank, shape[-1]) / 8
+        b = torch.ones(*shape[:-1], rank, dtype=torch.bfloat16)
+        if len(shape) == 3:
+            a = a.repeat(shape[0], 1, 1)
+        adapters[f"base_model.model.{prefix}.lora_A.weight"] = a
+        adapters[f"base_model.model.{prefix}.lora_B.weight"] = b
+        base[key] = torch.full(shape, 2, dtype=torch.bfloat16)
+        expected[key] = (base[key].float() + scale * (b.float() @ a.float())).to(torch.bfloat16)
+    base["mtp.embedding.weight"] = torch.full((2, 4), 7, dtype=torch.bfloat16)
+    expected["mtp.embedding.weight"] = base["mtp.embedding.weight"].clone()
+    save_file(base, base_dir / "model.safetensors")
+    save_file(adapters, adapter_dir / "adapter_model.safetensors")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(_SCRIPT_PATH),
+            "--base-hf-dir",
+            str(base_dir),
+            "--adapter-dir",
+            str(adapter_dir),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+    threads = torch.get_num_threads()
+    try:
+        merge_lora.main()
+    finally:
+        torch.set_num_threads(threads)
+    with safe_open(output_dir / "model.safetensors", framework="pt", device="cpu") as handle:
+        assert set(handle.keys()) == set(expected)
+        for name, value in expected.items():
+            torch.testing.assert_close(handle.get_tensor(name), value, rtol=0, atol=0)
+    assert (output_dir / "config.json").read_bytes() == (base_dir / "config.json").read_bytes()
+    assert (output_dir / "tokenizer.json").is_file()
+
+
+def test_hf_merge_rejects_rank_mismatch_and_duplicate_factors() -> None:
+    with pytest.raises(ValueError, match="rank mismatch"):
+        merge_lora._module_scaling({"r": 4, "lora_alpha": 8}, "model.layers.0.ple.key_proj", 2)
+    with pytest.raises(ValueError, match="Duplicate"):
+        merge_lora._pair_adapter_keys(["w.lora_A.weight", "w.lora_A.default.weight", "w.lora_B.weight"])
+    assert merge_lora._module_scaling({"r": 4, "lora_alpha": 8, "use_rslora": True}, "w", 4) == 4

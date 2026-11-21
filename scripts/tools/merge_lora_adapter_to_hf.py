@@ -8,6 +8,12 @@ Relax exports the trained policy LoRA adapter as a *standard HF-PEFT* directory
 ``relax/backends/megatron/checkpoint.py::_save_lora_to_checkpoint``). The adapter
 keys are HF-style and are named after the *base tensor* they adapt.
 
+``--adapter-dir`` also accepts a native Megatron torch_dist LoRA checkpoint
+(an iteration directory or checkpoint root). This path delegates to the CPU
+checkpoint converter and supports Qwen3.5 MoE / Qwen3.8 full and LoRA-only
+checkpoints. It requires saved training args, an unquantized HF reference, and
+a fresh output directory; ``--device`` must be ``cpu``.
+
 This tool folds that adapter into the base HuggingFace model and writes a
 standalone merged HF checkpoint -- no Ray / Megatron / GPU cluster required. It is
 the offline counterpart of the inline merge done during RL weight sync
@@ -58,9 +64,12 @@ Notes:
 
 import argparse
 import json
+import math
+import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 
 _RELAX_ROOT = str(Path(__file__).resolve().parents[2])
@@ -78,7 +87,7 @@ _INDEX_FILE = "model.safetensors.index.json"
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Merge a trained LoRA adapter (HF-PEFT dir) back into its base HF model, offline."
+        description="Merge HF-PEFT adapters or native torch_dist LoRA checkpoints into HF weights, offline."
     )
     parser.add_argument(
         "--base-hf-dir",
@@ -90,8 +99,7 @@ def _parse_args():
         "--adapter-dir",
         type=str,
         required=True,
-        help="Exported LoRA adapter directory (contains adapter_config.json + adapter_model.safetensors, "
-        "e.g. <save>/iter_XXXXXXX/lora_adapter).",
+        help="HF-PEFT adapter directory, or native torch_dist LoRA iteration/checkpoint root.",
     )
     parser.add_argument(
         "--output-dir",
@@ -116,7 +124,17 @@ def _parse_args():
         "-f",
         "--force",
         action="store_true",
-        help="Overwrite the output directory if it already exists and is non-empty.",
+        help="Overwrite an existing HF-PEFT merge output. Native DCP exports require a fresh directory.",
+    )
+    parser.add_argument("--cpu-threads", type=int, default=2)
+    parser.add_argument("--memory-budget-gb", type=float, default=64, help="Native DCP tensor-buffer budget in GiB")
+    parser.add_argument("--max-shard-size-gb", type=float, default=2, help="Native DCP output shard target in GiB")
+    parser.add_argument(
+        "--allow-base-fallback",
+        choices=("vision", "ple", "mtp"),
+        action="append",
+        default=[],
+        help="Native full DCP only: copy missing frozen tensors in this group from the exact training base",
     )
     return parser.parse_args()
 
@@ -189,10 +207,14 @@ def _pair_adapter_keys(adapter_keys) -> dict:
     for key in adapter_keys:
         prefix = _strip_suffix(key, _LORA_A_SUFFIXES)
         if prefix:
+            if "A" in pairs.get(prefix, {}):
+                raise ValueError(f"Duplicate LoRA A factor for {prefix}")
             pairs.setdefault(prefix, {})["A"] = key
             continue
         prefix = _strip_suffix(key, _LORA_B_SUFFIXES)
         if prefix:
+            if "B" in pairs.get(prefix, {}):
+                raise ValueError(f"Duplicate LoRA B factor for {prefix}")
             pairs.setdefault(prefix, {})["B"] = key
             continue
         unrecognized.append(key)
@@ -205,6 +227,8 @@ def _pair_adapter_keys(adapter_keys) -> dict:
     incomplete = sorted(p for p, slot in pairs.items() if "A" not in slot or "B" not in slot)
     if incomplete:
         raise ValueError(f"{len(incomplete)} LoRA pair(s) are missing their A or B half, e.g. {incomplete[:5]}.")
+    if not pairs:
+        raise ValueError("No LoRA factor pairs found in adapter")
     return pairs
 
 
@@ -254,6 +278,33 @@ def _resolve_base_keys(pairs: dict, base_keys: set) -> dict:
     return resolved
 
 
+def _module_scaling(config: dict[str, Any], prefix: str, actual_rank: int, *, relax_export: bool = False) -> float:
+    """Apply PEFT per-module scaling, including Relax's normalized expert
+    ranks."""
+    if config.get("use_dora") or config.get("fan_in_fan_out"):
+        raise ValueError("DoRA and fan_in_fan_out adapters are not supported by this tensor merge")
+
+    def pattern_value(field: str, default: Any) -> tuple[Any, bool]:
+        for pattern, value in config.get(field, {}).items():
+            if re.match(rf"(.*\.)?({pattern})$", prefix):
+                return value, True
+        return default, False
+
+    rank, explicit_rank = pattern_value("rank_pattern", config.get("r"))
+    alpha, _ = pattern_value("alpha_pattern", config.get("lora_alpha"))
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+        raise ValueError(f"Invalid LoRA rank for {prefix}: {rank}")
+    if actual_rank != rank:
+        if not (relax_export and not explicit_rank and ".experts." in prefix):
+            raise ValueError(f"LoRA rank mismatch for {prefix}: config={rank}, tensors={actual_rank}")
+        # Native Relax export writes global r in adapter_config.json, while
+        # normalized routed-expert tensors retain their effective smaller rank.
+        rank = actual_rank
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or not math.isfinite(alpha):
+        raise ValueError(f"Invalid LoRA alpha for {prefix}: {alpha}")
+    return alpha / (math.sqrt(rank) if config.get("use_rslora") else rank)
+
+
 def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
     """Fold the adapter into ``shard_tensors`` in place.
 
@@ -269,7 +320,11 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
 
         # `@` covers both cases: 2-D (out,r)@(r,in) for nn.Linear weights, and batched
         # (E,out,r)@(E,r,in) for grouped MoE experts stored as one 3-D parameter.
-        delta = scaling * (lora_b @ lora_a)
+        factor = scaling[prefix] if isinstance(scaling, dict) else scaling
+        delta = factor * (lora_b @ lora_a)
+        if base.ndim == 3 and ".experts." in base_key and delta.shape[-2:] == base.shape[-2:]:
+            if delta.ndim == 2 or (delta.ndim == 3 and delta.shape[0] == 1):
+                delta = delta.expand(base.shape)
         if delta.shape != base.shape:
             raise ValueError(
                 f"LoRA delta shape {tuple(delta.shape)} does not match base tensor {base_key} "
@@ -305,16 +360,53 @@ def main() -> None:
 
     if not base_dir.is_dir():
         raise FileNotFoundError(f"--base-hf-dir {base_dir} does not exist.")
+    if output_dir.resolve() == base_dir.resolve() or output_dir.resolve() == adapter_dir.resolve():
+        raise ValueError("--output-dir must differ from the base model and adapter directories")
+    if args.cpu_threads <= 0:
+        raise ValueError("--cpu-threads must be positive")
+    if (adapter_dir / ".metadata").is_file() or (adapter_dir / "latest_checkpointed_iteration.txt").is_file():
+        if args.device != "cpu":
+            raise ValueError("Native torch_dist LoRA conversion requires --device cpu")
+        import torch
+
+        from scripts.tools.convert_checkpoint_to_hf_cpu import export_checkpoint
+
+        torch.set_num_threads(args.cpu_threads)
+        export_checkpoint(
+            adapter_dir,
+            base_dir,
+            output_dir,
+            shard_bytes=int(args.max_shard_size_gb * 1024**3),
+            memory_budget=int(args.memory_budget_gb * 1024**3),
+            allow_base_fallback=tuple(args.allow_base_fallback),
+            dry_run=args.dry_run,
+            require_lora=True,
+        )
+        return
     _validate_adapter_dir(adapter_dir)
 
     if not args.dry_run and output_dir.exists() and any(output_dir.iterdir()) and not args.force:
         raise ValueError(f"Output directory {output_dir} already exists and is non-empty. Use --force to overwrite.")
 
-    scaling = _read_adapter_scaling(adapter_dir)
+    _read_adapter_scaling(adapter_dir)
+    config = json.loads((adapter_dir / "adapter_config.json").read_text())
+    sidecar = adapter_dir / "relax_lora_meta.json"
+    relax_export = False
+    if sidecar.is_file():
+        metadata = json.loads(sidecar.read_text())
+        relax_export = metadata.get("lora_rank") == config.get("r") and metadata.get("lora_alpha") == config.get(
+            "lora_alpha"
+        )
+    base_config = json.loads((base_dir / "config.json").read_text())
+    if base_config.get("quantization_config") or base_config.get("text_config", {}).get("quantization_config"):
+        raise ValueError("Merge requires an unquantized HF base model")
 
     # Heavy deps imported lazily so `--help` / arg validation work without a full ML stack.
+    import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
+
+    torch.set_num_threads(args.cpu_threads)
 
     weight_map, shard_names = _read_base_index(base_dir)
     print(f"[merge-lora] base model: {len(weight_map)} tensors across {len(shard_names)} shard(s) in {base_dir}")
@@ -328,6 +420,16 @@ def main() -> None:
     with safe_open(str(adapter_file), framework="pt") as adapter:
         pairs = _pair_adapter_keys(adapter.keys())
         targets_by_key = _resolve_base_keys(pairs, set(weight_map))
+        scaling = {}
+        delta_shapes = {}
+        for prefix, pair in pairs.items():
+            a, b = (tuple(adapter.get_slice(pair[side]).get_shape()) for side in ("A", "B"))
+            if len(a) not in (2, 3) or len(b) not in (2, 3) or a[-2] != b[-1] or a[-2] <= 0:
+                raise ValueError(f"Invalid LoRA factor shapes for {prefix}: {a}, {b}")
+            scaling[prefix] = _module_scaling(config, prefix, a[-2], relax_export=relax_export)
+            delta_shapes[prefix] = (*torch.broadcast_shapes(a[:-2], b[:-2]), b[-2], a[-1])
+            if any(adapter.get_slice(key).get_dtype() not in ("BF16", "F16", "F32", "F64") for key in pair.values()):
+                raise ValueError(f"LoRA factors must be floating point: {prefix}")
         print(f"[merge-lora] adapter: {len(pairs)} LoRA pair(s), all resolved against the base model")
 
         router = sorted(p for p in targets_by_key if p.endswith(".mlp.gate"))
@@ -343,6 +445,20 @@ def main() -> None:
         per_shard: dict = {}
         for prefix, base_key in targets_by_key.items():
             per_shard.setdefault(weight_map[base_key], {})[prefix] = base_key
+
+        # Validate every target before creating output, including --dry-run.
+        for shard, targets in per_shard.items():
+            with safe_open(base_dir / shard, framework="pt", device="cpu") as handle:
+                for prefix, key in targets.items():
+                    base = handle.get_slice(key)
+                    shape, delta = tuple(base.get_shape()), delta_shapes[prefix]
+                    if len(shape) == 3 and ".experts." in key and delta[-2:] == shape[-2:]:
+                        if len(delta) == 2 or (len(delta) == 3 and delta[0] == 1):
+                            delta = shape
+                    if delta != shape or base.get_dtype() not in ("BF16", "F16", "F32", "F64"):
+                        raise ValueError(
+                            f"LoRA delta does not match floating-point base tensor {key}: {delta} vs {shape}"
+                        )
 
         if args.dry_run:
             for shard in shard_names:
