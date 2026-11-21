@@ -7,6 +7,20 @@ from relax.distributed.ray.ray_actor import RayActor
 from relax.utils.device import device_module
 
 
+def get_settled(refs):
+    """Get a batch of Ray results.
+
+    On failure, let every submitted operation finish before cleanup.
+    """
+    if not refs:
+        return []
+    try:
+        return ray.get(refs)
+    except Exception:
+        ray.wait(refs, num_returns=len(refs), fetch_local=False)
+        raise
+
+
 # Refer to
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/amd_gpu.py#L102-L103

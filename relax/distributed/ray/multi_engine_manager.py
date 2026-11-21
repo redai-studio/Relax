@@ -267,6 +267,7 @@ class MultiEngineManager:
         logger.info(f"{self._log_prefix} engines onload started with tags={tags}")
         # Engines rebuilt just above are already onloaded -- resuming them
         # again would be a double-resume, so only touch the ones that survived.
+        self._onloaded = None  # Partial recovery must remain eligible for cleanup.
         dead = self._fanout("resume_memory_occupation", skip_ranks=rebuilt, tags=tags)
         if dead:
             # An engine that died while offloaded is only discovered here
@@ -285,7 +286,7 @@ class MultiEngineManager:
         while other ranks wait on a barrier, so keep it short and leave the
         rebuild to the next onload().
         """
-        if not self._onloaded:
+        if self._onloaded is False:
             logger.info(f"{self._log_prefix} engines already offloaded; skipping")
             return
         logger.info(f"{self._log_prefix} engines offload started")
@@ -312,14 +313,18 @@ class MultiEngineManager:
             handles[rank] = getattr(engine, method).remote(**kwargs)
 
         dead = []
+        error = None
         for rank, handle in handles.items():
             try:
                 ray.get(handle)
             except Exception as exc:
-                if not _is_engine_dead(exc):
-                    raise
-                logger.warning(f"{self._log_prefix} engine rank={rank} died during {method}: {exc}")
-                dead.append(rank)
+                if _is_engine_dead(exc):
+                    logger.warning(f"{self._log_prefix} engine rank={rank} died during {method}: {exc}")
+                    dead.append(rank)
+                else:
+                    error = error or exc
+        if error is not None:
+            raise error
         return dead
 
     def _retire_engines(self, ranks: list[int]) -> None:
@@ -379,7 +384,7 @@ class MultiEngineManager:
         return rebuilt
 
     def is_onloaded(self) -> bool:
-        return self._onloaded
+        return self._onloaded is True
 
     def shutdown(self) -> None:
         """Tear down every engine and remove any placement group this manager
