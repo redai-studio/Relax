@@ -255,6 +255,24 @@ For long-context training, split the sequence across GPUs:
 
 ---
 
+## CPU Offload and NUMA
+
+On a multi-NUMA host, placing all training GPUs on one NUMA node can concentrate CPU optimizer work and memory traffic on that node. Check `nvidia-smi topo -m` and select GPUs across NUMA nodes while accounting for GPU interconnect topology.
+
+For example, if GPUs 0/1 are local to NUMA 0 and GPUs 4/5 to NUMA 1, expose those four GPUs **when starting the Ray node**:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,4,5 ray start --head --num-gpus=4
+```
+
+Use your existing Ray startup options for networking and cluster membership. Setting `CUDA_VISIBLE_DEVICES` only on the job submission command does not change the GPU resources of an already running Ray node. See [Ray accelerator configuration](https://docs.ray.io/en/latest/ray-core/scheduling/accelerators.html).
+
+Before initializing training process groups, Relax resolves the selected CUDA device's UUID and binds existing threads to nearby CPUs within their allowed CPU masks. This also handles non-contiguous GPU allocations. It does not change thread counts or automatically select GPUs across NUMA nodes.
+
+CPU affinity does not enforce memory placement or migrate existing pages. Under Linux's default memory policy, new pages are allocated near the CPU that first touches them when capacity permits. Inspect `/proc/<pid>/numa_maps` to verify placement. Strict `numactl --membind` policies can exhaust a local node even when another node has free RAM; Relax does not enable them automatically.
+
+---
+
 ## Activation Recomputation
 
 Recomputation trades compute for memory. For most RL training workloads, enabling recomputation is recommended:
