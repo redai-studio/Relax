@@ -4,7 +4,7 @@
 
 MOPD (Multi-Teacher On-Policy Distillation) 实现多教师在线蒸馏，允许一个学生模型同时从多个异构教师模型中学习。每个教师专注于不同的数据领域（如文本数学、视觉几何），框架按样本的 `data_source` 把它路由到对应教师，请求 token 级 log-probability，实现跨模态、跨领域的知识传递。
 
-教师由 **Relax 托管**：只需通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，Relax 会为每个教师自动拉起一个专用 SGLang 服务，运行时注入真实 URL。**无需手动 `sglang.launch_server`、无需管理端口。**
+教师由 **Relax 托管**：只需通过 `--opd-teacher-routes` 提供 `{data_source: HF 权重路径}`，默认每个 Teacher 使用自己的 SGLang 服务。同一基座的 Teacher 可共用一组 SGLang 副本，整组同步切换权重。**无需手动 `sglang.launch_server`、无需管理端口。**
 
 本示例场景：
 
@@ -127,7 +127,36 @@ Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确�
 - `mopd/by_teacher/<teacher_id>/responses` 统计本轮登记的 Student 回答，也包括上轮仍待提交的回答。同一回答在本轮重试只算一次。
 - `mopd/by_teacher/<teacher_id>/awaiting_submission` 统计其中尚待提交评分的回答。回答进入 `_teacher_prefill()`、逐条生成被取消或整组跳过评分时移出，重试时重新计入。
 
-> `--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
+> 独占模式下，`--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
+
+### 多个 Teacher 共用一组 SGLang 副本
+
+在现有 MOPD 命令中使用以下参数。例中 Student rollout 占一张卡，Teacher 占一张卡，训练阶段 Actor 使用两张卡。把路由键换成数据集里实际的 `data_source`，路径换成两个同构、分词器一致的本地 BF16 checkpoint。
+
+```bash
+--colocate --offload --use-opd --opd-type sglang \
+--resource '{"actor":[1,2],"rollout":[1,1],"teacher":[1,1]}' \
+--rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 \
+--opd-shared-teacher --teacher-num-gpus-per-engine 1 --opd-teacher-timeout-s 600 \
+--opd-teacher-routes '{"math":"/models/Teacher1","code":"/models/Teacher2"}'
+```
+
+所有副本从第一条路由的 checkpoint 启动，每条回答只交给一个副本评分。默认的 `--opd-teacher-scheduler affinity` 让每个副本优先处理当前 Teacher 的请求。多个 Teacher 有积压时，空闲副本可以切到其他 Teacher；只有要换权重的副本排空请求并确认新版本，其余副本继续评分。`--opd-teacher-scheduler lockstep` 让整个池一起切换。
+
+默认从磁盘重载完整 checkpoint。对同基座的 BF16 Teacher，可用和线上相同的 TP 大小离线打一次 U16 差分包。下面的命令依次加载两个模型，使用两张 GPU 捕获各 TP rank 的权重布局。
+
+```bash
+python -m examples.on_policy_distillation.mopd.pack_teacher_pair \
+  --checkpoints /models/Teacher1 /models/Teacher2 --tp-size 2 --output /models/teacher-deltas
+```
+
+启动 rollout 时设置 `--teacher-num-gpus-per-engine 2 --opd-teacher-delta-dir /models/teacher-deltas`，并将 `teacher` 的资源预算设为 2 的倍数。打包时的第一个 checkpoint 对应路由表的第一个 Teacher。每个副本准备好自己的包后，后续切换只发送控制请求，由对应 rank 从主机内存取压缩数据并原地恢复权重。
+
+下面用同一份 Qwen3.5-2B recipe 跑单机八卡。Student 用六个 TP1 副本生成，Teacher 池有两个 TP1 副本。训练阶段 Student 使用全部八张卡。
+
+```bash
+ROLLOUT_GPUS=6 TEACHER_GPUS=2 bash examples/on_policy_distillation/mopd/run-mopd-qwen35-2b-2xgpu-shared.sh
+```
 
 ## 奖励路由：`rm_type=mopd`
 
@@ -151,7 +180,7 @@ Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确�
 
 1. 用 `prepare_data.py` 为新领域样本生成带对应 `data_source` 的统一 schema 数据（或用 `--manifest` 接入已有 verl 格式数据）。
 2. 在 `--opd-teacher-routes` 里加一条 `data_source → 权重路径`。
-3. 增大 `--resource` 里 `teacher` 的 GPU 总预算，并**同步缩小 `--rollout-num-gpus`**（或整体扩大 `actor_gpus`），保证 `rollout + teacher == actor` 始终成立——新增教师不能凭空多占卡。
+3. 使用独占模式时，增大 `--resource` 里 `teacher` 的 GPU 总预算，并**同步缩小 `--rollout-num-gpus`**（或整体扩大 `actor_gpus`），保证 `rollout + teacher == actor` 始终成立——新增教师不能凭空多占卡。
 
 ## 参考
 
