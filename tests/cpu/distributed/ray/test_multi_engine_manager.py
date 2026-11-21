@@ -171,6 +171,26 @@ def test_fanout_reraises_non_dead_exceptions(_patch_ray, monkeypatch):
         manager._fanout("release_memory_occupation")
 
 
+def test_failed_resume_settles_other_engines_and_allows_offload(_patch_ray, monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=2)
+    manager.offload()
+    get = mem.ray.get
+
+    def fail_first_resume(ref, **kwargs):
+        if isinstance(ref, tuple) and ref == (manager.all_engines[0], "resume_memory_occupation"):
+            raise ValueError("judge resume failed")
+        return get(ref, **kwargs)
+
+    monkeypatch.setattr(mem.ray, "get", fail_first_resume)
+    with pytest.raises(ValueError, match="judge resume failed"):
+        manager.onload()
+    manager.offload()
+    assert manager.all_engines[1].calls[-2:] == ["resume_memory_occupation", "release_memory_occupation"]
+    assert not manager.is_onloaded()
+
+
 def test_offload_onload_are_idempotent_when_state_unchanged(_patch_ray):
     manager = _FakeManager(num_slots=2)
     for engine in manager.all_engines:

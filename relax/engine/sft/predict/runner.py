@@ -63,9 +63,22 @@ def run_sft_predict(actor, rollout_id: int, *, published_version: dict | None = 
         published_version = actor.update_weights()
     _t_update = time.monotonic() - _t
     dist.barrier(group=get_gloo_group())
+    managed_judges = (
+        (getattr(actor, "genrm_manager", None) or [])
+        if is_main_rank
+        and scoring
+        and args.offload_rollout
+        and not getattr(args, "defer_reward_to_post_process", False)
+        else []
+    )
+    if managed_judges:
+        from relax.distributed.ray.utils import get_settled
+
     if is_main_rank:
         _t = time.monotonic()
         try:
+            if published_version is not None and managed_judges:
+                get_settled([manager.onload.remote() for manager in managed_judges])
             # Bound the time other training ranks wait for the prediction pass.
             params = {"train_step": rollout_id}
             if published_version is not None:
@@ -82,18 +95,13 @@ def run_sft_predict(actor, rollout_id: int, *, published_version: dict | None = 
             logger.warning(f"SFT predict at rollout_id {rollout_id} failed: {e}")
             predict_error = str(e)
         _t_http = time.monotonic() - _t
-    if scoring:
-        # A colocated judge must release memory before the actor wakes up.
-        # Eligible background judges promise to use independent resources.
-        # Use the HTTP caller rank: with PP it may differ from global rank 0,
-        # which could otherwise offload GenRM while /predict is still scoring.
-        if args.offload_rollout and is_main_rank:
-            try:
-                import ray
-
-                ray.get([manager.offload.remote() for manager in (getattr(actor, "genrm_manager", None) or [])])
-            except Exception as exc:
-                predict_error = f"SFT judge offload failed: {exc}"
+    if managed_judges:
+        # The prediction caller releases the judges after scoring and before training resumes.
+        try:
+            get_settled([manager.offload.remote() for manager in managed_judges])
+        except Exception as exc:
+            cleanup_error = f"SFT judge offload failed: {exc}"
+            predict_error = f"{predict_error}; {cleanup_error}" if predict_error else cleanup_error
     if scoring or published_version is not None:
         errors = [None] * dist.get_world_size(group=get_gloo_group())
         dist.all_gather_object(errors, predict_error, group=get_gloo_group())
@@ -132,29 +140,25 @@ async def handle_predict(
     Returns the JSON payload the FastAPI handler should send back.
     """
     rollout._logger.info(f"Received request to predict train_step {train_step}")
+    error = None
     try:
         if weight_version is None and weight_root is None:
             await rollout.rollout_manager.run_predict.remote(train_step)
         else:
             await rollout.rollout_manager.run_predict.remote(train_step, weight_version, weight_root)
-        return {"status": "ok", "rollout_id": train_step}
-    except Exception as e:
-        error_msg = f"Predict failed for train_step {train_step}: {type(e).__name__}: {str(e)}"
-        rollout._logger.exception(error_msg)
-        rollout.healthy.report_error.remote("rollout", error_msg)
-        return {"status": "error", "message": error_msg}
+    except Exception as exc:
+        error = f"Predict failed for train_step {train_step}: {type(exc).__name__}: {exc}"
+        rollout._logger.exception(error)
     finally:
-        # Mirror RL's per-cycle reset: full no-tag offload after each
-        # predict puts all 3 tags back in `offload_tags`, so the next
-        # predict cycle's `update_weights → onload_weights` and
-        # `onload_kv` both resume cleanly. SFT's per-step `update_weights`
-        # is gated on `_should_run_sft_predict`, so this offload only
-        # ever fires on predict steps. Must run even on exception —
-        # leaking KV/weights would starve the next training step's GPU
-        # memory. RL: rollout manages its own offload in `_async_run`,
-        # skip here.
         if is_sft_mode(rollout.config) and rollout.config.offload_rollout:
             try:
                 await rollout.rollout_manager.offload.remote()
             except Exception as exc:
-                rollout._logger.warning(f"Post-predict offload failed at step {train_step}: {exc}")
+                cleanup_error = f"Post-predict offload failed at step {train_step}: {exc}"
+                rollout._logger.warning(cleanup_error)
+                if weight_version is not None or weight_root is not None:
+                    error = f"{error}; {cleanup_error}" if error else cleanup_error
+    if error is not None:
+        rollout.healthy.report_error.remote("rollout", error)
+        return {"status": "error", "message": error}
+    return {"status": "ok", "rollout_id": train_step}
