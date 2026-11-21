@@ -2,6 +2,7 @@
 
 
 import ray
+from ray.util.placement_group import placement_group_table
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
@@ -173,10 +174,20 @@ class TeacherManager(MultiEngineManager):
     def _engine_ctor_args(self, rank: int):
         return self._teacher_args
 
-    def _build_engine_ctor_kwargs(self, rank: int) -> dict:
+    def _build_engine_ctor_kwargs(self, pg_tuple: tuple, gpu_index: int) -> dict:
+        server_gpu_ids = None
+        if self.nodes_per_engine == 1:
+            pg, bundle_indices, gpu_ids = pg_tuple
+            replica = slice(gpu_index, gpu_index + self.gpus_per_replica)
+            nodes = placement_group_table(pg)["bundles_to_node_id"]
+            replica_nodes = {nodes[index] for index in bundle_indices[replica]}
+            if len(replica_nodes) != 1 or not all(replica_nodes):
+                raise ValueError(f"Single-node Teacher replica spans invalid placement-group nodes: {replica_nodes}")
+            server_gpu_ids = gpu_ids[replica]
         return {
             "sglang_overrides": self._overrides,
             "num_gpus_per_engine": self.gpus_per_replica,
+            "server_gpu_ids": server_gpu_ids,
             "register_sigterm_handler": False,
         }
 
