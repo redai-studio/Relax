@@ -164,7 +164,7 @@ class Service:
                     self.healthy.update_heartbeat.remote(self.role, 0)
                 except Exception as e:
                     logger.debug(f"Heartbeat error for {self.role}: {e}")
-                time.sleep(10)
+                self._stop_heartbeat.wait(10)
 
         self._heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
@@ -172,10 +172,13 @@ class Service:
 
     def _stop_heartbeat_thread(self) -> None:
         """Stop the heartbeat thread."""
-        if self._heartbeat_thread is not None:
+        thread = self._heartbeat_thread
+        if thread is not None:
             self._stop_heartbeat.set()
-            self._heartbeat_thread.join(timeout=2)
-            self._heartbeat_thread = None
+            # Finish any in-flight RPC submission before the caller tears down Ray.
+            thread.join()
+            if self._heartbeat_thread is thread:
+                self._heartbeat_thread = None
             logger.info(f"[{self.role}] Heartbeat thread stopped")
 
     def _http_call(

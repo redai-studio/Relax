@@ -591,7 +591,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
             loss_type="sft", generation_task="i2i" if mode.startswith("i2i") else "t2i"
         )
         partial_controller.serve_dict["sft"] = SimpleNamespace(
-            handle=SimpleNamespace(stop=SimpleNamespace(remote=stop_image))
+            handle=SimpleNamespace(stop=SimpleNamespace(remote=stop_image)), _stop_heartbeat_thread=Mock()
         )
     ns["shutdown"](partial_controller)
     if mode.startswith("i2i"):
@@ -639,7 +639,7 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
     dispose_ref = object()
     dispose_remote = Mock(return_value=dispose_ref)
     manager = SimpleNamespace(dispose=SimpleNamespace(remote=dispose_remote))
-    service = SimpleNamespace(get_rollout_manager=AsyncMock(return_value=manager))
+    service = SimpleNamespace(get_rollout_manager=AsyncMock(return_value=manager), _stop_heartbeat_thread=Mock())
     ray_get = Mock(side_effect=RuntimeError("Manager unavailable") if manager_fails else None)
     ns = {
         "logger": Mock(),
