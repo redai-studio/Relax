@@ -17,11 +17,7 @@ from relax.utils.replay.schema import ActorStepId, Identity, RecomputeConfig, St
 
 
 def build_config_from_args(args: Any) -> RecomputeConfig:
-    """Build a RecomputeConfig from the runtime args namespace.
-
-    eps_clip_high is None by argparse default but is derived to args.eps_clip
-    in slime_validate_args (arguments.py), so it is always present post-parse.
-    """
+    """Build a RecomputeConfig from the runtime args namespace."""
     return RecomputeConfig(
         advantage_estimator=str(args.advantage_estimator),
         kl_loss_type=str(args.kl_loss_type),
