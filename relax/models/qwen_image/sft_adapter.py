@@ -254,7 +254,8 @@ class QwenImageEditSFTAdapter:
         errors: list[str] = []
         if "prefix_gradient_checkpointing" in config:
             errors.append("Qwen-Image-Edit does not support prefix_gradient_checkpointing")
-        if type(config.get("transformer_gradient_checkpointing", True)) is not bool:
+        config.setdefault("transformer_gradient_checkpointing", True)
+        if type(config["transformer_gradient_checkpointing"]) is not bool:
             errors.append("transformer_gradient_checkpointing must be boolean")
         return errors
 

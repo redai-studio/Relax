@@ -125,8 +125,12 @@ def test_configuration_validation() -> None:
             model_adapter_path="relax.models.qwen_image.sft_adapter.QwenImageEditSFTAdapter",
         )
 
+    default = arguments({})
+    validate_i2i_sft_config(default)
     valid = arguments({"transformer_gradient_checkpointing": True})
     validate_i2i_sft_config(valid)
+    assert default.i2i_sft_config == valid.i2i_sft_config
+    assert valid.i2i_sft_config["transformer_gradient_checkpointing"] is True
     assert "prefix_gradient_checkpointing" not in valid.i2i_sft_config
     with pytest.raises(ValueError, match="prefix_gradient_checkpointing"):
         validate_i2i_sft_config(arguments({"prefix_gradient_checkpointing": False}))
