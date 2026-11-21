@@ -15,6 +15,7 @@ import time
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
+import psutil
 import ray
 import requests
 import sglang_router
@@ -176,6 +177,8 @@ def remove_dead_router_worker(
 # the downstream offload barrier) indefinitely.
 _GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
 _GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
+# Leave time for router removal and the reply within the manager's 60 s shutdown RPC.
+_SERVER_SHUTDOWN_TIMEOUT_S = 30.0
 _SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
 _MIN_HTTP_TIMEOUT_S = 1.0
 
@@ -388,7 +391,7 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args: ServerArgs, *, on_started=None) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -405,6 +408,8 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
     p.start()
+    if on_started is not None:
+        on_started(p)
 
     if server_args.node_rank != 0:
         return p
@@ -496,6 +501,8 @@ class SGLangEngine(RayActor):
         weight_consumer: bool = False,
     ):
         self.args = args
+        self.process: multiprocessing.Process | None = None
+        self._stopping_processes: set[psutil.Process] = set()
         self._weight_consumer_enabled = weight_consumer
         self.rank = rank
         self.worker_type = worker_type
@@ -724,13 +731,17 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
+
+        def own_process(process):
+            self.process = process
+
         if getattr(self, "_weight_consumer_enabled", False):
             from relax.distributed.weight_sync.sglang_plugin import version_plugin_environment
 
             with version_plugin_environment():
-                self.process = launch_server_process(server_args)
+                launch_server_process(server_args, on_started=own_process)
         else:
-            self.process = launch_server_process(server_args)
+            launch_server_process(server_args, on_started=own_process)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
@@ -1108,17 +1119,54 @@ class SGLangEngine(RayActor):
                 raise TimeoutError("Timeout while flushing cache.")
             time.sleep(1)
 
+    def _stop_server_process(self):
+        process = self.process
+        if process is None:
+            return
+        pending = self._stopping_processes
+        if process.is_alive():
+            try:
+                pending.add(psutil.Process(process.pid))
+            except psutil.NoSuchProcess:
+                pass
+        # Keep process identities across attempts: after the parent exits its
+        # children can no longer be found by traversing the original PID.
+        for parent in tuple(pending):
+            try:
+                pending.update(parent.children(recursive=True))
+            except psutil.NoSuchProcess:
+                pass
+        for proc in pending:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+        deadline = time.monotonic() + _SERVER_SHUTDOWN_TIMEOUT_S
+        while pending:
+            for proc in tuple(pending):
+                try:
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        continue
+                except psutil.NoSuchProcess:
+                    pass
+                pending.remove(proc)
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"SGLang processes still running: {sorted(p.pid for p in pending)}")
+                time.sleep(min(0.1, remaining))
+        process.join(timeout=0)
+        self.process = None
+
     def shutdown(self):
         if self.args.rollout_external:
             return
-
-        logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         try:
-            self.unregister_from_router(timeout=5.0)
+            if getattr(self, "server_host", None) is not None and getattr(self, "server_port", None) is not None:
+                self.unregister_from_router(timeout=5.0)
         finally:
-            process = getattr(self, "process", None)
-            if process is not None:
-                kill_process_tree(process.pid)
+            self._stop_server_process()
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
