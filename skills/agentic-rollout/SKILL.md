@@ -1,6 +1,6 @@
 ---
 name: agentic-rollout
-description: Assess an agent, bridge it into Relax, check launch readiness, and demonstrate resident Agentic rollout with evidence. Use when evaluating an agent app before integration, connecting an external agent with --use-agentic-rollout, auditing model-visible context linearity or SessionForest export, checking remote or large-scale resident concurrency, or preparing an Agentic experiment.
+description: Assess an agent, bridge it into Relax, check launch readiness, and demonstrate resident Agentic rollout with evidence. Use when evaluating an agent app before integration, authoring an Agentic recipe or resource adapter, connecting an external agent with --use-agentic-rollout, auditing model-visible context linearity or SessionForest export, checking remote or large-scale resident concurrency, or preparing an Agentic experiment.
 argument-hint: "[assess|bridge|check|demonstrate] [agent-or-script-path]"
 ---
 
@@ -26,7 +26,12 @@ Start every response with the current stage letter and name, evidence available,
 - Treat model-facing `messages`, `tools`, and `chat_template_kwargs` as the context contract. Python calls and internal agent objects are not substitutes.
 - Treat reasoning and tool-call parsers as part of the model/chat-template contract. A basic text response does not
   prove parser compatibility.
-- Distinguish logical prompt Groups, resident Sessions, model requests, exported contexts, and physical training rows.
+- Distinguish logical prompt Groups, physical Session slots, model requests, exported contexts, and training rows.
+  `--agentic-concurrency` counts Groups across Prepare and Runtime. Leased members generate independently when ready;
+  external executors own physical task quotas.
+- The launched `--agent-command` cleans up its tools, descendants, containers and remote jobs, both on natural exit
+  and when Relax sends SIGTERM because of a timeout or another reason. Relax fallback cleanup runs after
+  logical retirement; cleanup failures warn without holding Group capacity or invalidating exports.
 - Apply export, advantage, and dynamic-batching rules to exported contexts per Session. The number of resident Sessions is a different dimension.
 - Choosing resident Agentic rollout (`--use-agentic-rollout`) gives Agentic ownership of train and Eval generation;
   `--custom-generate-function-path` is ignored on this path.
@@ -82,7 +87,8 @@ Enter only when the user asks for implementation and Stage A has no unresolved b
 1. Preserve the agent's normal model-and-tool loop.
 2. Map dataset fields with `--input-key`, `--metadata-key`, and `--multimodal-keys`; decide whether the harness receives
    ready-to-use messages or constructs them from metadata at runtime.
-3. Wire the complete agent environment in [integration-contract.md](references/integration-contract.md).
+3. Use the recipe assembly and environment contracts in [integration-contract.md](references/integration-contract.md).
+   Ensure the launched `--agent-command` cleans up resources on natural exit and on SIGTERM from Relax.
 4. Configure the agent application's client that calls `RELAX_BASE_URL` so the timeout of each model API request can
    span every applicable prelaunch, partial-rollout, or fully-async hold. Keep this client timeout separate from
    `--agent-timeout`, which bounds the agent process's Runtime active time.
@@ -102,7 +108,10 @@ Enter only when the user asks for implementation and Stage A has no unresolved b
 9. Decide where reward and advantages come from. For one implicitly exported context, write `reward` in the agent
    output or configure `--custom-rm-path`. When using `--agentic-custom-advantage-path`, use explicit export and keep its
    inputs in export metadata. Multiple exported contexts require custom advantage and dynamic batching.
-10. Keep the change at the adapter and recipe boundary unless the verified contract requires a core `relax/agentic/**` change.
+10. Resolve Group concurrency, external executor quotas, and Eval demand separately using
+    [external-agent-capacity.md](references/external-agent-capacity.md). Do not copy a hardware example's capacity as a
+    universal default or assume another recipe is enabled automatically.
+11. Keep the change at the adapter and recipe boundary unless the verified contract requires a core `relax/agentic/**` change.
 
 Start with:
 
@@ -120,9 +129,11 @@ Goal: produce a launch verdict without starting the job.
 2. Read [parameter-preflight.md](references/parameter-preflight.md). Resolve every applicable Agentic parameter after
    defaults and validation, then check its dependencies and runtime evidence.
 3. Audit context linearity again from the integrated HTTP payloads.
-4. Read [resident-lifecycle.md](references/resident-lifecycle.md). Verify Group size, first-request barrier, and cleanup.
-5. When agents use a capacity-limited external platform, read
-   [external-agent-capacity.md](references/external-agent-capacity.md). Otherwise report `External capacity: N/A`.
+4. Read [resident-lifecycle.md](references/resident-lifecycle.md). Verify independent member generation,
+   Group size, generation gates, and the physical release contract.
+5. When a capacity-limited external platform is used, read
+   [external-agent-capacity.md](references/external-agent-capacity.md). With local execution, report external quotas
+   as `N/A` but still check the host budget and release owner.
 6. Read [large-scale-rollout.md](references/large-scale-rollout.md) if and only if the projected or observed load is
    large enough to approach or exceed a fixed internal width or known validated scale envelope.
    Otherwise report `Internal scale: N/A`; prelaunch, production use, or a "large-scale" label alone does not activate
@@ -144,7 +155,9 @@ Stage name: Check before Launch
 Verdict: PASS | UNSAFE | UNVERIFIED
 Agentic parameters: PASS | NEEDS_CHANGES | UNVERIFIED
 Context linearity: PASS | NEEDS_CHANGES | UNVERIFIED
-External capacity: PASS | UNSAFE | UNVERIFIED
+External executor capacity: PASS | UNSAFE | UNVERIFIED | not applicable
+Resource release contract: PASS | NEEDS_CHANGES | UNVERIFIED
+External capacity: PASS | UNSAFE | UNVERIFIED | N/A
 Internal scale: PASS | UNSAFE | UNVERIFIED | N/A
 Internal width changes: N/A | see conditional large-scale result
 Relax-facing per-request timeout: PASS | UNSAFE | UNVERIFIED
@@ -162,13 +175,15 @@ Enter only after explicit user authorization and a passing Stage C check. Use th
 
 Validate in order:
 
-1. one complete Group reaches the first-request barrier;
+1. a complete Group starts and produces first requests; in capacity mode also observe partial startup and leased ready
+   members progressing before the all-member barrier;
 2. the full model/tool loop completes, with expected text, reasoning, tool calls, call IDs, arguments, finish reasons,
    usage, and protocol-specific JSON or Buffered SSE terminal shape in the Relax response;
 3. request payloads preserve context lineage and stable tools/template arguments;
 4. SessionForest commits the intended leaf or branches;
 5. export, reward, and custom advantage match the selected contexts; if custom advantage can return `None`, the whole-Group drop and replenishment path is observed;
-6. agent and external resources clean up;
+6. normal and cancelled tasks release agent/external resources with matching ownership proof; unknown cleanup keeps
+   its debit for retry, and Group failure/replacement semantics remain unchanged;
 7. a meaningful multi-sample run reaches transfer and an optimizer step;
 8. partial/resume or Eval overlap behavior is exercised when configured.
 9. large-scale runs reach their target resident fanout and soak duration without saturating ingress, Shard, permit, or
@@ -183,9 +198,9 @@ A one-sample success proves plumbing only. Do not claim training success without
 Trace failures through this ownership order:
 
 ```text
-DataSource -> Prepare Group -> first-request barrier -> Runtime lease
--> Session -> model/backend request -> agent process
--> external executor -> Reward -> Transfer
+DataSource -> Prepare registers complete Group -> Runtime lease
+-> each ready Session -> model/backend request -> agent process -> external executor
+-> logical Session retirement + background cleanup -> complete-Group Reward/Transfer
 ```
 
 Stay in Agentic diagnosis for context mismatches, external slot exhaustion, first-request barriers, protected Sessions, agent timeouts, exports, rewards, or cleanup. Use `debug-hang` after evidence points to Ray scheduling, Actor state, placement, resources, or distributed collectives.
@@ -193,7 +208,7 @@ Stay in Agentic diagnosis for context mismatches, external slot exhaustion, firs
 ## References
 
 - [context-linearity.md](references/context-linearity.md): model-visible history and branch audit
-- [external-agent-capacity.md](references/external-agent-capacity.md): mandatory remote slot calculation
+- [external-agent-capacity.md](references/external-agent-capacity.md): logical/physical budgets, Eval overlap, and remote quotas
 - [integration-contract.md](references/integration-contract.md): adapter, request, export, and validation contracts
 - [large-scale-rollout.md](references/large-scale-rollout.md): conditional target-scale readiness
 - [parameter-preflight.md](references/parameter-preflight.md): effective Agentic flags, dependencies, and evidence

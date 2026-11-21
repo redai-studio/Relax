@@ -124,7 +124,7 @@ ROLLOUT_ARGS=(
 
    --custom-rm-path examples.on_policy_distillation.agentic_opd.alfworld.reward_alfworld.reward_func
    --use-agentic-rollout
-   --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+   --agent-command "bash ${SCRIPT_DIR}/run_agent_app.sh"
    --agent-cwd "${SCRIPT_DIR}"
 
    --agent-env

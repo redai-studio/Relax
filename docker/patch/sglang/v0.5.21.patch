@@ -467,7 +467,7 @@ index 01dc5a9c..4aa1dfe9 100644
      no_override_protected_fields: bool = field(
          default=False, metadata={"batch_sig_exclude": True}
 diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
-index b558be3e..47c1594e 100644
+index b558be3..5dc4bcb 100644
 --- a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
 +++ b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
 @@ -39,6 +39,17 @@ class UpdateWeightFromTensorCheckerReqInput:
@@ -488,6 +488,15 @@ index b558be3e..47c1594e 100644
  @dataclass
  class GetWeightsChecksumReqInput:
      """Compute SHA-256 checksum of loaded module weights for verification."""
+@@ -63,7 +74,7 @@ class ResumeMemoryOccupationReqInput:
+ class RolloutRequest(BaseModel):
+     prompt: str
+     negative_prompt: Optional[str] = None
+-    seed: Optional[int] = None
++    seed: Optional[int | list[int]] = None
+     generator_device: str = "cuda"
+ 
+     width: Optional[int] = None
 diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
 index 2e9a0956..b1dcf19f 100644
 --- a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
@@ -1147,7 +1156,7 @@ index aa52a25e..a157de70 100644
              raise ValueError(f"Unsupported sde_type: {sde_type}")
  
 diff --git a/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py b/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
-index e6ef5094..33be05fb 100644
+index e6ef509..4ad35da 100644
 --- a/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
 +++ b/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
 @@ -545,6 +545,13 @@ class WeightsUpdater:
@@ -1164,6 +1173,29 @@ index e6ef5094..33be05fb 100644
          if target_modules is None:
              target_modules = [_DEFAULT_TENSOR_TARGET_MODULE]
          try:
+@@ -584,6 +591,22 @@ class WeightsUpdater:
+             try:
+                 payload = module_payloads[module_name]
+                 weights_iter = self._materialize_weights_iter(payload, load_format)
++                if (
++                    getattr(self.pipeline, "pipeline_name", None)
++                    == "SenseNovaU1Pipeline"
++                    and module_name == "model"
++                ):
++                    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
++                        iter_materialized_weights,
++                    )
++                    from sglang.multimodal_gen.runtime.models.sensenova_u1.weights import (
++                        validate_dense_bucket,
++                    )
++
++                    weights_iter = list(weights_iter)
++                    validate_dense_bucket(
++                        weights_iter, list(iter_materialized_weights(module))
++                    )
+                 _load_weights_into_module(module, weights_iter)
+                 updated_modules.append(module_name)
+             except Exception as e:
 diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
 index 21afe7f0..e73fce32 100644
 --- a/python/sglang/srt/arg_groups/fields/exec_.py
@@ -6829,3 +6861,3587 @@ diff --git a/python/sglang/srt/models/qwen3_omni_moe.py b/python/sglang/srt/mode
 
 
  class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index fb062ce..7bcfefb 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -1648,6 +1648,30 @@ async def pd_role_switch(
+     )
+ 
+ 
++@app.get("/relax/lora/inventory")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def relax_lora_inventory():
++    return _global_state.tokenizer_manager.relax_lora.inventory()
++
++
++@app.post("/relax/lora/load")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def relax_lora_load(obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()]):
++    try:
++        return await _global_state.tokenizer_manager.relax_lora.load(obj)
++    except ValueError as exc:
++        return ORJSONResponse({"error": str(exc)}, status_code=409)
++
++
++@app.post("/relax/lora/control")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def relax_lora_control(body: dict = Body(...)):
++    try:
++        return await _global_state.tokenizer_manager.relax_lora.control(body)
++    except ValueError as exc:
++        return ORJSONResponse({"error": str(exc)}, status_code=409)
++
++
+ @app.api_route("/load_lora_adapter", methods=["POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def load_lora_adapter(
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index dae118d..8000251 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -396,6 +396,14 @@ class LoRAManager:
+         """
+ 
+         loaded_lora_ref = self.lora_refs.get(lora_ref.lora_id)
++        if (
++            lora_ref.lora_name.startswith("relax_lora@")
++            and loaded_lora_ref is not None
++            and loaded_lora_ref.lora_name != lora_ref.lora_name
++        ):
++            return self.create_lora_update_result(
++                success=False, error_message="LORA_ID_MISMATCH"
++            )
+         try:
+             pending_events = getattr(self, "pending_lora_load_events", {})
+             pending_event = pending_events.get(lora_ref.lora_id)
+diff --git a/python/sglang/srt/lora/lora_registry.py b/python/sglang/srt/lora/lora_registry.py
+index ed7101b..cd478c9 100644
+--- a/python/sglang/srt/lora/lora_registry.py
++++ b/python/sglang/srt/lora/lora_registry.py
+@@ -15,6 +15,7 @@
+ 
+ import asyncio
+ from collections import OrderedDict
++from dataclasses import dataclass
+ from typing import Dict, List, Optional, Union
+ from uuid import NAMESPACE_URL, uuid4, uuid5
+ 
+@@ -62,6 +63,12 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
+         return f"{self.__class__.__name__}({', '.join(parts)})"
+ 
+ 
++@dataclass
++class LoRARequestLease:
++    lora_id: str
++    owners: int = 1
++
++
+ class LoRARegistry:
+     """
+     The central registry to keep track of available LoRA adapters and ongoing LoRA requests.
+@@ -80,8 +87,8 @@ class LoRARegistry:
+         )
+ 
+         # A read-write lock to ensure adapters loading / unloading operations are exclusive.
+-        # Please note that the counter increment/decrement operations are not synchronized through this
+-        # lock, as they are designed to be non-blocking and can be performed concurrently.
++        # Acquire holds this lock through counter increment so unregister cannot
++        # observe zero users while a previously admitted request is still acquiring.
+         self._registry_lock = RWLock()
+         # An ordered dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
+         # The LoRARefs are stored in LRU order, such that LoRA adapters that have been
+@@ -142,27 +149,26 @@ class LoRARegistry:
+             self._registry.move_to_end(name)
+             return lora_ref.lora_id
+ 
+-        if isinstance(lora_name, str):
+-            async with self._registry_lock.writer_lock:
+-                lora_id = _lookup(lora_name)
+-
+-            await self._counters[lora_id].increment(notify_all=False)
+-            return lora_id
+-        elif isinstance(lora_name, list):
+-            async with self._registry_lock.writer_lock:
+-                lora_ids = [_lookup(name) for name in lora_name]
+-
+-            # Increment the counters only after all IDs are looked up.
+-            await asyncio.gather(
+-                *[
+-                    self._counters[id].increment(notify_all=False)
+-                    for id in lora_ids
+-                    if id is not None
+-                ]
+-            )
+-            return lora_ids
+-        else:
++        if not isinstance(lora_name, (str, list)):
+             raise TypeError("lora_name must be either a string or a list of strings.")
++        async with self._registry_lock.writer_lock:
++            names = [lora_name] if isinstance(lora_name, str) else lora_name
++            lora_ids = [_lookup(name) for name in names]
++            acquired = []
++            try:
++                for lora_id in lora_ids:
++                    if lora_id is not None:
++                        await self._counters[lora_id].increment(notify_all=False)
++                        acquired.append(lora_id)
++            except BaseException:
++                for lora_id in acquired:
++                    await self._counters[lora_id].decrement()
++                raise
++            return lora_ids[0] if isinstance(lora_name, str) else lora_ids
++
++    def request_count(self, lora_id: str) -> int:
++        counter = self._counters.get(lora_id)
++        return counter.value() if counter is not None else 0
+ 
+     async def release(self, lora_id: Union[str, List[str]]):
+         """
+diff --git a/python/sglang/srt/lora/relax_control.py b/python/sglang/srt/lora/relax_control.py
+new file mode 100644
+index 0000000..dc16df9
+--- /dev/null
++++ b/python/sglang/srt/lora/relax_control.py
+@@ -0,0 +1,332 @@
++# Copyright 2026 SGLang Team
++"""Fenced immutable adapters. Metadata locks never wait for inference to drain."""
++
++import asyncio
++import hashlib
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from uuid import uuid4
++
++from sglang.srt.lora.lora_registry import LoRARef
++
++
++# The receiver is packaged in SGLang, without a dependency on the Relax wheel.
++# Keep this transport checksum in sync with Relax's lora_versions.identity.
++def tensor_fingerprint(tensor: "torch.Tensor") -> "torch.Tensor":
++    """Position-weighted byte checksum, returned as a device int64 scalar.
++
++    SplitMix64 weights and the sum wrap modulo 2**64; byte length seeds the sum
++    so dropping zero bytes is detected too. Chunking bounds scratch memory and
++    uses absolute byte positions, independent of chunk boundaries. This is a
++    transport check, not a substitute for the snapshot's SHA-256.
++    """
++    import torch
++
++    data = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
++    checksum = torch.full((), data.numel(), dtype=torch.int64, device=data.device)
++    for start in range(0, data.numel(), 1 << 20):
++        end = min(start + (1 << 20), data.numel())
++        positions = torch.arange(start, end, dtype=torch.int64, device=data.device)
++        weights = positions + (-7046029254386353131)
++        weights = (weights ^ ((weights >> 30) & ((1 << 34) - 1))) * (
++            -4658895280553007687
++        )
++        weights = (weights ^ ((weights >> 27) & ((1 << 37) - 1))) * (
++            -7723592293110705685
++        )
++        weights = weights ^ ((weights >> 31) & ((1 << 33) - 1))
++        checksum += (data[start:end].to(torch.int64) * weights).sum()
++    return checksum
++
++
++def verify_snapshot(req, tensors):
++    """Validate receiver bytes, dtype and shape before any backend mutation."""
++    import torch
++
++    manifest = json.loads(req.relax_manifest)
++    if (
++        hashlib.sha256(req.relax_manifest.encode("utf-8")).hexdigest()
++        != req.relax_digest
++    ):
++        raise ValueError("snapshot manifest digest mismatch")
++    if manifest["format_version"] != 1 or manifest["adapter_config"] != req.config_dict:
++        raise ValueError("snapshot configuration mismatch")
++    expected = {entry["name"]: entry for entry in manifest["tensors"]}
++    if set(expected) != set(tensors):
++        raise ValueError("snapshot tensor names mismatch")
++    fingerprints = {}
++    for name, tensor in tensors.items():
++        entry = expected[name]
++        data = tensor.detach().cpu().contiguous()
++        if str(data.dtype) != entry["dtype"] or list(data.shape) != entry["shape"]:
++            raise ValueError(f"snapshot dtype/shape mismatch: {name}")
++        digest = hashlib.sha256(data.reshape(-1).view(torch.uint8).numpy()).hexdigest()
++        if digest != entry["sha256"]:
++            raise ValueError(f"snapshot bytes mismatch: {name}")
++        fingerprints[name] = int(tensor_fingerprint(data))
++    return fingerprints
++
++
++def read_artifact_tensors(req):
++    """Read engine-format tensors locally on each worker, without HF repacking.
++
++    The caller verifies these exact tensors before passing them to the model;
++    paths alone are not evidence of successful transfer or complete content.
++    """
++    from safetensors.torch import load_file
++
++    path = Path(req.relax_artifact_path)
++    if not path.is_absolute():
++        raise ValueError("managed artifact path must be absolute")
++    metadata = json.loads((path / "manifest.json").read_text())
++    identity = metadata["identity"]
++    if (
++        identity["digest"] != req.relax_digest
++        or req.lora_name
++        != f"relax_lora@{identity['version_id']}.{req.relax_digest[:12]}"
++        or metadata["snapshot"] != json.loads(req.relax_manifest)
++        or json.loads((path / "adapter_config.json").read_text()) != req.config_dict
++    ):
++        raise ValueError("artifact identity or manifest mismatch")
++    # Own the bytes before verification; later filesystem changes must not
++    # mutate a mapped tensor between hashing and model installation.
++    return {
++        name: tensor.clone()
++        for name, tensor in load_file(
++            str(path / "adapter_model.safetensors"), device="cpu"
++        ).items()
++    }
++
++
++@dataclass
++class ManagedAdapter:
++    ref: LoRARef
++    attempt_id: int
++    digest: str
++    phase: str = "loading"
++    admission_closed: bool = True
++    attempt_fenced: bool = False
++    fingerprints: dict | None = None
++    error: str | None = None
++    task: asyncio.Task | None = None
++
++
++class RelaxLoRAControl:
++    def __init__(self, manager):
++        self.manager = manager
++        self.instance_id = uuid4().hex
++        self.records = {}
++        self.fences = set()
++        self.lock = asyncio.Lock()
++        self.tasks = set()
++
++    def check_instance(self, instance_id):
++        if instance_id != self.instance_id:
++            raise ValueError("ENGINE_INSTANCE_MISMATCH")
++
++    def inventory(self):
++        return {
++            "instance_id": self.instance_id,
++            "tp_size": self.manager.server_args.tp_size,
++            "max_loras_per_batch": self.manager.server_args.max_loras_per_batch,
++            "adapters": [
++                self.receipt(name, record) for name, record in self.records.items()
++            ],
++            "fences": [[name, attempt] for name, attempt in sorted(self.fences)],
++        }
++
++    def receipt(self, name, record):
++        return {
++            "instance_id": self.instance_id,
++            "lora_name": name,
++            "attempt_id": record.attempt_id,
++            "digest": record.digest,
++            "lora_id": None if record.phase == "absent" else record.ref.lora_id,
++            "phase": record.phase,
++            "pinned": bool(record.ref.pinned),
++            "requests": self.manager.lora_registry.request_count(record.ref.lora_id),
++            "admission_closed": record.admission_closed,
++            "attempt_fenced": record.attempt_fenced,
++            "fingerprints": record.fingerprints,
++            "error": record.error,
++        }
++
++    async def load(self, req):
++        self.check_instance(req.relax_instance_id)
++        args = self.manager.server_args
++        if (
++            not args.enable_lora
++            or args.dp_size != 1
++            or args.pp_size != 1
++            or args.disaggregation_mode != "null"
++            or args.speculative_algorithm
++            or args.hicache_storage_backend
++            or args.tokenizer_worker_num != 1
++        ):
++            raise ValueError(
++                "managed LoRA requires LoRA enabled, DP=PP=1, one tokenizer worker, no PD/speculation/L3"
++            )
++        if (
++            not req.lora_name.startswith("relax_lora@")
++            or not req.pinned
++            or req.relax_attempt_id is None
++            or req.relax_manifest is None
++            or not req.relax_digest
++            or not req.lora_name.endswith("." + req.relax_digest[:12])
++        ):
++            raise ValueError(
++                "managed load requires immutable identity, manifest and pinned=True"
++            )
++        artifact_path = getattr(req, "relax_artifact_path", None)
++        if (artifact_path is not None) == bool(req.serialized_named_tensors):
++            raise ValueError("managed load requires exactly one tensor source")
++        if artifact_path is not None and (
++            not Path(artifact_path).is_absolute()
++            or req.load_format is not None
++            or req.added_tokens_config is not None
++        ):
++            raise ValueError(
++                "managed artifacts require an absolute path and unmodified tensor layout"
++            )
++        async with self.lock:
++            key = (req.lora_name, req.relax_attempt_id)
++            if key in self.fences:
++                raise ValueError("ATTEMPT_FENCED")
++            record = self.records.get(req.lora_name)
++            if record is not None:
++                if record.digest != req.relax_digest:
++                    raise ValueError("VERSION_CONFLICT")
++                if (
++                    record.attempt_id != req.relax_attempt_id
++                    and record.phase != "absent"
++                ):
++                    raise ValueError("previous attempt is not physically absent")
++            if record is None or record.attempt_id != req.relax_attempt_id:
++                ref = LoRARef(
++                    lora_name=req.lora_name, lora_path="__tensor__", pinned=True
++                )
++                record = ManagedAdapter(ref, req.relax_attempt_id, req.relax_digest)
++                self.records[req.lora_name] = record
++                req.lora_id = ref.lora_id
++                record.task = asyncio.create_task(self._load(req, record))
++            task = record.task
++        await asyncio.shield(task)
++        return self.receipt(req.lora_name, record)
++
++    async def _load(self, req, record):
++        from sglang.srt.managers.tokenizer_control_mixin import (
++            _merge_lora_update_results,
++        )
++        from sglang.srt.utils import normalize_serialized_named_tensor_payloads
++
++        self.manager.auto_create_handle_loop()
++        try:
++            if getattr(req, "relax_artifact_path", None) is None:
++                req.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
++                    req.serialized_named_tensors
++                )
++            async with self.manager.lora_update_lock:
++                # Even a failed RPC can have changed a worker: retain the ID until unload ACK.
++                async with self.lock:
++                    if record.attempt_fenced:
++                        record.phase = "absent"
++                        return
++                result = _merge_lora_update_results(
++                    await self.manager.update_lora_adapter_communicator(req)
++                )
++                async with self.lock:
++                    record.phase = "loaded" if result.success else "failed"
++                    record.error = result.error_message
++                    record.fingerprints = result.fingerprints
++                    if result.success and not record.attempt_fenced:
++                        # Initial load opens admission for the publisher's generation probe.
++                        await self.manager.lora_registry.register(record.ref)
++                        record.admission_closed = False
++        except Exception as exc:
++            async with self.lock:
++                record.phase = "failed"
++                record.error = str(exc)
++
++    async def control(self, body):
++        # HTTP disconnect must not strand an unload between worker ACK and metadata update.
++        task = asyncio.create_task(self._control(body))
++        self.tasks.add(task)
++        task.add_done_callback(self.tasks.discard)
++        return await asyncio.shield(task)
++
++    async def _control(self, body):
++        from sglang.srt.managers.io_struct import UnloadLoRAAdapterReqInput
++        from sglang.srt.managers.tokenizer_control_mixin import (
++            _merge_lora_update_results,
++        )
++
++        self.check_instance(body["instance_id"])
++        name, attempt, action = body["lora_name"], body["attempt_id"], body["action"]
++        if not name.startswith("relax_lora@") or action not in (
++            "fence",
++            "stop",
++            "unload",
++        ):
++            raise ValueError("invalid managed control")
++        async with self.lock:
++            record = self.records.get(name)
++            if record is not None and record.attempt_id == attempt:
++                expected_id = body.get("lora_id")
++                if (
++                    action in ("stop", "unload") or expected_id is not None
++                ) and expected_id != record.ref.lora_id:
++                    raise ValueError("LORA_ID_MISMATCH")
++            if action == "fence":
++                self.fences.add((name, attempt))
++            if record is None or record.attempt_id != attempt:
++                if action != "fence":
++                    raise ValueError("ATTEMPT_MISMATCH")
++                return {
++                    "instance_id": self.instance_id,
++                    "lora_name": name,
++                    "attempt_id": attempt,
++                    "lora_id": None,
++                    "phase": "absent",
++                    "requests": 0,
++                    "admission_closed": True,
++                    "attempt_fenced": True,
++                }
++            if action in ("stop", "fence"):
++                # Retirement closes both admission and this load attempt.
++                # A pending completion must never reopen a stopped name.
++                record.attempt_fenced = True
++                self.fences.add((name, attempt))
++                if not record.admission_closed:
++                    await self.manager.lora_registry.unregister(name)
++                    record.admission_closed = True
++                return self.receipt(name, record)
++            if (
++                not record.admission_closed
++                or not record.attempt_fenced
++                or record.phase in ("loading", "unloading")
++                or self.manager.lora_registry.request_count(record.ref.lora_id)
++            ):
++                raise ValueError("ADAPTER_BUSY")
++            if record.phase == "absent":
++                return self.receipt(name, record)
++            record.phase = "unloading"
++        try:
++            async with self.manager.lora_update_lock:
++                req = UnloadLoRAAdapterReqInput(
++                    lora_name=name, lora_id=record.ref.lora_id
++                )
++                result = _merge_lora_update_results(
++                    await self.manager.update_lora_adapter_communicator(req)
++                )
++            async with self.lock:
++                record.phase = "absent" if result.success else "failed"
++                record.error = result.error_message
++                if result.success:
++                    self.manager.lora_registry._counters.pop(record.ref.lora_id, None)
++                return self.receipt(name, record)
++        except Exception as exc:
++            async with self.lock:
++                record.phase = "failed"
++                record.error = str(exc)
++            raise
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index d1f593a..adafa3c 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -376,12 +376,17 @@ class GenerateReqInput:
+         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
+     ] = None
+
+-    def regenerate_rid(self):
++    def regenerate_rid(self, prefix: Optional[str] = None):
+         """Generate a new request ID and return it."""
++
++        def new_rid() -> str:
++            suffix = uuid.uuid4().hex
++            return f"{prefix}_{suffix}" if prefix is not None else suffix
++
+         if isinstance(self.rid, list):
+-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
++            self.rid = [new_rid() for _ in range(len(self.rid))]
+         else:
+-            self.rid = uuid.uuid4().hex
++            self.rid = new_rid()
+         return self.rid
+
+     def _validate_rid_uniqueness(self):
+@@ -2455,6 +2460,11 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+     lora_id: Optional[str] = None
+     load_format: Optional[str] = None
+     expected_checksums: Optional[Dict[str, str]] = None
++    relax_instance_id: Optional[str] = None
++    relax_attempt_id: Optional[int] = None
++    relax_digest: Optional[str] = None
++    relax_manifest: Optional[str] = None
++    relax_artifact_path: Optional[str] = None
+ 
+     def to_ref(self) -> LoRARef:
+         return LoRARef(
+@@ -2505,6 +2515,7 @@ class UpdateLoRAFromDistributedReqInput(BaseReq, kw_only=True):
+ 
+ 
+ class LoRAUpdateOutput(BaseReq, kw_only=True):
++    fingerprints: Optional[Dict[str, int]] = None
+     success: bool
+     error_message: Optional[str] = None
+     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 796e766..8ede95e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -5817,8 +5817,9 @@ class Scheduler(
+     ) -> LoadLoRAAdapterFromTensorsReqOutput:
+         """In-place loading a new lora adapter from serialized tensors."""
+ 
+-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+-        return result
++        if recv_req.relax_attempt_id is not None:
++            return self._managed_lora_update(self.tp_worker.load_lora_adapter_from_tensors, recv_req)
++        return self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+ 
+     def update_lora_from_distributed(
+         self, recv_req: UpdateLoRAFromDistributedReqInput
+@@ -5833,8 +5834,25 @@ class Scheduler(
+     ) -> UnloadLoRAAdapterReqOutput:
+         """Unload the lora adapter."""
+ 
+-        result = self.tp_worker.unload_lora_adapter(recv_req)
+-        return result
++        if recv_req.lora_name.startswith("relax_lora@"):
++            return self._managed_lora_update(self.tp_worker.unload_lora_adapter, recv_req)
++        return self.tp_worker.unload_lora_adapter(recv_req)
++
++    def _managed_lora_update(self, operation, req):
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        try:
++            result = operation(req)
++        except Exception as exc:
++            result = LoRAUpdateOutput(success=False, error_message=str(exc))
++        results = [None] * get_parallel().tp_size
++        torch.distributed.all_gather_object(results, result, group=self.tp_cpu_group)
++        errors = [r.error_message or "worker failed" for r in results if not r.success]
++        if errors:
++            return LoRAUpdateOutput(success=False, error_message=" | ".join(errors))
++        if any(r.fingerprints != results[0].fingerprints for r in results):
++            return LoRAUpdateOutput(success=False, error_message="TP fingerprint mismatch")
++        return results[0]
+ 
+     def init_weights_send_group_for_remote_instance(
+         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index 26072a6..9a7be0d 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -662,6 +662,8 @@ class TokenizerControlMixin:
+         obj: LoadLoRAAdapterReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> LoadLoRAAdapterReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+@@ -748,6 +750,8 @@ class TokenizerControlMixin:
+         obj: LoadLoRAAdapterFromTensorsReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> LoadLoRAAdapterFromTensorsReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+@@ -834,6 +838,8 @@ class TokenizerControlMixin:
+         obj: UpdateLoRAFromDistributedReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> UpdateLoRAFromDistributedReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+@@ -933,6 +939,8 @@ class TokenizerControlMixin:
+         obj: UnloadLoRAAdapterReqInput,
+         _: Optional[fastapi.Request] = None,
+     ) -> UnloadLoRAAdapterReqOutput:
++        if obj.lora_name.startswith("relax_lora@"):
++            raise ValueError("managed LoRA requires /relax/lora control endpoints")
+         self.auto_create_handle_loop()
+ 
+         try:
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 898ef2b..a709da1 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -64,7 +64,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+ from sglang.srt.environ import envs
+-from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
++from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry, LoRARequestLease
+ from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+ from sglang.srt.managers.disagg_service import start_disagg_service
+ from sglang.srt.managers.embed_types import PositionalEmbeds
+@@ -249,10 +249,11 @@ class ReqState:
+     last_completion_tokens: int = 1
+     ttft_observed: bool = False
+ 
++    lora_lease: Optional[LoRARequestLease] = None
+     dispatched: bool = False
+     abort_sent: bool = False
+     abort_requested: bool = False
+-    lora_lease_released: bool = False
++    lifecycle_id: object = dataclasses.field(default_factory=object)
+ 
+     # For streaming output
+     last_output_offset: int = 0
+@@ -664,6 +665,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+     def init_running_status(self):
+         # Request states
+         self.rid_to_state: Dict[str, ReqState] = {}
++        self._lora_draining_requests: Dict[str, ReqState] = {}
++        self.logical_rid_to_child_rids: Dict[str, set[str]] = {}
++        self.child_rid_to_logical_rid: Dict[str, str] = {}
++        self._lora_release_tasks: set[asyncio.Task] = set()
+         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
+         self.event_loop = None
+         self.asyncio_tasks = set()
+@@ -742,6 +747,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
+         # LoRA updates and inference to overlap.
+         self.lora_update_lock = asyncio.Lock()
++        from sglang.srt.lora.relax_control import RelaxLoRAControl
++
++        self.relax_lora = RelaxLoRAControl(self)
+         # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
+         # point to their latest LoRARef objects, so that they can be
+         # dynamically loaded if needed for inference
+@@ -888,8 +896,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                 )
+ 
+-        self._init_req_state(obj, request)
+-        request_rids = {obj.rid} if obj.is_single else set(obj.rid)
++        request_lifecycles = self._init_req_state(obj, request)
++        request_rids = set(request_lifecycles)
+         try:
+             if get_disagg().language_only:
+                 self._handle_epd_disaggregation_encode_request(obj)
+@@ -926,7 +934,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             # request -- would otherwise leak those entries forever. Drop
+             # undelivered states, but abort dispatched requests for scheduler-side
+             # cleanup.
+-            self._release_req_states_on_failure(request_rids)
++            self._release_req_states_on_failure(
++                request_rids, set(request_lifecycles.values())
++            )
+             raise
+
+     async def _wait_for_request_unpaused(self, rids: set[str]) -> None:
+@@ -1894,10 +1904,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             # Delete the key to prevent resending abort request to the scheduler and
+             # to ensure aborted request state is cleaned up.
+             if state.obj.rid in self.rid_to_state:
+-                del self.rid_to_state[state.obj.rid]
+-
+-            # Mark ongoing LoRA request as finished.
+-            self._finalize_lora_lease(state)
++                self._remove_req_state(state.obj.rid, state.lifecycle_id)
+             if not is_stream:
+                 raise fastapi.HTTPException(
+                     status_code=finish_reason["status_code"],
+@@ -1941,7 +1948,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     and await request.is_disconnected()
+                 ):
+                     # Abort the request for disconnected requests (non-streaming, waiting queue)
+-                    self.abort_request(obj.rid)
++                    if self.rid_to_state.get(obj.rid) is state:
++                        self.abort_request(obj.rid)
+                     # Use exception to kill the whole call stack and asyncio task
+                     raise ValueError(
+                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
+@@ -2029,7 +2037,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     and await request.is_disconnected()
+                 ):
+                     # Abort the request for disconnected requests (non-streaming, running)
+-                    self.abort_request(obj.rid)
++                    if self.rid_to_state.get(obj.rid) is state:
++                        self.abort_request(obj.rid)
+                     # Use exception to kill the whole call stack and asyncio task
+                     raise ValueError(
+                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+@@ -2042,7 +2051,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         request_rids: Optional[set[str]] = None,
+     ):
+         if request_rids is None:
+-            request_rids = set(obj.rid)
++            request_rids = set(self._logical_rids(obj))
+         batch_size = obj.batch_size
+ 
+         generators = []
+@@ -2104,13 +2113,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     tokenized_obj.mm_inputs.mm_items = [
+                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                     ]
+-                tokenized_obj.rid = tmp_obj.regenerate_rid()
++                tokenized_obj.rid = tmp_obj.regenerate_rid(prefix=objs[i].rid)
+                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
+                 tokenized_obj.sampling_params.max_new_tokens = 0
+                 tokenized_obj.stream = False
+-                await self._init_parallel_req_state(
+-                    tmp_obj, tokenized_obj, request_rids
+-                )
++                self._init_child_req_state(objs[i].rid, tmp_obj)
++                request_rids.add(tmp_obj.rid)
+                 await self._send_one_request(tokenized_obj)
+                 await self._wait_one_response(tmp_obj, request).__anext__()
+ 
+@@ -2126,10 +2134,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         tokenized_obj.mm_inputs.mm_items = [
+                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                         ]
+-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+-                    await self._init_parallel_req_state(
+-                        tmp_obj, tokenized_obj, request_rids
+-                    )
++                    tokenized_obj.rid = tmp_obj.regenerate_rid(prefix=objs[i].rid)
++                    self._init_child_req_state(objs[i].rid, tmp_obj)
++                    request_rids.add(tmp_obj.rid)
+                     state = self.rid_to_state[tmp_obj.rid]
+                     tokenized_obj.time_stats = state.time_stats
+                     if tmp_obj.return_prompt_token_ids:
+@@ -2138,14 +2145,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     generators.append(self._wait_one_response(tmp_obj, request))
+                     rids.append(tmp_obj.rid)
+ 
+-            # Normalization expanded the parent IDs/leases to batch_size * n.
+-            # Every dispatched clone now owns its own lease; retire all parent
+-            # states, including expanded entries unused by prefix tokenization.
+-            for rid in obj.rid:
+-                state = self.rid_to_state.pop(rid, None)
++            # Children retain the logical parent's lease until every scheduler
++            # request finishes. Retire only the actual logical parent states.
++            for rid in self._logical_rids(obj):
++                state = self._remove_req_state(rid)
+                 if state is not None:
+                     state.time_stats.set_finished_time()
+-                    self._finalize_lora_lease(state)
+ 
+         # Wait for all requests
+         is_stream = hasattr(obj, "stream") and obj.stream
+@@ -2156,19 +2161,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             async for response in self._stream_batch_responses(generators, rids):
+                 yield response
+ 
+-    async def _init_parallel_req_state(self, obj, tokenized_obj, request_rids):
+-        # copy.copy inherits the parent's ID, but a scheduler-visible clone
+-        # needs its own lease. Clear it before any await so failed acquisition
+-        # cannot release the parent's lease during handler cleanup.
+-        needs_lora = self.enable_lora and obj.lora_path is not None
+-        if needs_lora:
+-            obj.lora_id = None
+-        self._init_req_state(obj)
+-        request_rids.add(obj.rid)
+-        if needs_lora:
+-            obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+-            tokenized_obj.lora_id = obj.lora_id
+-
+     async def _collect_batch_responses(self, generators):
+         tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
+         try:
+@@ -2218,27 +2210,49 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         if not abort_all and not rid:
+             logger.warning("Ignore abort_request with empty rid and abort_all=False")
+             return
+-        state = None if abort_all else self.rid_to_state.get(rid)
+-        pending_states = self.rid_to_state.values() if abort_all else (state,)
+-        for pending_state in pending_states:
+-            if pending_state is not None and not pending_state.dispatched:
+-                pending_state.abort_requested = True
+-                pending_state.event.set()
+-        if not abort_all:
++        if abort_all:
++            for state in self.rid_to_state.values():
++                if not state.dispatched:
++                    state.abort_requested = True
++                    state.event.set()
++            target_rids = (rid,)
++        elif children := self.logical_rid_to_child_rids.get(rid):
++            # The logical parent may already be retired while children run.
++            parent = self.rid_to_state.get(rid)
++            if parent is not None:
++                parent.abort_requested = True
++                parent.event.set()
++            target_rids = tuple(sorted(children))
++        elif (
++            rid in self.rid_to_state
++            or rid in self._lora_draining_requests
++            or get_serving().tokenizer_worker_num != 1
++        ):
++            target_rids = (rid,)
++        else:
++            return
++
++        sent = False
++        for target_rid in target_rids:
++            state = None if abort_all else (
++                self.rid_to_state.get(target_rid)
++                or self._lora_draining_requests.get(target_rid)
++            )
+             if state is not None:
++                if not state.dispatched:
++                    state.abort_requested = True
++                    state.event.set()
+                 if state.abort_sent:
+-                    return
++                    continue
+                 state.abort_sent = True
+-            elif get_serving().tokenizer_worker_num == 1:
+-                return
+-        req = AbortReq(rid=rid, abort_all=abort_all)
+-        try:
+-            self._dispatch_to_scheduler(req)
+-        except BaseException:
+-            if state is not None:
+-                state.abort_sent = False
+-            raise
+-        if self.enable_metrics:
++            try:
++                self._dispatch_to_scheduler(AbortReq(rid=target_rid, abort_all=abort_all))
++            except BaseException:
++                if state is not None:
++                    state.abort_sent = False
++                raise
++            sent = True
++        if sent and self.enable_metrics:
+             # TODO: also use custom_labels from the request
+             self.metrics_collector.observe_one_aborted_request(
+                 self.metrics_collector.labels
+@@ -2467,6 +2481,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         for i, rid in enumerate(recv_obj.rids):
+             state = self.rid_to_state.get(rid, None)
+             if state is None:
++                draining = self._lora_draining_requests.get(rid)
++                if draining is not None and recv_obj.finished_reasons[i] is not None:
++                    draining.finished = True
++                    self._remove_req_state(rid, draining.lifecycle_id)
++                if draining is not None:
++                    continue
+                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                     continue
+@@ -2732,10 +2752,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         )
+                     )
+ 
+-                del self.rid_to_state[rid]
+-
+-                # Mark ongoing LoRA request as finished.
+-                self._finalize_lora_lease(state)
++                self._remove_req_state(rid)
+ 
+             if out_dict is not None:
+                 state.out_list.append(out_dict)
+@@ -3541,6 +3558,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         # disconnects, amplified by prefix / abort_all fan-out.
+         state = self.rid_to_state.get(recv_obj.rid)
+         if state is None:
++            draining = self._lora_draining_requests.get(recv_obj.rid)
++            if draining is not None:
++                draining.finished = True
++                self._remove_req_state(recv_obj.rid, draining.lifecycle_id)
++                return
+             logger.info(
+                 "Abort request for rid=%s not found in rid_to_state; "
+                 "likely already finished/removed.",
+@@ -3591,8 +3613,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         }
+         if state.prompt_token_ids is not None:
+             out["prompt_token_ids"] = state.prompt_token_ids
+-        self._finalize_lora_lease(state)
+-        del self.rid_to_state[recv_obj.rid]
++        self._remove_req_state(recv_obj.rid)
+ 
+         state.out_list.append(out)
+         state.event.set()
+@@ -3695,6 +3716,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         await self._resolve_lora_path(obj)
+
+     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
++        request_states = {
++            rid: self.rid_to_state.get(rid) for rid in self._logical_rids(obj)
++        }
+         if isinstance(obj.lora_path, str):
+             unique_lora_paths = set([obj.lora_path])
+         else:
+@@ -3717,6 +3741,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             if lora_path is None:
+                 continue
+ 
++            if lora_path.startswith("relax_lora@"):
++                raise fastapi.HTTPException(status_code=409, detail="LORA_VERSION_RETIRED")
+             if lora_path not in self.lora_ref_cache:
+                 raise ValueError(
+                     f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+@@ -3741,18 +3767,106 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 )
+ 
+         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
+-        obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
++        # Parallel sampling expands lora_path, but creates one logical RID per
++        # prompt. Children share that prompt's lease instead of acquiring n times.
++        lora_paths = obj.lora_path
++        if isinstance(lora_paths, list):
++            lora_paths = lora_paths[:len(self._logical_rids(obj))]
++        try:
++            obj.lora_id = await self.lora_registry.acquire(lora_paths)
++        except ValueError:
++            if any(path and path.startswith("relax_lora@") for path in unique_lora_paths):
++                raise fastapi.HTTPException(status_code=409, detail="LORA_VERSION_RETIRED") from None
++            raise
++        ids = obj.lora_id if isinstance(obj.lora_id, list) else [obj.lora_id]
++        stale = False
++        for rid, lora_id in zip(self._logical_rids(obj), ids):
++            if lora_id is None:
++                continue
++            state = self.rid_to_state.get(rid)
++            if state is not None and state is request_states[rid]:
++                state.lora_lease = LoRARequestLease(lora_id)
++            else:
++                # Never attach a delayed acquire to a new request reusing this RID.
++                stale = True
++                task = asyncio.create_task(self.lora_registry.release(lora_id))
++                self._lora_release_tasks.add(task)
++                task.add_done_callback(self._lora_release_tasks.discard)
++        if stale:
++            raise RequestAbortedError("Request changed while acquiring its LoRA adapter")
+         # Propagate lora_id to any sub-objects already cached by __getitem__.
+         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+             sub_obj.lora_id = (
+                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+             )
+ 
++    @staticmethod
++    def _logical_rids(obj) -> List[str]:
++        if not hasattr(obj, "is_single") or obj.is_single:
++            return [obj.rid]
++        # Normalization may expand autogenerated RIDs for n samples, but only the
++        # original prompts own leases; sampling children are created below.
++        return list(obj.rid[:obj.batch_size])
++
++    def _remove_req_state(
++        self, rid: str, lifecycle_id: Optional[object] = None
++    ) -> Optional[ReqState]:
++        state = self.rid_to_state.get(rid) or self._lora_draining_requests.get(rid)
++        if state is None or (
++            lifecycle_id is not None and state.lifecycle_id is not lifecycle_id
++        ):
++            return None
++        self.rid_to_state.pop(rid, None)
++        if state.dispatched and not state.finished and (
++            state.lora_lease is not None or rid in self.child_rid_to_logical_rid
++        ):
++            self._lora_draining_requests[rid] = state
++            return state
++        self._lora_draining_requests.pop(rid, None)
++        self._release_lora_lease(state)
++        logical_rid = self.child_rid_to_logical_rid.pop(rid, None)
++        if logical_rid is not None:
++            children = self.logical_rid_to_child_rids[logical_rid]
++            children.remove(rid)
++            if not children:
++                self.logical_rid_to_child_rids.pop(logical_rid)
++        return state
++
++    def _init_child_req_state(
++        self,
++        logical_rid: str,
++        obj: Union[GenerateReqInput, EmbeddingReqInput],
++        request: Optional[fastapi.Request] = None,
++    ) -> None:
++        parent = self.rid_to_state.get(logical_rid)
++        if parent is None or parent.abort_requested:
++            raise RequestAbortedError(f"Request {logical_rid} was aborted")
++        self._init_req_state(obj, request, lifecycle_id=parent.lifecycle_id)
++        lease = parent.lora_lease
++        if lease is not None:
++            lease.owners += 1
++            self.rid_to_state[obj.rid].lora_lease = lease
++        self.child_rid_to_logical_rid[obj.rid] = logical_rid
++        self.logical_rid_to_child_rids.setdefault(logical_rid, set()).add(obj.rid)
++
++    def _release_lora_lease(self, state: ReqState) -> None:
++        lease = state.lora_lease
++        if lease is None:
++            return
++        state.lora_lease = None
++        lease.owners -= 1
++        if lease.owners == 0:
++            task = asyncio.create_task(self.lora_registry.release(lease.lora_id))
++            self._lora_release_tasks.add(task)
++            task.add_done_callback(self._lora_release_tasks.discard)
++
+     def _init_req_state(
+         self,
+         obj: Union[GenerateReqInput, EmbeddingReqInput],
+         request: Optional[fastapi.Request] = None,
+-    ):
++        *,
++        lifecycle_id: Optional[object] = None,
++    ) -> Dict[str, object]:
+         created_time = obj.received_time
+
+         external_trace_header = None
+@@ -3780,33 +3894,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         else None
+                     ),
+                 )
+-                for i in range(len(obj.rid))
++                for i in range(obj.batch_size)
+             ]
+ 
+-        for rid, sub_obj, bootstrap_room in items:
+-            if rid in self.rid_to_state:
++        seen_rids = set()
++        for rid, _, _ in items:
++            if (
++                rid in seen_rids
++                or rid in self.rid_to_state
++                or rid in self._lora_draining_requests
++                or rid in self.logical_rid_to_child_rids
++                or rid in self.child_rid_to_logical_rid
++            ):
+                 raise ValueError(f"Duplicate request ID detected: {rid}")
++            seen_rids.add(rid)
++
++        # Validate the whole batch before adding any state.
++        lifecycle_ids = {}
++        for rid, sub_obj, bootstrap_room in items:
+             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+-            state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
++            state = ReqState(
++                [], False, asyncio.Event(), sub_obj, time_stats,
++                lifecycle_id=lifecycle_id if lifecycle_id is not None else object(),
++            )
+             self.rid_to_state[rid] = state
++            lifecycle_ids[rid] = state.lifecycle_id
+             if self.enable_trace:
+                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
+             time_stats.set_created_time(created_time)
++        return lifecycle_ids
+ 
+-    def _finalize_lora_lease(self, state: ReqState) -> None:
+-        # A terminal output and its waiter can both finalize the same state.
+-        # Undispatched failures have no scheduler output to release their lease.
+-        if (
+-            state.lora_lease_released
+-            or not self.enable_lora
+-            or state.obj.lora_path is None
+-            or state.obj.lora_id is None
+-        ):
+-            return
+-        state.lora_lease_released = True
+-        asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+-
+-    def _release_req_states_on_failure(self, rids: Iterable[str]):
++    def _release_req_states_on_failure(
++        self, rids: Iterable[str], lifecycle_ids: Optional[set[object]] = None
++    ):
+         """Release rid_to_state entries created for a failed handler.
+ 
+         Undelivered states are removed locally. Dispatched requests are aborted
+@@ -3815,6 +3935,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         for rid in rids:
+             state = self.rid_to_state.get(rid)
+             if state is not None:
++                if lifecycle_ids is not None and state.lifecycle_id not in lifecycle_ids:
++                    continue
+                 if state.dispatched:
+                     try:
+                         self.abort_request(rid)
+@@ -3823,8 +3945,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                             "Failed to abort request %s during cleanup", rid
+                         )
+                 else:
+-                    self._finalize_lora_lease(state)
+-                    del self.rid_to_state[rid]
++                    self._remove_req_state(rid)
+             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
+             if dispatch_ready is not None:
+                 dispatch_ready.set()
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 6168468..86729a8 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -226,15 +226,27 @@ class BaseTpWorker(ABC):
+     ):
+         # The LoRA code handles TP sharding internally using slice_lora_a_weights
+         # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
+-        data = self.deserialize_own_rank(recv_req.serialized_named_tensors)
+-        if recv_req.load_format == "flattened_bucket":
+-            bucket = FlattenedTensorBucket(
+-                flattened_tensor=data["flattened_tensor"],
+-                metadata=data["metadata"],
+-            )
+-            tensors = dict(bucket.reconstruct_tensors())
++        if recv_req.relax_artifact_path is not None:
++            from sglang.srt.lora.relax_control import read_artifact_tensors
++
++            if (
++                recv_req.relax_attempt_id is None
++                or recv_req.serialized_named_tensors
++                or recv_req.load_format is not None
++                or recv_req.added_tokens_config is not None
++            ):
++                raise ValueError("file tensors require an exclusive managed load")
++            tensors = read_artifact_tensors(recv_req)
+         else:
+-            tensors = data
++            data = self.deserialize_own_rank(recv_req.serialized_named_tensors)
++            if recv_req.load_format == "flattened_bucket":
++                bucket = FlattenedTensorBucket(
++                    flattened_tensor=data["flattened_tensor"],
++                    metadata=data["metadata"],
++                )
++                tensors = dict(bucket.reconstruct_tensors())
++            else:
++                tensors = data
+         if recv_req.expected_checksums is not None:
+             import hashlib
+ 
+@@ -266,12 +278,18 @@ class BaseTpWorker(ABC):
+             logger.info(
+                 f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+             )
++        fingerprints = None
++        if recv_req.relax_attempt_id is not None:
++            from sglang.srt.lora.relax_control import verify_snapshot
++
++            fingerprints = verify_snapshot(recv_req, tensors)
+         result = self.model_runner.load_lora_adapter_from_tensors(
+             recv_req.to_ref(),
+             tensors,
+             recv_req.config_dict,
+             recv_req.added_tokens_config,
+         )
++        result.fingerprints = fingerprints
+         return result
+ 
+     def update_lora_from_distributed(
+diff --git a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
+index a0ffe87..603ea38 100644
+--- a/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
++++ b/test/registered/unit/managers/test_tokenizer_lora_lease_cleanup.py
+@@ -5,7 +5,11 @@ import asyncio
+ import copy
+ import logging
+ import os
+-from collections import OrderedDict
++import uuid
++from collections import Counter, OrderedDict
++from dataclasses import dataclass, field
++from enum import IntEnum
++from functools import total_ordering
+ from http import HTTPStatus
+ from pathlib import Path
+ from types import SimpleNamespace as N
+@@ -29,7 +33,10 @@ def _production_class(root, path, name, methods=None):
+         ]
+     for item in node.body:
+         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+-            item.decorator_list = []
++            item.decorator_list = [
++                decorator for decorator in item.decorator_list
++                if isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod", "property"}
++            ]
+     return node
+ 
+ 
+@@ -48,18 +55,32 @@ def runtime():
+         Path(override).parents[1] if override else Path(__file__).resolve().parents[4]
+     )
+     namespace = {
++        "__name__": __name__,
+         "asyncio": asyncio,
++        "dataclass": dataclass,
++        "field": field,
++        "uuid": uuid,
++        "Counter": Counter,
++        "IntEnum": IntEnum,
++        "total_ordering": total_ordering,
+         "copy": copy,
+         "HTTPStatus": HTTPStatus,
+         "logger": logging.getLogger(__name__),
+-        "GenerateReqInput": type("GenerateReqInput", (), {}),
+         "get_disagg": lambda: N(language_only=False),
+         "get_lora": lambda: N(max_loaded_loras=None),
+         "get_serving": lambda: N(tokenizer_worker_num=1),
+         "AbortReq": lambda **kwargs: N(kind="abort", **kwargs),
+     }
+     path = "python/sglang/srt/managers/tokenizer_manager.py"
+-    nodes = [
++    nodes = []
++    for source, name in (
++        ("python/sglang/srt/model_executor/forward_batch_info.py", "CaptureHiddenMode"),
++        ("python/sglang/srt/managers/schedule_batch.py", "get_return_hidden_states_mode"),
++    ):
++        nodes.extend(item for item in ast.parse((root / source).read_text()).body if getattr(item, "name", None) == name)
++    nodes += [
++        _production_class(root, "python/sglang/srt/managers/io_struct.py", "GenerateReqInput"),
++        _production_class(root, "python/sglang/srt/lora/lora_registry.py", "LoRARequestLease"),
+         _production_class(
+             root, "python/sglang/srt/utils/common.py", "ConcurrentCounter"
+         ),
+@@ -83,10 +104,12 @@ def runtime():
+                 "_release_req_states_on_failure",
+                 "_send_one_request",
+                 "abort_request",
+-                "_finalize_lora_lease",
++                "_logical_rids",
++                "_remove_req_state",
++                "_release_lora_lease",
++                "_init_child_req_state",
+                 "_handle_abort_finish_reason",
+                 "_handle_batch_request",
+-                "_init_parallel_req_state",
+                 "_collect_batch_responses",
+             },
+         ),
+@@ -116,6 +139,7 @@ def _manager(runtime):
+     manager.enable_lora, manager.enable_metrics, manager.is_pause = True, False, False
+     manager.tokenizer = None
+     manager.encoder_dispatch_ready, manager.rid_to_state = {}, {}
++    manager._lora_draining_requests, manager._lora_release_tasks = {}, set()
+     manager.model_update_lock = N(reader_lock=_AsyncLock())
+     manager.lora_registry = registry
+     manager.request_logger = N(log_received_request=lambda *args: None)
+@@ -124,7 +148,7 @@ def _manager(runtime):
+ 
+     def init_state(obj, request=None):
+         objects = (
+-            [obj[i] for i in range(len(obj.rid))]
++            [obj[i] for i in range(obj.batch_size)]
+             if isinstance(obj.rid, list)
+             else [obj]
+         )
+@@ -143,7 +167,8 @@ def _state(obj, dispatched=False):
+         dispatched=dispatched,
+         abort_sent=False,
+         abort_requested=False,
+-        lora_lease_released=False,
++        finished=False,
++        lora_lease=None,
+         time_stats=N(set_finished_time=lambda: None),
+     )
+ 
+@@ -194,12 +219,11 @@ def test_abort_after_acquire_before_dispatch_allows_unload(runtime):
+     asyncio.run(run())
+ 
+ 
+-@pytest.mark.parametrize("stop", [None, "prefix", "child", "acquire"])
++@pytest.mark.parametrize("stop", [None, "prefix", "child", "close_admission"])
+ @pytest.mark.parametrize("n", [2, 3])
+-def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, stop, n):
+-    # Use the actual n-expansion and cached sub-objects: the original request
+-    # has n parent states/leases, not just one, before clones are constructed.
+-    from sglang.srt.managers.io_struct import GenerateReqInput
++def test_parallel_sampling_retains_shared_lease_and_retires_parents(runtime, stop, n):
++    # Execute the target source's normalizer; only logical prompts own leases.
++    GenerateReqInput = runtime["GenerateReqInput"]
+ 
+     async def run():
+         manager, registry, sent = _manager(runtime)
+@@ -226,16 +250,17 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+                 manager.abort_request(obj.rid[0])
+ 
+         async def response(request, *_):
+-            state = manager.rid_to_state.pop(request.rid)
+-            manager._finalize_lora_lease(state)
++            state = manager.rid_to_state[request.rid]
++            state.finished = True
++            manager._remove_req_state(request.rid)
+             await asyncio.sleep(0)
+             if len(generated) == 1:
+-                assert registry._counters["lease"].value() == n
++                assert registry._counters["lease"].value() == 1
+                 if stop == "prefix":
+                     manager.abort_request(obj.rid[0])
+-                if stop == "acquire":
+-                    # Removal during a clone acquire must not release the
+-                    # copied parent's ID a second time.
++                if stop == "close_admission":
++                    # Already-admitted children retain their shared lease even
++                    # after new admission closes; unload must still wait.
+                     registry._registry.clear()
+             yield {"rid": request.rid}
+ 
+@@ -245,7 +270,7 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+             manager._wait_one_response,
+         ) = tokenize, send, response
+         stream = manager.generate_request(obj)
+-        if stop is None:
++        if stop in (None, "close_admission"):
+             outputs = await stream.__anext__()
+             assert len(outputs) == n and len(generated) == n + 1
+         else:
+@@ -254,8 +279,8 @@ def test_parallel_sampling_clones_own_leases_and_parents_are_retired(runtime, st
+             # Only dispatched children may remain until their terminal echo.
+             assert all(state.dispatched for state in manager.rid_to_state.values())
+             for state in list(manager.rid_to_state.values()):
+-                manager._finalize_lora_lease(state)
+-                del manager.rid_to_state[state.obj.rid]
++                state.finished = True
++                manager._remove_req_state(state.obj.rid)
+         await stream.aclose()
+         await _unload(registry)
+         assert not manager.rid_to_state
+@@ -272,6 +297,9 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
+         manager, registry, sent = _manager(runtime)
+         objects = [N(rid=f"r{i}", lora_path="adapter", lora_id=None) for i in range(2)]
+         batch = N(
++            is_single=False,
++            batch_size=len(objects),
++            rid=[obj.rid for obj in objects],
+             lora_path=["adapter", "adapter"],
+             lora_id=None,
+             _sub_obj_cache=dict(enumerate(objects)),
+@@ -299,7 +327,8 @@ def test_batch_leases_are_per_request_and_terminal_release_is_once(
+         for state in states:
+             # Terminal output processing and the awaiting client can both
+             # finalize; each batch child owns one lease even for the same ID.
+-            manager._finalize_lora_lease(state)
++            state.finished = True
++            manager._remove_req_state(state.obj.rid)
+             assert (
+                 await manager._handle_abort_finish_reason(out, state, is_stream=True)
+                 == out
+diff --git a/python/sglang/multimodal_gen/configs/pipeline_configs/sensenova_u1.py b/python/sglang/multimodal_gen/configs/pipeline_configs/sensenova_u1.py
+index c94b783..d9fc410 100644
+--- a/python/sglang/multimodal_gen/configs/pipeline_configs/sensenova_u1.py
++++ b/python/sglang/multimodal_gen/configs/pipeline_configs/sensenova_u1.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+-from dataclasses import dataclass
++import os
++from dataclasses import dataclass, field
+ 
+ from sglang.multimodal_gen.configs.pipeline_configs.base import (
+     ModelTaskType,
+@@ -79,15 +80,30 @@ def _set_compatible_runtime_defaults(server_args) -> None:
+ class SenseNovaU1PipelineConfig(PipelineConfig):
+     """Native SenseNova-U1 text-to-image pipeline configuration."""
+ 
+-    task_type: ModelTaskType = ModelTaskType.T2I
++    task_type: ModelTaskType = field(
++        default_factory=lambda: (
++            ModelTaskType.TI2I
++            if os.environ.get("SENSENOVA_IMAGE_EDIT", "0") == "1"
++            else ModelTaskType.T2I
++        )
++    )
+     model_precision: str = "bf16"
+     should_use_guidance: bool = True
+     supports_cfg_parallel: bool = False
+ 
+     def supports_dynamic_batching(self):
+-        return True
++        return self.task_type != ModelTaskType.TI2I
++
++    def calculate_condition_image_size(self, *args):
++        # The native model owns reference-image resizing and patch alignment.
++        return None
++
++    def prepare_calculated_size(self, *args):
++        return None
+ 
+     def supports_dynamic_batching_for_request(self, batch) -> bool:
++        if self.task_type == ModelTaskType.TI2I:
++            return False
+         sampling_params = getattr(batch, "sampling_params", None)
+         return not bool(getattr(sampling_params, "think_mode", DEFAULT_THINK_MODE))
+ 
+@@ -107,14 +123,15 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
+         return False
+ 
+     def supports_sequential_multi_output_inference(self):
+-        return True
++        return self.task_type != ModelTaskType.TI2I
+ 
+     def validate_server_args(self, server_args) -> None:
+-        if server_args.num_gpus != 1:
+-            raise ValueError(
+-                "SenseNovaU1Pipeline currently supports num_gpus=1. "
+-                "Native tensor/pipeline parallelism is not implemented yet."
+-            )
++        if (
++            server_args.num_gpus != 1
++            or any(int(getattr(server_args, field, 1) or 1) != 1 for field in ("tp_size", "sp_degree", "dp_size"))
++            or getattr(server_args, "enable_cfg_parallel", False)
++        ):
++            raise ValueError("SenseNova ART supports one GPU per replica without TP/SP/CFG parallelism.")
+         if getattr(server_args, "enable_torch_compile", False):
+             raise ValueError(
+                 "SenseNovaU1Pipeline does not support torch.compile yet. "
+diff --git a/python/sglang/multimodal_gen/configs/sample/sensenova_u1.py b/python/sglang/multimodal_gen/configs/sample/sensenova_u1.py
+index 8afe673..2ac0683 100644
+--- a/python/sglang/multimodal_gen/configs/sample/sensenova_u1.py
++++ b/python/sglang/multimodal_gen/configs/sample/sensenova_u1.py
+@@ -19,6 +19,9 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
+ )
+ 
+ _PUBLIC_OVERRIDE_FIELDS = {
++    "image_path",
++    "task_type",
++    "true_cfg_scale",
+     "prompt",
+     "prompt_path",
+     "height",
+@@ -55,6 +58,12 @@ class SenseNovaU1SamplingParams(SamplingParams):
+     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
+     t_eps: float = DEFAULT_T_EPS
+     think_mode: bool = DEFAULT_THINK_MODE
++    think_token_ids: list[int] | None = None
++    max_think_tokens: int = 1024
++    # SenseNova's versioned RL contract; kept separate from generic DiT latents.
++    rollout_options: dict[str, Any] | None = None
++    fixed_input_image_pixels: int = 0
++    max_input_image_side_length: int = 0
+     negative_prompt: None = field(default=None, init=False)
+ 
+     @classmethod
+@@ -77,6 +86,23 @@ class SenseNovaU1SamplingParams(SamplingParams):
+ 
+     def _validate(self) -> None:
+         super()._validate()
++        if any(
++            type(value) is not int or value < 0
++            for value in (
++                self.fixed_input_image_pixels,
++                self.max_input_image_side_length,
++            )
++        ):
++            raise ValueError(
++                "Fixed input pixels and maximum side length must be nonnegative integers"
++            )
++        if self.think_token_ids is not None and not self.think_mode:
++            raise ValueError("think_token_ids requires think_mode=True")
++        if (
++            type(self.max_think_tokens) is not int
++            or not 1 <= self.max_think_tokens <= 1024
++        ):
++            raise ValueError("max_think_tokens must be in [1, 1024]")
+         if (
+             self.width % RESOLUTION_ALIGNMENT != 0
+             or self.height % RESOLUTION_ALIGNMENT != 0
+@@ -112,5 +138,18 @@ class SenseNovaU1SamplingParams(SamplingParams):
+             "cfg_interval": tuple(self.cfg_interval),
+             "t_eps": self.t_eps,
+             "think_mode": self.think_mode,
++            "think_token_ids": self.think_token_ids,
++            "max_think_tokens": self.max_think_tokens,
+         }
++        if self.fixed_input_image_pixels:
++            extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]["fixed_input_image_pixels"] = (
++                self.fixed_input_image_pixels
++            )
++            extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]["max_input_image_side_length"] = (
++                self.max_input_image_side_length
++            )
++        if self.rollout_options is not None:
++            extra[SENSENOVA_U1_REQUEST_EXTRA_KEY]["rollout_options"] = (
++                self.rollout_options
++            )
+         return extra
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/mask_codec.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/mask_codec.py
+new file mode 100644
+index 0000000..0212b86
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/mask_codec.py
+@@ -0,0 +1,96 @@
++"""Lossless +0/-inf FP32 attention-mask transport for ART trajectories."""
++
++import math
++from typing import Any, Callable
++
++import numpy as np
++import torch
++
++
++MARKER = "__art_mask_bitpack__"
++NEG_INF = np.uint32(0xFF800000)
++MAX_BYTES = 2 * 1024**3
++CHUNK = 1024**2
++
++
++def encode_mask(tensor: Any) -> dict | None:
++    if not (
++        isinstance(tensor, torch.Tensor)
++        and tensor.device.type == "cpu"
++        and tensor.layout == torch.strided
++        and tensor.dtype == torch.float32
++        and tensor.ndim == 4
++        and tensor.is_contiguous()
++        and tensor.numel()
++        and not tensor.requires_grad
++        and not tensor.is_conj()
++        and not tensor.is_neg()
++        and 1048576 <= tensor.numel() * 4 <= MAX_BYTES
++    ):
++        return None
++    bits = tensor.numpy().reshape(-1).view(np.uint32)
++    chunks = []
++    for offset in range(0, bits.size, CHUNK):
++        block = bits[offset : offset + CHUNK]
++        selected = block == NEG_INF
++        if not np.all((block == 0) | selected):
++            return None
++        chunks.append(np.packbits(selected, bitorder="little").tobytes())
++    data = b"".join(chunks)
++    return {
++        MARKER: 1,
++        "dtype": "torch.float32",
++        "shape": list(tensor.shape),
++        "numel": tensor.numel(),
++        "bitorder": "little",
++        "data": data,
++    }
++
++
++def decode_mask(envelope: dict) -> torch.Tensor:
++    shape = envelope.get("shape")
++    if (
++        type(envelope.get(MARKER)) is not int
++        or envelope[MARKER] != 1
++        or envelope.get("dtype") != "torch.float32"
++        or envelope.get("bitorder") != "little"
++        or not isinstance(shape, list)
++        or len(shape) != 4
++        or any(type(n) is not int or n <= 0 for n in shape)
++    ):
++        raise ValueError("Invalid ART mask envelope")
++    size = math.prod(shape)
++    data = envelope.get("data")
++    if (
++        type(envelope.get("numel")) is not int
++        or size != envelope["numel"]
++        or size * 4 > MAX_BYTES
++        or not isinstance(data, bytes)
++        or len(data) != (size + 7) // 8
++    ):
++        raise ValueError("Invalid ART mask length")
++    if size % 8 and data[-1] >> (size % 8):
++        raise ValueError("Invalid ART mask padding")
++    packed = np.frombuffer(data, dtype=np.uint8)
++    # Owned uint32 output; bound transient unpacked bits to one chunk.
++    output = np.empty(size, dtype=np.uint32)
++    for offset in range(0, size, CHUNK):
++        count = min(CHUNK, size - offset)
++        flags = np.unpackbits(packed[offset // 8 : (offset + count + 7) // 8], count=count, bitorder="little")
++        np.multiply(flags, NEG_INF, out=output[offset : offset + count], dtype=np.uint32)
++    return torch.from_numpy(output.view(np.float32).reshape(shape))
++
++
++def serialize_art_conditions(env: Any, serializer: Callable) -> Any:
++    conditions = env.pos_cond_kwargs
++    metadata = (env.image_kwargs or {}).get("sensenova_rollout") or {}
++    if (
++        not isinstance(conditions, dict)
++        or metadata.get("capture") != "ode_states"
++        or metadata.get("protocol") != "sensenova_i2i_flow_v1"
++    ):
++        return serializer(conditions)
++    encoded = encode_mask(conditions.get("prefix_attention_mask"))
++    if encoded is None:
++        return serializer(conditions)
++    return serializer({**conditions, "prefix_attention_mask": encoded})
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/rollout_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/rollout_api.py
+index 7149252..de3a615 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/rollout_api.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/rollout_api.py
+@@ -7,23 +7,27 @@ from typing import Any
+ import msgspec
+ import torch
+ from fastapi import APIRouter, HTTPException, Response
+-
+ from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
+ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+     RolloutRequest,
+     RolloutResponse,
+ )
++from sglang.multimodal_gen.runtime.entrypoints.post_training.mask_codec import serialize_art_conditions
+ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
+     _maybe_serialize,
+ )
+ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
++from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
++    normalize_output_seeds,
++)
+ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+     RolloutDebugTensors,
+     RolloutDenoisingEnv,
+     RolloutDitTrajectory,
+     RolloutTrajectoryData,
++    select_denoising_env_metadata,
+ )
+ from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+@@ -100,17 +104,24 @@ def _slice_rollout_trajectory_for_sample(
+         env = rtd.denoising_env
+         denoising_env = RolloutDenoisingEnv(
+             image_kwargs=(
+-                _extract_single_sample_tensor(env.image_kwargs, sample_idx, batch_size)
+-                if env.image_kwargs
++                _extract_single_sample_tensor(
++                    select_denoising_env_metadata(env, sample_idx),
++                    sample_idx,
++                    batch_size,
++                )
++                if env.image_kwargs or env.per_sample_image_kwargs
+                 else None
+             ),
+             pos_cond_kwargs=(
+-                _extract_single_sample_tensor(
++                env.pos_cond_kwargs
++                if env.pos_cond_kwargs_shared
++                else _extract_single_sample_tensor(
+                     env.pos_cond_kwargs, sample_idx, batch_size
+                 )
+                 if env.pos_cond_kwargs
+                 else None
+             ),
++            pos_cond_kwargs_shared=env.pos_cond_kwargs_shared,
+             neg_cond_kwargs=(
+                 _extract_single_sample_tensor(
+                     env.neg_cond_kwargs, sample_idx, batch_size
+@@ -131,6 +142,7 @@ def _slice_rollout_trajectory_for_sample(
+             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
+             timesteps=dit.timesteps,
+             sigmas=dit.sigmas,
++            old_velocities=_extract_single_sample_tensor(dit.old_velocities, sample_idx, batch_size),
+         )
+     return RolloutTrajectoryData(
+         rollout_log_probs=log_probs,
+@@ -167,7 +179,7 @@ def _serialize_rollout_trajectory(
+                 _maybe_serialize(env.image_kwargs) if env.image_kwargs else None
+             ),
+             "pos_cond_kwargs": (
+-                _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None
++                serialize_art_conditions(env, _maybe_serialize) if env.pos_cond_kwargs else None
+             ),
+             "neg_cond_kwargs": (
+                 _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None
+@@ -185,6 +197,11 @@ def _serialize_rollout_trajectory(
+             ),
+             "timesteps": serialized_dit_timesteps,
+             "sigmas": serialized_dit_sigmas,
++            **(
++                {"old_velocities": _maybe_serialize(dit.old_velocities)}
++                if dit.old_velocities is not None
++                else {}
++            ),
+         }
+     return (
+         serialized_log_probs,
+@@ -195,12 +212,17 @@ def _serialize_rollout_trajectory(
+ 
+ 
+ def _build_response(
+-    request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
++    request_id: str,
++    prompt: str,
++    seed: int | list[int],
++    rollout: bool,
++    result: OutputBatch,
+ ) -> list[RolloutResponse]:
+     """
+     rollout: bool - set to False when evaluating the model
+     """
+-    batch_size = result.output.shape[0]
++    batch_size = len(result.output)
++    seeds = normalize_output_seeds(seed, num_outputs_per_prompt=batch_size)
+     inference_time_s = (
+         result.metrics.total_duration_s
+         if result.metrics and result.metrics.total_duration_s > 0
+@@ -234,7 +256,7 @@ def _build_response(
+                 RolloutResponse(
+                     request_id=request_id,
+                     prompt=prompt,
+-                    seed=seed,
++                    seed=seeds[sample_idx],
+                     generated_output=serialized_generated_output,
+                     inference_time_s=inference_time_s,
+                     peak_memory_mb=peak_memory_mb,
+@@ -258,7 +280,7 @@ def _build_response(
+             RolloutResponse(
+                 request_id=request_id,
+                 prompt=prompt,
+-                seed=seed,
++                seed=seeds[sample_idx],
+                 generated_output=serialized_generated_output,
+                 rollout_log_probs=serialized_log_probs,
+                 rollout_debug_tensors=serialized_debug_tensors,
+@@ -341,7 +363,7 @@ async def rollout_generate(request: RolloutRequest):
+     if output_batch.error:
+         raise HTTPException(status_code=500, detail=output_batch.error)
+     rollout_responses = _build_response(
+-        request_id, request.prompt, request.seed, request.rollout, output_batch
++        request_id, request.prompt, pipeline_request.seed, request.rollout, output_batch
+     )
+     payload = [r.model_dump() for r in rollout_responses]
+     return Response(
+diff --git a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/geometry.py b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/geometry.py
+new file mode 100644
+index 0000000..b4137f0
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/geometry.py
+@@ -0,0 +1,40 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Reference-compatible fixed-pixel SenseNova input resizing."""
++
++from __future__ import annotations
++
++
++def fixed_pixel_size(
++    width: int, height: int, pixels: int, max_side_length: int = 0, factor: int = 32
++) -> tuple[int, int]:
++    if any(type(v) is not int or v <= 0 for v in (width, height, pixels, factor)):
++        raise ValueError(
++            "Image dimensions, fixed pixels and alignment factor must be positive integers"
++        )
++    if type(max_side_length) is not int or max_side_length < 0:
++        raise ValueError("max_side_length must be a nonnegative integer")
++    scale = (width * height / pixels) ** 0.5
++    height, width = int(round(height / scale)), int(round(width / scale))
++    if max_side_length and max(height, width) > max_side_length:
++        ratio = max_side_length / max(height, width)
++        height, width = int(height * ratio), int(width * ratio)
++    height, width = height // factor * factor, width // factor * factor
++    if min(height, width) <= 0:
++        raise ValueError("Fixed-pixel resize produced an empty image")
++    return width, height
++
++
++def resize_reference(image, pixels: int, max_side_length: int = 0):
++    from torchvision.transforms import InterpolationMode
++    from torchvision.transforms import functional as tvf
++
++    image = image.convert("RGB")
++    old_width, old_height = image.size
++    width, height = fixed_pixel_size(old_width, old_height, pixels, max_side_length)
++    cover = max(width / old_width, height / old_height)
++    image = tvf.resize(
++        image,
++        [round(old_height * cover), round(old_width * cover)],
++        interpolation=InterpolationMode.BILINEAR,
++    )
++    return tvf.center_crop(image, [height, width])
+diff --git a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/loader.py b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/loader.py
+index 08c7211..d96f861 100644
+--- a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/loader.py
++++ b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/loader.py
+@@ -38,5 +38,8 @@ def load_model_and_tokenizer(
+     model = AutoModel.from_pretrained(model_path, **model_kwargs).eval()
+     device = get_local_torch_device()
+     current_platform.set_device(device)
+-    model = model.to(device)
++    # HF loading may leave nonpersistent RoPE buffers in FP32. SenseNova's
++    # business precision policy casts floating buffers along with parameters;
++    # otherwise an identical BF16 checkpoint yields different prefix KV.
++    model = model.to(device=device, dtype=dtype)
+     return {"model": model, "tokenizer": tokenizer}
+diff --git a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_neo_chat.py b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_neo_chat.py
+index a7f1614..f1f73fd 100644
+--- a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_neo_chat.py
++++ b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_neo_chat.py
+@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
+ 
+ import torch.utils.checkpoint
+ import transformers
++from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
+ from torch import nn
+ from torch.nn import CrossEntropyLoss
+ from transformers import GenerationConfig
+@@ -13,8 +14,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
+ from transformers.modeling_utils import PreTrainedModel
+ from transformers.utils import logging
+ 
+-from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
+-
+ from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
+ from .conversation import get_conv_template
+ from .modeling_fm_modules import (
+@@ -34,6 +33,22 @@ from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
+ logger = logging.get_logger(__name__)
+ 
+ 
++def _it2i_ode_schedule(native_timesteps):
++    """Use the public [1000, 0] scheduler coordinate for model time and ODE deltas."""
++    times = 1000 * (1 - native_timesteps[:-1].float())
++    # Sigma uses correctly rounded FP64 division to FP32; model time uses
++    # native FP32 division. CUDA division can differ by an ULP.
++    sigmas = torch.cat([(times.double() / 1000).float(), times.new_zeros(1)])
++    timesteps = torch.cat([1 - times / 1000, times.new_ones(1)])
++    return timesteps, sigmas
++
++
++def _it2i_ode_step(state, native_velocity, sigma, sigma_next):
++    """Update in FP32 and round once at the stored-state boundary."""
++    velocity = -native_velocity.float()
++    return (state.float() + velocity * (sigma_next - sigma)).to(state.dtype)
++
++
+ def version_cmp(v1, v2, op="eq"):
+     import operator
+ 
+@@ -770,18 +785,47 @@ class NEOChatModel(PreTrainedModel):
+         t_idx,
+         IMG_START_TOKEN,
+         max_think_tokens=1024,
++        replay_token_ids=None,
++        record=None,
+     ):
+         template = get_conv_template(self.template)
+         eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
+         think_end_token_id = tokenizer.convert_tokens_to_ids("</think>")
++        if replay_token_ids is not None:
++            if (
++                not isinstance(replay_token_ids, list)
++                or len(replay_token_ids) > max_think_tokens
++            ):
++                raise ValueError("Invalid replay Think token count")
++            vocab_size = self.language_model.get_input_embeddings().num_embeddings
++            if any(
++                type(i) is not int or not 0 <= i < vocab_size for i in replay_token_ids
++            ):
++                raise ValueError("Invalid replay Think token ID")
++            if (
++                eos_token_id in replay_token_ids
++                or think_end_token_id in replay_token_ids[:-1]
++            ):
++                raise ValueError(
++                    "Replay Think tokens must stop at their first terminator"
++                )
++        start_index = t_idx
++        termination = "max_tokens"
+         think_token_ids = []
+         next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
+ 
+-        for _ in range(max_think_tokens):
++        limit = max_think_tokens if replay_token_ids is None else len(replay_token_ids)
++        for token_index in range(limit):
++            if replay_token_ids is not None:
++                next_token = torch.tensor(
++                    [replay_token_ids[token_index]], device=self.device
++                )
+             token_item = next_token.item()
+             if token_item == eos_token_id:
++                termination = "eos"
+                 break
+             if token_item == think_end_token_id:
++                termination = "think_end"
+                 self.language_model.model.current_index = t_idx
+                 outputs = self.language_model(
+                     input_ids=next_token.unsqueeze(0),
+@@ -815,6 +859,23 @@ class NEOChatModel(PreTrainedModel):
+ 
+         think_text = tokenizer.decode(think_token_ids, skip_special_tokens=False)
+ 
++        if record is not None:
++            record.update(
++                {
++                    "token_ids": think_token_ids,
++                    "append_token_ids": append_ids[0].tolist(),
++                    "text": think_text,
++                    "start_index": start_index,
++                    "end_index": t_idx,
++                    "termination": termination
++                    if replay_token_ids is None
++                    else "replay",
++                    "max_think_tokens": max_think_tokens,
++                    "sampling": "greedy"
++                    if replay_token_ids is None
++                    else "fixed_tokens",
++                }
++            )
+         return past_key_values, t_idx, think_text
+ 
+     def _t2i_predict_v(
+@@ -841,6 +902,7 @@ class NEOChatModel(PreTrainedModel):
+             indexes=indexes_image,
+             attention_mask=attn_mask,
+             past_key_values=past_key_values,
++            _sensenova_pure_image=True,
+             update_cache=False,
+             use_cache=True,
+         )
+@@ -856,7 +918,13 @@ class NEOChatModel(PreTrainedModel):
+             img_2d = torch.einsum("b h w c -> b c h w", img_reshaped)
+             img_2d = img_2d.contiguous().view(B, -1, token_h, token_w)
+ 
+-            smoothed_img_2d = self.fm_modules["fm_head"](img_2d)
++            # Keep the pixel head's BF16 convolution shape stable across group
++            # sizes. Its batch-dependent kernel rounding can amplify over the
++            # denoising trajectory; the expensive decoder remains fully batched.
++            smoothed_img_2d = torch.cat(
++                [self.fm_modules["fm_head"](sample) for sample in img_2d.split(1)],
++                dim=0,
++            )
+ 
+             smoothed_reshaped = smoothed_img_2d.view(
+                 B,
+@@ -1960,29 +2028,39 @@ class NEOChatModel(PreTrainedModel):
+         return generated_text, generated_images
+ 
+     @torch.no_grad()
+-    def it2i_generate(
++    def prepare_it2i_conditioning(
+         self,
+         tokenizer,
+         prompt,
+         images,
++        *,
+         cfg_scale=1,
+         img_cfg_scale=1,
+         cfg_norm="none",
+-        enable_timestep_shift=True,
+-        timestep_shift=1,
+         image_size=(256, 256),
+-        num_steps=30,
+-        IMG_START_TOKEN="<img>",
+-        IMG_END_TOKEN="</img>",
+-        IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
+-        method="euler",
+-        cfg_interval=(0, 1),
+         batch_size=1,
+         t_eps=0.02,
+         think_mode=False,
+-        seed=0,
++        think_token_ids=None,
++        max_think_tokens=1024,
++        cfg_interval=(0, 1),
++        IMG_START_TOKEN="<img>",
++        IMG_END_TOKEN="</img>",
++        IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
+     ):
+-        assert cfg_norm in ["none", "global", "channel"]
++        """Prepare image/text conditions only; sampling belongs to the caller.
++
++        A group shares its prompt and ordered references. Think tokens can be
++        teacher-forced under the current weights when replaying an old rollout.
++        """
++        if not isinstance(prompt, str) or batch_size < 1:
++            raise ValueError("I2I requires one shared prompt and a positive batch size")
++        if think_token_ids is not None and not think_mode:
++            raise ValueError("think_token_ids requires think_mode=True")
++        if type(max_think_tokens) is not int or not 1 <= max_think_tokens <= 1024:
++            raise ValueError("max_think_tokens must be in [1, 1024]")
++        if cfg_norm not in ("none", "global", "channel"):
++            raise ValueError("Unsupported I2I CFG normalization")
+         self._notify_layer_offload_phase("prefix")
+ 
+         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+@@ -2020,6 +2098,7 @@ class NEOChatModel(PreTrainedModel):
+         merge_size = int(1 / self.downsample_ratio)
+         question_condition = f"{prompt}"
+         think_text = ""
++        think_record = {}
+         needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
+         needs_img_condition = needs_cfg and (
+             img_cfg_scale == 1 or cfg_scale != img_cfg_scale
+@@ -2131,6 +2210,9 @@ class NEOChatModel(PreTrainedModel):
+                     past_key_values_condition,
+                     t_index_condition,
+                     IMG_START_TOKEN,
++                    max_think_tokens=max_think_tokens,
++                    replay_token_ids=think_token_ids,
++                    record=think_record,
+                 )
+             )
+             indexes_image_condition = self._build_t2i_image_indexes(
+@@ -2164,6 +2246,16 @@ class NEOChatModel(PreTrainedModel):
+                 attention_mask_uncondition_prefix,
+             )
+ 
++        # Capture the actual positive prefix, not the 42-layer KV cache. Think
++        # adds tokens after this prefix and is intentionally not replayable yet.
++        replay_conditions = None
++        if not think_mode:
++            replay_conditions = {
++                "prefix_inputs_embeds": input_embeds_condition.detach(),
++                "prefix_indexes": indexes_condition.detach(),
++                "prefix_attention_mask": attention_mask_condition_prefix["full_attention"].detach(),
++                "indexes_image": indexes_image_condition.detach(),
++            }
+         del pixel_values, grid_hw
+         del input_embeds_condition, indexes_condition, attention_mask_condition_prefix
+         if input_embeds_img_condition is not None:
+@@ -2251,166 +2343,302 @@ class NEOChatModel(PreTrainedModel):
+             if self.noise_scale_mode == "dynamic_sqrt":
+                 noise_scale = math.sqrt(noise_scale)
+         noise_scale = min(noise_scale, self.noise_scale_max_value)
+-        image_prediction = noise_scale * _randn_with_seed(
+-            (batch_size, 3, image_size[1], image_size[0]),
+-            device=device,
+-            dtype=dtype,
+-            seed=seed,
+-        )
+-
+-        attention_mask_condition = {"full_attention": None}
+-        attention_mask_img_condition = {"full_attention": None}
+-        attention_mask_uncondition = {"full_attention": None}
++        if replay_conditions is not None:
++            replay_conditions["noise_scale"] = torch.tensor(noise_scale)
++            replay_conditions["t_eps"] = torch.tensor(self.config.t_eps)
++        return {
++            "replay_conditions": replay_conditions,
++            "caches": (
++                past_key_values_condition,
++                past_key_values_img_condition,
++                past_key_values_uncondition,
++            ),
++            "indexes": (
++                indexes_image_condition,
++                indexes_image_img_condition,
++                indexes_image_uncondition,
++            ),
++            "batch_size": batch_size,
++            "grid_hw": grid_hw,
++            "token_h": token_h,
++            "token_w": token_w,
++            "grid_h": grid_h,
++            "grid_w": grid_w,
++            "merge_size": merge_size,
++            "noise_scale": noise_scale,
++            "image_size": image_size,
++            "cfg_scale": cfg_scale,
++            "img_cfg_scale": img_cfg_scale,
++            "cfg_norm": cfg_norm,
++            "cfg_interval": cfg_interval,
++            "device": device,
++            "dtype": dtype,
++            "think_text": think_text,
++            "think_record": think_record,
++        }
+ 
+-        timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+-        if enable_timestep_shift:
+-            timesteps = self._apply_time_schedule(
+-                timesteps, token_h * token_w, timestep_shift
++    def predict_it2i_velocity(
++        self,
++        image_prediction,
++        t,
++        conditioning,
++        *,
++        inclusive_cfg=False,
++        timestep_embeddings=None,
++    ):
++        """Predict native clean-directed pixel velocity for a complete batch."""
++        batch_size = conditioning["batch_size"]
++        token_h, token_w = conditioning["token_h"], conditioning["token_w"]
++        grid_h, grid_w = conditioning["grid_h"], conditioning["grid_w"]
++        merge_size, grid_hw = conditioning["merge_size"], conditioning["grid_hw"]
++        image_size, noise_scale = (
++            conditioning["image_size"],
++            conditioning["noise_scale"],
++        )
++        cfg_scale, img_cfg_scale = (
++            conditioning["cfg_scale"],
++            conditioning["img_cfg_scale"],
++        )
++        cfg_norm, cfg_interval = conditioning["cfg_norm"], conditioning["cfg_interval"]
++        (
++            past_key_values_condition,
++            past_key_values_img_condition,
++            past_key_values_uncondition,
++        ) = conditioning["caches"]
++        (
++            indexes_image_condition,
++            indexes_image_img_condition,
++            indexes_image_uncondition,
++        ) = conditioning["indexes"]
++        attention_mask_condition = attention_mask_img_condition = (
++            attention_mask_uncondition
++        ) = {"full_attention": None}
++        use_cfg = (
++            ((t >= cfg_interval[0]) & (t <= cfg_interval[1]))
++            if inclusive_cfg
++            else ((t > cfg_interval[0] and t < cfg_interval[1]) or cfg_interval[0] == 0)
++        )
++        z = self.patchify(image_prediction, self.patch_size * merge_size)
++        image_input = self.patchify(
++            image_prediction, self.patch_size, channel_first=True
++        )
++        image_embeds = self.extract_feature(
++            image_input.view(batch_size * grid_h * grid_w, -1),
++            gen_model=True,
++            grid_hw=grid_hw,
++        ).view(batch_size, token_h * token_w, -1)
++        if timestep_embeddings is None:
++            t_expanded = t.expand(batch_size * token_h * token_w)
++            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
++                batch_size, token_h * token_w, -1
+             )
+-        denoise_embeddings = None
+-        if device.type == "npu":
+-            denoise_embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1])
+             if self.add_noise_scale_embedding:
+-                noise_level = timesteps.new_tensor(
+-                    [noise_scale / self.noise_scale_max_value]
++                noise_scale_tensor = torch.full_like(
++                    t_expanded, noise_scale / self.noise_scale_max_value
+                 )
+-                denoise_embeddings = denoise_embeddings + self.fm_modules[
+-                    "noise_scale_embedder"
+-                ](noise_level)
++                timestep_embeddings += self.fm_modules["noise_scale_embedder"](
++                    noise_scale_tensor
++                ).view(batch_size, token_h * token_w, -1)
++        image_embeds = image_embeds + timestep_embeddings
+ 
+-        for step_i in range(num_steps):
+-            t = timesteps[step_i]
+-            t_next = timesteps[step_i + 1]
+-            use_cfg = (t > cfg_interval[0] and t < cfg_interval[1]) or cfg_interval[
+-                0
+-            ] == 0
++        out_cond = self._t2i_predict_v(
++            image_embeds,
++            indexes_image_condition,
++            attention_mask_condition,
++            past_key_values_condition,
++            t,
++            z,
++            image_token_num=token_h * token_w,
++            timestep_embeddings=timestep_embeddings,
++            image_size=image_size,
++        )
+ 
+-            z = self.patchify(image_prediction, self.patch_size * merge_size)
+-            image_input = self.patchify(
+-                image_prediction, self.patch_size, channel_first=True
++        if not use_cfg:
++            v_pred = out_cond
++        elif cfg_scale == 1 and img_cfg_scale == 1:
++            v_pred = out_cond
++        elif img_cfg_scale == 1:
++            out_img_cond = self._t2i_predict_v(
++                image_embeds,
++                indexes_image_img_condition,
++                attention_mask_img_condition,
++                past_key_values_img_condition,
++                t,
++                z,
++                image_token_num=token_h * token_w,
++                timestep_embeddings=timestep_embeddings,
++                image_size=image_size,
+             )
+-            image_embeds = self.extract_feature(
+-                image_input.view(batch_size * grid_h * grid_w, -1),
+-                gen_model=True,
+-                grid_hw=grid_hw,
+-            ).view(batch_size, token_h * token_w, -1)
+-            if denoise_embeddings is not None:
+-                timestep_embeddings = denoise_embeddings[step_i].view(1, 1, -1)
+-            else:
+-                t_expanded = t.expand(batch_size * token_h * token_w)
+-                timestep_embeddings = self.fm_modules["timestep_embedder"](
+-                    t_expanded
+-                ).view(batch_size, token_h * token_w, -1)
+-                if self.add_noise_scale_embedding:
+-                    noise_scale_tensor = torch.full_like(
+-                        t_expanded, noise_scale / self.noise_scale_max_value
+-                    )
+-                    timestep_embeddings += self.fm_modules["noise_scale_embedder"](
+-                        noise_scale_tensor
+-                    ).view(batch_size, token_h * token_w, -1)
+-            image_embeds = image_embeds + timestep_embeddings
+-
+-            out_cond = self._t2i_predict_v(
++            v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
++        elif cfg_scale == img_cfg_scale:
++            out_uncond = self._t2i_predict_v(
+                 image_embeds,
+-                indexes_image_condition,
+-                attention_mask_condition,
+-                past_key_values_condition,
++                indexes_image_uncondition,
++                attention_mask_uncondition,
++                past_key_values_uncondition,
++                t,
++                z,
++                image_token_num=token_h * token_w,
++                timestep_embeddings=timestep_embeddings,
++                image_size=image_size,
++            )
++            v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
++        else:
++            out_img_cond = self._t2i_predict_v(
++                image_embeds,
++                indexes_image_img_condition,
++                attention_mask_img_condition,
++                past_key_values_img_condition,
+                 t,
+                 z,
+                 image_token_num=token_h * token_w,
+                 timestep_embeddings=timestep_embeddings,
+                 image_size=image_size,
+             )
++            out_uncond = self._t2i_predict_v(
++                image_embeds,
++                indexes_image_uncondition,
++                attention_mask_uncondition,
++                past_key_values_uncondition,
++                t,
++                z,
++                image_token_num=token_h * token_w,
++                timestep_embeddings=timestep_embeddings,
++                image_size=image_size,
++            )
++            v_pred = (
++                out_uncond
++                + cfg_scale * (out_cond - out_img_cond)
++                + img_cfg_scale * (out_img_cond - out_uncond)
++            )
++        normalize_cfg = (
++            (cfg_scale != 1 or img_cfg_scale != 1)
++            if inclusive_cfg
++            else (cfg_scale > 1 or img_cfg_scale > 1)
++        )
++        if normalize_cfg and use_cfg:
++            if cfg_norm == "global":
++                norm_v_condition = torch.norm(out_cond, dim=(1, 2), keepdim=True)
++                norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
++                scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
++                v_pred = v_pred * scale
++            elif cfg_norm == "channel":
++                norm_v_condition = torch.norm(out_cond, dim=-1, keepdim=True)
++                norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
++                scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
++                v_pred = v_pred * scale
++
++        return self.unpatchify(
++            v_pred, self.patch_size * merge_size, image_size[1], image_size[0]
++        )
+ 
+-            if not use_cfg:
+-                v_pred = out_cond
+-            elif cfg_scale == 1 and img_cfg_scale == 1:
+-                v_pred = out_cond
+-            elif img_cfg_scale == 1:
+-                out_img_cond = self._t2i_predict_v(
+-                    image_embeds,
+-                    indexes_image_img_condition,
+-                    attention_mask_img_condition,
+-                    past_key_values_img_condition,
+-                    t,
+-                    z,
+-                    image_token_num=token_h * token_w,
+-                    timestep_embeddings=timestep_embeddings,
+-                    image_size=image_size,
+-                )
+-                v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
+-            elif cfg_scale == img_cfg_scale:
+-                out_uncond = self._t2i_predict_v(
+-                    image_embeds,
+-                    indexes_image_uncondition,
+-                    attention_mask_uncondition,
+-                    past_key_values_uncondition,
+-                    t,
+-                    z,
+-                    image_token_num=token_h * token_w,
+-                    timestep_embeddings=timestep_embeddings,
+-                    image_size=image_size,
+-                )
+-                v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+-            else:
+-                out_img_cond = self._t2i_predict_v(
+-                    image_embeds,
+-                    indexes_image_img_condition,
+-                    attention_mask_img_condition,
+-                    past_key_values_img_condition,
+-                    t,
+-                    z,
+-                    image_token_num=token_h * token_w,
+-                    timestep_embeddings=timestep_embeddings,
+-                    image_size=image_size,
+-                )
+-                out_uncond = self._t2i_predict_v(
+-                    image_embeds,
+-                    indexes_image_uncondition,
+-                    attention_mask_uncondition,
+-                    past_key_values_uncondition,
+-                    t,
+-                    z,
+-                    image_token_num=token_h * token_w,
+-                    timestep_embeddings=timestep_embeddings,
+-                    image_size=image_size,
+-                )
+-                v_pred = (
+-                    out_uncond
+-                    + cfg_scale * (out_cond - out_img_cond)
+-                    + img_cfg_scale * (out_img_cond - out_uncond)
+-                )
+-            if (cfg_scale > 1 or img_cfg_scale > 1) and use_cfg:
+-                if cfg_norm == "global":
+-                    norm_v_condition = torch.norm(out_cond, dim=(1, 2), keepdim=True)
+-                    norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
+-                    scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(
+-                        min=0, max=1.0
+-                    )
+-                    v_pred = v_pred * scale
+-                elif cfg_norm == "channel":
+-                    norm_v_condition = torch.norm(out_cond, dim=-1, keepdim=True)
+-                    norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
+-                    scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(
+-                        min=0, max=1.0
+-                    )
+-                    v_pred = v_pred * scale
++    @staticmethod
++    def release_it2i_conditioning(conditioning):
++        for cache in conditioning["caches"]:
++            clear_flash_kv_cache(cache)
++
++    def initialize_it2i_latents(self, conditioning, seed):
++        width, height = conditioning["image_size"]
++        return conditioning["noise_scale"] * _randn_with_seed(
++            (conditioning["batch_size"], 3, height, width),
++            device=conditioning["device"],
++            dtype=conditioning["dtype"],
++            seed=seed,
++        )
+ 
+-            z = z + (t_next - t) * v_pred
+-            image_prediction = self.unpatchify(
+-                z, self.patch_size * merge_size, image_size[1], image_size[0]
++    def it2i_timesteps(
++        self, conditioning, num_steps, enable_timestep_shift=True, timestep_shift=1
++    ):
++        times = torch.linspace(0, 1, num_steps + 1, device=conditioning["device"])
++        if enable_timestep_shift:
++            times = self._apply_time_schedule(
++                times, conditioning["token_h"] * conditioning["token_w"], timestep_shift
+             )
++        return times
+ 
+-        clear_flash_kv_cache(past_key_values_condition)
+-        if past_key_values_img_condition is not None:
+-            clear_flash_kv_cache(past_key_values_img_condition)
+-        if past_key_values_uncondition is not None:
+-            clear_flash_kv_cache(past_key_values_uncondition)
++    def prepare_it2i_timestep_embeddings(self, conditioning, timesteps):
++        """Preserve the native NPU path's one-pass timestep embedding."""
++        if conditioning["device"].type != "npu":
++            return None
++        embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1])
++        if self.add_noise_scale_embedding:
++            level = timesteps.new_tensor(
++                [conditioning["noise_scale"] / self.noise_scale_max_value]
++            )
++            embeddings = embeddings + self.fm_modules["noise_scale_embedder"](level)
++        return embeddings
+ 
+-        self.last_think_content = think_text
+-        if think_mode:
+-            return image_prediction, think_text
+-        return image_prediction
++    @torch.no_grad()
++    def it2i_generate(
++        self,
++        tokenizer,
++        prompt,
++        images,
++        cfg_scale=1,
++        img_cfg_scale=1,
++        cfg_norm="none",
++        enable_timestep_shift=True,
++        timestep_shift=1,
++        image_size=(256, 256),
++        num_steps=30,
++        IMG_START_TOKEN="<img>",
++        IMG_END_TOKEN="</img>",
++        IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
++        method="euler",
++        cfg_interval=(0, 1),
++        batch_size=1,
++        t_eps=0.02,
++        think_mode=False,
++        seed=0,
++        think_token_ids=None,
++        max_think_tokens=1024,
++    ):
++        conditioning = self.prepare_it2i_conditioning(
++            tokenizer,
++            prompt,
++            images,
++            cfg_scale=cfg_scale,
++            img_cfg_scale=img_cfg_scale,
++            cfg_norm=cfg_norm,
++            image_size=image_size,
++            batch_size=batch_size,
++            t_eps=t_eps,
++            think_mode=think_mode,
++            think_token_ids=think_token_ids,
++            max_think_tokens=max_think_tokens,
++            cfg_interval=cfg_interval,
++            IMG_START_TOKEN=IMG_START_TOKEN,
++            IMG_END_TOKEN=IMG_END_TOKEN,
++            IMG_CONTEXT_TOKEN=IMG_CONTEXT_TOKEN,
++        )
++        try:
++            state = self.initialize_it2i_latents(conditioning, seed)
++            times, sigmas = _it2i_ode_schedule(
++                self.it2i_timesteps(
++                    conditioning, num_steps, enable_timestep_shift, timestep_shift
++                )
++            )
++            denoise_embeddings = self.prepare_it2i_timestep_embeddings(
++                conditioning, times
++            )
++            for i in range(num_steps):
++                velocity = self.predict_it2i_velocity(
++                    state,
++                    times[i : i + 1],
++                    conditioning,
++                    timestep_embeddings=(
++                        None
++                        if denoise_embeddings is None
++                        else denoise_embeddings[i].view(1, 1, -1)
++                    ),
++                )
++                state = _it2i_ode_step(state, velocity, sigmas[i], sigmas[i + 1])
++            self.last_think_content = conditioning["think_text"]
++            if think_mode:
++                return state, conditioning["think_text"]
++            return state
++        finally:
++            self.release_it2i_conditioning(conditioning)
+ 
+     @torch.no_grad()
+     def t2i_generate(
+@@ -2789,7 +3017,6 @@ class NEOChatModel(PreTrainedModel):
+         IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
+         verbose=False,
+     ):
+-
+         if history is None and pixel_values is not None and "<image>" not in question:
+             question = "<image>\n" + question
+ 
+diff --git a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_qwen3.py b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_qwen3.py
+index 289fd18..4793b04 100644
+--- a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_qwen3.py
++++ b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/neo_unify/modeling_qwen3.py
+@@ -1586,7 +1586,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
+         # assert cache_position is not None
+         # assert past_key_values is not None
+ 
+-        if image_gen_indicators is None:
++        if kwargs.pop("_sensenova_pure_image", False):
++            exist_non_image_gen_tokens = False
++            exist_image_gen_tokens = True
++        elif image_gen_indicators is None:
+             exist_non_image_gen_tokens = True
+             exist_image_gen_tokens = False
+         else:
+diff --git a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/rollout.py b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/rollout.py
+new file mode 100644
+index 0000000..21f06ad
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/rollout.py
+@@ -0,0 +1,292 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Request-local SenseNova I2I rollout contract, independent of trainer state."""
++
++from __future__ import annotations
++
++import hashlib
++import math
++from typing import Any
++
++import torch
++
++ROLLOUT_PROTOCOL_VERSION = 4
++ART_ROLLOUT_PROTOCOL_VERSION = 5
++
++
++def _seed(value: Any, name: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**63:
++        raise ValueError(f"{name} must be an integer in [0, 2**63)")
++    return value
++
++
++def derive_denoise_seed(base_seed: int, candidate_id: str, step: int) -> int:
++    payload = f"sensenova-rollout-v1\0{base_seed}\0{candidate_id}\0{step}".encode()
++    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") % 2**63
++
++
++def _indices(value: Any, total: int, name: str) -> list[int]:
++    if not isinstance(value, (list, tuple)) or any(
++        isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < total
++        for i in value
++    ):
++        raise ValueError(f"{name} must contain transition indices in [0, {total})")
++    if len(set(value)) != len(value):
++        raise ValueError(f"{name} must not contain duplicate indices")
++    return sorted(value)
++
++
++class SenseNovaRolloutPlan:
++    """Validate model-specific controls; execution state lives on the request."""
++
++    def __init__(
++        self,
++        *,
++        num_steps: int,
++        seed: int,
++        dynamics: str,
++        noise_level: float,
++        sde_step_indices: list[int] | None = None,
++        return_step_indices: list[int] | None = None,
++        options: dict[str, Any] | None = None,
++    ):
++        options = dict(options or {})
++        allowed = {
++            "capture",
++            "initial_seed",
++            "denoise_seed",
++            "denoise_seeds",
++            "candidate_id",
++            "sigmas",
++            "timesteps",
++            "storage_dtype",
++        }
++        unknown = set(options) - allowed
++        if unknown:
++            raise ValueError(f"Unknown SenseNova rollout options: {sorted(unknown)}")
++        if (
++            isinstance(num_steps, bool)
++            or not isinstance(num_steps, int)
++            or num_steps < 1
++        ):
++            raise ValueError("num_steps must be a positive integer")
++        if dynamics not in ("ode", "cps", "sde"):
++            raise ValueError(f"Unsupported SenseNova rollout dynamics: {dynamics!r}")
++        if not math.isfinite(noise_level) or not 0 <= noise_level <= 1:
++            raise ValueError("noise_level must be finite and in [0, 1]")
++        self.num_steps = num_steps
++        self.dynamics = dynamics
++        self.noise_level = 0.0 if dynamics == "ode" else noise_level
++        self.capture = options.get(
++            "capture", "terminal" if dynamics == "ode" else "transitions"
++        )
++        if self.capture not in ("terminal", "transitions", "ode_states"):
++            raise ValueError("capture must be 'terminal', 'transitions' or 'ode_states'")
++        if self.capture == "ode_states" and (
++            dynamics != "ode" or noise_level != 0 or sde_step_indices not in (None, [])
++        ):
++            raise ValueError("ODE state capture requires deterministic ODE with no stochastic steps")
++        if self.capture == "transitions" and (dynamics == "ode" or noise_level <= 0):
++            raise ValueError("Transition-score capture requires stochastic dynamics")
++        self.storage_dtype = options.get("storage_dtype", "bfloat16")
++        if self.storage_dtype not in ("bfloat16", "float16"):
++            raise ValueError("storage_dtype must be bfloat16 or float16")
++        if self.storage_dtype == "float16" and (dynamics != "ode" or self.capture not in ("terminal", "ode_states")):
++            raise ValueError("FP16 storage requires ODE terminal or selected-state capture")
++        self.initial_seed = _seed(options.get("initial_seed", seed), "initial_seed")
++        self.candidate_id = str(options.get("candidate_id", seed))
++        if not self.candidate_id:
++            raise ValueError("candidate_id must not be empty")
++        base = _seed(options.get("denoise_seed", seed), "denoise_seed")
++        denoise = options.get("denoise_seeds")
++        if denoise is not None and (
++            not isinstance(denoise, list) or len(denoise) != num_steps
++        ):
++            raise ValueError("denoise_seeds must have one seed per transition")
++        self.denoise_seeds = [
++            _seed(denoise[i], "denoise_seeds")
++            if denoise is not None
++            else derive_denoise_seed(base, self.candidate_id, i)
++            for i in range(num_steps)
++        ]
++        eligible = _indices(
++            list(range(num_steps - 1))
++            if sde_step_indices is None
++            else sde_step_indices,
++            num_steps,
++            "sde_step_indices",
++        )
++        self.sde_indices = eligible if self.noise_level > 0 else []
++        if dynamics == "cps" and num_steps - 1 in self.sde_indices:
++            raise ValueError(
++                "The terminal CPS step has zero variance and cannot be stochastic"
++            )
++        self.transition_indices = []
++        self.selected_indices = []
++        if self.capture == "transitions":
++            self.transition_indices = _indices(
++                self.sde_indices
++                if return_step_indices is None
++                else return_step_indices,
++                num_steps,
++                "return_step_indices",
++            )
++            if not self.transition_indices or not set(self.transition_indices) <= set(
++                self.sde_indices
++            ):
++                raise ValueError(
++                    "Captured transitions must be a nonempty subset of stochastic steps"
++                )
++        elif self.capture == "ode_states":
++            self.selected_indices = _indices(
++                return_step_indices, num_steps, "return_step_indices"
++            )
++            if not self.selected_indices:
++                raise ValueError("ODE state capture requires nonempty explicit input step indices")
++        elif return_step_indices not in (None, []):
++            raise ValueError("Terminal capture does not accept return_step_indices")
++        self.state_indices = (
++            self.selected_indices + [num_steps]
++            if self.capture == "ode_states"
++            else [num_steps]
++            if self.capture == "terminal"
++            else sorted({j for i in self.transition_indices for j in (i, i + 1)})
++        )
++        self.options = options
++
++    def prepare_schedule(self, native_timesteps: torch.Tensor) -> torch.Tensor:
++        """Freeze shifted scheduler coordinates; never shift a driver schedule twice."""
++        if len(native_timesteps) != self.num_steps + 1:
++            raise ValueError("Native schedule length does not match num_steps")
++        device = native_timesteps.device
++        explicit_sigmas = self.options.get("sigmas")
++        explicit_times = self.options.get("timesteps")
++        if explicit_sigmas is not None:
++            sigmas = torch.tensor(explicit_sigmas, dtype=torch.float32)
++            if sigmas.ndim != 1 or len(sigmas) != self.num_steps + 1:
++                raise ValueError(
++                    "sigmas must have T+1 entries, including terminal zero"
++                )
++            times = sigmas[:-1] * 1000
++        elif explicit_times is not None:
++            times = torch.tensor(explicit_times, dtype=torch.float32)
++            if times.ndim != 1 or len(times) != self.num_steps:
++                raise ValueError(
++                    "timesteps must have T entries in descending [1000,0] coordinates"
++                )
++            sigmas = torch.cat([times / 1000, times.new_zeros(1)])
++        else:
++            times = (1000 * (1 - native_timesteps[:-1].float())).cpu()
++            sigmas = torch.cat([times / 1000, times.new_zeros(1)])
++        if explicit_times is not None and explicit_sigmas is not None:
++            requested = torch.tensor(explicit_times, dtype=torch.float32)
++            if requested.shape != times.shape or not torch.allclose(
++                requested, times, atol=1e-5, rtol=1e-6
++            ):
++                raise ValueError("Driver timesteps and sigmas disagree")
++            times = requested
++        # Derive sigma from the public FP32 scheduler time coordinate,
++        # including driver-provided schedules.
++        sigmas = torch.cat([times / 1000, sigmas[-1:]])
++        if (
++            not torch.isfinite(sigmas).all()
++            or sigmas[0] != 1
++            or sigmas[-1] != 0
++            or not torch.all(sigmas[:-1] > sigmas[1:])
++        ):
++            raise ValueError(
++                "Schedule must decrease strictly from sigma=1 to terminal sigma=0"
++            )
++        if self.dynamics == "sde" and self.num_steps < 2:
++            raise ValueError("Flow-SDE requires at least two steps for sigma_max")
++        self.sigmas = sigmas.to(device)
++        self.timesteps = times.to(device)
++        # Convert scheduler time to the model's increasing native coordinate.
++        self.native_timesteps = torch.cat(
++            [1 - self.timesteps / 1000, self.timesteps.new_ones(1)]
++        )
++        return self.native_timesteps
++
++    def metadata(
++        self, conditioning: dict[str, Any], *, batch_size: int
++    ) -> dict[str, Any]:
++        return {
++            "protocol": "sensenova_i2i_flow_v1",
++            "protocol_version": ART_ROLLOUT_PROTOCOL_VERSION if self.capture == "ode_states" else ROLLOUT_PROTOCOL_VERSION,
++            "actual_batch_size": batch_size,
++            "dynamics": self.dynamics,
++            "capture": self.capture,
++            "state_layout": "T,C,H,W",
++            "storage_dtype": self.storage_dtype,
++            "score_kind": "none"
++            if not self.transition_indices
++            else (
++                "cps_residual_mse"
++                if self.dynamics == "cps"
++                else "gaussian_mean_logprob"
++            ),
++            "state_indices": self.state_indices,
++            "transition_indices": self.transition_indices,
++            "sde_indices": self.sde_indices,
++            "noise_level": self.noise_level,
++            "initial_seed": self.initial_seed,
++            "denoise_seeds": self.denoise_seeds,
++            "candidate_id": self.candidate_id,
++            "conditioning": conditioning,
++            **(
++                {
++                    "selected_indices": self.selected_indices,
++                    "velocity_convention": "noise_directed",
++                    "velocity_dtype": "float32",
++                    "solver": "euler",
++                }
++                if self.capture == "ode_states"
++                else {}
++            ),
++        }
++
++
++def build_rollout_plans(batch, options, seeds):
++    """Expand explicit candidate identities behind num_outputs_per_prompt.
++
++    A native group shares scheduler/conditioning controls. Heterogeneous groups
++    must remain separate requests, as with the public RolloutRequest schema.
++    """
++    options = dict(options or {})
++    candidates = options.pop("candidates", None)
++    count = int(batch.num_outputs_per_prompt)
++    if candidates is None:
++        if count != 1:
++            raise ValueError("Batched rollout requires explicit candidates")
++        candidates = [{"seed": seeds[0]}]
++    if not isinstance(candidates, list) or len(candidates) != count:
++        raise ValueError("candidates must have num_outputs_per_prompt entries")
++    plans = []
++    for candidate in candidates:
++        candidate = dict(candidate)
++        seed = _seed(candidate.pop("seed", None), "candidate seed")
++        allowed = {
++            "candidate_id",
++            "initial_seed",
++            "denoise_seed",
++            "denoise_seeds",
++        }
++        if set(candidate) - allowed:
++            raise ValueError("Candidates may override only identity and noise streams")
++        plan = SenseNovaRolloutPlan(
++            num_steps=int(batch.num_inference_steps),
++            seed=seed,
++            dynamics=batch.rollout_sde_type,
++            noise_level=float(batch.rollout_noise_level),
++            sde_step_indices=batch.rollout_sde_step_indices,
++            return_step_indices=batch.rollout_return_step_indices,
++            options={**options, **candidate},
++        )
++        plan.request_seed = seed
++        plans.append(plan)
++    if len({p.candidate_id for p in plans}) != count:
++        raise ValueError("Candidate IDs must be unique within a rollout batch")
++    if any(p.sde_indices != plans[0].sde_indices for p in plans):
++        raise ValueError(
++            "A batched group must share explicitly selected stochastic steps"
++        )
++    return plans
+diff --git a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/rope_cache.py b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/rope_cache.py
+new file mode 100644
+index 0000000..0a21f5a
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/rope_cache.py
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Reuse identical static RoPE results within one ART decoder forward."""
++
++import functools
++from typing import Any
++
++import torch
++
++
++def install_rope_cache(model: Any) -> None:
++    # Cache only within one decoder forward. Values depend on positions,
++    # inverse frequencies, scaling and dtype, not hidden-state contents.
++    decoder = model.language_model.model
++    cache = {}
++    for attribute in ["rotary_emb", "rotary_emb_hw"]:
++        reference = getattr(decoder.layers[0].self_attn, attribute)
++        for layer in decoder.layers:
++            rotary = getattr(layer.self_attn, attribute)
++            if not torch.equal(rotary.inv_freq, reference.inv_freq):
++                raise ValueError("Layer RoPE frequencies are not identical")
++            if (
++                rotary.attention_scaling != reference.attention_scaling
++                or rotary.rope_type != "default"
++            ):
++                raise ValueError("Only static identical RoPE tables are supported")
++            original = rotary.forward
++
++            def forward(x, position_ids, _original=original, _group=attribute):
++                key = (
++                    _group,
++                    x.dtype,
++                    x.device,
++                    position_ids.data_ptr(),
++                    tuple(position_ids.shape),
++                    tuple(position_ids.stride()),
++                )
++                if key not in cache:
++                    cache[key] = _original(x, position_ids)
++                return cache[key]
++
++            rotary.forward = forward
++    original_decoder = decoder.forward
++
++    @functools.wraps(original_decoder)
++    def decoder_forward(*args, **kwargs):
++        cache.clear()
++        try:
++            return original_decoder(*args, **kwargs)
++        finally:
++            cache.clear()
++
++    decoder.forward = decoder_forward
+diff --git a/python/sglang/multimodal_gen/runtime/models/sensenova_u1/weights.py b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/weights.py
+new file mode 100644
+index 0000000..c5f5aa7
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/models/sensenova_u1/weights.py
+@@ -0,0 +1,30 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Strict validation of generation-branch dense weight-update buckets."""
++
++from __future__ import annotations
++
++import torch
++
++
++def validate_dense_bucket(
++    bucket: list[tuple[str, torch.Tensor]],
++    materialized_weights: list[tuple[str, torch.Tensor]],
++) -> None:
++    """Reject the entire bucket before any in-place parameter write."""
++    if not bucket:
++        raise ValueError("SenseNova dense weight bucket is empty")
++    expected = dict(materialized_weights)
++    if len(expected) != len(materialized_weights):
++        raise ValueError("SenseNova model has duplicate materialized parameter names")
++    seen: set[str] = set()
++    for entry in bucket:
++        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
++            raise ValueError("SenseNova dense entries must be (name, tensor) pairs")
++        name, tensor = entry
++        if not isinstance(name, str) or not name or name in seen:
++            raise ValueError(f"Invalid or duplicate SenseNova weight name: {name!r}")
++        seen.add(name)
++        if name not in expected:
++            raise ValueError(f"Unknown SenseNova weight: {name}")
++        if not isinstance(tensor, torch.Tensor) or tensor.shape != expected[name].shape:
++            raise ValueError(f"SenseNova weight shape/type mismatch: {name}")
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines/sensenova_u1.py b/python/sglang/multimodal_gen/runtime/pipelines/sensenova_u1.py
+index fbed05c..eba9155 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines/sensenova_u1.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines/sensenova_u1.py
+@@ -5,6 +5,8 @@ from typing import Any
+ 
+ import torch
+ 
++from sglang.multimodal_gen.configs.task_type import ModelTaskType
++
+ from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
+     SenseNovaU1PipelineConfig,
+ )
+@@ -55,6 +57,12 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
+                 "Native tensor/pipeline parallelism is not implemented yet."
+             )
+         modules = load_model_and_tokenizer(self.model_path, server_args)
++        if server_args.pipeline_config.task_type == ModelTaskType.TI2I:
++            from sglang.multimodal_gen.runtime.models.sensenova_u1.rope_cache import (
++                install_rope_cache,
++            )
++
++            install_rope_cache(modules["model"])
+         logger.info("Loaded SenseNova-U1 model from %s", self.model_path)
+         return modules
+ 
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1/stages/generation.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1/stages/generation.py
+index d1a8c03..dded7e1 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1/stages/generation.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1/stages/generation.py
+@@ -5,7 +5,6 @@ from dataclasses import dataclass
+ from typing import Any
+ 
+ import torch
+-
+ from sglang.multimodal_gen.configs.sensenova_u1 import (
+     DEFAULT_CFG_INTERVAL,
+     DEFAULT_CFG_NORM,
+@@ -16,11 +15,17 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
+     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+ )
+ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
++from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
++    normalize_output_seeds,
++)
+ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+     OutputBatch,
+     Req,
+ )
+ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
++from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
++    RolloutDenoisingMixin,
++)
+ from sglang.multimodal_gen.runtime.server_args import ServerArgs
+ 
+ 
+@@ -37,6 +42,8 @@ class SenseNovaU1GenerationOptions:
+     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
+     t_eps: float = DEFAULT_T_EPS
+     think_mode: bool = DEFAULT_THINK_MODE
++    think_token_ids: list[int] | None = None
++    max_think_tokens: int = 1024
+ 
+     @classmethod
+     def from_batch(cls, batch: Req) -> SenseNovaU1GenerationOptions:
+@@ -50,10 +57,12 @@ class SenseNovaU1GenerationOptions:
+             cfg_interval=tuple(extra.get("cfg_interval", DEFAULT_CFG_INTERVAL)),
+             t_eps=float(extra.get("t_eps", DEFAULT_T_EPS)),
+             think_mode=bool(extra.get("think_mode", DEFAULT_THINK_MODE)),
++            think_token_ids=extra.get("think_token_ids"),
++            max_think_tokens=extra.get("max_think_tokens", 1024),
+         )
+ 
+ 
+-class SenseNovaU1GenerationStage(PipelineStage):
++class SenseNovaU1GenerationStage(RolloutDenoisingMixin, PipelineStage):
+     def __init__(self, model: torch.nn.Module, tokenizer: Any):
+         super().__init__()
+         self.model = model
+@@ -64,6 +73,22 @@ class SenseNovaU1GenerationStage(PipelineStage):
+         return RoleType.DENOISER
+ 
+     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
++        if getattr(self.model, "_sensenova_lora_unusable", False):
++            raise RuntimeError(
++                "SenseNova policy is unusable after LoRA failure; rebuild the engine"
++            )
++        if (
++            getattr(batch, "rollout", False)
++            and getattr(batch, "condition_image", None) is None
++        ):
++            raise ValueError(
++                "SenseNova RL rollout currently requires I2I reference images"
++            )
++        if getattr(batch, "condition_image", None) is not None:
++            return self.forward_edit(batch, server_args)
++        return self.forward_text(batch, server_args)
++
++    def forward_text(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+         del server_args
+         options = SenseNovaU1GenerationOptions.from_batch(batch)
+         if int(batch.num_outputs_per_prompt) != 1:
+@@ -132,3 +157,255 @@ class SenseNovaU1GenerationStage(PipelineStage):
+             metrics=batch.metrics,
+             usage=usage,
+         )
++
++    @torch.inference_mode()
++    def forward_edit(self, batch, server_args):
++        options = SenseNovaU1GenerationOptions.from_batch(batch)
++        prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
++        if len(prompts) != 1:
++            raise ValueError(
++                "An I2I batch shares one prompt and ordered reference images"
++            )
++        images = batch.condition_image
++        images = images if isinstance(images, list) else [images]
++        if not images or any(image is None for image in images):
++            raise ValueError("Image editing requires at least one reference image")
++        extra = batch.extra.get(SENSENOVA_U1_REQUEST_EXTRA_KEY, {})
++        fixed_pixels = extra.get("fixed_input_image_pixels", 0)
++        if fixed_pixels:
++            from sglang.multimodal_gen.runtime.models.sensenova_u1.geometry import (
++                resize_reference,
++            )
++
++            images = [
++                resize_reference(
++                    image, fixed_pixels, extra.get("max_input_image_side_length", 0)
++                )
++                for image in images
++            ]
++        count = int(batch.num_outputs_per_prompt)
++        seeds = normalize_output_seeds(batch.seed, num_outputs_per_prompt=count)
++        image_guidance = (
++            1.0 if batch.true_cfg_scale is None else float(batch.true_cfg_scale)
++        )
++        kwargs = dict(
++            image_size=(int(batch.width), int(batch.height)),
++            cfg_scale=float(batch.guidance_scale),
++            img_cfg_scale=image_guidance,
++            cfg_norm=options.cfg_norm,
++            cfg_interval=options.cfg_interval,
++            batch_size=count,
++            t_eps=options.t_eps,
++            think_mode=options.think_mode,
++            think_token_ids=options.think_token_ids,
++            max_think_tokens=options.max_think_tokens,
++        )
++        previous_t_eps = self.model.config.t_eps
++        try:
++            if getattr(batch, "rollout", False):
++                generated, think_text, rollout_data = self._forward_edit_rollout(
++                    batch, server_args, prompts[0], images, seeds, options, kwargs
++                )
++            else:
++                result = self.model.it2i_generate(
++                    self.tokenizer,
++                    prompts[0],
++                    images,
++                    **kwargs,
++                    num_steps=int(batch.num_inference_steps),
++                    seed=seeds,
++                    timestep_shift=options.timestep_shift,
++                    enable_timestep_shift=options.enable_timestep_shift,
++                )
++                generated, think_text = result if options.think_mode else (result, None)
++                rollout_data = None
++        finally:
++            self.model.config.t_eps = previous_t_eps
++        if not torch.isfinite(generated).all().item():
++            raise RuntimeError("The native image-editing output contains NaN or Inf")
++        expected = (count, 3, int(batch.height), int(batch.width))
++        if tuple(generated.shape) != expected:
++            raise RuntimeError(
++                f"Unexpected native output shape: {tuple(generated.shape)} != {expected}"
++            )
++        generated = _denorm_sensenova_output(generated)
++        if getattr(batch, "rollout", False):
++            # HTTP must carry tensor bytes, not node-local CUDA IPC handles.
++            # Serialization needs this host copy regardless of scheduler host.
++            generated = generated.cpu()
++        return OutputBatch(
++            output=[sample.contiguous() for sample in generated],
++            metrics=batch.metrics,
++            usage={"think_text": think_text} if think_text is not None else None,
++            rollout_trajectory_data=rollout_data,
++        )
++
++    def _forward_edit_rollout(
++        self, batch, server_args, prompt, images, seeds, options, model_kwargs
++    ):
++
++        from sglang.multimodal_gen.runtime.models.sensenova_u1.rollout import (
++            build_rollout_plans,
++        )
++        from sglang.multimodal_gen.runtime.post_training.flow_matching_scheduler import (
++            FlowMatchingRolloutScheduler,
++        )
++
++        if int(getattr(server_args, "num_gpus", 1) or 1) != 1:
++            raise ValueError(
++                "SenseNova rollout requires a single-GPU engine; use independent engines for DP"
++            )
++        rollout_options = (
++            batch.extra.get(SENSENOVA_U1_REQUEST_EXTRA_KEY, {}).get("rollout_options")
++            or {}
++        )
++        plans = build_rollout_plans(batch, rollout_options, seeds)
++        if [plan.request_seed for plan in plans] != seeds:
++            raise ValueError("Candidate seeds disagree with the request's output seeds")
++        plan = plans[0]
++        capture_ode = plan.capture == "ode_states"
++        if capture_ode and not (
++            batch.rollout_return_dit_trajectory and batch.rollout_return_denoising_env
++        ):
++            raise ValueError("ODE state capture requires trajectory and replay conditions")
++        selected_steps = set(plan.selected_indices)
++        old_velocities = []
++        conditioning = None
++        previous_scheduler = getattr(batch, "scheduler", None)
++        previous_latents = getattr(batch, "latents", None)
++        previous_return_steps = batch.rollout_return_step_indices
++        previous_sde_steps = batch.rollout_sde_step_indices
++        self.server_args = server_args
++        try:
++            conditioning = self.model.prepare_it2i_conditioning(
++                self.tokenizer, prompt, images, **model_kwargs
++            )
++            state = self.model.initialize_it2i_latents(
++                conditioning, [p.initial_seed for p in plans]
++            )
++            if state.dtype != torch.bfloat16:
++                raise ValueError("SenseNova initial noise must use BF16 model compute dtype")
++            # Preserve native noise generation/scaling before selecting the
++            # scheduler storage. Casting only the final response is not FP16 ODE.
++            state = state.to(getattr(torch, plan.storage_dtype))
++            native_times = plan.prepare_schedule(
++                self.model.it2i_timesteps(
++                    conditioning,
++                    int(batch.num_inference_steps),
++                    options.enable_timestep_shift,
++                    options.timestep_shift,
++                )
++            )
++            denoise_embeddings = self.model.prepare_it2i_timestep_embeddings(
++                conditioning, native_times
++            )
++            batch.latents = state
++            batch.scheduler = FlowMatchingRolloutScheduler(
++                timesteps=plan.timesteps,
++                sigmas=plan.sigmas,
++                denoise_seeds=[p.denoise_seeds for p in plans],
++                score_step_indices=plan.transition_indices,
++            )
++            batch.rollout_sde_step_indices = plan.sde_indices
++            # The shared collector filters state indices; the external adapter
++            # accepts transition indices and expands both replay boundaries.
++            batch.rollout_return_step_indices = plan.state_indices
++            batch.rollout_trajectory_data = None
++            self._maybe_prepare_rollout(batch)
++            self._maybe_init_denoising_env_collection(
++                batch,
++                server_args.pipeline_config,
++                {},
++                conditioning.get("replay_conditions") or {},
++                {},
++                None,
++            )
++            condition_record = {
++                "prompt": prompt,
++                "image_paths": batch.image_path,
++                "height": int(batch.height),
++                "width": int(batch.width),
++                "guidance_scale": model_kwargs["cfg_scale"],
++                "image_guidance_scale": model_kwargs["img_cfg_scale"],
++                "cfg_norm": options.cfg_norm,
++                "cfg_interval": list(options.cfg_interval),
++                "t_eps": options.t_eps,
++                "timestep_shift": options.timestep_shift,
++                "enable_timestep_shift": options.enable_timestep_shift,
++                "think_mode": options.think_mode,
++                "think": conditioning["think_record"] if options.think_mode else None,
++            }
++            env_state = batch._rollout_denoising_env_state
++            if env_state is not None and env_state["env"] is not None:
++                env_state["env"].pos_cond_kwargs_shared = True
++                env_state["env"].per_sample_image_kwargs = [
++                    {
++                        "sensenova_rollout": p.metadata(
++                            condition_record, batch_size=len(plans)
++                        )
++                    }
++                    for p in plans
++                ]
++            for i in range(plan.num_steps):
++                batch._rollout_loop_step_index = i
++                self._maybe_append_dit_trajectory_step(
++                    batch,
++                    state.clone() if capture_ode and i in selected_steps else state,
++                    plan.timesteps[i],
++                    i,
++                )
++                # Native FF keeps FP16 state but uses BF16 CUDA autocast for
++                # patchify, CNN/head compute and unpatchify's rounding boundary.
++                with torch.autocast(
++                    device_type=state.device.type,
++                    dtype=torch.bfloat16,
++                    enabled=plan.storage_dtype == "float16" and state.device.type == "cuda",
++                ):
++                    native_velocity = self.model.predict_it2i_velocity(
++                        state,
++                        native_times[i : i + 1],
++                        conditioning,
++                        inclusive_cfg=True,
++                        timestep_embeddings=(
++                            None
++                            if denoise_embeddings is None
++                            else denoise_embeddings[i].view(1, 1, -1)
++                        ),
++                    )
++                velocity = -native_velocity
++                if capture_ode and i in selected_steps:
++                    # Cache the actual scheduler input, never a finite difference
++                    # of quantized states or an unguided model-head prediction.
++                    old_velocities.append(velocity.detach().float().clone())
++                state = batch.scheduler.step(velocity, plan.timesteps[i], state, batch=batch)
++                if state.dtype != getattr(torch, plan.storage_dtype):
++                    raise RuntimeError(
++                        f"SenseNova scheduler changed storage dtype at step {i}"
++                    )
++            self._postprocess_rollout_outputs(
++                batch, state, plan.num_steps, plan.timesteps.new_tensor(0), server_args
++            )
++            data = batch.rollout_trajectory_data
++            if data.dit_trajectory is not None:
++                # Replay uses the full scheduler coordinate; sparse state
++                # positions are explicit in each sample's metadata.
++                data.dit_trajectory.timesteps = plan.timesteps.cpu()
++                if capture_ode:
++                    if len(old_velocities) != len(plan.selected_indices):
++                        raise RuntimeError("Incomplete ODE velocity capture")
++                    data.dit_trajectory.old_velocities = torch.stack(old_velocities, dim=1).cpu().contiguous()
++            return (
++                state,
++                conditioning["think_text"] if options.think_mode else None,
++                data,
++            )
++        finally:
++            if batch.scheduler is not previous_scheduler:
++                batch.scheduler.release_rollout_resources(batch)
++            batch._rollout_denoising_env_state = None
++            batch.scheduler = previous_scheduler
++            batch.latents = previous_latents
++            batch.rollout_return_step_indices = previous_return_steps
++            batch.rollout_sde_step_indices = previous_sde_steps
++            if conditioning is not None:
++                self.model.release_it2i_conditioning(conditioning)
+diff --git a/python/sglang/multimodal_gen/runtime/post_training/flow_matching.py b/python/sglang/multimodal_gen/runtime/post_training/flow_matching.py
+new file mode 100644
+index 0000000..f9d6aef
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/post_training/flow_matching.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Stateless flow-matching transitions for rollout schedulers.
++
++The caller owns scheduling and randomness. Transition scores describe the
++sampled observation after rounding to the configured storage dtype. CPS uses a
++residual-MSE score, not a normalized Gaussian log density.
++"""
++
++from dataclasses import dataclass
++
++import torch
++
++
++@dataclass
++class FlowStepOutput:
++    next_sample: torch.Tensor
++    mean: torch.Tensor
++    noise_std: torch.Tensor
++    dt: torch.Tensor
++    score: torch.Tensor | None
++    score_kind: str
++
++
++def flow_matching_step(
++    sample: torch.Tensor,
++    velocity: torch.Tensor,
++    sigma: torch.Tensor,
++    sigma_next: torch.Tensor,
++    *,
++    dynamics: str,
++    noise_level: float,
++    variance_noise: torch.Tensor | None = None,
++    compute_score: bool = False,
++    sigma_max: float | torch.Tensor | None = None,
++) -> FlowStepOutput:
++    """Sample one descending-sigma transition and optionally score its output.
++
++    ``velocity`` points from clean data toward noise. Scoring the rounded
++    output keeps the sampling record consistent with the returned trajectory.
++    The caller validates the descending sigma schedule once before sampling;
++    FlowMatchingRolloutScheduler does this at construction.
++    """
++    if dynamics not in ("ode", "cps", "sde"):
++        raise ValueError(f"Unsupported flow dynamics: {dynamics!r}")
++    if sample.shape != velocity.shape or sample.ndim < 2:
++        raise ValueError("sample and velocity must have the same batched shape")
++    if sample.dtype not in (torch.bfloat16, torch.float16, torch.float32):
++        raise ValueError("sample must use BF16, FP16 or FP32 boundary storage")
++    if not 0 <= noise_level <= 1:
++        raise ValueError("noise_level must be finite and in [0, 1]")
++    if variance_noise is not None and variance_noise.shape != sample.shape:
++        raise ValueError("variance_noise must match sample shape")
++    if dynamics == "ode" and compute_score:
++        raise ValueError("ODE has no transition score")
++    if compute_score and dynamics == "sde" and noise_level == 0:
++        raise ValueError("A zero-noise Gaussian cannot be scored")
++
++    def broadcast(value):
++        value = torch.as_tensor(value, device=sample.device, dtype=torch.float32)
++        if value.numel() not in (1, sample.shape[0]):
++            raise ValueError("sigma must be scalar or have one value per sample")
++        return value.reshape(-1, *([1] * (sample.ndim - 1)))
++
++    current, following = broadcast(sigma), broadcast(sigma_next)
++    state, prediction = sample.float(), velocity.float()
++    dt = following - current
++    score_kind = "none"
++
++    if dynamics == "ode":
++        mean = (state + prediction * dt).to(sample.dtype).float()
++        noise_std = torch.zeros_like(current)
++    elif dynamics == "cps":
++        noise_std = following * torch.sin(
++            current.new_full((), noise_level) * torch.pi / 2
++        )
++        clean = state - current * prediction
++        noise = state + prediction * (1 - current)
++        mean = clean * (1 - following) + noise * torch.sqrt(following**2 - noise_std**2)
++        score_kind = "cps_residual_mse"
++    else:
++        if sigma_max is None:
++            raise ValueError("Flow-SDE requires the actual schedule sigma_max")
++        maximum = broadcast(sigma_max)
++        coefficient = (
++            torch.sqrt(current / (1 - torch.where(current == 1, maximum, current)))
++            * noise_level
++        )
++        noise_std = coefficient * torch.sqrt(-dt)
++        mean = (
++            state * (1 + coefficient**2 / (2 * current) * dt)
++            + prediction * (1 + coefficient**2 * (1 - current) / (2 * current)) * dt
++        )
++        score_kind = "gaussian_mean_logprob"
++
++    if dynamics != "ode" and noise_level > 0 and variance_noise is None:
++        raise ValueError("Stochastic sampling requires explicit variance_noise")
++    sampled = mean
++    if variance_noise is not None and dynamics != "ode":
++        sampled = sampled + noise_std * variance_noise.float()
++    next_sample = sampled.to(sample.dtype)
++
++    score = None
++    if compute_score:
++        residual_squared = (next_sample.detach().float() - mean) ** 2
++        if dynamics == "cps":
++            elementwise = -residual_squared
++        else:
++            # Compute the Gaussian normalizer in FP32 and reduce per sample in FP64.
++            elementwise = (
++                -residual_squared / (2 * noise_std**2)
++                - torch.log(noise_std)
++                - torch.log(torch.sqrt(current.new_full((), torch.pi * 2)))
++            )
++        score = elementwise.flatten(1).mean(dim=1, dtype=torch.float64).float()
++
++    return FlowStepOutput(next_sample, mean, noise_std, dt, score, score_kind)
+diff --git a/python/sglang/multimodal_gen/runtime/post_training/flow_matching_scheduler.py b/python/sglang/multimodal_gen/runtime/post_training/flow_matching_scheduler.py
+new file mode 100644
+index 0000000..470c4e5
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/post_training/flow_matching_scheduler.py
+@@ -0,0 +1,108 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Explicit-noise flow scheduler using the shared rollout session lifecycle.
++
++Models provide noise-directed velocity. This opt-in scheduler scores rounded
++storage states and consumes independent, explicit noise streams. Existing
++schedulers retain their current numerical conventions.
++"""
++
++import torch
++from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
++from sglang.multimodal_gen.runtime.post_training.flow_matching import flow_matching_step
++from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
++    SchedulerRLMixin,
++)
++
++
++class FlowMatchingRolloutScheduler(SchedulerRLMixin):
++    def __init__(self, *, timesteps, sigmas, denoise_seeds, score_step_indices):
++        if sigmas.ndim != 1 or timesteps.ndim != 1 or len(sigmas) != len(timesteps) + 1:
++            raise ValueError("Expected T timesteps and T+1 sigmas")
++        # Validate once, before the loop; Python checks on CUDA scalars would
++        # otherwise synchronize the device at every transition.
++        schedule = sigmas.detach().cpu()
++        if (
++            len(schedule) < 2
++            or not torch.isfinite(schedule).all()
++            or schedule[0] > 1
++            or schedule[-1] < 0
++            or not torch.all(schedule[:-1] > schedule[1:])
++        ):
++            raise ValueError("Expected finite, descending sigmas in [0, 1]")
++        if not denoise_seeds or any(
++            len(seeds) != len(timesteps) for seeds in denoise_seeds
++        ):
++            raise ValueError("Expected one transition seed per sample and timestep")
++        self.timesteps = timesteps
++        self.sigmas = sigmas
++        self.denoise_seeds = denoise_seeds
++        self.score_step_indices = set(score_step_indices)
++        self._step_index = 0
++
++    def prepare_rollout(self, batch, pipeline_config=None):
++        if get_sp_world_size() != 1:
++            raise ValueError(
++                "Explicit-noise rollout scheduler requires unsharded states"
++            )
++        if batch.latents.shape[0] != len(self.denoise_seeds):
++            raise ValueError("Latent batch size does not match candidate seed streams")
++        if batch.rollout_sde_type == "sde" and len(self.timesteps) < 2:
++            raise ValueError("Flow-SDE requires at least two steps for sigma_max")
++        super().prepare_rollout(batch, pipeline_config)
++        self._step_index = 0
++
++    def step(self, model_output, timestep, sample, *, batch):
++        self._get_rollout_session_data(batch)
++        index = batch._rollout_loop_step_index
++        if index != self._step_index or index >= len(self.timesteps):
++            raise ValueError(
++                "Rollout steps must execute exactly once in scheduler order"
++            )
++        selected = batch.rollout_sde_step_indices
++        level = (
++            batch.rollout_noise_level if selected is None or index in selected else 0.0
++        )
++        if batch.rollout_sde_type == "ode":
++            level = 0.0
++        noise = None
++        if level > 0:
++            # Draw [1, ...] separately: batching/reordering cannot change a
++            # candidate's random stream. The model forward remains batched.
++            noise = torch.cat(
++                [
++                    torch.randn(
++                        (1, *sample.shape[1:]),
++                        device=sample.device,
++                        dtype=torch.float32,
++                        generator=torch.Generator(device=sample.device).manual_seed(
++                            seeds[index]
++                        ),
++                    )
++                    for seeds in self.denoise_seeds
++                ]
++            )
++        collect = index in self.score_step_indices
++        output = flow_matching_step(
++            sample,
++            model_output,
++            self.sigmas[index],
++            self.sigmas[index + 1],
++            dynamics=batch.rollout_sde_type,
++            noise_level=level,
++            variance_noise=noise,
++            compute_score=collect,
++            sigma_max=self.sigmas[min(1, len(self.sigmas) - 1)],
++        )
++        if collect:
++            # flow_matching_step already reduces in FP64. Preserve that result
++            # while reusing the shared sum/count collection interface.
++            self.append_local_rollout_log_probs(
++                batch, output.score.detach(), torch.ones_like(output.score)
++            )
++        self._step_index += 1
++        return output.next_sample
++
++    def collect_rollout_log_probs(self, batch):
++        if not self._get_rollout_session_data(batch).local_log_prob_sum:
++            return None
++        return super().collect_rollout_log_probs(batch)
+diff --git a/python/sglang/multimodal_gen/runtime/post_training/rl_dataclasses.py b/python/sglang/multimodal_gen/runtime/post_training/rl_dataclasses.py
+index 012c69c..6f7ac49 100644
+--- a/python/sglang/multimodal_gen/runtime/post_training/rl_dataclasses.py
++++ b/python/sglang/multimodal_gen/runtime/post_training/rl_dataclasses.py
+@@ -42,8 +42,22 @@ class RolloutDebugTensors:
+ class RolloutDenoisingEnv:
+     image_kwargs: dict[str, Any] | None = None
+     pos_cond_kwargs: dict[str, Any] | None = None
++    # SenseNova candidates share a canonical prefix. Its leading axes are
++    # attention/position axes, not a guessed candidate batch dimension.
++    pos_cond_kwargs_shared: bool = False
+     neg_cond_kwargs: dict[str, Any] | None = None
+     guidance: torch.Tensor | None = None
++    # Explicit sample axis for non-tensor metadata. Lists within a sample
++    # (token IDs, reference images, step indices) are never guessed to be batch axes.
++    per_sample_image_kwargs: list[dict[str, Any]] | None = None
++
++
++def select_denoising_env_metadata(
++    env: RolloutDenoisingEnv, index: int
++) -> dict[str, Any] | None:
++    if env.per_sample_image_kwargs is None:
++        return env.image_kwargs
++    return {**(env.image_kwargs or {}), **env.per_sample_image_kwargs[index]}
+ 
+ 
+ @dataclass
+@@ -54,6 +68,10 @@ class RolloutDitTrajectory:
+     timesteps: torch.Tensor | None = None  # [T]
+     # [T+1] scheduler.sigmas snapshot (post-shift, includes terminal 0).
+     sigmas: torch.Tensor | None = None
++    # SenseNova ART: [B, S, C, H, W] FP32 scheduler-consumed velocities.
++    # The selected input step indices live in the explicit sample metadata;
++    # the terminal state has no associated old velocity.
++    old_velocities: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -108,6 +126,9 @@ def concat_rollout_trajectory_data(
+             ),
+             timesteps=first.dit_trajectory.timesteps,
+             sigmas=first.dit_trajectory.sigmas,
++            old_velocities=_cat_per_output(
++                [data.dit_trajectory.old_velocities for data in per_output]
++            ),
+         )
+ 
+     return RolloutTrajectoryData(
+@@ -115,11 +136,34 @@ def concat_rollout_trajectory_data(
+             [data.rollout_log_probs for data in per_output]
+         ),
+         rollout_debug_tensors=debug_tensors,
+-        denoising_env=first.denoising_env,
++        denoising_env=_concat_denoising_env(per_output),
+         dit_trajectory=dit_trajectory,
+     )
+ 
+ 
++def _concat_denoising_env(per_output):
++    first = per_output[0].denoising_env
++    if first is None or first.per_sample_image_kwargs is None:
++        return first
++    from dataclasses import replace
++
++    if any(
++        data.denoising_env is None or data.denoising_env.per_sample_image_kwargs is None
++        for data in per_output
++    ):
++        raise ValueError(
++            "Cannot combine rollout environments with incomplete sample metadata"
++        )
++    return replace(
++        first,
++        per_sample_image_kwargs=[
++            item
++            for data in per_output
++            for item in data.denoising_env.per_sample_image_kwargs
++        ],
++    )
++
++
+ def _slice_output_dim(
+     tensor: torch.Tensor | None, output_index: int
+ ) -> torch.Tensor | None:
+@@ -160,13 +204,21 @@ def select_output_rollout_trajectory(
+             latents=_slice_output_dim(dit_trajectory.latents, output_index),
+             timesteps=dit_trajectory.timesteps,
+             sigmas=dit_trajectory.sigmas,
++            old_velocities=_slice_output_dim(dit_trajectory.old_velocities, output_index),
+         )
+ 
++    env = rollout_trajectory_data.denoising_env
++    if env is not None and env.per_sample_image_kwargs is not None:
++        from dataclasses import replace
++
++        env = replace(
++            env, per_sample_image_kwargs=[env.per_sample_image_kwargs[output_index]]
++        )
+     return RolloutTrajectoryData(
+         rollout_log_probs=_slice_output_dim(
+             rollout_trajectory_data.rollout_log_probs, output_index
+         ),
+         rollout_debug_tensors=debug_tensors,
+-        denoising_env=rollout_trajectory_data.denoising_env,
++        denoising_env=env,
+         dit_trajectory=dit_trajectory,
+     )
+diff --git a/python/sglang/kernels/aot/CMakeLists.txt b/python/sglang/kernels/aot/CMakeLists.txt
+--- a/python/sglang/kernels/aot/CMakeLists.txt
++++ b/python/sglang/kernels/aot/CMakeLists.txt
+@@ -219,6 +219,7 @@
+     endif()
+     list(APPEND SGL_KERNEL_CUDA_FLAGS
+         "-gencode=arch=compute_120a,code=sm_120a"
++        "-gencode=arch=compute_103a,code=sm_103a"
+     )
+     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
+     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")

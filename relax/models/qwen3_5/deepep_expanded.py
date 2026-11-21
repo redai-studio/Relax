@@ -8,8 +8,7 @@ import torch
 from megatron.core.transformer.moe import fused_a2a as fa
 from megatron.core.transformer.moe import token_dispatcher as td
 
-
-CAPACITY = 131072
+from relax.models.qwen3_5.recipe import EXPANDED_ROWS_PER_RANK as CAPACITY
 
 
 def _event_args(buffer, asynchronous, allocate):

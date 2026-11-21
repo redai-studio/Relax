@@ -649,7 +649,7 @@ class PrefetchBuffer:
         stop_event = self._stop
         self._thread = threading.Thread(target=self._run, args=(stop_event,), daemon=True, name="prefetch-worker")
         self._thread.start()
-        logger.info(f"PrefetchBuffer: started prefetching {len(indices)} samples")
+        logger.debug(f"PrefetchBuffer: started prefetching {len(indices)} samples")
 
     def get(self, idx: int) -> Optional[Sample]:
         """Return the sample for *idx*.
@@ -852,6 +852,9 @@ class PrefetchBuffer:
             logger.info("Prefetch thread finished. Hit rate: %.1f%%", self.hit_rate * 100)
 
 
+_FILTERED_BY_LENGTH = Sample()  # Private sentinel; None denotes a read or processing failure.
+
+
 class StreamingDataset(BaseDataset):
     """Memory-efficient streaming dataset with on-demand loading.
 
@@ -969,7 +972,7 @@ class StreamingDataset(BaseDataset):
         self._prefetch_buffer: Optional[PrefetchBuffer] = None
         if multimodal_keys and prefetch_max_cached > 0:
             self._prefetch_buffer = PrefetchBuffer(
-                process_fn=self._prefetch_process_single,
+                process_fn=lambda idx: self._prepare_sample(self.reader[idx]),
                 chunk_size=prefetch_chunk_size,
                 max_cached=prefetch_max_cached,
                 num_workers=prefetch_num_workers,
@@ -980,24 +983,6 @@ class StreamingDataset(BaseDataset):
                 f"num_workers={prefetch_num_workers}"
             )
         self._prefetch_hits_log_counter = 0
-
-    def _prefetch_process_single(self, idx: int) -> Optional[Sample]:
-        """Process a single index for prefetching.
-
-        Called by the PrefetchBuffer's worker threads.  Each call loads
-        a single sample (including heavy video/image I/O) and returns it.
-
-        NOTE: We intentionally do NOT access ``self.buffer`` (SampleBuffer)
-        here because SampleBuffer is not thread-safe and these calls run
-        in parallel worker threads.
-        """
-        try:
-            raw_data = self.reader[idx]
-            sample = self._process_raw_data(raw_data)
-            return sample
-        except Exception as e:
-            logger.warning(f"Prefetch: error processing index {idx}: {e}")
-            return None
 
     def __len__(self) -> int:
         """Return total number of samples in the dataset."""
@@ -1016,28 +1001,25 @@ class StreamingDataset(BaseDataset):
         """
         self.index_manager.shuffle(epoch_id)
         self.epoch_id = epoch_id
-        # Trigger prefetch with the remaining upcoming index order
+        self._reset_prefetch_window()
+
+    def _reset_prefetch_window(self) -> None:
         if self._prefetch_buffer is not None and self.index_manager.indices is not None:
             remaining = self.index_manager.indices[self.index_manager.position :]
-            self._prefetch_buffer.set_index_order(list(remaining))
+            self._prefetch_buffer.set_index_order(remaining)
             logger.info(
-                f"Prefetch: triggered for epoch {epoch_id}, "
-                f"{len(remaining)} indices remaining (position={self.index_manager.position})"
+                f"Prefetch window: epoch={self.index_manager.current_epoch}, "
+                f"position={self.index_manager.position}, remaining={len(remaining)}"
             )
 
-    def _process_raw_data(self, data: dict) -> Optional[Sample]:
-        """Process raw data into a Sample.
-
-        Uses the shared _process_data from BaseDataset.
-
-        Args:
-            data: Raw data dict from file
-
-        Returns:
-            Sample or None if filtered out
-        """
+    def _record_consumed(self, sample: Optional[Sample]) -> Optional[Sample]:
         self._total_processed += 1
+        if sample is _FILTERED_BY_LENGTH:
+            self._filter_count += 1
+            return None
+        return sample
 
+    def _prepare_sample(self, data: dict) -> Optional[Sample]:
         try:
             sample = self._process_data(data)
 
@@ -1050,8 +1032,7 @@ class StreamingDataset(BaseDataset):
                     self.max_length,
                     apply_chat_template_kwargs=self.apply_chat_template_kwargs,
                 ):
-                    self._filter_count += 1
-                    return None
+                    return _FILTERED_BY_LENGTH
 
             return sample
 
@@ -1095,19 +1076,11 @@ class StreamingDataset(BaseDataset):
             indices, epoch_crossed = self.index_manager.get_next_indices(1)
             if epoch_crossed and not crossed_epoch:
                 crossed_epoch = True
-                # IndexManager already shuffled the new epoch internally.
-                # Re-trigger prefetch immediately for the remaining indices
-                # so subsequent get() calls hit the cache instead of falling
-                # back to synchronous loading.
-                remaining = self.index_manager.indices[self.index_manager.position :]
-                self._prefetch_buffer.set_index_order(list(remaining))
-                logger.info(
-                    f"Prefetch: epoch crossing detected, re-triggered with "
-                    f"{len(remaining)} indices (epoch={self.index_manager.current_epoch})"
-                )
+                # IndexManager has shuffled the new epoch, but prefetch still follows the old order.
+                self._reset_prefetch_window()
             idx = indices[0]
 
-            sample = self._prefetch_buffer.get(idx)
+            sample = self._record_consumed(self._prefetch_buffer.get(idx))
 
             if sample is None:
                 # Prefetch returned None — either the sample was filtered
@@ -1146,19 +1119,9 @@ class StreamingDataset(BaseDataset):
             indices, epoch_crossed = self.index_manager.get_next_indices(fetch_size)
             crossed_epoch = crossed_epoch or epoch_crossed
 
+            attempts += len(indices)
             for idx in indices:
-                if len(samples) >= n:
-                    break
-
-                attempts += 1
-
-                sample = self.buffer.get(idx)
-                if sample is None:
-                    raw_data = self.reader[idx]
-                    sample = self._process_raw_data(raw_data)
-                    if sample is not None:
-                        self.buffer.put(idx, sample)
-
+                sample = self[idx]
                 if sample is not None:
                     samples.append(sample)
 
@@ -1184,7 +1147,7 @@ class StreamingDataset(BaseDataset):
             return sample
 
         raw_data = self.reader[idx]
-        sample = self._process_raw_data(raw_data)
+        sample = self._record_consumed(self._prepare_sample(raw_data))
 
         if sample is not None:
             self.buffer.put(idx, sample)
@@ -1213,6 +1176,7 @@ class StreamingDataset(BaseDataset):
         self.index_manager.load_state(state)
         self._filter_count = state.get("filter_count", 0)
         self._total_processed = state.get("total_processed", 0)
+        self._reset_prefetch_window()
 
     def get_stats(self) -> dict:
         """Get dataset statistics."""

@@ -16,11 +16,14 @@ Consolidates three previously separate suites:
   base/adapter prefix-join used by the merge lookup.
 """
 
+import ast
 import json
+import re
+import sys
 import tempfile
 from collections import namedtuple
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -319,6 +322,107 @@ class TestMergeContract:
         merged = LoRAMerge().merge(base.float(), b.float(), a.float(), alpha, r, tp_group=None)
         expected = base + (alpha / r) * (b @ a)
         assert torch.allclose(merged, expected, atol=1e-5)
+
+
+@pytest.fixture
+def merge_entrypoints(monkeypatch):
+    """Execute the production merge methods without importing Megatron/CUDA."""
+    calls = []
+
+    class LoRAMerge:
+        # Deliberately use the Bridge API's strict signature: tp_size must fail.
+        def merge(self, base_weight, linear_out, linear_in, alpha, dim, *, tp_group, scale=None):
+            assert base_weight.dtype == linear_out.dtype == linear_in.dtype == torch.float32
+            calls.append(tp_group)
+            return base_weight + (alpha / dim) * (linear_out @ linear_in)
+
+    module = ModuleType("megatron.bridge.peft.lora_merge")
+    module.LoRAMerge = LoRAMerge
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    tp_group, etp_group = object(), object()
+    mpu = SimpleNamespace(
+        get_tensor_model_parallel_group=lambda: tp_group,
+        get_expert_tensor_parallel_group=lambda: etp_group,
+        get_expert_model_parallel_world_size=lambda: 2,
+        get_expert_model_parallel_rank=lambda: 1,
+    )
+    namespace = {"torch": torch, "re": re, "mpu": mpu, "LoRAMerge": LoRAMerge}
+    root = Path(__file__).resolve().parents[5]
+    for path, class_name, method_name in (
+        ("relax/distributed/checkpoint_service/backends/device_direct.py", "DeviceDirectBackend", "_merge_full_base"),
+        (
+            "relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py",
+            "HfWeightIteratorBridge",
+            "_merge_base_with_adapter",
+        ),
+    ):
+        tree = ast.parse((root / path).read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == method_name)
+        definitions = [
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_base_param_prefix"
+        ]
+        exec(compile(ast.Module(body=[*definitions, method], type_ignores=[]), str(root / path), "exec"), namespace)
+    return SimpleNamespace(**namespace, calls=calls, tp_group=tp_group, etp_group=etp_group)
+
+
+@pytest.mark.parametrize("expert", [False, True])
+@pytest.mark.parametrize("entrypoint", ["dcs", "iterator"])
+@pytest.mark.parametrize("paired", [False, True])
+def test_lora_merge_entrypoints_preserve_weights_and_parallel_groups(merge_entrypoints, expert, entrypoint, paired):
+    env = merge_entrypoints
+    name = "decoder.layers.0.mlp.experts.linear_fc1.to_wrap.weight3" if expert else "linear_qkv.to_wrap.weight"
+    prefix = env._base_param_prefix(name)
+    base = torch.arange(30, dtype=torch.bfloat16).reshape(6, 5)
+    original = base.clone()
+    a, b = torch.ones(2, 5), torch.full((6, 2), 3.0)
+    # EP rank 1 owns experts 2 and 3; weight3 must use local slice 1.
+    linear_in = torch.stack([a * 9, a]) if expert else a
+    linear_out = torch.stack([b * 7, b]) if expert else b
+    args = SimpleNamespace(lora_alpha=8, lora_rank=2, num_experts=4)
+    if entrypoint == "dcs":
+        instance = SimpleNamespace(
+            args=args,
+            _lora_adapter_full={prefix: {"in": linear_in, "out": linear_out}} if paired else {},
+            _megatron=SimpleNamespace(base_param_prefix=env._base_param_prefix, mpu=env.mpu),
+        )
+        result = env._merge_full_base(instance, name, base)
+        expected_group = None
+    else:
+        instance = SimpleNamespace(
+            args=args, lora_alpha=8, lora_dim=2, _adapter_map={prefix: {"in": "A", "out": "B"}} if paired else {}
+        )
+        info = SimpleNamespace(name=name, attrs={"tensor_model_parallel": True, "partition_dim": 0})
+        result = env._merge_base_with_adapter(instance, info, base, {"A": linear_in, "B": linear_out}, "cpu")
+        expected_group = env.etp_group if expert else env.tp_group
+        if paired:
+            assert not result.requires_grad
+            assert result.tensor_model_parallel
+            assert result.partition_dim == 0
+    assert torch.equal(base, original)
+    if paired:
+        assert env.calls == [expected_group]
+        assert result.dtype == base.dtype
+        torch.testing.assert_close(result, (original.float() + 4 * (b @ a)).to(base.dtype))
+    else:
+        assert result is base
+        assert env.calls == []
+
+
+def test_adapter_splice_wrapper_forwards_bridge_export_options():
+    from relax.utils.megatron_bridge_utils import _make_adapter_splice_wrapper
+
+    bridge, model, excluded = object(), object(), {"mtp.layers.0.eh_proj"}
+    tasks = {"layer": []}
+
+    def build_tasks(self, megatron_model, conversion_tasks, *, exclude_adapter_base_prefixes):
+        assert self is bridge
+        assert megatron_model is model
+        assert exclude_adapter_base_prefixes is excluded
+        return conversion_tasks
+
+    result = _make_adapter_splice_wrapper(build_tasks)(bridge, model, tasks, exclude_adapter_base_prefixes=excluded)
+    assert result is tasks
 
 
 class TestPrefixJoin:
