@@ -11,6 +11,7 @@ from functools import lru_cache
 from itertools import chain
 from typing import Any
 
+import numpy as np
 import torch
 
 from relax.utils.sparse_tensor import storage_identity
@@ -372,6 +373,8 @@ class ShardFrame:
     fence."""
 
     BLOCK = 512
+    # Limit each vector of temporary int64 tile indices to 256 KiB.
+    _HOST_BATCH_TILES = 32 * 1024
 
     @classmethod
     def ordered_workspace(cls, codes: list) -> int:
@@ -386,7 +389,8 @@ class ShardFrame:
         self.plan = plan
         self.raw = raw
         self.runs = []
-        rows = []
+        descriptors = np.empty((len(ordinals), 6), dtype=np.int64)
+        tile_count = descriptor_count = 0
         self.local_checks = []
         selected = set(ordinals)
         self.group_runs = []
@@ -414,34 +418,49 @@ class ShardFrame:
                     groups.setdefault(weight, []).append((entry, positions, values, base, limit))
                 batch = []
                 for weight, parts in groups.items():
-                    first = len(rows)
+                    first = tile_count
                     for entry, positions, values, base, limit in parts:
                         count = entry["count"]
                         if raw.device.type == "cpu":
                             self.local_checks.append((positions, limit))
-                        for tile in range(0, count, self.BLOCK):
-                            rows.append(
-                                (
-                                    entry["offset"] + 4 * tile,
-                                    entry["value_offset"] + 2 * tile,
-                                    min(count - tile, self.BLOCK),
-                                    int(tile > 0),
-                                    base,
-                                    limit,
-                                )
+                        if count:
+                            descriptors[descriptor_count] = (
+                                tile_count,
+                                entry["offset"],
+                                entry["value_offset"],
+                                count,
+                                base,
+                                limit,
                             )
-                    batch.append((weight, first, len(rows), parts if raw.device.type == "cpu" else None))
+                            descriptor_count += 1
+                            tile_count += (count + self.BLOCK - 1) // self.BLOCK
+                    batch.append((weight, first, tile_count, parts if raw.device.type == "cpu" else None))
                 self.runs.append((True, batch))
             if stop == end:
                 self.group_runs.append(self.runs[group_start:])
                 group_start = len(self.runs)
                 end = next(ends, len(entries))
             start = stop
-        self.table = (
-            torch.tensor(rows, dtype=torch.int64, pin_memory=raw.is_cuda).to(raw.device, non_blocking=True)
-            if rows
-            else None
-        )
+        self.table = self._tile_table(descriptors[:descriptor_count], tile_count, raw) if tile_count else None
+
+    @classmethod
+    def _tile_table(cls, descriptors: np.ndarray, tile_count: int, raw: torch.Tensor) -> torch.Tensor:
+        host = torch.empty((tile_count, 6), dtype=torch.int64, device="cpu", pin_memory=raw.is_cuda)
+        table = host.numpy()
+        first, position_offset, value_offset, count, base, limit = descriptors.T
+        for start in range(0, tile_count, cls._HOST_BATCH_TILES):
+            stop = min(start + cls._HOST_BATCH_TILES, tile_count)
+            rows = table[start:stop]
+            tiles = np.arange(start, stop, dtype=np.int64)
+            owner = np.searchsorted(first, tiles, side="right") - 1
+            offset = (tiles - first[owner]) * cls.BLOCK
+            rows[:, 0] = position_offset[owner] + 4 * offset
+            rows[:, 1] = value_offset[owner] + 2 * offset
+            rows[:, 2] = np.minimum(count[owner] - offset, cls.BLOCK)
+            rows[:, 3] = offset != 0
+            rows[:, 4] = base[owner]
+            rows[:, 5] = limit[owner]
+        return host.to(raw.device, non_blocking=True)
 
     def invalid_positions(self) -> torch.Tensor | None:
         if self.table is None:
