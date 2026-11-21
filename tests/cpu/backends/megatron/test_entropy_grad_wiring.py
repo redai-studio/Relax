@@ -111,11 +111,19 @@ def test_policy_checkpoint_entropy_matches_eager(monkeypatch, coef, reentrant, r
         entropy = metrics["values"][1 + metrics["keys"].index("entropy_loss")]
         return loss.detach(), entropy, logits.grad
 
-    expected = run(False)
-    actual = run(True)
+    ref_logits = inputs.clone().requires_grad_()
+    # Only the first response token (target 1) contributes, with unit advantage and on-policy ratio 1.
+    log_probs = ref_logits[0, 0].log_softmax(dim=-1)
+    ref_entropy = -(log_probs.exp() * log_probs).sum()
+    ratio = (log_probs[1] - log_probs[1].detach()).exp()
+    ref_loss = -ratio - coef * ref_entropy
+    (ref_grad,) = torch.autograd.grad(ref_loss, ref_logits)
+
+    for loss, entropy, grad in (run(False), run(True)):
+        torch.testing.assert_close(grad, ref_grad)
+        torch.testing.assert_close(loss, ref_loss.detach())
+        torch.testing.assert_close(entropy, ref_entropy.detach())
     assert [call.kwargs["with_entropy"] for call in kernel.call_args_list] == [True, True, replay_entropy]
-    for observed, reference in zip(actual, expected, strict=True):
-        torch.testing.assert_close(observed, reference)
 
 
 def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.MonkeyPatch) -> None:

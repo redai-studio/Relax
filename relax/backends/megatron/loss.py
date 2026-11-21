@@ -1230,8 +1230,6 @@ def policy_loss_function(
         pg_loss_reducer = sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
-    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
 
     loss = pg_loss
     if with_entropy:
@@ -1265,6 +1263,9 @@ def policy_loss_function(
 
     if not with_entropy:
         return loss, {}  # The checkpoint forward already returned the metrics.
+
+    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
+    ppo_kl = sum_of_sample_mean(ppo_kl)
 
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
