@@ -680,11 +680,8 @@ class DeviceDirectBackend(CommBackend):
         self._skip_empty_actor_fwd_ref_sync = (
             self.role_info.role_name == "actor" and topology_data.get("world_size") == 1
         )
-        if self._skip_empty_actor_fwd_ref_sync:
-            self._model_update_groups_for_actor_fwd_ref = None
-            return
         previous = cache.get(mode)
-        if previous and previous[0] == self._forward_topology_id:
+        if previous and previous[0] == self._forward_topology_id and not self._skip_empty_actor_fwd_ref_sync:
             self._model_update_groups_for_actor_fwd_ref = previous[1]
             return
         if previous:
@@ -693,6 +690,9 @@ class DeviceDirectBackend(CommBackend):
                 if group is not None:
                     dist.destroy_process_group(group)
             del cache[mode]
+        if self._skip_empty_actor_fwd_ref_sync:
+            self._model_update_groups_for_actor_fwd_ref = None
+            return
         pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
         groups = None if self.role_info.role_name == "actor" else {}
         for name, endpoint in sorted(topology_data["pp_groups"].items()):

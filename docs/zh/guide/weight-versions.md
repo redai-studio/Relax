@@ -6,6 +6,8 @@
 
 通过 `--weight-version-config` 指定发布配置，通过 `--weight-consumer-config` 指定消费者配置。省略这两个参数时沿用现有同步路径。
 
+使用版本发布的 SFT 周期预测时，同时配置发布端与同一权重流的消费者。训练步将已发布的版本号和内容摘要传给预测端，各推理引擎确认该版本已生效后，预测端写入本步的 JSONL。仅导出训练权重时可以单独配置发布端。
+
 SharedFS 消费者使用 `transport.type=sharedfs`，配置 `transport.store` 和 `transport.disk_budget`。发布端和消费端使用可共同访问的仓库路径，各自配置临时目录与空间预算。
 
 ## 发布与安装

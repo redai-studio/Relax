@@ -1403,7 +1403,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 store_prefix=store_prefix,
             )
 
-    def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
+    def _run_step_evaluation(
+        self, rollout_id: int, *, end_update_weight: bool = False, published_version: dict | None = None
+    ) -> None:
         is_offline = is_offline_mode(self.args)
         has_rollout = getattr(self, "rollout_manager", None) is not None
 
@@ -1430,7 +1432,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 if should_run_predict:
                     with manual_gc_eval(self.args):
-                        run_sft_predict(self, rollout_id)
+                        run_sft_predict(self, rollout_id, published_version=published_version)
             except Exception as e:
                 logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
@@ -2368,19 +2370,22 @@ class MegatronTrainRayActor(TrainRayActor):
         if should_save_checkpoint(self.args, rollout_id + 1):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
+        published_version = None
         if self._per_step_rollout:
             if self.args.offload_train:
                 self.sleep()
             if has_rollout:
                 self.update_weights()
         elif getattr(self.args, "weight_version_config", None):
-            self.publish_weight_version()
+            published_version = self.publish_weight_version()
         with timer("train_metrics_flush"):
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id), wait=is_train_done)
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
+        self._run_step_evaluation(
+            evaluation_step_for_rollout(self.args, rollout_id), published_version=published_version
+        )
 
         # On the final training step the rollout component has already exited
         # its main loop, so nothing else awaits the eval handler. Block here

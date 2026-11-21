@@ -393,7 +393,6 @@ class DCSCoordinator:
         topology_id = hashlib.sha256(json.dumps(members, sort_keys=True).encode()).hexdigest()[:24]
         update_id = f"{topology_id}:{rollout_id}:{occurrence}"
         expected = {node.node_id for node in receivers}
-        self.weight_updates.setdefault(update_id, {"expected": expected, "finished": set(), "metadata": []})
         node_id = f"{role}_{int(rank)}"
         if role == "actor":
             global_rank = 0
@@ -401,6 +400,8 @@ class DCSCoordinator:
             global_rank = 1 + [node.node_id for node in receivers].index(node_id)
         else:
             raise HTTPException(409, "Role is outside this update's receiver set")
+        if expected:
+            self.weight_updates.setdefault(update_id, {"expected": expected, "finished": set(), "metadata": []})
         includes_reference = any(node.role_name == "reference" for node in receivers)
         pp_groups = {}
         for _, node in sorted(train_nodes.items()):
