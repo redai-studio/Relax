@@ -996,6 +996,91 @@ def test_eval_rollout_records_dataset_and_eval_reward(tmp_path, rollout_module, 
     assert runtime.shutdown.await_count == 2
 
 
+def test_eval_manager_replacement_rebaselines_retained_shards(tmp_path, rollout_module, monkeypatch):
+    from relax.agentic.pipeline import runtime as runtime_module
+    from relax.agentic.session import service
+
+    dataset = SimpleNamespace(name="dataset", n_samples_per_eval_prompt=1)
+
+    def manager_args():
+        return _obs_args(
+            tmp_path,
+            eval_datasets=[dataset],
+            reward_key=None,
+            eval_reward_key=None,
+            group_rm=False,
+            agentic_custom_advantage_path=None,
+        )
+
+    monkeypatch.setattr(rollout_module, "_build_eval_samples", lambda *args: [Sample(index=0, group_index=0)])
+    monkeypatch.setattr(rollout_module, "_agentic_eval_runtime_concurrency", lambda *args: 1)
+
+    async def scenario():
+        shards = [_session_observation_fixture(tmp_path / str(i))[0] for i in range(2)]
+        round_number = 1
+
+        async def snapshot(index, *, reset, rollout_mode):
+            if round_number == 1 and index == 1:
+                raise RuntimeError("Shard RPC did not execute")
+            return await shards[index].agentic_kv_metrics(reset=reset, rollout_mode=rollout_mode)
+
+        async def connect(args, mode, concurrency):
+            bindings = [
+                runtime_module._SessionShardBinding(
+                    actor_name=f"shard-{i}",
+                    handle=SimpleNamespace(
+                        agentic_kv_metrics=SimpleNamespace(remote=partial(snapshot, i)),
+                        trim_memory=SimpleNamespace(remote=AsyncMock()),
+                    ),
+                )
+                for i in range(2)
+            ]
+            return runtime_module.RuntimeDomain(args, mode, bindings, concurrency)
+
+        async def evaluate_groups(**kwargs):
+            for index, shard in enumerate(shards):
+                key = f"eval-{round_number}-{index}"
+                group = service.ResidentGroup("eval", key, {}, [], ownership=service.GroupOwnership.RUNTIME)
+                session = service._SessionRecord(group, key, {}, service._SessionResultCell())
+                group.sessions.append(session)
+                shard._session_records[key] = session
+                await shard._finish_session(
+                    session,
+                    SessionExportTransport(exports=()),
+                    failure=("execution_failed", "execution", "test failure") if index else None,
+                )
+            return (_group(f"eval-{round_number}", export_ids=[round_number], reward=0.0),)
+
+        monkeypatch.setattr(runtime_module.RuntimeDomain, "connect", connect)
+        monkeypatch.setattr(rollout_module, "_eval_groups", evaluate_groups)
+        old_manager = manager_args()
+        new_manager = manager_args()
+        try:
+            first = (await rollout_module.eval_rollout(old_manager, 1)).metrics
+            assert first["eval/agentic/session_metrics_complete"] == 0
+            assert "eval/agentic/session_error_rate" not in first
+            round_number = 2
+            # A new manager gets fresh args, while the separately owned Shards survive.
+            recovered = (await rollout_module.eval_rollout(new_manager, 2)).metrics
+            assert recovered["eval/agentic/sessions_completed"] == 1
+            assert recovered["eval/agentic/sessions_failed"] == 2
+            assert "eval/agentic/session_error_rate" not in recovered
+            assert recovered["eval/agentic/session_metrics_complete"] == 1
+            assert recovered["eval/agentic/session_metrics_interval_aligned"] == 0
+            round_number = 3
+            aligned = (await rollout_module.eval_rollout(new_manager, 3)).metrics
+            assert aligned["eval/agentic/sessions_completed"] == aligned["eval/agentic/sessions_failed"] == 1
+            assert aligned["eval/agentic/session_error_rate"] == 0.5
+            assert aligned["eval/agentic/session_metrics_interval_aligned"] == 1
+        finally:
+            for shard in shards:
+                if shard._agent_cleanup_tasks:
+                    await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+                await shard._trajectory_recorder.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_update_membership_masks_and_optimizer_skip(tmp_path, fake_mpu):
     from relax.utils.agentic_obs import train_hooks
 
@@ -2756,7 +2841,8 @@ def test_pre_request_failure_uses_terminal_metrics_without_training_samples(
         assert metrics["agentic/sessions_failed"] == 1
         assert metrics["agentic/sessions_completed"] == 1
         assert metrics["agentic/sessions_cancelled"] == 1
-        assert metrics["agentic/session_error_rate"] == 0.5
+        assert "agentic/session_error_rate" not in metrics
+        assert metrics["agentic/session_metrics_interval_aligned"] == 0
         assert "agentic/session_error_rate" not in await runtime.collect_agentic_kv_metrics()
         assert (await shard.agentic_kv_metrics(rollout_mode="eval"))["terminal/completed"] == 1
         await shard._trajectory_recorder.aclose()
@@ -2916,10 +3002,8 @@ def test_session_metrics_mark_partial_shard_coverage(rollout_module, missing_sha
         assert metrics["agentic/session_metrics_shards_total"] == 2
         assert metrics["agentic/session_metrics_shards_reported"] == 2 - missing_shards
         assert metrics["agentic/session_metrics_complete"] == int(missing_shards == 0)
-        if missing_shards:
-            assert "agentic/session_error_rate" not in metrics
-        else:
-            assert metrics["agentic/session_error_rate"] == pytest.approx(1 / 5)
+        assert "agentic/session_error_rate" not in metrics
+        assert metrics["agentic/session_metrics_interval_aligned"] == 0
         assert metrics["agentic/sessions_completed"] == sum(
             snapshot["terminal/completed"] for snapshot in snapshots[missing_shards:]
         )
@@ -2983,6 +3067,9 @@ def test_session_metrics_recovery_reestablishes_shared_interval(tmp_path, rollou
                     assert metrics["agentic/session_metrics_interval_aligned"] == 1
                 if round_number == 1:
                     other_mode = "eval" if mode == "train" else "train"
+                    baseline = await collect(other_mode)
+                    assert "agentic/session_error_rate" not in baseline
+                    assert baseline["agentic/session_metrics_interval_aligned"] == 0
                     await record_events(other_mode)
                     assert (await collect(other_mode))["agentic/session_error_rate"] == 0.5
         finally:

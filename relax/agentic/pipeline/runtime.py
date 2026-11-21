@@ -1453,8 +1453,9 @@ class RuntimeDomain:
         reported_shards = sum(not isinstance(snapshot, BaseException) for snapshot in shard_metrics)
         complete = reported_shards == len(self._shards)
         # Eval reconnects its RuntimeDomain each time; the worker's args persist.
+        # A replacement manager may inherit Shards with unknown reset boundaries.
         alignment = vars(self.args).setdefault("_agentic_session_metrics_alignment", {})
-        interval_aligned = complete and alignment.get(self.rollout_mode, True)
+        interval_aligned = complete and alignment.get(self.rollout_mode, False)
         # After a missing RPC, the first complete reset only restores a baseline.
         alignment[self.rollout_mode] = complete
         result.update(
