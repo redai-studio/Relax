@@ -695,3 +695,66 @@ def test_triton_maps_global_broadcast_words_to_each_tp_rank(down):
         kernel[(len(rows),)](raw, rows, target, bad, True, width, True, down, hidden, local, 2, rank)
         expected = words.view(shape).chunk(2, dim=int(down))[rank].reshape(-1)
         assert torch.equal(target[3:-3], expected) and not target[:3].any() and not target[-3:].any()
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_tile_table_respects_entry_weight_and_loader_boundaries(empty, monkeypatch):
+    from relax.backends.sglang.delta_shard_layout import ShardFrame
+    from relax.distributed.weight_sync.codec import tensors
+
+    monkeypatch.setattr(ShardFrame, "_HOST_BATCH_TILES", 2)
+    a, b = (torch.zeros(8192, dtype=torch.bfloat16) for _ in range(2))
+    targets = {
+        "a0": (a, 0, 2048),
+        "b0": (b, 0, 2048),
+        "a1": (a, 2048, 2048),
+        "a2": (a, 4096, 2048),
+        "a3": (a, 6144, 2048),
+        "b1": (b, 2048, 2048),
+    }
+    inputs = []
+    for name, count in (("a0", 1025), ("b0", 512), ("a1", 0), ("a2", 513), ("ordinary", 1), ("a3", 1), ("b1", 0)):
+        if name == "ordinary":
+            inputs.append((name, (1,), torch.bfloat16, None, torch.ones(1, dtype=torch.bfloat16)))
+        else:
+            count = 0 if empty else count
+            inputs.append(
+                (
+                    name,
+                    (2048,),
+                    torch.bfloat16,
+                    torch.arange(count, dtype=torch.int32),
+                    torch.arange(count, dtype=torch.int16).view(torch.bfloat16),
+                )
+            )
+    metadata, raw = encode(inputs, max_bytes=1 << 20)
+    entries = list(tensors(metadata, raw))
+    ordinals = frozenset(i for i, (e, _, _) in enumerate(entries) if e["name"] in targets)
+    frame = ShardFrame(SimpleNamespace(broadcast=False, targets=targets), ordinals, entries, raw, [4, 7])
+    assert [[direct for direct, _ in runs] for runs in frame.group_runs] == [[True], [False, True]]
+    # The first loader call groups its nonadjacent a entries before b. The
+    # second call has its own ordinary and direct runs, including a zero-count b.
+    rows = []
+    spans = []
+    for group in ((0, 2, 3), (1,), (5,), (6,)):
+        first = len(rows)
+        for i in group:
+            e = entries[i][0]
+            _, base, limit = targets[e["name"]]
+            for offset in range(0, e["count"], ShardFrame.BLOCK):
+                rows.append(
+                    [
+                        e["offset"] + 4 * offset,
+                        e["value_offset"] + 2 * offset,
+                        min(ShardFrame.BLOCK, e["count"] - offset),
+                        int(offset > 0),
+                        base,
+                        limit,
+                    ]
+                )
+        spans.append((first, len(rows)))
+    assert [(first, end) for direct, run in frame.runs if direct for _, first, end, _ in run] == spans
+    if empty:
+        assert frame.table is None and frame.invalid_positions() is None
+    else:
+        assert torch.equal(frame.table, torch.tensor(rows)) and not frame.invalid_positions()

@@ -443,3 +443,100 @@ def test_live_publication_reads_source_until_ack_and_preserves_last_bank_on_abor
     with pytest.raises(RuntimeError, match="delayed copy error"):
         s.abort()
     assert s._ack_bank is attempt and not s.sender_pipeline_active and s._pending is None
+
+
+@pytest.mark.parametrize("case", ["reuse", "budget", "oom", "device_error", "transfer_error"])
+def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monkeypatch):
+    from contextlib import nullcontext
+    from threading import Event, current_thread
+    from types import SimpleNamespace
+
+    from relax.backends.megatron.weight_update import delta_export, shard_snapshot
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    model = {"byte": torch.ones(1, dtype=torch.uint8), "weight": torch.ones(1, 1), "derived": torch.ones(1)}
+    # The 9 model bytes require a 12-byte aligned bank.
+    source = exporter(23 if case == "budget" else 24)
+    source.config = DeltaSyncConfig(stream="test", sender_pipeline=True)
+    monkeypatch.setattr(source, "_can_read_live", lambda _: True)
+    monkeypatch.setattr(delta_export.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(delta_export.dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(delta_export.dist, "get_process_group_ranks", lambda group: [0])
+    monkeypatch.setattr(delta_export.dist, "all_gather_object", lambda out, obj, group: out.__setitem__(0, obj))
+    monkeypatch.setattr(delta_export.dist, "broadcast_object_list", lambda *args, **kwargs: None)
+
+    stream = SimpleNamespace(
+        wait_stream=lambda _: None, record_event=lambda: SimpleNamespace(synchronize=lambda: None)
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    devices = []
+    monkeypatch.setattr(torch.cuda, "device", lambda device: devices.append(device) or nullcontext())
+
+    begun, copying, release = Event(), Event(), Event()
+    worker = []
+    allocations = []
+
+    def allocate(size, *, spare=False):
+        assert size == 12
+        if spare:
+            assert begun.is_set() and devices == [model["weight"].device]
+            worker.append(current_thread())
+            copying.set()
+            assert release.wait(5)
+            if case == "oom":
+                raise torch.OutOfMemoryError("test host allocation")
+            if case == "device_error":
+                raise RuntimeError("device unavailable")
+        bank = torch.empty(size, dtype=torch.uint8)
+        allocations.append(bank)
+        return bank
+
+    monkeypatch.setattr(shard_snapshot, "_allocate_bank", allocate)
+
+    def submit(*args, **kwargs):
+        if case != "budget":
+            assert copying.wait(5)
+        if case == "transfer_error":
+            raise RuntimeError("delivery interrupted")
+        release.set()
+        return set()
+
+    source.transfer = SimpleNamespace(
+        connect=lambda *args, **kwargs: True,
+        begin=lambda **kwargs: begun.set(),
+        prepare_frame=lambda _: None,
+        drain_frame=set,
+        discard_prepared=release.set,
+        submit_frame=submit,
+        ordered_target_consume=False,
+        finalize=lambda: {"receivers": [{"force_full_seed": False}]},
+    )
+    args = dict(engines=[], gpu_counts=[], version="0", group=object())
+    if case in {"device_error", "transfer_error"}:
+        message = "device unavailable" if case == "device_error" else "delivery interrupted"
+        with pytest.raises(RuntimeError, match=message):
+            source.synchronize(lambda: model, **args)
+        assert not worker[0].is_alive()
+        assert source._ack_bank is None and source._pending is None and source._spare_bank is allocations[0]
+        return
+    source.synchronize(lambda: model, **args)
+    assert len(worker) == (case != "budget") and all(not thread.is_alive() for thread in worker)
+    assert source._ack_bank is None and not source._acknowledged
+    source.commit()
+    assert source._ack_bank is allocations[0]
+    if case == "budget":
+        assert source._spare_bank is None and len(allocations) == 1
+        with pytest.raises(ValueError, match="host budget"):
+            source.begin(model, live_locked=True)
+        return
+    if case == "oom":
+        assert source._spare_bank is None and len(allocations) == 1
+    else:
+        assert source._spare_bank is allocations[1]
+    source.synchronize(lambda: model, **dict(args, version="1", force_full=True))
+    assert source._backup.storage is allocations[1] and len(allocations) == 2 and len(worker) == 1
+    source.commit()
+    assert source._ack_bank is allocations[1] and source._spare_bank is allocations[0]

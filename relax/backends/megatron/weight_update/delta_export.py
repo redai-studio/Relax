@@ -11,6 +11,7 @@ receives only final HF coordinates and does not interpret Megatron layouts.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from dataclasses import dataclass
 from typing import Any
@@ -23,7 +24,7 @@ from relax.utils.logging_utils import get_logger
 
 from . import target_shard
 from .expert_gather import OwnerExpert
-from .shard_snapshot import CudaShardBackup, CudaShardInputs, shard_layout
+from .shard_snapshot import CudaShardBackup, CudaShardInputs, preallocate_spare_bank, shard_layout
 
 
 logger = get_logger(__name__)
@@ -246,6 +247,7 @@ class ShardDeltaExporter:
             if any(errors):
                 raise RuntimeError(f"Delta weight synchronization failed across source ranks: {errors}")
 
+        warm_pool = warm_spare = None
         try:
             status = [None, False]
             error = None
@@ -300,6 +302,7 @@ class ShardDeltaExporter:
                 eligible = [None] * world
                 dist.all_gather_object(eligible, live, group=group)
                 live = all(eligible)
+            cold_banks = self._ack_bank is None and not self._acknowledged and self._spare_bank is None
             if error is None:
                 try:
                     self.begin(shards, live_locked=live)
@@ -313,6 +316,16 @@ class ShardDeltaExporter:
                 except Exception as exc:
                     error = exc
             agree(error)
+            first_live_seed = seed and live and self._sequence == 0
+            if first_live_seed:
+                try:
+                    size = self._backup.storage.numel()
+                    if cold_banks and 0 < size <= self.snapshot_budget_bytes // 2:
+                        warm_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard-spare")
+                        warm_spare = warm_pool.submit(preallocate_spare_bank, size, self._live_inputs.device)
+                except Exception as exc:
+                    error = exc
+                agree(error)
 
             stream = self.export(full=seed, full_names=frozenset(self.full_names), emit=rank == 0, _owner_group=group)
             pack = self.config.transport == "nccl_socket" and not self._target_shards
@@ -384,6 +397,13 @@ class ShardDeltaExporter:
                 del frame, chunk
             if self.sender_pipeline_active:
                 drain_previous_frame()
+            if first_live_seed:
+                try:
+                    if warm_spare is not None:
+                        self._spare_bank = warm_spare.result()
+                except Exception as exc:
+                    error = exc
+                agree(error)
             source_peaks = [None] * world
             dist.all_gather_object(source_peaks, workspace_peak(), group=group)
             status = [None]
@@ -424,6 +444,9 @@ class ShardDeltaExporter:
                     logger.exception("Unsubmitted TCP frame also failed during delta cleanup")
             self.abort()
             raise
+        finally:
+            if warm_pool is not None:
+                warm_pool.shutdown(wait=True)
 
     def invalidate(self) -> None:
         """Recipient recreation or weight residency loss requires a FULL
@@ -771,7 +794,9 @@ class ShardDeltaExporter:
         if self._pending is None or not self._exported:
             raise RuntimeError("Cannot commit an incomplete or absent delta export")
         if self._backup is not None:
-            self._spare_bank, self._ack_bank = self._ack_bank, self._backup.storage
+            if self._ack_bank is not None:
+                self._spare_bank = self._ack_bank
+            self._ack_bank = self._backup.storage
         else:
             self._ack_bank = None
         self._backup = self._live_inputs = None

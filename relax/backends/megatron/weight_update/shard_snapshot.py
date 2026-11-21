@@ -3,9 +3,39 @@
 """Local shard copies for a locked CUDA weight publication."""
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from time import perf_counter
 from typing import Any
 
 import torch
+
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def _allocate_bank(size: int, *, spare: bool = False) -> torch.Tensor:
+    started = perf_counter()
+    bank = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
+    logger.info("Pinned shard bank allocated: bytes=%d spare=%s elapsed_s=%.6f", size, spare, perf_counter() - started)
+    return bank
+
+
+def preallocate_spare_bank(size: int, device: torch.device) -> torch.Tensor | None:
+    # CUDA's current device is thread-local. The host allocation belongs to
+    # the same rank/device as the mandatory shard bank.
+    with torch.cuda.device(device):
+        try:
+            return _allocate_bank(size, spare=True)
+        except (MemoryError, RuntimeError) as exc:
+            # Some pinned allocators expose CUDA/OS exhaustion as a plain RuntimeError.
+            if not isinstance(exc, (MemoryError, torch.OutOfMemoryError)) and not any(
+                text in str(exc).lower()
+                for text in ("out of memory", "cannot allocate memory", "can't allocate memory")
+            ):
+                raise
+            logger.warning("Could not preallocate %d pinned shard bytes: %s", size, exc)
+            return None
 
 
 def shard_layout(items: Iterable[tuple[str, torch.Tensor]]) -> tuple[list[tuple[str, torch.Tensor, int, int]], int]:
@@ -56,11 +86,7 @@ class CudaShardBackup:
     ) -> None:
         if size > budget:
             raise ValueError("Acknowledged and pending aligned shard banks exceed their host budget")
-        self.storage = (
-            spare
-            if spare is not None and spare.numel() == size
-            else torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
-        )
+        self.storage = spare if spare is not None and spare.numel() == size else _allocate_bank(size)
         device = entries[0][1].device
         self.stream = torch.cuda.Stream(device=device)
         self.targets = {}
