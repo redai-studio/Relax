@@ -52,8 +52,9 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     [(False, True), (True, True), (False, False)],
     ids=["plain-launch", "patched-launch", "parent-exited"],
 )
+@pytest.mark.parametrize("weight_plugin", [False, True])
 def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
-    monkeypatch, sglang_engine_module, routing_replay, parent_alive
+    monkeypatch, sglang_engine_module, routing_replay, parent_alive, weight_plugin
 ):
     module = sglang_engine_module
     events = []
@@ -74,10 +75,17 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     monkeypatch.setattr(module.os, "getppid", getppid)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
     server_args = SimpleNamespace()
+    plugin = ModuleType("relax.distributed.weight_sync.sglang_http")
+    plugin.install_http_extension = lambda: events.append("weight_plugin")
+    monkeypatch.setitem(sys.modules, "relax.distributed.weight_sync.sglang_http", plugin)
+    if weight_plugin:
+        monkeypatch.setenv("RELAX_WEIGHT_VERSION_PLUGIN", "1")
+    else:
+        monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
     module._launch_server_with_patches(server_args, 123)
 
     if parent_alive:
-        assert events == ["guard", "parent_check", "launch"]
+        assert events == ["guard", "parent_check"] + (["weight_plugin"] if weight_plugin else []) + ["launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
@@ -619,3 +627,165 @@ def _check_native_transport_validation(monkeypatch, actual, expected):
     else:
         validate_transport(cfg)
         assert cfg.mm_feature_transport == (expected or native_default)
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+def test_startup_readiness_with_closed_installation_gate(monkeypatch, sglang_engine_module, versioned):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+
+    app, calls = FastAPI(), []
+
+    @app.get("/health")
+    async def health():
+        calls.append("health")
+        return {}
+
+    @app.get("/health_generate")
+    async def health_generate():
+        calls.append("health_generate")
+        return {}
+
+    @app.get("/flush_cache")
+    async def flush():
+        calls.append("flush_cache")
+        return {}
+
+    if versioned:
+        import asyncio
+
+        monkeypatch.setenv("RELAX_WEIGHT_VERSION_PLUGIN", "1")
+        fence = InstallationFence()
+        app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+    else:
+        monkeypatch.delenv("RELAX_WEIGHT_VERSION_PLUGIN", raising=False)
+    monkeypatch.setattr(sglang_engine_module.requests, "Session", lambda: TestClient(app))
+    # This checks endpoint selection and admission, including TestClient startup.
+    sglang_engine_module._wait_server_healthy("http://testserver", None, lambda: True, timeout=5)
+    assert calls == (["health"] if versioned else ["health_generate", "flush_cache"])
+    if versioned:
+        with TestClient(app) as client:
+            assert client.get("/flush_cache").status_code == 200
+            fence.claim({"epoch": 0, "installation_id": "startup", "root": "target", "workers": {"0": "worker"}})
+            assert client.get("/flush_cache").status_code == 409
+            assert client.get("/health_generate").status_code == 503
+
+
+def test_offload_flush_uses_current_installation_identity(monkeypatch, sglang_engine_module):
+    import asyncio
+
+    import requests
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+
+    app, calls = FastAPI(), []
+    identity = {"epoch": 2, "installation_id": "install-2", "root": "target-2", "workers": {"0": "worker-0"}}
+    fence = InstallationFence()
+    fence.claim(identity)
+    app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+
+    @app.get("/flush_cache")
+    async def flush():
+        calls.append("flush")
+        return {}
+
+    client = TestClient(app)
+
+    def get(url, **options):
+        result = client.get(url, **options)
+        response = requests.Response()
+        response.status_code, response._content = result.status_code, result.content
+        return response
+
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    engine.node_rank = 0
+    engine.server_host, engine.server_port = "testserver", 80
+    engine._weight_consumer_enabled = True
+    group = SimpleNamespace(installation_identity=identity, control_headers={})
+    monkeypatch.setattr(
+        engine, "_get_version_consumer", lambda: SimpleNamespace(session=SimpleNamespace(engines=group))
+    )
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    engine.flush_cache(timeout_s=0.1)
+    assert calls == ["flush"]
+    group.installation_identity = {**identity, "epoch": 1}
+    with pytest.raises(requests.HTTPError, match="409"):
+        engine.flush_cache(timeout_s=0.1)
+    assert calls == ["flush"]
+
+
+@pytest.fixture
+def sglang_control_auth():
+    # Import the installed HTTP policy before the lightweight engine fixture.
+    auth = pytest.importorskip("sglang.srt.utils.auth")
+    constants = pytest.importorskip("sglang.srt.constants")
+    return auth, constants
+
+
+@pytest.mark.parametrize("admin_key", [None, "test-admin"])
+def test_authenticated_offload_restore(admin_key, sglang_control_auth, sglang_engine_module, monkeypatch):
+    import asyncio
+
+    import requests
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from relax.distributed.weight_sync.admission import AdmissionGate, AdmissionMiddleware, InstallationFence
+    from relax.distributed.weight_sync.sglang_loader import EmbeddedSGLangGroup, SGLangHTTPGroup
+
+    auth, constants = sglang_control_auth
+    monkeypatch.setitem(sys.modules, "sglang.srt.constants", constants)
+    monkeypatch.setattr(EmbeddedSGLangGroup, "__init__", lambda *args, **kwargs: None)
+    group = SGLangHTTPGroup(
+        "http://testserver", ".", tp_size=1, audit_directory=".", api_key="test-api", admin_api_key=admin_key
+    )
+    fence = InstallationFence()
+    group.installation_identity = {"epoch": 1, "installation_id": "v1", "root": "root", "workers": {"0": "worker"}}
+    fence.claim(group.installation_identity)
+    app = FastAPI()
+    calls = []
+
+    def endpoint(name):
+        @auth.auth_level(auth.AuthLevel.ADMIN_OPTIONAL)
+        async def operation():
+            calls.append(name)
+            return {}
+
+        return operation
+
+    for name, method in (
+        ("flush_cache", "GET"),
+        ("release_memory_occupation", "POST"),
+        ("resume_memory_occupation", "POST"),
+    ):
+        app.add_api_route("/" + name, endpoint(name), methods=[method])
+    app.add_middleware(AdmissionMiddleware, gate=AdmissionGate(), fence=fence, control=asyncio.Lock())
+    auth.add_api_key_middleware(app, api_key="test-api", admin_api_key=admin_key)
+    client = TestClient(app)
+
+    def request(method, url, *, timeout=None, **options):
+        result = client.request(method, url, **options)
+        response = requests.Response()
+        response.status_code, response._content = result.status_code, result.content
+        return response
+
+    from functools import partial
+
+    monkeypatch.setattr(sglang_engine_module.requests, "get", partial(request, "GET"))
+    monkeypatch.setattr(sglang_engine_module.requests, "post", partial(request, "POST"))
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    engine.node_rank, engine.server_host, engine.server_port = 0, "testserver", 80
+    engine._weight_consumer_enabled = True
+    engine._version_consumer = SimpleNamespace(
+        session=SimpleNamespace(engines=group, suspend=lambda: calls.append("suspend"))
+    )
+    monkeypatch.setattr(engine, "_get_version_consumer", lambda: engine._version_consumer)
+    assert client.get("/flush_cache").status_code == 401
+    engine.release_memory_occupation()
+    engine.resume_memory_occupation()
+    assert calls == ["suspend", "flush_cache", "release_memory_occupation", "resume_memory_occupation"]
+    assert engine._version_offloaded_tags == set()

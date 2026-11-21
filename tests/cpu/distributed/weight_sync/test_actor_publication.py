@@ -1,0 +1,347 @@
+"""Exercise publication routing without starting the distributed actor
+runtime."""
+
+import inspect
+import sys
+import tempfile
+import unittest
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
+
+from relax.distributed.weight_sync.config import validate_weight_version_arguments
+from relax.distributed.weight_sync.store import canonical
+
+
+def actor_method(name, **globals_):
+    pytest.importorskip("megatron.core")
+    try:
+        from relax.backends.megatron import actor as actor_module
+    except (ImportError, AssertionError) as error:
+        pytest.skip(f"Megatron actor dependencies unavailable: {error}")
+    method = inspect.unwrap(getattr(actor_module.MegatronTrainRayActor, name))
+
+    def invoke(*args, **kwargs):
+        with patch.dict(actor_module.__dict__, globals_):
+            return method(*args, **kwargs)
+
+    return invoke
+
+
+class PublicationRoutingTests(unittest.TestCase):
+    def test_offline_training_publishes_after_each_optimizer_step(self):
+        events = []
+        args = SimpleNamespace(
+            loss_type="sft",
+            use_routing_replay=False,
+            use_rollout_routing_replay=False,
+            compute_advantages_and_returns=False,
+            ref_update_interval=None,
+            num_rollout=2,
+            save=None,
+            weight_version_config="publisher.json",
+            offload_train=False,
+        )
+        publications = [{"version": i, "root": f"root-{i}"} for i in range(2)]
+
+        def publish():
+            events.append("publish")
+            return publications[events.count("publish") - 1]
+
+        actor = SimpleNamespace(
+            args=args,
+            model=[],
+            optimizer=object(),
+            opt_param_scheduler=object(),
+            rollout_data_postprocess=None,
+            tokenizer=None,
+            prof=Mock(),
+            flops_counter=None,
+            _per_step_rollout=False,
+            _resident_sft_overlap_enabled=lambda: False,
+            _is_standard_dpo=lambda: False,
+            _backup_actor_weights_after_train=lambda: events.append("backup"),
+            publish_weight_version=publish,
+            _run_step_evaluation=Mock(),
+            _wait_for_previous_eval=Mock(),
+        )
+
+        def gather(output, value, **kwargs):
+            output[0] = value
+
+        train_actor = actor_method(
+            "train_actor",
+            timer=lambda *a, **kw: nullcontext(),
+            inverse_timer=lambda *a: nullcontext(),
+            get_data_iterator=lambda *a: ([], [1]),
+            train=lambda *a: events.append("train"),
+            log_rollout_data=Mock(),
+            log_perf_data=Mock(),
+            train_dump_utils=Mock(),
+            tracking_utils=Mock(),
+            compute_rollout_step=lambda *a: 0,
+            evaluation_step_for_rollout=lambda *a: 0,
+            mpu=SimpleNamespace(
+                get_data_parallel_world_size=lambda **kw: 1, get_data_parallel_group=lambda **kw: None
+            ),
+            dist=SimpleNamespace(all_gather_object=gather, barrier=lambda **kw: None),
+            get_gloo_group=lambda: None,
+        )
+        for step in range(2):
+            train_actor(actor, step, {"total_lengths": [2], "loss_masks": [[1, 1]]})
+        self.assertEqual(events, ["train", "backup", "publish"] * 2)
+        self.assertEqual(
+            [c.kwargs["published_version"] for c in actor._run_step_evaluation.call_args_list], publications
+        )
+
+    def test_predict_request_reuses_step_publication_and_restores_training_on_error(self):
+        from relax.backends.megatron import initialize
+        from relax.engine.sft.predict import runner
+
+        actor = Mock(args=SimpleNamespace(offload_train=True))
+        published = {"version": 0, "root": "step-root"}
+        with (
+            patch.object(initialize, "is_megatron_main_rank", return_value=True),
+            patch.object(runner, "get_gloo_group", return_value=None),
+            patch.object(runner, "get_serve_url", return_value="http://rollout"),
+            patch.object(runner, "dist") as dist,
+            patch.object(runner.requests, "get") as get,
+        ):
+            dist.get_world_size.return_value = 1
+            dist.all_gather_object.side_effect = lambda out, value, **kw: out.__setitem__(0, value)
+            get.return_value.json.return_value = {"status": "error", "message": "installation failed"}
+            with self.assertRaisesRegex(RuntimeError, "installation failed"):
+                runner.run_sft_predict(actor, 12, published_version=published)
+            actor.update_weights.assert_not_called()
+            get.assert_called_once_with(
+                "http://rollout/predict",
+                params={"train_step": 12, "weight_version": 0, "weight_root": "step-root"},
+                timeout=1800,
+            )
+            actor.sleep.assert_called_once_with()
+            actor.wake_up.assert_called_once_with()
+
+    def test_initial_publication_protects_setup_and_releases_offload_context(self):
+        @dataclass
+        class Published:
+            version: int
+
+        for failure in (None, "setup", "publish"):
+            with self.subTest(failure=failure):
+                events = []
+                active = False
+
+                @contextmanager
+                def protected():
+                    nonlocal active
+                    active = True
+                    events.append("enter")
+                    try:
+                        yield
+                    finally:
+                        active = False
+                        events.append("exit")
+
+                def publish(*args, **kwargs):
+                    self.assertTrue(active, "publication allocates temporary device buffers")
+                    events.append("publish")
+                    if failure == "publish":
+                        raise RuntimeError("publication failure")
+                    return Published(0)
+
+                def create(*args):
+                    self.assertTrue(active, "Bridge setup can allocate device tensors while training is offloaded")
+                    events.append("setup")
+                    if failure == "setup":
+                        raise RuntimeError("setup failure")
+                    return SimpleNamespace(publish=publish)
+
+                module = ModuleType("relax.backends.megatron.weight_update.version_integration")
+                module.create_version_publisher = create
+                actor = SimpleNamespace(
+                    args=SimpleNamespace(offload_train=True, distributed_timeout_minutes=3),
+                    _per_step_rollout=False,
+                    _flush_resident_sft_parameters=Mock(),
+                    _train_state_offloader=SimpleNamespace(disable_during_update=protected),
+                    _backup_published_actor=lambda: events.append("backup"),
+                )
+
+                @contextmanager
+                def export_groups(*, offload_train, timeout_minutes):
+                    self.assertTrue(offload_train)
+                    self.assertEqual(timeout_minutes, 3)
+                    events.append("reload")
+                    try:
+                        yield
+                    finally:
+                        events.append("destroy")
+
+                method = actor_method(
+                    "publish_weight_version",
+                    __package__="relax.backends.megatron",
+                    weight_export_groups=export_groups,
+                    get_gloo_group=lambda: "source-group",
+                )
+                with patch.dict(sys.modules, {module.__name__: module}):
+                    if failure:
+                        with self.assertRaisesRegex(RuntimeError, "failure"):
+                            method(actor, "capture-0")
+                    else:
+                        self.assertEqual(method(actor, "capture-0"), {"version": 0})
+                self.assertFalse(active)
+                self.assertEqual(events[:3], ["reload", "enter", "setup"])
+                self.assertEqual(events[-2:], ["exit", "destroy"])
+                self.assertEqual(hasattr(actor, "_version_publisher"), failure != "setup")
+
+    def test_previous_actor_queue_keeps_the_existing_training_contract(self):
+        actor = SimpleNamespace(
+            args=SimpleNamespace(keep_old_actor=True, update_weights_interval=1), weights_backuper=Mock()
+        )
+        backup = actor_method("_backup_published_actor")
+        backup(actor)
+        actor.weights_backuper.copy.assert_called_once_with(src_tag="rollout_actor", dst_tag="old_actor")
+        actor.weights_backuper.backup.assert_called_once_with("rollout_actor")
+        actor.weights_backuper.reset_mock()
+        actor.args.update_weights_interval = 2
+        backup(actor)
+        actor.weights_backuper.copy.assert_not_called()
+        actor.weights_backuper.backup.assert_called_once_with("old_actor")
+
+    def test_offline_consumers_do_not_suppress_async_publication(self):
+        actor = SimpleNamespace(
+            args=SimpleNamespace(weight_version_config="publisher.json"),
+            publish_weight_version=Mock(return_value={"version": 9}),
+        )
+        update = actor_method("update_weights_fully_async")
+        self.assertEqual(update(actor, 9, rollout_only=True, actor_fwd_only=True), {"version": 9})
+        actor.publish_weight_version.assert_called_once_with()
+
+    def test_independent_publisher_does_not_wait_for_inference_evaluation(self):
+        actor = SimpleNamespace(args=SimpleNamespace(weight_version_config="publisher.json"))
+        wait = actor_method("_wait_for_previous_eval")
+        # No HTTP, Ray or process-group symbols are supplied: this route must
+        # finish without reaching any inference coordination operation.
+        self.assertIsNone(wait(actor, before_publication=True))
+
+    def test_final_async_evaluation_finishes_before_shutdown(self):
+        actor = SimpleNamespace(args=SimpleNamespace(weight_version_config="publisher.json"))
+        requests = Mock()
+        requests.get.return_value.json.return_value = {"done": True}
+        dist = Mock()
+        dist.get_rank.return_value = 0
+        wait = actor_method(
+            "_wait_for_previous_eval",
+            requests=requests,
+            dist=dist,
+            time=SimpleNamespace(monotonic=lambda: 0),
+            get_serve_url=lambda role: "http://rollout",
+            get_gloo_group=lambda: "training-group",
+        )
+        wait(actor)
+        requests.get.assert_called_once_with("http://rollout/is_eval_done", timeout=10)
+        dist.barrier.assert_called_once_with(group="training-group")
+
+    def test_initial_async_publication_without_forward_recipient(self):
+        update = actor_method("update_weights_fully_async")
+        for mode in ("true_on_policy_mode", "hybrid"):
+            with self.subTest(mode=mode):
+                actor = SimpleNamespace(
+                    args=SimpleNamespace(weight_version_config="publisher.json", **{mode: True}),
+                    publish_weight_version=Mock(return_value={"version": 0}),
+                )
+                # Controller initialization supplies neither routing flag.
+                # It must not enter DCS when there is no forward recipient.
+                self.assertEqual(update(actor, 0), {"version": 0})
+                actor.publish_weight_version.assert_called_once_with()
+
+    def test_async_publication_retains_training_forward_sync(self):
+        client = Mock()
+        client.update_weights_for_rollout.return_value = []
+        actor = SimpleNamespace(
+            args=SimpleNamespace(weight_version_config="publisher.json"),
+            publish_weight_version=Mock(return_value={"version": 3}),
+            checkpoint_engine_client=client,
+        )
+        update = actor_method(
+            "update_weights_fully_async",
+            dist=Mock(),
+            get_gloo_group=lambda: "training-group",
+            print_memory=Mock(),
+            run=lambda result: result,
+        )
+        update(actor, 3)
+        actor.publish_weight_version.assert_called_once_with()
+        client.init_process_groups_for_actor_fwd_ref.assert_called_once_with(3)
+        client.update_weights_for_rollout.assert_called_once_with(False, True)
+
+    def test_reference_updates_without_a_forward_actor(self):
+        client = Mock()
+        client.update_weights_for_rollout.return_value = []
+        actor = SimpleNamespace(
+            args=SimpleNamespace(
+                weight_version_config="publisher.json",
+                true_on_policy_mode=True,
+                ref_update_interval=2,
+                resource={"actor": [1, 1], "rollout": [1, 1], "reference": [1, 1]},
+            ),
+            publish_weight_version=Mock(return_value={"version": 1}),
+            checkpoint_engine_client=client,
+        )
+        update = actor_method(
+            "update_weights_fully_async",
+            dist=Mock(),
+            get_gloo_group=lambda: "training-group",
+            print_memory=Mock(),
+            run=lambda result: result,
+        )
+        update(actor, 0, rollout_only=True)
+        client.init_process_groups_for_actor_fwd_ref.assert_not_called()
+        update(actor, 1, rollout_only=True)
+        client.init_process_groups_for_actor_fwd_ref.assert_called_once_with(1)
+        client.update_weights_for_rollout.assert_called_once_with(False, True)
+
+    def test_managed_rollouts_require_a_consumer_and_matching_stream(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            publication, consumer = root / "source.json", root / "consumer.json"
+            publication.write_bytes(
+                canonical(
+                    {
+                        "store": "source",
+                        "stream": "run",
+                        "scratch": "scratch",
+                        "disk_budget": 1024,
+                        "max_weight_bytes": 512,
+                    }
+                )
+            )
+            args = SimpleNamespace(
+                weight_version_config=str(publication),
+                weight_consumer_config=None,
+                train_backend="megatron",
+                debug_train_only=False,
+            )
+            with self.assertRaisesRegex(ValueError, "managed rollout"):
+                validate_weight_version_arguments(args, offline_training=False)
+            validate_weight_version_arguments(args, offline_training=True)
+            args.sft_predict_interval = 3
+            with self.assertRaisesRegex(ValueError, "--weight-consumer-config"):
+                validate_weight_version_arguments(args, offline_training=True)
+            args.sft_predict_interval = None
+            args.debug_train_only = True
+            validate_weight_version_arguments(args, offline_training=False)
+            args.debug_train_only = False
+            args.weight_consumer_config = str(consumer)
+            consumer.write_bytes(canonical({"stream": "another"}))
+            with self.assertRaisesRegex(ValueError, "same weight stream"):
+                validate_weight_version_arguments(args, offline_training=False)
+            consumer.write_bytes(canonical({"stream": "run"}))
+            validate_weight_version_arguments(args, offline_training=False)
+
+
+if __name__ == "__main__":
+    unittest.main()

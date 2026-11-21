@@ -589,7 +589,7 @@ class Rollout(Base):
             return {"status": "error", "message": error_msg}
 
     @app.get("/predict")
-    async def predict(self, train_step: int):
+    async def predict(self, train_step: int, weight_version: int | None = None, weight_root: str | None = None):
         """Periodic SFT predict pass — symmetric with /evaluate.
 
         Body lives in ``relax.engine.sft.predict.runner.handle_predict``;
@@ -597,7 +597,7 @@ class Rollout(Base):
         """
         from relax.engine.sft.predict.runner import handle_predict
 
-        return await handle_predict(self, train_step)
+        return await handle_predict(self, train_step, weight_version, weight_root)
 
     @app.get("/can_do_update_weight_for_async")
     async def can_do_update_weight_for_async(self):

@@ -119,7 +119,7 @@ def test_hybrid_dcs_restores_explicit_rollout_offload(hybrid_actor, monkeypatch,
 
 @pytest.mark.parametrize("offload_train", [False, True])
 @pytest.mark.parametrize("fail_sync", [False, True])
-def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_actor, offload_train, fail_sync):
+async def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_actor, offload_train, fail_sync):
     actor, state = hybrid_actor
     actor.args.offload_train = offload_train
     if offload_train:
@@ -139,9 +139,9 @@ def test_initial_hybrid_dcs_sync_restores_offloaded_state_and_tp_group(hybrid_ac
     service = SimpleNamespace(config=config, actor_model=actor)
     if fail_sync:
         with pytest.raises(RuntimeError, match="sync failed"):
-            Actor.func_or_class.set_rollout_manager(service, object())
+            await Actor.func_or_class.set_rollout_manager(service, object())
     else:
-        Actor.func_or_class.set_rollout_manager(service, object())
+        await Actor.func_or_class.set_rollout_manager(service, object())
     assert state.awake is not offload_train
     assert (state.tp_group is None) is offload_train
     assert not state.updating

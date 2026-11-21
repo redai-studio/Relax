@@ -34,12 +34,12 @@ from relax.utils.utils import get_serve_url
 logger = get_logger(__name__)
 
 
-def run_sft_predict(actor, rollout_id: int) -> None:
+def run_sft_predict(actor, rollout_id: int, *, published_version: dict | None = None) -> None:
     """SFT predict cycle driven from the Megatron actor.
 
-    Megatron sleep → update_weights (NCCL) → /predict (SGLang onload_kv +
-    generate + finally full offload) → wake_up. Timings are logged so we can
-    attribute predict-step latency.
+    Use the weights published by this training step when available. Otherwise
+    update the rollout engines before requesting prediction. Colocated actors
+    release GPU memory around the prediction pass.
     """
     from relax.backends.megatron.initialize import is_megatron_main_rank
 
@@ -59,24 +59,24 @@ def run_sft_predict(actor, rollout_id: int) -> None:
         actor.sleep()
         _t_sleep = time.monotonic() - _t
     _t = time.monotonic()
-    actor.update_weights()
+    if published_version is None:
+        published_version = actor.update_weights()
     _t_update = time.monotonic() - _t
     dist.barrier(group=get_gloo_group())
     if is_main_rank:
         _t = time.monotonic()
         try:
-            # Without a timeout, a hung rollout service blocks this rank
-            # forever and the Gloo barrier on line 65 traps every other rank
-            # until the much-larger NCCL/Gloo watchdog fires — all GPUs idle.
-            # 1800s is generous enough for a full eval-set generate; on
-            # timeout the except below logs and we proceed (predict skipped).
+            # Bound the time other training ranks wait for the prediction pass.
+            params = {"train_step": rollout_id}
+            if published_version is not None:
+                params.update(weight_version=published_version["version"], weight_root=published_version["root"])
             response = requests.get(
                 f"{get_serve_url('rollout')}/predict",
-                params={"train_step": rollout_id},
+                params=params,
                 timeout=1800,
             )
             response.raise_for_status()
-            if scoring and response.json().get("status") != "ok":
+            if (scoring or published_version is not None) and response.json().get("status") != "ok":
                 raise RuntimeError(response.json().get("message", "SFT predict reward evaluation failed"))
         except Exception as e:
             logger.warning(f"SFT predict at rollout_id {rollout_id} failed: {e}")
@@ -94,15 +94,17 @@ def run_sft_predict(actor, rollout_id: int) -> None:
                 ray.get([manager.offload.remote() for manager in (getattr(actor, "genrm_manager", None) or [])])
             except Exception as exc:
                 predict_error = f"SFT judge offload failed: {exc}"
+    if scoring or published_version is not None:
         errors = [None] * dist.get_world_size(group=get_gloo_group())
         dist.all_gather_object(errors, predict_error, group=get_gloo_group())
-        if any(error is not None for error in errors):
-            raise RuntimeError(f"SFT predict/reward failed at step {rollout_id}: {errors}")
+        predict_error = next((error for error in errors if error is not None), None)
     dist.barrier(group=get_gloo_group())
     if args.offload_train:
         _t = time.monotonic()
         actor.wake_up()
         _t_wake = time.monotonic() - _t
+    if (scoring or published_version is not None) and predict_error is not None:
+        raise RuntimeError(f"SFT prediction failed at step {rollout_id}: {predict_error}")
     if is_main_rank:
         step = compute_rollout_step(args, rollout_id)
         metrics = {
@@ -118,7 +120,9 @@ def run_sft_predict(actor, rollout_id: int) -> None:
         logger.info(f"SFT predict @ rollout_id={rollout_id}: {metrics}")
 
 
-async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
+async def handle_predict(
+    rollout, train_step: int, weight_version: int | None = None, weight_root: str | None = None
+) -> dict[str, Any]:
     """Rollout-side handler for the /predict HTTP endpoint.
 
     Awaits ``rollout_manager.run_predict`` (renders + generates + writes
@@ -129,7 +133,10 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
     """
     rollout._logger.info(f"Received request to predict train_step {train_step}")
     try:
-        await rollout.rollout_manager.run_predict.remote(train_step)
+        if weight_version is None and weight_root is None:
+            await rollout.rollout_manager.run_predict.remote(train_step)
+        else:
+            await rollout.rollout_manager.run_predict.remote(train_step, weight_version, weight_root)
         return {"status": "ok", "rollout_id": train_step}
     except Exception as e:
         error_msg = f"Predict failed for train_step {train_step}: {type(e).__name__}: {str(e)}"
