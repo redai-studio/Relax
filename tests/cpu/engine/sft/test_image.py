@@ -55,6 +55,24 @@ def test_head_validation_and_sizing_need_no_worker_mount():
     assert args.num_rollout == 6
     assert args.num_rollout_per_epoch == 3
     assert args.i2i_sft_config["max_pixels"] == 1024**2
+    args.i2i_sft_config.update(attention_implementation="torch", deterministic_attention=True)
+    validate_i2i_sft_config(args)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("condition_cache_bytes", -1),
+        ("condition_cache_bytes", True),
+        ("condition_cache_entries", 0),
+        ("condition_cache_entries", 1.5),
+    ],
+)
+def test_condition_cache_limits_are_validated_at_configuration_boundary(field, value):
+    args = _args()
+    args.i2i_sft_config[field] = value
+    with pytest.raises(ValueError, match=field):
+        validate_i2i_sft_config(args)
 
 
 @pytest.mark.parametrize("tiers", [[True], [False], [1024, True], [1.5], ["1024"], [0], [-1], [], True])
