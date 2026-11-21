@@ -789,3 +789,88 @@ def test_authenticated_offload_restore(admin_key, sglang_control_auth, sglang_en
     engine.resume_memory_occupation()
     assert calls == ["suspend", "flush_cache", "release_memory_occupation", "resume_memory_occupation"]
     assert engine._version_offloaded_tags == set()
+
+
+def test_uninitialized_genrm_can_be_retired(sglang_engine_module):
+    engine = sglang_engine_module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    engine.unregister_from_router = Mock()
+    engine.shutdown()
+    engine.unregister_from_router.assert_not_called()
+
+
+def test_failed_readiness_keeps_started_server_for_shutdown(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    from tests.cpu.backends.sglang.test_router_registration import _pd_engine
+
+    engine = _pd_engine(module)
+    engine._skip_router_registration = True
+    process = Mock()
+    monkeypatch.setattr(module.multiprocessing, "set_start_method", Mock())
+    monkeypatch.setattr(module.multiprocessing, "Process", Mock(return_value=process))
+    monkeypatch.setattr(module, "ServerArgs", SimpleNamespace)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    monkeypatch.setattr(module, "_wait_server_healthy", Mock(side_effect=RuntimeError("health check failed")))
+    args = dict(
+        host="worker",
+        node_rank=0,
+        url=lambda: "http://worker",
+        api_key=None,
+        disaggregation_bootstrap_port=9000,
+        dp_size=1,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="health check failed"):
+            engine._init_normal(args, apply_policy_load_plan=False)
+        assert engine.process is process
+    finally:
+        engine.process = None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux process exit and zombie states")
+def test_shutdown_retries_surviving_child_after_parent_exits(monkeypatch, tmp_path, sglang_engine_module):
+    import multiprocessing
+    import os
+    import time
+
+    import psutil
+
+    module = sglang_engine_module
+    engine = module.GenRMEngine(SimpleNamespace(rollout_external=False), rank=0)
+    # The partial startup owns a server process but has no router endpoint.
+    child_file = tmp_path / "child.pid"
+    code = (
+        "import pathlib, subprocess, sys, time;"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(60)"
+    )
+    parent = multiprocessing.get_context("spawn").Process(
+        target=os.execl, args=(sys.executable, sys.executable, "-c", code, str(child_file))
+    )
+    parent.start()
+    engine.process = parent
+    child = None
+    try:
+        deadline = time.monotonic() + 10
+        while not child_file.exists() or not child_file.read_text():
+            assert parent.is_alive() and time.monotonic() < deadline
+            time.sleep(0.02)
+        child = psutil.Process(int(child_file.read_text()))
+        assert child.ppid() == parent.pid
+        kill = psutil.Process.kill
+        with monkeypatch.context() as attempt:
+            attempt.setattr(module, "_SERVER_SHUTDOWN_TIMEOUT_S", 0.5)
+            attempt.setattr(psutil.Process, "kill", lambda proc: None if proc == child else kill(proc))
+            with pytest.raises(TimeoutError, match=str(child.pid)):
+                engine.shutdown()
+        parent.join(timeout=5)
+        assert not parent.is_alive() and child.is_running()
+        engine.shutdown()
+        assert engine.process is None
+        assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+    finally:
+        if child is not None and child.is_running():
+            child.kill()
+        if parent.is_alive():
+            parent.kill()
+        parent.join(timeout=5)
