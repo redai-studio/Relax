@@ -72,7 +72,7 @@ from relax.utils.training.train_dump_utils import (
 from relax.utils.types import Sample
 from relax.utils.utils import get_ray_accelerator_kwargs
 
-from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, get_settled
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -855,14 +855,14 @@ class RolloutServer:
         handles = []
         for g in self.engine_groups:
             handles.extend(g.offload())
-        return ray.get(handles) if handles else []
+        return get_settled(handles)
 
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
         handles = []
         for g in self.engine_groups:
             handles.extend(g.onload(tags))
-        return ray.get(handles) if handles else []
+        return get_settled(handles)
 
 
 # In-process singleton set inside RolloutManager.__init__. Only meaningful
@@ -1704,8 +1704,15 @@ class RolloutManager(ReloadableMixin):
             logger.info("Rollout already offloaded; skipping")
             return
         self.health_monitoring_pause()
+        error = None
         for srv in self.servers.values():
-            srv.offload()
+            try:
+                srv.offload()
+            except Exception as exc:
+                error = error or exc
+        if error is not None:
+            self.status = None
+            raise error
         self.status = "offload"
 
     async def onload(self, tags: list[str] | None = None):
@@ -1714,6 +1721,9 @@ class RolloutManager(ReloadableMixin):
     def _onload_local(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
+        if self.status == "offload":
+            # Once a resume is dispatched, some engines may be resident even if a peer fails.
+            self.status = None
         for srv in self.servers.values():
             srv.onload(tags)
         # Full onload transitions status; per-tag calls leave status for the
