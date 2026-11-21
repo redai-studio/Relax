@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import random
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -116,7 +117,20 @@ class FSDPSFTTrainer:
             "metadata_sha256": self.dataset.sha256,
             # CPU scheduling controls do not change samples or optimizer math.
             # Keep old checkpoints resumable when prefetch is toggled.
-            "config": {k: v for k, v in config.items() if k not in ("image_prefetch_depth", "image_prefetch_workers")},
+            "config": {
+                k: v
+                for k, v in config.items()
+                if k
+                not in (
+                    "image_prefetch_depth",
+                    "image_prefetch_workers",
+                    "baseline_stats_dir",
+                    "baseline_warmup_steps",
+                    "condition_cache_enabled",
+                    "condition_cache_max_entries",
+                    "condition_cache_max_bytes",
+                )
+            },
             "world_size": self.world,
             "global_batch_size": self.args.global_batch_size,
             "seed": self.args.seed,
@@ -141,7 +155,9 @@ class FSDPSFTTrainer:
         import json
 
         self.contract = json.loads(json.dumps(self.contract))
-        if any(contract != self.contract for contract in _collect_rank_objects(self.contract)):
+        cache_enabled = config.get("condition_cache_enabled", False)
+        initialization = (self.contract, cache_enabled)
+        if any(value != initialization for value in _collect_rank_objects(initialization)):
             raise ValueError("Image SFT dataset/model/config differs between training ranks")
         actor.adapter.on_device_ready(actor.model, actor.device)
         if self.args.load:
@@ -170,7 +186,101 @@ class FSDPSFTTrainer:
                 depth,
                 workers,
             )
-        self.profiler.on_init_end()
+        self.tracker = None
+        stats_dir = config.get("baseline_stats_dir")
+        if stats_dir:
+            from relax.engine.sft.condition_tracker import ConditionTracker
+
+            warmup_steps = int(config.get("baseline_warmup_steps", 5))
+            self.tracker = ConditionTracker(
+                rank=self.rank,
+                world_size=self.world,
+                micro_batches=self.args.global_batch_size // self.world,
+                dataset_size=int(config["dataset_size"]),
+                output_dir=Path(stats_dir),
+                warmup_steps=warmup_steps,
+                seed=int(self.args.seed),
+            )
+        pipe = getattr(actor.model, "pipe", None)
+        if pipe is not None:
+            pipe.tracker = self.tracker
+            if getattr(pipe, "dit", None) is not None:
+                pipe.dit.tracker = self.tracker
+        self.condition_cache = None
+        try:
+            if cache_enabled:
+                self._init_condition_cache()
+            self.profiler.on_init_end()
+        except BaseException:
+            self.close()
+            raise
+
+    def _init_condition_cache(self) -> None:
+        from dataclasses import asdict
+
+        from relax.backends.fsdp.actor import _collect_rank_objects, _collect_weight_sync_errors
+        from relax.backends.fsdp.condition_cache import ConditionCacheBinding
+        from relax.models.generative_sft import ConditionCacheAdapter
+        from relax.utils.distributed_utils import get_gloo_group
+
+        error = None
+        try:
+            self.control_group = get_gloo_group()
+            if dist.get_process_group_ranks(self.control_group) != dist.get_process_group_ranks(self.group):
+                raise ValueError("Condition cache control and FSDP groups must have identical members")
+            if not isinstance(self.actor.adapter, ConditionCacheAdapter):
+                raise ValueError("The SFT adapter does not support condition caching")
+            self.condition_cache = ConditionCacheBinding(
+                self.actor.model, self.actor.adapter, self.actor.device, self.args.i2i_sft_config
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        errors = _collect_weight_sync_errors(error)
+        if errors:
+            raise ValueError(f"Condition cache initialization failed: {errors}")
+        declarations = [asdict(spec) for spec in self.condition_cache.specs]
+        if any(value != declarations for value in _collect_rank_objects(declarations)):
+            raise ValueError("Condition field declarations differ between ranks")
+
+    def bump_encoder_version(self, spec_name: str | None = None, version_tag: Any = None) -> None:
+        """Invalidate cached conditions after an encoder weight update.
+
+        Call between micro-batches when frozen encoder weights change outside
+        ``load_state_dict``. A call on any rank reaches all ranks at the next
+        micro-batch. Does nothing when the condition cache is disabled.
+        """
+        if self.condition_cache is not None:
+            self.condition_cache.bump_encoder_version(spec_name, version_tag)
+
+    def _prepare_conditions(self, data: Any, step: int, micro: int, count: int) -> None:
+        cache = self.condition_cache
+        error = None
+        states = [(0, 0, 0, 0)] * len(cache.specs)
+        try:
+            states = cache.prepare(data)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        started = time.monotonic()
+        local = torch.tensor(
+            [step, micro, count, int(error is not None), *(value for state in states for value in state)],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        gathered = [torch.empty_like(local) for _ in range(self.world)]
+        if self.world > 1:
+            dist.all_gather(gathered, local, group=self.control_group)
+        else:
+            gathered[0] = local
+        rows = [state.tolist() for state in gathered]
+        cache.counters["control_ms"] += (time.monotonic() - started) * 1000
+        if any(row[3] for row in rows):
+            from relax.backends.fsdp.actor import _collect_weight_sync_errors
+
+            errors = _collect_weight_sync_errors(error)
+            raise ValueError(f"Condition preparation failed: {errors}")
+        if any(row[:3] != rows[0][:3] for row in rows):
+            raise ValueError("Condition cache micro-batch sequence differs between ranks")
+        cache.decide([[tuple(row[index : index + 4]) for index in range(4, len(row), 4)] for row in rows])
 
     def _resume(self) -> None:
         latest = checkpoint.find_latest_committed(self.args.load, TASK)
@@ -198,13 +308,28 @@ class FSDPSFTTrainer:
     def train(self, step: int) -> None:
         try:
             self._train_step(step)
-        except BaseException:
+        except BaseException as exc:
+            if getattr(self, "condition_cache", None) is not None:
+                traceback.clear_frames(exc.__traceback__)
             self.close()
             raise
 
     def close(self) -> None:
-        if self.prefetch:
-            self.prefetch.close()
+        try:
+            if self.prefetch:
+                self.prefetch.close()
+        finally:
+            try:
+                tracker = getattr(self, "tracker", None)
+                if tracker is not None:
+                    tracker.save_summary()
+            finally:
+                cache = getattr(self, "condition_cache", None)
+                if cache is not None:
+                    try:
+                        logger.info("i2i condition cache rank=%s stats=%s", self.rank, cache.stats())
+                    finally:
+                        cache.close()
 
     def _train_step(self, step: int) -> None:
         from relax.backends.fsdp.actor import _collect_weight_sync_errors
@@ -229,6 +354,9 @@ class FSDPSFTTrainer:
             self.rank :: self.world
         ]
         started = time.monotonic()
+        tracker = getattr(self, "tracker", None)
+        if tracker is not None:
+            tracker.begin_step(step, self.actor.device)
         optimizer = self.actor.optimizer
         optimizer.zero_grad(set_to_none=True)
         loss_sum = torch.zeros((), device=self.actor.device, dtype=torch.float32)
@@ -246,13 +374,44 @@ class FSDPSFTTrainer:
                 if self.prefetch:
                     self.prefetch.close()
                 raise ValueError(f"Image decoding failed: {errors}")
-            loss = self.actor.model(data)
-            torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
-            (loss / len(ids)).backward()
-            loss_sum.add_(loss.detach().float() / len(ids))
-        norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
-        lr = optimizer.param_groups[0]["lr"]
-        optimizer.step()
+            if tracker is not None:
+                image = data["image"]
+                tracker.begin_micro(
+                    micro,
+                    sample_id,
+                    self.dataset.rows[sample_id],
+                    self.dataset.config,
+                    self.actor._trainable_mode,
+                    image.height,
+                    image.width,
+                )
+            cache = self.condition_cache
+            loss = scaled_loss = None
+            try:
+                if cache is not None:
+                    self._prepare_conditions(data, step, micro, len(ids))
+                loss = self.actor.model(data)
+                torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
+                scaled_loss = loss / len(ids)
+                if tracker is not None:
+                    with tracker.gpu_stage("backward_ms"):
+                        scaled_loss.backward()
+                else:
+                    scaled_loss.backward()
+                loss_sum.add_(loss.detach().float() / len(ids))
+            finally:
+                data = loss = scaled_loss = None
+                if cache is not None:
+                    cache.end_micro()
+        if tracker is not None:
+            with tracker.gpu_stage("optimizer_ms"):
+                norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
+                lr = optimizer.param_groups[0]["lr"]
+                optimizer.step()
+        else:
+            norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
+            lr = optimizer.param_groups[0]["lr"]
+            optimizer.step()
         self.scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         self.step += 1
@@ -260,10 +419,15 @@ class FSDPSFTTrainer:
             self.prefetch.close()
         self.profiler.step(step)
         dist.all_reduce(loss_sum, group=self.group)
+        if tracker is not None:
+            alloc, reserved = tracker.consume_step_memory(self.actor.device)
+        else:
+            alloc = torch.cuda.max_memory_allocated(self.actor.device)
+            reserved = torch.cuda.max_memory_reserved(self.actor.device)
         peak_memory = torch.tensor(
             [
-                torch.cuda.max_memory_allocated(self.actor.device),
-                torch.cuda.max_memory_reserved(self.actor.device),
+                alloc,
+                reserved,
                 int(data_wait * 1e9),
             ],
             device=self.actor.device,
@@ -272,12 +436,19 @@ class FSDPSFTTrainer:
         dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX, group=self.group)
         metrics = torch.stack([loss_sum / self.world, norm]).cpu().tolist()
         peak_allocated, peak_reserved, max_data_wait_ns = peak_memory.cpu().tolist()
+        train_seconds = time.monotonic() - started
+        if tracker is not None:
+            if self.condition_cache is not None:
+                tracker.condition_cache_stats = self.condition_cache.stats()
+            tracker.end_step(step, data_wait, train_seconds)
+            if self.step == self.args.num_rollout:
+                tracker.save_summary()
         if self.rank == 0:
             values = {
                 "train/loss": metrics[0],
                 "train/grad_norm": metrics[1],
                 "train/lr": lr,
-                "perf/train_seconds": time.monotonic() - started,
+                "perf/train_seconds": train_seconds,
                 "perf/data_wait_seconds": max_data_wait_ns / 1e9,
                 "perf/peak_allocated_bytes": peak_allocated,
                 "perf/peak_reserved_bytes": peak_reserved,
@@ -295,11 +466,15 @@ class FSDPSFTTrainer:
         interval = self.args.save_interval
         if self.args.save and (self.step == self.args.num_rollout or (interval and self.step % interval == 0)):
             self.save()
+        if self.step == self.args.num_rollout and self.condition_cache is not None:
+            self.close()
 
     def save(self) -> None:
         try:
             self._save_checkpoint()
-        except BaseException:
+        except BaseException as exc:
+            if getattr(self, "condition_cache", None) is not None:
+                traceback.clear_frames(exc.__traceback__)
             self.close()
             raise
 

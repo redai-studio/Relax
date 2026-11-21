@@ -3,9 +3,11 @@
 trajectories."""
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import torch
+
+from relax.engine.sft.condition_cache import ConditionFieldSpec, ConditionRequest
 
 
 class GenerativeSFTAdapter(Protocol):
@@ -33,4 +35,27 @@ class GenerativeSFTAdapter(Protocol):
         sample deterministic random stream (e.g. fixed-pixel tier sampling)
         that survives checkpoint resume.
         """
+        ...
+
+
+@runtime_checkable
+class ConditionCacheAdapter(Protocol):
+    """Adapter methods required to cache frozen condition outputs.
+
+    With ``condition_cache_enabled``, the SFT trainer rejects adapters that do
+    not implement this protocol. The model forward reads reused values from,
+    and inserts online outputs into, the binding passed to
+    ``bind_condition_cache``.
+    """
+
+    def condition_field_specs(self, model: torch.nn.Module) -> tuple[ConditionFieldSpec, ...]:
+        """Declare the cacheable condition fields and their dependencies."""
+        ...
+
+    def prepare_condition_request(self, model: torch.nn.Module, data: Any) -> dict[str, ConditionRequest]:
+        """Build one request per declared field for a prepared sample."""
+        ...
+
+    def bind_condition_cache(self, model: torch.nn.Module, cache: Any | None) -> None:
+        """Attach the cache binding to ``model``; ``None`` detaches it."""
         ...
