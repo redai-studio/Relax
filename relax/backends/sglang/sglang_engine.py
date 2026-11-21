@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
-import functools
 import ipaddress
 import json
 import multiprocessing
@@ -756,6 +755,14 @@ class SGLangEngine(RayActor):
         )
         response.raise_for_status()
         return True
+
+    def begin_weight_update(self):
+        """Open the scheduler's tensor weight-update session."""
+        return self._make_request("begin_weight_update", {"selector": "all"}, timeout=120)
+
+    def end_weight_update(self):
+        """Finalize weights before resuming generation."""
+        return self._make_request("end_weight_update", {}, timeout=120)
 
     def update_weights_from_tensor(
         self,
@@ -1741,25 +1748,6 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
-    def begin_weight_update(self):
-        """Open a weight-update session; newer SGLang rejects weight loads
-        outside one.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("begin_weight_update", {})
-
-    def end_weight_update(self):
-        """Close the session opened by ``begin_weight_update``.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("end_weight_update", {})
-
     def post_process_weights(
         self,
         restore_weights_before_load: bool = False,
@@ -1949,20 +1937,6 @@ def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None)
     return speculative_algorithm is not None
 
 
-@functools.lru_cache(maxsize=None)
-def _sglang_has_weight_update_session() -> bool:
-    """Probe lazily: this module is imported by every process that parses args,
-    and importing ``io_struct`` there can pull torch_npu's torchair
-    ``all_reduce`` patch into train actors on Ascend, which rejects float64."""
-    try:
-        from sglang.srt.managers.io_struct import BeginWeightUpdateReqInput  # noqa: F401
-    except ImportError:
-        # SGLang < 0.5.21 accepts weight loads without an explicit update session.
-        # Weight-update sessions were added in 0.5.21 (sgl-project/sglang#40777).
-        return False
-    return True
-
-
 def _server_arg_field_names() -> tuple[str, ...]:
     """Return ServerArgs field names; newer SGLang defines it as a msgspec
     Struct instead of a dataclass."""
@@ -2094,6 +2068,7 @@ def _compute_genrm_server_args(
         and "mm_feature_transport" not in (args.genrm_engine_config or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
+        and device_utils.is_cuda_available
         and not device_utils.is_rocm
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
@@ -2227,6 +2202,7 @@ def _compute_server_args(
         and "mm_feature_transport" not in (sglang_overrides or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
+        and device_utils.is_cuda_available
         and not device_utils.is_rocm
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
@@ -2249,6 +2225,12 @@ def _compute_server_args(
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
         kwargs["custom_weight_loader"] = loaders
+    if getattr(args, "train_backend", None) == "fsdp_turbo":
+        from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
+
+        kwargs["json_model_override_args"] = get_turbo_sglang_model_override(
+            args.turbo_config, kwargs["model_path"], kwargs.get("json_model_override_args")
+        )
 
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names
