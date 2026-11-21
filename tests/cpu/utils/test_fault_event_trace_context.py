@@ -147,8 +147,8 @@ def test_source_trace_state_stays_bounded_and_clear_releases_it(monkeypatch):
         for role in ROLES:
             source.error(role, "reported_error")
             source.error(role, "reported_error", fatal=True)
-        assert len(source.snapshot(list(ROLES))["trace_contexts"]) == 18
-        assert sum(map(len, source._trace_contexts.values())) == 18
+        assert len(source.snapshot(list(ROLES))["trace_contexts"]) == 2 * len(ROLES)
+        assert sum(map(len, source._trace_contexts.values())) == 2 * len(ROLES)
         for role in ROLES:
             source.clear(role)
         assert source._trace_contexts == {}
