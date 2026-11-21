@@ -3253,7 +3253,12 @@ class MegatronTrainRayActor(TrainRayActor):
     def _onload_rollout_kv(self, *, include_kv: bool = True) -> None:
         if dist.get_rank() == 0:
             handles = [self.rollout_manager.onload_kv.remote()] if include_kv and self._per_step_rollout else []
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
+            # SFT restores its inline judge after installation and generation.
+            if (
+                self.genrm_manager is not None
+                and not is_sft_mode(self.args)
+                and not getattr(self.args, "defer_reward_to_post_process", False)
+            ):
                 handles.extend(manager.onload.remote() for manager in self.genrm_manager)
             if handles:
                 ray.get(handles)

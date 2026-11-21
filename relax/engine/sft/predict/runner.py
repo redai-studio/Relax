@@ -63,22 +63,12 @@ def run_sft_predict(actor, rollout_id: int, *, published_version: dict | None = 
         published_version = actor.update_weights()
     _t_update = time.monotonic() - _t
     dist.barrier(group=get_gloo_group())
-    managed_judges = (
-        (getattr(actor, "genrm_manager", None) or [])
-        if is_main_rank
-        and scoring
-        and args.offload_rollout
-        and not getattr(args, "defer_reward_to_post_process", False)
-        else []
-    )
-    if managed_judges:
-        from relax.distributed.ray.utils import get_settled
-
+    needs_release = args.offload_train and getattr(args, "offload_rollout", False)
+    release_unconfirmed = is_main_rank and needs_release
+    require_prediction = scoring or published_version is not None
     if is_main_rank:
         _t = time.monotonic()
         try:
-            if published_version is not None and managed_judges:
-                get_settled([manager.onload.remote() for manager in managed_judges])
             # Bound the time other training ranks wait for the prediction pass.
             params = {"train_step": rollout_id}
             if published_version is not None:
@@ -89,29 +79,30 @@ def run_sft_predict(actor, rollout_id: int, *, published_version: dict | None = 
                 timeout=1800,
             )
             response.raise_for_status()
-            if (scoring or published_version is not None) and response.json().get("status") != "ok":
-                raise RuntimeError(response.json().get("message", "SFT predict reward evaluation failed"))
+            if require_prediction or needs_release:
+                result = response.json()
+                release_unconfirmed = needs_release and result.get("resources_released") is not True
+                if require_prediction and result.get("status") != "ok":
+                    raise RuntimeError(result.get("message", "SFT prediction failed"))
+                if release_unconfirmed:
+                    raise RuntimeError(result.get("message", "Rollout did not confirm GPU release after prediction"))
         except Exception as e:
             logger.warning(f"SFT predict at rollout_id {rollout_id} failed: {e}")
             predict_error = str(e)
         _t_http = time.monotonic() - _t
-    if managed_judges:
-        # The prediction caller releases the judges after scoring and before training resumes.
-        try:
-            get_settled([manager.offload.remote() for manager in managed_judges])
-        except Exception as exc:
-            cleanup_error = f"SFT judge offload failed: {exc}"
-            predict_error = f"{predict_error}; {cleanup_error}" if predict_error else cleanup_error
-    if scoring or published_version is not None:
-        errors = [None] * dist.get_world_size(group=get_gloo_group())
-        dist.all_gather_object(errors, predict_error, group=get_gloo_group())
-        predict_error = next((error for error in errors if error is not None), None)
+    if require_prediction or needs_release:
+        outcomes = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(outcomes, (predict_error, release_unconfirmed), group=get_gloo_group())
+        predict_error = next((error for error, _ in outcomes if error is not None), None)
+        release_unconfirmed = any(held for _, held in outcomes)
     dist.barrier(group=get_gloo_group())
-    if args.offload_train:
+    if args.offload_train and not release_unconfirmed:
         _t = time.monotonic()
         actor.wake_up()
         _t_wake = time.monotonic() - _t
-    if (scoring or published_version is not None) and predict_error is not None:
+    if release_unconfirmed:
+        raise RuntimeError(f"SFT prediction failed at step {rollout_id}; training remains offloaded: {predict_error}")
+    if require_prediction and predict_error is not None:
         raise RuntimeError(f"SFT prediction failed at step {rollout_id}: {predict_error}")
     if is_main_rank:
         step = compute_rollout_step(args, rollout_id)
@@ -140,25 +131,37 @@ async def handle_predict(
     Returns the JSON payload the FastAPI handler should send back.
     """
     rollout._logger.info(f"Received request to predict train_step {train_step}")
-    error = None
+    errors = []
+    released = False
     try:
         if weight_version is None and weight_root is None:
             await rollout.rollout_manager.run_predict.remote(train_step)
         else:
             await rollout.rollout_manager.run_predict.remote(train_step, weight_version, weight_root)
     except Exception as exc:
-        error = f"Predict failed for train_step {train_step}: {type(exc).__name__}: {exc}"
-        rollout._logger.exception(error)
+        message = f"Predict failed for train_step {train_step}: {type(exc).__name__}: {exc}"
+        rollout._logger.exception(message)
+        errors.append(message)
     finally:
         if is_sft_mode(rollout.config) and rollout.config.offload_rollout:
+            from .loop import managed_predict_judge
+
+            released = True
+            try:
+                judge = managed_predict_judge(rollout.config)
+                if judge is not None:
+                    await judge.offload.remote()
+            except Exception as exc:
+                errors.append(f"SFT judge offload failed: {exc}")
+                released = False
             try:
                 await rollout.rollout_manager.offload.remote()
             except Exception as exc:
-                cleanup_error = f"Post-predict offload failed at step {train_step}: {exc}"
-                rollout._logger.warning(cleanup_error)
-                if weight_version is not None or weight_root is not None:
-                    error = f"{error}; {cleanup_error}" if error else cleanup_error
-    if error is not None:
-        rollout.healthy.report_error.remote("rollout", error)
-        return {"status": "error", "message": error}
-    return {"status": "ok", "rollout_id": train_step}
+                errors.append(f"Post-predict offload failed at step {train_step}: {exc}")
+                released = False
+    if errors:
+        message = "; ".join(errors)
+        rollout._logger.warning(message)
+        rollout.healthy.report_error.remote("rollout", message)
+        return {"status": "error", "message": message, "resources_released": released}
+    return {"status": "ok", "rollout_id": train_step, "resources_released": released}

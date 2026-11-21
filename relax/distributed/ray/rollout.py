@@ -1532,6 +1532,8 @@ class RolloutManager(ReloadableMixin):
                         raise TimeoutError("Rollout engine membership is busy; retry the same target")
                     await asyncio.sleep(0.1)
             engines = self.rollout_engines
+            if engines and getattr(self.args, "offload_rollout", False):
+                self.status = "busy"
             # Keep the membership lock until every bounded engine operation has
             # settled, including a failed peer. Cancelling the Ray await does not
             # cancel an in-flight installation in that actor.
@@ -1703,6 +1705,7 @@ class RolloutManager(ReloadableMixin):
         if self.status == "offload":
             logger.info("Rollout already offloaded; skipping")
             return
+        self.status = "busy"
         self.health_monitoring_pause()
         error = None
         for srv in self.servers.values():
@@ -1711,7 +1714,6 @@ class RolloutManager(ReloadableMixin):
             except Exception as exc:
                 error = error or exc
         if error is not None:
-            self.status = None
             raise error
         self.status = "offload"
 
@@ -1721,9 +1723,9 @@ class RolloutManager(ReloadableMixin):
     def _onload_local(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
-        if self.status == "offload":
-            # Once a resume is dispatched, some engines may be resident even if a peer fails.
-            self.status = None
+        # A partial resume can already own GPU memory. Only a completed
+        # release lets colocated training reclaim it.
+        self.status = "busy"
         for srv in self.servers.values():
             srv.onload(tags)
         # Full onload transitions status; per-tag calls leave status for the
