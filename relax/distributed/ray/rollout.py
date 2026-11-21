@@ -908,6 +908,8 @@ class RolloutManager(ReloadableMixin):
     - get_loaded_modules(): Retrieve information about loaded modules
     """
 
+    _sft_predict_judge = None
+
     # Scale-out weight-sync tunables; see relax.utils.env.Envs for semantics/defaults.
     _WEIGHT_SYNC_PORT_BASE = Envs.RELAX_WEIGHT_SYNC_PORT_BASE
     _WEIGHT_SYNC_PORT_MAX = Envs.RELAX_WEIGHT_SYNC_PORT_MAX
@@ -1697,7 +1699,12 @@ class RolloutManager(ReloadableMixin):
                 raise
 
     async def offload(self):
-        self._offload_local()
+        try:
+            if self._sft_predict_judge is not None:
+                await self._sft_predict_judge.offload.remote()
+                self._sft_predict_judge = None
+        finally:
+            self._offload_local()
 
     def _offload_local(self):
         """Sync body of offload(); safe to call directly from code running
@@ -1741,7 +1748,7 @@ class RolloutManager(ReloadableMixin):
         self.status = "onload"
 
     def get_status(self):
-        return self.status
+        return "busy" if self._sft_predict_judge is not None else self.status
 
     @ray.method(concurrency_group="recover_rollout_engines")
     def recover_rollout_engines(self, model_name: str | None = None):

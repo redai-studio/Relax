@@ -95,6 +95,7 @@ class MultiEngineManager:
         # Per-slot (pg_tuple, owns_pg) so shutdown()/_retire_engines() only
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
+        self._retiring: set[int] = set()
         self._engine_addr_and_ports: dict[int, dict] = {}
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
@@ -286,12 +287,12 @@ class MultiEngineManager:
         while other ranks wait on a barrier, so keep it short and leave the
         rebuild to the next onload().
         """
-        if self._onloaded is False:
+        if self._onloaded is False and not self._retiring:
             logger.info(f"{self._log_prefix} engines already offloaded; skipping")
             return
         logger.info(f"{self._log_prefix} engines offload started")
         self._onloaded = None
-        dead = self._fanout("release_memory_occupation")
+        dead = self._fanout("release_memory_occupation", skip_ranks=self._retiring)
         self._retire_engines(dead)
         # Unconditional: the surviving engines did release, so the manager
         # must not claim to still be onloaded just because one engine died.
@@ -331,29 +332,32 @@ class MultiEngineManager:
 
     def _retire_engines(self, ranks: list[int]) -> None:
         """Retire the whole logical engine containing each given slot."""
-        heads = sorted({rank // self.nodes_per_engine * self.nodes_per_engine for rank in ranks})
-        for rank in heads:
-            for i in range(rank, rank + self.nodes_per_engine):
-                engine = self.all_engines[i]
+        self._retiring.update(rank // self.nodes_per_engine * self.nodes_per_engine for rank in ranks)
+        error = None
+        for head in sorted(self._retiring):
+            slots = range(head, head + self.nodes_per_engine)
+            for rank in slots:
+                engine = self.all_engines[rank]
                 if engine is None:
                     continue
                 try:
-                    # shutdown() kill_process_tree's the SGLang server. Must run
-                    # before ray.kill or the scheduler subprocesses are orphaned
-                    # and keep holding GPU memory, so the rebuild can't fit.
+                    # shutdown stops the SGLang child processes. Keep a live actor
+                    # reachable if shutdown times out so the next release can retry.
                     ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
-                except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={i} shutdown failed (killing anyway): {exc}")
-                try:
                     ray.kill(engine)
+                except ray.exceptions.ActorDiedError:
+                    pass
                 except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={i} ray.kill failed: {exc}")
-                self.all_engines[i] = None
-                logger.info(f"{self._log_prefix} engine rank={i} retired")
-            # Followers share the head's owned PG. Stop every local process
-            # before releasing it, even if one actor was never created.
-            for i in range(rank, rank + self.nodes_per_engine):
-                self._remove_owned_pg(i)
+                    logger.warning(f"{self._log_prefix} could not retire engine rank={rank}: {exc}")
+                    error = error or exc
+                    continue
+                self.all_engines[rank] = None
+            if all(self.all_engines[rank] is None for rank in slots):
+                for rank in slots:
+                    self._remove_owned_pg(rank)
+                self._retiring.remove(head)
+        if error is not None:
+            raise error
 
     def recover(self) -> set:
         """Rebuild engines with missing slots. Returns all slot ranks rebuilt.
@@ -361,6 +365,8 @@ class MultiEngineManager:
         Retirement clears every slot in a logical engine, so recovery rebuilds
         its whole TP group.
         """
+        if self._retiring:
+            self._retire_engines([])
         dead = [i for i, engine in enumerate(self.all_engines) if engine is None]
         if not dead:
             return set()
@@ -370,6 +376,8 @@ class MultiEngineManager:
             self._init_engines(dead)
         except Exception as exc:
             logger.exception(f"{self._log_prefix} engine rebuild failed for ranks={dead}: {exc}")
+            if self._retiring:
+                raise
 
         rebuilt = {i for i in dead if self.all_engines[i] is not None}
         still_dead = [i for i in dead if i not in rebuilt]

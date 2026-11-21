@@ -144,16 +144,7 @@ async def handle_predict(
         errors.append(message)
     finally:
         if is_sft_mode(rollout.config) and rollout.config.offload_rollout:
-            from .loop import managed_predict_judge
-
             released = True
-            try:
-                judge = managed_predict_judge(rollout.config)
-                if judge is not None:
-                    await judge.offload.remote()
-            except Exception as exc:
-                errors.append(f"SFT judge offload failed: {exc}")
-                released = False
             try:
                 await rollout.rollout_manager.offload.remote()
             except Exception as exc:
