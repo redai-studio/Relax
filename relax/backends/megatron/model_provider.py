@@ -516,6 +516,17 @@ def get_model_provider_func(
             _install_bridge_vision_cp_all_gather_compat()
 
         # Handle name-mismatched attributes that require explicit mapping
+        # Bridge selects the activation from the checkpoint. MCore's fused
+        # SwiGLU requires gated SiLU with zero linear offset and no TE activation.
+        swiglu_fusion = getattr(args, "bias_swiglu_fusion", None)
+        if (
+            swiglu_fusion is not None
+            and getattr(provider, "activation_func", None) is torch.nn.functional.silu
+            and provider.gated_linear_unit
+            and getattr(provider, "glu_linear_offset", 0.0) == 0.0
+            and not getattr(provider, "use_te_activation_func", False)
+        ):
+            provider.bias_activation_fusion = swiglu_fusion
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
