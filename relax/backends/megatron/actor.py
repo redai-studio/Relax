@@ -88,7 +88,12 @@ from relax.utils.opd.opd_utils import (
     consume_opd_train_data,
     has_managed_opd_teacher_manager,
 )
-from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+from relax.utils.reloadable_process_group import (
+    destroy_process_groups,
+    monkey_patch_torch_dist,
+    reload_process_groups,
+    weight_export_groups,
+)
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
@@ -3087,6 +3092,27 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("rollout_actor")
         else:
             self.weights_backuper.backup("old_actor")
+
+    @timer
+    def export_weight_checkpoint(self, **options) -> dict:
+        """Export a FULL package after a completed training step.
+
+        Invoke on every training rank as the final distributed operation in the
+        active training step, after the optimizer update and immediately before
+        any sleep/offload. The caller supplies the shared store, stream and
+        version; rollout processes can consume the result later. This method
+        does not wake an already-offloaded model.
+        """
+        from .weight_update.export_full_checkpoint import export_full_checkpoint
+
+        self._flush_resident_sft_parameters()
+        with (
+            weight_export_groups(
+                offload_train=self.args.offload_train, timeout_minutes=self.args.distributed_timeout_minutes
+            ),
+            self._train_state_offloader.disable_during_update(),
+        ):
+            return export_full_checkpoint(self, get_gloo_group(), **options)
 
     @timer
     def update_weights(self) -> None:

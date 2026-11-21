@@ -274,6 +274,10 @@ export default defineConfig({
                 { text: 'Architecture', link: '/en/guide/architecture' },
                 { text: 'Dataset Design', link: '/en/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/en/guide/distributed-checkpoint' },
+                {
+                  text: 'Weight Versions and FULL Checkpoints',
+                  link: '/en/guide/weight-checkpoints',
+                },
                 { text: 'Health Check Manager', link: '/en/guide/health-check-manager' },
                 { text: 'Fault Event History', link: '/en/guide/fault-events' },
               ],
@@ -415,6 +419,7 @@ export default defineConfig({
                 { text: '架构设计', link: '/zh/guide/architecture' },
                 { text: '数据集设计', link: '/zh/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/zh/guide/distributed-checkpoint' },
+                { text: '权重版本与 FULL Checkpoint', link: '/zh/guide/weight-checkpoints' },
                 { text: '健康检查管理器', link: '/zh/guide/health-check-manager' },
                 { text: '故障事件历史', link: '/zh/guide/fault-events' },
               ],

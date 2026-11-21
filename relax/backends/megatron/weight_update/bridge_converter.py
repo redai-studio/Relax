@@ -4,18 +4,18 @@ import dataclasses
 import re
 from argparse import Namespace
 from collections.abc import Collection, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import MethodType, SimpleNamespace
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from megatron.core import mpu
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding
 from relax.backends.megatron.weight_update.common import named_params_and_buffers
 from relax.backends.megatron.weight_update.expert_routing import bf16_expert_projection
+from relax.distributed.weight_sync import traffic
 from relax.utils.logging_utils import get_logger
 
 
@@ -184,7 +184,7 @@ class BridgeConverter:
     # Lazy initialisation
     # ------------------------------------------------------------------
 
-    def init_tasks(self) -> None:
+    def init_tasks(self, *, agreement=None) -> None:
         """Build the bridge task map on first use.
 
         Builds a mapping from ``global_param_name`` (e.g.
@@ -200,101 +200,154 @@ class BridgeConverter:
         if self._bridge_task_map is not None:
             return
 
-        from megatron.bridge import AutoBridge
-        from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
-        from megatron.bridge.models.conversion.param_mapping import AutoMapping
+        error = None
+        try:
+            from megatron.bridge import AutoBridge
+            from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+            from megatron.bridge.models.conversion.param_mapping import AutoMapping
 
-        from relax.utils.megatron_bridge_utils import patch_megatron_model
+            from relax.utils.megatron_bridge_utils import patch_megatron_model
 
-        bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
-        checkpoint_keys = _get_hf_checkpoint_keys(bridge)
-        if checkpoint_keys is not None:
-            self._hf_alias_checkpoint_keys = frozenset(
-                key
-                for key in checkpoint_keys
-                if any(first in key or second in key for first, second in _HF_NAME_ALIAS_PAIRS)
-            )
-        with patch_megatron_model(self._model):
-            tasks = bridge.get_conversion_tasks(self._model)
-
-        self._bridge_task_map = {}
-        for task in tasks:
-            # Bridge's task builder may leave a ``None`` entry when a mapping
-            # does not apply to the source checkpoint on this rank.
-            if task is not None and task.param_weight is not None:
-                self._bridge_task_map[task.global_param_name] = task
-
-        self._bridge_mapping_registry = bridge._model_bridge.mapping_registry()
-        mapping_registry = self._bridge_mapping_registry
-        for name, _param in named_params_and_buffers(self._args, self._model, include_persistent_buffers=True):
-            global_name = _normalize_global_name(name)
-            if global_name in self._bridge_task_map:
-                continue
-            # Keep the existing registry fallback for parameters. It also lets
-            # older Bridge releases add persistent buffers they did not
-            # enumerate. For buffers, repeat Bridge's HF-schema check so a
-            # registry entry alone cannot revive an inapplicable mapping.
-            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
-            if mapping is not None:
-                if (
-                    not isinstance(_param, torch.nn.Parameter)
-                    and checkpoint_keys is not None
-                    and not mapping.allow_hf_name_mismatch
-                ):
-                    hf_param_names = (
-                        [mapping.hf_param] if isinstance(mapping.hf_param, str) else mapping.hf_param.values()
-                    )
-                    if any(hf_name not in checkpoint_keys for hf_name in hf_param_names):
-                        continue
-                self._bridge_task_map[global_name] = WeightConversionTask(
-                    param_name=global_name,
-                    global_param_name=global_name,
-                    mapping=mapping,
-                    megatron_module=None,
-                    param_weight=_param,
+            bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
+            checkpoint_keys = _get_hf_checkpoint_keys(bridge)
+            if checkpoint_keys is not None:
+                self._hf_alias_checkpoint_keys = frozenset(
+                    key
+                    for key in checkpoint_keys
+                    if any(first in key or second in key for first, second in _HF_NAME_ALIAS_PAIRS)
                 )
+        except Exception as caught:
+            if agreement is None:
+                raise
+            error = f"{type(caught).__name__}: {caught}"
+        if agreement is not None:
+            agreement(error)
+        if agreement is None:
+            with patch_megatron_model(self._model):
+                tasks = bridge.get_conversion_tasks(self._model)
+        else:
+            # Enter the local model patch on every rank before any rank starts
+            # Bridge task construction. A rank-local patch failure must not let
+            # peers enter Bridge's PP task-building path alone.
+            stack = ExitStack()
+            error = None
+            try:
+                stack.enter_context(patch_megatron_model(self._model))
+            except Exception as caught:
+                error = f"{type(caught).__name__}: {caught}"
+            try:
+                agreement(error)
+            except BaseException:
+                stack.close()
+                raise
 
-        for task in self._bridge_task_map.values():
-            mapping = task.mapping
-            if isinstance(mapping, AutoMapping) and mapping._mapping is None:
-                if task.megatron_module is not None:
-                    mapping._detected_type = mapping._detect_parallelism_type(task.megatron_module)
-                    mapping._mapping = mapping._get_or_create_mapping(mapping._detected_type)
-                else:
-                    mapping._detected_type = "replicated"
-                    mapping._mapping = mapping._get_or_create_mapping("replicated")
-            inner_tp = getattr(mapping, "_tp_mapping", None)
-            if isinstance(inner_tp, AutoMapping) and inner_tp._mapping is None:
-                if task.megatron_module is not None:
-                    inner_tp._detected_type = inner_tp._detect_parallelism_type(task.megatron_module)
-                    inner_tp._mapping = inner_tp._get_or_create_mapping(inner_tp._detected_type)
+            tasks, error = None, None
+            try:
+                tasks = bridge.get_conversion_tasks(self._model)
+            except Exception as caught:
+                error = f"{type(caught).__name__}: {caught}"
+            finally:
+                try:
+                    stack.close()
+                except Exception as caught:
+                    error = error or f"{type(caught).__name__}: {caught}"
+            agreement(error)
 
-        self._config_map: dict[str, Any] = {}
-        for task in self._bridge_task_map.values():
-            if task.megatron_module is not None:
-                prefix = task.global_param_name.split(".")[0]
-                if prefix not in self._config_map:
-                    self._config_map[prefix] = task.megatron_module.config
+        def build_task_map():
+            self._bridge_task_map = {}
+            for task in tasks:
+                # Bridge's task builder may leave a ``None`` entry when a mapping
+                # does not apply to the source checkpoint on this rank.
+                if task is not None and task.param_weight is not None:
+                    self._bridge_task_map[task.global_param_name] = task
 
-        # Patch local tasks that have megatron_module=None (Phase 2 tasks
-        # from named_params_and_buffers that AutoBridge didn't produce).
-        for name, task in list(self._bridge_task_map.items()):
-            if task.megatron_module is None:
-                prefix = name.split(".")[0]
-                config = self._config_map.get(prefix)
-                if config is not None:
-                    self._bridge_task_map[name] = dataclasses.replace(
-                        task, megatron_module=SimpleNamespace(config=config)
+            self._bridge_mapping_registry = bridge._model_bridge.mapping_registry()
+            mapping_registry = self._bridge_mapping_registry
+            for name, _param in named_params_and_buffers(self._args, self._model, include_persistent_buffers=True):
+                global_name = _normalize_global_name(name)
+                if global_name in self._bridge_task_map:
+                    continue
+                # Keep the existing registry fallback for parameters. It also lets
+                # older Bridge releases add persistent buffers they did not
+                # enumerate. For buffers, repeat Bridge's HF-schema check so a
+                # registry entry alone cannot revive an inapplicable mapping.
+                mapping = mapping_registry.megatron_to_hf_lookup(global_name)
+                if mapping is not None:
+                    if (
+                        not isinstance(_param, torch.nn.Parameter)
+                        and checkpoint_keys is not None
+                        and not mapping.allow_hf_name_mismatch
+                    ):
+                        hf_param_names = (
+                            [mapping.hf_param] if isinstance(mapping.hf_param, str) else mapping.hf_param.values()
+                        )
+                        if any(hf_name not in checkpoint_keys for hf_name in hf_param_names):
+                            continue
+                    self._bridge_task_map[global_name] = WeightConversionTask(
+                        param_name=global_name,
+                        global_param_name=global_name,
+                        mapping=mapping,
+                        megatron_module=None,
+                        param_weight=_param,
                     )
 
-        self._bridge_expert_transposes_down = False
-        for task in self._bridge_task_map.values():
-            cls = type(task.mapping)
-            if cls.__name__ == "ExpertMLPDownProjMapping":
-                self._bridge_expert_transposes_down = "megatron_to_hf" in cls.__dict__
-                break
+            for task in self._bridge_task_map.values():
+                mapping = task.mapping
+                if isinstance(mapping, AutoMapping) and mapping._mapping is None:
+                    if task.megatron_module is not None:
+                        mapping._detected_type = mapping._detect_parallelism_type(task.megatron_module)
+                        mapping._mapping = mapping._get_or_create_mapping(mapping._detected_type)
+                    else:
+                        mapping._detected_type = "replicated"
+                        mapping._mapping = mapping._get_or_create_mapping("replicated")
+                inner_tp = getattr(mapping, "_tp_mapping", None)
+                if isinstance(inner_tp, AutoMapping) and inner_tp._mapping is None:
+                    if task.megatron_module is not None:
+                        inner_tp._detected_type = inner_tp._detect_parallelism_type(task.megatron_module)
+                        inner_tp._mapping = inner_tp._get_or_create_mapping(inner_tp._detected_type)
+                    else:
+                        # Registry-only tasks have no local module to inspect.
+                        # The caller supplies an already gathered tensor; the
+                        # inner mapping only needs to preserve it for QKV split.
+                        inner_tp._detected_type = "replicated"
+                        inner_tp._mapping = inner_tp._get_or_create_mapping("replicated")
 
-        logger.info("Bridge task map initialized with %d local tasks", len(self._bridge_task_map))
+            self._config_map: dict[str, Any] = {}
+            for task in self._bridge_task_map.values():
+                if task.megatron_module is not None:
+                    prefix = task.global_param_name.split(".")[0]
+                    if prefix not in self._config_map:
+                        self._config_map[prefix] = task.megatron_module.config
+
+            # Patch local tasks that have megatron_module=None (Phase 2 tasks
+            # from named_params_and_buffers that AutoBridge didn't produce).
+            for name, task in list(self._bridge_task_map.items()):
+                if task.megatron_module is None:
+                    prefix = name.split(".")[0]
+                    config = self._config_map.get(prefix)
+                    if config is not None:
+                        self._bridge_task_map[name] = dataclasses.replace(
+                            task, megatron_module=SimpleNamespace(config=config)
+                        )
+
+            self._bridge_expert_transposes_down = False
+            for task in self._bridge_task_map.values():
+                cls = type(task.mapping)
+                if cls.__name__ == "ExpertMLPDownProjMapping":
+                    self._bridge_expert_transposes_down = "megatron_to_hf" in cls.__dict__
+                    break
+
+            logger.info("Bridge task map initialized with %d local tasks", len(self._bridge_task_map))
+
+        if agreement is None:
+            build_task_map()
+        else:
+            error = None
+            try:
+                build_task_map()
+            except Exception as caught:
+                error = f"{type(caught).__name__}: {caught}"
+            agreement(error)
 
     def can_convert(self, name: str) -> bool:
         """Return whether Bridge has a mapping for a parameter or persistent
@@ -304,43 +357,88 @@ class BridgeConverter:
         global_name = _normalize_global_name(name)
         return global_name in self._bridge_task_map
 
-    def broadcast_and_apply_configs(self) -> None:
+    def broadcast_and_apply_configs(self, *, agreement=None) -> None:
         """Broadcast ``_config_map`` across PP ranks and patch remaining tasks.
 
-        Must be called by all PP ranks after :meth:`init_tasks`.  After this
-        call every task in ``_bridge_task_map`` has a non-None
-        ``megatron_module`` with the correct ``.config`` for QKV split.
-
-        Safe to call multiple times; the broadcast only runs once.
+        Must be called by all PP ranks after :meth:`init_tasks`. After this
+        call every task in ``_bridge_task_map`` has a non-None ``.config``.
         """
         if self._configs_broadcast_done:
             return
-        pp_size = mpu.get_pipeline_model_parallel_world_size()
-        if pp_size > 1:
-            from megatron.bridge.models.conversion.utils import remove_non_pickleables
 
-            # Keep live configs local: they can contain process groups that
-            # all_gather_object cannot pickle. Bridge cleans a copy for PP transfer.
-            local_config_map = {prefix: remove_non_pickleables(config) for prefix, config in self._config_map.items()}
+        if agreement is None:
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            if pp_size > 1:
+                from megatron.bridge.models.conversion.utils import remove_non_pickleables
+
+                local_config_map = {
+                    prefix: remove_non_pickleables(config) for prefix, config in self._config_map.items()
+                }
+                all_config_maps: list[dict[str, Any] | None] = [None] * pp_size
+                traffic.all_gather_object(
+                    obj=local_config_map,
+                    object_list=all_config_maps,
+                    group=mpu.get_pipeline_model_parallel_group(),
+                )
+                for remote_map in all_config_maps:
+                    for prefix, cfg in remote_map.items():
+                        if prefix not in self._config_map:
+                            self._config_map[prefix] = cfg
+            for name, task in list(self._bridge_task_map.items()):
+                if task.megatron_module is None:
+                    prefix = name.split(".")[0]
+                    config = self._config_map.get(prefix)
+                    if config is not None:
+                        self._bridge_task_map[name] = dataclasses.replace(
+                            task, megatron_module=SimpleNamespace(config=config)
+                        )
+            self._configs_broadcast_done = True
+            return
+
+        local_config_map, error = None, None
+        try:
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            if pp_size > 1:
+                from megatron.bridge.models.conversion.utils import remove_non_pickleables
+
+                # Serialize local config copies before entering the PP collective.
+                local_config_map = {
+                    prefix: remove_non_pickleables(config) for prefix, config in self._config_map.items()
+                }
+        except Exception as caught:
+            error = f"{type(caught).__name__}: {caught}"
+        agreement(error)
+
+        if pp_size > 1:
             all_config_maps: list[dict[str, Any] | None] = [None] * pp_size
-            dist.all_gather_object(
+            traffic.all_gather_object(
                 obj=local_config_map,
                 object_list=all_config_maps,
                 group=mpu.get_pipeline_model_parallel_group(),
             )
-            for remote_map in all_config_maps:
-                for prefix, cfg in remote_map.items():
-                    if prefix not in self._config_map:
-                        self._config_map[prefix] = cfg
+            error = None
+            try:
+                for remote_map in all_config_maps:
+                    for prefix, cfg in remote_map.items():
+                        if prefix not in self._config_map:
+                            self._config_map[prefix] = cfg
+            except Exception as caught:
+                error = f"{type(caught).__name__}: {caught}"
+            agreement(error)
 
-        for name, task in list(self._bridge_task_map.items()):
-            if task.megatron_module is None:
-                prefix = name.split(".")[0]
-                config = self._config_map.get(prefix)
-                if config is not None:
-                    self._bridge_task_map[name] = dataclasses.replace(
-                        task, megatron_module=SimpleNamespace(config=config)
-                    )
+        error = None
+        try:
+            for name, task in list(self._bridge_task_map.items()):
+                if task.megatron_module is None:
+                    prefix = name.split(".")[0]
+                    config = self._config_map.get(prefix)
+                    if config is not None:
+                        self._bridge_task_map[name] = dataclasses.replace(
+                            task, megatron_module=SimpleNamespace(config=config)
+                        )
+        except Exception as caught:
+            error = f"{type(caught).__name__}: {caught}"
+        agreement(error)
         self._configs_broadcast_done = True
 
     # ------------------------------------------------------------------

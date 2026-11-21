@@ -277,7 +277,7 @@ def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: 
     iterator.lora_merge_mode = False
     iterator._bridge_converter = SimpleNamespace(
         init_tasks=lambda: None,
-        broadcast_and_apply_configs=lambda: None,
+        broadcast_and_apply_configs=lambda *, agreement=None: None,
         convert=lambda name, tensor: _values(int(name.rsplit("weight", 1)[1]), int(tensor[0])),
     )
     with (

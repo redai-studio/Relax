@@ -162,10 +162,11 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         return getattr(self.group, name)
 
     @staticmethod
-    def destroy_process_groups(post_destroy_delay: float = 2.0, *, force: bool = False):
+    def destroy_process_groups(post_destroy_delay: float = 2.0, *, force: bool = False, process_groups=None):
         pid = os.getpid()
         destroyed_count = 0
-        for reloadable_group in ReloadableProcessGroup.GROUPS.get(pid, []):
+        groups = ReloadableProcessGroup.GROUPS.get(pid, []) if process_groups is None else process_groups
+        for reloadable_group in groups:
             if not force and getattr(reloadable_group, "_keep_alive_for_weight_sync", False):
                 continue
             if force:
@@ -374,13 +375,20 @@ def _should_skip_reload_and_destroy() -> bool:
     return device_utils.is_klx()
 
 
-def destroy_process_groups(post_destroy_delay: float = 2.0, *, force: bool = False):
+def destroy_process_groups(
+    post_destroy_delay: float = 2.0,
+    *,
+    force: bool = False,
+    process_groups: Sequence[ReloadableProcessGroup] | None = None,
+):
     """Release offloaded groups; force also releases retained sync groups."""
     if _should_skip_reload_and_destroy():
         return
     if device_utils.is_npu_available:
         post_destroy_delay = 0.0
-    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay, force=force)
+    ReloadableProcessGroup.destroy_process_groups(
+        post_destroy_delay=post_destroy_delay, force=force, process_groups=process_groups
+    )
 
 
 def reload_process_groups(
@@ -398,6 +406,22 @@ def reload_process_groups(
         retry_delay=retry_delay,
         process_groups=process_groups,
     )
+
+
+@contextmanager
+def weight_export_groups(*, offload_train: bool, timeout_minutes: int):
+    """Restore sleeping training groups for export, then release only those
+    groups."""
+    registry = ReloadableProcessGroup.GROUPS.get(os.getpid(), ())
+    sleeping = [group for group in registry if group.group is None] if offload_train else []
+    if not sleeping:
+        yield
+        return
+    try:
+        reload_process_groups(timeout_minutes=timeout_minutes, process_groups=sleeping)
+        yield
+    finally:
+        destroy_process_groups(process_groups=sleeping)
 
 
 def retain_process_groups(
