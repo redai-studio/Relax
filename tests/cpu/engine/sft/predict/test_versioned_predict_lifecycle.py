@@ -81,7 +81,10 @@ def test_partial_resume_settles_and_releases_before_training_wakes(monkeypatch, 
                 offload=lambda: [pool.submit(release, name) for name in names],
             )
 
-        manager.servers = {"a": rollout_module.RolloutServer([group(["first"])]), "b": rollout_module.RolloutServer([group(["broken", "late"])])}
+        manager.servers = {
+            "a": rollout_module.RolloutServer([group(["first"])]),
+            "b": rollout_module.RolloutServer([group(["broken", "late"])]),
+        }
         asyncio.run(manager.offload())
         events.clear()
 
