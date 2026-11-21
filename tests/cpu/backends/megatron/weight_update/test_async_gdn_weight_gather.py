@@ -67,7 +67,7 @@ def test_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped, async_mode
         wait()
         return None
 
-    monkeypatch.setattr(common.dist, "all_gather", all_gather)
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
     monkeypatch.setattr(
         common,
         "mpu",
@@ -83,7 +83,7 @@ def test_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped, async_mode
         result = [
             common.all_gather_param(SimpleNamespace(hf_checkpoint="test"), info.name, param) for info, param in inputs
         ]
-    assert len(waited) == 3
+    assert len(waited) == (0 if tp == 1 else 3)
     assert len(result) == len(expected)
     assert all(
         torch.equal(actual.view(torch.uint8), target.view(torch.uint8))
@@ -103,3 +103,40 @@ def test_non_sharded_gdn_named_tensor_needs_no_gdn_config(monkeypatch, kind):
     monkeypatch.setattr(common, "get_hf_config", lambda *a: pytest.fail("unneeded config lookup"))
     actual = common.all_gather_param(SimpleNamespace(), "decoder.layers.0.self_attention.in_proj.weight", tensor)
     assert actual.data_ptr() == tensor.data_ptr()
+
+
+@pytest.mark.parametrize("expert", [False, True])
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_single_rank_gather_uses_existing_storage(monkeypatch, expert, async_mode):
+    from relax.backends.megatron.weight_update import common
+
+    tensor = torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.bfloat16)
+    tensor.tensor_model_parallel = True
+    tensor.partition_dim = 0
+    tensor.partition_stride = 2
+    name = "decoder.layers.0.mlp." + ("experts." if expert else "") + "linear_fc1.weight"
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A single-rank gather must not allocate or enter a device collective")
+
+    monkeypatch.setattr(torch, "empty_like", unexpected)
+    monkeypatch.setattr(torch, "cat", unexpected)
+    monkeypatch.setattr(torch.distributed, "all_gather", unexpected)
+    monkeypatch.setattr(
+        common,
+        "mpu",
+        SimpleNamespace(
+            get_tensor_model_parallel_world_size=lambda: 2 if expert else 1,
+            get_expert_tensor_parallel_world_size=lambda: 1,
+            get_tensor_model_parallel_group=unexpected,
+            get_expert_tensor_parallel_group=unexpected,
+        ),
+    )
+    agreements = []
+    if async_mode:
+        actual = common.all_gather_params_async([(SimpleNamespace(name=name), tensor)], agreement=agreements.append)[0]
+    else:
+        actual = common.all_gather_param(SimpleNamespace(), name, tensor, agreement=agreements.append)
+    assert agreements == [None] * (2 if async_mode else 3)
+    assert actual.data_ptr() == tensor.data_ptr()
+    assert torch.equal(actual.view(torch.uint8), tensor.view(torch.uint8))

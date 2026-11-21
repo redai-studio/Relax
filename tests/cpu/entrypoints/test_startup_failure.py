@@ -54,6 +54,7 @@ def _train_namespace():
         "Controller": Mock(),
         "RunRecorder": RunRecorder,
         "post_process_env": lambda args, env: env,
+        "get_serve_http_port": lambda: 8000,
         "init_tracking": Mock(),
         "maybe_pin_baseline_to_stable": Mock(),
         "_ctrl": None,
