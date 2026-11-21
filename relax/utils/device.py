@@ -468,11 +468,19 @@ def set_numa_affinity(local_rank: int) -> None:
         try:
             import pynvml
 
+            allowed = set(os.sched_getaffinity(0))
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
-            pynvml.nvmlDeviceSetCpuAffinity(handle)
-            logger.info(f"Set NUMA affinity for GPU {local_rank}")
-            pynvml.nvmlShutdown()
+            try:
+                # CUDA local ranks are remapped by CUDA_VISIBLE_DEVICES; NVML
+                # indices remain host-global. Preserve the launcher's CPU mask.
+                gpu_uuid = str(torch.cuda.get_device_properties(local_rank).uuid)
+                handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
+                words = pynvml.nvmlDeviceGetCpuAffinity(handle, max(allowed) // 64 + 1)
+                preferred = {cpu for cpu in allowed if words[cpu // 64] & (1 << (cpu % 64))}
+                os.sched_setaffinity(0, preferred or allowed)
+                logger.info(f"Set NUMA affinity for GPU {local_rank} ({gpu_uuid}) within the assigned CPU mask")
+            finally:
+                pynvml.nvmlShutdown()
         except ImportError:
             logger.info("pynvml not available, skipping NUMA affinity setup")
         except Exception as e:

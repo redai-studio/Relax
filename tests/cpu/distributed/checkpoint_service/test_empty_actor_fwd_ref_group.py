@@ -49,7 +49,7 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
 
     def state(self, role="actor", pp_rank=0):
         return SimpleNamespace(
-            role_info=SimpleNamespace(role_name=role),
+            role_info=SimpleNamespace(role_name=role, node_id=role),
             backend_type="gloo",
             _megatron=SimpleNamespace(
                 mpu=SimpleNamespace(
@@ -66,9 +66,15 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
 
     def topology(self, world_size, port=12345, global_rank=0, pp_size=1):
         return {
+            "topology_id": f"members-{world_size}",
+            "update_id": f"update-{world_size}",
+            "includes_reference": world_size > 1,
             "world_size": world_size,
             "global_rank": global_rank,
-            "pp_groups": {f"update_actor_pp_{rank}": f"tcp://127.0.0.1:{port + rank}" for rank in range(pp_size)},
+            "pp_groups": {
+                f"update_actor_pp_{rank}_members-{world_size}": f"tcp://127.0.0.1:{port + rank}"
+                for rank in range(pp_size)
+            },
         }
 
     def initialize(self, state, topology):
@@ -117,7 +123,13 @@ class EmptyActorFwdRefGroupTest(unittest.TestCase):
         self.send(actor)
         actor.http_client.post.assert_called_once_with(
             "http://coordinator/send_weight_meta",
-            json={"names": ["weight"], "dtypes": ["float32"], "shapes": [[2]], "group_name": "update_actor_pp_0"},
+            json={
+                "names": ["weight"],
+                "dtypes": ["float32"],
+                "shapes": [[2]],
+                "group_name": "update_actor_pp_0_members-2",
+                "update_id": "update-2",
+            },
         )
         self.broadcast.assert_called_once_with(
             self.tensor.data, 0, group=actor._model_update_groups_for_actor_fwd_ref, async_op=True

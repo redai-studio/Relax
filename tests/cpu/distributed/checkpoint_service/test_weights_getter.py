@@ -171,6 +171,7 @@ def test_rollout_only_skips_actor_fwd_group_init(monkeypatch):
     actor_mod = _import_actor_module()
 
     actor = actor_mod.MegatronTrainRayActor.__new__(actor_mod.MegatronTrainRayActor)
+    actor.args = Namespace(weight_version_config=None)
     actor._weight_sync_lock = None
     client = MagicMock()
     actor.checkpoint_engine_client = client

@@ -500,6 +500,7 @@ class EngineGroup:
                 sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 register_sigterm_handler=self.is_scaled_out,
+                **({"weight_consumer": True} if getattr(self.args, "weight_consumer_config", None) else {}),
             )
 
             rollout_engines.append((global_rank, rollout_engine))
@@ -1414,6 +1415,8 @@ class RolloutManager(ReloadableMixin):
     async def generate(self, rollout_id):
         self._begin_generation()
         self.rollout_id = rollout_id
+        if getattr(self.args, "weight_consumer_config", None):
+            await self.consume_available_weight_versions()
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
@@ -1432,6 +1435,8 @@ class RolloutManager(ReloadableMixin):
             )
 
     async def eval(self, rollout_id):
+        if getattr(self.args, "weight_consumer_config", None):
+            await self.consume_available_weight_versions()
         self._begin_generation()
         self.health_monitoring_resume()
 
@@ -1497,7 +1502,55 @@ class RolloutManager(ReloadableMixin):
         if self._eval_judge_errors:
             raise RuntimeError("Async eval judge failures: " + "; ".join(self._eval_judge_errors))
 
-    async def run_predict(self, train_step: int) -> None:
+    async def consume_available_weight_versions(self):
+        """Freeze a published target at the rollout boundary, then install
+        it."""
+        engines = self.rollout_engines
+        if not engines:
+            raise RuntimeError("No rollout engine is available for version consumption")
+        deadline = time.monotonic() + self.args.rollout_http_timeout
+        versions = []
+        while not versions:
+            versions = await engines[0].published_weight_versions.remote(-1, 1, True)
+            if not versions:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("No published weight version is visible; check the source transport and stream")
+                await asyncio.sleep(0.25)
+        return await self.consume_weight_version(versions[-1]["version"])
+
+    async def consume_weight_version(self, version: int, full: bool = False):
+        """Consume a fixed version independently of training communication
+        groups."""
+        acquired = False
+        deadline = time.monotonic() + self.args.rollout_http_timeout
+        self.health_monitoring_pause()
+        try:
+            while not acquired:
+                acquired = await self.rollout_engine_lock.acquire.remote()
+                if not acquired:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Rollout engine membership is busy; retry the same target")
+                    await asyncio.sleep(0.1)
+            engines = self.rollout_engines
+            # Keep the membership lock until every bounded engine operation has
+            # settled, including a failed peer. Cancelling the Ray await does not
+            # cancel an in-flight installation in that actor.
+            results = await asyncio.gather(
+                *(engine.consume_weight_version.remote(version, full) for engine in engines),
+                return_exceptions=True,
+            )
+            failures = [result for result in results if isinstance(result, Exception)]
+            if failures:
+                raise RuntimeError(f"Version {version} was not activated on all engines: {failures}")
+            self.status = "onload"
+            return results
+        finally:
+            if acquired:
+                await self.rollout_engine_lock.release.remote()
+
+    async def run_predict(
+        self, train_step: int, weight_version: int | None = None, weight_root: str | None = None
+    ) -> None:
         """Periodic SFT predict pass entry point.
 
         Restores KV/cuda-graph when rollout offloading is enabled, then delegates
@@ -1511,7 +1564,18 @@ class RolloutManager(ReloadableMixin):
         """
         from relax.engine.sft.predict.loop import run_predict_loop
 
-        if self.args.offload_rollout:
+        if weight_version is not None or weight_root is not None or getattr(self.args, "weight_version_config", None):
+            if weight_version is None or not weight_root:
+                raise ValueError("SFT prediction requires the training step's published version and root")
+            if self.args.offload_rollout:
+                await self.onload()
+            receipts = await self.consume_weight_version(weight_version)
+            if not receipts or any(
+                state["active_version"]["version"] != weight_version or state["active_version"]["root"] != weight_root
+                for state in receipts
+            ):
+                raise RuntimeError(f"Rollout engines did not activate the published weights for step {train_step}")
+        elif self.args.offload_rollout:
             await self.onload_kv()
         await run_predict_loop(self, self.args, train_step)
 

@@ -229,15 +229,18 @@ def test_device_numa_affinity_cover_ppu(monkeypatch) -> None:
     calls = []
     fake_nvml = types.SimpleNamespace(
         nvmlInit=lambda: calls.append("init"),
-        nvmlDeviceGetHandleByIndex=lambda index: f"handle{index}",
-        nvmlDeviceSetCpuAffinity=lambda handle: calls.append(handle),
+        nvmlDeviceGetHandleByUUID=lambda uuid: calls.append(uuid) or uuid,
+        nvmlDeviceGetCpuAffinity=lambda handle, words: [1 << 3],
         nvmlShutdown=lambda: calls.append("shutdown"),
     )
     monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
 
     monkeypatch.setattr(device, "_detect_accelerator", lambda: AcceleratorType.PPU)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda rank: types.SimpleNamespace(uuid=f"GPU-{rank}"))
+    monkeypatch.setattr(device.os, "sched_getaffinity", lambda pid: {3, 4})
+    monkeypatch.setattr(device.os, "sched_setaffinity", lambda pid, cpus: calls.append(cpus))
     device.set_numa_affinity(3)
-    assert calls == ["init", "handle3", "shutdown"]
+    assert calls == ["init", "GPU-3", {3}, "shutdown"]
 
 
 def test_device_weight_chunk_barrier_on_ppu(monkeypatch) -> None:
