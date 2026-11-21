@@ -535,6 +535,9 @@ def post_process_env(args, env):
     # this value, so it must be identical in every Serve and Megatron actor.
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
         env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
+    for name in ("RELAX_SFT_ROPE_FP32", "RELAX_SFT_ROUTER_FP32"):
+        if name in os.environ:
+            env["env_vars"].setdefault(name, os.environ[name])
 
     # Use the same file-scanning concurrency in the driver and SFT replicas.
     env["env_vars"].setdefault("RELAX_JSONL_INDEX_WORKERS", str(Envs.RELAX_JSONL_INDEX_WORKERS))

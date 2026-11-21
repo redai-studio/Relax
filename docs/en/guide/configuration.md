@@ -42,11 +42,24 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--train-backend` | str | megatron | `megatron` | Training backend selection |
+| `--train-backend` | str | megatron | `megatron`, `fsdp`, `fsdp_turbo` | Training backend selection |
+| `--turbo-config` | str | None | YAML path or inline JSON | FSDPTurbo backend configuration |
 | `--qkv-format` | str | thd | `thd`, `bshd` | QKV layout for Megatron backend. Dynamic batching not supported in `bshd` mode; must specify `--micro-batch-size` |
 | `--megatron-to-hf-mode` | str | raw | `raw`, `bridge` | Megatron to HF weight conversion method. `bridge` uses megatron bridge for automatic conversion |
 | `--true-on-policy-mode` | flag | False | - | Whether to enable true on-policy mode |
 | `--fully-async` | flag | False | - | Whether to use fully asynchronous training pipeline |
+
+### FSDPTurbo Configuration and Supported Modes
+
+Select this backend with `--train-backend fsdp_turbo --turbo-config <config> --colocate`. It currently supports offline SFT and synchronous colocated GRPO. Fully async and hybrid training, critic/reference models, and standalone log-probability services are unsupported; `--kl-coef` must be `0`.
+
+The Turbo YAML `optimizer` section controls the optimizer and learning-rate schedule, including `lr`, `min_lr`, `warmup_ratio` / `warmup_steps`, betas, and weight decay. Megatron arguments such as `--lr` and `--lr-decay-style` do not override these values. Inline JSON passed through `--turbo-config` follows the same rules. Relax arguments such as global batch size and data paths remain CLI settings.
+
+Ulysses CP is currently SFT-only. Qwen4 Exp SFT supports CP with `memory.chunk_loss: true`; `memory.chunk_loss_size` sets the chunk row count. This requires TP=1, MTP disabled, and `memory.chunk_batch: false`. `chunk_batch` and `chunk_loss` are separate settings and are not interchangeable.
+
+The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-next-tmp-fsdp-turbo-128xnpu.sh`, using `configs/turbo_config/qwen3_8_flash_next.yaml`. Set `HF_CHECKPOINT` to the model directory and `DATA_DIR` to the directory containing training parquet files. Use `LOAD_PATH` to resume and `SAVE_INTERVAL` to override the default checkpoint interval of 5000. Per-token loss is always enabled.
+
+Both DCP and legacy FSDPTurbo checkpoints need `lr_scheduler.pt` to restore scheduler progress with `--load`. Older checkpoints without it fail explicitly instead of inferring optimizer update counts from rollout IDs. To reuse only the weights, first export a compatible HF model directory and start a new run with `--hf-checkpoint`; a DCP shard directory is not an HF model directory.
 
 ---
 
