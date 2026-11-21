@@ -330,3 +330,42 @@ def test_packed_wire_keeps_ordinary_loader_side_effects_and_rejects_invalid_boun
         with pytest.raises(ValueError, match="boundaries"):
             install(model, dict(directory, loader_ends=invalid_ends))
         assert not model.calls
+
+
+@pytest.mark.parametrize("fault", ["digest", "length", "compressed_bytes", "status_alias", "loader_ends"])
+def test_ipc_directory_rejects_invalid_tail_before_writing(fault):
+    import hashlib
+    import zlib
+
+    from relax.backends.sglang.weight_sync_proxy import _status_buffer
+
+    model = TinyModel(torch.bfloat16)
+    control = dict(op="begin", seed=True, version="seed", receiver_gpu_budget_bytes=1 << 20, staging_budget_bytes=1024)
+    load_delta_weights(model, [(json.dumps(control), torch.empty(0))])
+    values = torch.tensor([11, 12, 13, 14], dtype=torch.bfloat16)
+    metadata, raw = encode([("weight", (2, 2), values.dtype, None, values)], max_bytes=1024)
+    if fault == "loader_ends":
+        metadata["loader_ends"] = [2]
+    canonical = json.dumps(metadata).encode()
+    compressed = zlib.compress(canonical)
+    ctl = dict(
+        op="consume",
+        version="seed",
+        frame=0,
+        metadata_id=hashlib.sha256(canonical).hexdigest(),
+        metadata_ipc=[1, len(compressed), len(canonical)],
+    )
+    ack = _status_buffer(1, compressed, "cpu")
+    ack[0] = 99
+    if fault == "digest":
+        ctl["metadata_id"] = "0" * 64
+    elif fault == "length":
+        ctl["metadata_ipc"][2] -= 1
+    elif fault == "compressed_bytes":
+        ack[-1] ^= 127
+    elif fault == "status_alias":
+        raw = ack[: raw.numel()]
+    with pytest.raises(ValueError):
+        load_delta_weights(model, [(json.dumps(ctl), raw), ("__delta_capability__", ack)])
+    assert int(ack[0]) == 99 and not model.weight.any()
+    assert model._relax_delta_receiver.failed and model._relax_delta_receiver.version is None

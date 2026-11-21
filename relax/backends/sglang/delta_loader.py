@@ -51,17 +51,20 @@ def _inline_directory(control: dict, *, encoded_limit: int = MAX_HTTP_BYTES) -> 
         or len(data) > encoded_limit
     ):
         raise ValueError("Invalid inline delta directory size")
+    return _decode_directory(base64.b64decode(data, validate=True), size, control.get("metadata_id"))
+
+
+def _decode_directory(compressed: bytes, size: int, identity: str) -> Any:
     try:
-        compressed = base64.b64decode(data, validate=True)
         decoder = zlib.decompressobj()
         decoded = decoder.decompress(compressed, size + 1)
         if len(decoded) != size or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
-            raise ValueError("Invalid inline delta directory stream or length")
-        if hashlib.sha256(decoded).hexdigest() != control.get("metadata_id"):
-            raise ValueError("Inline delta directory identity mismatch")
+            raise ValueError("Invalid delta directory stream or length")
+        if hashlib.sha256(decoded).hexdigest() != identity:
+            raise ValueError("Delta directory identity mismatch")
         return json.loads(decoded.decode("ascii"))
     except zlib.error as exc:
-        raise ValueError("Invalid inline delta directory compression") from exc
+        raise ValueError("Invalid delta directory compression") from exc
 
 
 def _model_storage(model: Any) -> frozenset[tuple[str, int]]:
@@ -246,7 +249,9 @@ class DeltaReceiver:
                 raise ValueError("Delta metadata document identity mismatch")
             doc["metadata"] = json.loads(encoded)
 
-    def _admit(self, metadata: dict, raw: torch.Tensor, local: frozenset = frozenset()) -> None:
+    def _admit(
+        self, metadata: dict, raw: torch.Tensor, local: frozenset = frozenset(), ipc_directory_bytes: int = 0
+    ) -> None:
         control = self.active["control"]
         if raw.device != next(self.model.parameters()).device:
             raise ValueError("Delta IPC payload must reside on the model worker's device")
@@ -271,7 +276,7 @@ class DeltaReceiver:
         # Proxy-owned resident staging and SG-owned workspace are distinct
         # allocations sharing the configured synchronization budget.
         staging = control["staging_budget_bytes"]
-        if required + staging > budget:
+        if required + ipc_directory_bytes + staging > budget:
             raise ValueError("Receiver workspace plus proxy staging exceeds its configured GPU budget")
         if raw.device.type == "cuda":
             free, _ = torch.cuda.mem_get_info(raw.device)
@@ -414,7 +419,39 @@ class DeltaReceiver:
         if control.get("ordered_target") is True:
             self._consume_ordered(control, raw, status)
             return
-        if "metadata_zlib" in control:
+        ipc_directory_bytes = 0
+        if "metadata_ipc" in control:
+            if (
+                self.document is not None
+                or "metadata" in control
+                or "metadata_zlib" in control
+                or self.active["control"].get("target_shard_request")
+            ):
+                raise ValueError("Conflicting IPC delta directories")
+            descriptor = control["metadata_ipc"]
+            if not isinstance(descriptor, list) or len(descriptor) != 3 or any(type(n) is not int for n in descriptor):
+                raise ValueError("Invalid IPC delta directory descriptor")
+            count, compressed, size = descriptor
+            if (
+                not 0 < count <= 65536
+                or not 0 < compressed <= size <= MAX_DOCUMENT_BYTES
+                or type(status) is not torch.Tensor
+                or status.dtype != torch.uint8
+                or status.device != raw.device
+                or status.shape != (count + compressed,)
+                or not status.is_contiguous()
+            ):
+                raise ValueError("Invalid IPC delta directory size or storage")
+            ipc_directory_bytes = ((status.numel() + 511) // 512) * 512
+            active = self.active["control"]
+            if ipc_directory_bytes > active["receiver_gpu_budget_bytes"] - active["staging_budget_bytes"]:
+                raise ValueError("IPC delta directory exceeds the receiver workspace budget")
+            # Validate the entire exported status allocation before reading its
+            # immutable tail. The original capability ACK only writes the prefix.
+            validate_transport_storage(self.model, (raw, status))
+            metadata = _decode_directory(status[count:].cpu().numpy().tobytes(), size, control.get("metadata_id"))
+            status = status[:count]
+        elif "metadata_zlib" in control:
             if self.document is not None or "metadata" in control:
                 raise ValueError("Conflicting inline and staged delta directories")
             metadata = _inline_directory(control)
@@ -448,7 +485,7 @@ class DeltaReceiver:
             if local and (not plan.current(self, raw, status) or not status.is_contiguous()):
                 self._broadcast_plan, plan, local = None, None, frozenset()
         if pending is None:
-            self._admit(metadata, raw, local)
+            self._admit(metadata, raw, local, ipc_directory_bytes)
         entries = list(tensors(metadata, raw))
         if status.dtype != torch.uint8 or status.shape != (len(entries),) or status.device != raw.device:
             raise ValueError("Delta capability output must have one byte per input tensor on the same device")
@@ -562,7 +599,7 @@ class DeltaReceiver:
             key = self._workspace_key(metadata, local)
             self.workspace_peaks[key] = max(self.workspace_peaks.get(key, 0), peak)
             if (
-                peak + self.active["control"]["staging_budget_bytes"]
+                peak + ipc_directory_bytes + self.active["control"]["staging_budget_bytes"]
                 > self.active["control"]["receiver_gpu_budget_bytes"]
             ):
                 raise ValueError("Measured receiver workspace plus proxy staging exceeds its GPU budget")
