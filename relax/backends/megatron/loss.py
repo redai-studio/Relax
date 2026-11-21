@@ -377,7 +377,8 @@ def _chunked_sft_log_probs(
         chunk_log_prob, _ = calculate_log_probs_and_entropy(chunk_logits, targets, tp_group, with_entropy=False)
         return chunk_log_prob.squeeze(-1)
 
-    # Keep empty CP shards connected to the head input for collective backward.
+    # Keep empty shards connected for CP collective backward, in fp32
+    # to match the non-empty log-probabilities.
     if hidden_states.size(0) == 0:
         return hidden_states.float().sum(dim=-1)
 
@@ -390,13 +391,17 @@ def _chunked_sft_log_probs(
         if fused_ce is not None and Envs.RELAX_SFT_FUSED_LINEAR_CE:
             fused_losses = fused_ce(hidden, targets[start:stop], args.rollout_temperature)
             if fused_losses is not None:
-                # Fused CE already recomputes the projection in its backward.
+                # The fused Function retains no vocab activations and already
+                # recomputes GEMM in backward. An outer checkpoint would
+                # redundantly run another projection before that backward.
                 log_probs.append(-fused_losses.squeeze(-1))
                 continue
 
         labels = targets[start:stop]
         if getattr(args, "recompute_loss_function", False) and torch.is_grad_enabled():
-            # Checkpoint projection and CE together to avoid saving full-vocabulary softmax buffers.
+            # Checkpoint the head and CE together. Chunking only the forward
+            # would still retain every chunk's full-vocabulary softmax until
+            # backward, using O(sequence * vocabulary / TP) activation memory.
             use_reentrant = not unfused_wgrad
             if use_reentrant and not hidden.requires_grad:
                 hidden = hidden.detach().requires_grad_(True)
@@ -1081,6 +1086,7 @@ def policy_loss_function(
 
     full_log_probs = None
     full_old_log_probs = None
+    # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering.
     if args.use_opsm or algorithm.needs_full_log_probs:
         padded_iter = padded_total_lengths if padded_total_lengths is not None else [None] * len(log_probs)
         # OPSM supports CP: reconstruct each sample's full response from its CP-local
@@ -1472,6 +1478,7 @@ def _sft_response_loss(
     )
     log_probs = torch.cat(scores["log_probs"], dim=0)
     loss = -sum_of_sample_mean(log_probs)
+    # Keep empty response shards connected to the model output for backward.
     if log_probs.numel() == 0:
         loss += 0 * model_output.sum()
     return loss, _sft_loss_metrics(args, batch, loss, log_probs, negate=True)
@@ -1865,7 +1872,8 @@ def _compute_loss_and_metrics(
             case "sft" if getattr(args, "task_type", "causal_lm") == "seq_cls":
                 func = sequence_classification_loss_function
             case "sft" if args.sft_chunked_logits and lm_head_forward is not None:
-                # Chunked SFT checkpoints each head + CE block itself.
+                # Chunked SFT checkpoints each head+CE block, so backward never rebuilds
+                # a whole sequence of full-vocabulary softmax buffers at once.
                 return sft_loss_function_chunked(
                     args, batch, logits, sum_of_sample_mean, lm_head_forward=lm_head_forward
                 )
@@ -1979,15 +1987,21 @@ def loss_function(
     if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
         loss = loss + 0 * logits.sum(dtype=torch.float32)
 
+    # Fully-async + dynamic-batch path injects per-rollout loss_scale and tags
+    # dummy micro-batches (used to align num_microbatches across DPs). Dummy
+    # mbs must contribute zero gradient AND zero metric values.
     is_dummy = batch.get("__is_dummy__", False)
     explicit_loss_scale = batch.get("__loss_scale__", None)
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     if is_dummy:
-        # Keep dummy microbatches in the backward collectives with zero gradient.
+        # Zero-out gradient contribution but keep the autograd graph
+        # connected so PP/CP backward collectives still complete.
         loss = 0.0 * loss
     elif not args.calculate_per_token_loss:
-        # Token sums are normalized later by the all-reduced CP-local token count.
-        # Only sample-mean loss needs Megatron's gradient-accumulation scale here.
+        # The DP(+CP) factor cancels DDP's gradient averaging for sample means.
+        # Per-token loss skips this scaling: finalize_model_grads normalizes by
+        # the all-reduced CP-local token count. An extra cp_size factor would
+        # weight each sample by its CP degree when it varies across microbatches.
         if explicit_loss_scale is not None:
             loss = loss * explicit_loss_scale
         else:
