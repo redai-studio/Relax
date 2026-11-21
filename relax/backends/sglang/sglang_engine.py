@@ -335,6 +335,8 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     """Top-level picklable ``multiprocessing.Process`` target that applies the
     SGLang patches, each gated by its own env flag so any combination is valid:
 
+    - server process: shorten health and abort-pause readiness polling when
+      SGLANG_CONTROL_POLL_INTERVAL is below the native one-second interval.
     - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
@@ -347,6 +349,14 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     kill_itself_when_parent_died()
     if os.getppid() != parent_pid:
         return
+
+    if Envs.SGLANG_CONTROL_POLL_INTERVAL != 1.0:
+        from .control_polling_patch import patch_control_poll_interval
+
+        patch_control_poll_interval(
+            Envs.SGLANG_CONTROL_POLL_INTERVAL,
+            tokenizer_worker_num=getattr(server_args, "tokenizer_worker_num", None),
+        )
 
     if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
