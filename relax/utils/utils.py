@@ -20,6 +20,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.data_fields import needs_multimodal_fields
 from relax.utils.types import Sample
 
 
@@ -114,6 +115,29 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
+        if getattr(args, "use_agentic_rollout", False) and train_data.get("multimodal_train_inputs") is None:
+            # Custom converters may reorder or expand rows. Only text-only
+            # inputs can safely receive a nullable column without an explicit
+            # media-to-output mapping supplied by the converter.
+            flat_samples = [sample for item in samples for sample in (item if isinstance(item, list) else [item])]
+            if any(sample.multimodal_train_inputs is not None for sample in flat_samples):
+                raise ValueError(
+                    "Agentic custom converter omitted multimodal_train_inputs for media-bearing samples; "
+                    "preserve the media in the converter's output row order"
+                )
+            rows = (
+                int(train_data.batch_size[0])
+                if isinstance(train_data, TensorDict)
+                else len(
+                    next(train_data[key] for key in ("total_lengths", "tokens", "sample_indices") if key in train_data)
+                )
+            )
+            nullable = {"multimodal_train_inputs": [None] * rows}
+            train_data["multimodal_train_inputs"] = (
+                dict_to_tensordict(nullable, rows)["multimodal_train_inputs"]
+                if isinstance(train_data, TensorDict)
+                else nullable["multimodal_train_inputs"]
+            )
         if getattr(args, "advantage_estimator", None) == "score_centering":
             from relax.utils.score_centering import SCORE_CENTERING_FIELDS
 
@@ -268,8 +292,20 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
-    if args.multimodal_keys is not None:
+    # Rollout actors may lack the backend's is_vl_model flag; also inspect samples.
+    if needs_multimodal_fields(args) or any(
+        getattr(sample, "multimodal_train_inputs", None) is not None for sample in samples
+    ):
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+        if Envs.RELAX_TRAIN_VISION_CACHE:
+            from relax.utils.multimodal.vision_feature_cache import attach_vision_cache_info
+
+            train_data["multimodal_train_inputs"] = [
+                attach_vision_cache_info(
+                    sample.session_id or (sample.metadata or {}).get("session_id"), sample.multimodal_train_inputs
+                )
+                for sample in samples
+            ]
 
     if args.use_opd:
         from relax.engine.rollout.on_policy_distillation import produce_opd_transfer_data

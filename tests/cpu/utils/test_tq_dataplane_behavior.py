@@ -285,6 +285,106 @@ def test_empty_get_returns_without_hanging(tq_factory) -> None:
     assert getattr(meta, "size", None) == 0 and list(data.keys()) == []
 
 
+@pytest.mark.parametrize("custom_converter", [False, True])
+def test_agentic_text_first_batch_publishes_nullable_multimodal_column(
+    tq_factory, monkeypatch, custom_converter
+) -> None:
+    from argparse import Namespace
+
+    from relax.utils.training.data_fields import build_data_fields
+    from relax.utils.types import Sample
+    from relax.utils.utils import convert_samples_to_train_data
+
+    producer = Namespace(
+        loss_type="policy_loss",
+        advantage_estimator="grpo",
+        use_agentic_rollout=True,
+        multimodal_keys=None,
+        use_opd=False,
+        debug_train_only=False,
+        custom_reward_post_process_path=None,
+        agentic_custom_advantage_path="unused:advantage",
+    )
+    if custom_converter:
+        from relax.utils import utils
+
+        producer.custom_convert_samples_to_train_data_path = "custom.convert"
+
+        def convert(args, samples):
+            default_args = Namespace(**{**vars(args), "custom_convert_samples_to_train_data_path": None})
+            batch = convert_samples_to_train_data(default_args, samples)
+            if samples[0].multimodal_train_inputs is None:
+                del batch["multimodal_train_inputs"]
+            return batch
+
+        monkeypatch.setattr(utils, "load_function", lambda path: convert)
+    image = {"pixel_values": torch.ones(4, 4), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+    client = tq_factory()
+    for index, multimodal in enumerate((None, image)):
+        sample = Sample(
+            index=index,
+            tokens=[1, 2],
+            response_length=1,
+            rollout_log_probs=[-0.1],
+            custom_advantage=0.5,
+            multimodal_train_inputs=multimodal,
+        )
+        batch = convert_samples_to_train_data(producer, [sample])
+        assert "multimodal_train_inputs" in batch
+        client.put(batch, partition_id="text_first")
+    consumer = Namespace(**vars(producer), is_vl_model=True)
+    meta, received = _get(client, "text_first", build_data_fields(consumer), 2)
+    assert meta.size == 2
+    by_index = dict(
+        zip(
+            (int(value) for value in payload_rows(received["sample_indices"])),
+            payload_rows(received["multimodal_train_inputs"]),
+            strict=True,
+        )
+    )
+    assert by_index[0] is None
+    torch.testing.assert_close(by_index[1]["pixel_values"], image["pixel_values"])
+    torch.testing.assert_close(by_index[1]["image_grid_thw"], image["image_grid_thw"])
+
+
+@pytest.mark.parametrize("as_tensordict", [False, True])
+def test_agentic_custom_converter_nullable_media_uses_output_row_count(monkeypatch, as_tensordict) -> None:
+    from argparse import Namespace
+
+    from relax.utils import utils
+    from relax.utils.types import Sample
+
+    args = Namespace(use_agentic_rollout=True, custom_convert_samples_to_train_data_path="custom.convert")
+    converted = {"tokens": [[3, 4], [1, 2]], "total_lengths": [2, 2]}
+    if as_tensordict:
+        converted = utils.dict_to_tensordict(converted, 2)
+    before = payload_rows(converted["tokens"])
+    monkeypatch.setattr(utils, "load_function", lambda path: lambda args, samples: converted)
+    result = utils.convert_samples_to_train_data(args, [[Sample(tokens=[1, 2])]])
+    assert result is converted
+    assert payload_rows(result["multimodal_train_inputs"]) == [None, None]
+    for expected, actual in zip(before, payload_rows(result["tokens"]), strict=True):
+        assert not diff_digests(leaf_digests(expected), leaf_digests(actual))
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_agentic_custom_converter_rejects_missing_media(monkeypatch, missing) -> None:
+    from argparse import Namespace
+
+    from relax.utils import utils
+    from relax.utils.types import Sample
+
+    args = Namespace(use_agentic_rollout=True, custom_convert_samples_to_train_data_path="custom.convert")
+    converted = {"tokens": [[1, 2]]}
+    if not missing:
+        converted["multimodal_train_inputs"] = None
+    monkeypatch.setattr(utils, "load_function", lambda path: lambda args, samples: converted)
+    sample = Sample(multimodal_train_inputs={"pixel_values": torch.ones(4, 4)})
+    with pytest.raises(ValueError, match="omitted multimodal_train_inputs for media-bearing samples"):
+        utils.convert_samples_to_train_data(args, [[sample]])
+    assert converted.get("multimodal_train_inputs") is None
+
+
 def test_repeat_put_stays_bounded_and_uncorrupted(tq_factory) -> None:
     client = tq_factory()
     first, second = _payload(4, ["a"], 4, 1), _payload(4, ["a"], 4, 2)

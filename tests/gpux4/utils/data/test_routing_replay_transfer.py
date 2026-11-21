@@ -235,6 +235,8 @@ def test_routing_replay_single_rank_preserves_ragged_offsets_without_collectives
     "use_gpu", [False, pytest.param(True, marks=pytest.mark.skipif(not _GPU_TESTS, reason="GPU opt-in"))]
 )
 def test_routing_replay_postprocess_keeps_full_batch_on_cpu(monkeypatch, use_gpu: bool) -> None:
+    from relax.utils.training.data_fields import has_multimodal_inputs
+
     if use_gpu and not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda", 0) if use_gpu else torch.device("cpu")
@@ -247,6 +249,7 @@ def test_routing_replay_postprocess_keeps_full_batch_on_cpu(monkeypatch, use_gpu
     monkeypatch.setitem(sys.modules, tensorclass.__name__, tensorclass)
     (post_process,) = _load_functions(
         "post_process_rollout_data",
+        has_multimodal_inputs=has_multimodal_inputs,
         Envs=SimpleNamespace(RELAX_SFT_SELECTIVE_LOGITS=False),
         device_utils=SimpleNamespace(make_current_torch_device=lambda: device),
         _add_sft_token_lengths=lambda *args: None,

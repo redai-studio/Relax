@@ -214,9 +214,20 @@ def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: s
         "image_token_count": multimodal_stats["image_token_count"],
         "multimodal_token_count": multimodal_stats["multimodal_token_count"],
         "agent_turns": metadata.get("rollout_turns", 1),
+        # Keep agent_turns compatible: it counts model turns within this export,
+        # not environment actions across the whole logical session.
+        "export_turns": metadata.get("rollout_turns", 1),
         "status": sample.status.value if hasattr(sample.status, "value") else str(sample.status),
         "group_index": sample.group_index,
     }
+    session_id = getattr(sample, "session_id", None) or metadata.get("session_id")
+    if session_id is not None:
+        record["session_id"] = session_id
+    if "agent_turns" in metadata:
+        record["session_agent_turns"] = metadata["agent_turns"]
+    for key in ("task_id", "turn_index", "export_index", "parse_attempt", "accepted_for_execution"):
+        if key in metadata:
+            record[key] = metadata[key]
     if sample.label is not None:
         record["label"] = sample.label
     if sample.multimodal_inputs is not None:

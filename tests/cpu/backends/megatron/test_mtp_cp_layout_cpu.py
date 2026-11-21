@@ -40,9 +40,11 @@ def load_functions(path, names, namespace):
 def production_namespace(cp_size, rank, tp_size=2):
     from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
     from relax.utils.env import Envs
+    from relax.utils.training.data_fields import has_multimodal_inputs
 
     namespace = {
         "Envs": Envs,
+        "has_multimodal_inputs": has_multimodal_inputs,
         "os": os,
         "torch": torch,
         "F": F,

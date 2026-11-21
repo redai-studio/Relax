@@ -92,3 +92,21 @@ def test_log_perf_data_raw_reports_baseline_per_card_throughput(monkeypatch):
     assert logged_metrics["perf/actor_train_tok_per_s_per_card"] == 75.0
     assert logged_metrics["perf/step_token_per_s_per_card"] == 50.0
     assert logged_metrics["perf/step_resp_token_per_s_per_card"] == 25.0
+
+
+def test_reused_reference_forward_has_zero_time_without_fictitious_mfu(monkeypatch):
+    original = FakeTimer.log_dict
+
+    def reused_forward(self):
+        values = original(self)
+        values["ref_log_probs"] = 0.0
+        values["ref_log_probs_reuse"] = 0.002
+        return values
+
+    monkeypatch.setattr(FakeTimer, "log_dict", reused_forward)
+    metrics = _collect_perf_metrics(monkeypatch, 100.0)
+    assert metrics["perf/ref_log_probs_time"] == 0.0
+    assert metrics["perf/ref_log_probs_reuse_time"] == 0.002
+    assert "perf/ref_log_probs_tflops" not in metrics
+    assert "perf/mfu/ref_infer" not in metrics
+    assert "perf/mfu/actor_infer" in metrics

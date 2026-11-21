@@ -163,6 +163,7 @@ async def test_resident_teacher_tracks_original_session(monkeypatch, cancel) -> 
     shard.handle.pause_generation.remote = AsyncMock(return_value=0)
     shard.handle.trim_memory.remote = AsyncMock()
     shard.handle.release_group.remote = AsyncMock()
+    shard.handle.agentic_kv_metrics.remote = AsyncMock(return_value={})
     prepare = PrepareDomain("train", None, runtime)
     monkeypatch.setattr(prepare, "fill", lambda demand: None)  # Use the groups prepared below.
     reward = RewardDomain(args, "train", None)
