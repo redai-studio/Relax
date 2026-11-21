@@ -2,6 +2,7 @@
 
 import argparse
 import importlib
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -204,6 +205,36 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.relax_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+def test_mm_replay_flag_enables_reference_delivery(arguments_module, monkeypatch):
+    from relax.distributed import replay_manager
+    from relax.distributed.replay_manager import core
+    from relax.distributed.replay_manager.config import ReplayConfig
+
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "")
+    manager = core.ReplayManager(config=ReplayConfig(delivery="full", run_id="abcd"))
+    monkeypatch.setattr(core, "replay_data_manager", manager)
+    monkeypatch.setattr(replay_manager, "replay_data_manager", manager)
+    checkpoint = SimpleNamespace(
+        model_type="qwen3_5_moe",
+        vision_config=SimpleNamespace(out_hidden_size=2048, spatial_merge_size=2),
+        text_config=SimpleNamespace(hidden_size=2048),
+    )
+    monkeypatch.setattr("relax.utils.misc.get_hf_config", lambda _path: checkpoint)
+    args = _opd_args()
+    args.hf_checkpoint = "model"
+    args.use_opd = False
+    args.colocate = True
+    args.use_rollout_mm_embedding_replay = True
+    args.freeze_vision_model = args.freeze_vision_projection = True
+    args.multimodal_keys = {"image": "images"}
+    args.qkv_format = "thd"
+    args.rollout_function_path = "relax.engine.rollout.sglang_rollout.generate_rollout"
+    arguments_module.relax_validate_args(args)
+    assert manager.uses_references
+    assert os.environ["RELAX_REPLAY_RUN_ID"] == "abcd"
 
 
 @pytest.mark.parametrize("rollout_gpus", [None, 4])

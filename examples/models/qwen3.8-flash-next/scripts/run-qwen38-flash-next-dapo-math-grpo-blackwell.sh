@@ -8,7 +8,7 @@
 # Nodes GPUs  Training (TP/PP/CP/EP/ETP)  Rollout
 # 2     16    4/4/1/4/1                  one TP16/DP2/EP16 engine (attention TP8)
 # 3     24    4/3/2/8/1                  three TP8/EP8 engines
-# 4     32    4/4/2/8/1                  four TP8/EP8 engines
+# 4     32    4/4/1/8/1 (DP2)            eight TP4/EP4 engines
 # 8     64    4/4/2/8/1 (DP2)            eight TP8/EP8 engines
 # The 32/64-GPU presets require multi-node training validation.
 # Requires docker/Dockerfile.cu13 target relax with GPU_ARCH=blackwell on all nodes.
@@ -27,8 +27,8 @@
 # SAVE_DIR: persistent checkpoint root, accessible on all nodes.
 # RAY_ADDRESS: existing cluster GCS address; submit from the Ray head via its local dashboard.
 # Resume: keep SAVE_DIR and EXP_NAME unchanged; new experiment: change EXP_NAME.
-# Default: 200 updates, save every 50 (16 GPUs) / 100 (others) updates, retain two checkpoints.
-# Two-update validation: NUM_ROLLOUT=2 SAVE_INTERVAL=1 (use a separate EXP_NAME).
+# The 32-GPU preset defaults to 200 rollouts and saves every 100 rollouts.
+# Other presets run 200 updates and save every 50 (16 GPUs) or 100 updates.
 # Ray submission blocks by default; set RAY_NO_WAIT=1 only for nonblocking submission.
 # CPU_OFFLOAD: optimizer CPU offload, 1=on / 0=off; defaults to on for 16 GPUs, off for >16.
 
@@ -67,7 +67,6 @@ case "${WORLD_SIZE}" in
         PP_SIZE=4
         CP_SIZE=1
         EP_SIZE=4
-        DEFAULT_SAVE_INTERVAL=50
         # Two PP stages share each node: disable P2P PXN relays to avoid lazy
         # transport initialization deadlocking with another stage's CUDA wait.
         export NCCL_P2P_PXN_LEVEL=0
@@ -83,15 +82,19 @@ case "${WORLD_SIZE}" in
         PP_SIZE=3
         CP_SIZE=2
         EP_SIZE=8
-        DEFAULT_SAVE_INTERVAL=100
         PP_LAYOUT_ARGS=(--pipeline-model-parallel-layout 'Et*16|t*16|t*16L')
         ;;
     4|8)
         TOTAL_GPUS=$((WORLD_SIZE * 8))
         PP_SIZE=4
-        CP_SIZE=2
+        CP_SIZE=$((WORLD_SIZE == 4 ? 1 : 2))
         EP_SIZE=8
-        DEFAULT_SAVE_INTERVAL=100
+        if [ "${WORLD_SIZE}" = 4 ]; then
+            ROLLOUT_TOPOLOGY_ARGS=(
+                --rollout-num-gpus-per-engine 4
+                --sglang-ep-size 4
+            )
+        fi
         ;;
     *)
         echo "Unsupported WORLD_SIZE=${WORLD_SIZE}: expected node count 2, 3, 4, or 8." >&2
@@ -128,13 +131,34 @@ fi
 # Reuse the example's full 48-layer architecture and Bridge defaults.
 source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 
+DEFAULT_NUM_ROLLOUT=200
+DEFAULT_SAVE_INTERVAL=$((TOTAL_GPUS == 16 ? 50 : 100))
+TOKEN_BUDGET=16384
+
+# Keep the original 32-GPU CP1 mixed-attention preset.
+if [ "${TOTAL_GPUS}" = 32 ]; then
+    TOKEN_BUDGET=131072
+    export RELAX_QWEN38_QSA_COMMUNITY_BACKEND=mixed
+    export MCORE_QSA_SPARSE_BACKEND=id_sparse
+    export RELAX_QWEN38_QSA_FUSED_ATTENTION=0
+    export RELAX_QWEN38_QSA_FUSED_SELECTOR=0
+    export RELAX_QWEN38_QSA_TP_SELECTOR=1
+    export RELAX_QWEN38_QSA_SELECTOR_COMPILE=1
+fi
+
 # Keep streamed PLE disabled. Host-only training PLE is not supported by the
 # colocated GPU weight iterator; keep the frozen table on its owning GPU ranks.
 export RELAX_QWEN38_PLE_STREAMED=0
 export QWEN38_PLE_CPU_OFFLOAD=0
+export RELAX_QWEN38_HC_FUSED_COMBINE=1
+export RELAX_QWEN38_QSA_ROUTED_QKV=1
+# Fused PLE convolution supports CP1 only (the 16/32-GPU presets).
+export RELAX_QWEN38_PLE_FUSED_CONV=$((CP_SIZE == 1))
 export SGLANG_VLM_CACHE_SIZE_MB=0
 # Attention TP8 GDN projection has width 2060, incompatible with DeepGEMM TMA alignment.
 export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0
+# Scale FP32 QK scores like training; avoid rounding a pre-scaled Q to BF16.
+export RELAX_QSA_MATCH_TRAINING_SCALE="${RELAX_QSA_MATCH_TRAINING_SCALE:-1}"
 # Match Megatron's FP32 router. Other AutoModel parity knobs remain opt-in:
 # their BF16 rounding contracts are not established for Megatron fused kernels.
 export RELAX_QWEN38_FP32_ROUTER=1
@@ -142,7 +166,7 @@ export RELAX_QWEN38_FP32_ROUTER=1
 MODEL_NAME="${MODEL_NAME:-Qwen3.8-Flash-Next}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/dapo-math}"
 EXP_NAME="${EXP_NAME:-qwen38-flash-next-dapo-math-grpo-${TOTAL_GPUS}xgpu-blackwell-280g-colocate-t4p${PP_SIZE}c${CP_SIZE}e${EP_SIZE}}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-${DEFAULT_NUM_ROLLOUT}}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-${DEFAULT_SAVE_INTERVAL}}"
 now=$(date "+%Y%m%d-%H%M%S")
 
@@ -151,10 +175,14 @@ CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}/${MODEL_NAME}"
     --megatron-to-hf-mode bridge
     --load "${SAVE_DIR}/${EXP_NAME}"
-    --save "${SAVE_DIR}/${EXP_NAME}"
-    --save-interval "${SAVE_INTERVAL}"
-    --max-actor-ckpt-to-keep 2
 )
+if [ "${SAVE_INTERVAL}" -gt 0 ]; then
+    CKPT_ARGS+=(
+        --save "${SAVE_DIR}/${EXP_NAME}"
+        --save-interval "${SAVE_INTERVAL}"
+        --max-actor-ckpt-to-keep 2
+    )
+fi
 
 ROLLOUT_ARGS=(
     --prompt-data "${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl"
@@ -216,7 +244,7 @@ PERF_ARGS=(
     --micro-batch-size 1
     --use-dynamic-batch-size
     # Dynamic microbatch token budget per GPU.
-    --max-tokens-per-gpu 16384
+    --max-tokens-per-gpu "${TOKEN_BUDGET}"
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
@@ -266,6 +294,7 @@ SGLANG_ARGS=(
     --sglang-max-total-tokens 1048576
     # Explicit backend enables the BF16 MoE unpack/repack weight-update lifecycle.
     --sglang-moe-runner-backend flashinfer_trtllm
+    # Eight 4-GPU engines admit all 512 trajectories in the 32-GPU preset.
     --sglang-max-running-requests 64
     --sglang-max-mamba-cache-size 512
 )
@@ -299,7 +328,7 @@ import os
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
 for name, value in os.environ.items():
-    if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_")) or name in (
+    if name.startswith(("CLEARML_", "RELAX_QWEN38_", "RELAX_GDN_", "RELAX_HC_", "RELAX_MOE_", "RELAX_QSA_", "RELAX_REPLAY_")) or name in (
         "PYTHONPATH", "MEGATRON", "RELAX", "PYTHONNOUSERSITE",
         "QWEN38_PLE_CPU_OFFLOAD", "MCORE_QSA_SPARSE_BACKEND",
         "SGLANG_VLM_CACHE_SIZE_MB", "CUDA_HOME", "TRITON_F32_DEFAULT",

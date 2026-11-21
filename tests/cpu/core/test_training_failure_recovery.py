@@ -3,6 +3,7 @@
 
 import ast
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -14,6 +15,8 @@ from unittest.mock import Mock
 import pytest
 
 from relax.components.background_loop import BackgroundLoopRunner
+from relax.distributed.replay_manager import ReplayManager, rollout_kinds
+from relax.distributed.replay_manager.config import default_reference_r3, validate_reference_training
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -301,6 +304,11 @@ def test_entrypoint_exits_nonzero_for_training_failure(fails, expected):
 
     scope = {
         "Controller": Controller,
+        "json": json,
+        "replay_data_manager": ReplayManager(),
+        "rollout_kinds": rollout_kinds,
+        "default_reference_r3": default_reference_r3,
+        "validate_reference_training": validate_reference_training,
         "os": SimpleNamespace(path=os.path, environ={}),
         "cur_file_dir": str(ROOT),
         "yaml": SimpleNamespace(safe_load=lambda file: {}),

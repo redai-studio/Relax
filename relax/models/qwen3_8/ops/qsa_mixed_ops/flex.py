@@ -17,6 +17,11 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 _compiled_attention = torch.compile(flex_attention, dynamic=True)
 
 
+def _bounds_tensor(bounds: tuple[int, ...] | list[int], device: torch.device) -> torch.Tensor:
+    host = torch.tensor(bounds, dtype=torch.int32, pin_memory=device.type == "cuda")
+    return host.to(device, non_blocking=True)
+
+
 @triton.jit
 def _selected_bits(
     Indices,
@@ -40,7 +45,7 @@ def _selected_bits(
 def layout(bounds: tuple[int, ...] | list[int], device: torch.device) -> tuple:
     total = bounds[-1]
     rows = torch.arange(total, device=device, dtype=torch.int32)
-    starts = torch.tensor(bounds[:-1], device=device, dtype=torch.int32)
+    starts = _bounds_tensor(bounds[:-1], device)
     docs = torch.searchsorted(starts, rows, right=True) - 1
     token_starts = starts[docs]
     return docs, rows - token_starts, token_starts, max(b - a for a, b in zip(bounds, bounds[1:]))
@@ -57,7 +62,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
     if maximum <= budget + ratio - 1:
         from flash_attn import flash_attn_varlen_func
 
-        cu = torch.tensor(bounds, device=q.device, dtype=torch.int32)
+        cu = _bounds_tensor(bounds, q.device)
         return flash_attn_varlen_func(
             q.contiguous(), k.contiguous(), v.contiguous(), cu, cu, maximum, maximum, softmax_scale=scale, causal=True
         )
@@ -72,7 +77,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
         _selected_bits[(tokens,)](
             indices, starts, bits, indices.shape[1], topk, words, ratio, triton.next_power_of_2(topk), num_warps=4
         )
-        stride = torch.tensor(words, device=q.device, dtype=torch.int64)
+        stride = torch.full((), words, device=q.device, dtype=torch.int64)
         flat_bits = bits.flatten()
 
         def mask(batch, head, qi, ki):

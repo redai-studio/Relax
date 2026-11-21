@@ -419,8 +419,9 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no
             # Ray-actor/transport fault. Do NOT fall back to a local re-send:
             # that would double the logical attempt and, for an SGLang
             # pre-dispatch 499, hide the real error the 499 mapping needs to
-            # see. Only transport/actor failures fall back to the local client.
-            if isinstance(e, httpx.HTTPStatusError):
+            # see. Only transport/actor failures fall back to the local client,
+            # and an explicitly single-attempt call must never be resent.
+            if isinstance(e, httpx.HTTPStatusError) or max_retries == 1:
                 raise
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local

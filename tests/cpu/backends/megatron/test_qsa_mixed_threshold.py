@@ -27,7 +27,7 @@ def mixed_dispatcher(monkeypatch):
     def no_kernel(*_args, **_kwargs):
         pytest.fail("A dispatch-only test must replace GPU execution")
 
-    flex.attention = flex.attention_auto = grouped.attention_bf16 = no_kernel
+    flex._bounds_tensor = flex.attention = flex.attention_auto = grouped.attention_bf16 = no_kernel
     path = Path(__file__).resolve().parents[4] / "relax/models/qwen3_8/ops/qsa_mixed_ops/mixed.py"
     spec = importlib.util.spec_from_file_location("qsa_mixed_dispatch_under_test", path)
     mixed = importlib.util.module_from_spec(spec)

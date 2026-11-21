@@ -331,14 +331,8 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
-    """Top-level picklable ``multiprocessing.Process`` target that applies the
-    SGLang patches, each gated by its own env flag so any combination is valid:
-
-    - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
-    """
+def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
+    """Launch the server with the capture hooks configured by its engine."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -348,7 +342,15 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     if os.getppid() != parent_pid:
         return
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+    if reference_publication:
+        from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
+
+        launch_server(
+            server_args,
+            run_scheduler_process_func=run_reference_scheduler,
+            run_detokenizer_process_func=run_reference_detokenizer,
+        )
+    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -383,7 +385,7 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -398,7 +400,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
+    p = multiprocessing.Process(
+        target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
+    )
     p.start()
 
     if server_args.node_rank != 0:
@@ -571,6 +575,30 @@ class SGLangEngine(RayActor):
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
+        reference_publication = False
+        if Envs.RELAX_REPLAY_REFERENCES:
+            from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+            from relax.distributed.replay_manager.backend.sglang import validate_configuration
+
+            kinds = rollout_kinds(self.args)
+            local_publication = not (
+                getattr(self.args, "rollout_external", False) or init_external_kwargs
+            ) and server_args_dict.get("disaggregation_mode", "null") in (None, "null")
+            if kinds:
+                validate_configuration(self.args, server_args_dict, local_publication=local_publication)
+            reference_publication = bool(kinds) and local_publication
+            if reference_publication:
+                # Register resolved TQ endpoints before spawning scheduler processes.
+                # Children construct their own clients; no sockets cross spawn.
+                replay_data_manager.initialize(kinds=kinds, connection=self.args.tq_config)
+                os.environ["RELAX_REPLAY_REGISTRATION"] = json.dumps(replay_data_manager.export_registration())
+                os.environ["RELAX_REPLAY_RAY_ADDRESS"] = ray.get_runtime_context().gcs_address
+                publisher = (self.rank, ray.get_runtime_context().get_actor_id())
+                replay_data_manager.store().invoke("register_engine_publisher", *publisher)
+                os.environ["RELAX_REPLAY_ENGINE_PUBLISHER"] = json.dumps(publisher)
+            elif kinds:
+                logger.info("SGLang retains its native HTTP payload; Replay publishes references at rollout ingress")
+
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
@@ -589,7 +617,7 @@ class SGLangEngine(RayActor):
             self._sync_nextn_draft = server_args_dict.get(
                 "speculative_algorithm"
             ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, reference_publication=reference_publication)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
@@ -654,7 +682,9 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router()
 
-    def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
+    def _init_normal(
+        self, server_args_dict, *, apply_policy_load_plan: bool = True, reference_publication: bool = False
+    ):
         if apply_policy_load_plan:
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
@@ -700,7 +730,7 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args)
+        self.process = launch_server_process(server_args, reference_publication=reference_publication)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False

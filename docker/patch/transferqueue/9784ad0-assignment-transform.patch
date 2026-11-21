@@ -44,3 +44,34 @@ index 20c904d..85e9358 100644
  
  
  # Copied from https://github.com/volcengine/verl/blob/468adf22c43b744348051fccd7a5d830c6c3c36a/verl/utils/seqlen_balancing.py
+
+diff --git a/transfer_queue/controller.py b/transfer_queue/controller.py
+--- a/transfer_queue/controller.py
++++ b/transfer_queue/controller.py
+@@ -1503,7 +1503,6 @@
+                 # push data into TQ before this actor can drain anything.
+                 # The actor-side drain loop uses check_consumption_status to
+                 # know when the partition is truly done.
+-                start_time = time.time()
+                 while True:
+                     partition = self._get_partition(partition_id)
+                     if partition is None:
+@@ -1580,13 +1579,11 @@
+                     ):
+                         return BatchMeta.empty({"stream_end": True})
+ 
+-                    # Bounded wait: short backoff inside the handler so other
+-                    # consumers' GET_META requests aren't starved.  When the
+-                    # wait exceeds TQ_CONTROLLER_GET_METADATA_TIMEOUT, return
+-                    # empty meta and let the actor-side drain loop retry.
+-                    if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
+-                        return BatchMeta.empty()
+-                    time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
++                    # The same request thread serves producer metadata and
++                    # write acknowledgements. Never wait here for samples that
++                    # those producers still need to publish. The consumer owns
++                    # polling/backoff; preserve the terminal flags above.
++                    return BatchMeta.empty()
+             else:
+                 if batch_size is None:
+                     raise ValueError("must provide batch_size or token_budget in fetch mode")

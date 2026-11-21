@@ -7,11 +7,10 @@ Run the NCCL cases explicitly on two otherwise available GPUs with
 import ast
 import gc
 import os
-import sys
 from argparse import Namespace
 from datetime import timedelta
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -191,6 +190,14 @@ def _transfer_worker(rank: int, init_file: str, topology: tuple[int, int, int], 
                 assert sum(size > 24 for _, size in calls) >= 2
             del actual, actual_offsets, source, offsets
             gc.collect()
+        # In streaming mode every PP stage fetches its own batch on CP0 / TP0.
+        if pp_size > 1 and cp_size > 1:
+            sender = groups.cp_rank == 0 and groups.tp_rank == 0
+            expected = torch.full((2, 1), 10 + groups.pp_rank, dtype=torch.int32)
+            offsets = torch.tensor([0, 2]) if sender else None
+            actual, actual_offsets = broadcast(expected if sender else None, offsets, sender, device, False)
+            assert torch.equal(actual, expected)
+            assert actual_offsets.tolist() == [0, 2]
         if backend == "nccl":
             assert abs(peaks[-1] - peaks[-2]) < 1024 * 1024
             # The indexer replay caller still requests and receives GPU data.
@@ -238,20 +245,15 @@ def test_routing_replay_postprocess_keeps_full_batch_on_cpu(monkeypatch, use_gpu
     if use_gpu and not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda", 0) if use_gpu else torch.device("cpu")
-    cp_utils = ModuleType("relax.backends.megatron.cp_utils")
-    cp_utils.maybe_padded_total_lengths = lambda *args, **kwargs: None
-    cp_utils.slice_log_prob_with_cp = lambda values, *args, **kwargs: values
-    monkeypatch.setitem(sys.modules, cp_utils.__name__, cp_utils)
-    tensorclass = ModuleType("tensordict.tensorclass")
-    tensorclass.NonTensorData = type("NonTensorData", (), {})
-    monkeypatch.setitem(sys.modules, tensorclass.__name__, tensorclass)
-    (post_process,) = _load_functions(
-        "post_process_rollout_data",
-        Envs=SimpleNamespace(RELAX_SFT_SELECTIVE_LOGITS=False),
-        device_utils=SimpleNamespace(make_current_torch_device=lambda: device),
-        _add_sft_token_lengths=lambda *args: None,
-        iter_opd_cp_float_fields=lambda: (),
-    )
+    from relax.backends.megatron import cp_utils
+    from relax.utils.data import stream_dataloader
+
+    monkeypatch.setattr(cp_utils, "maybe_padded_total_lengths", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cp_utils, "slice_log_prob_with_cp", lambda values, *args, **kwargs: values)
+    monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: device)
+    monkeypatch.setattr(stream_dataloader, "_add_sft_token_lengths", lambda *args: None)
+    monkeypatch.setattr(stream_dataloader, "iter_opd_cp_float_fields", lambda: ())
+    post_process = stream_dataloader.post_process_rollout_data
     routes = [torch.tensor([[4, 1], [2, 9]], dtype=torch.int64), torch.tensor([[3, 7]], dtype=torch.int64)]
     data = {
         "tokens": [[1, 2, 3], [4, 5]],
