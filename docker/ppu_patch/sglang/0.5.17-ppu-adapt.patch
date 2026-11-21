@@ -1,0 +1,273 @@
+PPU re-anchoring of the upstream Relax SGLang patch.
+
+Based on:
+  PPU source   https://github.com/flytiger-eco/sglang-for-sail/tree/v0.5.17
+               (sglang 0.5.17+v0.1.0.ppu2.2.0, as shipped in the base image)
+  Relax patch  docker/patch/latest/sglang.patch
+               (-> docker/patch/sglang/v0.5.17.patch), applied unchanged, with
+               docker/patch/latest/sglang_per_pos_topk.patch after it
+
+The upstream patch applies to that fork with seven hunks left unapplied; this
+file places exactly those seven. Dockerfile.ppu asserts the two counts agree
+before applying it, so a change on either side fails the build instead of
+drifting silently.
+
+Apply inside site-packages with -p2, between the two upstream patches:
+
+  patch --batch --forward -p2 --fuzz=0 < sglang.patch
+  patch --batch --forward -p2 --fuzz=0 < 0.5.17-ppu-adapt.patch
+  patch --batch --forward -p2 --fuzz=0 < sglang_per_pos_topk.patch
+
+Five hunks keep the upstream added and removed lines unchanged and differ only
+in context or position:
+
+  dsa_indexer.py  _maybe_repeat_query_heads   sits just before _get_q_k_bf16
+  dsa_indexer.py  its second call site        PPU adds an `if self.use_fp4:` block after it
+  memory_pool.py  memory_saver_adapter.region PPU adds an `if self.use_fp4_indexer:` block
+  mxfp4.py        _pad_hopper_mxfp4_scale     PPU puts an `if is_ppu():` import block above it
+  mxfp4.py        the weight-reload block     PPU renames the method body it wraps
+
+Two carry what the fork's own code needs:
+
+  kimi_k3.py      the _bfa_w merge call       PPU passes merge_mods / pad_rows instead of
+                                              upstream's literal argument list
+  kimi_k3.py      _k3_fused_decode_args       PPU also stacks the tuple into the buffer
+                  reuse                       the decode kernel reads, so that one is
+                                              kept captured too
+
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+@@ -739,6 +739,12 @@
+             )
+         raise NotImplementedError
+ 
++    def _maybe_repeat_query_heads(self, query: torch.Tensor) -> torch.Tensor:
++        if query.shape[1] < 32:
++            assert 32 % query.shape[1] == 0
++            query = query.repeat_interleave(32 // query.shape[1], dim=1)
++        return query
++
+     def _get_q_k_bf16(
+         self,
+         q_lora: torch.Tensor,
+@@ -2222,6 +2228,7 @@
+                 enable_dual_stream,
+                 forward_batch=forward_batch,
+             )
++            query = self._maybe_repeat_query_heads(query)
+ 
+             if self.use_fp4:
+                 # MXFP4 path: Q goes through downcast_to_mxfp4_indexer producing
+--- a/python/sglang/srt/layers/quantization/mxfp4.py
++++ b/python/sglang/srt/layers/quantization/mxfp4.py
+@@ -207,6 +207,16 @@
+     from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
+ 
+ 
++def _pad_hopper_mxfp4_scale(scale, k_size):
++    # triton_kernels' HOPPER_SCALE branch (matmul_ogs_details/_matmul_ogs.py)
++    # loads weight scales unmasked over cdiv(k_size, 128) tiles.
++    mxfp4_block = 32
++    want = round_up(k_size, 128) // mxfp4_block
++    if scale.shape[-1] >= want:
++        return scale
++    return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
++
++
+ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
+     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+@@ -814,7 +824,133 @@
+             layer.register_parameter("w2_weight_bias", w2_weight_bias)
+             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+ 
++    @torch.no_grad()
++    def restore_weights_before_loading(self, layer):
++        """Restore serialized buffers without changing captured runtime storage."""
++        pristine = getattr(layer, "_mxfp4_pristine_params", None)
++        if pristine is None or layer._mxfp4_loading:
++            return
++        # Both caches can hold GPU indices allocated in the weights region.
++        # Colocated sleep discards that region without CPU backup; reusing
++        # those indices would silently corrupt the next FlashInfer repack.
++        if self.use_flashinfer:
++            _flashinfer_mxfp4_permute_indices_cache.clear()
++            _flashinfer_mxfp4_permute_indices_device_cache.clear()
++        for name, param in pristine.items():
++            # Sleep may discard serialized storage. Full weight pushes do not
++            # overwrite padding or the synthetic zero biases used by K3.
++            if name in layer._mxfp4_bias_values:
++                param.copy_(layer._mxfp4_bias_values[name])
++            else:
++                param.fill_(_UE8M0_ONE if "scale" in name else 0)
++            layer.register_parameter(name, param)
++        layer._mxfp4_loading = True
++
++    @staticmethod
++    def _copy_mxfp4_runtime_tensor(target, source):
++        if (
++            target.shape != source.shape
++            or target.dtype != source.dtype
++            or target.device != source.device
++            or target.stride() != source.stride()
++        ):
++            raise RuntimeError("MXFP4 runtime layout changed during weight update")
++        target.copy_(source)
++
++    def _reuse_mxfp4_loading_storage(self, layer):
++        # Generation is paused throughout restore/load/repack. Reuse the
++        # captured allocations as upload buffers instead of retaining a second
++        # full expert copy (especially costly for DeepGEMM/MegaMoE).
++        for name, param in layer._mxfp4_pristine_params.items():
++            target = layer._mxfp4_runtime_params.get(name)
++            if target is None and self.use_triton_kernels and name in (
++                "w13_weight", "w2_weight"
++            ):
++                target = getattr(self, f"{name}_triton_tensor").storage.data
++            if target is None or not param.is_contiguous():
++                continue
++            if target.numel() * target.element_size() < param.numel() * param.element_size():
++                continue
++            offset_bytes = target.storage_offset() * target.element_size()
++            if offset_bytes % param.element_size():
++                continue
++            storage = target.untyped_storage()
++            if storage.nbytes() < offset_bytes + param.numel() * param.element_size():
++                continue
++            param.data = torch.empty(0, dtype=param.dtype, device=target.device).set_(
++                storage,
++                offset_bytes // param.element_size(),
++                param.shape,
++                param.stride(),
++            )
++
++    @torch.no_grad()
+     def process_weights_after_loading(self, layer):
++        if getattr(layer, "_mxfp4_pristine_params", None) is None:
++            layer._mxfp4_pristine_params = dict(layer.named_parameters(recurse=False))
++            layer._mxfp4_bias_values = {
++                name: param.detach().cpu().clone()
++                for name, param in layer._mxfp4_pristine_params.items()
++                if name.endswith("_bias")
++            }
++            layer._mxfp4_loading = True
++        if not layer._mxfp4_loading:
++            return
++
++        # Backends may replace Parameters, reassign .data (DeepGEMM), or
++        # shuffle bytes in place (AITER). None may mutate the loader buffers.
++        for name, param in layer._mxfp4_pristine_params.items():
++            staging = Parameter(param.detach().clone(), requires_grad=False)
++            staging.__dict__.update(param.__dict__)
++            layer.register_parameter(name, staging)
++        self._process_mxfp4_weights_after_loading(layer)
++
++        params = dict(layer.named_parameters(recurse=False))
++        runtime = getattr(layer, "_mxfp4_runtime_params", None)
++        if runtime is None:
++            layer._mxfp4_runtime_params = params
++            layer._mxfp4_runtime_workspace = getattr(layer, "workspace", None)
++            if self.use_triton_kernels:
++                self._mxfp4_runtime_triton = tuple(
++                    (
++                        getattr(self, f"{prefix}_weight_triton_tensor"),
++                        getattr(self, f"{prefix}_precision_config"),
++                    )
++                    for prefix in ("w13", "w2")
++                )
++            self._reuse_mxfp4_loading_storage(layer)
++        else:
++            if params.keys() != runtime.keys():
++                raise RuntimeError("MXFP4 runtime parameters changed during weight update")
++            for name, target in runtime.items():
++                self._copy_mxfp4_runtime_tensor(target, params[name])
++                layer.register_parameter(name, target)
++            workspace = layer._mxfp4_runtime_workspace
++            if workspace is not None:
++                self._copy_mxfp4_runtime_tensor(workspace, layer.workspace)
++                layer.workspace = workspace
++            if self.use_triton_kernels:
++                for prefix, (weight, precision) in zip(
++                    ("w13", "w2"), self._mxfp4_runtime_triton
++                ):
++                    self._copy_mxfp4_runtime_tensor(
++                        weight.storage.data,
++                        getattr(self, f"{prefix}_weight_triton_tensor").storage.data,
++                    )
++                    self._copy_mxfp4_runtime_tensor(
++                        precision.weight_scale.storage.data,
++                        getattr(self, f"{prefix}_precision_config").weight_scale.storage.data,
++                    )
++                    setattr(self, f"{prefix}_weight_triton_tensor", weight)
++                    setattr(self, f"{prefix}_precision_config", precision)
++
++        # MegaMoE also reads these aliases outside named_parameters().
++        if self.use_deep_gemm and get_moe_a2a_backend().is_megamoe():
++            layer.mega_l1_weights = (layer.w13_weight.data, layer.w13_weight_scale.data)
++            layer.mega_l2_weights = (layer.w2_weight.data, layer.w2_weight_scale.data)
++        layer._mxfp4_loading = False
++
++    def _process_mxfp4_weights_after_loading(self, layer):
+         if _is_ppu and self.use_deepgemm_mxfp4_w4a16_mma:
+             from sglang.srt.layers.quantization.ppu_mxfp4_utils import (
+                 preprocess_mxfp4_w4a16_mma_scales,
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -4408,9 +4408,12 @@
+     def _create_index_buffers(self):
+         num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
+         with (
+-            torch.cuda.use_mem_pool(self.custom_mem_pool)
+-            if self.custom_mem_pool
+-            else nullcontext()
++            (
++                torch.cuda.use_mem_pool(self.custom_mem_pool)
++                if self.custom_mem_pool
++                else nullcontext()
++            ),
++            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
+         ):
+             if self.use_fp4_indexer:
+                 # FP4 layout per token: 64 packed FP4 bytes + 4 ue8m0 scale bytes.
+--- a/python/sglang/srt/models/kimi_k3.py
++++ b/python/sglang/srt/models/kimi_k3.py
+@@ -1570,7 +1570,11 @@
+         ):
+             return
+         pad_rows = 16 if self.use_fused_input_projection else 8
+-        self._bfa_w, sizes = _merge_weights_as_views(merge_mods, pad_rows_to=pad_rows)
++        self._bfa_w, sizes = _merge_weights_as_views(
++            merge_mods,
++            pad_rows_to=pad_rows,
++            merged=getattr(self, "_bfa_w", None),
++        )
+         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
+ 
+     def _prepare_fused_decode(self) -> None:
+@@ -1632,11 +1636,23 @@
+             self.o_norm.weight.data.float().contiguous(),
+             float(self.o_norm.eps),
+         )
++        previous = getattr(layer, "_k3_fused_decode_args", None)
++        if previous is None:
++            layer._k3_fused_decode_args = fused_args
++        else:
++            for target, value in zip(previous[:-1], fused_args[:-1]):
++                target.copy_(value)
+         if is_ppu():
+-            layer._k3_fused_decode_weight = torch.stack(
+-                layer._k3_fused_decode_args[:3]
+-            ).contiguous()
++            captured = getattr(layer, "_k3_fused_decode_weight", None)
++            if captured is None:
++                layer._k3_fused_decode_weight = torch.stack(
++                    layer._k3_fused_decode_args[:3]
++                ).contiguous()
++            else:
++                # A captured graph keeps reading the first allocation.
++                for row, value in zip(captured, layer._k3_fused_decode_args[:3]):
++                    row.copy_(value)
+         self._kda_fused_decode_ready = True
+ 
+     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
+         if self.use_full_rank_gate:

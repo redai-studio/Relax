@@ -1,0 +1,45 @@
+PPU 8 MiB allocation granularity for the opt-in MemPool line of torch_memory_saver.
+
+Based on:
+  PPU source   https://github.com/zhuzilin/torch_memory_saver @ bdab8c55
+               (TMS_LINE=vmm, the default; installed as-is, this file does not
+               apply to it)
+  Relax patch  none -- docker/Dockerfile.cu13 pins the opt-in line's source,
+               https://github.com/redai-studio/torch_memory_saver @ afc13785c5,
+               unpatched, so this file is the whole delta there: PPU allocates
+               in 8 MiB granules and cuMemCreate rejects any size that is not a
+               multiple of it.
+
+bdab8c55 keeps working with expandable_segments because it hooks cuMemCreate /
+cuMemMap; the afc13785 line drives the saver through torch.cuda.MemPool and
+refuses expandable_segments.
+
+diff --git a/csrc/core.cpp b/csrc/core.cpp
+index 914d18a..b0f81d8 100644
+--- a/csrc/core.cpp
++++ b/csrc/core.cpp
+@@ -36,6 +36,24 @@ cudaError_t TorchMemorySaver::malloc(void **ptr, CUdevice device, size_t size, c
+     return ROCmHIPImplementation::rocm_malloc(ptr, device, size, tag, enable_cpu_backup, allocation_metadata_, allocator_metadata_mutex_);
+ 
+ #else
++    // The minimum allocation granularity is platform specific (2 MiB on NVIDIA,
++    // 8 MiB on PPU) and cuMemCreate rejects anything that is not a multiple of
++    // it.  torch's caching allocator rounds large blocks to 2 MiB, so without
++    // this every allocation on a coarser platform fails with INVALID_VALUE.
++    // The aligned size is what metadata.size stores, and free/pause/resume all
++    // work off metadata.size, so the bookkeeping stays consistent.
++    {
++        CUmemAllocationProp alignment_prop = {};
++        alignment_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++        alignment_prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++        alignment_prop.location.id = device;
++        size_t granularity = 0;
++        CURESULT_CHECK(cuMemGetAllocationGranularity(&granularity, &alignment_prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
++        if (granularity > 1 && size % granularity != 0) {
++            size = ((size + granularity - 1) / granularity) * granularity;
++        }
++    }
++
+     const uint64_t memory_margin_bytes = memory_margin_bytes_.load();
+     if (memory_margin_bytes > 0) {
+         size_t free_bytes, total_bytes;
