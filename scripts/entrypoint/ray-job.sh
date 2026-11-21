@@ -237,6 +237,19 @@ export RUNTIME_ENV_JSON="{
 
 relax_kernel_cache_inject_runtime_env
 
+if [[ -n "${RELAX_ELASTIC_NODE_GROUP:-}" ]]; then
+    RUNTIME_ENV_JSON="$(python3 - "$RELAX_ELASTIC_NODE_GROUP" <<'PY'
+import json
+import os
+import sys
+
+runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+runtime_env["env_vars"]["RELAX_ELASTIC_NODE_GROUP"] = sys.argv[1]
+print(json.dumps(runtime_env))
+PY
+)"
+fi
+
 # Enforce terminal success for every local Ray submission from the launcher.
 source "${DIR}/ray-status.sh"
 

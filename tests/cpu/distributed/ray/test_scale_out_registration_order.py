@@ -4,9 +4,11 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+
+from relax.core.node_group_affinity import maybe_pin_baseline_to_stable
 
 
 try:
@@ -28,6 +30,55 @@ from conftest import (
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("autoscaler_enabled", "enable_affinity", "elastic_group", "expected_marker"),
+    [
+        (True, True, None, "elastic_gpu"),
+        (True, True, "overflow", "overflow_gpu"),
+        (True, False, "elastic", "elastic_gpu"),
+        (True, False, None, None),
+        (False, True, "elastic", None),
+        (None, True, "elastic", None),
+        (None, True, None, None),
+    ],
+)
+async def test_ray_native_scale_out_requests_elastic_marker(
+    monkeypatch, tmp_path, autoscaler_enabled, enable_affinity, elastic_group, expected_marker
+):
+    monkeypatch.setenv("RELAX_INITIAL_NODE_GROUP", "")
+    monkeypatch.delenv("RELAX_ELASTIC_NODE_GROUP", raising=False)
+    if elastic_group is not None:
+        monkeypatch.setenv("RELAX_ELASTIC_NODE_GROUP", elastic_group)
+
+    config_path = tmp_path / "autoscaler.yaml"
+    if autoscaler_enabled is not None:
+        config_path.write_text(f"enabled: {str(autoscaler_enabled).lower()}\n")
+    args = make_mock_args(
+        enable_affinity=enable_affinity,
+        autoscaler_config=str(config_path) if autoscaler_enabled is not None else None,
+    )
+    maybe_pin_baseline_to_stable(args)
+    # The training entrypoint supplies the resolved flag to the remote rollout manager.
+    config_path.unlink(missing_ok=True)
+    server = make_rollout_server(engine_groups=[make_engine_group(args=args)])
+    manager = create_test_manager(args=args, servers={"default": server})
+    request = ScaleOutRequest(request_id="test", num_replicas=2, timeout_secs=0, status=ScaleOutStatus.PENDING)
+
+    with (
+        patch("relax.distributed.ray.rollout.device_utils.get_ray_accelerator_name", return_value="GPU"),
+        patch("relax.distributed.ray.rollout.ray.util.placement_group") as create_pg,
+        patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg,
+    ):
+        await manager._scale_out_ray_native(request)
+
+    bundle = {"GPU": 1, "CPU": 1}
+    if expected_marker:
+        bundle[expected_marker] = 1
+    assert create_pg.call_args_list == [call([bundle, bundle], strategy="PACK")] * 2
+    assert remove_pg.call_count == 2
 
 
 @pytest.mark.asyncio
