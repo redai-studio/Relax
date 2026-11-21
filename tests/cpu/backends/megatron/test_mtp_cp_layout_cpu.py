@@ -10,6 +10,7 @@ They do not emulate distributed MTP boundary communication.
 import __future__
 
 import ast
+import os
 import sys
 from argparse import Namespace
 from collections.abc import Callable, Sequence
@@ -42,6 +43,7 @@ def production_namespace(cp_size, rank, tp_size=2):
 
     namespace = {
         "Envs": Envs,
+        "os": os,
         "torch": torch,
         "F": F,
         "Namespace": Namespace,
@@ -77,6 +79,26 @@ def make_batch(namespace, lengths):
     return namespace["get_batch"](
         iter([(raw, None)]), tuple(raw), pad_multiplier=1024, is_vl_model=True, pack_device=torch.device("cpu")
     )
+
+
+def test_static_cp_producer_prebuilds_both_physical_routes(monkeypatch):
+    from megatron.core.context_parallel_layout.routes import build_thd_cp_partition_route
+
+    namespace = production_namespace(2, 0)
+    load_functions(ROOT / "relax/backends/megatron/data.py", ["_prebuild_cp_route"], namespace)
+    monkeypatch.setenv("RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE", "1")
+    batch = make_batch(namespace, [17, 25])
+    for key in ("packed_seq_params", "vlm_packed_seq_params"):
+        packed = batch[key]
+        expected = build_thd_cp_partition_route(torch.tensor(packed.qsa_select_offsets_cpu), 2, 0)
+        actual = packed.cp_partition_route
+        assert actual.zigzag_split_sizes == expected.zigzag_split_sizes
+        assert actual.contiguous_split_sizes == expected.contiguous_split_sizes
+        torch.testing.assert_close(actual.zigzag_index, expected.zigzag_index)
+        torch.testing.assert_close(actual.contiguous_index, expected.contiguous_index)
+        assert getattr(packed, "local_cp_size", None) is None
+        assert getattr(packed, "cp_group", None) is None
+    assert batch["packed_seq_params"].qsa_select_offsets_cpu != batch["vlm_packed_seq_params"].qsa_select_offsets_cpu
 
 
 def legacy_kwargs(batch):

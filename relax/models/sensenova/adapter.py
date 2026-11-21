@@ -14,6 +14,15 @@ from typing import Any
 import torch
 
 
+def __getattr__(name: str) -> Any:
+    # Preserve the RL import path without loading optional RL dependencies for SFT.
+    if name == "SenseNovaU1ImageEditAdapter":
+        from .rl_adapter import SenseNovaU1ImageEditAdapter
+
+        return SenseNovaU1ImageEditAdapter
+    raise AttributeError(name)
+
+
 LORA_TARGETS = (
     "q_proj_mot_gen",
     "k_proj_mot_gen",

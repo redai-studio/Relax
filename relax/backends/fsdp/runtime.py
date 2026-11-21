@@ -108,6 +108,7 @@ def fsdp2_wrap(
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
     master_dtype: Optional[str] = None,
+    cast_root_forward_inputs: bool = True,
 ) -> torch.nn.Module:
     """Apply FSDP2 ``fully_shard`` per transformer block, then to the root.
 
@@ -172,7 +173,16 @@ def fsdp2_wrap(
         for module in model.modules():
             if isinstance(module, shard_targets):
                 fully_shard(module, **kwargs)
-    fully_shard(model, **kwargs)
+    # ART keeps FP32 timestep/noise-scale metadata at the root. Child blocks
+    # still receive the usual mixed-precision activation cast. The adapter owns
+    # the dtype of actual root activations (BF16 in the reference recipe).
+    root_kwargs = dict(kwargs)
+    root_kwargs["mp_policy"] = MixedPrecisionPolicy(
+        param_dtype=_DTYPES[param_dtype],
+        reduce_dtype=_DTYPES[reduce_dtype],
+        cast_forward_inputs=cast_root_forward_inputs,
+    )
+    fully_shard(model, **root_kwargs)
     logger.info(
         f"FSDP2 wrapped model; fine-grained modules: {len(fine_grained_modules)} "
         f"({sorted({type(m).__name__ for m in fine_grained_modules})}); "

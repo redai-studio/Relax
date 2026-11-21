@@ -78,7 +78,7 @@ ROLLOUT_ARGS=(
     --metadata-key extra_info
     --custom-rm-path examples.deepeyes_agentic.reward_deepeyes.reward_func
     --use-agentic-rollout
-    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-command "bash ${SCRIPT_DIR}/run_agent_app.sh"
     --agent-cwd "${SCRIPT_DIR}"
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size 32

@@ -337,3 +337,49 @@ def _local_phase_failure_worker(rank: int, rendezvous: str, phase: str, queue) -
 def test_rank_local_precollective_failure_exits_all_ranks_without_hang(phase, message, tmp_path):
     results = _run_failure_workers(_local_phase_failure_worker, (tmp_path / "rendezvous").as_uri(), phase)
     assert all(message in result for _, result in results)
+
+
+@pytest.mark.parametrize("offload_train", [False, True])
+def test_sync_preparation_releases_training_memory_before_engine_onload(offload_train):
+    shell, events = _shell(), []
+    shell.args.offload_train = offload_train
+    shell.wake_up = lambda **kwargs: events.append(("wake", kwargs))
+    shell.optimizer = SimpleNamespace(zero_grad=lambda **kwargs: events.append(("zero_grad", kwargs)))
+    shell._move_optimizer_state = lambda device: events.append(("optimizer", device.type))
+    shell.clear_memory = lambda: events.append(("clear",))
+    shell._prepare_weight_sync_memory_state()
+    assert events == (
+        [
+            ("wake", {"include_optimizer": False}),
+            ("zero_grad", {"set_to_none": True}),
+            ("optimizer", "cpu"),
+            ("clear",),
+        ]
+        if offload_train
+        else []
+    )
+
+
+@pytest.mark.parametrize("failure", [None, "local", "peer"])
+def test_sync_preparation_agrees_errors_before_engine_restore(monkeypatch, failure):
+    from relax.backends.fsdp import actor
+
+    shell, events = _shell(), []
+
+    def prepare():
+        events.append("prepare")
+        if failure == "local":
+            raise OSError("prepare failure")
+
+    def agree(error):
+        events.append(("agree", error))
+        return [(7, error or "peer prepare failure")] if failure else []
+
+    shell._prepare_weight_sync_memory_state = prepare
+    monkeypatch.setattr(actor, "_collect_weight_sync_errors", agree)
+    if failure:
+        with pytest.raises(WeightSyncError, match="training-memory preparation failed.*rank 7"):
+            shell._prepare_weight_sync_memory_state_and_agree(3)
+    else:
+        shell._prepare_weight_sync_memory_state_and_agree(3)
+    assert events == ["prepare", ("agree", "OSError: prepare failure" if failure == "local" else None)]

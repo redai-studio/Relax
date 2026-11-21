@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Shared checkpoint streaming and indexing helpers for FP8 conversion."""
+"""Shared checkpoint streaming and indexing helpers for HF/FP8 export."""
 
 import json
 import os
@@ -56,29 +56,32 @@ def write_safetensors_index(output_path: str | Path, result: ConversionResult) -
         json.dump(index_dict, f, indent=2)
 
 
-class StreamingFP8Writer:
-    """Quantize Bridge HF tensors immediately and write size-bounded shards."""
+class StreamingHFWriter:
+    """Write Bridge tensors in arrival order with a bounded shard buffer.
+
+    The buffer owns compact CPU tensors so slices cannot retain a full PLE
+    table or an autograd graph. A single tensor can exceed the shard target.
+    """
+
+    _temporary_prefix = "hf"
 
     def __init__(
         self,
         key_to_filename_map: dict[str, str],
-        strategy: str,
-        block_size: list[int] | None,
-        device: str | torch.device,
         max_shard_size: int = 4 * 1024**3,
     ) -> None:
         if not key_to_filename_map:
-            raise ValueError("Online FP8 conversion requires a safetensors source checkpoint")
+            raise ValueError("Streaming conversion requires a safetensors source checkpoint")
         if max_shard_size <= 0:
             raise ValueError("max_shard_size must be positive")
-        validate_fp8_options(strategy, block_size)
         self.expected_names = set(key_to_filename_map)
-        self.strategy = strategy
-        self.block_size = block_size
-        self.device = device
         self.max_shard_size = max_shard_size
         self.result = ConversionResult()
 
+    def _convert_tensor(self, name: str, tensor: torch.Tensor) -> tuple[dict[str, torch.Tensor], list[str]]:
+        return {name: tensor}, []
+
+    @torch.no_grad()
     def save_generator(
         self,
         generator: Iterable[tuple[str, torch.Tensor]],
@@ -86,10 +89,20 @@ class StreamingFP8Writer:
         strict: bool = True,
         distributed_save: bool = False,
         save_every_n_ranks: int = 1,
+        ignored_source_key_prefixes: Iterable[str] | None = None,
+        ignored_source_key_suffixes: Iterable[str] | None = None,
     ) -> None:
         del save_every_n_ranks
         if distributed_save:
-            raise ValueError("Online FP8 conversion does not support Bridge distributed_save")
+            raise ValueError("Streaming conversion does not support Bridge distributed_save")
+
+        ignored_prefixes = tuple(ignored_source_key_prefixes or ())
+        ignored_suffixes = tuple(ignored_source_key_suffixes or ())
+        expected_names = {
+            name
+            for name in self.expected_names
+            if not name.startswith(ignored_prefixes) and not name.endswith(ignored_suffixes)
+        }
 
         is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         rank = torch.distributed.get_rank() if is_distributed else 0
@@ -100,10 +113,11 @@ class StreamingFP8Writer:
 
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
-        temporary_dir = Path(tempfile.mkdtemp(prefix=".fp8-export-", dir=output_path))
+        temporary_dir = Path(tempfile.mkdtemp(prefix=f".{self._temporary_prefix}-export-", dir=output_path))
         cleanup_temporary_dir = True
 
         buffered_tensors: dict[str, torch.Tensor] = {}
+        buffered_storages: set[int] = set()
         buffered_size = 0
         temporary_shards: list[tuple[str, list[str]]] = []
         yielded_names: set[str] = set()
@@ -113,12 +127,13 @@ class StreamingFP8Writer:
             nonlocal buffered_size, buffered_tensors
             if not buffered_tensors:
                 return
-            filename = f".fp8-shard-{len(temporary_shards) + 1:05d}.tmp"
+            filename = f".{self._temporary_prefix}-shard-{len(temporary_shards) + 1:05d}.tmp"
             safetensors.torch.save_file(buffered_tensors, temporary_dir / filename, metadata={"format": "pt"})
             shard_keys = list(buffered_tensors)
             self.result.add_result(filename, buffered_tensors, [])
             temporary_shards.append((filename, shard_keys))
             buffered_tensors = {}
+            buffered_storages.clear()
             buffered_size = 0
 
         try:
@@ -127,35 +142,41 @@ class StreamingFP8Writer:
                     raise ValueError(f"Bridge yielded duplicate tensor: {name}")
                 yielded_names.add(name)
 
-                if name not in self.expected_names:
+                if name not in expected_names:
                     if strict:
                         raise KeyError(f"Bridge tensor '{name}' is missing from the source safetensors index")
                     logger.warning(f"Skipping Bridge tensor missing from the source safetensors index: {name}")
                     del tensor
                     continue
 
-                converted, ignored_modules = quantize_hf_tensor(
-                    name,
-                    tensor,
-                    self.strategy,
-                    self.block_size,
-                    self.device,
-                )
+                converted, ignored_modules = self._convert_tensor(name, tensor)
                 duplicate_outputs = output_names & converted.keys()
                 if duplicate_outputs:
-                    raise ValueError(f"Duplicate FP8 output tensors: {sorted(duplicate_outputs)}")
+                    raise ValueError(f"Duplicate output tensors: {sorted(duplicate_outputs)}")
                 self.result.add_ignored_modules(ignored_modules)
                 converted_size = sum(tensor.numel() * tensor.element_size() for tensor in converted.values())
                 if buffered_tensors and buffered_size + converted_size > self.max_shard_size:
                     flush()
-                buffered_tensors.update(converted)
+                # Detach even inputs already on CPU. Clone slices/noncontiguous
+                # tensors so buffered bytes reflect the storage retained here.
+                for output_name, weight in converted.items():
+                    compact = weight.detach().to(device="cpu").contiguous()
+                    storage = compact.untyped_storage()
+                    if (
+                        storage.nbytes() != compact.numel() * compact.element_size()
+                        or storage.data_ptr() in buffered_storages
+                    ):
+                        compact = compact.clone()
+                    buffered_storages.add(compact.untyped_storage().data_ptr())
+                    buffered_tensors[output_name] = compact
+                    del weight, compact, storage
                 buffered_size += converted_size
                 output_names.update(converted)
                 if buffered_size >= self.max_shard_size:
                     flush()
                 del tensor, converted
 
-            missing_names = self.expected_names - yielded_names
+            missing_names = expected_names - yielded_names
             if missing_names:
                 logger.warning(f"Bridge did not yield {len(missing_names)} tensors from the source safetensors index")
                 if strict:
@@ -164,7 +185,7 @@ class StreamingFP8Writer:
             flush()
 
             if not self.result.weight_map:
-                raise ValueError("Bridge did not produce any FP8 tensors")
+                raise ValueError("Bridge did not produce any checkpoint tensors")
 
             shard_count = len(temporary_shards)
             staged_shards: list[tuple[Path, Path]] = []
@@ -207,3 +228,26 @@ class StreamingFP8Writer:
         finally:
             if cleanup_temporary_dir:
                 shutil.rmtree(temporary_dir, ignore_errors=True)
+
+
+class StreamingFP8Writer(StreamingHFWriter):
+    """Quantize Bridge HF tensors before buffering them for output."""
+
+    _temporary_prefix = "fp8"
+
+    def __init__(
+        self,
+        key_to_filename_map: dict[str, str],
+        strategy: str,
+        block_size: list[int] | None,
+        device: str | torch.device,
+        max_shard_size: int = 4 * 1024**3,
+    ) -> None:
+        super().__init__(key_to_filename_map, max_shard_size)
+        validate_fp8_options(strategy, block_size)
+        self.strategy = strategy
+        self.block_size = block_size
+        self.device = device
+
+    def _convert_tensor(self, name: str, tensor: torch.Tensor) -> tuple[dict[str, torch.Tensor], list[str]]:
+        return quantize_hf_tensor(name, tensor, self.strategy, self.block_size, self.device)

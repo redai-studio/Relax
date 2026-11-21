@@ -29,3 +29,86 @@
  
          if ctx.fp8 and ctx.is_input_fp8:
              dq, dk, dv, _, _ = combine_and_quantize(ctx.qkv_layout, dq, dk, dv, ctx.dQKV_quantizer)
+--- a/transformer_engine/pytorch/attention/dot_product_attention/utils.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+@@ -841,6 +841,7 @@
+                 )
+             use_fused_attention = False
+ 
++    # FA2 kernels built for SM100 also support the SM10x family, including SM103.
+     fa2_padded_head_dim = max(head_dim_qk, head_dim_v)
+     if (  # pylint: disable=too-many-boolean-expressions
+         use_flash_attention_2
+@@ -851,6 +852,7 @@
+             or (
+                 fa2_padded_head_dim > 192
+                 and device_compute_capability not in ((8, 0), (9, 0), (10, 0), (12, 0))
++                and device_compute_capability[0] != 10
+             )
+         )
+     ):
+@@ -926,6 +928,22 @@
+                 head_dim_qk,
+                 head_dim_v,
+                 device_compute_capability[0] * 10 + device_compute_capability[1],
++            )
++            use_flash_attention_4 = False
++        # FA4's SM100 backward requires aligned head tiles; padded visual heads
++        # (e.g. Qwen3.5 head_dim=72) fail in preprocess or dQ reduction. Keep
++        # native FA2/fused filtering for these shapes and retain FA4 for hd256.
++        if (
++            use_flash_attention_4
++            and is_training
++            and (10, 0) <= device_compute_capability < (12, 0)
++            and (head_dim_qk % 32 != 0 or head_dim_v % 32 != 0)
++        ):
++            logger.debug(
++                "Disabling FlashAttention 4 for SM100 training with unaligned head dimensions. "
++                "Found: head_dim_qk = %s, head_dim_v = %s.",
++                head_dim_qk,
++                head_dim_v,
+             )
+             use_flash_attention_4 = False
+         # flash-attn-4 4.0.0b11 validates (256, 256) on SM100, but its dedicated
+--- a/transformer_engine/pytorch/optimizers/fused_adam.py
++++ b/transformer_engine/pytorch/optimizers/fused_adam.py
+@@ -741,21 +741,24 @@
+                 # pylint: disable=cell-var-from-loop
+                 inv_scale_arg = () if inv_scale is None else (inv_scale,)
+                 out_dtype_arg = () if out_dtype is None else (out_dtype,)
+-                multi_tensor_applier(
+-                    adam_func,
+-                    self._dummy_overflow_buf,
+-                    tensor_lists,
+-                    group["lr"],
+-                    beta1,
+-                    beta2,
+-                    group["eps"],
+-                    group["step"],
+-                    self.adam_w_mode,
+-                    bias_correction,
+-                    group["weight_decay"],
+-                    *inv_scale_arg,
+-                    *out_dtype_arg,
+-                )
++                # Bound temporary NVTETensor handles for models with many experts.
++                # Adam updates are independent per parameter; keep the group step fixed.
++                for start in range(0, len(tensor_lists[0]), 1024):
++                    multi_tensor_applier(
++                        adam_func,
++                        self._dummy_overflow_buf,
++                        [items[start : start + 1024] for items in tensor_lists],
++                        group["lr"],
++                        beta1,
++                        beta2,
++                        group["eps"],
++                        group["step"],
++                        self.adam_w_mode,
++                        bias_correction,
++                        group["weight_decay"],
++                        *inv_scale_arg,
++                        *out_dtype_arg,
++                    )
+ 
+             if self.capturable:
+                 # If the optimizer is capturable, then if there's a grad scaler it works

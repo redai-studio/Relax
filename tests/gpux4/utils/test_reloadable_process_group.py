@@ -44,6 +44,14 @@ def _collective_worker(rank: int, rendezvous: str, backend: str) -> None:
             exchange_alias(exchanged, torch.tensor([rank * 10.0, rank * 10.0 + 1], device=device), group=group)
             torch.testing.assert_close(exchanged, torch.tensor([float(rank), 10.0 + rank], device=device))
             if backend == "nccl":
+                direct_gathered = torch.full_like(gathered, float("nan"))
+                dist.all_gather_single(direct_gathered, source, group=group)
+                torch.testing.assert_close(direct_gathered, gathered)
+                direct_reduced = torch.full_like(reduced, float("nan"))
+                dist.reduce_scatter_single(direct_reduced, torch.full((4,), rank + 1.0, device=device), group=group)
+                torch.testing.assert_close(direct_reduced, reduced)
+                gathered.fill_(float("nan"))
+                reduced.fill_(float("nan"))
                 with dist._coalescing_manager(group=group, device=device):
                     dist.all_gather_single(gathered, source, group=group)
                 torch.testing.assert_close(
