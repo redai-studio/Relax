@@ -908,18 +908,58 @@ class DeviceDirectBackend(CommBackend):
         )
 
         pause_rollout = not actor_fwd_only and (not managed or not self._lora_sync.base_sync_done)
-        if pause_rollout:
+        delta_overlap = delta_active and self.delta_exporter.config.receive_overlap
 
-            def pause_and_flush() -> None:
-                # Pause generation on all rollout nodes
-                logger.info("Pausing generation on all rollout nodes...")
-                ray.get(self._batch_request("/pause_generation"))
+        def pause_and_flush() -> None:
+            # This remains the original DCS control owner. The exporter may
+            # defer this barrier, but cannot choose recipients or resume them.
+            logger.info("Pausing generation on all rollout nodes...")
+            ray.get(self._batch_request("/pause_generation"))
+            logger.info("Flushing cache on all rollout nodes...")
+            for rank, engine in self.rollout_engines.items():
+                ray.get(engine.flush_cache.remote())
 
-                # Flush cache on all rollout nodes
-                logger.info("Flushing cache on all rollout nodes...")
-                for rank, engine in self.rollout_engines.items():
-                    ray.get(engine.flush_cache.remote())
+        def pause_delta_apply() -> None:
+            group = get_gloo_group()
+            error = [None]
+            if dist.get_rank(group=group) == 0:
+                try:
+                    pause_and_flush()
+                except Exception as exc:
+                    error[0] = str(exc)
+            dist.broadcast_object_list(error, src=dist.get_process_group_ranks(group)[0], group=group)
+            if error[0] is not None:
+                raise RuntimeError(f"DCS delta pause/flush failed: {error[0]}")
+            from relax.backends.sglang.sglang_engine import _sglang_has_weight_update_session
 
+            if _sglang_has_weight_update_session():
+                self._rollout_control_request("/begin_weight_update")
+
+        if delta_active:
+            getter = self._weights_getter
+            if getter is None:
+                getter = lambda: dict(
+                    self._megatron.named_params_and_buffers(
+                        self.args,
+                        self.model,
+                        convert_to_global_name=not self._use_bridge,
+                        include_persistent_buffers=self._use_bridge,
+                    )
+                )
+            delta_arguments = dict(
+                engines=delta_engines,
+                gpu_counts=delta_counts,
+                version=str(self.weight_version),
+                group=get_gloo_group(),
+                force_full=self.args.offload_rollout,
+            )
+            if delta_overlap:
+                # Exhaust the complete HF converter here. In particular, do
+                # not suspend Bridge's cross-yield process-group scopes while
+                # the original raw actor_fwd/reference iterator runs below.
+                self.delta_exporter.synchronize(getter, **delta_arguments, before_first_apply=pause_delta_apply)
+
+        if pause_rollout and not delta_overlap:
             if managed:
                 run_on_training_rank_zero(pause_and_flush, phase="initial LoRA base pause")
             elif dist.get_rank() == 0:
@@ -983,25 +1023,8 @@ class DeviceDirectBackend(CommBackend):
             else:
                 self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only or delta, pbar=pbar)
             dist.barrier(group=get_gloo_group())
-        if delta_active:
-            getter = self._weights_getter
-            if getter is None:
-                getter = lambda: dict(
-                    self._megatron.named_params_and_buffers(
-                        self.args,
-                        self.model,
-                        convert_to_global_name=not self._use_bridge,
-                        include_persistent_buffers=self._use_bridge,
-                    )
-                )
-            self.delta_exporter.synchronize(
-                getter,
-                engines=delta_engines,
-                gpu_counts=delta_counts,
-                version=str(self.weight_version),
-                group=get_gloo_group(),
-                force_full=self.args.offload_rollout,
-            )
+        if delta_active and not delta_overlap:
+            self.delta_exporter.synchronize(getter, **delta_arguments)
         if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
             self._finish_actor_fwd_ref_sync()
 
