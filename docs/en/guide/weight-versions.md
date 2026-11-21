@@ -6,6 +6,8 @@ After an optimizer update, the training side exports logical weights as a FULL v
 
 Use `--weight-version-config` for the publisher and `--weight-consumer-config` for managed consumers. Omitting both options keeps the existing synchronization path.
 
+For periodic SFT prediction with versioned weights, configure a publisher and consumers on the same stream. The training step passes its published version and content root to the prediction service. The service writes the step’s JSONL after every engine confirms activation of that checkpoint. Export-only training needs just the publisher configuration.
+
 For SharedFS, set `transport.type=sharedfs`, `transport.store`, and `transport.disk_budget`. The publisher and consumer use a shared repository path and configure their own temporary directories and storage budgets.
 
 ## Publication and installation

@@ -87,6 +87,10 @@ def validate_weight_version_arguments(args, *, offline_training: bool) -> None:
     if publication:
         if args.train_backend != "megatron":
             raise ValueError("--weight-version-config uses the Megatron checkpoint converter")
+        if not consumer and getattr(args, "sft_predict_interval", None) and not args.debug_train_only:
+            raise ValueError(
+                "Set --weight-consumer-config so SFT prediction can install the published training weights"
+            )
         if not consumer and not offline_training and not args.debug_train_only:
             raise ValueError(
                 "Set --weight-consumer-config for the managed rollout engines; "

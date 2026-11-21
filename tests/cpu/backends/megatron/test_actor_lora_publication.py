@@ -160,6 +160,7 @@ def test_single_rank_actor_fwd_initialization_failure_exits_all_trainers(monkeyp
             else:
                 client._backend.init_process_groups_for_actor_fwd_ref.side_effect = RuntimeError("one rank failed")
         actor = object.__new__(actor_module.MegatronTrainRayActor)
+        actor.args = SimpleNamespace(weight_version_config=None)
         actor._managed_lora_publication = True
         actor.rollout_manager, actor._weight_sync_lock = manager, lock
         actor.checkpoint_engine_client = client

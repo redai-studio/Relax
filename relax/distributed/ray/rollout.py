@@ -1548,7 +1548,9 @@ class RolloutManager(ReloadableMixin):
             if acquired:
                 await self.rollout_engine_lock.release.remote()
 
-    async def run_predict(self, train_step: int) -> None:
+    async def run_predict(
+        self, train_step: int, weight_version: int | None = None, weight_root: str | None = None
+    ) -> None:
         """Periodic SFT predict pass entry point.
 
         Restores KV/cuda-graph when rollout offloading is enabled, then delegates
@@ -1562,7 +1564,18 @@ class RolloutManager(ReloadableMixin):
         """
         from relax.engine.sft.predict.loop import run_predict_loop
 
-        if self.args.offload_rollout:
+        if weight_version is not None or weight_root is not None or getattr(self.args, "weight_version_config", None):
+            if weight_version is None or not weight_root:
+                raise ValueError("SFT prediction requires the training step's published version and root")
+            if self.args.offload_rollout:
+                await self.onload()
+            receipts = await self.consume_weight_version(weight_version)
+            if not receipts or any(
+                state["active_version"]["version"] != weight_version or state["active_version"]["root"] != weight_root
+                for state in receipts
+            ):
+                raise RuntimeError(f"Rollout engines did not activate the published weights for step {train_step}")
+        elif self.args.offload_rollout:
             await self.onload_kv()
         await run_predict_loop(self, self.args, train_step)
 
