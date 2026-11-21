@@ -23,11 +23,14 @@ from torch.overrides import TorchFunctionMode
 from torch.utils._pytree import tree_leaves
 
 from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, tensors, validate_directory
+from relax.utils.logging_utils import get_logger
 from relax.utils.sparse_tensor import FullTensorRequired, SparseTensor, storage_identity
 
 from .delta_capability import full_loader_inputs, requires_full_input, sparse_loader_identity
 from .delta_shard_layout import ExpertTargets, ShardFrame, marked_ordinals, validate_transport_storage
 
+
+logger = get_logger(__name__)
 
 LOADER = "relax.backends.sglang.delta_loader.load_delta_weights"
 
@@ -36,7 +39,7 @@ MAX_HTTP_BYTES = 64 << 10
 MAX_DOCUMENT_BYTES = 16 << 20
 
 
-def _inline_directory(control: dict) -> Any:
+def _inline_directory(control: dict, *, encoded_limit: int = MAX_HTTP_BYTES) -> Any:
     inline = control["metadata_zlib"]
     if not isinstance(inline, dict) or set(inline) != {"bytes", "data"}:
         raise ValueError("Invalid inline delta directory envelope")
@@ -45,7 +48,7 @@ def _inline_directory(control: dict) -> Any:
         type(size) is not int
         or not 0 < size <= MAX_DOCUMENT_BYTES
         or not isinstance(data, str)
-        or len(data) > MAX_HTTP_BYTES
+        or len(data) > encoded_limit
     ):
         raise ValueError("Invalid inline delta directory size")
     try:
@@ -132,6 +135,7 @@ class DeltaReceiver:
         self.capability: tuple | None = None
         self.destinations = _model_storage(model)
         self._target_plan: ExpertTargets | None = None
+        self._broadcast_plan: ExpertTargets | None = None
         self._seed_directory: tuple = ()
         self.target_shard_metrics: dict | None = None
 
@@ -148,6 +152,8 @@ class DeltaReceiver:
             and (type(control.get("target_shard_rank")) is not int or not 0 <= control["target_shard_rank"] < 4)
         ):
             raise ValueError("Invalid target shard request binding")
+        if control["seed"]:
+            self._broadcast_plan = None
         if control["seed"] or not requested:
             self._target_plan = None
             self._seed_directory = ()
@@ -176,6 +182,19 @@ class DeltaReceiver:
         self.target_shard_metrics = (
             dict(frames=0, entries=0, words=0, wire_bytes=0, tiles=0, scatter_launches=0) if requested else None
         )
+        if not requested:
+            self.target_shard_metrics = dict(
+                mode="broadcast_hf",
+                frames=0,
+                entries=0,
+                nonempty_entries=0,
+                ordinary_entries=0,
+                ordinary_full_entries=0,
+                words=0,
+                wire_bytes=0,
+                tiles=0,
+                scatter_launches=0,
+            )
 
     def _workspace_key(self, metadata: dict, local: frozenset = frozenset()) -> tuple:
         directory = tuple((e["name"], tuple(e["shape"]), e["dtype"]) for e in metadata["tensors"])
@@ -195,10 +214,20 @@ class DeltaReceiver:
             or len(data.encode()) > MAX_HTTP_BYTES
         ):
             raise ValueError("Invalid bounded delta metadata fragment")
+        decoded_size = control.get("decoded_bytes")
+        if "decoded_bytes" in control and (
+            type(decoded_size) is not int or not 0 < decoded_size <= MAX_DOCUMENT_BYTES
+        ):
+            raise ValueError("Invalid compressed directory size")
         if self.document is None:
-            self.document = dict(id=identity, count=count, next=0, parts=[], bytes=0)
+            self.document = dict(id=identity, count=count, next=0, parts=[], bytes=0, decoded_size=decoded_size)
         doc = self.document
-        if doc["id"] != identity or doc["count"] != count or doc["next"] != index:
+        if (
+            doc["id"] != identity
+            or doc["count"] != count
+            or doc["next"] != index
+            or doc["decoded_size"] != decoded_size
+        ):
             raise ValueError("Delta metadata fragments must arrive once in order")
         doc["bytes"] += len(data.encode())
         if doc["bytes"] > MAX_DOCUMENT_BYTES:
@@ -207,6 +236,12 @@ class DeltaReceiver:
         doc["next"] += 1
         if doc["next"] == count:
             encoded = "".join(doc.pop("parts"))
+            if decoded_size is not None:
+                doc["metadata"] = _inline_directory(
+                    dict(metadata_zlib=dict(data=encoded, bytes=decoded_size), metadata_id=identity),
+                    encoded_limit=MAX_DOCUMENT_BYTES,
+                )
+                return
             if hashlib.sha256(encoded.encode()).hexdigest() != identity:
                 raise ValueError("Delta metadata document identity mismatch")
             doc["metadata"] = json.loads(encoded)
@@ -218,12 +253,19 @@ class DeltaReceiver:
         budget = control["receiver_gpu_budget_bytes"]
         validate_directory(metadata, max_bytes=budget)
         ordinary = [e for i, e in enumerate(metadata["tensors"]) if i not in local] if local else metadata["tensors"]
+        entries = metadata["tensors"]
+        ends = metadata.get("loader_ends", [len(entries)])
+        groups = (
+            [entries[i] for i in range(start, end) if i not in local]
+            for start, end in zip([0, *ends[:-1]], ends, strict=True)
+        )
+        decode_peak = max(workspace_bytes({"tensors": group}) for group in groups)
         indices = max((e["count"] * 8 for e in ordinary if not e["full"]), default=0)
         tile_bytes = sum(
             48 * ((metadata["tensors"][i]["count"] + ShardFrame.BLOCK - 1) // ShardFrame.BLOCK) for i in local
         )
         required = max(
-            workspace_bytes({"tensors": ordinary}) + tile_bytes + (4 if local else 0),
+            decode_peak + tile_bytes + (4 if local else 0),
             self.workspace_peaks.get(self._workspace_key(metadata, local), 0) + indices,
         )
         # Proxy-owned resident staging and SG-owned workspace are distinct
@@ -236,9 +278,6 @@ class DeltaReceiver:
             reusable = torch.cuda.memory_reserved(raw.device) - torch.cuda.memory_allocated(raw.device)
             if required > free + reusable:
                 raise ValueError("Receiver loader workspace exceeds physically available device memory")
-
-    def _weights(self, metadata: dict, raw: torch.Tensor) -> Iterable[tuple[str, torch.Tensor]]:
-        yield from self._decoded_weights(tensors(metadata, raw))
 
     def _decoded_weights(self, decoded: Iterable) -> Iterable[tuple[str, torch.Tensor]]:
         for entry, positions, values in decoded:
@@ -386,6 +425,7 @@ class DeltaReceiver:
         else:
             raise ValueError("Delta frame lacks its complete metadata document")
         local = frozenset()
+        plan = None
         if isinstance(metadata, dict) and "target_shard" in metadata:
             if (
                 not self.active["control"].get("target_shard_request")
@@ -395,7 +435,18 @@ class DeltaReceiver:
                 raise ValueError("Target shard lacks a confirmed ordinary FULL receiver layout")
             metadata = dict(metadata)
             marker = metadata.pop("target_shard")
-            local = frozenset(marked_ordinals(marker, self._target_plan.rank, len(metadata["tensors"])))
+            if "loader_ends" in metadata:
+                raise ValueError("A target-lane frame cannot contain packed ordinary groups")
+            plan = self._target_plan
+            local = frozenset(marked_ordinals(marker, plan.rank, len(metadata["tensors"])))
+        elif self._broadcast_plan is not None and not self.active["control"].get("target_shard_request"):
+            validate_directory(metadata, max_bytes=raw.numel())
+            plan = self._broadcast_plan
+            local = frozenset(
+                i for i, entry in enumerate(metadata["tensors"]) if not entry["full"] and entry["name"] in plan.targets
+            )
+            if local and (not plan.current(self, raw, status) or not status.is_contiguous()):
+                self._broadcast_plan, plan, local = None, None, frozenset()
         if pending is None:
             self._admit(metadata, raw, local)
         entries = list(tensors(metadata, raw))
@@ -408,9 +459,9 @@ class DeltaReceiver:
         if local:
             if not status.is_contiguous():
                 raise ValueError("Target shard capability output must be contiguous")
-            if pending is None:
-                self._target_plan.check(self, raw, status)
-            shard = ShardFrame(self._target_plan, local, entries, raw)
+            if pending is None and not plan.broadcast:
+                plan.check(self, raw, status)
+            shard = ShardFrame(plan, local, entries, raw, metadata.get("loader_ends"))
             invalid = shard.invalid_positions()
             if invalid is not None:
                 invalid_positions.append(invalid)
@@ -461,23 +512,40 @@ class DeltaReceiver:
         # is established from reviewed code/layout, never by running speculative
         # writes or replaying unknown Python side effects on the live model.
         with _ImmutableInputs():
-            if shard is None:
-                self.model.load_weights(self._weights(metadata, raw))
-            elif len(local) == len(entries):
+            if shard is not None and not plan.broadcast and len(local) == len(entries):
                 for _, batch in shard.runs:
                     shard.scatter(batch)
             else:
-                # Qwen's pinned ordinary loader consumes each yielded input
-                # synchronously and in order. Flush direct runs between those
-                # yields so mixed ordinary and local inputs keep that order.
-                def ordered_weights():
-                    for direct, batch in shard.runs:
-                        if direct:
-                            shard.scatter(batch)
-                        else:
-                            yield from self._decoded_weights(batch)
+                # The Qwen3.5 loader wraps each original invocation in model-owned
+                # setup/teardown (including LazyValue), even for pure direct runs.
+                start = 0
+                ordinary_ran = False
+                for group, end in enumerate(metadata.get("loader_ends", [len(entries)])):
+                    if ordinary_ran:
+                        if sparse_loader_identity(self.model) != self.capability:
+                            raise FullTensorRequired("Ordinary loader capability changed between packed groups")
+                        _model_signature(self.model)
+                        self.destinations = _model_storage(self.model)
+                    runs = shard.group_runs[group] if shard is not None else [(False, entries[start:end])]
 
-                self.model.load_weights(ordered_weights())
+                    def ordered_weights(runs: list = runs):
+                        nonlocal ordinary_ran
+                        for direct, batch in runs:
+                            if direct:
+                                if ordinary_ran and (
+                                    not plan.current(self, raw, status)
+                                    or sparse_loader_identity(self.model) != self.capability
+                                ):
+                                    raise FullTensorRequired("Ordinary loader changed the admitted expert storage")
+                                shard.scatter(batch)
+                                ordinary_ran = False
+                            else:
+                                yield from self._decoded_weights(batch)
+                                ordinary_ran = True
+
+                    self.model.load_weights(ordered_weights())
+                    ordinary_ran = any(not direct for direct, _ in runs)
+                    start = end
         _model_signature(self.model)
         self.destinations = _model_storage(self.model)
         if full_required:
@@ -500,6 +568,10 @@ class DeltaReceiver:
                 raise ValueError("Measured receiver workspace plus proxy staging exceeds its GPU budget")
         if shard is not None:
             self._record_shard(shard, local, entries)
+        if self.target_shard_metrics is not None and self.target_shard_metrics.get("mode") == "broadcast_hf":
+            self.target_shard_metrics["nonempty_entries"] += sum(entries[i][0]["count"] > 0 for i in local)
+            self.target_shard_metrics["ordinary_entries"] += len(entries) - len(local)
+            self.target_shard_metrics["ordinary_full_entries"] += sum(entry["full"] for entry, _, _ in entries)
         self.active["next_frame"] += 1
         self.document = None
 
@@ -536,6 +608,8 @@ class DeltaReceiver:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
         self.schema = schema
+        if self.active["control"]["seed"] and not self.active["control"].get("target_shard_request"):
+            self._broadcast_plan = ExpertTargets.build(self, broadcast=True)
         if self.active["control"].get("target_shard_request"):
             if self.active["control"]["seed"]:
                 self._target_plan = ExpertTargets.build(self)
@@ -548,6 +622,14 @@ class DeltaReceiver:
                 self._target_plan is not None and self._target_plan.rank != self.active["control"]["target_shard_rank"]
             ):
                 self._target_plan = None
+        if self.target_shard_metrics is not None and self.target_shard_metrics.get("mode") == "broadcast_hf":
+            logger.info(
+                "Broadcast delta receiver version=%s seed=%s tp_rank=%s metrics=%s",
+                self.active["control"]["version"],
+                self.active["control"]["seed"],
+                self._broadcast_plan.rank if self._broadcast_plan is not None else None,
+                self.target_shard_metrics,
+            )
         self.version = self.active["control"]["version"]
         self.active = None
 
@@ -590,7 +672,7 @@ def load_delta_weights(model: Any, weights: Iterable[tuple[str, torch.Tensor]]) 
                     or storage_identity(status) in receiver.destinations
                 ):
                     raise ValueError("Invalid target shard status storage")
-                if requested:
+                if requested or receiver._broadcast_plan is not None:
                     # Final status may be a fresh StorageImpl wrapping live bytes.
                     validate_transport_storage(model, (weights[0][1], status))
             receiver.finalize(control)

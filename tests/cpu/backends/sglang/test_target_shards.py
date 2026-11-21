@@ -10,7 +10,7 @@ from relax.backends.sglang import delta_loader, delta_shard_layout
 from relax.distributed.weight_sync.codec import encode
 
 
-def model_at(rank):
+def model_at(rank, tp=4):
     pytest.importorskip("sglang.srt.models.qwen3_moe")
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -34,15 +34,15 @@ def model_at(rank):
     experts._has_fused_shared = False
     experts.num_fused_shared_experts = 0
     experts.layer_id = experts.moe_ep_rank = experts._expert_storage_rank = 0
-    experts.moe_ep_size, experts.moe_tp_size, experts.moe_tp_rank = 1, 4, rank
+    experts.moe_ep_size, experts.moe_tp_size, experts.moe_tp_rank = 1, tp, rank
     experts._num_local_routed = experts._num_global_routed = experts.num_local_experts = 3
-    experts.intermediate_size_per_partition = 2
+    local = experts.intermediate_size_per_partition = 8 // tp
     experts.w2_weight = torch.nn.Parameter(
-        torch.arange(24, dtype=torch.int16).view(torch.bfloat16).reshape(3, 4, 2), requires_grad=False
+        torch.arange(12 * local, dtype=torch.int16).view(torch.bfloat16).reshape(3, 4, local), requires_grad=False
     )
     experts.w2_weight.weight_loader = experts.weight_loader
     model.model.extra = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16), requires_grad=False)
-    experts.w13_weight = torch.nn.Parameter(torch.zeros(3, 4, 4, dtype=torch.bfloat16), requires_grad=False)
+    experts.w13_weight = torch.nn.Parameter(torch.zeros(3, 2 * local, 4, dtype=torch.bfloat16), requires_grad=False)
     experts.w13_weight.weight_loader = experts.weight_loader
     experts.moe_runner_config = SimpleNamespace(is_gated=True)
     experts.quant_method.use_flashinfer_cutlass = False
@@ -59,7 +59,7 @@ def fixture_admission(monkeypatch):
     monkeypatch.setattr(
         delta_shard_layout,
         "_runtime",
-        lambda m: (m.model.layers[0].mlp.experts.moe_tp_rank, FusedMoE, UnquantizedFusedMoEMethod),
+        lambda m, broadcast=False: (m.model.layers[0].mlp.experts.moe_tp_rank, FusedMoE, UnquantizedFusedMoEMethod),
     )
 
 
@@ -548,23 +548,23 @@ def test_ordered_target_consume_fences_each_frame_and_byte(fault, monkeypatch):
         )
 
 
+def conditional_at(rank, tp):
+    cls = pytest.importorskip("sglang.srt.models.qwen3_5").Qwen3_5MoeForConditionalGeneration
+
+    template, experts = model_at(rank, tp)
+    model = cls.__new__(cls)
+    torch.nn.Module.__init__(model)
+    model.model, model.config = template.model, template.config
+    model.model.start_layer, model.model.end_layer = 0, 1
+    model.config.encoder_only = model.config.tie_word_embeddings = False
+    model.enable_shared_expert_fusion = False
+    return model, experts
+
+
 @pytest.mark.parametrize("fused", [False, True])
 def test_conditional_moe_ordinary_sparse_loader_keeps_raw_tp_words(monkeypatch, fused):
-    module = pytest.importorskip("sglang.srt.models.qwen3_5")
-    Qwen3_5MoeForConditionalGeneration = module.Qwen3_5MoeForConditionalGeneration
-
-    def conditional():
-        template, experts = model_at(1)
-        model = Qwen3_5MoeForConditionalGeneration.__new__(Qwen3_5MoeForConditionalGeneration)
-        torch.nn.Module.__init__(model)
-        model.model, model.config = template.model, template.config
-        model.model.start_layer, model.model.end_layer = 0, 1
-        model.config.encoder_only = model.config.tie_word_embeddings = False
-        model.enable_shared_expert_fusion = False
-        return model, experts
-
-    model, actual = conditional()
-    reference, expected = conditional()
+    model, actual = conditional_at(1, 4)
+    reference, expected = conditional_at(1, 4)
     fixture_admission(monkeypatch)
     prefix = "model.language_model.layers.0.mlp.experts."
     if fused:
@@ -602,3 +602,96 @@ def test_conditional_moe_ordinary_sparse_loader_keeps_raw_tp_words(monkeypatch, 
         if not seed:
             assert (actual.w13_weight.view(torch.int16) < 0).any()
             assert (actual.w2_weight.view(torch.int16) < 0).any()
+
+
+@pytest.mark.parametrize(("rank", "fault"), [(0, None), (1, None), (0, "alias"), (1, "bad_coordinate")])
+def test_broadcast_global_expert_positions_match_conditional_loader(rank, fault, monkeypatch):
+    model, actual = conditional_at(rank, 2)
+    reference, _ = conditional_at(rank, 2)
+    fixture_admission(monkeypatch)
+    # Dense aliases and FP32 occur outside the direct BF16 expert destinations.
+    for m in (model, reference):
+        m.model.extra_alias = m.model.extra
+        m.model.single_precision = torch.nn.Parameter(torch.ones(3), requires_grad=False)
+    if fault == "alias":
+        model.register_buffer("aliased_expert_words", actual.w13_weight.detach())
+    words = {
+        name.replace("model.layers.", "model.language_model.layers.") if rank else name: value
+        for name, value in source_words().items()
+    }
+    for version in (1, 2):
+        full = version == 1
+        begin(model, rank, version, full, requested=False)
+        entries = []
+        dense = []
+        for i, (name, matrix) in enumerate(words.items()):
+            pos = None
+            flat = matrix.flatten()
+            if not full:
+                # Include both lane boundaries, the last global word, an empty
+                # sparse projection, and a count greater than the local size.
+                pos = torch.arange(0 if i == 0 else flat.numel(), dtype=torch.int32)
+                flat[pos.long()] = torch.tensor([32705, -32768, -63, 32706], dtype=torch.int16).repeat(8)[
+                    : pos.numel()
+                ]
+                if name == "model.extra":
+                    pos = None
+            value = flat if pos is None else flat[pos.long()]
+            if fault == "bad_coordinate" and not full and i == len(words) - 1:
+                pos[-1] += 1
+            entries.append((name, tuple(matrix.shape), torch.bfloat16, pos, value.view(torch.bfloat16)))
+            dense.append((name, matrix.view(torch.bfloat16)))
+        metadata, raw = encode(entries, max_bytes=1 << 20)
+        if fault == "bad_coordinate" and not full:
+            before = [p.detach().clone() for p in model.parameters()]
+            with pytest.raises(ValueError, match="in bounds"):
+                apply_frame(model, version, metadata, raw)
+            assert all(
+                torch.equal(b.view(torch.uint8), p.view(torch.uint8)) for b, p in zip(before, model.parameters())
+            )
+            return
+        prev_lazy = getattr(model, "_routed_experts_weights_of_layer", None)
+        apply_frame(model, version, metadata, raw)
+        finish(model, version, requested=False)
+        reference.load_weights(dense)
+        assert model._routed_experts_weights_of_layer is not prev_lazy
+        for p, oracle in zip(model.parameters(), reference.parameters(), strict=True):
+            assert torch.equal(p.view(torch.uint8), oracle.view(torch.uint8))
+        receiver = model._relax_delta_receiver
+        assert (receiver._broadcast_plan is None) == (fault == "alias")
+        if not full:
+            m = receiver.target_shard_metrics
+            assert m["entries"] == (0 if fault == "alias" else 9)
+            assert m["ordinary_entries"] == (10 if fault == "alias" else 1)
+            assert m["ordinary_full_entries"] == 1
+
+
+@pytest.mark.parametrize("down", [True, False])
+def test_triton_maps_global_broadcast_words_to_each_tp_rank(down):
+    from triton.runtime.interpreter import InterpretedFunction
+
+    from relax.backends.sglang.delta_shard_kernel import shard_tiles
+
+    hidden, local, width = 53, 11, 512
+    elements = hidden * 2 * local
+    coords = torch.arange(elements, dtype=torch.int32)
+    words = torch.arange(elements, dtype=torch.int16) - 32768
+    words[::13] = 32705
+    shape = (hidden, 2 * local) if down else (2 * local, hidden)
+    meta, raw = encode([("expert", shape, torch.bfloat16, coords, words.view(torch.bfloat16))], max_bytes=1 << 20)
+    entry = meta["tensors"][0]
+    rows = torch.tensor(
+        [
+            (4 * j, entry["value_offset"] + 2 * j, min(width, elements - j), int(j > 0), 3, elements)
+            for j in range(0, elements, width)
+        ]
+    )
+    kernel = InterpretedFunction(shard_tiles.fn)
+    for rank in range(2):
+        target = torch.zeros(hidden * local + 6, dtype=torch.int16)
+        bad = torch.zeros(1, dtype=torch.int32)
+        kernel[(len(rows),)](raw, rows, target, bad, False, width)
+        assert not bad.item()
+        kernel[(len(rows),)](raw, rows, target, bad, True, width, True, down, hidden, local, 2, rank)
+        expected = words.view(shape).chunk(2, dim=int(down))[rank].reshape(-1)
+        assert torch.equal(target[3:-3], expected) and not target[:3].any() and not target[-3:].any()

@@ -127,6 +127,59 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
             transfer.tcp.close()
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, failure):
+    from threading import Event, get_ident
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+
+    entered, release = Event(), Event()
+    producer = get_ident()
+
+    def broadcast(raw, *, deadline):
+        assert get_ident() == producer
+
+    def operation(action, **kwargs):
+        if action == "consume":
+            assert get_ident() != producer
+            entered.set()
+            assert release.wait(5)
+            if failure:
+                raise RuntimeError("injected install failure")
+            return {"full_required": ["ordinary"]}
+        return {}
+
+    monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
+    transfer = DeltaTransfer(DeltaSyncConfig(stream="test", transport="nccl_socket"), "cpu")
+    transfer.group = SimpleNamespace(send=broadcast, close=lambda: None)
+    transfer.engines = (SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=operation)),)
+    transfer.ranks, transfer.routes = [[1]], []
+    transfer.connection = {"group_name": "test", "world_size": 2}
+    transfer.begin(version="1", base=None, seed=True)
+    directory, raw = encode([("w", (1,), torch.float32, None, torch.ones(1))], max_bytes=8)
+    try:
+        assert not transfer.submit_frame(directory, raw)
+        assert entered.wait(5)
+        with pytest.raises(RuntimeError, match="Drain"):
+            transfer.finalize()
+        release.set()
+        if failure:
+            with pytest.raises(RuntimeError, match="injected install failure"):
+                transfer.drain_frame()
+            with pytest.raises(RuntimeError, match="Drain"):
+                transfer.finalize()
+        else:
+            assert transfer.drain_frame() == {"ordinary"}
+            assert transfer.finalize()["frames"] == 1
+    finally:
+        release.set()
+        transfer.close()
+
+
 def test_empty_staged_groups_still_consume_directory_admission():
     from relax.distributed.weight_sync.config import DeltaSyncConfig
     from relax.distributed.weight_sync.transport import DeltaTransfer
@@ -186,6 +239,81 @@ def test_lane_staging_capacity_is_per_gpu_across_mixed_rounds():
     assert transfer.can_stage({}, torch.empty(0, dtype=torch.uint8))
 
 
+@pytest.mark.parametrize(
+    ("transport", "source_net", "peer_net", "reject"),
+    [
+        ("nccl_socket", None, None, False),
+        ("nccl_socket", "IB", None, True),
+        ("nccl_socket", None, "IB", True),
+        ("nccl", "IB", "IB", False),
+    ],
+)
+def test_collective_selects_network_only_for_unique_gpu_members(
+    monkeypatch, tmp_path, transport, source_net, peer_net, reject
+):
+    import json
+    import os
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+    from relax.utils import distributed_utils
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"stream": "test", "transport": transport}))
+    if source_net is None:
+        monkeypatch.delenv("NCCL_NET", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_NET", source_net)
+    monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
+    monkeypatch.setattr(ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="GPU-source"))
+    monkeypatch.setattr(
+        torch.distributed,
+        "ProcessGroupNCCL",
+        SimpleNamespace(Options=lambda: SimpleNamespace(config=SimpleNamespace())),
+        raising=False,
+    )
+    groups = {}
+    monkeypatch.setattr(
+        distributed_utils, "init_process_group", lambda **kwargs: groups.update({kwargs["rank"]: kwargs})
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, group: None)
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", lambda group: None)
+
+    def dispatch(op, **kwargs):
+        if op == "prepare":
+            return [dict(uuid="GPU-other", nccl_net=peer_net), dict(uuid="GPU-source", nccl_net="IB")]
+        if op == "join":
+            assert kwargs["ranks"] == [1, None]
+            GpuSyncGroup(kwargs["connection"], rank=1, device="cpu", timeout_s=5)
+
+    engine = SimpleNamespace(_actor_id=b"id", delta_weight_sync=SimpleNamespace(remote=dispatch))
+    source = DeltaTransfer(DeltaSyncConfig.load(config_path), "cpu")
+    try:
+        if reject:
+            with pytest.raises(ValueError, match="NCCL_NET"):
+                source.connect([engine], [2])
+            assert not groups and not source.signature
+        else:
+            assert source.connect([engine], [2]) and not source.connect([engine], [2])
+            assert [route["actual_transport"] for route in source.routes] == [transport, "tcp"]
+            assert set(groups) == {0, 1}
+            for group in groups.values():
+                assert group["backend"] == "nccl" and group["world_size"] == 2
+                if transport == "nccl_socket":
+                    assert group["pg_options"].config.net_name == "Socket"
+                else:
+                    assert group["pg_options"] is None
+        assert os.getenv("NCCL_NET") == source_net
+    finally:
+        source.close()
+
+
 def _send_four_lanes(rank, rendezvous):
     from datetime import timedelta
     from time import monotonic
@@ -202,6 +330,16 @@ def _send_four_lanes(rank, rendezvous):
     group.fence = lambda works, *, deadline: [w.wait(timedelta(seconds=deadline - monotonic())) for w in works]
     sizes = [3, 0, 13, 7]
     try:
+        # Ordinary FULL and delta frames share the broadcast before switching
+        # to peer-addressed TP lanes in the same communicator.
+        for size in (17, 0, 3):
+            expected = torch.arange(size, dtype=torch.uint8)
+            if rank == 0:
+                group.send(expected, deadline=monotonic() + 15)
+            else:
+                actual, works = group.receive({"bytes": size})
+                group.fence(works, deadline=monotonic() + 15)
+                assert torch.equal(actual, expected)
         if rank == 0:
             slabs = [torch.full((n,), 10 + tp, dtype=torch.uint8) for tp, n in enumerate(sizes)]
             group.send_lanes(slabs, [[1, 2, 3, 4], [5, 6, 7, 8]], deadline=monotonic() + 15)
@@ -235,7 +373,7 @@ def test_source_requires_current_all_receiver_ack_and_paused_apply_for_lanes(mon
     delivered = {}
     source = DeltaTransfer(DeltaSyncConfig(stream="s", target_shard_delta=True, staging_budget_bytes=256), "cpu")
     source.ranks = [list(range(1, 5)), list(range(5, 9))]
-    source.connection = dict(world_size=9, target_shard_p2p=True)
+    source.connection = dict(world_size=9, group_name="lanes", target_shard_p2p=True)
     source.routes = []
     source.nccl_members = {str(r): r for r in range(1, 9)}
     source.group = SimpleNamespace(
@@ -315,7 +453,7 @@ def test_ordered_lane_consumes_hold_independent_slices_and_drain_before_mixed_or
     source = DeltaTransfer(DeltaSyncConfig(stream="s", target_shard_delta=True, staging_budget_bytes=32), "cpu")
     source.ranks = [list(range(1, 5)), list(range(5, 9))]
     source.nccl_members = {str(r): r for r in range(1, 9)}
-    source.connection = {"world_size": 9, "target_shard_p2p": True}
+    source.connection = {"world_size": 9, "group_name": "lanes", "target_shard_p2p": True}
     source.target_shard_version, source.target_shard_capable = "1", True
     arenas = [_StagingArena(32, "cpu") for _ in range(8)]
     views = [dict() for _ in arenas]

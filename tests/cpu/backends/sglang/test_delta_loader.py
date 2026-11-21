@@ -7,7 +7,7 @@ import torch
 
 from relax.backends.sglang import delta_loader as loader_module
 from relax.backends.sglang.delta_loader import load_delta_weights
-from relax.distributed.weight_sync.codec import encode
+from relax.distributed.weight_sync.codec import WireBucket, encode
 
 
 class TinyModel(torch.nn.Module):
@@ -289,3 +289,44 @@ def test_inline_consume_rejects_duplicate_frame_in_source_order():
     with pytest.raises(ValueError, match="once in source order"):
         load_delta_weights(model, weights)
     assert torch.equal(before, model.weight)
+
+
+def test_packed_wire_keeps_ordinary_loader_side_effects_and_rejects_invalid_boundaries():
+    class Recorder(TinyModel):
+        def __init__(self):
+            super().__init__(torch.float32)
+            self.calls = []
+
+        def load_weights(self, weights):
+            self.calls.append([(n, v.tolist()) for n, v in weights])
+
+    bucket = WireBucket(16)
+    for i in range(3):
+        item = (str(i), (1,), torch.int16, None, torch.tensor([i], dtype=torch.int16))
+        result = bucket.offer(*encode([item], max_bytes=16))
+        if i < 2:
+            assert result is None
+    directory, raw = result
+    assert directory["bytes"] == 10
+    assert directory["loader_ends"] == [1, 2]
+    assert raw[2:8].tolist() == [0] * 6
+    final, _ = bucket.finish()
+    assert "loader_ends" not in final
+    assert bucket.finish() is None
+
+    def install(model, metadata):
+        begin(model, "seed", seed=True)
+        command = dict(op="consume", version="seed", frame=0, metadata=metadata)
+        status = torch.zeros(2, dtype=torch.uint8)
+        load_delta_weights(model, [(json.dumps(command), raw), ("__delta_capability__", status)])
+        control(model, op="finalize", frames=1)
+        assert status.tolist() == [1, 1]
+
+    model = Recorder()
+    install(model, directory)
+    assert model.calls == [[("0", [0])], [("1", [1])]]
+    for invalid_ends in ([0, 2], [1, 1], [1], [False, 2]):
+        model = Recorder()
+        with pytest.raises(ValueError, match="boundaries"):
+            install(model, dict(directory, loader_ends=invalid_ends))
+        assert not model.calls

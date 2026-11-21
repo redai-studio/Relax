@@ -98,9 +98,58 @@ def encode(weights: Iterable[tuple[str, tuple[int, ...], Any, Any, Any]], *, max
     return metadata, raw
 
 
+class WireBucket:
+    """Combine independently owned ordinary frames without merging their loader
+    calls."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.frames = []
+        self.size = 0
+        self.entries = 0
+
+    def offer(self, directory: dict, raw: Any) -> tuple | None:
+        aligned = (self.size + WIRE_ALIGNMENT - 1) // WIRE_ALIGNMENT * WIRE_ALIGNMENT
+        count = len(directory["tensors"])
+        # Cap very sparse/empty directories independently of their payload.
+        # A complete input group is always admitted on its own.
+        flush = bool(self.frames) and (aligned + raw.numel() > self.limit or self.entries + count > 4096)
+        result = self.finish() if flush else None
+        offset = 0 if flush else aligned
+        self.frames.append((offset, directory, raw))
+        self.size = offset + raw.numel()
+        self.entries += count
+        return result
+
+    def finish(self) -> tuple | None:
+        if not self.frames:
+            return None
+        frames, size = self.frames, self.size
+        self.frames, self.size, self.entries = [], 0, 0
+        if len(frames) == 1:
+            return frames[0][1:]
+        entries, ends = [], []
+        packed = frames[0][2].new_empty(size)
+        end = 0
+        for offset, directory, raw in frames:
+            if offset > end:
+                packed[end:offset].zero_()
+            end = offset + raw.numel()
+            packed[offset:end].copy_(raw)
+            entries.extend(
+                dict(e, offset=e["offset"] + offset, value_offset=e["value_offset"] + offset)
+                for e in directory["tensors"]
+            )
+            ends.append(len(entries))
+        return dict(format=1, bytes=size, tensors=entries, loader_ends=ends), packed
+
+
 def validate_directory(metadata: dict, *, max_bytes: int) -> None:
     """Bound allocations and disallow overlapping or ambiguous wire ranges."""
-    if not isinstance(metadata, dict) or set(metadata) != {"format", "bytes", "tensors"}:
+    if not isinstance(metadata, dict) or set(metadata) not in (
+        {"format", "bytes", "tensors"},
+        {"format", "bytes", "tensors", "loader_ends"},
+    ):
         raise ValueError("Invalid lossless wire directory")
     size, tensors = metadata["bytes"], metadata["tensors"]
     if (
@@ -112,6 +161,15 @@ def validate_directory(metadata: dict, *, max_bytes: int) -> None:
         raise ValueError("Unsupported wire format or payload size")
     if not isinstance(tensors, list) or not 0 < len(tensors) <= 65536:
         raise ValueError("Invalid wire tensor directory length")
+    if "loader_ends" in metadata:
+        ends = metadata["loader_ends"]
+        if (
+            not isinstance(ends, list)
+            or not 1 <= len(ends) <= len(tensors)
+            or any(type(end) is not int or end <= 0 or (i and end <= ends[i - 1]) for i, end in enumerate(ends))
+            or ends[-1] != len(tensors)
+        ):
+            raise ValueError("Invalid packed loader group boundaries")
     names, end = set(), 0
     for entry in tensors:
         if not isinstance(entry, dict) or set(entry) != {

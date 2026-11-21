@@ -28,6 +28,12 @@ class GpuSyncGroup:
 
         self.device = torch.device(device)
         self.rank = rank
+        options = None
+        if connection.get("transport") == "nccl_socket":
+            # This selection is local to the delta communicator. Training and
+            # native DCS may use a different NCCL network in the same process.
+            options = dist.ProcessGroupNCCL.Options()
+            options.config.net_name = "Socket"
         self.group = init_process_group(
             backend="nccl",
             init_method=connection["init_method"],
@@ -35,6 +41,7 @@ class GpuSyncGroup:
             rank=rank,
             group_name=connection["group_name"],
             timeout=timedelta(seconds=timeout_s),
+            pg_options=options,
         )
         # Admit every fixed communicator member before the first payload.
         warmup = torch.zeros(1, dtype=torch.int32, device=self.device)

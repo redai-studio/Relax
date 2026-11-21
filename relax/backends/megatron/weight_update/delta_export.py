@@ -223,7 +223,7 @@ class ShardDeltaExporter:
         code. The caller commits only after its remaining lifecycle gates
         succeed.
         """
-        from relax.distributed.weight_sync.codec import encode
+        from relax.distributed.weight_sync.codec import WireBucket, encode
         from relax.distributed.weight_sync.transport import DeltaTransfer
 
         if self.config is None or self.failed:
@@ -315,6 +315,10 @@ class ShardDeltaExporter:
             agree(error)
 
             stream = self.export(full=seed, full_names=frozenset(self.full_names), emit=rank == 0, _owner_group=group)
+            pack = self.config.transport == "nccl_socket" and not self._target_shards
+            bucket = (
+                WireBucket(min(self.config.staging_budget_bytes, self.config.gpu_budget_bytes // 8)) if pack else None
+            )
             while True:
                 error, chunk = None, None
                 try:
@@ -329,24 +333,38 @@ class ShardDeltaExporter:
                 if any(finished):
                     if not all(finished):
                         raise ValueError("Source converters disagree on the complete HF group directory")
-                    break
-                error = None
+                    if not pack:
+                        break
+                error, frame = None, None
                 if rank == 0:
                     try:
-                        if self._target_shards:
-                            metadata, raw = target_shard.encode_frame(chunk, self.config.staging_budget_bytes)
+                        if chunk is None:
+                            frame = bucket.finish()
+                        elif self._target_shards:
+                            frame = target_shard.encode_frame(chunk, self.config.staging_budget_bytes)
                         else:
-                            metadata, raw = encode(
+                            frame = encode(
                                 ((item.name, item.shape, item.dtype, item.positions, item.values) for item in chunk),
                                 max_bytes=self.config.staging_budget_bytes,
                             )
+                            if pack:
+                                frame = bucket.offer(*frame)
                         if workspace_peak() > self.config.gpu_budget_bytes:
                             raise ValueError("Measured source conversion/encoding workspace exceeds its GPU budget")
-                        if self.sender_pipeline_active:
-                            self.transfer.prepare_frame(raw)
+                        if frame is not None:
+                            metadata, raw = frame
+                            if self.sender_pipeline_active:
+                                self.transfer.prepare_frame(raw)
                     except Exception as exc:
                         error = exc
                 agree(error)
+                if pack:
+                    available = [frame is not None]
+                    dist.broadcast_object_list(available, src=source_rank, group=group)
+                    if not available[0]:
+                        if chunk is None:
+                            break
+                        continue
                 if self.sender_pipeline_active:
                     drain_previous_frame()
                 error = None
@@ -361,7 +379,9 @@ class ShardDeltaExporter:
                 agree(error)
                 if rank == 0:
                     del raw, metadata
-                del chunk
+                if chunk is None:
+                    break
+                del frame, chunk
             if self.sender_pipeline_active:
                 drain_previous_frame()
             source_peaks = [None] * world

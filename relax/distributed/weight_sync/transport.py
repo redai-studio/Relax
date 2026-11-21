@@ -9,6 +9,7 @@ This object owns only transport resources and waits for actual receiver fences.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import struct
 import sys
@@ -73,7 +74,6 @@ class DeltaTransfer:
         self.target_shard_capable = False
         self.target_shard_version = None
         self.engines = tuple(engines)
-        self.signature = signature
         rank = 1
         self.ranks = []
         for count in counts:
@@ -100,7 +100,7 @@ class DeltaTransfer:
             assigned = []
             for member, identity in zip(delivery, identities, strict=True):
                 gpu_uuid = identity["uuid"].removeprefix("GPU-").lower()
-                if self.config.transport == "nccl" and gpu_uuid not in seen:
+                if self.config.transport in ("nccl", "nccl_socket") and gpu_uuid not in seen:
                     collective_rank = len(self.nccl_members) + 1
                     self.nccl_members[str(member)] = collective_rank
                     seen.add(gpu_uuid)
@@ -112,11 +112,18 @@ class DeltaTransfer:
                     dict(
                         **identity,
                         delivery_id=member,
-                        actual_transport="tcp" if collective_rank is None else "nccl",
+                        actual_transport="tcp" if collective_rank is None else self.config.transport,
                         collective_rank=collective_rank,
                     )
                 )
             collective_ranks.append(assigned)
+        if self.config.transport == "nccl_socket" and self.nccl_members:
+            # NCCL_NET overrides ncclConfig_t.netName. Reject a conflicting
+            # source or proxy before any member blocks in communicator init.
+            networks = [os.getenv("NCCL_NET"), *(r["nccl_net"] for r in routes if r["collective_rank"] is not None)]
+            if any(net is not None and net.casefold() != "socket" for net in networks):
+                self.close()
+                raise ValueError("nccl_socket requires NCCL_NET unset or Socket on each collective member")
         host = ray._private.services.get_node_ip_address()
         connection = dict(
             transport=self.config.transport,
@@ -153,6 +160,7 @@ class DeltaTransfer:
         joined = ray.get(joins, timeout=self.config.sync_timeout_s)
         self.routes = routes
         self.joined = joined
+        self.signature = signature
         return True
 
     def begin(self, *, version: str, base: str | None, seed: bool) -> None:
@@ -517,12 +525,24 @@ class DeltaTransfer:
     def submit_frame(self, metadata: dict | list, raw: Any) -> set[str]:
         """Transfer ownership of a sealed frame until drain_frame().
 
-        Only pure TCP can run independently of the source ranks' collectives.
-        The owner may export the next bucket before draining this submission.
+        Source collectives stay on the caller thread. After a socket broadcast
+        has fenced, receiver installation can run concurrently with conversion
+        of the next bucket.
         """
         self._require_drained()
         if not self._applying:
             raise RuntimeError("Delta submission disagrees with the owner's apply window")
+        if (
+            self.config.transport == "nccl_socket"
+            and self.group is not None
+            and self.tcp is None
+            and not self.ordered_target_consume
+        ):
+            self.stage(metadata, raw)
+            if self._sender is None:
+                self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="delta-install")
+            self._pending_frame = self._sender.submit(self.apply)
+            return set()
         if self.tcp is None or self.group is not None:
             return self.send(metadata, raw, defer_ordered=True)
         if isinstance(metadata, list):
@@ -571,6 +591,7 @@ class DeltaTransfer:
             self.metrics,
             receivers=replies,
             routes=self.routes,
+            nccl_group_name=self.connection["group_name"] if self.group is not None else None,
             nccl_world_size=self.connection["world_size"] if self.group is not None else 0,
         )
 

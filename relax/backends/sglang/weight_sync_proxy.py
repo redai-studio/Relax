@@ -183,6 +183,7 @@ def _child(connection: Connection) -> None:
         device = torch.device("cuda", config["device"])
         properties = torch.cuda.get_device_properties(device)
         identity = dict(pid=os.getpid(), device=device.index, uuid=str(properties.uuid), rank=config["rank"])
+        identity["nccl_net"] = os.getenv("NCCL_NET")
         free, total = torch.cuda.mem_get_info(device)
         connection.send(
             dict(
@@ -209,7 +210,7 @@ def _child(connection: Connection) -> None:
                     result = dict(
                         success=True,
                         **identity,
-                        transport="nccl" if group is not None else "tcp",
+                        transport=command["connection"]["transport"] if group is not None else "tcp",
                         collective_rank=command["rank"],
                     )
                 elif op == "receive":
@@ -442,6 +443,7 @@ class WeightSyncProxy:
             [dict(op="join", connection=connection, rank=rank) for rank in ranks], deadline=time.monotonic() + timeout
         )
         self.connection = connection
+        self._inline_frame_directory = connection.get("transport") == "nccl_socket"
         return replies
 
     def receive(
@@ -483,6 +485,12 @@ class WeightSyncProxy:
 
     def _send_frame_directory(self, data: bytes, identity: str, *, deadline: float) -> None:
         text = data.decode("ascii")
+        envelope = {}
+        if self._inline_frame_directory:
+            compressed = base64.b64encode(zlib.compress(data, level=1))
+            if len(compressed) < len(data):
+                text = compressed.decode("ascii")
+                envelope["decoded_bytes"] = len(data)
         tp_size = len(self.children)
         width = max(1, MAX_HTTP_BYTES // (4 * tp_size))
         while True:
@@ -495,6 +503,7 @@ class WeightSyncProxy:
                     index=i,
                     count=count,
                     data=text[i * width : (i + 1) * width],
+                    **envelope,
                 )
                 for i in range(count)
             ]

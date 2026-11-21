@@ -61,7 +61,7 @@ class DeltaSyncConfig:
             type(config.full_only) is not bool
             or type(config.sender_pipeline) is not bool
             or type(config.target_shard_delta) is not bool
-            or config.transport not in ("tcp", "nccl")
+            or config.transport not in ("tcp", "nccl", "nccl_socket")
         ):
-            raise ValueError("Delta mode flags must be boolean and transport must be tcp or nccl")
+            raise ValueError("Delta mode flags must be boolean and transport must be tcp, nccl or nccl_socket")
         return config
