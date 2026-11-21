@@ -32,7 +32,7 @@ from relax.utils.logging_utils import get_logger
 
 ROOT = Path(__file__).resolve().parents[3]
 ROLES = SimpleNamespace(
-    actor="actor", actor_fwd="actor_fwd", reference="reference", rollout="rollout", critic="critic"
+    sft="sft", actor="actor", actor_fwd="actor_fwd", reference="reference", rollout="rollout", critic="critic"
 )
 
 

@@ -35,7 +35,7 @@ from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rol
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
-from relax.utils.env import Envs
+from relax.utils.env import Envs, resolve_in
 from relax.utils.fault_events.models import RecoveryEvidence
 from relax.utils.fault_events.recovery import GlobalStartup
 from relax.utils.health_system import HealthManager
@@ -186,6 +186,8 @@ class Controller:
     _fault_events: Any = None
     _fault_recovery: Any = None
     _fault_rebuild_ready: Any = None
+    _sft_cleanup_error: Optional[Exception] = None
+    _sft_finishing: bool = False
 
     def __init__(
         self, config: Namespace, runtime_env: dict = None, fault_events: Any = None, fault_recovery: Any = None
@@ -193,6 +195,7 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
+        self._sft_finishing = False
         self.serve_dict = {}
         self._teacher_manager = None
         # Initialize health management system
@@ -292,6 +295,8 @@ class Controller:
             # before the entrypoint runs its broader shutdown cleanup.
             logger.error("Controller construction failed; closing any initialized TQ state.")
             try:
+                for service in self.serve_dict.values():
+                    self._stop_prepared_sft(service)
                 self._close_data_system()
             except Exception as cleanup_error:  # pragma: no cover - best effort
                 logger.warning(
@@ -639,6 +644,17 @@ class Controller:
         owner-mediated runs delegate to
         :func:`relax.utils.tq.lifecycle.close_tq_owner`.
         """
+        if getattr(self, "_startup_abort_event", None) is not None:
+            self._startup_abort_event.set()
+        if getattr(self, "_sft_early_prepare_issued", False) and not getattr(
+            self, "_sft_early_prepare_stopped", False
+        ):
+            if self._sft_cleanup_error is None:
+                self._sft_cleanup_error = RuntimeError("SFT producer has not confirmed it stopped")
+        if self._sft_cleanup_error is not None:
+            raise RuntimeError(
+                "SFT producer cleanup is unconfirmed; refusing to close TransferQueue"
+            ) from self._sft_cleanup_error
         if self._tq_legacy_init:
             self._tq_legacy_init = False
             tq.close()
@@ -711,6 +727,15 @@ class Controller:
             refs_to_cancel = list(self._pending_task_refs)
             self._pending_task_refs.clear()
 
+        # Early prepare is awaited before service.run() registers its task
+        # refs. Cancel that request too so a failed restart can reach the
+        # entrypoint's exit path; cancellation does not stop shielded writers.
+        refs_to_cancel.extend(
+            prepared
+            for service in getattr(self, "serve_dict", {}).values()
+            if (prepared := vars(service).get("_sft_prepare_response")) is not None
+        )
+
         if not refs_to_cancel:
             return
 
@@ -775,6 +800,55 @@ class Controller:
         except Exception as e:
             logger.warning(f"Failed to report fatal error to metrics service: {e}")
 
+    def _maybe_prepare_sft_data(self, role: str, service: Service) -> None:
+        """Overlap fresh-run CPU data preparation with GPU service startup."""
+        runtime_env_vars = (getattr(self, "runtime_env", None) or {}).get("env_vars", {})
+        if role != "sft" or not resolve_in("RELAX_SFT_EARLY_PREPARE", {**os.environ, **runtime_env_vars}):
+            return
+        from relax.engine.sft.runtime import is_i2i_sft, should_run_sft_eval, should_run_sft_predict
+
+        if is_i2i_sft(self.config) or should_run_sft_eval(self.config, 1) or should_run_sft_predict(self.config, 1):
+            return
+        if getattr(self, "_sft_early_prepare_issued", False):
+            return
+        if (getattr(self.config, "start_rollout_id", 0) or 0) != 0:
+            return
+        # A backend checkpoint can change the effective starting step. Keep
+        # early preparation restricted to an initial HF/fresh start, once per
+        # controller; restarts and resumed checkpoints use the normal run path.
+        if getattr(self.config, "load", None) not in (None, self.config.hf_checkpoint):
+            return
+        self._sft_early_prepare_issued = True
+        self._sft_early_prepare_stopped = False
+        # Publish ownership before checking abort: a late startup thread must
+        # not launch a producer after the driver has already closed its queue.
+        if getattr(self, "_startup_abort_event", None) is not None and self._startup_abort_event.is_set():
+            self._sft_early_prepare_stopped = True
+            return
+        service._sft_prepare_response = service.handle.prepare.remote(prefetch_first_batch=True)
+        logger.info("Started CPU-only SFT preparation alongside GPU service initialization")
+
+    def _stop_prepared_sft(self, service: Service) -> None:
+        if self._sft_cleanup_error is not None:
+            raise self._sft_cleanup_error
+        if vars(service).get("_sft_prepare_response") is None:
+            return
+
+        async def stop() -> None:
+            await asyncio.wait_for(service.handle.stop.remote(), timeout=30)
+
+        try:
+            run(stop())
+        except Exception as exc:
+            # Startup phases can wrap this error and lose the failed service.
+            # Keep a terminal guard on the queue owner as well as propagating
+            # failure. The entrypoint must terminate Serve/Ray, not rebuild or
+            # close a queue whose writers have not confirmed they stopped.
+            self._sft_cleanup_error = RuntimeError("SFT producer cleanup is unconfirmed; refusing resource teardown")
+            raise self._sft_cleanup_error from exc
+        service._sft_prepare_response = None
+        self._sft_early_prepare_stopped = True
+
     def _create_service_task(
         self,
         role,
@@ -817,6 +891,8 @@ class Controller:
             if self._startup_abort_event.is_set():
                 self._cleanup_aborted_service(role, service, deploy=not defer_deploy)
                 return (role, None, "startup phase aborted")
+            if not defer_deploy:
+                self._maybe_prepare_sft_data(role, service)
             logger.info(f"Service {role} has been created successfully")
             return (role, service, None)
         except Exception as e:
@@ -834,6 +910,7 @@ class Controller:
             if self._startup_abort_event.is_set():
                 self._cleanup_aborted_service(role, service, deploy=True)
                 return (role, None, "startup phase aborted")
+            self._maybe_prepare_sft_data(role, service)
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to deploy service {role}: {e}")
@@ -955,6 +1032,7 @@ class Controller:
                 service._stop_heartbeat_thread()
             except Exception as e:
                 logger.warning(f"[{role}] Failed to stop heartbeat during phase abort: {e}")
+            self._stop_prepared_sft(service)
             if str(role) == "rollout" and getattr(service, "_deployed", False):
                 try:
                     rollout_manager = run(service.get_rollout_manager())
@@ -1307,6 +1385,11 @@ class Controller:
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
         async def run_all_services(*, resume_existing: bool = False, startup: GlobalStartup):
+            if not resume_existing:
+                for service in self.serve_dict.values():
+                    prepared = vars(service).get("_sft_prepare_response")
+                    if prepared is not None:
+                        await prepared
             if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
                 # Pass genRM manager(s) to actor for coordinated offload/onload
                 if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
@@ -1385,7 +1468,18 @@ class Controller:
                 if ROLES.actor in self.serve_dict:
                     with startup.step_restore():
                         step = await self.serve_dict[ROLES.actor].get_step()
+                        if step != 0 and any(
+                            vars(service).get("_sft_prepare_response") is not None
+                            for service in self.serve_dict.values()
+                        ):
+                            raise RuntimeError(
+                                "Early SFT preparation requires actor step zero; refusing a cursor mismatch"
+                            )
                         for service in self.serve_dict.values():
+                            if vars(service).get("_sft_prepare_response") is not None:
+                                # Its first partition was produced during model init;
+                                # resetting to zero would duplicate that sample.
+                                continue
                             await service.set_step(step)
 
             # All startup consumers have now initialized and the first policy
@@ -1440,8 +1534,15 @@ class Controller:
             startup = GlobalStartup(self._fault_events, pending_recovery, pending_initialized)
             try:
                 run(run_all_services(resume_existing=resume_existing, startup=startup))
-                if self._restarting:
-                    raise RuntimeError("Service completion interrupted by recovery")
+                with self._restart_lock:
+                    if self._restarting:
+                        raise RuntimeError("Service completion interrupted by recovery")
+                    sft_service = self.serve_dict.get(ROLES.sft)
+                    if sft_service is not None and vars(sft_service).get("_sft_prepare_response") is not None:
+                        # Choose completion atomically with recovery. A new
+                        # replica must not undo the producer stop confirmation.
+                        self._sft_finishing = True
+                        self._stop_prepared_sft(sft_service)
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
@@ -1511,7 +1612,10 @@ class Controller:
 
         from relax.engine.sft.runtime import is_i2i_sft
 
-        if is_i2i_sft(getattr(self, "config", None)) and ROLES.sft in self.serve_dict:
+        sft_service = self.serve_dict.get(ROLES.sft)
+        if sft_service is not None:
+            self._stop_prepared_sft(sft_service)
+        if sft_service is not None and is_i2i_sft(getattr(self, "config", None)):
 
             async def stop_image_producer() -> None:
                 await asyncio.wait_for(self.serve_dict[ROLES.sft].handle.stop.remote(), timeout=10)
@@ -1571,6 +1675,8 @@ class Controller:
         while True:
             self._restart_consumed_event.wait()
             with self._restart_lock:
+                if self._sft_finishing:
+                    return
                 if not self._restart_consumed_event.is_set():
                     continue
                 self._restart_consumed_event.clear()
@@ -1783,6 +1889,7 @@ class Controller:
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():
+            self._stop_prepared_sft(service)
             try:
                 service._stop_heartbeat_thread()
                 logger.info(f"[Global Restart] Stopped heartbeat for '{svc_role}'")
@@ -1843,6 +1950,8 @@ class Controller:
         try:
             self._close_data_system()
         except Exception as e:
+            if self._sft_cleanup_error is not None:
+                raise
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 
         # --- 1.8 Stop the global async event loop BEFORE ray.shutdown() ---
