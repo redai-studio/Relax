@@ -194,6 +194,8 @@ def _bridge_args(**overrides):
         "fp16": False,
         "bf16": True,
         "save": None,
+        "custom_model_provider_path": None,
+        "lora_scope": "all",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -674,7 +676,7 @@ def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrappe
 
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
     monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
-    args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None)
+    args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None, lora_scope="all")
     provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
     if "lora" in wrapper:
         provider = module.wrap_model_provider_with_lora(provider, args)
