@@ -2189,6 +2189,13 @@ def _compute_server_args(
     sglang_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
 ):
+    from relax.engine.inference.phase_plans import deferred_opd_enabled, genrm_shares_rollout_bundles
+
+    requires_weights_cpu_backup = (
+        getattr(args, "_requires_weights_cpu_backup", False)
+        or genrm_shares_rollout_bundles(args)
+        or deferred_opd_enabled(args)
+    )
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
     node_rank = rank % nnodes
@@ -2201,7 +2208,7 @@ def _compute_server_args(
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
-        "enable_memory_saver": args.offload_rollout,
+        "enable_memory_saver": requires_weights_cpu_backup or args.offload_rollout,
         # distributed
         "host": host,
         "port": port,
@@ -2280,13 +2287,7 @@ def _compute_server_args(
             kwargs[key] = value
             unused_keys.discard(key)
 
-    from relax.engine.inference.phase_plans import deferred_opd_enabled, genrm_shares_rollout_bundles
-
-    if (
-        getattr(args, "_requires_weights_cpu_backup", False)
-        or genrm_shares_rollout_bundles(args)
-        or deferred_opd_enabled(args)
-    ):
+    if requires_weights_cpu_backup:
         # A phase handoff restores weights without a subsequent weight push.
         if not kwargs.get("enable_memory_saver") or "enable_weights_cpu_backup" not in server_arg_field_names:
             raise ValueError("Shared scoring requires SGLang memory saver with weight CPU backup")

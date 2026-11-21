@@ -3,9 +3,12 @@
 import argparse
 import importlib
 import sys
+from dataclasses import make_dataclass
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from tests.cpu.backends.sglang.test_router_registration import sglang_engine_module as sglang_engine_module
 
 
 @pytest.fixture()
@@ -231,6 +234,39 @@ def test_rollout_only_with_external_teacher_uses_student_gpus(arguments_module) 
 
     assert not args.colocate
     assert args.actor_num_gpus_per_node * args.actor_num_nodes == args.rollout_num_gpus == 4
+
+
+@pytest.mark.parametrize(("gpus_per_role", "shared"), [(8, True), (4, False)], ids=["shared", "split"])
+def test_rollout_only_student_memory_saver_follows_teacher_phase(
+    arguments_module, sglang_engine_module, monkeypatch, gpus_per_role: int, shared: bool
+) -> None:
+    args = _opd_args()
+    args.debug_rollout_only = args.colocate = True
+    args.resource.update(rollout=[1, gpus_per_role], teacher=[1, gpus_per_role])
+    args.rollout_num_gpus = gpus_per_role
+    args.rollout_num_gpus_per_engine = 1
+    args.num_gpus_per_node = 8
+    args.sglang_pp_size = args.sglang_dp_size = args.sglang_ep_size = 1
+    args.seed = 42
+    args.fp16 = False
+    arguments_module.relax_validate_args(args)
+    assert args.colocate
+    assert args.offload_rollout is False
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(
+        sglang_engine_module,
+        "ServerArgs",
+        make_dataclass(
+            "ServerArgs", [("enable_memory_saver", bool, False), ("enable_weights_cpu_backup", bool, False)]
+        ),
+    )
+    config, _ = sglang_engine_module._compute_server_args(
+        args, 0, "localhost:8000", 8001, "localhost", 8002, base_gpu_id=0
+    )
+
+    assert config["enable_memory_saver"] is shared
+    assert config.get("enable_weights_cpu_backup", False) is shared
 
 
 @pytest.mark.parametrize("deferred", [True, False])
