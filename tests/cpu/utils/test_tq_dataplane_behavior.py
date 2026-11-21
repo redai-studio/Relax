@@ -202,7 +202,7 @@ def tq_factory(_ray_cluster):
 
     leaked: set[str] = set()
 
-    def reinit(capacity: int | None = 1024):
+    def reinit(capacity: int | None = 1024, storage_units: int = 1):
         tq.close()
         if not _wait_controller_gone():
             _force_kill_controller()
@@ -215,7 +215,9 @@ def tq_factory(_ray_cluster):
         conf = OmegaConf.create(
             {
                 "controller": {"sampler": GRPOGroupNSampler(n_samples_per_prompt=1), "polling_mode": True},
-                "backend": {"SimpleStorage": {"total_storage_size": capacity, "num_data_storage_units": 1}},
+                "backend": {
+                    "SimpleStorage": {"total_storage_size": capacity, "num_data_storage_units": storage_units}
+                },
             },
             flags={"allow_objects": True},
         )
@@ -411,3 +413,74 @@ def test_multimodal_non_tensor_full_link_is_byte_exact(tq_factory, record_proper
     for position, sample_id in enumerate(sample_ids):
         assert not diff_digests(expected_mm[sample_id], leaf_digests(payload_rows(received[fields[2]])[position]))
         assert not diff_digests(expected_tokens[sample_id], leaf_digests(payload_rows(received[fields[1]])[position]))
+
+
+def test_replay_parallel_transport_roundtrip_and_private_partition_cleanup(tq_factory, monkeypatch):
+    """One real TQ lifecycle covers sockets, raw/encoded reads and cleanup.
+
+    In-process body doubles cannot detect shared client loops, strided writes
+    split across storage units, or generic TQ repacking on the receive path.
+    Reuse this module's bounded CPU Ray cluster instead of adding a new one.
+    """
+    from uuid import uuid4
+
+    import numpy as np
+    import ray
+    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.mm_embedding import MMPublisher, read_mm_embedding, release_media_entries
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+
+    client = tq_factory(storage_units=2)
+    connection = ray.get(ray.get_actor(_TQ_ACTOR, namespace=_TQ_NS).get_config.remote())
+    store = TQReplayStorage(ReplayConfig(delivery="reference", run_id=uuid4().hex, chunk_rows=2))
+    store.start_run()
+    store.register_local_owner(connection)
+    repacks = []
+    original_pack = AsyncSimpleStorageManager._pack_field_values
+
+    def pack(values):
+        repacks.append(True)
+        return original_pack(values)
+
+    monkeypatch.setattr(AsyncSimpleStorageManager, "_pack_field_values", staticmethod(pack))
+    publications, media = [], None
+    try:
+        expected = np.arange(24, dtype=np.int32).reshape(4, 3, 2)
+        for _ in range(4):
+            publication = store.begin_publication(kind="indexer", layers=3, topk=2)
+            publications.append(publication)
+            for start in (0, 2):
+                publication.append(2, lambda layer, start=start: expected[start : start + 2, layer].copy())
+        refs = [publication.finish([10, 11, 12, 13, 14]) for publication in publications]
+        store.attach(refs, "train_0")
+        store.commit(refs)
+        completed = []
+        with store.reader(refs, partition="train_0") as reader:
+            outputs = [np.full((16, 2), -1, dtype=np.int32) for _ in range(3)]
+            requests = [
+                (ref, np.arange(4), np.arange(4) + 4 * index, reader._leases[index]) for index, ref in enumerate(refs)
+            ]
+            store._read_layers_into(
+                [(requests, layer, output) for layer, output in enumerate(outputs)], on_layer=completed.append
+            )
+            for layer, output in enumerate(outputs):
+                np.testing.assert_array_equal(output, np.tile(expected[:, layer], (4, 1)))
+        assert completed == [0, 1, 2]
+        assert not repacks  # Real raw body reads bypass generic TQ aggregation.
+        store.retire_partition("train_0")
+        bits = np.arange(4 * 5120, dtype=np.uint8).reshape(4, 5120)
+        media = MMPublisher(store).publish("a" * 64, bits, [1, 4, 4])
+        actual = read_mm_embedding(store, media)
+        np.testing.assert_array_equal(actual.view(torch.uint8).numpy(), bits)
+        release_media_entries(store, [media])
+        media = None
+        assert not store.invoke("snapshot")["objects"]
+    finally:
+        if media is not None:
+            release_media_entries(store, [media])
+        for publication in publications:
+            publication.abort()
+        store.close_run()
+    assert store._backend.partition not in client.get_partition_list()

@@ -15,6 +15,8 @@ import numpy as np
 import pybase64
 import pytest
 
+from relax.distributed.replay_manager.config import rollout_kinds
+from relax.distributed.replay_manager.core import replay_data_manager
 from relax.utils.score_centering import (
     append_score_centering_candidates,
     configure_score_centering_request,
@@ -391,6 +393,8 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         "GenerateState": lambda args: state,
         "opd": SimpleNamespace(is_opd_enabled=lambda *args, **kwargs: False),
         "monotonic": monotonic,
+        "replay_data_manager": replay_data_manager,
+        "rollout_kinds": rollout_kinds,
         "_post_generation": post_generation,
         "configure_score_centering_request": configure_score_centering_request,
         "parse_score_centering_response": parse_score_centering_response,

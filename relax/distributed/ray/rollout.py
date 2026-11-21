@@ -470,6 +470,10 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            from relax.distributed.replay_manager import reference_environment
+
+            env_vars.update(reference_environment())
+
             effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
             effective_load_format = self.sglang_overrides.get(
                 "load_format", getattr(self.args, "sglang_load_format", "auto")
@@ -1299,6 +1303,14 @@ class RolloutManager(ReloadableMixin):
                 ray.kill(host)
                 self._lora_runtime = None
             self._shutdown_all_engines()
+            from relax.distributed.replay_manager import replay_data_manager
+
+            if replay_data_manager.uses_references:
+                # dispose also runs during restart: reclaim dead producers, but
+                # keep the run open and never remove a reader or TQ hold.
+                remaining = replay_data_manager.store().reclaim_stopped_publishers()
+                if remaining:
+                    logger.warning(f"Replay shutdown retained {remaining} owned bodies; cleanup is incomplete")
         finally:
             try:
                 # Deregister the worker's Mooncake segment before a fast restart.
@@ -1430,6 +1442,7 @@ class RolloutManager(ReloadableMixin):
             self._dynamic_global_batch_size = len(
                 {sample.index for sample_group in output.samples for sample in sample_group}
             )
+        return output.partition_complete
 
     async def eval(self, rollout_id):
         self._begin_generation()

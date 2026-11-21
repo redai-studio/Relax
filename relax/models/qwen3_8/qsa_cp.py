@@ -93,6 +93,26 @@ def _indexer_forward(self: qsa.QSAIndexer, *args: Any, **kwargs: Any) -> qsa.QSA
     return _cached("indexer", self, build)
 
 
+def _reference_indexer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+    """Reuse this checkpoint's immutable selection, retaining replay checks."""
+    from relax.distributed.replay_manager.backend.megatron import IndexerReplay
+    from relax.models.qwen3_8.ops.qsa_mixed_ops.selector import forward
+
+    tape = _active_tape.get()
+    if tape is None:
+        return forward(self, *args, **kwargs, replay_data=IndexerReplay.read(self.layer_number))
+
+    def build() -> Any:
+        token = IndexerReplay._checkpoint_token(self.layer_number)
+        data = IndexerReplay.read(self.layer_number)
+        return forward(self, *args, **kwargs, replay_data=data), token
+
+    selection, token = _cached("rollout_indexer", self, build)
+    if tape.replay:
+        IndexerReplay._consume_cached(self.layer_number, token)
+    return selection
+
+
 def _local_mask(selection: qsa.QSASelection, query_ids: Tensor) -> BlockMask:
     global_mod = qsa._qsa_mask_mod_factory(selection)
     local_length = query_ids.numel()

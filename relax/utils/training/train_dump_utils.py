@@ -9,6 +9,7 @@ from PIL import Image
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
+from relax.utils.types import Sample
 
 
 logger = get_logger(__name__)
@@ -119,6 +120,24 @@ def save_debug_train_data(args, *, rollout_id, rollout_data, tokenizer=None):
             ),
             path,
         )
+
+
+def load_debug_rollout_samples(path: str, args: Any) -> list[Sample]:
+    from relax.distributed.replay_manager.config import rollout_kinds
+
+    samples = torch.load(path, weights_only=False)["samples"]
+    required = rollout_kinds(args)
+    for sample in samples:
+        refs = sample.pop("rollout_replay_refs", None) or {}
+        missing = required.intersection(refs)
+        if missing:
+            raise ValueError(f"Cannot replay {path}: {sorted(missing)} reference bodies belong to another run")
+        inputs = sample.get("multimodal_train_inputs") or {}
+        for entry in refs.get("mm_embedding", {}).get("media", []):
+            key = "pixel_values_videos" if entry["modality"] == "video" else "pixel_values"
+            if inputs.get(key) is None:
+                raise ValueError(f"Cannot replay {path}: the multimodal embedding dump lacks {key}")
+    return [Sample.from_dict(sample) for sample in samples]
 
 
 def save_debug_rollout_data(args, data, rollout_id: int, evaluation: bool, tokenizer=None) -> None:

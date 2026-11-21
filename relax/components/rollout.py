@@ -17,6 +17,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.distributed.replay_manager.storage import BODY_PARTITION_PREFIX
 from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
@@ -300,14 +301,16 @@ def satisfy_staleness(partition_list: Optional[List[str]], current_rollout_id: i
     """Check if the current rollout remains within the allowed staleness.
 
     Args:
-        partition_list: list of partition ids as strings like 'train_123' or None.
+        partition_list: TQ partition ids, including training batches and replay bodies, or None.
         current_rollout_id: current rollout index.
         max_staleness: maximum allowed staleness.
 
     Returns:
         True if within staleness bounds (or partition_list is empty/None), False otherwise.
     """
-    if not partition_list:  # for None or []
+    # Replay bodies share TQ storage but are not pending training batches.
+    partition_list = [p for p in partition_list or () if not p.startswith(BODY_PARTITION_PREFIX)]
+    if not partition_list:
         return True
 
     def split_partition(partition: str) -> int:
@@ -418,6 +421,7 @@ class Rollout(Base):
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:
                 await self._run_eval_with_mark(rollout_id=0)
+            partition_complete = None
             while True:
                 local_step = self.step
 
@@ -439,6 +443,7 @@ class Rollout(Base):
                     if (
                         local_step == self.config.num_rollout
                         and getattr(self.config, "fully_async", False)
+                        and partition_complete is not True
                         and not await self._async_check_partition_production_complete(final_partition_id)
                     ):
                         self._logger.warning(
@@ -451,7 +456,8 @@ class Rollout(Base):
 
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
-                    await self.rollout_manager.generate.remote(rollout_id=local_step)
+                    # Actor may clear a completed partition before our next poll.
+                    partition_complete = await self.rollout_manager.generate.remote(rollout_id=local_step)
                     if self.config.offload_rollout:
                         await self.rollout_manager.offload.remote()
                 except Exception as e:
@@ -519,7 +525,9 @@ class Rollout(Base):
                 self.step += 1
                 if is_final_backfill_step:
                     final_partition_id = f"train_{self.config.num_rollout - 1}"
-                    if not await self._async_check_partition_production_complete(final_partition_id):
+                    if partition_complete is not True and not await self._async_check_partition_production_complete(
+                        final_partition_id
+                    ):
                         raise RuntimeError(f"Final rollout partition {final_partition_id} is still incomplete")
                     self._logger.info("All rollouts finished")
                     break

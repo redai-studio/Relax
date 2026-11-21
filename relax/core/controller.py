@@ -639,12 +639,20 @@ class Controller:
         owner-mediated runs delegate to
         :func:`relax.utils.tq.lifecycle.close_tq_owner`.
         """
-        if self._tq_legacy_init:
-            self._tq_legacy_init = False
-            tq.close()
-            return
-        close_tq_owner(self._tq_owner)
-        self._tq_owner = None
+        from relax.distributed.replay_manager import replay_data_manager
+
+        try:
+            if getattr(self, "_restarting", False):
+                replay_data_manager.prepare_restart(self.runtime_env)
+            else:
+                replay_data_manager.finish_run()
+        finally:
+            if self._tq_legacy_init:
+                self._tq_legacy_init = False
+                tq.close()
+            else:
+                close_tq_owner(self._tq_owner)
+                self._tq_owner = None
 
     def _deploy_metrics_service(self):
         """Deploy the MetricsService as a lightweight Ray Serve deployment.
@@ -1883,6 +1891,9 @@ class Controller:
         # --- 1.10 Re-initialize Ray and Ray Serve (same as train.py) ---
         ray.init(runtime_env=runtime_env)
         logger.info("[Global Restart] Ray re-initialized")
+        from relax.distributed.replay_manager import replay_data_manager
+
+        replay_data_manager.start_run()
         try:
             serve.start(
                 http_options={"host": "0.0.0.0", "port": "8000"},

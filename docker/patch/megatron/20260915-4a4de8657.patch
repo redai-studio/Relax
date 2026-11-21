@@ -1137,7 +1137,7 @@ index 59a5fef..62d9a0c 100644
                      )
                  )
 +                if getattr(self.config, "relax_use_indexer_replay", False):
-+                    from relax.utils.training.indexer_replay import maybe_replay_indexer_topk
++                    from relax.distributed.replay_manager.backend.megatron import maybe_replay_indexer_topk
 +                    compressed_topk = maybe_replay_indexer_topk(
 +                        layer_number=self.layer_number,
 +                        computed_topk=compressed_topk,
@@ -1182,7 +1182,7 @@ index 4ce5ebf..d39ca64 100644
                  scores, topk, num_groups, group_topk, _compute_topk
              )
  
-+    from relax.utils.training.routing_replay import get_routing_replay_compute_topk
++    from relax.distributed.replay_manager.backend.megatron import get_routing_replay_compute_topk
 +    compute_topk = get_routing_replay_compute_topk(compute_topk)
 +
      # Precision notes:
@@ -1232,7 +1232,7 @@ index 84d64ea..5199eac 100644
          if self.config.moe_enable_routing_replay:
              self.router_replay = RouterReplay()
  
-+        from relax.utils.training.routing_replay import register_routing_replay
++        from relax.distributed.replay_manager.backend.megatron import register_routing_replay
 +        register_routing_replay(self)
 +
      def _maintain_float32_expert_bias(self):

@@ -64,8 +64,15 @@ def attention_for_selection(
 
     batch, length, heads, dim = query.shape
     validate_bounds(bounds, length)
-    ids = selection.selected_ids.view(batch, length, -1)
-    maximum = ids.shape[-1] * 4 + 3
+    ids = selection.selected_ids
+    if ids is None:
+        if selection.bits_per_row % 4 or selection.selected_bits.dtype != torch.uint8:
+            raise ValueError("Mixed QSA replay requires int32-aligned bitmap bytes")
+        bits = selection.selected_bits.view(torch.int32).reshape(batch, length, selection.bits_per_row // 4)
+        maximum = 512 * 4 + 3
+    else:
+        ids = ids.view(batch, length, -1)
+        maximum = ids.shape[-1] * 4 + 3
     threshold = Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN
     threshold = maximum if threshold == -1 else threshold
     if not 0 <= threshold <= maximum:
@@ -82,12 +89,18 @@ def attention_for_selection(
             positions.append(short_rows)
         if long:
             long_rows = torch.cat([torch.arange(a, b, device=query.device) for a, b in long])
+            if ids is None:
+                from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import _block_ids_from_bits
+
+                long_ids = _block_ids_from_bits(bits[row].index_select(0, long_rows)).unsqueeze(0)
+            else:
+                long_ids = ids[row : row + 1].index_select(1, long_rows)
             pieces.append(
                 sparse_attention(
                     query[row : row + 1].index_select(1, long_rows),
                     key[row : row + 1],
                     value[row : row + 1],
-                    ids[row : row + 1].index_select(1, long_rows),
+                    long_ids,
                     bounds,
                     scale,
                     long_rows,

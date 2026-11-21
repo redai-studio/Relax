@@ -16,6 +16,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
@@ -236,6 +237,8 @@ def create_stream_dataloader(
         pipeline stage) and the second element is a list with the number of
         microbatches for each step in the rollout.
     """
+
+    data_fields = replay_data_manager.register_consumer().fields(data_fields)
 
     # Choose the appropriate fetch function based on fully_async mode
     # Use partial to bind the broadcast_pp parameter
@@ -475,13 +478,9 @@ def _broadcast_routed_experts(
         is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
 
         # --- Step 0: CP broadcast (cp_rank==0 -> others in each CP group) ---
-        # Only the (TP=0, PP=0) CP group needs this: it fans data from
-        # CP=0 to all CP peers.  Other CP groups are skipped — their
-        # ranks receive data later via the PP and TP broadcasts (the
-        # PP/TP source ranks already have data from this CP step).
-        # All members of a CP group share the same TP/PP rank, so the
-        # guard is uniform within each group — no hang risk.
-        if not cp_trivial and is_tp_rank0 and is_pp_rank0:
+        # Async stages fetch independently on TP0/CP0. When PP broadcasts
+        # are enabled, only stage zero fetches the original CPU tensor.
+        if not cp_trivial and is_tp_rank0 and (not broadcast_pp or is_pp_rank0):
             cp_group = mpu.get_context_parallel_group()
             cp_src_global = dist.get_global_rank(cp_group, 0)
             tensor = _bcast_unknown_shape(tensor, is_cp_rank0, cp_src_global, cp_group)
@@ -1202,6 +1201,8 @@ def post_process_rollout_data(args, rollout_data):
 
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
+    replay_consumer = replay_data_manager.register_consumer(rollout_kinds(args))
+    replay_consumer.receive_references(rollout_data)
     if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
         masks = rollout_data["loss_masks"]
         # Per-rank fetch supplies CPU masks. Never copy CUDA masks back in the
@@ -1323,23 +1324,7 @@ def post_process_rollout_data(args, rollout_data):
 
         restore_opd_topk_rollout_fields(rollout_data, args, cuda_dev)
 
-    if "rollout_routed_experts" in rollout_data:
-        from tensordict.tensorclass import NonTensorData
-
-        # Pack CP/TP slices and PP-local layers on CPU in fill_routing_replay.
-        # Upload and widen indices only when a router consumes its microbatch.
-        rollout_data["rollout_routed_experts"] = [
-            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.int32, device="cpu")
-            for r in rollout_data["rollout_routed_experts"]
-        ]
-
-    if getattr(args, "use_rollout_indexer_replay", False) and "rollout_indexer_topk" in rollout_data:
-        from tensordict.tensorclass import NonTensorData
-
-        rollout_data["rollout_indexer_topk"] = [
-            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.int32, device=cuda_dev)
-            for r in rollout_data["rollout_indexer_topk"]
-        ]
+    replay_consumer.receive_tensors(rollout_data, device=cuda_dev)
 
 
 class StreamingTQIterator:
@@ -1409,7 +1394,7 @@ class StreamingTQIterator:
             raise ValueError(f"max_stream_stall_s must be positive, got {max_stream_stall_s}")
         self.args = args
         self.tq_client = tq_client
-        self.data_fields = data_fields
+        self.data_fields = replay_data_manager.register_consumer().fields(data_fields)
         self.rollout_id = rollout_id
         self.token_budget = token_budget
         self.loss_scale = loss_scale
