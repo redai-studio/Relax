@@ -119,6 +119,7 @@ class _QuietProgress:
 
 
 class _Prepare:
+    fixed_batch = False
     ready_group_count = 0
 
     def __init__(self, harness):

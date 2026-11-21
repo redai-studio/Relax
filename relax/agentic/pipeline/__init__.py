@@ -57,6 +57,7 @@ class GroupInput:
 
     group_id: str
     samples: list[Sample]
+    source_sequence: int = 0
 
 
 @dataclass
