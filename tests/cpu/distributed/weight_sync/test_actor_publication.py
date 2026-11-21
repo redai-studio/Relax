@@ -46,6 +46,12 @@ class PublicationRoutingTests(unittest.TestCase):
             weight_version_config="publisher.json",
             offload_train=False,
         )
+        publications = [{"version": i, "root": f"root-{i}"} for i in range(2)]
+
+        def publish():
+            events.append("publish")
+            return publications[events.count("publish") - 1]
+
         actor = SimpleNamespace(
             args=args,
             model=[],
@@ -59,7 +65,7 @@ class PublicationRoutingTests(unittest.TestCase):
             _resident_sft_overlap_enabled=lambda: False,
             _is_standard_dpo=lambda: False,
             _backup_actor_weights_after_train=lambda: events.append("backup"),
-            publish_weight_version=lambda: events.append("publish"),
+            publish_weight_version=publish,
             _run_step_evaluation=Mock(),
             _wait_for_previous_eval=Mock(),
         )
@@ -88,6 +94,36 @@ class PublicationRoutingTests(unittest.TestCase):
         for step in range(2):
             train_actor(actor, step, {"total_lengths": [2], "loss_masks": [[1, 1]]})
         self.assertEqual(events, ["train", "backup", "publish"] * 2)
+        self.assertEqual(
+            [c.kwargs["published_version"] for c in actor._run_step_evaluation.call_args_list], publications
+        )
+
+    def test_predict_request_reuses_step_publication_and_restores_training_on_error(self):
+        from relax.backends.megatron import initialize
+        from relax.engine.sft.predict import runner
+
+        actor = Mock(args=SimpleNamespace(offload_train=True))
+        published = {"version": 0, "root": "step-root"}
+        with (
+            patch.object(initialize, "is_megatron_main_rank", return_value=True),
+            patch.object(runner, "get_gloo_group", return_value=None),
+            patch.object(runner, "get_serve_url", return_value="http://rollout"),
+            patch.object(runner, "dist") as dist,
+            patch.object(runner.requests, "get") as get,
+        ):
+            dist.get_world_size.return_value = 1
+            dist.all_gather_object.side_effect = lambda out, value, **kw: out.__setitem__(0, value)
+            get.return_value.json.return_value = {"status": "error", "message": "installation failed"}
+            with self.assertRaisesRegex(RuntimeError, "installation failed"):
+                runner.run_sft_predict(actor, 12, published_version=published)
+            actor.update_weights.assert_not_called()
+            get.assert_called_once_with(
+                "http://rollout/predict",
+                params={"train_step": 12, "weight_version": 0, "weight_root": "step-root"},
+                timeout=1800,
+            )
+            actor.sleep.assert_called_once_with()
+            actor.wake_up.assert_called_once_with()
 
     def test_initial_publication_protects_setup_and_releases_offload_context(self):
         @dataclass
@@ -292,6 +328,10 @@ class PublicationRoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "managed rollout"):
                 validate_weight_version_arguments(args, offline_training=False)
             validate_weight_version_arguments(args, offline_training=True)
+            args.sft_predict_interval = 3
+            with self.assertRaisesRegex(ValueError, "--weight-consumer-config"):
+                validate_weight_version_arguments(args, offline_training=True)
+            args.sft_predict_interval = None
             args.debug_train_only = True
             validate_weight_version_arguments(args, offline_training=False)
             args.debug_train_only = False

@@ -69,6 +69,32 @@ def test_periodic_reference_has_distinct_members_and_metadata_lifetime():
     asyncio.run(verify())
 
 
+def test_sender_only_topologies_do_not_accumulate_updates():
+    coordinator = object.__new__(DCSCoordinator.func_or_class)
+    coordinator.topology_manager = TopologyManager()
+    coordinator.weight_updates = {}
+    for rank in range(2):
+        coordinator.topology_manager.register(
+            RoleInfo(role_name="actor", rank=rank, metadata={"pp_size": 1, "is_pp_src_rank": False})
+        )
+
+    async def query():
+        for step in range(32):
+            for occurrence in range(2):
+                first, second = await asyncio.gather(
+                    *(
+                        coordinator.get_model_update_group_ranks("actor", rank, "false", step, occurrence)
+                        for rank in range(2)
+                    )
+                )
+                assert first == second
+                assert first.world_size == 1 and first.global_rank == 0
+                assert first.update_id.endswith(f":{step}:{occurrence}")
+        assert coordinator.weight_updates == {}
+
+    asyncio.run(query())
+
+
 def test_backend_selects_cached_group_by_exact_member_generation(monkeypatch):
     pytest.importorskip("megatron.core")
     from relax.distributed.checkpoint_service.backends import device_direct
@@ -113,3 +139,15 @@ def test_backend_selects_cached_group_by_exact_member_generation(monkeypatch):
     assert len(removed) == 1
     assert removed[0] is created[1][0]
     assert backend._forward_update_id == "new-both:3"
+
+    combined = backend._model_update_groups_for_actor_fwd_ref
+    empty = dict(topology("empty", False, 4), world_size=1)
+    backend.init_process_groups_for_actor_fwd_ref(empty)
+    backend.init_process_groups_for_actor_fwd_ref(empty)
+    assert backend._model_update_groups_for_actor_fwd_ref is None
+    assert removed == [created[1][0], first]
+    backend.init_process_groups_for_actor_fwd_ref(topology("new-both", True, 5))
+    assert backend._model_update_groups_for_actor_fwd_ref is combined
+    backend.init_process_groups_for_actor_fwd_ref(topology("fwd", False, 6))
+    assert backend._model_update_groups_for_actor_fwd_ref is not first
+    assert len(created) == 4

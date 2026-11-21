@@ -77,6 +77,65 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.apply(2)
 
+    def test_sft_predict_writes_outputs_from_the_requested_checkpoint(self):
+        import asyncio
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import torch
+        from safetensors.torch import load
+
+        from relax.distributed.ray.rollout import RolloutManager
+        from relax.engine.sft.predict import loop, runner
+
+        consumer, engines = self.runner(SharedFSTransport(self.source), mode="latest")
+        consumer.apply(0)
+        published = self.source.manifest("s", 1)
+        self.assertEqual(consumer.available()[0]["version"], 3)
+        args = SimpleNamespace(save=str(self.root), offload_rollout=True, weight_version_config="source.json")
+        manager = SimpleNamespace(args=args, onload=AsyncMock())
+
+        async def consume(version):
+            manager.onload.assert_awaited_once_with()
+            return [consumer.apply_through(version)]
+
+        async def generate(prompts, multimodal_inputs):
+            self.assertTrue(engines.serving)
+            weight = load(engines.bytes)["w"].view(torch.int16)[0]
+            return [str(weight.item()) for _ in prompts]
+
+        manager.consume_weight_version = consume
+        manager.generate_predict = generate
+        method = RolloutManager.__ray_metadata__.modified_class.run_predict
+        rollout = SimpleNamespace(
+            _logger=Mock(),
+            config=SimpleNamespace(loss_type="sft", offload_rollout=True),
+            healthy=Mock(),
+            rollout_manager=SimpleNamespace(
+                offload=SimpleNamespace(remote=AsyncMock()),
+                run_predict=SimpleNamespace(remote=lambda *a, **kw: method(manager, *a, **kw)),
+            ),
+        )
+        with patch.object(loop, "render_eval_prompts", return_value=[("prompt", "reference", None)]):
+            response = asyncio.run(runner.handle_predict(rollout, 12, 1, published["root"]))
+            self.assertEqual(response["status"], "ok", response)
+            result = self.root / "predict/predictions_step_12.jsonl"
+            self.assertEqual(json.loads(result.read_text())["completion"], "1")
+            self.assertEqual(consumer.session.status()["serving"]["version"], 1)
+            self.assertEqual(engines.loads, 2)
+            for receipts in (
+                [],
+                [{"active_version": {"version": 1, "root": "wrong"}}],
+                [{"active_version": self.source.manifest("s", 0)}],
+            ):
+                rollout.rollout_manager.offload.remote.reset_mock()
+                manager.consume_weight_version = AsyncMock(return_value=receipts)
+                response = asyncio.run(runner.handle_predict(rollout, 13, 1, published["root"]))
+                self.assertEqual(response["status"], "error", response)
+                rollout.rollout_manager.offload.remote.assert_awaited_once_with()
+                self.assertFalse((self.root / "predict/predictions_step_13.jsonl").exists())
+
     def test_capacity_shortage_explains_recovery_and_preserves_serving(self):
         runner, engines = self.runner(SharedFSTransport(self.source))
         runner.apply(0)
