@@ -73,6 +73,15 @@ def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected
     assert args.sft_invalid_multimodal_strategy == expected
 
 
+@pytest.mark.parametrize("argv,expected", [([], False), (["--sft-literal-image-tags-as-text"], True)])
+def test_sft_literal_image_tags_as_text_option(arguments_module, argv, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    assert parser.parse_args(argv).sft_literal_image_tags_as_text is expected
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",

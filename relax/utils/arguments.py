@@ -866,6 +866,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-literal-image-tags-as-text",
+                action="store_true",
+                default=False,
+                help=(
+                    "Treat literal <image> strings as text when a sample's mapped image field is absent or empty. "
+                    "Default off: keep strict image validation. Structured image parts and nonempty image "
+                    "fields remain validated. Enabling this can also accept samples whose image data was lost."
+                ),
+            )
+            parser.add_argument(
                 "--sft-invalid-multimodal-strategy",
                 type=str,
                 default="error",

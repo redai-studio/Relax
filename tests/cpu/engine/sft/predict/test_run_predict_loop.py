@@ -142,6 +142,36 @@ def test_render_eval_prompts_uses_seeded_random_eval_rows(monkeypatch, scoring):
             assert sample.metadata is not canonical.metadata
 
 
+@pytest.mark.parametrize("separate_eval", [False, True])
+def test_render_eval_prompts_preserves_opt_in_literal_images(tmp_path, monkeypatch, separate_eval):
+    class _FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return messages[-1]["content"]
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+    monkeypatch.setattr(predict_loop, "prepare_model_maybe_update_args", lambda *args, **kwargs: None)
+    path = tmp_path / "literal.jsonl"
+    row = {"messages": [{"role": "user", "content": "Run emu <image>."}, {"role": "assistant", "content": "Done"}]}
+    path.write_text((json.dumps(row) + "\n") * 2)
+    config = SimpleNamespace(
+        hf_checkpoint="/fake/model",
+        max_tokens_per_gpu=128,
+        eval_prompt_data=["heldout", str(path)] if separate_eval else None,
+        eval_size=None if separate_eval else 1,
+        prompt_data=str(path),
+        input_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        metadata_key="metadata",
+        tool_key=None,
+        system_prompt=None,
+    )
+    assert predict_loop.render_eval_prompts(config) == []
+    config.sft_literal_image_tags_as_text = True
+    expected_count = 2 if separate_eval else 1
+    assert predict_loop.render_eval_prompts(config) == [("Run emu <image>.", "Done", None)] * expected_count
+
+
 class _FakeRolloutManager:
     def __init__(self, completion_factory=None):
         self.calls: list[list[str]] = []

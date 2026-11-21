@@ -695,7 +695,7 @@ def test_streaming_dataset_collects_inline_structured_image_url(tmp_path: Path):
                             {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
                         ],
                     },
-                    {"role": "assistant", "content": "Answer"},
+                    {"role": "assistant", "content": "The tag <image> is literal."},
                 ],
                 "images": [],
             }
@@ -710,6 +710,7 @@ def test_streaming_dataset_collects_inline_structured_image_url(tmp_path: Path):
         prompt_key="messages",
         label_key=None,
         multimodal_keys={"image": "images"},
+        literal_image_tags_as_text=True,
         seed=42,
         prefetch_max_cached=0,
     )
@@ -717,6 +718,7 @@ def test_streaming_dataset_collects_inline_structured_image_url(tmp_path: Path):
     sample = ds.get_canonical_sample(0)
 
     assert sample.images == ["https://example.test/image.png"]
+    assert sample.messages[1].content == "The tag <image> is literal."
     assert sample.messages[0].content[1] == {
         "type": "image",
         "image": "https://example.test/image.png",
@@ -833,6 +835,7 @@ def test_streaming_dataset_rejects_malformed_inline_image_url(tmp_path: Path, im
         prompt_key="messages",
         label_key=None,
         multimodal_keys={"image": "images"},
+        literal_image_tags_as_text=True,
         seed=42,
         prefetch_max_cached=0,
     )
@@ -1383,14 +1386,18 @@ def test_streaming_dataset_rejects_duplicate_inline_and_top_level_image_sources(
     ds.stop()
 
 
-def test_streaming_dataset_accepts_literal_image_placeholder_with_matching_top_level_image(tmp_path: Path):
+@pytest.mark.parametrize("placeholder_count", [1, 2])
+@pytest.mark.parametrize("literal_image_tags_as_text", [False, True])
+def test_streaming_dataset_validates_literal_image_placeholder_count(
+    tmp_path: Path, placeholder_count: int, literal_image_tags_as_text: bool
+):
     path = tmp_path / "train.jsonl"
     _write_jsonl(
         path,
         [
             {
                 "messages": [
-                    {"role": "user", "content": "<image>\nDescribe the image."},
+                    {"role": "user", "content": "<image>" * placeholder_count + "\nDescribe the image."},
                     {"role": "assistant", "content": "Answer"},
                 ],
                 "images": ["/data/image.png"],
@@ -1406,14 +1413,18 @@ def test_streaming_dataset_accepts_literal_image_placeholder_with_matching_top_l
         prompt_key="messages",
         label_key=None,
         multimodal_keys={"image": "images"},
+        literal_image_tags_as_text=literal_image_tags_as_text,
         seed=42,
         prefetch_max_cached=0,
     )
 
-    sample = ds.get_canonical_sample(0)
-
-    assert sample.images == ["/data/image.png"]
-    assert sample.messages[0].content[0] == {"type": "image", "image": "/data/image.png"}
+    if placeholder_count == 2:
+        with pytest.raises(SFTMultimodalContractError, match="contract mismatch"):
+            ds.get_canonical_sample(0)
+    else:
+        sample = ds.get_canonical_sample(0)
+        assert sample.images == ["/data/image.png"]
+        assert sample.messages[0].content[0] == {"type": "image", "image": "/data/image.png"}
     ds.stop()
 
 
@@ -1628,7 +1639,8 @@ def test_message_loss_mask_preserves_selected_assistant_round(tmp_path):
     assert "learn" not in row["messages"][1]
 
 
-def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tmp_path):
+@pytest.mark.parametrize("literal_image_tags_as_text", [False, True])
+def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tmp_path, literal_image_tags_as_text):
     path = tmp_path / "tool.jsonl"
     _write_jsonl(
         path,
@@ -1654,11 +1666,34 @@ def test_multimodal_tool_call_null_content_normalizes_before_media_resolution(tm
         str(path),
         prompt_key="messages",
         multimodal_keys={"image": "images"},
+        literal_image_tags_as_text=literal_image_tags_as_text,
         prefetch_max_cached=0,
     )
     sample = dataset.get_canonical_sample(0)
-    assert sample.messages[1].content == []
+    assert sample.messages[1].content == ("" if literal_image_tags_as_text else [])
     assert sample.messages[1].tool_calls[0]["function"]["arguments"] == {}
+
+
+@pytest.mark.parametrize(
+    "role,content", [("user", None), ("assistant", None), ("user", 42), ("assistant", {"text": "4"})]
+)
+def test_streaming_dataset_literal_image_opt_in_rejects_invalid_content(tmp_path, role, content):
+    path = tmp_path / "invalid.jsonl"
+    messages = [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "4"}]
+    messages[0 if role == "user" else 1]["content"] = content
+    _write_jsonl(path, [{"messages": messages, "images": []}])
+    dataset = SFTStreamingDataset(
+        str(path),
+        prompt_key="messages",
+        multimodal_keys={"image": "images"},
+        literal_image_tags_as_text=True,
+        prefetch_max_cached=0,
+    )
+    try:
+        with pytest.raises(ValueError, match="Unsupported content type"):
+            dataset.get_canonical_sample(0)
+    finally:
+        dataset.stop()
 
 
 def test_expand_loss_mask_alignment_multiple_pad_kinds():
@@ -1768,8 +1803,64 @@ def test_opt_in_preserves_assistant_literal_media_tags(tmp_path, monkeypatch, wi
         ds.stop()
 
 
-@pytest.mark.parametrize("media_name", ["image", "audio", "video"])
-def test_configured_literal_media_still_requires_payload(tmp_path, media_name, monkeypatch):
+@pytest.mark.parametrize("image_fields", [{}, {"pictures": None}, {"pictures": []}])
+@pytest.mark.parametrize("literal_image_tags_as_text", [False, True])
+def test_streaming_dataset_preserves_literal_images_without_payload(
+    tmp_path, image_fields, literal_image_tags_as_text
+):
+    messages = [
+        {"role": "user", "content": "Run emu <image>."},
+        {"role": "tool", "content": "Usage: emu <image>"},
+        {"role": "assistant", "content": "Keep <image> unchanged.", "reasoning_content": "This is a CLI argument."},
+    ]
+    path = tmp_path / "literal.jsonl"
+    row = {"messages": messages, **image_fields}
+    original = deepcopy(row)
+    image_row = {
+        "messages": [{"role": "user", "content": "Describe <image>"}, {"role": "assistant", "content": "A cat."}],
+        "pictures": ["/data/cat.png"],
+    }
+    _write_jsonl(path, [row, image_row])
+    multimodal_keys = {"image": "pictures"}
+    ds = SFTStreamingDataset(
+        str(path),
+        tokenizer=_FakeTokenizer(),
+        prompt_key="messages",
+        multimodal_keys=multimodal_keys,
+        literal_image_tags_as_text=literal_image_tags_as_text,
+        prefetch_max_cached=0,
+    )
+    try:
+        if not literal_image_tags_as_text:
+            with pytest.raises(SFTMultimodalContractError, match="contract mismatch"):
+                ds.get_canonical_sample(0)
+            return
+        sample = ds.get_canonical_sample(0, row=row)
+        assert row == original
+        assert multimodal_keys == {"image": "pictures"}
+        assert sample.images is None
+        assert streaming_module.render_to_text(sample, tokenizer=ds.tokenizer) == "".join(
+            message["content"] for message in messages
+        )
+        assert sample.messages[-1].reasoning_content == messages[-1]["reasoning_content"]
+        processed = ds.get_batch_by_indices([0])[0]
+        assert processed.multimodal_train_inputs is None
+        assert processed.total_length == sum(len(message["content"]) for message in messages)
+        context_length = sum(len(message["content"]) for message in messages[:-1])
+        assert processed.loss_mask.tolist() == [0] * context_length + [1] * len(messages[-1]["content"])
+        image_sample = ds.get_canonical_sample(1)
+        assert image_sample.images == ["/data/cat.png"]
+        assert image_sample.messages[0].content[-1] == {"type": "image", "image": "/data/cat.png"}
+        assert ds.get_canonical_sample(0).messages == sample.messages
+        assert ds.reader[0] == original
+    finally:
+        ds.stop()
+
+
+@pytest.mark.parametrize("media_name,literal_image_tags_as_text", [("image", False), ("audio", True), ("video", True)])
+def test_configured_literal_media_still_requires_payload(
+    tmp_path, media_name, literal_image_tags_as_text, monkeypatch
+):
     monkeypatch.setenv("RELAX_SFT_ASSISTANT_MEDIA_TAGS_AS_TEXT", "1")
     path = tmp_path / "missing.jsonl"
     _write_jsonl(
@@ -1777,7 +1868,11 @@ def test_configured_literal_media_still_requires_payload(tmp_path, media_name, m
         [{"messages": [{"role": "user", "content": f"<{media_name}>"}, {"role": "assistant", "content": "Done"}]}],
     )
     ds = SFTStreamingDataset(
-        path=str(path), prompt_key="messages", multimodal_keys={media_name: "media"}, prefetch_max_cached=0
+        path=str(path),
+        prompt_key="messages",
+        multimodal_keys={media_name: "media"},
+        literal_image_tags_as_text=literal_image_tags_as_text,
+        prefetch_max_cached=0,
     )
     try:
         with pytest.raises(SFTMultimodalContractError, match="contract mismatch"):
