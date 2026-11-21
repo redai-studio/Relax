@@ -424,6 +424,15 @@ def build_trajectory_record(
                 state_hash=node.state_hash,
                 token_count=len(node.train_token_delta),
                 weight_versions=list(node.weight_version_delta),
+                weight_version_spans=[
+                    {
+                        "version": span.version,
+                        "token_start": span.token_start,
+                        "token_end": span.token_end,
+                        "attempt_seq": span.attempt_seq,
+                    }
+                    for span in node.weight_version_spans
+                ],
                 messages=messages,
             )
         )

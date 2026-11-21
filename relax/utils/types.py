@@ -25,6 +25,23 @@ def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
     return 0, 0
 
 
+@dataclass(frozen=True)
+class WeightVersionSpan:
+    """One backend generate attempt's committed tokens annotated with the
+    engine's weight version at generation time.
+
+    Coordinates are relative to the resp node's ``train_token_delta`` (the
+    flattening into whole-response indices happens in ``build_sample``).
+    ``version`` is None when the engine did not report a version; unknown
+    versions are reported explicitly and never coerced to 0 or "latest".
+    """
+
+    version: str | None
+    token_start: int
+    token_end: int
+    attempt_seq: int
+
+
 @dataclass
 class Sample:
     """The sample generated."""
@@ -45,6 +62,7 @@ class Sample:
     custom_advantage: float | list[float] | list[list[float]] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
+    weight_version_spans: list[WeightVersionSpan] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_topk_token_ids: np.ndarray | None = None  # [response_length, K], int32; -1 pads observations
     rollout_topk_log_probs: np.ndarray | None = None  # [response_length, K], float32; generation-time log-q
