@@ -145,11 +145,15 @@ def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatc
                 self.weights[int(name.split(".")[5])].copy_(value.T)
 
     monkeypatch.setattr(delta_loader, "sparse_loader_identity", lambda m: (Matrix.load_weights,))
-    for inline in (False, True):
+    for encoding in ("documents", "inline", "ipc"):
+        inline = encoding != "documents"
         models = [Matrix() for _ in range(4)]
         proxy = WeightSyncProxy(None)
         assert proxy._inline_frame_directory is False
         proxy._inline_frame_directory = inline
+        if encoding == "ipc":
+            fits = proxy._fits_ipc
+            monkeypatch.setattr(proxy, "_fits_ipc", lambda ctl: "metadata_zlib" not in ctl and fits(ctl))
         proxy.children = [None] * 4
         proxy.identities = [dict(uuid=f"cpu-{tp}") for tp in range(4)]
         events = []
@@ -163,7 +167,8 @@ def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatc
                 items = native_serializer.deserialize(serialization)
                 ctl = json.loads(items[0][0])
                 if ctl["op"] == "consume":
-                    assert ("metadata_zlib" in ctl) is inline
+                    assert ("metadata_zlib" in ctl) == (encoding == "inline")
+                    assert ("metadata_ipc" in ctl) == (encoding == "ipc")
                     assert torch.equal(items[0][1], raw)
                 delta_loader.load_delta_weights(m, items)
             events.append(ctl["op"])
@@ -171,10 +176,11 @@ def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatc
         def commands(cmds, *, deadline):
             first = cmds[0]
             if first["op"] == "export":
-                statuses[:] = [torch.full((c["count"],), 99, dtype=torch.uint8) for c in cmds]
+                acks = [wire._status_buffer(c["count"], c.get("directory_tail", b""), "cpu") for c in cmds]
+                statuses[:] = [ack[: c["count"]].fill_(99) for ack, c in zip(acks, cmds, strict=True)]
                 events.append("export")
                 return [
-                    dict(serialized=wire._serialize(c["control"], raw, s)) for c, s in zip(cmds, statuses, strict=True)
+                    dict(serialized=wire._serialize(c["control"], raw, ack)) for c, ack in zip(cmds, acks, strict=True)
                 ]
             if first["op"] == "status":
                 events.append("status")
@@ -208,6 +214,9 @@ def test_inline_roundtrip_uses_existing_loader_ipc_status_and_version(monkeypatc
             assert proxy.consume(0, metadata, timeout=30) == dict(success=True, full_required=[])
             assert events[-4:] == ["export", "consume", "status", "release"]
             assert bool(events.count("document")) is (not inline)
+            if encoding == "ipc":
+                assert proxy.metrics["ipc_directory_frames"] == 1 and proxy.metrics["update_directory_calls"] == 0
+                assert proxy.metrics["ipc_directory_bytes"] > 0
             assert not proxy.finalize(version, timeout=30)["force_full_seed"]
             for model in models:
                 assert model._relax_delta_receiver.version == version

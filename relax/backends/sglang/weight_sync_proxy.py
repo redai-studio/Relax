@@ -22,7 +22,7 @@ from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, validate_directo
 from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup, remaining
 
 from .delta_loader import LOADER as PROXY_MEMORY_LOADER
-from .delta_loader import MAX_DOCUMENT_BYTES, MAX_HTTP_BYTES
+from .delta_loader import MAX_DOCUMENT_BYTES, MAX_HTTP_BYTES, workspace_bytes
 from .delta_shard_layout import ShardFrame, marked_ordinals
 
 
@@ -81,6 +81,15 @@ def _serialize(control: dict, tensor: Any = None, status: Any = None) -> str:
     if status is not None:
         weights.append(("__delta_capability__", status))
     return MultiprocessingSerializer.serialize(weights, output_str=True)
+
+
+def _status_buffer(count: int, tail: bytes, device: Any) -> Any:
+    import torch
+
+    ack = torch.empty(count + len(tail), dtype=torch.uint8, device=device)
+    if tail:
+        ack[count:].copy_(torch.frombuffer(bytearray(tail), dtype=torch.uint8))
+    return ack
 
 
 class _EmptyControlTensor:
@@ -286,11 +295,14 @@ def _child(connection: Connection) -> None:
                         for key in range(command["round"], command["stop"]):
                             buffers[key]["exported"] = True
                     item["exported"] = True
-                    item["status"] = torch.empty(command["count"], dtype=torch.uint8, device=device)
+                    ack = _status_buffer(command["count"], command.get("directory_tail", b""), device)
+                    # The prefix view also keeps the immutable directory allocation
+                    # alive until the worker's original consume/release fence.
+                    item["status"] = ack[: command["count"]]
                     if command.get("sentinel"):
                         item["status"].fill_(255)
-                    result = dict(success=True, serialized=_serialize(command["control"], slab, item["status"]))
-                    del item, slab
+                    result = dict(success=True, serialized=_serialize(command["control"], slab, ack))
+                    del item, slab, ack
                 elif op == "status":
                     item = buffers[command["round"]]
                     result = dict(success=True, full_required=item["status"].cpu().tolist())
@@ -360,6 +372,7 @@ class WeightSyncProxy:
     def __init__(self, engine: Any) -> None:
         self.engine = engine
         self._inline_frame_directory = False
+        self._workspace_budget = 0
         self._ordered_capable = self._record_seed = False
         self._seed_directory: dict[str, tuple] = {}
         self._target_requested = self._target_capable = self._target_failed = False
@@ -515,9 +528,13 @@ class WeightSyncProxy:
             if width == 1:
                 raise ValueError("One proxy control fragment cannot fit the whole-engine HTTP budget")
             width = max(1, width // 2)
+        before = self.metrics.get("http_s", 0.0)
         for part in parts:
             self._controls([part] * tp_size, deadline=deadline)
             self.metrics["update_directory_calls"] += 1
+        self.metrics["update_directory_http_s"] = self.metrics.get("update_directory_http_s", 0.0) + (
+            self.metrics.get("http_s", 0.0) - before
+        )
 
     def _fits_ipc(self, control: dict) -> bool:
         preview = self._payload([_serialize(control, _CudaWireSize(), _CudaWireSize()) for _ in self.children])
@@ -528,7 +545,15 @@ class WeightSyncProxy:
             raise RuntimeError("Target shard publication has an ambiguous outcome")
         deadline = time.monotonic() + timeout
         self.metrics = dict(
-            http_calls=0, control_bytes=0, http_s=0.0, schema_calls=0, update_directory_calls=0, consume_calls=0
+            http_calls=0,
+            control_bytes=0,
+            http_s=0.0,
+            schema_calls=0,
+            update_directory_calls=0,
+            update_directory_http_s=0.0,
+            consume_calls=0,
+            consume_http_s=0.0,
+            consume_ack_s=0.0,
         )
         self.batch = 0
         self.version = control["version"]
@@ -562,11 +587,30 @@ class WeightSyncProxy:
                 candidate = dict(control, metadata_zlib=dict(bytes=len(data), data=compressed))
                 if self._fits_ipc(candidate):
                     control, inline = candidate, True
-        if not inline:
+        tail = b""
+        if not inline and self._inline_frame_directory and not self._target_requested:
+            compressed = zlib.compress(data, level=1)
+            count = len(metadata["tensors"])
+            allocation = ((count + len(compressed) + 511) // 512) * 512
+            candidate = dict(control, metadata_ipc=[count, len(compressed), len(data)])
+            if len(compressed) <= len(data) and allocation <= self._workspace_budget and self._fits_ipc(candidate):
+                # Keep the document fallback when this extra allocation would
+                # crowd out the ordinary loader. Direct sparse runs may need
+                # one tile table in addition to the current loader group.
+                entries = metadata["tensors"]
+                ends = metadata.get("loader_ends", [count])
+                decode = max(
+                    workspace_bytes({"tensors": entries[start:end]})
+                    for start, end in zip([0, *ends[:-1]], ends, strict=True)
+                )
+                tiles = ShardFrame.ordered_workspace([(0, e["count"]) for e in entries if not e["full"]])
+                if allocation + decode + tiles <= self._workspace_budget:
+                    control, tail = candidate, compressed
+        if not inline and not tail:
             if not self._fits_ipc(control):
                 raise ValueError("One GPU bucket IPC control exceeds its HTTP budget")
             self._send_frame_directory(data, identity, deadline=deadline)
-        return [control] * len(self.children), inline
+        return [control] * len(self.children), inline, tail
 
     def _validate_lanes(self, lanes: list[dict]) -> None:
         if not self._target_requested or not self._target_capable or len(lanes) != 4 or len(self.children) != 4:
@@ -780,13 +824,14 @@ class WeightSyncProxy:
     def _consume(self, round_id: int, metadata: dict | list[dict], deadline: float, lanes: bool) -> dict:
         if round_id != self.batch:
             raise ValueError("Unexpected logical round")
+        tail = b""
         if lanes:
             controls, inline = self._lane_controls(metadata, deadline)
             directory = metadata[0]
         else:
             if "target_shard" in metadata:
                 raise ValueError("Partial target mapping requires four ordered lanes")
-            controls, inline = self._shared_controls(metadata, deadline)
+            controls, inline, tail = self._shared_controls(metadata, deadline)
             directory = metadata
         replies = self._commands(
             [
@@ -796,14 +841,20 @@ class WeightSyncProxy:
                     control=c,
                     count=len(directory["tensors"]),
                     **({"sentinel": True} if lanes else {}),
+                    **({"directory_tail": tail} if tail else {}),
                 )
                 for c in controls
             ],
             deadline=deadline,
         )
+        before = self.metrics.get("http_s", 0.0)
         self._request(
             "update_weights_from_tensor", self._payload([item["serialized"] for item in replies]), deadline=deadline
         )
+        self.metrics["consume_http_s"] = (
+            self.metrics.get("consume_http_s", 0.0) + self.metrics.get("http_s", 0.0) - before
+        )
+        ack_started = time.monotonic()
         statuses = self._commands([dict(op="status", round=round_id)] * len(self.children), deadline=deadline)
         if lanes:
             marked = set(directory["target_shard"]["entries"])
@@ -814,6 +865,7 @@ class WeightSyncProxy:
             ):
                 raise RuntimeError("Missing or invalid target shard install acknowledgement")
         self._commands([dict(op="release", round=round_id, consumed=True)] * len(self.children), deadline=deadline)
+        self.metrics["consume_ack_s"] = self.metrics.get("consume_ack_s", 0.0) + (time.monotonic() - ack_started)
         if lanes:
             self._record_target_frame(metadata)
         elif self._record_seed:
@@ -821,7 +873,13 @@ class WeightSyncProxy:
                 self._seed_directory[e["name"]] = (len(self._seed_directory), tuple(e["shape"]), e["dtype"])
         self.metrics["consume_calls"] += 1
         if self._inline_frame_directory or lanes:
-            metric = "inline_directory_frames" if inline else "inline_directory_fallback_frames"
+            metric = (
+                "ipc_directory_frames"
+                if tail
+                else ("inline_directory_frames" if inline else "inline_directory_fallback_frames")
+            )
+            if tail:
+                self.metrics["ipc_directory_bytes"] = self.metrics.get("ipc_directory_bytes", 0) + len(tail)
             self.metrics[metric] = self.metrics.get(metric, 0) + 1
         self.batch += 1
         names = [entry["name"] for entry in directory["tensors"]]
