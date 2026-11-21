@@ -5,6 +5,7 @@ import copy
 import pickle
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import numpy as np
 import pybase64
@@ -109,16 +110,31 @@ class _Session:
 
 
 @pytest.mark.asyncio
-async def test_plain_image_opd_uses_collapsed_ids_raw_images_and_expanded_offset(processor_state):
+@pytest.mark.parametrize("shared", [False, True])
+async def test_plain_image_opd_uses_collapsed_ids_raw_images_and_expanded_offset(processor_state, shared):
     sample = _sample()
-    session = _Session(_response(sample.tokens))
-    assert await _manager()._teacher_prefill(sample, session)
-    payload = session.requests[0][1]
+    sample.loss_mask = [0, 1]
+    response = _response(sample.tokens)
+    if shared:
+        score = AsyncMock(return_value=response)
+        manager = _manager(
+            opd_teacher_delta_dir="bank",
+            _opd_shared_teacher_manager=SimpleNamespace(score=SimpleNamespace(remote=score)),
+        )
+        sample.metadata["teacher_id"] = "image"
+        assert await manager._teacher_prefill(sample, None)
+        route, payload = score.await_args.args
+        assert route == "image"
+    else:
+        session = _Session(response)
+        assert await _manager()._teacher_prefill(sample, session)
+        payload = session.requests[0][1]
     assert payload["input_ids"] == sample.rollout_tokens
     assert payload["image_data"] == ["student-image"]
     assert payload["logprob_start_len"] == 4
     assert payload["return_prompt_token_ids"] is True
     assert sample.teacher_log_probs == pytest.approx([-0.2, -0.3])
+    assert sample.loss_mask == [0, 1]
 
 
 @pytest.mark.asyncio
@@ -132,11 +148,15 @@ async def test_image_teacher_prefix_uses_collapsed_prompt_boundary(processor_sta
 
 
 @pytest.mark.asyncio
-async def test_image_teacher_rejects_same_length_retokenization_before_assigning_logprobs(processor_state):
+@pytest.mark.parametrize("shared", [False, True])
+async def test_image_teacher_rejects_same_length_retokenization_before_assigning_logprobs(processor_state, shared):
     sample = _sample()
-    session = _Session(_response(sample.tokens[:-2] + [12, 13]))
+    result = _response(sample.tokens[:-2] + [12, 13])
+    handle = SimpleNamespace(score=SimpleNamespace(remote=AsyncMock(return_value=result)))
+    manager = _manager(opd_teacher_delta_dir="bank" if shared else None, _opd_shared_teacher_manager=handle)
+    sample.metadata = {"teacher_id": "A"}
     with pytest.raises(ValueError, match="expanded input IDs differ"):
-        await _manager()._teacher_prefill(sample, session)
+        await manager._teacher_prefill(sample, None if shared else _Session(result))
     assert sample.teacher_log_probs is None
 
 
