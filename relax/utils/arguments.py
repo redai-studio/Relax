@@ -1630,6 +1630,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # mbs for the training, will be ignored if `use_dynamic_batch_size` is set.
             reset_arg(parser, "--micro-batch-size", type=int, default=1)
             parser.add_argument(
+                "--flops-scheduling",
+                choices=("off", "microbatch", "dp", "both"),
+                default="off",
+                help="Use Relax theoretical training FLOPs for dynamic microbatches, DP placement, or both. "
+                "Default off preserves legacy scheduling. Enabled modes currently require synchronous "
+                "non-MTP text Qwen3.5 Megatron training without LoRA/freezing/prepack/Wholepack.",
+            )
+            parser.add_argument(
+                "--flops-scheduling-order",
+                choices=("dp-first", "pack-first"),
+                default="dp-first",
+                help="Scheduling order. pack-first requires both and synchronous text SFT or Balanced RL; "
+                "default dp-first preserves the existing four modes.",
+            )
+            parser.add_argument(
                 "--balance-data",
                 action="store_true",
                 default=False,
@@ -4140,6 +4155,12 @@ def _validate_ref_load(args: argparse.Namespace) -> None:
         )
 
 
+def slime_validate_args(args):
+    if (
+        getattr(args, "flops_scheduling_order", "dp-first") == "pack-first"
+        and getattr(args, "flops_scheduling", "off") != "both"
+    ):
+        raise ValueError("--flops-scheduling-order=pack-first requires --flops-scheduling=both")
 def _configure_rollout_only_gpus(args: argparse.Namespace) -> None:
     if is_managed_opd_teacher_colocate(args):
         # The configured rollout/teacher split also applies without a training actor.

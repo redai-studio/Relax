@@ -1,0 +1,53 @@
+{
+  "relax": {
+    "sha": "3673d7eb566f2fd05dbf0e450ae4746a0d7758f8",
+    "branch": "feat/flops-aware-scheduling",
+    "tracked_modifications_before_p1": false,
+    "preexisting_untracked": [
+      "Readme/",
+      "docs/codepath_audit.md",
+      "docs/hardware_matrix.md",
+      "docs/spark_hardware_audit.md",
+      "scripts/benchmarks/flops_scheduler/"
+    ]
+  },
+  "slime": {
+    "repository": "https://github.com/THUDM/slime",
+    "pull_request": 2017,
+    "merge_sha": "71c2679b1a87dc06c591a446b09561c425f74f38",
+    "head_sha": "053bdfcebb9733373cc4fc70d6c1e011fa3ee216",
+    "merged_at": "2026-06-06T15:01:38Z"
+  },
+  "transfer_queue": {
+    "sha": "9784ad0d8a5f0db93ff8326379ab2a6d06e640a0",
+    "patch": "docker/patch/transferqueue/9784ad0-assignment-transform.patch",
+    "scope": "Sampler source-only algorithm boundary, not an installed TransferQueue service",
+    "patched_sha256": "dc8025222da02a350cb8142c6a4d2c0fb41df1a4d225bdc3d0882c3b536cb6a2"
+  },
+  "sha256": {
+    "relax/core/controller.py": "4ca6af44d6709bd8b5d7faf726265c4f8c7d5793a99a69ed6d343e0061f4479f",
+    "relax/utils/data/identity_window_sampler.py": "961ce845163982825dbb9cf868ecf4a9576338b8038e7db913e220d9e558d911",
+    "relax/utils/data/seqlen_balancing.py": "58713e29b9d45855195b640fab4c79e07cf9a9614a6004b40e01620f26f17c1f",
+    "relax/utils/data/data.py": "b2aba0ea5ac1b87a6c7ceb807b059aedb31164dece2d5fcaa0db9badc4b2c974",
+    "relax/utils/data/packing.py": "c46ecfd0eebed2f8cd40619e23b6f07e79ae11eecec13d44a3174ba96a4ad414",
+    "relax/utils/data/wholepack.py": "b5676767d66d2a0db3030361da60f92a75706c0255d9cc7d691062d2cd2dfeef",
+    "relax/utils/data/wholepack_policy.py": "0f9dc88da7b8b8c3998d2b1699395a06b9f3f17a1b8d962225b996f9a67dde5b",
+    "relax/backends/megatron/data.py": "2798cfde6a905d64bda77f7f7a83f6415a5347d9e3481769e051cdd28569d773",
+    "relax/backends/megatron/actor.py": "c877b727e5006a5ad86cc05d46ce886707353befe3a501579d816d3ba6b1b95a",
+    "docker/patch/transferqueue/9784ad0-assignment-transform.patch": "9307bfb95629d74d9a1a38b81f207353276f0171ad09b4f45766067231d4b752",
+    "tests/no16/reference/slime_2017/dp_schedule.py.txt": "2b8340c7e590528a5f690c65a24c23b00fb895f9b8bbbf27ada0e05cf41dc219",
+    "tests/no16/reference/slime_2017/flops_utils.py.txt": "a4fac22109731915369084f1654ffc73708d4b01765d094a9c6581fb8a54fd6a",
+    "tests/no16/reference/slime_2017/LICENSE.txt": "7090a09a59cf55701feb04b2d4f99ce31fc4f31bbe1aaf33dd0dafd8e7546313",
+    "tests/no16/reference/slime_2017/seqlen_balancing.py.txt": "3ecfb2ec447a94de5012c2e4ac9432bda9b103195abdd1ab802e05a78c092cfe",
+    "tests/no16/reference/transfer_queue/base.py.txt": "035b573a113544d2552b6f9ed57fafca467a3487c3a18ffc129a4d5a4cdf8bd2",
+    "tests/no16/reference/transfer_queue/grpo_group_n_sampler.py.txt": "973792a5289064ce0b51e601654961af377628bcca5c75c14e78524b3a9d7506",
+    "tests/no16/reference/transfer_queue/LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "tests/no16/reference/transfer_queue/seqlen_balanced_sampler.py.txt": "dc6c2db50df4b9448d4845ccacef67a400517db892b5cd55de2e22f6baf6888b",
+    "tests/no16/reference/transfer_queue/streaming_token_budget_sampler.py.txt": "fab68c5a1f107839faca9fdc396ca0c50f77a855353e3510bb4e3dddbb895239"
+  },
+  "license_upstream_sha256": {
+    "tests/no16/reference/slime_2017/LICENSE.txt": "bf917707c1e0ffdfe653d63aebc188a48f738f3faad9acc188c346d3618694af",
+    "tests/no16/reference/transfer_queue/LICENSE.txt": "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd"
+  },
+  "license_artifact_normalization": "A single terminal LF is appended to each upstream LICENSE, as required by repository hooks; removing it reproduces the recorded upstream byte hash. Source .py.txt files are unchanged."
+}
