@@ -18,6 +18,19 @@ from relax.distributed.checkpoint_service.backends.shard_p2p.plan import fingerp
 from .bridge_converter import _normalize_global_name
 
 
+def observe_native_specs(specs: dict, values) -> None:
+    """Keep only scalar ordinary HF shapes from a completed native export."""
+    for name, tensor in values:
+        if ".experts." in name or name.startswith("relax.expert_slice.v1:"):
+            del tensor
+            continue
+        spec = dict(shape=list(tensor.shape), dtype=str(tensor.dtype))
+        del tensor
+        if name in specs and specs[name] != spec:
+            raise ValueError("Native HF schema changed during TP seed")
+        specs[name] = spec
+
+
 def _gdn_regions(name: str, parameter: torch.Tensor, task, tp_rank: int, tp_size: int) -> list[dict] | None:
     if type(task.mapping).__name__ != "GDNLinearMappingSeparate":
         return None
@@ -251,11 +264,7 @@ class OrdinaryTPSource:
         self._recipes = {}
 
     def observe_native(self, values) -> None:
-        for name, tensor in values:
-            spec = dict(shape=list(tensor.shape), dtype=str(tensor.dtype))
-            if name in self.native_specs and self.native_specs[name] != spec:
-                raise ValueError("Native HF schema changed during TP seed")
-            self.native_specs[name] = spec
+        observe_native_specs(self.native_specs, values)
 
     def _views(self, weights: Mapping[str, torch.Tensor], *, selected_only: bool) -> tuple[dict, list, dict]:
         converter = self.iterator._bridge_converter
@@ -299,6 +308,33 @@ class OrdinaryTPSource:
 
     def catalogue(self, weights: Mapping[str, torch.Tensor]) -> dict:
         tensors, regions, groups = self._views(weights, selected_only=False)
+        full_regions = regions
+        parts = []
+        for region in regions:
+            if (
+                region["offset"][1] == 0
+                and region["shape"][1] == region["global_shape"][1]
+                and getattr(tensors[region["source"]], "partition_dim", None) == 0
+            ):
+                # DP/CP replicas own identical weights. Share complete rows
+                # without copying storage or changing native conversion.
+                rows = region["shape"][0]
+                begin = rows * self.replica_rank // len(self.replica_ranks)
+                end = rows * (self.replica_rank + 1) // len(self.replica_ranks)
+                if begin == end:
+                    continue
+                region = {
+                    **region,
+                    "offset": [region["offset"][0] + begin, 0],
+                    "shape": [end - begin, region["shape"][1]],
+                    "storage_offset": region["storage_offset"] + begin * region["stride"],
+                }
+            elif self.replica_rank != 0:
+                # Keep full-height column shards for replica reconstruction.
+                continue
+            parts.append(region)
+        # Keep every qualified replica as an address-free candidate. The shared
+        # geometry still uses the original disjoint DP/CP partitions below.
         self._recipes = {
             name: dict(
                 key=self.iterator._vanilla_key_map[name],
@@ -308,23 +344,30 @@ class OrdinaryTPSource:
                 stride=tuple(value.stride()),
                 offset=value.storage_offset(),
                 nbytes=value.untyped_storage().nbytes(),
-                regions=[dict(region) for region in regions if region["source"] == name],
+                regions=[dict(region) for region in full_regions if region["source"] == name],
                 group=tuple(groups[name]),
             )
             for name, value in tensors.items()
         }
-        if self.replica_rank != 0:
-            tensors, regions, groups = {}, [], {}
         _, views = group_storage_views(tensors)
         self._catalogue_slots = {name: item["source"] for name, item in views.items()}
-        for region in regions:
-            region["source"] = "ordinary:" + views[region["source"]]["source"]
+        replicas = [
+            dict(
+                region,
+                source="ordinary:" + views[region["source"]]["source"],
+                group=groups[region["source"]],
+                capacity=tensors[region["source"]].untyped_storage().nbytes(),
+            )
+            for region in full_regions
+        ]
+        regions = [dict(region, source="ordinary:" + views[region["source"]]["source"]) for region in parts]
         return dict(
             rank=self.rank,
             global_rank=dist.get_global_rank(self.group, self.rank),
             replica_ranks=list(self.replica_ranks),
             replica_rank=self.replica_rank,
             regions=regions,
+            replica_regions=replicas,
             groups=groups,
             native_specs=self.native_specs,
         )
@@ -348,8 +391,6 @@ class OrdinaryTPSource:
             tensors[name] = value
             regions.extend(recipe["regions"])
             groups[name] = recipe["group"]
-        if self.replica_rank != 0:
-            tensors, groups = {}, {}
         sources, views = group_storage_views(tensors)
         slots = {}
         for name, view in views.items():
@@ -382,3 +423,75 @@ class OrdinaryTPSource:
         if len(set(slots.values())) != len(slots):
             raise ValueError("Ordinary TP source storage aliasing split")
         return {"ordinary:" + slots[key]: value for key, value in sources.items()}
+
+
+def local_replica_writes(records: list[dict], writes: list[dict], endpoints: list[dict], receiver: dict) -> list[dict]:
+    """Choose proven ordinary DP/CP equivalents on the receiver's host.
+
+    Preserve canonical rectangles and native dependency groups. Source storage
+    slots and offsets belong to each actual owner, including fused HF views.
+    """
+    by_global = {record["global_rank"]: record for record in records}
+    regions = [{} for _ in records]
+    for record, index in zip(records, regions, strict=True):
+        for region in record["replica_regions"]:
+            index.setdefault(region["hf"], []).append(region)
+    preferred = next(
+        (
+            record["replica_rank"]
+            for record, endpoint in zip(records, endpoints, strict=True)
+            if endpoint["boot_id"] == receiver["boot_id"] and endpoint["gpu_uuid"] == receiver["gpu_uuid"]
+        ),
+        0,
+    )
+    result = []
+    equivalence = ("hf", "global_shape", "offset", "shape", "stride", "dtype", "itemsize", "group")
+
+    def contains(region: dict, write: dict) -> bool:
+        itemsize = region["itemsize"]
+        stride = region["stride"] * itemsize
+        width = region["shape"][1] * itemsize
+        begin = region["storage_offset"] * itemsize
+        end = begin + (region["shape"][0] - 1) * stride + width
+        if (
+            write["src_offset"] < begin
+            or write["src_offset"] + (write["rows"] - 1) * write["src_stride"] + write["row_bytes"] > end
+        ):
+            return False
+        if stride == width:
+            return True
+        _, column = divmod(write["src_offset"] - begin, stride)
+        return (write["rows"] == 1 or write["src_stride"] == stride) and column + write["row_bytes"] <= width
+
+    for write in writes:
+        owner = records[write["source_rank"]]
+        originals = [
+            region
+            for region in regions[owner["rank"]].get(write.get("hf"), ())
+            if region["source"] == write["source"] and contains(region, write)
+        ]
+        original = originals[0] if len(originals) == 1 else None
+        candidates = []
+        if original is not None:
+            for rank in owner["replica_ranks"]:
+                peer = by_global[rank]
+                if endpoints[peer["rank"]]["boot_id"] != receiver["boot_id"]:
+                    continue
+                matches = [
+                    region
+                    for region in regions[peer["rank"]].get(write.get("hf"), ())
+                    if all(region[key] == original[key] for key in equivalence)
+                ]
+                if len(matches) == 1:
+                    candidates.append((peer, matches[0]))
+        if candidates:
+            peer, region = candidates[(owner["replica_rank"] + preferred) % len(candidates)]
+            offset = write["src_offset"] + (region["storage_offset"] - original["storage_offset"]) * region["itemsize"]
+            if (
+                offset < 0
+                or offset + (write["rows"] - 1) * write["src_stride"] + write["row_bytes"] > region["capacity"]
+            ):
+                raise ValueError("Local ordinary replica exceeds its actual storage")
+            write = dict(write, source_rank=peer["rank"], source=region["source"], src_offset=offset)
+        result.append(write)
+    return result

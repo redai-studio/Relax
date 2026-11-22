@@ -78,6 +78,16 @@ def test_delivery_does_not_recoalesce_finalized_write_ids():
     )
     assert binding["delivery"]["routes"]["cuda_ipc"] == [write["id"] for write in finalized]
     assert not binding["delivery"]["routes"]["nixl"]
+    remote = dict(endpoint, boot_id="00000000-0000-0000-0000-000000000001")
+    mixed = bind_delivery(
+        finalized,
+        geometry,
+        [dict(rank=0, endpoint=remote)],
+        endpoint,
+        layouts={name: dict(nbytes=prod(shape) * 2) for name, shape in expert_shapes(geometry).items()},
+    )
+    assert mixed["delivery"]["routes"]["nixl"] == [write["id"] for write in finalized]
+    assert not mixed["delivery"]["routes"]["cuda_ipc"]
 
 
 @pytest.mark.parametrize("separate", [False, True])

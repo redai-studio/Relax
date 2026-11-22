@@ -642,6 +642,43 @@ class MegatronTrainRayActor(TrainRayActor):
                             except (AttributeError, TypeError, ValueError) as error:
                                 reason = f"Unsupported offloader capability: {error}"
                         self.weight_updater.actor_weight_retention_fallback_reason = reason
+                    if self.weight_updater.shard_p2p_requested:
+                        ready = torch.tensor(
+                            [int(reason is None and not Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK)],
+                            dtype=torch.int32,
+                            device="cpu",
+                        )
+                        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=get_gloo_group())
+                        if ready.item():
+                            from .weight_update.utils import run_with_distributed_error_check
+
+                            group = get_gloo_group()
+                            weights = run_with_distributed_error_check(
+                                lambda: dict(
+                                    named_params_and_buffers(
+                                        self.args,
+                                        self.model,
+                                        convert_to_global_name=False,
+                                        include_persistent_buffers=True,
+                                    )
+                                ),
+                                group,
+                            )
+                            can_release = run_with_distributed_error_check(
+                                lambda: (
+                                    self._per_step_rollout
+                                    and not push_quant_config
+                                    and self._train_state_offloader.can_release_initial_gradients(weights)
+                                ),
+                                group,
+                            )
+                            ready.fill_(int(can_release))
+                            dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=group)
+                            if ready.item():
+                                run_with_distributed_error_check(
+                                    self._train_state_offloader.release_initial_gradients, group
+                                )
+                            self.weight_updater._prime_initial_native_specs(weights)
         elif not skip_weight_management:
             self.checkpoint_engine_client = self._create_checkpoint_engine_client(role)
         else:
@@ -1521,6 +1558,35 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train and self._per_step_rollout:
             self.wake_up()
+
+        updater = getattr(self, "weight_updater", None)
+        if (
+            self.role == "actor"
+            and self.args.colocate
+            and getattr(self.args, "use_shard_p2p_weight_sync", False)
+            and getattr(updater, "weight_version", 0) == 1
+            and hasattr(updater, "prefetch_cold_plan")
+        ):
+            updater.prefetch_cold_plan(
+                dict(
+                    named_params_and_buffers(
+                        self.args, self.model, convert_to_global_name=False, include_persistent_buffers=True
+                    )
+                )
+            )
+
+        if (
+            self.role == "actor"
+            and self.args.colocate
+            and getattr(self.args, "use_shard_p2p_weight_sync", False)
+            and not getattr(self, "_cpu_gradient_allocator_warm", False)
+        ):
+            from .weight_update.train_offload import warm_cpu_gradient_allocator
+
+            # Earlier sleep() calls clear the host cache. Prepare once in the
+            # real training window, before PP stages diverge in their first step.
+            warm_cpu_gradient_allocator(self.optimizer)
+            self._cpu_gradient_allocator_warm = True
 
         if self.args.debug_train_only:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for debug with mcore.")
@@ -3137,9 +3203,9 @@ class MegatronTrainRayActor(TrainRayActor):
             return
         self._flush_resident_sft_parameters()
         retain_actor_weights = getattr(self, "_actor_weights_pending_sync", False)
-        if retain_actor_weights:
-            from .weight_update.utils import run_rank0_rpc_calls, run_with_distributed_error_check
+        from .weight_update.utils import run_rank0_rpc_calls, run_with_distributed_error_check
 
+        def retain_source(initial_snapshot=None):
             def prepare_actor_weights_for_sync():
                 if self._active_model_tag != "actor" or set(self.weights_backuper.backup_tags) != {"actor"}:
                     raise RuntimeError("Source weight sync requires the live actor version")
@@ -3151,8 +3217,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Finish optimizer/parameter-gather writes before the CPU backup
                 # and weight sender read the same GPU parameters.
                 device_module.synchronize()
+                options = {} if initial_snapshot is None else dict(initial_snapshot=initial_snapshot)
                 backup_done = self._train_state_offloader.begin_weight_sync(
-                    weights, overlap=Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
+                    weights, overlap=Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP, **options
                 )
                 return weights, backup_done
 
@@ -3161,6 +3228,19 @@ class MegatronTrainRayActor(TrainRayActor):
             # copying on another stream when overlap is enabled.
             self.weight_updater.weights_getter = lambda: weights
             self.weight_updater.actor_weight_retention_active = True
+
+            def release_actor_weights_after_sync():
+                snapshot = self._train_state_offloader.finish_weight_sync()
+                self.weights_backuper.reuse_actor_cpu_backup(snapshot)
+                self.weight_updater.weights_getter = lambda: self.weights_backuper.get("actor")
+                self._actor_weights_pending_sync = False
+
+            self.weight_updater._release_source = lambda: run_with_distributed_error_check(
+                release_actor_weights_after_sync, get_gloo_group()
+            )
+            return backup_done
+
+        backup_done = retain_source() if retain_actor_weights else None
 
         if getattr(self, "_use_dcs_hybrid_weight_sync", False):
             if self.args.offload_train:
@@ -3187,9 +3267,32 @@ class MegatronTrainRayActor(TrainRayActor):
             # offloads optimizer state. This avoids allocation races across ranks.
             dist.barrier(group=get_gloo_group())
 
+        from relax.backends.sglang.sglang_engine import _sglang_has_weight_update_session
+
+        updater = self.weight_updater
+        prepare_before_onload = bool(
+            updater.weight_version == 0
+            and self.args.offload_train
+            and self.args.offload_rollout
+            and getattr(updater, "_initial_native_tp_specs", None) is not None
+            and not Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK
+            and Envs.RELAX_COLOCATE_PINNED_NIXL_TARGET
+            and not _sglang_has_weight_update_session()
+        )
+        if prepare_before_onload and self.args.use_fault_tolerance:
+            rollout_id = [None]
+
+            def read_rollout_id():
+                if dist.get_rank(get_gloo_group()) == 0:
+                    rollout_id[0] = ray.get(self.rollout_manager.get_rollout_id.remote())
+
+            run_with_distributed_error_check(read_rollout_id, get_gloo_group())
+            dist.broadcast_object_list(rollout_id, src=0, group=get_gloo_group())
+            # Recovery may have already resumed replacement engines' weights.
+            prepare_before_onload = type(rollout_id[0]) is int and rollout_id[0] == -1
         if retain_actor_weights:
             run_rank0_rpc_calls([self.rollout_manager.onload_weights.remote], get_gloo_group())
-        elif self.args.offload_rollout:
+        elif self.args.offload_rollout and not prepare_before_onload:
             # Onload rollout weights. genRM (no NCCL weight sync — the reward
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
@@ -3238,22 +3341,80 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
+        if (
+            updater.weight_version == 0
+            and getattr(updater, "actor_weight_retention_enabled", False)
+            and getattr(updater, "_colocate_tp_ipc_enabled", False)
+        ):
+            snapshot, weights = run_with_distributed_error_check(
+                lambda: (
+                    self.weights_backuper.get("actor"),
+                    dict(
+                        named_params_and_buffers(
+                            self.args, self.model, convert_to_global_name=False, include_persistent_buffers=True
+                        )
+                    ),
+                ),
+                get_gloo_group(),
+            )
+            supported = run_with_distributed_error_check(
+                lambda: (
+                    not Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK
+                    and getattr(updater, "_initial_native_tp_specs", None) is not None
+                    and self._train_state_offloader.initial_weight_sync_supported(weights, snapshot)
+                ),
+                get_gloo_group(),
+            )
+            ready = torch.tensor([int(supported)], dtype=torch.int32, device="cpu")
+            dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=get_gloo_group())
+            if ready.item():
+                self.weights_backuper.mark_actor_backup_pending()
+                self._actor_weights_pending_sync = retain_actor_weights = True
+                try:
+                    backup_done = retain_source(snapshot)
+                except Exception:
+                    # Preparation failed collectively, before seed or any send.
+                    # A peer may already have restored its source successfully.
+                    def undo_initial_restore():
+                        self._train_state_offloader.abort_initial_weight_sync()
+                        self.weights_backuper.reuse_actor_cpu_backup(snapshot)
+                        self._actor_weights_pending_sync = False
+                        updater.actor_weight_retention_active = False
+                        updater._release_source = None
+                        updater.weights_getter = lambda: self.weights_backuper.get("actor")
+
+                    run_with_distributed_error_check(undo_initial_restore, get_gloo_group())
+                    raise
+
+        if prepare_before_onload:
+            try:
+                if retain_actor_weights:
+                    updater._prepare_initial_colocate()
+                # Seed holds scalar layouts and starts the exact CPU arena;
+                # bind/apply revalidate the allocations after weights resume.
+                run_with_distributed_error_check(self._onload_rollout_weights, get_gloo_group())
+            except Exception:
+                helper = getattr(updater, "_colocate_expert_ipc", None)
+                if helper is not None:
+                    helper.failed = True
+                # No normal source release or retry after an incomplete seed.
+                raise
+
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
-            if retain_actor_weights:
-                self.weight_updater.update_weights(backup_done=backup_done)
-
-                # Receiver ACKs cover CUDA completion and closing source mappings.
-                def release_actor_weights_after_sync():
-                    snapshot = self._train_state_offloader.finish_weight_sync()
-                    self.weights_backuper.reuse_actor_cpu_backup(snapshot)
-
-                run_with_distributed_error_check(release_actor_weights_after_sync, get_gloo_group())
-                self.weight_updater.weights_getter = lambda: self.weights_backuper.get("actor")
-                self.weight_updater.actor_weight_retention_active = False
-                self._actor_weights_pending_sync = False
-            else:
-                self.weight_updater.update_weights()
+            try:
+                if retain_actor_weights:
+                    self.weight_updater.update_weights(backup_done=backup_done)
+                    # Some consumers finish reading only when update_weights returns.
+                    release = self.weight_updater._release_source
+                    if release is not None:
+                        release()
+                    self.weight_updater.actor_weight_retention_active = False
+                else:
+                    self.weight_updater.update_weights()
+            finally:
+                if retain_actor_weights:
+                    self.weight_updater._release_source = None
             light_cleanup = retain_actor_weights and Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
             if light_cleanup:
                 # finish_weight_sync already frees parameters and empties the

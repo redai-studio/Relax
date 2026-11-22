@@ -85,6 +85,36 @@ class _Mxfp4OnlineQuantizer:
             raise ValueError(f"Invalid E8M0 scale output from quantizer: {scale.dtype} {tuple(scale.shape)}")
         return packed, scale
 
+    def compiled(self, weight: torch.Tensor, block_size: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse the reference arithmetic while preserving eager numerics."""
+        if (
+            weight.device.type != "cuda"
+            or weight.dtype != torch.bfloat16
+            or not weight.is_contiguous()
+            or weight.ndim != 2
+            or block_size != (1, 32)
+            or weight.shape[1] % 32
+            or not hasattr(torch, "compile")
+        ):
+            return self(weight, block_size)
+        from torch._inductor import config
+
+        numerics = getattr(config, "eager_numerics", None)
+        if not all(hasattr(numerics, option) for option in ("division_rounding", "disable_ftz")):
+            return self(weight, block_size)
+        if getattr(self, "_compiled", None) is None:
+            self._compiled = torch.compile(
+                self,
+                fullgraph=True,
+                dynamic=False,
+                options={
+                    "triton.cudagraphs": False,
+                    "eager_numerics.division_rounding": True,
+                    "eager_numerics.disable_ftz": True,
+                },
+            )
+        return self._compiled(weight, block_size)
+
 
 def _resolve_hf_name_against_checkpoint(hf_name: str, checkpoint_keys: Collection[str]) -> str:
     """Resolve a known bidirectional alias against the source checkpoint
@@ -209,9 +239,9 @@ class BridgeConverter:
         from relax.utils.megatron_bridge_utils import patch_megatron_model
 
         bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
-        export_filter_factory = getattr(bridge._model_bridge, "_make_weight_sync_export_filter", None)
-        if export_filter_factory is not None:
-            self._weight_sync_export_filter = export_filter_factory()
+        filter_factory = getattr(bridge._model_bridge, "_make_weight_sync_export_filter", None)
+        if filter_factory is not None:
+            self._weight_sync_export_filter = filter_factory()
         checkpoint_keys = _get_hf_checkpoint_keys(bridge)
         if checkpoint_keys is not None:
             self._hf_fp8_weight_names = frozenset(
@@ -446,6 +476,13 @@ class BridgeConverter:
         Keep MTP/tower experts on the ordinary path. Transposes and fused
         projections remain handled by convert(), including Qwen3.5 mappings.
         """
+        if (getattr(self, "_quantization_config", None) or {}).get("quant_method") == "fp8":
+            from ..sglang import should_deepgemm_weight_requant_ue8m0
+
+            if should_deepgemm_weight_requant_ue8m0 is None or should_deepgemm_weight_requant_ue8m0(
+                weight_block_size=self._quantization_config.get("weight_block_size", (128, 128))
+            ):
+                return False
         global_name = _normalize_global_name(name)
         source = re.search(r"\.experts\.linear_fc([12])\.weight(\d+)$", global_name)
         if source is None or re.search(r"(?:^|\.)(?:mtp\w*|nextn\w*|multi_token_prediction)(?:\.|$)", global_name):
@@ -464,6 +501,10 @@ class BridgeConverter:
                 projections.add("up")
             elif output.endswith(".experts.down_proj"):
                 output = output.removesuffix(".down_proj") + f".{expert}.down_proj.weight"
+            if (getattr(self, "_quantization_config", None) or {}).get(
+                "quant_method"
+            ) == "fp8" and output not in self._hf_fp8_weight_names:
+                return False
             coordinate = bf16_expert_projection(output)
             if coordinate is None or coordinate[0] != expert:
                 return False
@@ -550,7 +591,7 @@ class BridgeConverter:
         return quantize_params(self._args, name, [(hf_name, scale)], self._quantization_config)
 
     def _convert_mxfp4_expert(
-        self, global_name: str, name: str, param: torch.Tensor, task: Any, mapping: Any
+        self, global_name: str, name: str, param: torch.Tensor, task: Any, mapping: Any, *, compile_mxfp4: bool = False
     ) -> list[tuple[str, torch.Tensor]]:
         """Routed experts of an mxfp4-pack-quantized release (Kimi K3).
 
@@ -564,8 +605,9 @@ class BridgeConverter:
         """
         with self._disable_mapping_collectives(mapping):
             try:
+                quantizer = self._mxfp4_quantizer.compiled if compile_mxfp4 else self._mxfp4_quantizer
                 converted_dict = mapping.megatron_to_hf_quant(
-                    param, task.megatron_module, lambda _hf_name: True, self._mxfp4_quantizer, (1, 32)
+                    param, task.megatron_module, lambda _hf_name: True, quantizer, (1, 32)
                 )
             except Exception:
                 logger.error(
@@ -693,7 +735,9 @@ class BridgeConverter:
                     raise ValueError(f"Bridge does not describe the canonical expert ETP interval: {view.name}")
         return [(view.name, view.weight.detach()) for view in views]
 
-    def convert(self, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def convert(
+        self, name: str, param: torch.Tensor, *, compile_mxfp4: bool = False
+    ) -> list[tuple[str, torch.Tensor]]:
         """Convert a single TP/EP-gathered parameter to HF format.
 
         Args:
@@ -748,7 +792,7 @@ class BridgeConverter:
         mapping = task.mapping
 
         if self._mxfp4_pack_format and _is_mxfp4_routed_expert(mapping):
-            return self._convert_mxfp4_expert(global_name, name, param, task, mapping)
+            return self._convert_mxfp4_expert(global_name, name, param, task, mapping, compile_mxfp4=compile_mxfp4)
 
         with self._disable_mapping_collectives(mapping):
             param = remove_padding(name, param, self._args.vocab_size)

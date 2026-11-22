@@ -101,6 +101,28 @@ def torch_memory_saver_preloaded() -> bool:
     return "torch_memory_saver" in os.environ.get("LD_PRELOAD", "")
 
 
+def warm_cpu_gradient_allocator(optimizer) -> None:
+    """Prepare native HDO grad allocations without binding grads or state."""
+    if not _PIN_MEMORY:
+        return
+    from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    wrappers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else [optimizer]
+    # Hold the whole batch until return so equal-sized parameters get distinct
+    # cached allocations. Native HDO still creates and binds the real gradients.
+    buffers = [
+        torch.empty(param.shape, dtype=param.dtype, device="cpu", pin_memory=True)
+        for wrapper in wrappers
+        if isinstance(inner := getattr(wrapper, "optimizer", None), HybridDeviceOptimizer) and inner.pin_cpu_grads
+        for cpu in inner.cpu_optimizers
+        for group in cpu.param_groups
+        for param in group["params"]
+        if param not in inner.cpu_copy_map_grad
+    ]
+    del buffers
+
+
 class _OffloadStrategy(Protocol):
     """Structural interface implemented by the TMS and selective offload
     strategies.
@@ -239,6 +261,52 @@ class _SelectiveOffloadStrategy:
                     if "exp_avg_sq" in state:
                         state["exp_avg_sq"] = state["exp_avg_sq"].to("cpu", non_blocking=False)
 
+    def can_release_initial_gradients(self, weights: dict[str, torch.Tensor]) -> bool:
+        """Qualify gradient-only release before the initial native export."""
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+        if (
+            not self.model
+            or not self._skip_optimizer
+            or not all(
+                isinstance(getattr(wrapper, "optimizer", None), HybridDeviceOptimizer)
+                for wrapper in self._iter_optimizers()
+            )
+        ):
+            return False
+        for model in self.model:
+            config = model.ddp_config
+            if not config.use_distributed_optimizer or getattr(config, "reuse_grad_buf_for_mxfp8_param_ag", False):
+                return False
+            for group in (*model.bucket_groups, *model.expert_parallel_bucket_groups):
+                if group.param_gather_handle is not None or group.grad_reduce_handle is not None:
+                    return False
+
+        buffers = list(self._iter_ddp_buffers())
+        if not buffers or any(
+            buffer.param_data is None
+            or buffer.param_data.dtype != torch.bfloat16
+            or not buffer.param_data.is_cuda
+            or not buffer.param_data.untyped_storage().nbytes()
+            for buffer in buffers
+        ):
+            return False
+        grads = [buffer.grad_data.untyped_storage() for buffer in buffers if buffer.grad_data is not None]
+        grads = [storage for storage in grads if storage.nbytes()]
+        if not grads or any(storage.device.type != "cuda" for storage in grads):
+            return False
+        grad_ids = {storage._cdata for storage in grads}
+        ranges = [(storage.device, storage.data_ptr(), storage.data_ptr() + storage.nbytes()) for storage in grads]
+        for tensor in (*weights.values(), *(buffer.param_data for buffer in buffers)):
+            storage = tensor.untyped_storage()
+            start = storage.data_ptr()
+            end = start + storage.nbytes()
+            if storage._cdata in grad_ids or any(
+                storage.device == device and start < right and left < end for device, left, right in ranges
+            ):
+                return False
+        return True
+
     def validate_optimizer_storage_aliases(self) -> str | None:
         """Check storage aliases before retaining weights and releasing
         gradients.
@@ -313,7 +381,101 @@ class _SelectiveOffloadStrategy:
         device_module.empty_cache()
 
     @torch.no_grad()
-    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> torch.cuda.Event:
+    def initial_weight_sync_supported(self, weights: dict, snapshot: dict) -> bool:
+        """Qualify a sleeping source before restoring any initial GPU bytes."""
+        buffers = list(self._iter_ddp_buffers())
+        if (
+            getattr(self, "_actor_weights_pending_release", False)
+            or not buffers
+            or weights.keys() != snapshot.keys()
+            or any(
+                b.param_data is None
+                or b.param_data.device.type != "cuda"
+                or b.param_data.storage().size() != 0
+                or not getattr(b, "param_data_size", 0)
+                or not hasattr(b.param_data, "cpu_data")
+                or b.param_data.cpu_data.device.type != "cpu"
+                or b.param_data.cpu_data.shape != b.param_data.shape
+                or b.param_data.cpu_data.dtype != b.param_data.dtype
+                or b.grad_data is not None
+                and b.grad_data.storage().size() != 0
+                for b in buffers
+            )
+        ):
+            return False
+        parameter_storages = {b.param_data.untyped_storage()._cdata for b in buffers}
+        if any(
+            b.grad_data is not None and b.grad_data.untyped_storage()._cdata in parameter_storages for b in buffers
+        ):
+            return False
+        backing = {b.param_data.untyped_storage()._cdata: b.param_data for b in buffers}
+        for name, tensor in weights.items():
+            cpu = snapshot[name]
+            if (
+                tensor.device.type != "cuda"
+                or cpu.device.type != "cpu"
+                or (tensor.shape, tensor.dtype)
+                != (
+                    cpu.shape,
+                    cpu.dtype,
+                )
+            ):
+                return False
+            flat = backing.get(tensor.untyped_storage()._cdata)
+            if flat is None:
+                if tensor.untyped_storage().nbytes() == 0:
+                    return False
+            else:
+                view = getattr(tensor, "_relax_cpu_offload_data", None)
+                if (
+                    view is None
+                    or view.untyped_storage()._cdata != flat.cpu_data.untyped_storage()._cdata
+                    or view.storage_offset() != tensor.storage_offset() - flat.storage_offset()
+                    or (view.shape, view.stride(), view.dtype) != (tensor.shape, tensor.stride(), tensor.dtype)
+                ):
+                    return False
+        return True
+
+    @torch.no_grad()
+    def _begin_initial_weight_sync(self, weights: dict, snapshot: dict) -> None:
+        # The caller proves version 0 and no intervening training/model switch.
+        # Reuse the completed initial CPU snapshot; there is no second D2H.
+        if not self.initial_weight_sync_supported(weights, snapshot):
+            raise RuntimeError("Initial source allocations no longer match the CPU snapshot")
+        buffers = list(self._iter_ddp_buffers())
+        backing = {b.param_data.untyped_storage()._cdata: b.param_data for b in buffers}
+        cpu_weights = {
+            name: tensor._relax_cpu_offload_data if tensor.untyped_storage()._cdata in backing else snapshot[name]
+            for name, tensor in weights.items()
+        }
+        try:
+            for buffer in buffers:
+                buffer.param_data.storage().resize_(buffer.param_data_size)
+                buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=_NON_BLOCKING)
+            for name, tensor in weights.items():
+                if tensor.untyped_storage()._cdata not in backing:
+                    tensor.copy_(snapshot[name], non_blocking=_NON_BLOCKING)
+            done = torch.cuda.Event()
+            done.record()
+            done.synchronize()
+        except BaseException:
+            # No receiver has been seeded or submitted yet. Drain H2D before
+            # returning the flat allocations to sleep; never swallow the error.
+            device_module.synchronize()
+            self._release_parameter_storage(buffers)
+            raise
+        for buffer in buffers:
+            for tensor in self._param_index_map(buffer):
+                if hasattr(tensor, "_relax_cpu_offload_data"):
+                    del tensor._relax_cpu_offload_data
+        self._cpu_backup_done = done
+        self._cpu_weight_snapshot = cpu_weights
+        self._actor_weights_pending_release = True
+
+    @torch.no_grad()
+    def begin_weight_sync(
+        self, weights: dict[str, torch.Tensor], *, overlap: bool, initial_snapshot: dict | None = None
+    ) -> torch.cuda.Event:
         """Back up Actor weights to CPU while keeping their GPU storage
         readable.
 
@@ -323,6 +485,9 @@ class _SelectiveOffloadStrategy:
         returning. In both modes, keep GPU weights unchanged until the caller
         receives every receiver ACK and calls finish_weight_sync.
         """
+        if initial_snapshot is not None:
+            self._begin_initial_weight_sync(weights, initial_snapshot)
+            return self._cpu_backup_done
         if getattr(self, "_actor_weights_pending_release", False):
             raise RuntimeError("A source weight transfer is already pending")
         buffers = list(self._iter_ddp_buffers())
@@ -546,12 +711,38 @@ class MegatronTrainStateOffloader:
         if self.enabled:
             self._strategy.reload()
 
-    def begin_weight_sync(self, weights: dict[str, torch.Tensor], *, overlap: bool) -> torch.cuda.Event:
+    def initial_weight_sync_supported(self, weights: dict, snapshot: dict) -> bool:
+        return self.enabled and not self.uses_tms and self._strategy.initial_weight_sync_supported(weights, snapshot)
+
+    def can_release_initial_gradients(self, weights: dict[str, torch.Tensor]) -> bool:
+        if not self.enabled or self.uses_tms:
+            return False
+        try:
+            return self._strategy.can_release_initial_gradients(weights)
+        except (AttributeError, NotImplementedError, RuntimeError, TypeError):
+            # A different DDP/optimizer layout keeps the ordinary sleep path.
+            return False
+
+    def release_initial_gradients(self) -> None:
+        """Run after all ranks qualified the storage and before the initial
+        export."""
+        torch.cuda.synchronize()
+        self._strategy._offload_training_state(retain_parameters=True)
+        device_module.empty_cache()
+
+    def abort_initial_weight_sync(self) -> None:
+        """Undo initial H2D only before any receiver seed or source reader."""
+        if self.enabled and not self.uses_tms and getattr(self._strategy, "_actor_weights_pending_release", False):
+            self._strategy.finish_weight_sync()
+
+    def begin_weight_sync(
+        self, weights: dict[str, torch.Tensor], *, overlap: bool, initial_snapshot: dict | None = None
+    ) -> torch.cuda.Event:
         """Prepare the CPU backup and retain Actor GPU weights for the
         sender."""
         if not self.enabled or self.uses_tms:
             raise RuntimeError("Source weight sync requires selective train-state offload")
-        return self._strategy.begin_weight_sync(weights, overlap=overlap)
+        return self._strategy.begin_weight_sync(weights, overlap=overlap, initial_snapshot=initial_snapshot)
 
     def validate_actor_weight_retention(self) -> str | None:
         """Check selective offload, CUDA and optimizer support without changing

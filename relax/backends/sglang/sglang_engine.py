@@ -339,6 +339,13 @@ def _patched_run_scheduler_process(*args, **kwargs):
         # remap storage that a failed IPC reader still holds.
         install_native_weight_guard()
 
+    from .weight_loader import COLOCATE_NIXL_LOADER
+
+    if COLOCATE_NIXL_LOADER in (getattr(server_args, "custom_weight_loader", None) or []):
+        from .shard_p2p_weight_loader import install_receiver_initialization
+
+        install_receiver_initialization()
+
     from sglang.srt.managers.scheduler import run_scheduler_process
 
     return run_scheduler_process(*args, **kwargs)
@@ -790,10 +797,13 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
-        return self._make_request(
+        result = self._make_request(
             "update_weights_from_tensor",
             payload,
         )
+        from .weight_loader import normalize_shard_control_response
+
+        return normalize_shard_control_response(result, load_format)
 
     def update_weight_version(self, weight_version: str) -> dict:
         """Publish a completed routed update while generation is still
@@ -802,7 +812,7 @@ class SGLangEngine(RayActor):
             "update_weight_version", {"new_version": weight_version, "abort_all_requests": False}
         )
 
-    def get_expert_weight_sync_layout(self) -> dict:
+    def get_expert_weight_sync_layout(self, require_nixl: bool = False) -> dict:
         """Return resolved layout settings for opt-in colocated expert routing
         and direct BF16 loading."""
         from relax.utils.misc import get_hf_config
@@ -911,6 +921,61 @@ class SGLangEngine(RayActor):
             quantization.to_dict() if quantization is not None and not isinstance(quantization, dict) else quantization
         )
         layout["ordinary_tp_protocol"] = 1
+        layout["colocate_nixl_protocol"] = 0
+        if (
+            require_nixl
+            and layout["is_cuda"]
+            and getattr(self.args, "colocate", False)
+            and getattr(self.args, "use_shard_p2p_weight_sync", False)
+        ):
+            from .p2p_weight_lease import native_worker_dispatch_supported
+
+            if native_worker_dispatch_supported():
+                from uuid import uuid4
+
+                import torch
+                from sglang.srt.utils import MultiprocessingSerializer
+
+                from .weight_loader import COLOCATE_NIXL_LOADER
+
+                try:
+                    tp_size = layout["tp_size"]
+                    challenge = uuid4().hex
+                    commands = [
+                        MultiprocessingSerializer.serialize(
+                            [
+                                (
+                                    json.dumps(
+                                        dict(
+                                            op="probe_nixl",
+                                            session=challenge,
+                                            engine=self.rank,
+                                            tp_rank=tp,
+                                            version=0,
+                                            nonce=uuid4().hex,
+                                            geometry=dict(tp_size=tp_size),
+                                        )
+                                    ),
+                                    torch.empty(0),
+                                )
+                            ],
+                            output_str=True,
+                        )
+                        for tp in range(tp_size)
+                    ]
+                    result = self.update_weights_from_tensor(commands, load_format=COLOCATE_NIXL_LOADER)
+                    replies = json.loads(result["message"])["shard_p2p_nixl_capabilities"]
+                    if (
+                        result["success"] is True
+                        and len(replies) == tp_size
+                        and all(reply.get("supported") is True for reply in replies)
+                    ):
+                        layout["colocate_nixl_protocol"] = 1
+                        if all(reply.get("native_fp8_experts") for reply in replies):
+                            layout["native_fp8_experts"] = [reply["native_fp8_experts"] for reply in replies]
+                except Exception as exc:
+                    layout["colocate_nixl_probe_failed"] = str(exc)
+                    logger.error("Colocate NIXL probe failed after worker dispatch: %s", exc)
         return layout
 
     def load_lora_adapter_from_tensors(
@@ -2292,9 +2357,9 @@ def _compute_server_args(
             if NATIVE_SYNC_FENCE_LOADER not in loaders:
                 loaders.append(NATIVE_SYNC_FENCE_LOADER)
             if getattr(args, "use_shard_p2p_weight_sync", False):
-                from .weight_loader import EXPERT_IPC_LOADER, TP_IPC_LOADER
+                from .weight_loader import COLOCATE_NIXL_LOADER, EXPERT_IPC_LOADER, TP_IPC_LOADER
 
-                for loader in (EXPERT_IPC_LOADER, TP_IPC_LOADER):
+                for loader in (EXPERT_IPC_LOADER, TP_IPC_LOADER, COLOCATE_NIXL_LOADER):
                     if loader not in loaders:
                         loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders

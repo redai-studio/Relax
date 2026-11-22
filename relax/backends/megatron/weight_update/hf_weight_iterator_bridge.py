@@ -95,6 +95,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         # All ranks must initialize Bridge tasks before buffer filtering because
         # task construction contains PP collectives.
         self._bridge_converter.init_tasks()
+        if getattr(self.args, "use_shard_p2p_weight_sync", False):
+            self._bridge_converter.broadcast_and_apply_configs()
         self.lora_merge_mode = is_lora_enabled(self.args) and is_lora_merge_mode(self.args)
         self.lora_adapter_mode = is_lora_enabled(self.args) and is_lora_adapter_mode(self.args)
         collect_adapters = self.lora_merge_mode or self.lora_adapter_mode
@@ -263,6 +265,11 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         rank = dist.get_rank(metadata_group)
         owned, error = [], None
         try:
+            if (
+                layout.fp8_block_size is not None
+                and tuple((self.quantization_config or {}).get("weight_block_size") or ()) != layout.fp8_block_size
+            ):
+                raise ValueError("Native FP8 routing requires matching source/receiver quantization blocks")
             for bucket in source_buckets:
                 for info in bucket:
                     if info.name in self._vanilla_key_map and (
@@ -318,9 +325,13 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
     @property
     def _routed_ipc_budget(self) -> int:
         budget = self.args.update_weight_buffer_size
-        # BF16 uses no quantization scratch and each IPC is acknowledged before
-        # advancing. Preserve the conservative existing MXFP4 staging budget.
-        return max(1, budget // 3) if self.quantization_config else budget
+        # Native FP8 is already bounded by the source and receive plans. Keep
+        # the conservative existing budget for MXFP4 conversion scratch.
+        return (
+            max(1, budget // 3)
+            if self.quantization_config and self.quantization_config.get("quant_method") != "fp8"
+            else budget
+        )
 
     def weight_sync_process_groups(self) -> list[dist.ProcessGroup]:
         """Groups needed by export and retained expert shard ownership."""
@@ -411,6 +422,10 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             chunk_size=self.args.update_weight_buffer_size,
         )
 
+    def iter_initial_hf_weights(self, megatron_local_weights):
+        """Run native conversion one source at a time for schema discovery."""
+        yield from self._iter_hf_params(megatron_local_weights, include_experts=False, serial_non_experts=True)
+
     def get_hf_weight_chunks(
         self,
         megatron_local_weights,
@@ -479,6 +494,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         megatron_local_weights,
         *,
         include_experts=True,
+        serial_non_experts=False,
         retained_ordinary_ipc: bool = False,
         backup_done: torch.cuda.Event | None = None,
     ):
@@ -501,7 +517,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         full_device_sync = device.type != "cpu" and any(
             weight.device.type == "cpu" for weight in megatron_local_weights.values()
         )
-        gather_options = {}
+        gather_options = {"copy_single_rank": True} if getattr(self, "_expert_router", None) is not None else {}
         if retained_ordinary_ipc and self._async_weight_gather:
             gather_options["contiguous_output_min_bytes"] = self.args.update_weight_buffer_size
         trim_quantized_cache = backup_done is not None and bool(self.quantization_config)
@@ -543,9 +559,15 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             )
             all_converted = []
             for info, param in zip(bucket_infos, params, strict=True):
-                gathered = all_gather_param(self.args, info.name, param)
+                gathered = all_gather_param(self.args, info.name, param, **gather_options)
                 if rank == info.src_rank:
-                    all_converted.append(self._bridge_converter.convert(info.name, gathered))
+                    options = (
+                        {"compile_mxfp4": True}
+                        if getattr(self, "_shard_p2p_skip_names", ())
+                        and getattr(self._bridge_converter, "_mxfp4_pack_format", False)
+                        else {}
+                    )
+                    all_converted.append(self._bridge_converter.convert(info.name, gathered, **options))
                 else:
                     all_converted.append(None)
                 del gathered
@@ -560,7 +582,12 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             del all_converted, results
 
         # --- Non-expert weights: original path ---
-        for bucket_infos in self._non_expert_buckets:
+        non_expert_buckets = self._non_expert_buckets
+        if serial_non_experts:
+            non_expert_buckets = ([info] for bucket in non_expert_buckets for info in bucket)
+            if device.type == "cuda":
+                gather_options["compact"] = True
+        for bucket_infos in non_expert_buckets:
             # Every Actor rank has the same cold-qualified PP-global selection.
             # Filter before PP broadcast and TP gather, not after conversion.
             skipped = getattr(self, "_shard_p2p_skip_names", frozenset())
@@ -605,7 +632,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             t_bcast_total += t_b1 - t_b0
 
             gathered_params = None
-            if self._async_weight_gather:
+            if self._async_weight_gather and not serial_non_experts:
                 t_g0 = time.monotonic()
                 gathered_params = iter(
                     all_gather_params_async(
@@ -649,7 +676,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                     # TP=1 needs no second full-sized copy for ordinary layouts.
                     gathered = all_gather_param(self.args, info.name, param, reuse_tp1_buffer=True)
                 else:
-                    gathered = all_gather_param(self.args, info.name, param)
+                    gathered = all_gather_param(self.args, info.name, param, **gather_options)
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 

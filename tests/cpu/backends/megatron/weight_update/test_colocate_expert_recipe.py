@@ -240,9 +240,11 @@ def test_source_lifecycle_raw_cache_fallback_and_reconnect(setup, monkeypatch):
     assert sources and plans and not source.raw_recipe_available
 
 
-def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(setup, monkeypatch):
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(setup, monkeypatch, prefetch):
     import json
     import weakref
+    from functools import cache
 
     import ray
 
@@ -258,6 +260,7 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
     monkeypatch.setattr(ipc.dist, "broadcast_object_list", lambda values, **kwargs: None)
     monkeypatch.setattr(ipc.dist, "gather_object", lambda value, out, **kwargs: out.__setitem__(0, value))
     monkeypatch.setattr(ipc.dist, "all_gather_object", lambda out, value, **kwargs: out.__setitem__(0, value))
+    monkeypatch.setattr(ipc.dist, "scatter_object_list", lambda out, values, **kwargs: out.__setitem__(0, values[0]))
     monkeypatch.setattr(ray, "get", lambda refs: [ref() for ref in refs])
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     endpoint = dict(
@@ -272,6 +275,8 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
     source = MegatronShardP2PSource(
         setup.iterator, setup.iterator._direct_expert_layout, process_group="gloo", num_layers=1, qualified=True
     )
+    describe = source.describe
+    source.describe = lambda: dict(describe(), native_refresh=True)
     source.source_role = lambda: ((0,), 0, ((8, 0), (1, 0), (2, 0), (1, 0), (1, 0)))
     exports, calls = {}, []
 
@@ -330,7 +335,7 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
                         assert observed == pointers
                 return dict(success=True, message=json.dumps(dict(shard_p2p_receivers=replies)))
 
-            return acknowledge
+            return cache(acknowledge)
 
         return SimpleNamespace(update_weights_from_tensor=SimpleNamespace(remote=remote))
 
@@ -345,11 +350,24 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
     )
     # Keep snapshots alive to prevent address reuse; reconnect changes offsets and alias groups.
     snapshots = [_weights(setup.iterator, v, padding=5 if v == 2 else 3, separate=v == 2) for v in range(3)]
+    if prefetch:
+        source.empty = True
+        helper.prepare(snapshots[0], version=0, audit_native=False, prefetch=True)
+        assert helper.needs_seed and helper.retained_sources is None and not calls
+        source.empty = False
     for version, weights in enumerate(snapshots):
         if version == 2:
             plans, deliveries = helper._plan_hashes, helper._receiver_plan_hashes
             helper.invalidate_receivers([engine(200)])
         if helper.needs_seed:
+            if prefetch:
+                # First exercise changed storage before adopting the CPU result;
+                # after reconnect, the unchanged layout exercises a cache hit.
+                initial = _weights(setup.iterator, padding=7) if version == 0 else weights
+                before = list(calls)
+                helper.prepare(initial, version=version, audit_native=False, prefetch=True)
+                assert helper._prefetched_version == version
+                assert helper.needs_seed and helper.retained_sources is None and calls == before
             helper.prepare(weights, version=version, audit_native=False)
         if version == 2:
             assert helper._plan_hashes != plans and helper._receiver_plan_hashes != deliveries
@@ -359,6 +377,10 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
             with pytest.raises(RuntimeError, match="Cannot reconnect"):
                 helper.invalidate_receivers([engine(300)])
             assert helper.engines is engines and not helper.needs_seed
+            retained = helper.retained_sources
+            helper.wait_for_apply(version=version)
+            assert helper.retained_sources is retained and helper.completed_version == 1
+            del retained
             helper.finish(version=version)
         else:
             helper.update(weights, version=version)
@@ -366,4 +388,14 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
     assert calls == [(100, op) for op in ("prepare", "seed", "apply", "apply")] + [
         (200, op) for op in ("prepare", "seed", "apply")
     ]
+    if prefetch:
+        helper.invalidate_receivers([engine(300)])
+        weights = _weights(setup.iterator, 3)
+        helper.prepare(weights, version=3, audit_native=False, prefetch=True)
+        before = list(calls)
+        monkeypatch.setenv("RELAX_P2P_WEIGHT_CONSISTENCY_CHECK", "1")
+        monkeypatch.setattr(source, "validate_replicas", Mock(side_effect=ValueError("replica content mismatch")))
+        with pytest.raises(RuntimeError, match="replica content mismatch"):
+            helper.prepare(weights, version=3, audit_native=True)
+        assert helper.failed and helper.needs_seed and helper.retained_sources is None and calls == before
     assert not torch.cuda.is_initialized()

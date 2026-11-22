@@ -52,6 +52,8 @@ class _WorkerWeightGuard:
         self.lease = NativeWeightLease()
         self.models: tuple = ()
         self.operation_sequence = 0
+        self.colocate_owner = None
+        self.current_control = None
 
     def refresh(self) -> None:
         import torch
@@ -114,10 +116,41 @@ def commit_native_weight_lease(model: Any, identity: tuple[str, int, str], group
         raise
 
 
-def _guard_native_weights(manager: Any, operation: str) -> _WorkerWeightGuard:
+def _colocate_control(manager: Any, operation: str, request: Any) -> dict | None:
+    """Decode only the checked NIXL probe and allocation-epoch requests."""
+    if operation != "update_weights_from_tensor" or request is None:
+        return None
+    from .weight_loader import COLOCATE_NIXL_LOADER
+
+    if getattr(request, "load_format", None) != COLOCATE_NIXL_LOADER:
+        return None
+    import json
+
+    import torch.distributed as dist
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    group = manager.tp_cpu_group
+    values = request.serialized_named_tensors
+    if len(values) != dist.get_world_size(group):
+        raise ValueError("Colocate control must address every TP worker")
+    weights = MultiprocessingSerializer.deserialize(values[dist.get_rank(group)])
+    if len(weights) != 1 or weights[0][1].numel() != 0:
+        raise ValueError("Colocate control requires one empty tensor")
+    command = json.loads(weights[0][0])
+    if (
+        command.get("op") in ("probe_nixl", "bind_epoch")
+        or command.get("op") == "apply"
+        and "epoch_generation" in command
+    ):
+        return command
+    return None
+
+
+def _guard_native_weights(manager: Any, operation: str, request: Any = None) -> _WorkerWeightGuard:
     import torch.distributed as dist
 
-    guard, error = None, None
+    guard, error, control = None, None, None
+    header = operation
     try:
         guard = getattr(manager.tp_worker, "_relax_native_weight_guard", None)
         if guard is None:
@@ -125,18 +158,27 @@ def _guard_native_weights(manager: Any, operation: str) -> _WorkerWeightGuard:
             manager.tp_worker._relax_native_weight_guard = guard
         if guard.manager is not manager:
             raise RuntimeError("Native weight manager incarnation changed")
-        guard.refresh()
+        control = _colocate_control(manager, operation, request)
+        if control is not None:
+            header = (operation,) + tuple(control.get(key) for key in ("session", "engine", "op", "version"))
+        if guard.colocate_owner is None:
+            guard.refresh()
+        else:
+            from .shard_p2p_weight_loader import validate_epoch_continuation
+
+            validate_epoch_continuation(guard, control)
     except Exception as exc:
         error = str(exc)
     try:
         outcomes = [None] * dist.get_world_size(manager.tp_cpu_group)
-        dist.all_gather_object(outcomes, (operation, error), group=manager.tp_cpu_group)
-        if any(name != operation or problem is not None for name, problem in outcomes):
+        dist.all_gather_object(outcomes, (header, error), group=manager.tp_cpu_group)
+        if any(name != header or problem is not None for name, problem in outcomes):
             raise RuntimeError(f"Native weight lifetime guard rejected {operation}: {outcomes}")
     except BaseException:
         if guard is not None:
             guard.lease.fail()
         raise
+    guard.current_control = control
     return guard
 
 
@@ -172,16 +214,53 @@ def install_native_weight_guard(manager_type: type | None = None) -> None:
     def wrapped(name: str, method: Callable) -> Callable:
         @wraps(method)
         def guarded(self, *args, **kwargs):
-            guard = _guard_native_weights(self, name)
+            guard = _guard_native_weights(self, name, args[0] if args else kwargs.get("recv_req"))
             try:
                 guard.operation_sequence += 1
                 for model in guard.models:
                     model.__dict__.pop("_relax_weight_sync_reply", None)
-                result = method(self, *args, **kwargs)
+                control = guard.current_control
+                if control is not None:
+                    from .p2p_weight_lease import _p2p_native_request, agree_control
+
+                    common = {key: control[key] for key in ("session", "engine", "op", "version")}
+                    try:
+                        result = _p2p_native_request(self, guard, ("colocate-shard", common), method, args, kwargs)
+                    except Exception as exc:
+                        if getattr(guard, "control_worker_succeeded", False):
+                            agree_control(
+                                guard.models[0],
+                                ("colocate-shard", common, "native-complete"),
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                        raise
+                else:
+                    result = method(self, *args, **kwargs)
                 # A loader returning before remote completion is not permission
                 # for the next request to remap these native allocations.
-                if guard.lease.failed or guard.lease.active is not None or guard.lease.pending:
-                    raise RuntimeError("Native weight loader returned with an unfinished allocation lease")
+                error = None
+                try:
+                    if (
+                        (control is not None and getattr(result, "success", True) is False)
+                        or guard.lease.failed
+                        or (
+                            (guard.lease.active is not None or guard.lease.pending)
+                            and (control is None or control.get("op") != "bind_epoch" or guard.colocate_owner is None)
+                        )
+                    ):
+                        raise RuntimeError("Native weight loader returned with an unfinished allocation lease")
+                    if (
+                        control is not None
+                        and control["op"] in ("probe_nixl", "bind_epoch")
+                        and not any(getattr(model, "_relax_weight_sync_reply", None) for model in guard.models)
+                    ):
+                        raise RuntimeError("Colocate control returned without its worker reply")
+                except Exception as exc:
+                    error = str(exc)
+                if control is not None:
+                    agree_control(guard.models[0], ("colocate-shard", common, "native-complete"), error)
+                if error is not None:
+                    raise RuntimeError(error)
                 replies = [model.__dict__.pop("_relax_weight_sync_reply", None) for model in guard.models]
                 replies = [reply for reply in replies if reply is not None]
                 if replies and result.success is True:
@@ -193,6 +272,7 @@ def install_native_weight_guard(manager_type: type | None = None) -> None:
                 guard.lease.fail()
                 raise
             finally:
+                guard.current_control = None
                 for model in guard.models:
                     model.__dict__.pop("_relax_weight_sync_reply", None)
 

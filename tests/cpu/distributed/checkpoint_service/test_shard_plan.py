@@ -2,12 +2,14 @@
 """Exact byte coverage is independent of Actor count; malformed owners fail."""
 
 import copy
+import pickle
 
 import pytest
 
 from relax.distributed.checkpoint_service.backends.shard_p2p.plan import (
     TransferPlan,
     coalesce_writes,
+    fingerprint,
     validate_coverage,
 )
 
@@ -89,6 +91,27 @@ def test_coverage_rejects_invalid_write_plan(corruption):
         validate_coverage(writes, {"p": {"nbytes": 16}})
 
 
+@pytest.mark.parametrize(
+    "capacity,rectangles",
+    [
+        (131072, [(0, 16384, 4, 8), (4, 16384, 4, 8)]),
+        (48, [(0, 2, 4, 8), (4, 1, 4, 4), (12, 1, 24, 24), (36, 1, 4, 4), (40, 1, 8, 8)]),
+        (24, [(0, 6, 2, 4), (2, 3, 2, 8), (6, 3, 2, 8)]),
+        (18, [(4, 2, 4, 6), (0, 1, 4, 4), (8, 1, 2, 2), (14, 1, 4, 4)]),
+    ],
+)
+def test_coverage_strided_rows_mixed_contiguous_edges_and_multiple_strides(capacity, rectangles):
+    writes = [
+        dict(id=str(index), source_rank=0, param="p", dst_offset=offset, rows=rows, row_bytes=width, dst_stride=stride)
+        for index, (offset, rows, width, stride) in enumerate(rectangles)
+    ]
+    layout = {"p": dict(nbytes=capacity)}
+    assert validate_coverage(list(reversed(writes)), layout) == {"p"}
+    for damaged in (writes[1:], writes + [dict(writes[0], id="overlapping-copy")]):
+        with pytest.raises(ValueError):
+            validate_coverage(damaged, layout)
+
+
 def _tiles():
     # Four tiles of a 4x8 byte matrix; the source starts inside a larger
     # allocation. Independent expected output is source[5:37].
@@ -122,6 +145,37 @@ def _copy_bytes(writes, source, size):
     return result
 
 
+def test_delivery_builder_owns_sources_and_immutable_write_identity():
+    writes = _tiles()
+    source = dict(
+        boot_id="00000000-0000-0000-0000-000000000001",
+        hostname="source",
+        pid=1,
+        gpu_uuid="source-0",
+        device_index=0,
+        generation="session",
+    )
+    sources = {0: source}
+    receiver = dict(source, pid=2, gpu_uuid="receiver-0")
+    plan = TransferPlan("engine-0", 1, tuple(writes))
+    geometry = {"source_world_size": 1, "layout": {"张量": [1, 8]}}
+    builder = plan.bind_sources(sources, geometry=geometry)
+    expected = builder(receiver)
+    assert expected == plan.delivery(sources, receiver)
+    assert expected["logical_hash"] == fingerprint(plan.as_dict())
+    assert builder.geometry_hash == fingerprint(dict(geometry=geometry, writes=writes))
+    for write in writes:
+        write.update(id="changed", source_rank=99)
+    source["generation"] = "changed"
+    assert builder(receiver) == expected
+    response = builder(receiver)
+    response["routes"]["cuda_ipc"].clear()
+    response["receiver"]["pid"] = 99
+    response["sources"][0]["generation"] = "changed"
+    assert builder(receiver) == expected
+    assert pickle.loads(pickle.dumps(builder))(receiver) == expected
+
+
 @pytest.mark.parametrize("max_bytes,expected_count", [(None, 1), (32, 1), (16, 2), (8, 4)])
 def test_common_plan_merges_tiles_without_changing_bytes_or_exceeding_budget(max_bytes, expected_count):
     original = _tiles()
@@ -153,7 +207,7 @@ def test_common_plan_merges_tiles_without_changing_bytes_or_exceeding_budget(max
     assert {w["id"] for w in plan["writes"]} == {w["id"] for w in reversed_plan["writes"]}
 
 
-@pytest.mark.parametrize("axis", ["rows", "columns"])
+@pytest.mark.parametrize("axis", ["rows", "columns", "reverse"])
 def test_strided_coalescing_preserves_gaps_and_nonzero_offsets(axis):
     first = dict(
         id="a",
@@ -170,12 +224,15 @@ def test_strided_coalescing_preserves_gaps_and_nonzero_offsets(axis):
     )
     second = dict(first, id="b")
     second.update(src_offset=19 if axis == "rows" else 5, dst_offset=13 if axis == "rows" else 3)
+    if axis == "reverse":
+        first["dst_offset"] = 9
+        second.update(src_offset=19, dst_offset=1)
     original = [first, second]
     merged = coalesce_writes(original, max_bytes=16)
-    assert len(merged) == 1
+    assert len(merged) == (2 if axis == "reverse" else 1)
     source = bytes(range(64))
     assert _copy_bytes(merged, source, 32) == _copy_bytes(original, source, 32)
-    assert merged[0]["rows"] * merged[0]["row_bytes"] == 8
+    assert sum(write["rows"] * write["row_bytes"] for write in merged) == 8
 
 
 @pytest.mark.parametrize(
@@ -203,3 +260,24 @@ def test_merge_never_crosses_producer_owner_target_or_adapter_boundary(boundary)
     else:
         second[boundary] = 1 if boundary in {"source_rank", "tp_rank"} else "different"
     assert len(coalesce_writes([first, second])) == 2
+
+
+@pytest.mark.parametrize(
+    "first_metadata,second_metadata,count", [(True, 1, 2), ({"axes": [0, 1]}, {"axes": (0, 1)}, 1)]
+)
+def test_merge_preserves_json_adapter_identity(first_metadata, second_metadata, count):
+    first = dict(
+        _tiles()[0],
+        id="a",
+        src_offset=0,
+        dst_offset=0,
+        rows=1,
+        row_bytes=2,
+        src_stride=2,
+        dst_stride=2,
+        adapter=first_metadata,
+    )
+    second = dict(first, id="b", src_offset=2, dst_offset=2, adapter=second_metadata)
+    merged = coalesce_writes([first, second])
+    assert len(merged) == count
+    assert _copy_bytes(merged, bytes(range(4)), 4) == bytes(range(4))

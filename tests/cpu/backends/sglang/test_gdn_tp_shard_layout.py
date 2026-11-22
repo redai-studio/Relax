@@ -6,9 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.backends.megatron.weight_update.tp_shard_source import local_tp_regions
+from relax.backends.megatron.weight_update.tp_shard_source import local_replica_writes, local_tp_regions
 from relax.backends.sglang.tp_shard_layout import describe_tp_targets
 from relax.distributed.checkpoint_service.backends.shard_p2p.ipc import copy_rectangle, group_storage_views
+from relax.distributed.checkpoint_service.backends.shard_p2p.plan import coalesce_writes
 
 
 @pytest.mark.parametrize("source_tp,target_tp", [(2, 4), (4, 2)])
@@ -58,6 +59,27 @@ def test_gdn_native_conversion_and_complete_group_fallback(monkeypatch, source_t
             names[key]: dict(shape=list(value.shape), dtype=str(value.dtype)) for key, value in values.items()
         },
     )
+    replicas, endpoints = [], []
+    for replica in range(2):
+        for rank, record in enumerate(records):
+            owner = replica * source_tp + rank
+            replicas.append(
+                dict(
+                    rank=owner,
+                    global_rank=owner,
+                    replica_rank=replica,
+                    replica_ranks=[rank, source_tp + rank],
+                    replica_regions=[
+                        dict(
+                            region,
+                            group=list(names.values()),
+                            capacity=sources[rank].untyped_storage().nbytes(),
+                        )
+                        for region in record["regions"]
+                    ],
+                )
+            )
+            endpoints.append(dict(boot_id=str(replica), gpu_uuid=str(rank)))
     for rank in range(target_tp):
         model = Qwen3_5ForCausalLM.__new__(Qwen3_5ForCausalLM)
         torch.nn.Module.__init__(model)
@@ -86,6 +108,10 @@ def test_gdn_native_conversion_and_complete_group_fallback(monkeypatch, source_t
         assert reply["selected_hf"] == sorted(names.values())
         # Different receiver processes must emit the same dependency-group plan.
         assert list(dict.fromkeys(write["param"] for write in reply["writes"])) == sorted(reply["target_shapes"])
+        planned = coalesce_writes(reply["writes"])
+        localized = local_replica_writes(replicas, planned, endpoints, dict(boot_id="1", gpu_uuid="0"))
+        assert all(write["source_rank"] >= source_tp for write in localized)
+        assert [dict(write, source_rank=write["source_rank"] % source_tp) for write in localized] == planned
         actual = {name: torch.zeros_like(value) for name, value in model.named_parameters()}
         for write in reply["writes"]:
             copy_rectangle(sources[write["source_rank"]], actual[write["param"]], write)

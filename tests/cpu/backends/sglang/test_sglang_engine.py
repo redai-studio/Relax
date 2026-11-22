@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import json
 import sys
 from dataclasses import make_dataclass
 from types import ModuleType, SimpleNamespace
@@ -10,6 +11,24 @@ import pytest
 
 
 pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
+
+
+@pytest.mark.parametrize("loader", ["control", "control_tp", "control_remote"])
+def test_shard_control_accepts_only_identical_dp_replies(monkeypatch, sglang_engine_module, loader):
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    reply = {"shard_p2p_nixl_capabilities": [{"supported": True, "reason": "a | b"}]}
+    message = json.dumps(reply)
+    request = Mock(return_value={"success": True, "message": " | ".join([message] * 8)})
+    monkeypatch.setattr(engine, "_make_request", request)
+    load_format = "relax.backends.sglang.shard_p2p_weight_loader." + loader
+    result = engine.update_weights_from_tensor([], load_format=load_format)
+    assert result["success"] is True and json.loads(result["message"]) == reply
+    for suffix in (' | {"shard_p2p_nixl_capabilities": []}', " | broken", " | "):
+        request.return_value = {"success": True, "message": message + suffix}
+        with pytest.raises(ValueError):
+            engine.update_weights_from_tensor([], load_format=load_format)
+    request.return_value = {"success": True, "message": "Success. | Success."}
+    assert engine.update_weights_from_tensor([]) is request.return_value
 
 
 @pytest.mark.parametrize("node_rank", [0, 1])
@@ -507,6 +526,7 @@ def test_expert_slice_loader_registration_preserves_user_loaders(
                 [
                     "relax.backends.sglang.shard_p2p_weight_loader.control",
                     "relax.backends.sglang.shard_p2p_weight_loader.control_tp",
+                    "relax.backends.sglang.shard_p2p_weight_loader.control_remote",
                 ]
             )
     assert result["custom_weight_loader"] == expected

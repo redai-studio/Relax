@@ -61,6 +61,8 @@ def _gather_tp_weights(
     async_op,
     contiguous_output_min_bytes: int | None = None,
     reuse_tp1_buffer: bool = False,
+    copy_single_rank: bool = False,
+    compact: bool = False,
 ):
     tasks, handles = [], []
     gather_inputs = []
@@ -103,16 +105,28 @@ def _gather_tp_weights(
         ):
             tasks.append((name, param.data, None, None))
             continue
+        if copy_single_rank and size == 1:
+            # Restore still validates dimensions and GLU ordering. GDN's
+            # singleton restore may return its input, so give it an owned copy.
+            value = param.data.clone(memory_format=torch.contiguous_format) if name in split_sizes else param.data
+            tasks.append((name, None, [value], param.partition_dim))
+            continue
         if (
-            contiguous_output_min_bytes is not None
-            and size > 1
+            size > 1
+            and param.ndim > 0
             and partition_dim == 0
             and getattr(param, "partition_stride", 1) == 1
             and name not in split_sizes
             and "linear_fc1.weight" not in name
             and "linear_fc2.weight" not in name
-            and param.numel() * param.element_size() * size > contiguous_output_min_bytes
-            and dist.get_backend(group) == dist.Backend.NCCL
+            and (
+                compact
+                or (
+                    contiguous_output_min_bytes is not None
+                    and param.numel() * param.element_size() * size > contiguous_output_min_bytes
+                    and dist.get_backend(group) == dist.Backend.NCCL
+                )
+            )
         ):
             # A row-concatenated result is also the native all-gather layout.
             # Avoid keeping a second, full-sized list of partitions for torch.cat.
@@ -136,7 +150,15 @@ def _gather_tp_weights(
     ]
 
 
-def all_gather_param(args, name: str, param: torch.Tensor, *, reuse_tp1_buffer: bool = False) -> torch.Tensor:
+def all_gather_param(
+    args,
+    name: str,
+    param: torch.Tensor,
+    *,
+    reuse_tp1_buffer: bool = False,
+    copy_single_rank: bool = False,
+    compact: bool = False,
+) -> torch.Tensor:
     """Gather one parameter using the same layout rules as batched export."""
     name = name.replace(".to_wrap.", ".")
     split_sizes = {}
@@ -149,7 +171,12 @@ def all_gather_param(args, name: str, param: torch.Tensor, *, reuse_tp1_buffer: 
             get_hf_config(args.hf_checkpoint), mpu.get_tensor_model_parallel_world_size(), name
         )
     return _gather_tp_weights(
-        [(name, param)], split_sizes=split_sizes, async_op=False, reuse_tp1_buffer=reuse_tp1_buffer
+        [(name, param)],
+        split_sizes=split_sizes,
+        async_op=False,
+        reuse_tp1_buffer=reuse_tp1_buffer,
+        copy_single_rank=copy_single_rank,
+        compact=compact,
     )[0]
 
 
@@ -158,6 +185,7 @@ def all_gather_params_async(
     *,
     gdn_split_sizes: Mapping[str, tuple[int, ...]] | None = None,
     contiguous_output_min_bytes: int | None = None,
+    copy_single_rank: bool = False,
 ) -> list[torch.Tensor]:
     """Launch every parameter gather before waiting, then restore shared TP
     layouts."""
@@ -166,6 +194,7 @@ def all_gather_params_async(
         split_sizes=gdn_split_sizes or {},
         async_op=True,
         contiguous_output_min_bytes=contiguous_output_min_bytes,
+        copy_single_rank=copy_single_rank,
     )
 
 

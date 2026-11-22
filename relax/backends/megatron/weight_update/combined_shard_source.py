@@ -10,7 +10,7 @@ from relax.backends.sglang.shard_p2p_weight_loader import expert_shapes
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
-from .tp_shard_source import OrdinaryTPSource
+from .tp_shard_source import OrdinaryTPSource, local_replica_writes
 from .utils import snapshot_digests
 
 
@@ -74,15 +74,13 @@ class CombinedShardSource:
         self.ordinary.native_specs.clear()
 
     def replica_record(self, weights) -> dict:
-        tensors, _, _ = self.ordinary._views(weights, selected_only=False)
         # DP/CP parameter synchronization is the training contract. Cold native
         # parity still checks every actual receiver against its original source;
         # hashing all source replicas is an additional content diagnostic.
-        hashes = (
-            snapshot_digests(tensors)
-            if Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK and len(self.ordinary.replica_ranks) > 1
-            else {}
-        )
+        hashes = {}
+        if Envs.RELAX_P2P_WEIGHT_CONSISTENCY_CHECK and len(self.ordinary.replica_ranks) > 1:
+            tensors, _, _ = self.ordinary._views(weights, selected_only=False)
+            hashes = snapshot_digests(tensors)
         return dict(
             expert=self.expert.replica_record(weights) if self.expert is not None else None,
             global_rank=dist.get_global_rank(self.group, self.rank),
@@ -122,7 +120,13 @@ class CombinedShardSource:
                 if name in specs and specs[name] != spec:
                     raise ValueError("Native HF schema differs across Actor stages")
                 specs[name] = spec
-        return dict(records=records, native_specs=specs, source_world_size=len(records))
+        self._ordinary_records = records
+        # Full replicas stay on the planner; receivers use the merged schema.
+        wire_records = [
+            {key: value for key, value in record.items() if key not in ("replica_regions", "native_specs")}
+            for record in records
+        ]
+        return dict(records=wire_records, native_specs=specs, source_world_size=len(records))
 
     def select_targets(self, description, replies, *, engine_count: int) -> dict | None:
         if self.rank != 0:
@@ -177,6 +181,9 @@ class CombinedShardSource:
         self._native_refresh = result["refresh"]
         self.empty = not result["selected_hf"] and not self.has_experts
         self.ordinary.bind(weights, seed=True)
+
+    def localize_plan(self, writes, receiver, endpoints) -> list[dict]:
+        return local_replica_writes(self._ordinary_records, writes, endpoints, receiver)
 
     def local_plan(self, weights, *, sources_only: bool = False):
         sources = self.ordinary.bind(weights)

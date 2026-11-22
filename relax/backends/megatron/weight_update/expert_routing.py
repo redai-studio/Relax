@@ -21,10 +21,10 @@ _EXPERT = re.compile(
     r"^(?:language_model\.)?model\.layers\.\d+\.block_sparse_moe\.experts\.(\d+)\.w[123]\.weight_(?:packed|scale)$"
 )
 _BF16_EXPERT = re.compile(
-    r"^(?:language_model\.)?model\.(?:language_model\.)?layers\.\d+\."
-    r"(?:mlp|block_sparse_moe)\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
-    r"|^(?:language_model\.)?model\.(?:language_model\.)?layers\.\d+\."
-    r"(?:mlp|block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight$"
+    r"^(?:(?:language_model\.)?model\.(?:language_model\.)?)?layers\.\d+\."
+    r"(?:mlp|block_sparse_moe|ffn)\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
+    r"|^(?:(?:language_model\.)?model\.(?:language_model\.)?)?layers\.\d+\."
+    r"(?:mlp|block_sparse_moe|ffn)\.experts\.(\d+)\.(w[123])\.weight$"
 )
 
 
@@ -43,17 +43,26 @@ class ExpertLayout:
     ep_size: int
     engine_offsets: tuple[int, ...]
     world_size: int
+    fp8_block_size: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.ep_size <= 0 or self.num_experts <= 0 or self.num_experts % self.ep_size:
             raise ValueError("Expert routing requires num_experts divisible by positive rollout EP size")
+        if self.fp8_block_size is not None and (
+            len(self.fp8_block_size) != 2 or any(type(value) is not int or value <= 0 for value in self.fp8_block_size)
+        ):
+            raise ValueError("Native FP8 routing requires a positive two-dimensional block shape")
         ranks = [rank for offset in self.engine_offsets for rank in range(offset, offset + self.ep_size)]
         if sorted(ranks) != list(range(self.world_size)) or not ranks:
             raise ValueError("Expert routing requires non-overlapping engine GPU ranges covering all training ranks")
 
     def destinations(self, name: str) -> tuple[int, ...]:
         match = _EXPERT.fullmatch(name)
-        coordinate = bf16_expert_projection(name) if match is None else (int(match[1]), "")
+        coordinate = (
+            bf16_expert_projection(name.removesuffix("_scale_inv") if self.fp8_block_size is not None else name)
+            if match is None
+            else (int(match[1]), "")
+        )
         if coordinate is None:
             raise ValueError(f"Unsupported routed-expert tensor: {name}")
         return self.expert_destinations(coordinate[0])
@@ -65,8 +74,8 @@ class ExpertLayout:
         return tuple(offset + shard for offset in self.engine_offsets)
 
 
-def validate_bf16_server_layout(config: dict, gpu_count: int, ep_size: int, num_experts: int) -> None:
-    """Route through the native HF loader only for verified static BF16 EP."""
+def _validate_native_server_layout(config: dict, gpu_count: int, ep_size: int, num_experts: int) -> None:
+    """Shared native loader topology and model-override contract."""
     required = dict(
         tp_size=gpu_count,
         ep_size=ep_size,
@@ -77,14 +86,14 @@ def validate_bf16_server_layout(config: dict, gpu_count: int, ep_size: int, num_
         is_cuda=True,
     )
     if gpu_count != ep_size or any(config.get(key) != value for key, value in required.items()):
-        raise ValueError("BF16 routing requires CUDA, matching experts, TP=EP, PP1 and MoE DP1")
+        raise ValueError("Native expert routing requires CUDA, matching experts, TP=EP, PP1 and MoE DP1")
     overrides = json.loads(config.get("json_model_override_args") or "{}")
     if (
         not isinstance(overrides, dict)
         or set(overrides) - {"language_only", "language_model_only"}
         or any(type(v) is not bool for v in overrides.values())
     ):
-        raise ValueError("BF16 routing cannot verify this model override")
+        raise ValueError("Native expert routing cannot verify this model override")
     if (
         config.get("moe_runner_backend") not in ("deep_gemm", "triton", "flashinfer_cutlass")
         or config.get("speculative_algorithm") not in (None, "NEXTN", "EAGLE")
@@ -95,15 +104,66 @@ def validate_bf16_server_layout(config: dict, gpu_count: int, ep_size: int, num_
         or config.get("ep_join_mode")
         or config.get("elastic_ep_backend")
         or config.get("dwdp_size", 1) != 1
-        or config.get("quantization")
-        or config.get("quantization_config")
         or config.get("enable_lora")
         or config.get("enforce_shared_experts_fusion")
         or config.get("kt_weight_path")
+    ):
+        raise ValueError("Native expert routing requires an unfused static expert layout without a separate draft")
+
+
+def validate_bf16_server_layout(config: dict, gpu_count: int, ep_size: int, num_experts: int) -> None:
+    """Route through the native HF loader only for verified static BF16 EP."""
+    _validate_native_server_layout(config, gpu_count, ep_size, num_experts)
+    if (
+        config.get("quantization")
+        or config.get("quantization_config")
         or not config.get("disable_shared_experts_fusion")
         and config.get("num_shared_experts") != 0
     ):
-        raise ValueError("BF16 routing requires an unfused static expert layout and no separate draft/quantization")
+        raise ValueError("BF16 routing requires unfused shared experts and no quantization")
+
+
+def validate_fp8_server_layout(config: dict, gpu_count: int, ep_size: int, num_experts: int) -> tuple[int, int]:
+    """Use native FP8 conversion/loading with verified actual expert
+    ownership."""
+    _validate_native_server_layout(config, gpu_count, ep_size, num_experts)
+    quantization = config.get("quantization_config") or {}
+    block = quantization.get("weight_block_size")
+    if (
+        config.get("quantization") not in (None, "fp8")
+        or quantization.get("quant_method") != "fp8"
+        or quantization.get("fmt", "e4m3") != "e4m3"
+        or not isinstance(block, (list, tuple))
+        or len(block) != 2
+        or any(type(value) is not int or value <= 0 for value in block)
+    ):
+        raise ValueError("Native FP8 routing requires the existing blockwise E4M3 conversion")
+    profiles = config.get("native_fp8_experts")
+    if not isinstance(profiles, list) or len(profiles) != gpu_count or not all(profiles):
+        raise ValueError("Native FP8 receiver ownership is unavailable")
+    modules = {item["module"] for item in profiles[0]}
+    for tp_rank, profile in enumerate(profiles):
+        if len(profile) != len(modules) or {item["module"] for item in profile} != modules:
+            raise ValueError("Native FP8 workers disagree on their expert modules")
+        for item in profile:
+            expected = dict(
+                moe_ep_rank=tp_rank,
+                moe_ep_size=ep_size,
+                moe_tp_size=1,
+                _num_global_routed=num_experts,
+                _num_local_routed=num_experts // ep_size,
+                expert_begin=tp_rank * (num_experts // ep_size),
+                expert_end=(tp_rank + 1) * (num_experts // ep_size),
+                num_fused_shared_experts=0,
+            )
+            if any(item.get(key) != value for key, value in expected.items()):
+                raise ValueError("Native FP8 worker ownership does not match its routed destination")
+            if (
+                not {"w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv"}
+                <= item["parameters"].keys()
+            ):
+                raise ValueError("Native FP8 worker is missing complete native weight/scale parameters")
+    return tuple(block)
 
 
 def validate_server_layout(config: dict, gpu_count: int, ep_size: int, num_experts: int | None = None) -> None:
@@ -176,6 +236,33 @@ def build_transfer_plan(schemas: Sequence[Sequence[TensorSpec]], layout: ExpertL
                     send_indices[destination].append(index)
             if rank in destinations:
                 receive_specs[source].append(spec)
+        if layout.fp8_block_size is not None:
+            weights = {spec.name: spec for spec in schema if spec.name.endswith(".weight")}
+            scales = {
+                spec.name.removesuffix("_scale_inv"): spec
+                for spec in schema
+                if spec.name.endswith(".weight_scale_inv")
+            }
+            if len(weights) + len(scales) != len(schema) or weights.keys() != scales.keys():
+                raise ValueError("Native FP8 routing requires weight/scale pairs in the same source bucket")
+            fused = {}
+            for name, weight in weights.items():
+                scale = scales[name]
+                if (
+                    weight.dtype != torch.float8_e4m3fn
+                    or len(weight.shape) != 2
+                    or scale.dtype != torch.float32
+                    or scale.shape
+                    != tuple(
+                        (size + block - 1) // block
+                        for size, block in zip(weight.shape, layout.fp8_block_size, strict=True)
+                    )
+                ):
+                    raise ValueError("Native FP8 routing has an unsupported weight/scale schema")
+                _, projection = bf16_expert_projection(name)
+                fused.setdefault(name.rsplit(".", 2)[0], set()).add(projection)
+            if any(("gate" in projections) != ("up" in projections) for projections in fused.values()):
+                raise ValueError("Native FP8 routing requires complete fused gate/up projections")
         # Packed weights and scales must be complete within the source bucket.
         weights = {spec.name.removesuffix("_packed") for spec in schema if spec.name.endswith("_packed")}
         scales = {spec.name.removesuffix("_scale") for spec in schema if spec.name.endswith("_scale")}
@@ -222,8 +309,18 @@ class ExpertRouter:
         error: str | None = None,
         receive_budget: int | None = None,
     ) -> list[tuple[str, torch.Tensor]]:
-        schema = tuple(TensorSpec(name, tuple(tensor.shape), tensor.dtype) for name, tensor in named_tensors)
         cached = self._plans.get(bucket)
+        if (
+            cached is not None
+            and len(cached[0]) == len(named_tensors)
+            and all(
+                name == spec.name and tensor.shape == spec.shape and tensor.dtype == spec.dtype
+                for (name, tensor), spec in zip(named_tensors, cached[0], strict=True)
+            )
+        ):
+            schema = cached[0]
+        else:
+            schema = tuple(TensorSpec(name, tuple(tensor.shape), tensor.dtype) for name, tensor in named_tensors)
         # CPU-only agreement: no accelerator-to-host synchronization. A change
         # on one owner refreshes all ranks before any variable-sized collective.
         refresh = torch.tensor(
