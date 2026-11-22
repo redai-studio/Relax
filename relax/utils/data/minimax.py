@@ -75,15 +75,20 @@ def align_minimax_loss_mask(
     for token, learn, (start, end) in zip(
         original_encoding["input_ids"], short_mask.tolist(), original_encoding["offset_mapping"], strict=True
     ):
-        if learn and end > start and (mapped := char_offsets[start]) is not None:
-            targets[mapped, mapped + end - start, token] += 1
+        if not learn or end <= start:
+            continue
+        mapped = char_offsets[start]
+        if mapped is None:
+            continue
+        targets[mapped, mapped + end - start, token] += 1
     mask = []
     for token, (start, end) in zip(output_ids, expanded_encoding["offset_mapping"], strict=True):
         key = (start, end, token)
         learn = int(targets[key] > 0)
         mask.append(learn)
-        if learn:
-            targets[key] -= 1
+        if not learn:
+            continue
+        targets[key] -= 1
     if any(targets.values()):
         raise ValueError("MiniMax processor changed a supervised token during media expansion.")
     return torch.tensor(mask, dtype=torch.long)

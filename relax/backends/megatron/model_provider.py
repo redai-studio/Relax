@@ -79,6 +79,7 @@ def configure_model_fp32(model: torch.nn.Module, provider: Any = None) -> None:
         from megatron.core.transformer.module import mark_keep_in_fp32
     except ImportError:
         # Older MCore builds still use the HF loader's expert-bias restoration.
+        # Remove this fallback once all supported Float16Module wrappers honor FP32 marks.
         return
 
     declare_fp32_tensors = getattr(provider, "declare_fp32_tensors", None)
@@ -103,8 +104,9 @@ def configure_model_fp32(model: torch.nn.Module, provider: Any = None) -> None:
             # survives get_model's device placement before Float16Module.
             for name in ("expert_bias", "qb_bin_bounds"):
                 buffer = getattr(module, name, None)
-                if buffer is not None:
-                    mark_keep_in_fp32(buffer)
+                if buffer is None:
+                    continue
+                mark_keep_in_fp32(buffer)
 
 
 def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:

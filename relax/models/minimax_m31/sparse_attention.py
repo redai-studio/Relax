@@ -143,7 +143,6 @@ def _qsa_bs_dq_kernel(
     TOKBASE,
     KLIST,
     KCNT,
-    OUT,
     LSE,
     DO,
     DQ,
@@ -348,26 +347,33 @@ def _qsa_bs_dkdv_kernel(
     tl.store(DV + dv_offs, dv, mask=k_in[:, None])
 
 
-def _tile_mask(sel: Tensor, block_first: Tensor, block_last: Tensor, bq: int, bk: int, block_size: int) -> Tensor:
+def _tile_mask(
+    sel: Tensor,
+    block_first_token: Tensor,
+    block_last_token: Tensor,
+    bq: int,
+    key_tile_size_tokens: int,
+    block_size: int,
+) -> Tensor:
     """``[NQT, NKT]`` bool: some query in query tile ``i`` selected a block
     with a token in key tile ``j``.
 
-    Key tiles are absolute token ranges ``[j * bk, (j + 1) * bk)``, as the kernels walk them.
-    ``block_first`` / ``block_last`` ``[NB]`` are each block's inclusive token span; packed
+    Key tiles are absolute token ranges ``[j * key_tile_size_tokens, (j + 1) * key_tile_size_tokens)``, as the kernels walk them.
+    ``block_first_token`` / ``block_last_token`` ``[NB]`` are each block's inclusive token span; packed
     block ids drift from ``token // block_size`` once a sequence length is off the grid.
     """
     T, nb = sel.shape
     nqt = -(-T // bq)
-    nkt = -(-T // bk)
+    nkt = -(-T // key_tile_size_tokens)
     pad_q = nqt * bq - T
     if pad_q:
         sel = torch.nn.functional.pad(sel, (0, 0, 0, pad_q))
     picked = sel.view(nqt, bq, nb).amax(dim=1).to(torch.int32)
     tile = torch.zeros(nqt, nkt, dtype=torch.int32, device=sel.device)
     # a block wider than a tile, or off the tile grid, touches every tile between its first and last token
-    first_tile = block_first.long() // bk
-    last_tile = block_last.long() // bk
-    for off in range(-(-block_size // bk) + 1):
+    first_tile = block_first_token.long() // key_tile_size_tokens
+    last_tile = block_last_token.long() // key_tile_size_tokens
+    for off in range(-(-block_size // key_tile_size_tokens) + 1):
         tile.index_add_(1, torch.minimum(first_tile + off, last_tile), picked)
     return tile > 0
 
@@ -511,7 +517,6 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             tok_base,
             klist,
             kcnt,
-            o,
             lse,
             do,
             dq,

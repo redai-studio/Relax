@@ -47,20 +47,24 @@ def test_minimax_forward_returns_tensor_when_labels_are_absent():
     logits = torch.zeros(1, 3, 8)
     mask = torch.tensor([[0, 1, 1]])
     labels = torch.tensor([[1, 2, 3]])
+    expected_logits = logits.clone()
+    expected_mask = mask.clone()
 
     def language_forward(*, labels, loss_mask, **kwargs):
         if labels is None:
             assert loss_mask is None
             return logits
-        assert loss_mask is mask
+        torch.testing.assert_close(loss_mask, expected_mask, rtol=0, atol=0)
         return torch.zeros_like(labels, dtype=torch.float32)
 
     model.language_model = language_forward
-    assert model(loss_mask=mask) is logits
+    output = model(loss_mask=mask)
+    assert isinstance(output, torch.Tensor)
+    torch.testing.assert_close(output, expected_logits, rtol=0, atol=0)
 
     token_losses, returned_mask = model(labels=labels, loss_mask=mask)
     assert token_losses.shape == labels.shape
-    assert returned_mask is mask
+    torch.testing.assert_close(returned_mask, expected_mask, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

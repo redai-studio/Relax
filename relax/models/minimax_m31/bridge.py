@@ -52,9 +52,9 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
         if set(args.multimodal_keys or ()) - {"image"}:
             raise ValueError("MiniMax-M3.1-Flash SFT supports text and image inputs.")
         if (
-            getattr(args, "overlap_grad_reduce", False)
+            args.overlap_grad_reduce
             and not (self.freeze_vision_model and self.freeze_vision_projection)
-            and not (is_lora_enabled(args) and getattr(args, "lora_scope", "all") == "language")
+            and not (is_lora_enabled(args) and args.lora_scope == "language")
         ):
             raise ValueError("MiniMax SFT with trainable vision parameters requires overlap-grad-reduce off.")
         args.multimodal_host_grid_keys = ("image_grid_thw",)

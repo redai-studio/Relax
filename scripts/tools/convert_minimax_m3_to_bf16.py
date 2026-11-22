@@ -172,11 +172,12 @@ def main(model_dir: str, save_dir: str, layers: list[int] | None, device: str):
     (dst / "config.json").write_text(json.dumps(convert_config(config, layers), indent=2, ensure_ascii=False))
     for path in src.iterdir():
         if (
-            path.is_file()
-            and path.suffix != ".safetensors"
-            and path.name not in ("config.json", "model.safetensors.index.json")
+            not path.is_file()
+            or path.suffix == ".safetensors"
+            or path.name in ("config.json", "model.safetensors.index.json")
         ):
-            shutil.copy(path, dst / path.name)
+            continue
+        shutil.copy(path, dst / path.name)
     print(f"{counts} -> {dst} ({writer.num_shards} shards)")
 
 

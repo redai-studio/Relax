@@ -54,7 +54,7 @@ class MiniMaxRMSNorm(torch.nn.Module):
     """Per-head gemma RMSNorm that stays in fp32, so rope runs in fp32 and q/k
     round to bf16 once as in sglang."""
 
-    def __init__(self, config, hidden_size: int, eps: float = 1e-6):
+    def __init__(self, config, hidden_size: int, eps: float):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(hidden_size, dtype=config.params_dtype))
         self.weight.sequence_parallel = config.sequence_parallel
