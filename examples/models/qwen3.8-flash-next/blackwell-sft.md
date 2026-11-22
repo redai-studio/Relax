@@ -34,3 +34,5 @@ In the 50-update tuning experiment, the text baseline and PP2 recipe processed t
 - The multimodal path rebuilds images on the stage owning the vision encoder, including nested MFSDP wrappers. An earlier depth-limited check missed this stage and failed on the first update. Checkpoint and optimizer-state experiments that failed recovery and numerical checks were excluded.
 
 Compare workload counters alongside speed. The PP4 backend comparison uses the matched effective token and image counts per update. The full PP2 recipe uses a different packing policy and pipeline layout.
+
+The PP4 comparison keeps global weight-gradient fusion enabled in both recipes. The image patch makes grouped BF16 experts accumulate into persistent FP32 buffers even when pipeline microbatches reverse their forward order. The shared output projection accumulates gradients from every loss chunk and MTP use before reduce-scatter. The four-GPU regression compares individual gradients and two Adam updates against explicit matrix products with dense DP4 and expert DP1.
