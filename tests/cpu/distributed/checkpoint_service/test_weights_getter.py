@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
+import weakref
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -108,6 +109,50 @@ def test_bridge_snapshot_names_are_initialized_before_first_sync(monkeypatch):
         backend._thread_pool.shutdown()
 
 
+@pytest.mark.parametrize("rollout_only", [False, True])
+def test_ep1_preserves_etp_reconstruction_and_releases_converted_source(monkeypatch, rollout_only):
+    def no_ep_collective(*args, **kwargs):
+        pytest.fail("EP=1 must not copy already reconstructed expert weights")
+
+    monkeypatch.setattr(dist, "all_gather", no_ep_collective)
+    monkeypatch.setattr(dist, "all_gather_object", no_ep_collective)
+    gathered, raw, sent = [], [], []
+
+    def gather(args, name, param, **options):
+        assert options == {"copy_single_rank": True}
+        full = torch.cat([param, param + 10])
+        gathered.append(weakref.ref(full))
+        return full
+
+    def send(weights, pbar=None):
+        assert not bucket and gathered[0]() is None
+        sent.extend((name, value.clone()) for name, value in weights)
+
+    backend = DeviceDirectBackend.__new__(DeviceDirectBackend)
+    backend.args = Namespace(update_weight_buffer_size=1024, use_shard_p2p_weight_sync=True)
+    backend._megatron = SimpleNamespace(
+        all_gather_param=gather,
+        mpu=SimpleNamespace(get_expert_model_parallel_world_size=lambda: 1),
+    )
+    backend._lora_enabled = backend._lora_merge_mode = backend._lora_adapter_mode = False
+    backend._is_pp_src_rank = backend._use_bridge = True
+    backend._bridge_converter = SimpleNamespace(convert=lambda name, param: [("hf." + name, param + 100)])
+    backend._update_bucket_weights_from_distributed = send
+    backend._update_bucket_weights_from_distributed_for_actor_fwd_ref = lambda weights: raw.extend(
+        (name, value.clone()) for name, value in weights
+    )
+    bucket = []
+    local = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    backend._update_expert_weight_from_distributed("expert", local, bucket, 0, rollout_only)
+    backend._update_expert_bucket_weights_from_distributed(bucket, rollout_only)
+    expected = torch.cat([local, local + 10])
+    assert sent[0][0] == "hf.expert"
+    torch.testing.assert_close(sent[0][1], expected + 100)
+    assert len(raw) == int(not rollout_only)
+    if raw:
+        torch.testing.assert_close(raw[0][1], expected)
+
+
 def test_engine_client_threads_weights_getter(monkeypatch):
     from relax.distributed.checkpoint_service.client import engine as engine_mod
 
@@ -133,6 +178,41 @@ def test_engine_client_threads_weights_getter(monkeypatch):
 
     assert isinstance(client._backend, _CaptureBackend)
     assert captured["weights_getter"] is weights_getter
+
+
+@pytest.mark.parametrize("world_size", [1, 2, None])
+def test_actor_fwd_buckets_skip_only_when_topology_has_no_receivers(monkeypatch, world_size):
+    from relax.distributed.checkpoint_service.backends import device_direct
+
+    backend = _bare_backend(weights_getter=None, device=torch.device("cpu"))
+    backend.role_info = SimpleNamespace(role_name="actor")
+    backend.backend_type = "gloo"
+    backend._model_update_groups_for_actor_fwd_ref = None
+    backend._megatron.mpu = SimpleNamespace(
+        get_pipeline_model_parallel_rank=lambda: 0,
+        get_data_parallel_rank=lambda *, with_context_parallel: 0,
+        get_tensor_model_parallel_rank=lambda: 0,
+    )
+    backend.http_client = MagicMock()
+    backend.coordinator_url = "http://127.0.0.1:9"
+    group = object()
+    init_group = MagicMock(return_value=group)
+    monkeypatch.setattr(device_direct, "init_process_group", init_group)
+    topology = {"pp_groups": {"update_actor_pp_0": "tcp://127.0.0.1:12345"}}
+    if world_size is not None:
+        topology["world_size"] = world_size
+    backend.init_process_groups_for_actor_fwd_ref(topology)
+
+    broadcast = MagicMock()
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+    weight = torch.arange(4)
+    backend._update_bucket_weights_from_distributed_for_actor_fwd_ref([("w", weight)])
+    assert init_group.call_count == backend.http_client.post.call_count == broadcast.call_count == int(world_size != 1)
+    if world_size != 1:
+        assert broadcast.call_args.args[0].data_ptr() == weight.data_ptr()
+        assert broadcast.call_args.args[1] == 0
+        assert broadcast.call_args.kwargs == {"group": group, "async_op": True}
+        broadcast.return_value.wait.assert_called_once_with()
 
 
 def _import_actor_module():

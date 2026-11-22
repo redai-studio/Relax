@@ -138,7 +138,8 @@ def _colocate_control(manager: Any, operation: str, request: Any) -> dict | None
         raise ValueError("Colocate control requires one empty tensor")
     command = json.loads(weights[0][0])
     if (
-        command.get("op") in ("probe_nixl", "bind_epoch")
+        command.get("op") in ("probe_nixl", "bind_epoch", "retire")
+        or str(command.get("op", "")).startswith("replica_")
         or command.get("op") == "apply"
         and "epoch_generation" in command
     ):
@@ -167,6 +168,19 @@ def _guard_native_weights(manager: Any, operation: str, request: Any = None) -> 
             from .shard_p2p_weight_loader import validate_epoch_continuation
 
             validate_epoch_continuation(guard, control)
+        if operation in (
+            "release_memory_occupation",
+            "resume_memory_occupation",
+            "update_weights_from_disk",
+            "post_process_weights",
+            "finalize_pending_bf16_weights",
+        ):
+            from .shard_p2p_weight_loader import retire_persistent_targets
+
+            for model in guard.models:
+                if operation != "post_process_weights":
+                    retire_persistent_targets(model)
+                model.__dict__.pop("_relax_async_shard_layout", None)
     except Exception as exc:
         error = str(exc)
     try:
@@ -193,6 +207,9 @@ def install_native_weight_guard(manager_type: type | None = None) -> None:
     if manager_type is None:
         from sglang.srt.managers.scheduler_components.weight_updater import SchedulerWeightUpdaterManager
 
+        from .native_flat_bucket import install_native_flat_bucket
+
+        install_native_flat_bucket()
         manager_type = SchedulerWeightUpdaterManager
     originals = {}
     for name in _NATIVE_WEIGHT_OPERATIONS:
@@ -236,6 +253,11 @@ def install_native_weight_guard(manager_type: type | None = None) -> None:
                         raise
                 else:
                     result = method(self, *args, **kwargs)
+                    if name == "post_process_weights":
+                        from .shard_p2p_weight_loader import refresh_persistent_targets
+
+                        for model in guard.models:
+                            refresh_persistent_targets(model)
                 # A loader returning before remote completion is not permission
                 # for the next request to remap these native allocations.
                 error = None
@@ -245,13 +267,21 @@ def install_native_weight_guard(manager_type: type | None = None) -> None:
                         or guard.lease.failed
                         or (
                             (guard.lease.active is not None or guard.lease.pending)
-                            and (control is None or control.get("op") != "bind_epoch" or guard.colocate_owner is None)
+                            and (
+                                control is None
+                                or control.get("op") not in ("bind_epoch", "replica_ready", "replica_gather")
+                                or guard.colocate_owner is None
+                            )
                         )
                     ):
                         raise RuntimeError("Native weight loader returned with an unfinished allocation lease")
+                    if control is not None and control["op"] in ("replica_ready", "replica_gather"):
+                        from .shard_p2p_weight_loader import validate_epoch_continuation
+
+                        validate_epoch_continuation(guard, control)
                     if (
                         control is not None
-                        and control["op"] in ("probe_nixl", "bind_epoch")
+                        and control["op"] in ("probe_nixl", "bind_epoch", "replica_bootstrap", "replica_ready")
                         and not any(getattr(model, "_relax_weight_sync_reply", None) for model in guard.models)
                     ):
                         raise RuntimeError("Colocate control returned without its worker reply")

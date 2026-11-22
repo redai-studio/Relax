@@ -119,8 +119,8 @@ def test_idle_staging_release_rebuilds_or_retains_uncertain_storage(monkeypatch,
         del transport._FAILED_WRITERS[before:]
 
 
-@pytest.mark.parametrize("owns_buffer", [True, False])
-def test_ack_releases_colocate_staging_collectively(owns_buffer):
+@pytest.mark.parametrize("persistent,owns_buffer", [(False, True), (False, False), (True, True)])
+def test_ack_releases_colocate_staging_collectively_and_preserves_async(persistent, owns_buffer):
     from relax.distributed.checkpoint_service.backends.shard_p2p.synchronizer import (
         ShardP2PSynchronizer,
         _PendingUpdate,
@@ -128,7 +128,7 @@ def test_ack_releases_colocate_staging_collectively(owns_buffer):
 
     core = object.__new__(ShardP2PSynchronizer)
     held, observed = {"source": object()}, []
-    core.failed, core._has_remote, core._has_ipc = False, True, False
+    core.failed, core._has_remote, core._has_ipc, core.persistent_targets = False, True, False, persistent
     core._pending = _PendingUpdate(1, held)
     core._wait_for_receivers = lambda *a, **kw: observed.append("ACK")
 
@@ -143,7 +143,7 @@ def test_ack_releases_colocate_staging_collectively(owns_buffer):
     core._phase = phase
     core._writer = SimpleNamespace(release_buffers=release) if owns_buffer else None
     core.finish(version=1)
-    assert observed == ["ACK", "collective"] + (["release"] if owns_buffer else [])
+    assert observed == (["ACK"] if persistent else ["ACK", "collective"] + (["release"] if owns_buffer else []))
     assert core.completed_version == 1 and core.retained_sources is None
 
 

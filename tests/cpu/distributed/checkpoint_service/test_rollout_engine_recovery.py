@@ -14,6 +14,8 @@ now only raise when *no* healthy engine is left, prune the unhealthy ones, and
 invalidate the cached topology signature so the group is rebuilt cleanly.
 """
 
+import json
+from types import SimpleNamespace
 from typing import Callable, Set
 
 import pytest
@@ -24,6 +26,20 @@ pytest.importorskip("megatron.core")
 
 from relax.distributed.checkpoint_service.backends import device_direct
 from relax.distributed.checkpoint_service.backends.device_direct import DeviceDirectBackend
+
+
+def test_async_http_proxy_normalizes_dp_control_reply(monkeypatch):
+    cls = device_direct.RolloutEngine.__ray_metadata__.modified_class
+    engine = object.__new__(cls)
+    engine.base_url = "http://rollout"
+    reply = {"shard_p2p_nixl_capabilities": [{"supported": True, "layout": {"tp_size": 8}}]}
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {"success": True, "message": " | ".join([json.dumps(reply)] * 8)},
+    )
+    monkeypatch.setattr(device_direct.requests, "post", lambda *args, **kwargs: response)
+    result = engine.update_weights_from_tensor([], "relax.backends.sglang.shard_p2p_weight_loader.control_remote")
+    assert result["success"] is True and json.loads(result["message"]) == reply
 
 
 def _make_backend(engines: dict, health_fn: Callable[..., Set[int]]) -> DeviceDirectBackend:

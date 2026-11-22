@@ -43,6 +43,7 @@ def receiver(backend="triton", **overrides):
 def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypatch, failure):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
     updater.shard_p2p_requested = False
+    updater.quantization_config = None
     updater.args = SimpleNamespace(num_experts=4)
     updater.quantization_config = None
     updater._route_experts = updater._auto_expert_routing = False
@@ -173,6 +174,7 @@ def test_expert_dp_source_role_survives_checkpoint_group_cycle(tmp_path):
 
 @pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"format": "mxfp4-pack-quantized"}])
 def test_communicator_plan_is_independent_of_quantization_and_releases_on_remote_reconnect(monkeypatch, quantization):
+    monkeypatch.setenv("RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS", "1")
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
     updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(
@@ -331,6 +333,7 @@ def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, 
     create = Mock(return_value="ipc")
     monkeypatch.setattr(sync.dist, "new_group", create)
     updater.connect_rollout_engines([first], None, [2], [0])
+    updater.weight_version = 1
     updater.connect_rollout_engines([replacement], None, [2], [0])
     create.assert_called_once_with(ranks=[0, 1], backend="gloo")
     assert updater._ipc_engine is (replacement if rank == 0 else None)
@@ -407,7 +410,7 @@ def test_ordinary_wait_drains_all_readers_without_adding_collectives(monkeypatch
     reduce.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["conversion", "previous_ack", "dispatch"])
+@pytest.mark.parametrize("failure", ["conversion", "previous_ack", "dispatch", "catalogue"])
 def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch, failure):
     import weakref
 
@@ -419,16 +422,17 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
     updater._route_experts = updater.lora_enabled = updater.lora_merge_mode = False
     updater.quantization_config = None
     updater.weight_version = 0
+    updater._colocate_tp_ipc_enabled = failure == "catalogue"
     updater.rollout_engines = updater.distributed_rollout_engines = []
     updater.weights_getter = lambda: {}
     alive, completed = {}, []
 
     def chunks(weights):
-        yield []
+        yield [("head.weight", torch.ones(1))] if failure == "catalogue" else []
         if failure == "conversion":
             assert alive["chunk0"]() is not None
             raise RuntimeError("next conversion failed")
-        yield []
+        yield [("head.weight", torch.ones(2))] if failure == "catalogue" else []
 
     def send(tensors, *, dispatch_errors, defer_version=False):
         assert not defer_version
@@ -456,8 +460,12 @@ def test_pipeline_retains_both_chunks_until_submitted_readers_finish(monkeypatch
     monkeypatch.setattr(sync.dist, "barrier", lambda **kwargs: None)
     monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
     monkeypatch.setattr(sync.device_utils, "maybe_backend_barrier_on_weight_chunk", lambda **kw: None)
-    with pytest.raises(RuntimeError):
+    if failure == "catalogue":
         updater.update_weights()
+        assert getattr(updater, "_initial_native_tp_specs", None) is None
+    else:
+        with pytest.raises(RuntimeError):
+            updater.update_weights()
     assert set(completed) == set(alive)
 
 
