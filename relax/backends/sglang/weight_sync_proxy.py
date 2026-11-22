@@ -312,8 +312,10 @@ def _child(connection: Connection) -> None:
                 elif op == "status":
                     item = buffers[command["round"]]
                     if "completion" in item:
-                        while not item["completion"].cpu().item():
+                        while (completed := item["completion"].cpu().item()) == 0:
                             time.sleep(min(0.005, remaining(command["deadline"])))
+                        if completed != 1:
+                            raise ValueError("Invalid pipeline completion acknowledgement")
                     result = dict(success=True, full_required=item["status"].cpu().tolist())
                     del item
                 elif op == "release":
@@ -939,31 +941,46 @@ class WeightSyncProxy:
             record["status_acks"] += 1
             record["releases"] += 1
 
-    def finalize(self, update: str, *, timeout: float) -> dict:
+    def finalize(self, update: str, *, timeout: float, final_schema: dict | None = None) -> dict:
         try:
-            return self._finalize(update, timeout=timeout)
+            return self._finalize(update, timeout=timeout, final_schema=final_schema)
         except BaseException:
             if self._target_requested:
                 self._target_failed = True
             raise
 
-    def _finalize(self, update: str, *, timeout: float) -> dict:
+    def _finalize(self, update: str, *, timeout: float, final_schema: dict | None) -> dict:
         if self._target_failed:
             raise RuntimeError("Target shard publication has an ambiguous outcome")
         if update != self.version:
             raise ValueError("Final delta version differs from the active update")
         deadline = time.monotonic() + timeout
+        control = dict(op="finalize", version=update, frames=self.batch)
+        count = 2 if self._target_requested else 1
+        if final_schema is not None:
+            if (
+                self._target_requested
+                or len(self.children) != self.tp_size * self.pp_size
+                or not isinstance(final_schema, dict)
+                or type(final_schema.get("count")) is not int
+                or final_schema["count"] <= 0
+                or final_schema["count"] + 1 + int(self.pp_size > 1) > self._workspace_budget
+                or not isinstance(final_schema.get("digest"), str)
+                or len(final_schema["digest"]) != 64
+            ):
+                raise ValueError("Invalid final capability mask schema or workspace")
+            count += final_schema["count"]
+            control.update(full_required_count=final_schema["count"], full_required_schema=final_schema["digest"])
         empty = dict(bytes=0, entries=[])
         self.receive(self.batch, [empty] * len(self.children), self.staging_budget, timeout=remaining(deadline))
         self.ready(self.batch, timeout=remaining(deadline))
-        control = dict(op="finalize", version=update, frames=self.batch)
         replies = self._commands(
             [
                 dict(
                     op="export",
                     round=self.batch,
                     control=control,
-                    count=2 if self._target_requested else 1,
+                    count=count,
                 )
             ]
             * len(self.children),
@@ -980,6 +997,7 @@ class WeightSyncProxy:
         if self._target_requested:
             if len(statuses) != 4 or any(
                 len(r["full_required"]) != 2
+                or any(type(v) is not int for v in r["full_required"])
                 or r["full_required"][0] not in (0, 1)
                 or r["full_required"][1] not in (0, 1, 2)
                 for r in statuses
@@ -988,7 +1006,15 @@ class WeightSyncProxy:
                 raise RuntimeError("Incomplete target shard final acknowledgement")
             capable = all(r["full_required"][0] == 0 and r["full_required"][1] in (1, 2) for r in statuses)
             self._ordered_capable = all(r["full_required"] == [0, 2] for r in statuses)
-        elif len(statuses) != len(self.children) or any(r["full_required"] not in ([0], [1]) for r in statuses):
+        elif (
+            not statuses
+            or len(statuses) != len(self.children)
+            or any(
+                len(r["full_required"]) != count
+                or any(type(v) is not int or v not in (0, 1) for v in r["full_required"])
+                for r in statuses
+            )
+        ):
             raise RuntimeError("Incomplete delta final acknowledgement")
         if self.pp_size > 1:
             # FIFO at each scheduler makes this control run after its original
@@ -1001,20 +1027,26 @@ class WeightSyncProxy:
             self._request(
                 "update_weights_from_tensor", self._payload([r["serialized"] for r in replies]), deadline=deadline
             )
-            self._commands(
+            flushed = self._commands(
                 [dict(op="status", round=self.batch, deadline=deadline)] * len(self.children), deadline=deadline
             )
+            if len(flushed) != len(self.children) or any(r["full_required"] != [] for r in flushed):
+                raise RuntimeError("Incomplete pipeline flush acknowledgement")
         self._commands([dict(op="release", round=self.batch, consumed=True)] * len(self.children), deadline=deadline)
         self._request("update_weight_version", dict(new_version=update, abort_all_requests=False), deadline=deadline)
-        if self._target_requested:
-            self._target_capable = capable
-        return dict(
+        result = dict(
             success=True,
-            **({"target_shard_capable": self._target_capable} if self._target_requested else {}),
             force_full_seed=any(reply["full_required"][0] for reply in statuses),
             metrics=dict(self.metrics),
             proxies=self.identities,
         )
+        if self._target_requested:
+            self._target_capable = result["target_shard_capable"] = capable
+        elif final_schema is not None:
+            columns = zip(*(r["full_required"] for r in statuses), strict=True)
+            next(columns)  # The leading force-full byte has its own field in the reply.
+            result["full_required_mask"] = [int(any(bits)) for bits in columns]
+        return result
 
     def close(self, *, timeout: float = 10) -> None:
         if not self.children:

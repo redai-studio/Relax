@@ -502,6 +502,7 @@ class ShardDeltaExporter:
                     if self.transfer.ordered_target_consume:
                         constraints.update(self.transfer.apply())
                     result = self.transfer.finalize()
+                    constraints.update(result.pop("final_full_names"))
                     status[0] = dict(
                         result,
                         full=seed,
@@ -516,6 +517,8 @@ class ShardDeltaExporter:
                     error = exc
             agree(error)
             dist.broadcast_object_list(status, src=source_rank, group=group)
+            if seed:
+                self.full_names.clear()
             self.full_names.update(status[0]["full_names"])
             self._pending_version = version
             self._seed_after_commit = status[0]["force_full_seed"]

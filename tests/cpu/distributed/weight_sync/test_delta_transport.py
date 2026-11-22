@@ -140,7 +140,7 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
                 raise RuntimeError("receiver failed to install frame")
             return {"full_required": [f"name{kw['round_id']}"]}
         elif action == "finalize":
-            return {"success": True}
+            return {"success": True, "force_full_seed": False}
 
     monkeypatch.setattr(ray, "get", lambda refs, **kw: refs)
     transfer = DeltaTransfer(DeltaSyncConfig(stream="test", staging_budget_bytes=16), "cpu")
@@ -216,6 +216,8 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
                 raise RuntimeError(f"injected {failure} failure")
         if action == "consume":
             return {"full_required": [f"ordinary{kwargs['round_id']}"]}
+        if action == "finalize":
+            return dict(success=True, force_full_seed=False, full_required_mask=[0, 0])
         return {}
 
     monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
@@ -671,3 +673,37 @@ def test_target_lanes_only_negotiate_actual_four_way_tp(monkeypatch, layout, exp
         assert source.connection.get("target_shard_p2p", False) is expected
     finally:
         source.close()
+
+
+@pytest.mark.parametrize("bad", ["scalar", "absent", "long", "unwritten", "boolean", "failed", "missing_engine"])
+def test_source_rejects_incomplete_final_mask_from_one_engine(monkeypatch, bad):
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+
+    transfer = DeltaTransfer(DeltaSyncConfig(stream="mask"), "cpu")
+    transfer.connection = {}
+    transfer.engines = [SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=lambda *a, **k: None))] * 2
+    transfer.begin(version="2", base="1", seed=True, defer_apply=True)
+    transfer._applying = True
+    transfer._final_schema = {"a": ((2,), "float32"), "b": ((2,), "float32")}
+    good = dict(success=True, force_full_seed=False, full_required_mask=[1, 0])
+    damaged = dict(good)
+    if bad == "failed":
+        damaged["success"] = False
+    elif bad == "absent":
+        del damaged["full_required_mask"]
+    else:
+        damaged["full_required_mask"] = {
+            "scalar": [0],
+            "long": [0, 1, 0],
+            "unwritten": [0, 255],
+            "boolean": [0, True],
+        }.get(bad)
+    replies = [good] if bad == "missing_engine" else [good, damaged]
+    monkeypatch.setattr(ray, "get", lambda *a, **k: replies)
+    with pytest.raises(RuntimeError, match="Incomplete receiver final"):
+        transfer.finalize()

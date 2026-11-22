@@ -591,7 +591,7 @@ def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monk
     source.transfer.discard_prepared = release.set
     source.transfer.submit_frame = submit
     source.transfer.apply = set
-    source.transfer.finalize = lambda: {"receivers": [{"force_full_seed": False}]}
+    source.transfer.finalize = lambda: {"receivers": [{"force_full_seed": False}], "final_full_names": []}
     args = dict(engines=[], gpu_counts=[], version="0", group=object())
     errors = {
         "device_error": "device unavailable",
@@ -665,7 +665,7 @@ def _export_empty_pipeline_stage(rank, rendezvous):
             begin=lambda **kwargs: None,
             send=lambda directory, _raw, **_kwargs: frames.append(directory) or set(),
             ordered_target_consume=False,
-            finalize=lambda: {"receivers": [{"force_full_seed": False}]},
+            finalize=lambda: {"receivers": [{"force_full_seed": False}], "final_full_names": []},
         )
         model = {"layer": torch.zeros(8)} if rank == 1 else {}
         args = dict(engines=[], gpu_counts=[], group=group)

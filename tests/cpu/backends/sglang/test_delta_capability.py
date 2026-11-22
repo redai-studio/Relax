@@ -492,3 +492,270 @@ def test_declared_loader_that_materializes_iterator_keeps_unobserved_input_full(
     )
     assert torch.equal(model.weight, expected)
     assert status.tolist() == [1]
+
+
+@pytest.mark.parametrize("tp", [2, 3])
+def test_final_seed_mask_replays_unchanged_tied_writer_through_source_and_pipeline(monkeypatch, tp):
+    import ray
+    import torch.distributed as dist
+
+    from relax.backends.megatron.weight_update.delta_export import ShardDeltaExporter
+    from relax.backends.sglang.delta_pipeline import _install
+    from relax.backends.sglang.weight_sync_proxy import WeightSyncProxy, _status_buffer
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+
+    embed, head, row = "model.embed_tokens.weight", "lm_head.weight", "model.row.weight"
+    values = {embed: torch.ones(2, 2), head: torch.full((2, 2), 2.0), row: torch.arange(4 * tp).float().view(2, -1)}
+    iterator = SimpleNamespace(get_hf_weight_chunks=lambda shards: ([(name, shards[name])] for name in values))
+    config = DeltaSyncConfig(stream="tied", anchor_interval=3)
+    source = ShardDeltaExporter(iterator, SimpleNamespace(**vars(iterator)), snapshot_budget_bytes=1024, config=config)
+    transfer = source.transfer = DeltaTransfer(config, "cpu")
+    transfer.routes, transfer.connection = [], {}
+    monkeypatch.setattr(transfer, "connect", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0])
+    monkeypatch.setattr(dist, "all_gather_object", lambda out, obj, group: out.__setitem__(0, obj))
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda *args, **kwargs: None)
+
+    wire, emitted, replicas = {}, [], []
+
+    def stage(directory, raw):
+        wire[transfer.frame] = raw
+        emitted.extend((e["name"], e["full"], e["count"]) for e in directory["tensors"])
+        transfer._staged.append((transfer.frame, directory))
+        transfer.frame += 1
+
+    monkeypatch.setattr(transfer, "stage", stage)
+
+    def engine(pp):
+        models = []
+        for stage_id in range(pp):
+            for rank in range(tp):
+                m, layer = model_with_row()
+                layer.tp_size, layer.tp_rank = tp, rank
+                m.config.tie_word_embeddings = pp == 2
+                m.pp_group.is_last_rank = stage_id == pp - 1
+                if stage_id == 0:
+                    m.model.embed_tokens = torch.nn.Linear(2, 2, bias=False)
+                if m.pp_group.is_last_rank:
+                    m.lm_head = torch.nn.Linear(2, 2, bias=False)
+                models.append(m)
+        replicas.append(models)
+        proxy = WeightSyncProxy(None)
+        proxy.tp_size, proxy.pp_size = tp, pp
+        proxy.children = [None] * len(models)
+        proxy.identities = [dict(uuid="cpu")] * len(models)
+        statuses = []
+        monkeypatch.setattr(
+            proxy,
+            "_controls",
+            lambda controls, **_: [
+                load_delta_weights(m, [(json.dumps(c), torch.empty(0))]) for m, c in zip(models, controls, strict=True)
+            ],
+        )
+        monkeypatch.setattr(
+            proxy,
+            "_shared_controls",
+            lambda meta, _: (
+                [dict(op="consume", metadata=meta, frame=proxy.batch, version=proxy.version)] * len(models),
+                False,
+                b"",
+            ),
+        )
+
+        def commands(cmds, *, deadline):
+            op = cmds[0]["op"]
+            if op == "status":
+                assert pp == 1 or all(status[-1].item() == 1 for status in statuses)
+                return [dict(full_required=(s[:-1] if pp > 1 else s).tolist()) for s in statuses]
+            if op != "export":
+                return [dict(success=True)] * len(cmds)
+            statuses.clear()
+            for m, cmd in zip(models, cmds, strict=True):
+                control = cmd["control"]
+                raw = wire[cmd["round"]] if control["op"] == "consume" else torch.empty(0, dtype=torch.uint8)
+                status = _status_buffer(cmd["count"], bytes(int(pp > 1)), "cpu")
+                items = [(json.dumps(control), raw), ("__delta_capability__", status)]
+                (_install if pp > 1 else load_delta_weights)(m, items)
+                statuses.append(status)
+                if control["op"] == "consume" and proxy.version in ("0", "3"):
+                    assert not status[: cmd["count"]].any()  # Each early seed ACK is optimistic.
+            return [dict(serialized=None)] * len(cmds)
+
+        monkeypatch.setattr(proxy, "_commands", commands)
+        monkeypatch.setattr(proxy, "_payload", lambda *args, **kwargs: {})
+        monkeypatch.setattr(proxy, "_request", lambda *args, **kwargs: None)
+        monkeypatch.setattr(proxy, "receive", lambda *args, **kwargs: None)
+        monkeypatch.setattr(proxy, "ready", lambda *args, **kwargs: None)
+        return SimpleNamespace(
+            delta_weight_sync=SimpleNamespace(remote=lambda action, **kw: getattr(proxy, action)(**kw))
+        )
+
+    transfer.engines = (engine(1), engine(2))
+    reference, ref_row = model_with_row()
+    ref_row.tp_size = tp
+    reference.config.tie_word_embeddings = reference.pp_group.is_last_rank = True
+    reference.lm_head = torch.nn.Linear(2, 2, bias=False)
+    for step in range(5):
+        seed = step % 3 == 0
+        emitted.clear()
+        values[embed].add_(1)  # Later head remains unchanged, so its FULL replay is essential.
+        values[row][0, 1] += 10
+        result = source.synchronize(lambda: values, version=str(step), engines=[], gpu_counts=[], group=object())
+        assert result["full"] == seed and not result["force_full_seed"] and source.full_names == {embed, head}
+        assert emitted == [(embed, True, 4), (head, True, 4), (row, seed, 4 * tp if seed else 1)]
+        assert all("full_required_mask" not in reply for reply in result["receivers"])
+        with torch.no_grad():
+            reference.load_weights(values.items())
+        for rank, model in enumerate(replicas[1][tp:]):
+            assert torch.equal(model.lm_head.weight, reference.lm_head.weight)
+            assert torch.equal(model.model.row.weight, values[row][:, 2 * rank : 2 * rank + 2])
+            if not seed:
+                assert model._relax_delta_receiver.target_shard_metrics["local_words"] == int(rank == 0)
+        source.commit()
+
+
+def test_nested_chained_and_multi_region_writers_keep_disjoint_input_sparse():
+    from relax.distributed.weight_sync.codec import schema_digest
+
+    regions = {"a": (0, 8), "b": (1, 3), "c": (7, 11), "d": (10, 12), "e": (12, 13), "free": (13, 17)}
+
+    class Slices(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(17), requires_grad=False)
+            self.calls = 0
+
+        def load_weights(self, items):
+            self.calls += 1
+            for name, value in items:
+                start, stop = regions[name]
+                tensor = torch.from_dlpack(self.weight.detach()) if name == "b" else self.weight
+                tensor[start:stop].copy_(value)
+                if name == "e":
+                    tensor[2:3].copy_(value)
+
+        load_weights.relax_copy_layout = lambda model: (1, frozenset(regions))
+
+    model, reference = Slices(), Slices()
+    values = {name: torch.full((hi - lo,), float(i)) for i, (name, (lo, hi)) in enumerate(regions.items())}
+    schema = {name: (tuple(v.shape), "float32") for name, v in values.items()}
+    for step in range(2):
+        begin(model, str(step), seed=step == 0, base="0" if step else None)
+        values["a"].add_(1)
+        values["free"][0] += 1
+        for i, names in enumerate((["a", "b"], ["c", "d", "e", "free"])):
+            entries = []
+            for name in names:
+                v = values[name]
+                sparse = step == 1 and name == "free"
+                pos = torch.tensor([0], dtype=torch.int32) if sparse else None
+                entries.append((name, tuple(v.shape), v.dtype, pos, v[:1] if sparse else v))
+            directory, raw = encode(entries, max_bytes=1024)
+            directory["loader_ends"] = [1, len(entries)]
+            ack = torch.empty(len(entries), dtype=torch.uint8)
+            load_delta_weights(
+                model,
+                [
+                    (json.dumps(dict(op="consume", version=str(step), frame=i, metadata=directory)), raw),
+                    ("__delta_capability__", ack),
+                ],
+            )
+            for group in (names[:1], names[1:]):
+                reference.load_weights((name, values[name]) for name in group)
+        options = {} if step else dict(full_required_count=len(schema), full_required_schema=schema_digest(schema))
+        output = torch.full((1 if step else len(schema) + 1,), 255, dtype=torch.uint8)
+        load_delta_weights(
+            model,
+            [
+                (json.dumps(dict(op="finalize", version=str(step), frames=2, **options)), torch.empty(0)),
+                ("__delta_capability__", output),
+            ],
+        )
+        assert output.tolist() == ([0] if step else [0, 1, 1, 1, 1, 1, 0])
+        assert torch.equal(model.weight, reference.weight) and model.calls == reference.calls
+    assert model._relax_delta_receiver.target_shard_metrics["local_words"] == 1
+
+
+@pytest.mark.parametrize("bad", ["bool", "negative", "short", "extra", "order", "alias", "frames", "missing"])
+def test_bad_final_mask_keeps_old_version(bad):
+    from relax.distributed.weight_sync.codec import schema_digest
+
+    model, layer = model_with_row()
+    begin(model, "0", seed=True)
+    vals = torch.arange(8, dtype=torch.float32)
+    names = ("model.row.weight", "row_mirror")
+    directory, raw = encode([(n, (2, 4), vals.dtype, None, vals) for n in names], max_bytes=1024)
+    ack = torch.empty(2, dtype=torch.uint8)
+    load_delta_weights(
+        model,
+        [
+            (json.dumps(dict(op="consume", version="0", frame=0, metadata=directory)), raw),
+            ("__delta_capability__", ack),
+        ],
+    )
+    before = layer.weight.clone()
+    order = reversed(names) if bad == "order" else names
+    digest = schema_digest({name: ((2, 4), "float32") for name in order})
+    control = dict(
+        op="finalize",
+        version="0",
+        frames=int(bad != "frames"),
+        full_required_count={"negative": -1, "bool": True}.get(bad, 2),
+        full_required_schema=digest,
+    )
+    status = torch.empty({"short": 2, "extra": 4}.get(bad, 3), dtype=torch.uint8)
+    if bad == "alias":
+        status = layer.weight.detach().view(torch.uint8).flatten()[:3]
+    weights = [(json.dumps(control), torch.empty(0))]
+    if bad != "missing":
+        weights.append(("__delta_capability__", status))
+    with pytest.raises(ValueError):
+        load_delta_weights(model, weights)
+    receiver = model._relax_delta_receiver
+    assert receiver.failed and receiver.version is None and torch.equal(layer.weight, before)
+
+
+def test_delayed_unattributed_overwrite_cannot_approve_a_partial_final_mask():
+    from relax.distributed.weight_sync.codec import schema_digest
+
+    class Buffered(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+        def load_weights(self, weights):
+            delayed = []
+            for name, value in weights:
+                if name == "direct":
+                    self.weight.copy_(value)
+                else:
+                    delayed.append(value)
+            for value in delayed:
+                self.weight.copy_(value)
+
+        load_weights.relax_copy_layout = lambda model: (1, frozenset({"direct"}))
+
+    m = Buffered()
+    begin(m, "0", seed=True)
+    schema = {n: ((4,), "float32") for n in ("direct", "buffered")}
+    directory, raw = encode(
+        [(n, (4,), torch.float32, None, torch.full((4,), float(i))) for i, n in enumerate(schema)], max_bytes=128
+    )
+    status = torch.empty(3, dtype=torch.uint8)
+    load_delta_weights(
+        m,
+        [
+            (json.dumps(dict(op="consume", version="0", frame=0, metadata=directory)), raw),
+            ("__delta_capability__", status[:2]),
+        ],
+    )
+    assert status[:2].tolist() == [0, 1]
+    final = dict(
+        op="finalize", version="0", frames=1, full_required_count=2, full_required_schema=schema_digest(schema)
+    )
+    load_delta_weights(m, [(json.dumps(final), torch.empty(0)), ("__delta_capability__", status)])
+    assert status.tolist() == [1, 1, 1] and torch.equal(m.weight, torch.ones(4))

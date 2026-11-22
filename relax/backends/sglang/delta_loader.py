@@ -17,6 +17,7 @@ import math
 import sys
 import zlib
 from collections.abc import Iterable
+from contextlib import nullcontext
 from itertools import chain
 from typing import Any
 
@@ -24,7 +25,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils._pytree import tree_leaves
 
-from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, tensors, validate_directory
+from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, schema_digest, tensors, validate_directory
 from relax.utils.logging_utils import get_logger
 from relax.utils.sparse_tensor import FullTensorRequired, SparseTensor, storage_identity
 
@@ -127,6 +128,7 @@ class DeltaReceiver:
         self.active: dict | None = None
         self.failed = False
         self.schema: dict[str, tuple] = {}
+        self._schema_order: tuple[str, ...] = ()
         self.full_only: set[str] = set()
         self.workspace_peaks: dict[tuple, int] = {}
         self.last_workspace_peak_bytes: int | None = None
@@ -156,6 +158,7 @@ class DeltaReceiver:
             raise ValueError("Invalid target shard request binding")
         if control["seed"]:
             self._broadcast_plan = None
+            self._schema_order = ()
             self.full_only.clear()
         if control["seed"] or not requested:
             self._target_plan = None
@@ -532,6 +535,11 @@ class DeltaReceiver:
                 self.full_only.add(entry["name"])
             if self.active["control"]["seed"] and not entry["full"]:
                 raise ValueError("A FULL seed cannot contain omitted values")
+            ordinal = len(self.active["schema"])
+            if self._schema_order and (
+                ordinal >= len(self._schema_order) or self._schema_order[ordinal] != entry["name"]
+            ):
+                raise ValueError("Delta HF input order differs from the acknowledged schema")
             signature = (tuple(entry["shape"]), entry["dtype"])
             if not self.active["control"]["seed"] and self.schema.get(entry["name"]) != signature:
                 raise ValueError("Delta HF name/shape/dtype differs from the acknowledged schema")
@@ -652,7 +660,8 @@ class DeltaReceiver:
                     yield from self._decoded_weights(batch)
                     recheck = True
 
-        self.model.load_weights(weights())
+        with self._capture if self._capture is not None else nullcontext():
+            self.model.load_weights(weights())
         if pending:
             raise FullTensorRequired("Ordinary loader did not consume every admitted scatter")
 
@@ -674,14 +683,26 @@ class DeltaReceiver:
             for key, first, end, _ in batch
         )
 
-    def finalize(self, control: dict) -> None:
+    def finalize(self, control: dict, status: torch.Tensor | None = None) -> None:
         if (
             self.active is None
             or control.get("version") != self.active["control"]["version"]
+            or self.document is not None
+            or type(control.get("frames")) is not int
             or control["frames"] != self.active["next_frame"]
         ):
             raise ValueError("Cannot finalize an incomplete delta update")
         schema = self.active["schema"]
+        final_mask = "full_required_count" in control
+        if final_mask and (
+            status is None
+            or not self.active["control"]["seed"]
+            or self.active["control"].get("target_shard_request")
+            or type(control["full_required_count"]) is not int
+            or control["full_required_count"] != len(schema)
+            or control.get("full_required_schema") != schema_digest(schema)
+        ):
+            raise ValueError("Final capability mask differs from the ordered ordinary seed schema")
         if not schema or (not self.active["control"]["seed"] and schema != self.schema):
             raise ValueError("Delta update did not cover the acknowledged HF directory")
         # Applicable model/session finalization runs in the existing engine
@@ -697,7 +718,13 @@ class DeltaReceiver:
                 torch.cuda.synchronize(device)
         self.schema = schema
         if self.active["control"]["seed"]:
-            if self._capture is not None and self._capture.seal(self) and not self.force_full_seed:
+            if final_mask:
+                self._schema_order = tuple(schema)
+            if (
+                self._capture is not None
+                and self._capture.seal(self, final_mask=final_mask)
+                and not self.force_full_seed
+            ):
                 self._broadcast_plan = self._capture
             elif self._declared is not None or (self._capture and self._capture.conflicts - self.full_only):
                 self.force_full_seed = True
@@ -728,6 +755,20 @@ class DeltaReceiver:
                 getattr(parallel, "pp_rank", None),
                 self.target_shard_metrics,
             )
+        if status is not None:
+            if final_mask:
+                # A single copy under the original final publication fence.
+                bits = [self.force_full_seed, *(name in self.full_only for name in schema)]
+                status.copy_(torch.tensor(bits, dtype=torch.uint8, device="cpu"), non_blocking=True)
+            elif self.active["control"].get("target_shard_request"):
+                status[0].fill_(int(self.force_full_seed))
+                status[1].fill_(
+                    2 if self._seed_directory and self._target_plan else int(self._target_plan is not None)
+                )
+            else:
+                status.fill_(int(self.force_full_seed))
+            if status.device.type == "cuda":
+                torch.cuda.synchronize(status.device)
         self.version = self.active["control"]["version"]
         self.active = None
 
@@ -753,37 +794,26 @@ def load_delta_weights(model: Any, weights: Iterable[tuple[str, torch.Tensor]]) 
             receiver.consume(control, weights[0][1], weights[1][1])
         elif control["op"] == "finalize":
             requested = receiver.active is not None and receiver.active["control"].get("target_shard_request", False)
-            if requested and len(weights) != 2:
-                raise ValueError("Target shard finalization requires acknowledged capability output")
+            count = control.get("full_required_count", 0)
+            if ("full_required_count" in control or "full_required_schema" in control) and (
+                requested or type(count) is not int or count <= 0 or "full_required_schema" not in control
+            ):
+                raise ValueError("Invalid final capability mask request")
+            if (requested or count) and len(weights) != 2:
+                raise ValueError("Finalization requires acknowledged capability output")
             if len(weights) == 2:
                 status = weights[1][1]
-                if (
-                    weights[1][0] != "__delta_capability__"
-                    or status.dtype != torch.uint8
-                    or status.numel() != (2 if requested else 1)
-                ):
+                if weights[1][0] != "__delta_capability__" or status.dtype != torch.uint8:
                     raise ValueError("Invalid final receiver capability output")
                 if (
                     type(status) is not torch.Tensor
-                    or status.shape != ((2,) if requested else (1,))
+                    or status.shape != (2 if requested else 1 + count,)
                     or not status.is_contiguous()
                     or status.device != next(model.parameters()).device
                 ):
                     raise ValueError("Invalid final receiver status storage")
                 validate_transport_storage(model, (weights[0][1], status))
-            receiver.finalize(control)
-            if len(weights) == 2:
-                if requested:
-                    status[0].fill_(int(receiver.force_full_seed))
-                    status[1].fill_(
-                        2
-                        if receiver._seed_directory and receiver._target_plan
-                        else int(receiver._target_plan is not None)
-                    )
-                else:
-                    status.fill_(int(receiver.force_full_seed))
-                if status.device.type == "cuda":
-                    torch.cuda.synchronize(status.device)
+            receiver.finalize(control, weights[1][1] if len(weights) == 2 else None)
         else:
             raise ValueError("Unknown or incomplete delta loader operation")
     except BaseException:

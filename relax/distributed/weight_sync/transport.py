@@ -20,7 +20,7 @@ from itertools import groupby
 from time import monotonic
 from typing import Any
 
-from .codec import WIRE_ALIGNMENT
+from .codec import WIRE_ALIGNMENT, schema_digest
 from .config import RETAINED_DIRECTORY_BYTES, DeltaSyncConfig
 from .gpu_transport import GpuSyncGroup
 from .tcp_transport import TcpFrameSource
@@ -50,6 +50,7 @@ class DeltaTransfer:
         self._staged_bytes = [0] * 4
         self._directory_bytes = sys.getsizeof(self._staged)
         self._control: dict | None = None
+        self._final_schema: dict[str, tuple] | None = None
         self._applying = False
         self.ordered_target_consume = False
         self._ordered_inflight = False
@@ -200,6 +201,7 @@ class DeltaTransfer:
                 target_shard_entries=0,
                 target_shard_changed_words=0,
             )
+        self._final_schema = {} if seed and not self._control.get("target_shard_request") else None
         if not defer_apply:
             self.activate()
 
@@ -459,6 +461,12 @@ class DeltaTransfer:
                 )
             ):
                 raise RuntimeError("Incomplete ordered target-frame acknowledgement")
+            if self._final_schema is not None:
+                for entry in metadata["tensors"]:
+                    name = entry["name"]
+                    if name in self._final_schema:
+                        raise ValueError("Duplicate HF input in the ordinary seed schema")
+                    self._final_schema[name] = (tuple(entry["shape"]), entry["dtype"])
             required.update(name for reply in replies for name in reply["full_required"])
         self._ordered_inflight = False
         self._staged.clear()
@@ -619,13 +627,41 @@ class DeltaTransfer:
         self._require_drained()
         if not self._applying or self._staged or self._prepared is not None:
             raise RuntimeError("Cannot finalize before staged payload consumption")
+        options = {}
+        if self._final_schema is not None:
+            options["final_schema"] = dict(count=len(self._final_schema), digest=schema_digest(self._final_schema))
         replies = ray.get(
             [
-                engine.delta_weight_sync.remote("finalize", update=self.version, timeout=self.config.sync_timeout_s)
+                engine.delta_weight_sync.remote(
+                    "finalize", update=self.version, timeout=self.config.sync_timeout_s, **options
+                )
                 for engine in self.engines
             ],
             timeout=self.config.sync_timeout_s,
         )
+        if (
+            len(replies) != len(self.engines)
+            or not replies
+            or any(
+                not isinstance(reply, dict)
+                or reply.get("success") is not True
+                or type(reply.get("force_full_seed")) is not bool
+                for reply in replies
+            )
+        ):
+            raise RuntimeError("Incomplete receiver final acknowledgement")
+        full_names = set()
+        if self._final_schema is not None:
+            for reply in replies:
+                bits = reply.pop("full_required_mask", None)
+                if (
+                    not isinstance(bits, list)
+                    or len(bits) != len(self._final_schema)
+                    or any(type(v) is not int or v not in (0, 1) for v in bits)
+                ):
+                    raise RuntimeError("Incomplete receiver final capability mask")
+                full_names.update(name for name, bit in zip(self._final_schema, bits, strict=True) if bit)
+            self._final_schema = None
         if self._control and self._control.get("target_shard_request"):
             self.target_shard_capable = len(replies) == len(self.engines) == 2 and all(
                 reply.get("success") is True
@@ -636,6 +672,7 @@ class DeltaTransfer:
             self.target_shard_version = self.version if self.target_shard_capable else None
         return dict(
             self.metrics,
+            final_full_names=sorted(full_names),
             receivers=replies,
             routes=self.routes,
             nccl_group_name=self.connection["group_name"] if self.group is not None else None,
