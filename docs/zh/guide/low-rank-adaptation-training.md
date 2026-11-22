@@ -247,6 +247,8 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
 
+新版 Relax 在 `relax_lora_meta.json` 中记录视觉 QKV 的 LoRA B 行顺序。合并旧版 Relax 按注意力头交错导出的 adapter 时，传入 `--legacy-vision-qkv-layout megatron`。已确认按标准 Q/K/V 顺序导出的无标记 Relax adapter 可指定 `hf`。第三方标准 PEFT adapter 默认使用 HF 顺序。
+
 它刻意在**张量**层面合并，而不是用 `peft.merge_and_unload()`：`AutoModelForCausalLM` 会把多模态 checkpoint 静默解析成它的纯文本类（重新保存时丢掉 `vision_config` 和视觉塔），而 PEFT 按*模块*名匹配，看不到以 3 维 `nn.Parameter` 存储的 grouped MoE 专家——那恰恰是 A3B MoE 上训练容量的大头。该工具逐 shard 流式处理（内存上限是最大的单个 shard），原样拷贝 `config.json` 和各类辅助文件，并把「适配器张量配不上基座张量」视为硬错误而非静默丢弃。
 
 ## 故障排除

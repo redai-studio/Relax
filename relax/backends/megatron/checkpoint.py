@@ -1042,6 +1042,12 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
                 "lora_merge_mode": args.lora_merge_mode,
                 "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
             }
+            if any(".attn.qkv.lora_B." in name and ".visual.blocks." in name for name in merged):
+                from megatron.bridge.models.conversion.param_mapping import ConcatenatedQKVMapping
+
+                metadata["vision_qkv_b_layout"] = (
+                    "hf" if hasattr(ConcatenatedQKVMapping, "for_lora_output") else "megatron"
+                )
             with open(adapter_dir / "relax_lora_meta.json", "w") as f:
                 json.dump(metadata, f)
 

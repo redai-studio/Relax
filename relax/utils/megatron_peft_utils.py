@@ -515,6 +515,19 @@ def write_hf_peft_adapter(
     if "eh_proj" in target_modules and any(".mtp.fc.lora_" in f".{name}" for name in merged):
         target_modules = list(dict.fromkeys("fc" if name == "eh_proj" else name for name in target_modules))
 
+    # Visual modules use HF names such as attn.qkv, while the canonical
+    # training targets describe the text projections. Include the exact visual
+    # module paths that produced factors so unrelated modules cannot match.
+    target_modules = list(target_modules)
+    for name in sorted(merged):
+        module, sep, _ = name.partition(".lora_A.")
+        if (
+            sep
+            and ".visual." in module
+            and not any(module == target or module.endswith("." + target) for target in target_modules)
+        ):
+            target_modules.append(module.removeprefix("base_model.model."))
+
     # HF PEFT adapter config (JSON-safe: no enums).
     config_dict = build_hf_peft_config_dict(
         lora_rank=lora_rank,

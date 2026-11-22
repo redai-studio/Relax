@@ -160,8 +160,8 @@ class TestReadAdapterScaling:
     )
     def test_scaling_rule(self, tmp_path, config, expected):
         (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-        parsed, is_relax = merge_lora._read_adapter_config(tmp_path)
-        assert not is_relax
+        parsed, is_relax, layout = merge_lora._read_adapter_config(tmp_path)
+        assert not is_relax and layout == "hf"
         assert merge_lora._module_scaling(parsed, "proj", parsed["r"]) == pytest.approx(expected)
 
     def test_missing_rank_or_alpha_is_a_hard_error(self, tmp_path):
@@ -235,3 +235,50 @@ def test_hf_merge_rejects_rank_mismatch_and_duplicate_factors() -> None:
     with pytest.raises(ValueError, match="Duplicate"):
         merge_lora._pair_adapter_keys(["w.lora_A.weight", "w.lora_A.default.weight", "w.lora_B.weight"])
     assert merge_lora._module_scaling({"r": 4, "lora_alpha": 8, "use_rslora": True}, "w", 4) == 4
+
+
+@pytest.mark.parametrize(
+    ("sidecar", "explicit", "expected"),
+    [
+        (None, None, "hf"),
+        ({}, None, "unmarked"),
+        ({}, "megatron", "megatron"),
+        ({}, "hf", "hf"),
+        ({"vision_qkv_b_layout": "megatron"}, None, "megatron"),
+        ({"vision_qkv_b_layout": "hf"}, None, "hf"),
+        ({"vision_qkv_b_layout": "hf"}, "megatron", "conflict"),
+    ],
+)
+def test_visual_qkv_peft_layout(tmp_path, monkeypatch, sidecar, explicit, expected):
+    from safetensors.torch import load_file, save_file
+
+    base, adapter, out = (tmp_path / n for n in ("base", "adapter", "out"))
+    base.mkdir()
+    adapter.mkdir()
+    prefix = "model.visual.blocks.0.attn.qkv"
+    key = prefix + ".weight"
+    (base / "config.json").write_text(json.dumps({"vision_config": {"hidden_size": 4, "num_heads": 2}}))
+    (adapter / "adapter_config.json").write_text(json.dumps({"r": 1, "lora_alpha": 1}))
+    if sidecar is not None:
+        (adapter / "relax_lora_meta.json").write_text(json.dumps({"lora_rank": 1, "lora_alpha": 1, **sidecar}))
+    # Distinct rows in two heads make a head-interleaving bug directly visible.
+    a = torch.tensor([[1.0, 3.0, 5.0, 7.0]])
+    b = torch.arange(12.0)[:, None]
+    save_file({key: torch.zeros(12, 4)}, base / "model.safetensors")
+    save_file({prefix + ".lora_A.weight": a, prefix + ".lora_B.weight": b}, adapter / "adapter_model.safetensors")
+    argv = [str(_SCRIPT_PATH), "--base-hf-dir", str(base), "--adapter-dir", str(adapter), "--output-dir", str(out)]
+    if explicit:
+        argv.extend(["--legacy-vision-qkv-layout", explicit])
+    monkeypatch.setattr(sys, "argv", argv)
+    threads = torch.get_num_threads()
+    try:
+        if expected in ("unmarked", "conflict"):
+            with pytest.raises(ValueError, match="Unmarked|conflicts"):
+                merge_lora.main()
+            assert not (out / "model.safetensors").exists()
+            return
+        merge_lora.main()
+    finally:
+        torch.set_num_threads(threads)
+    rows = [0, 1, 6, 7, 2, 3, 8, 9, 4, 5, 10, 11] if expected == "megatron" else list(range(12))
+    torch.testing.assert_close(load_file(out / "model.safetensors")[key], b[rows] @ a, atol=0, rtol=0)

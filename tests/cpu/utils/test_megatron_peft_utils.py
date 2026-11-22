@@ -159,6 +159,8 @@ class TestWriteHfPeftAdapter:
         merged = {
             "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 16),
             "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(16, 8),
+            "base_model.model.model.visual.blocks.0.attn.qkv.lora_A.weight": torch.randn(8, 16),
+            "base_model.model.model.visual.blocks.0.attn.qkv.lora_B.weight": torch.randn(48, 8),
             f"base_model.model.mtp.{mtp_projection}.lora_A.weight": torch.randn(8, 32),
             f"base_model.model.mtp.{mtp_projection}.lora_B.weight": torch.randn(16, 8),
         }
@@ -179,7 +181,7 @@ class TestWriteHfPeftAdapter:
         config = json.loads((adapter_dir / "adapter_config.json").read_text())
         assert config["r"] == 8
         assert config["lora_alpha"] == 16
-        assert {"q_proj", "v_proj"}.issubset(config["target_modules"])
+        assert {"q_proj", "v_proj", "model.visual.blocks.0.attn.qkv"}.issubset(config["target_modules"])
         assert config["lora_dropout"] == 0.05
         assert config["peft_type"] == "LORA"
         assert config["bias"] == "none"

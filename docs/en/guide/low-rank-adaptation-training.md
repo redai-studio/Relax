@@ -247,6 +247,8 @@ python scripts/tools/merge_lora_adapter_to_hf.py \
     --output-dir  /path/to/Qwen3.6-35B-A3B-merged
 ```
 
+For visual QKV adapters, current Relax exports record the B factor row order in `relax_lora_meta.json`. When merging an older unmarked Relax adapter from the historical head-interleaved exporter, pass `--legacy-vision-qkv-layout megatron`. Use `hf` for an unmarked Relax adapter whose standard Q/K/V order has been verified. Standard third-party PEFT adapters use HF order by default.
+
 It merges at the **tensor** level rather than via `peft.merge_and_unload()`, on purpose: `AutoModelForCausalLM` silently resolves a multimodal checkpoint to its text-only class (dropping `vision_config` and the vision tower on re-save), and PEFT matches *modules* by name so it cannot see grouped MoE experts, which are 3-D `nn.Parameter` tensors — the bulk of the trained capacity on an A3B MoE. The tool streams one shard at a time (memory is bounded by the largest shard), copies `config.json` and auxiliary files verbatim, and treats an adapter tensor that fails to pair with a base tensor as a hard error rather than a silent drop.
 
 ## Troubleshooting

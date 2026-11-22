@@ -31,6 +31,49 @@ index a7e4a70..b7118ca 100644
              if isinstance(task.param_weight, DTensor):
                  from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                      uneven_dtensor_to_full_tensor,
+diff --git a/megatron/bridge/models/conversion/param_mapping.py b/megatron/bridge/models/conversion/param_mapping.py
+--- a/megatron/bridge/models/conversion/param_mapping.py
++++ b/megatron/bridge/models/conversion/param_mapping.py
+@@ -2959,2 +2959,9 @@
+
++    @classmethod
++    def for_lora_output(cls, parallel_mapping: MegatronParamMapping) -> "ConcatenatedQKVMapping":
++        """Gather B with its adapter parallelism, then publish its rows in HF QKV order."""
++        mapping = cls(parallel_mapping.megatron_param, parallel_mapping.hf_param)
++        mapping._tp_mapping = parallel_mapping
++        return mapping
++
+     def local_hf_param_specs(self, global_param_name: Optional[str] = None) -> tuple[LocalHFParamSpec, ...]:
+@@ -3027,3 +3034,4 @@
+             # Split weights
+-            q, k, v = split_qkv_weights(config, packed_qkv)
++            feature_dim = packed_qkv.shape[-1] if self.is_adapter else None
++            q, k, v = split_qkv_weights(config, packed_qkv, feature_dim=feature_dim)
+
+diff --git a/megatron/bridge/models/conversion/peft_bridge.py b/megatron/bridge/models/conversion/peft_bridge.py
+--- a/megatron/bridge/models/conversion/peft_bridge.py
++++ b/megatron/bridge/models/conversion/peft_bridge.py
+@@ -29,2 +29,3 @@
+     ColumnParallelMapping,
++    ConcatenatedQKVMapping,
+     ReplicatedMapping,
+@@ -757,2 +758,8 @@
+
++            linear_out_mapping = linear_out_mapping_cls(
++                megatron_param=local_linear_out_name, hf_param=hf_linear_out_name
++            )
++            base_mapping = mapping_registry.megatron_to_hf_lookup(global_base_prefix + base_suffix)
++            if isinstance(base_mapping, ConcatenatedQKVMapping) and adapter_key is None:
++                linear_out_mapping = ConcatenatedQKVMapping.for_lora_output(linear_out_mapping)
+             linear_out_task = WeightConversionTask(
+@@ -760,6 +767,3 @@
+                 global_param_name=global_linear_out_name,
+-                mapping=linear_out_mapping_cls(
+-                    megatron_param=local_linear_out_name,
+-                    hf_param=hf_linear_out_name,
+-                ),
++                mapping=linear_out_mapping,
+                 pp_rank=pp_rank,
 diff --git a/megatron/bridge/models/gemma/modeling_gemma4.py b/megatron/bridge/models/gemma/modeling_gemma4.py
 index 75f73be..148c991 100644
 --- a/megatron/bridge/models/gemma/modeling_gemma4.py
