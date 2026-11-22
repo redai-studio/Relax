@@ -28,13 +28,17 @@ def test_transport_downcasts_large_encoder_inputs(key: str) -> None:
 
 def test_transport_preserves_temporal_metadata() -> None:
     timestamps = torch.tensor([0.123456], dtype=torch.float32)
-    assert cast_encoder_input_for_transport(object(), "video_second_per_grid", timestamps) is timestamps
+    expected = timestamps.clone()
+    actual = cast_encoder_input_for_transport(object(), "video_second_per_grid", timestamps)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, check_dtype=True)
 
 
 def test_transport_preserves_minimax_pixels() -> None:
     pixels = torch.tensor([0.123456], dtype=torch.float32)
     processor = SimpleNamespace(image_token=IMAGE_TOKEN)
-    assert cast_encoder_input_for_transport(processor, "pixel_values", pixels) is pixels
+    expected = pixels.clone()
+    actual = cast_encoder_input_for_transport(processor, "pixel_values", pixels)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, check_dtype=True)
 
 
 def test_processor_pool_applies_image_token_limit_with_processor_patch_size() -> None:

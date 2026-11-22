@@ -11,11 +11,13 @@ from functools import lru_cache
 from pathlib import Path
 
 import torch
+from megatron.core.dist_checkpointing.core import CheckpointingException
 
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
+from torch.distributed.checkpoint import CheckpointException
 
 from relax.engine.sft.runtime import is_rm_mode
 from relax.utils import megatron_bridge_utils
@@ -762,12 +764,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     skip_load_to_model_and_opt=skip_load_to_model_and_opt,
                     strict=True,
                 )
-        except AssertionError as e:
-            if "OptimizerParamScheduler" in str(e):
-                raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
-            if load_optimizer and str(e).startswith("Number of unpadded elements in each bucket need to be the same"):
+        except (AssertionError, CheckpointException) as e:
+            if isinstance(e, AssertionError):
+                message = str(e)
+                if "OptimizerParamScheduler" in message:
+                    raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
+                bucket_mismatch = message.startswith("Number of unpadded elements in each bucket need to be the same")
+            else:
+                bucket_mismatch = _is_dp_reshardable_bucket_load_error(e)
+            if load_optimizer and bucket_mismatch:
                 raise RuntimeError(
-                    f"Cannot resume optimizer state from {iter_dir}: {e}\n"
+                    f"Cannot resume optimizer state from {iter_dir} because the optimizer bucket layout changed.\n"
                     "Resume with the original parameter precision and DDP bucket settings. To start from the saved "
                     f"model weights with a new optimizer, use --load {load_path} --finetune --save <new-directory>."
                 ) from e
@@ -788,6 +795,31 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             args=args,
             load_path=load_path,
         )
+
+
+def _is_dp_reshardable_bucket_load_error(error: CheckpointException) -> bool:
+    """Recognize optimizer bucket mismatches reported by the DCP planner."""
+    if not error.failures:
+        return False
+    for cause, _ in error.failures.values():
+        message = cause.args[0] if cause.args else None
+        if not isinstance(message, str):
+            return False
+        if isinstance(cause, CheckpointingException) and message.startswith("Global shape mismatch for loaded ("):
+            key = message.rpartition(" for key ")[2]
+        elif isinstance(cause, KeyError):
+            key = message.partition(" from model not in state dict:")[0]
+        elif isinstance(cause, RuntimeError) and message.startswith("Missing key in checkpoint state_dict: "):
+            key = message.removeprefix("Missing key in checkpoint state_dict: ").removesuffix(".")
+        else:
+            return False
+        if not re.fullmatch(
+            r"(?:chained_\d+\.)*optimizer\.distributed\.dp_group_idx_\d+\.gbuf_idx_\d+\."
+            r"dtype_.+\.bucket_idx_\d+\.\w+",
+            key,
+        ):
+            return False
+    return True
 
 
 def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:

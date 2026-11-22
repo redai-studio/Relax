@@ -21,6 +21,7 @@ pytest.importorskip("megatron.core", exc_type=ImportError)
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.strategies.torch import (
+    MCoreLoadPlanner,
     MCoreSavePlanner,
     TorchDistSaveShardedStrategy,
     _replace_state_dict_keys_with_sharded_keys,
@@ -181,3 +182,53 @@ def test_checkpoint_chained_optimizer_resumes_adam_and_scheduler(
     finally:
         if owned_group:
             dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("mismatch", ["bucket_shape", "bucket_key", "model_shape"])
+def test_checkpoint_optimizer_bucket_planning_errors(monkeypatch, tmp_path, mismatch):
+    path = tmp_path / "iter_0000003"
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("3")
+    weight_key = "language_model.decoder.layers.mlp.router.weight"
+    bucket_prefix = "chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.float32)"
+    saved_bucket = f"{bucket_prefix}.bucket_idx_0.exp_avg"
+    requested_bucket = f"{bucket_prefix}.bucket_idx_1.exp_avg" if mismatch == "bucket_key" else saved_bucket
+    weight = torch.tensor([0.5, -1.0], dtype=torch.bfloat16)
+    dcp.save(
+        {
+            weight_key: weight,
+            saved_bucket: torch.zeros(2),
+            "iteration": 3,
+            "opt_param_scheduler": {"steps": 3},
+        },
+        checkpoint_id=path,
+    )
+    args = Namespace(load=str(tmp_path), ckpt_format="torch_dist", no_load_rng=True, finetune=False)
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+
+    def load_on_cpu(**kwargs):
+        state = {weight_key: torch.empty(3 if mismatch == "model_shape" else 2, dtype=torch.float32)}
+        if not args.finetune:
+            state[requested_bucket] = torch.empty(3 if mismatch == "bucket_shape" else 2)
+        planner = MCoreLoadPlanner(
+            shapes_validation_sharded_tensors=[
+                ShardedTensor.from_rank_offsets(key, tensor) for key, tensor in state.items()
+            ]
+        )
+        dcp.load(state, checkpoint_id=path, planner=planner, no_dist=True)
+        torch.testing.assert_close(state[weight_key], weight.float(), rtol=0, atol=0)
+        return 0, 0
+
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", load_on_cpu)
+    model = [Namespace(role="actor")]
+    optimizer = object()
+    if mismatch == "model_shape":
+        with pytest.raises(dcp.CheckpointException, match="Global shape mismatch"):
+            checkpoint.load_checkpoint(model, optimizer, None, {}, False)
+        return
+
+    with pytest.raises(RuntimeError, match="--finetune --save <new-directory>") as error:
+        checkpoint.load_checkpoint(model, optimizer, None, {}, False)
+    assert isinstance(error.value.__cause__, dcp.CheckpointException)
+    assert str(path) in str(error.value)
+    args.finetune = True
+    assert checkpoint.load_checkpoint(model, optimizer, None, {}, False) == (0, 0)
