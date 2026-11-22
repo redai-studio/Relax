@@ -390,11 +390,11 @@ class FSDPSFTTrainer:
 
         dist.broadcast_object_list(holder, src=0, group=get_gloo_group())
         global_ids = holder[0]
+        tagged_batch = self.sampler.batch_with_padding(step)
         positions = assign_image_batch_positions(global_ids, self.args.i2i_sft_config, step=step, world=self.world)
         rank_positions = positions[self.rank :: self.world]
         ids = [global_ids[pos] for pos in rank_positions]
-        step_start = (step % self.sampler.steps_per_epoch) * self.sampler.batch_size
-        padding_flags = [(step_start + pos) >= self.sampler.size for pos in rank_positions]
+        padding_flags = [tagged_batch[pos][1] for pos in rank_positions]
         started = time.monotonic()
         tracker = getattr(self, "tracker", None)
         if tracker is not None:

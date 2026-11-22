@@ -176,6 +176,20 @@ def fsdp_worker(rank: int, world: int, directory: str, mode: str) -> None:
                     if enabled
                     else None
                 )
+                resumed_trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
+                resumed_trainer.world, resumed_trainer.control_group, resumed_trainer.condition_cache = (
+                    world,
+                    control,
+                    resumed_cache,
+                )
+                if enabled:
+                    # 加载 checkpoint 前先经根模块前向写入一条缓存，验证 DCP 恢复会真实清空已有缓存并推进失效计数。
+                    resumed_trainer._prepare_conditions(data, 5, 0, 1)
+                    with torch.no_grad():
+                        resumed_model(data)
+                    resumed_cache.end_micro()
+                    assert resumed_cache.stats()["entries"] == 1
+                    assert resumed_cache.stats()["version_invalidations"] == 0
                 resumed_parameters = [p for p in resumed_model.parameters() if p.requires_grad]
                 with torch.no_grad():
                     for p in resumed_parameters:
@@ -197,6 +211,7 @@ def fsdp_worker(rank: int, world: int, directory: str, mode: str) -> None:
                 assert torch.equal(torch.cuda.get_rng_state(device), expected_step6_rng[1])
                 if enabled:
                     assert resumed_cache.stats()["entries"] == 0
+                    assert resumed_cache.stats()["version_invalidations"] >= 1
                 restored_moments = [
                     (
                         resumed_optimizer.state[p]["exp_avg"].to_local(),
@@ -209,12 +224,6 @@ def fsdp_worker(rank: int, world: int, directory: str, mode: str) -> None:
                 for (act_m, act_v), (exp_m, exp_v) in zip(restored_moments, expected_moments, strict=True):
                     assert torch.equal(act_m, exp_m)
                     assert torch.equal(act_v, exp_v)
-                resumed_trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
-                resumed_trainer.world, resumed_trainer.control_group, resumed_trainer.condition_cache = (
-                    world,
-                    control,
-                    resumed_cache,
-                )
                 resumed_optimizer.zero_grad(set_to_none=True)
                 if enabled:
                     resumed_trainer._prepare_conditions(data, 6, 0, 1)

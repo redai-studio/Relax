@@ -1109,6 +1109,7 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
     run_id = next(iter(run_ids))
 
     missing_ranks = [r for r in range(world_size) if r not in rank_step_records]
+    missing_summaries = [r for r in range(world_size) if r not in rank_summaries]
     steps_by_rank: dict[int, list[int]] = {}
     for rank in ranks:
         rank_steps = [int(rec["step"]) for rec in rank_step_records[rank]]
@@ -1117,14 +1118,29 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
         steps_by_rank[rank] = rank_steps
     expected_steps = steps_by_rank[ranks[0]]
     mismatched_steps = [rank for rank in ranks[1:] if steps_by_rank[rank] != expected_steps]
+    summary_step_mismatches = [
+        rank
+        for rank in ranks
+        if rank in rank_summaries and int(rank_summaries[rank].get("total_steps", -1)) != len(steps_by_rank[rank])
+    ]
     incomplete_summaries = sorted(rank for rank, data in rank_summaries.items() if data.get("complete") is False)
-    is_complete = not missing_ranks and not mismatched_steps and not incomplete_summaries
+    is_complete = (
+        not missing_ranks
+        and not missing_summaries
+        and not mismatched_steps
+        and not summary_step_mismatches
+        and not incomplete_summaries
+    )
     if not is_complete and not allow_incomplete:
         problems = []
         if missing_ranks:
             problems.append(f"missing ranks {missing_ranks} for world_size={world_size}")
+        if missing_summaries:
+            problems.append(f"missing rank summaries {missing_summaries} for world_size={world_size}")
         if mismatched_steps:
             problems.append(f"step mismatch across ranks { {r: steps_by_rank[r] for r in ranks} }")
+        if summary_step_mismatches:
+            problems.append(f"summary total_steps mismatch for ranks {summary_step_mismatches}")
         if incomplete_summaries:
             problems.append(f"incomplete rank summaries {incomplete_summaries}")
         raise ValueError("Incomplete baseline records: " + "; ".join(problems))
@@ -1522,7 +1538,10 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
         summary["run_id"] = run_id
     if not is_complete:
         summary["missing_ranks"] = missing_ranks
+        summary["missing_summaries"] = missing_summaries
         summary["recorded_steps_by_rank"] = {str(rank): steps_by_rank[rank] for rank in ranks}
+        if summary_step_mismatches:
+            summary["summary_step_mismatches"] = summary_step_mismatches
     if "tracker_schema" in first_rank_steps[0]:
         summary["tracker_schema"] = schema.name
     if cache_stats:
@@ -1533,6 +1552,7 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
         total_effective_reuses = sum(int(item.get("effective_reuses", 0)) for item in cache_stats.values())
         total_forced_online = sum(int(item.get("group_forced_online", 0)) for item in cache_stats.values())
         summary["condition_cache_summary"] = {
+            "ranks_covered": sorted(int(rank) for rank in cache_stats),
             "requests": total_requests,
             "lookups": total_lookups,
             "local_hits": total_local_hits,

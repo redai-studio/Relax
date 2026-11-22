@@ -702,6 +702,32 @@ def test_summarize_baseline_dir_detects_missing_stale_and_mixed_runs(tmp_path: P
     with pytest.raises(ValueError, match="step mismatch"):
         summarize_baseline_dir(step_mismatch_dir)
 
+    # 单 rank 缺失 summary.json 或 summary.total_steps 与 steps.jsonl 行数不符时严格模式必须报错。
+    no_summary_dir = tmp_path / "missing_summary"
+    tr_single = ConditionTracker(
+        rank=0,
+        world_size=1,
+        micro_batches=1,
+        dataset_size=1,
+        output_dir=no_summary_dir,
+        warmup_steps=0,
+        run_id="run-d",
+    )
+    tr_single.begin_step(0, torch.device("cpu"))
+    tr_single.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+    tr_single.end_step(0, 0.001, 0.01)
+    with pytest.raises(ValueError, match="missing rank summaries \\[0\\]"):
+        summarize_baseline_dir(no_summary_dir)
+    partial_single = summarize_baseline_dir(no_summary_dir, allow_incomplete=True)
+    assert partial_single["complete"] is False
+    assert partial_single["missing_summaries"] == [0]
+
+    tr_single.save_summary()
+    summary_path = no_summary_dir / "rank_0_summary.json"
+    summary_path.write_text(summary_path.read_text(encoding="utf-8").replace('"total_steps": 1', '"total_steps": 2'))
+    with pytest.raises(ValueError, match="summary total_steps mismatch"):
+        summarize_baseline_dir(no_summary_dir)
+
 
 def test_tracker_io_error_does_not_abort_step_or_mask_training_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -793,6 +819,7 @@ def test_summarize_baseline_dir_reports_authoritative_condition_cache_rates(tmp_
     agg = summarize_baseline_dir(cache_dir)
     assert agg["complete"] is True
     assert agg["condition_cache_summary"] == {
+        "ranks_covered": [0, 1],
         "requests": 8,
         "lookups": 8,
         "local_hits": 5,
