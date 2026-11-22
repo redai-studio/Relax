@@ -122,7 +122,7 @@ def test_retained_weights_release_after_both_readers_and_never_resume_on_failure
         return backup_event
 
     def update(*, backup_done=None):
-        assert backup_done is (backup_event if retain_actor_weights else None)
+        assert backup_done is (backup_event if expected_retained else None)
         # Simulate a checkpoint having destroyed NCCL groups before this call.
         assert "reload_groups" in events
         assert set(actor.weight_updater.weights_getter()) == set(expected)

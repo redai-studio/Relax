@@ -44,6 +44,7 @@ def test_bf16_routing_negotiates_before_enabling_and_restores_fallback(monkeypat
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
     updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(num_experts=4)
+    updater.quantization_config = None
     updater._route_experts = updater._auto_expert_routing = False
     updater.rollout_engines = [Mock()]
     configured, reductions = [], []
@@ -193,6 +194,12 @@ def test_communicator_plan_is_independent_of_quantization_and_releases_on_remote
     monkeypatch.setattr(sync.dist, "get_rank", lambda **kwargs: 0)
     retain = Mock(return_value=(group,))
     monkeypatch.setattr(sync, "retain_process_groups", retain)
+    monkeypatch.delenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", raising=False)
+    monkeypatch.delenv("RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS", raising=False)
+    updater._configure_sync_process_groups()
+    assert updater.process_groups_for_update is None
+    retain.assert_not_called()
+    updater.shard_p2p_requested = True
     updater._configure_sync_process_groups()
     assert updater.process_groups_for_update == (group,)
     retain.assert_called_once_with([group], metadata_group="gloo")
@@ -300,6 +307,7 @@ def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monk
 @pytest.mark.parametrize("rank", [0, 3])
 def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, rank):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.weight_version = 1
     updater.shard_p2p_requested = False
     updater.args = SimpleNamespace(
         rollout_num_gpus_per_engine=2,

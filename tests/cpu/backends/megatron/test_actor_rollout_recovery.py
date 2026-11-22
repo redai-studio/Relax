@@ -33,6 +33,7 @@ def test_update_weights_shares_rollout_recovery_result_before_weight_sync(monkey
         use_fault_tolerance=True,
     )
     actor.rollout_manager = manager
+    actor.weight_updater = SimpleNamespace(weight_version=1)
 
     class ReachedWeightSync(BaseException):
         pass

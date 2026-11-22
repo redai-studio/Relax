@@ -366,7 +366,7 @@ class UpdateWeightFromTensor:
         if (
             not (
                 self.shard_p2p_requested
-                or Envs.RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS
+                or getattr(Envs, "RELAX_COLOCATE_KEEP_TRAIN_PROCESS_GROUPS", False)
                 or Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP
             )
             or not getattr(self.args, "offload_train", False)

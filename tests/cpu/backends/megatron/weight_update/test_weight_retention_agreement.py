@@ -64,7 +64,7 @@ def _receiver_agreement_worker(rank, rendezvous, directory, fault):
         engine = SimpleNamespace(
             get_pid_and_node_id=SimpleNamespace(remote=query),
             get_expert_weight_sync_layout=SimpleNamespace(
-                remote=lambda: dict(
+                remote=lambda *, require_nixl: dict(
                     device="cuda",
                     dtype="bfloat16",
                     tp_size=2,

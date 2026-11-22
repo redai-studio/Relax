@@ -321,7 +321,8 @@ def test_synchronizer_reconnect_rebuilds_bindings_and_releases_fresh_sources(set
                             )
                         )
                     elif command["op"] == "seed":
-                        assert command["delivery"] == deliveries[tp]
+                        assert command["prepared_delivery_hash"] == deliveries[tp]["plan_hash"]
+                        assert not {"delivery", "geometry", "writes"}.intersection(command)
                     else:
                         assert command["delivery_hash"] == deliveries[tp]["plan_hash"]
                         assert helper.completed_version == (version - 1 if version else None)
