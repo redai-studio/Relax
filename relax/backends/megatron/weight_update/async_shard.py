@@ -194,18 +194,6 @@ def prepare_async_shard_iterator(backend, *, prepare_native: bool = False) -> Hf
     return iterator
 
 
-def initial_rollout_only(backend) -> bool:
-    """Prove every current PP sender has no ActorFwd or Ref recipients."""
-    sender = getattr(backend, "_is_pp_src_rank", None)
-    group = backend._model_update_groups_for_actor_fwd_ref
-    supported = getattr(backend, "_actor_fwd_ref_world_size", None) == 1 and (
-        sender is False or sender is True and group is not None and dist.get_world_size(group) == 1
-    )
-    ready = torch.tensor([int(supported)], dtype=torch.int32, device="cpu")
-    dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=get_gloo_group())
-    return bool(ready.item())
-
-
 class AsyncShardSync:
     """Keep Async scheduling separate from the common data/transport core.
 

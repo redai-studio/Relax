@@ -452,31 +452,6 @@ def test_initial_native_schema_reuse_preserves_trained_version_and_native_fallba
         assert events[:2] == [("native", ["direct", "fallback"]), ("prepare", version, invalid == "audit")]
 
 
-@pytest.mark.parametrize(
-    "sender,declared,actual,expected",
-    [
-        (True, 1, 1, True),
-        (True, 1, None, False),
-        (True, 2, 1, False),
-        (True, 1, 2, False),
-        (False, 1, None, True),
-        (None, 1, None, False),
-    ],
-)
-def test_initial_direct_requires_actual_empty_reference_recipient_groups(
-    monkeypatch, sender, declared, actual, expected
-):
-    backend = SimpleNamespace(
-        _is_pp_src_rank=sender,
-        _actor_fwd_ref_world_size=declared,
-        _model_update_groups_for_actor_fwd_ref="recipients" if actual is not None else None,
-    )
-    monkeypatch.setattr(module, "get_gloo_group", lambda: "actors")
-    monkeypatch.setattr(module.dist, "get_world_size", lambda group: actual)
-    monkeypatch.setattr(module.dist, "all_reduce", lambda *args, **kwargs: None)
-    assert module.initial_rollout_only(backend) is expected
-
-
 @pytest.mark.parametrize("remote", ["valid", "missing", "version", "topology", "conflict"])
 def test_native_schema_includes_other_pipeline_stages(monkeypatch, remote):
     sync = object.__new__(module.AsyncShardSync)

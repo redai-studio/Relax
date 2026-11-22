@@ -687,7 +687,6 @@ class DeviceDirectBackend(CommBackend):
         global_rank = topology_data.get("global_rank")
         pp_groups = topology_data.get("pp_groups")
         world_size = topology_data.get("world_size", 1)
-        self._actor_fwd_ref_world_size = topology_data.get("world_size")
 
         if self.role_info.role_name == "actor":
             # A source-only topology has no actor_fwd/reference recipients.
@@ -766,16 +765,9 @@ class DeviceDirectBackend(CommBackend):
         ):
             from relax.backends.megatron.weight_update.async_shard import (
                 AsyncShardSync,
-                initial_rollout_only,
                 supports_async_shards,
             )
 
-            if (
-                self.weight_version == 0
-                and not rollout_only
-                and supports_async_shards(self, rollout_only=True, actor_fwd_only=actor_fwd_only)
-            ):
-                rollout_only = initial_rollout_only(self)
             if supports_async_shards(self, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only):
                 if shard is None:
                     self._async_shard_sync = shard = AsyncShardSync(self)
