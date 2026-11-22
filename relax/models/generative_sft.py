@@ -15,21 +15,15 @@ class GenerativeSFTAdapter(Protocol):
 
     Adapters may optionally declare ``validate_sft_config``,
     ``image_tier_policy``, ``cpu_only_prepare_sample`` and
-    ``frozen_module_prefixes`` to override the legacy defaults.
+    ``frozen_module_prefixes`` to override the legacy defaults, and may
+    implement :class:`ConditionTrackerAdapter` or
+    :class:`ConditionCacheAdapter` to enable baseline tracking or condition
+    caching.
     """
 
     family: str
     supported_tasks: tuple[str, ...]
     lora_target_modules: tuple[str, ...]
-
-    def bind_tracker(self, model: torch.nn.Module, tracker: Any | None) -> None:
-        """Attach the online encoding tracker to the model."""
-        ...
-
-    @staticmethod
-    def tracker_schema() -> Any:
-        """Return the model's encoding and transfer declarations."""
-        ...
 
     def load_train_model(self, args: Any) -> torch.nn.Module:
         """Return the complete forward root: model(sample) yields scalar
@@ -51,6 +45,24 @@ class GenerativeSFTAdapter(Protocol):
         sample deterministic random stream (e.g. fixed-pixel tier sampling)
         that survives checkpoint resume.
         """
+        ...
+
+
+@runtime_checkable
+class ConditionTrackerAdapter(Protocol):
+    """Adapter methods required to record online encoding baseline metrics.
+
+    With ``baseline_stats_dir`` configured, the SFT trainer rejects adapters
+    that do not implement this protocol.
+    """
+
+    def bind_tracker(self, model: torch.nn.Module, tracker: Any | None) -> None:
+        """Attach the online encoding tracker to the model."""
+        ...
+
+    @staticmethod
+    def tracker_schema() -> Any:
+        """Return the model's encoding and transfer declarations."""
         ...
 
 

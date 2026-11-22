@@ -16,7 +16,7 @@ from relax.engine.sft.condition_tracker import (
     compute_past_key_values_bytes,
     summarize_baseline_dir,
 )
-from relax.engine.sft.image import ImageBatchSampler, assign_image_batch
+from relax.engine.sft.image import ImageBatchSampler
 
 
 def _make_rows() -> list[dict[str, object]]:
@@ -128,9 +128,9 @@ def test_condition_repeat_and_padding_counts_across_epochs(tmp_path: Path) -> No
     assert ref_enc["eligible"] is True
     assert ref_enc["calls"] == 16
     assert ref_enc["global_repeated_calls"] == 16 - 4
-    assert ref_enc["cache_lookups"] == 0
-    assert ref_enc["cache_hits"] == 0
-    assert ref_enc["cache_hit_rate"] == 0.0
+    assert "cache_lookups" not in ref_enc
+    assert "cache_hits" not in ref_enc
+    assert "cache_hit_rate" not in ref_enc
 
     # Rows 0 and 2 carry 2 reference images, and encoded_images counts every image
     all_consumed_ids = [sid for step in range(4) for sid in sampler.batch(step)]
@@ -140,9 +140,9 @@ def test_condition_repeat_and_padding_counts_across_epochs(tmp_path: Path) -> No
     assert prefix_enc["eligible"] is True
     assert prefix_enc["calls"] == 16
     assert prefix_enc["global_repeated_calls"] == 16 - 4
-    assert prefix_enc["cache_lookups"] == 0
-    assert prefix_enc["cache_hits"] == 0
-    assert prefix_enc["cache_hit_rate"] == 0.0
+    assert "cache_lookups" not in prefix_enc
+    assert "cache_hits" not in prefix_enc
+    assert "cache_hit_rate" not in prefix_enc
 
     assert gen_enc["eligible"] is False
     assert gen_enc["calls"] == 16
@@ -180,12 +180,18 @@ def test_dp_tier_micro_balance_padding_flags(tmp_path: Path) -> None:
     ]
 
     for step in range(4):
-        raw_ids = sampler.batch(step)
-        balanced_ids = assign_image_batch(raw_ids, config, step=step, world=world_size)
+        tagged = sampler.batch_with_padding(step)
+        raw_ids = [sid for sid, _ in tagged]
+        from relax.engine.sft.image import assign_image_batch_positions
+
+        positions = assign_image_batch_positions(raw_ids, config, step=step, world=world_size)
         for r in range(world_size):
             trackers[r].begin_step(step, torch.device("cpu"))
-            for micro, sid in enumerate(balanced_ids[r::world_size]):
-                trackers[r].begin_micro(micro, sid, rows[sid], config, "lora", 64, 64)
+            rank_positions = positions[r::world_size]
+            for micro, pos in enumerate(rank_positions):
+                sid, is_pad = tagged[pos]
+                trackers[r].begin_micro(micro, sid, rows[sid], config, "lora", 64, 64, is_padding=is_pad)
+                assert trackers[r]._current_micro_records[micro]["is_padding"] is is_pad
             trackers[r].end_step(step, 0.001, 0.01)
 
     for t in trackers:
@@ -644,3 +650,156 @@ def test_sensenova_pipeline_units_instrumentation_with_tracker(tmp_path: Path) -
     assert agg["encoding_stats"]["ref_vision_encode"]["global_repeated_calls"] == 1
     assert agg["encoding_stats"]["prefix_encode"]["local_repeated_calls"] == 1
     assert agg["encoding_stats"]["prefix_encode"]["global_repeated_calls"] == 1
+
+
+def test_summarize_baseline_dir_detects_missing_stale_and_mixed_runs(tmp_path: Path) -> None:
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+
+    # 仅收集到 rank 0 而缺失 rank 1 时，严格模式必须报错，allow_incomplete=True 须显式标明不完整。
+    missing_dir = tmp_path / "missing_rank"
+    t0 = ConditionTracker(
+        rank=0, world_size=2, micro_batches=1, dataset_size=2, output_dir=missing_dir, warmup_steps=0, run_id="run-a"
+    )
+    t0.begin_step(0, torch.device("cpu"))
+    t0.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+    t0.end_step(0, 0.001, 0.01)
+    t0.save_summary()
+    with pytest.raises(ValueError, match="missing ranks \\[1\\]"):
+        summarize_baseline_dir(missing_dir)
+    partial = summarize_baseline_dir(missing_dir, allow_incomplete=True)
+    assert partial["complete"] is False
+    assert partial["missing_ranks"] == [1]
+
+    # 混入不同 run_id 的另一个 rank 日志时必须报错。
+    t1_other = ConditionTracker(
+        rank=1, world_size=2, micro_batches=1, dataset_size=2, output_dir=missing_dir, warmup_steps=0, run_id="run-b"
+    )
+    t1_other.begin_step(0, torch.device("cpu"))
+    t1_other.begin_micro(0, 1, row, config, "lora", 64, 64, is_padding=False)
+    t1_other.end_step(0, 0.001, 0.01)
+    t1_other.save_summary()
+    with pytest.raises(ValueError, match="different runs"):
+        summarize_baseline_dir(missing_dir, allow_incomplete=True)
+
+    # 两个 rank 的步骤范围不一致时严格模式必须报错。
+    step_mismatch_dir = tmp_path / "step_mismatch"
+    for rank, steps in ((0, [0, 1]), (1, [0])):
+        tr = ConditionTracker(
+            rank=rank,
+            world_size=2,
+            micro_batches=1,
+            dataset_size=2,
+            output_dir=step_mismatch_dir,
+            warmup_steps=0,
+            run_id="run-c",
+        )
+        for step in steps:
+            tr.begin_step(step, torch.device("cpu"))
+            tr.begin_micro(0, rank, row, config, "lora", 64, 64, is_padding=False)
+            tr.end_step(step, 0.001, 0.01)
+        tr.save_summary()
+    with pytest.raises(ValueError, match="step mismatch"):
+        summarize_baseline_dir(step_mismatch_dir)
+
+
+def test_tracker_io_error_does_not_abort_step_or_mask_training_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+    tracker = ConditionTracker(
+        rank=0, world_size=1, micro_batches=1, dataset_size=1, output_dir=tmp_path / "io_err", warmup_steps=0
+    )
+    tracker.begin_step(0, torch.device("cpu"))
+    tracker.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+    original_open = Path.open
+
+    def fail_jsonl(self: Path, *args, **kwargs):
+        if self == tracker.steps_jsonl_path:
+            raise OSError("disk full")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_jsonl)
+    tracker.end_step(0, 0.001, 0.01)
+    assert tracker.io_failed is True
+    assert "disk full" in (tracker.io_error or "")
+    summary = tracker.save_summary()
+    assert summary["complete"] is False
+
+    # 清理阶段 save_summary 抛出异常时不得覆盖原始训练异常，且仍须关闭 condition_cache。
+    trainer = sft_module.FSDPSFTTrainer.__new__(sft_module.FSDPSFTTrainer)
+    trainer.prefetch = Mock()
+    trainer.tracker = Mock()
+    trainer.tracker.save_summary.side_effect = OSError("summary disk full")
+    trainer.condition_cache = Mock()
+    trainer.condition_cache.stats.return_value = {}
+    trainer.rank = 0
+    original = RuntimeError("original training failure")
+    trainer._train_step = Mock(side_effect=original)
+    with pytest.raises(RuntimeError) as raised:
+        trainer.train(0)
+    assert raised.value is original
+    trainer.prefetch.close.assert_called_once()
+    trainer.condition_cache.close.assert_called_once()
+
+
+def test_summarize_baseline_dir_reports_authoritative_condition_cache_rates(tmp_path: Path) -> None:
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+    cache_dir = tmp_path / "cache_rates"
+    for rank, stats in (
+        (
+            0,
+            {
+                "requests": 4,
+                "lookups": 4,
+                "local_hits": 3,
+                "effective_reuses": 2,
+                "group_forced_online": 1,
+                "local_hit_rate": 0.75,
+                "effective_reuse_rate": 0.5,
+            },
+        ),
+        (
+            1,
+            {
+                "requests": 4,
+                "lookups": 4,
+                "local_hits": 2,
+                "effective_reuses": 2,
+                "group_forced_online": 0,
+                "local_hit_rate": 0.5,
+                "effective_reuse_rate": 0.5,
+            },
+        ),
+    ):
+        tr = ConditionTracker(
+            rank=rank,
+            world_size=2,
+            micro_batches=1,
+            dataset_size=2,
+            output_dir=cache_dir,
+            warmup_steps=0,
+            run_id="cache-run",
+        )
+        tr.begin_step(0, torch.device("cpu"))
+        tr.begin_micro(0, rank, row, config, "lora", 64, 64, is_padding=False)
+        tr.condition_cache_stats = stats
+        tr.end_step(0, 0.001, 0.01)
+        tr.save_summary()
+    agg = summarize_baseline_dir(cache_dir)
+    assert agg["complete"] is True
+    assert agg["condition_cache_summary"] == {
+        "requests": 8,
+        "lookups": 8,
+        "local_hits": 5,
+        "effective_reuses": 4,
+        "group_forced_online": 1,
+        "local_hit_rate": 5 / 8,
+        "effective_reuse_rate": 4 / 8,
+    }
+    for enc_stats in agg["encoding_stats"].values():
+        assert "cache_hit_rate" not in enc_stats

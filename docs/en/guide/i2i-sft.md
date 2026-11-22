@@ -157,16 +157,21 @@ after the job:
 python -m relax.engine.sft.condition_tracker /shared/runs/i2i-baseline
 ```
 
-The command reads the recorded `tracker_schema` and writes
-`baseline_summary.json`. In it, `feature_tensor_bytes` reports the per-sample
-size of cached features (`past_key_values_bytes` and `indexes_image_bytes` for
-SenseNova; `prompt_embeds_bytes`, `edit_latents_bytes`, and
-`target_latents_bytes` for Qwen-Image-Edit), and `stage_timings_ms.<stage>.share_pct`
-shows how much of a step the cache can skip (`ref_vision_encode_ms` and
-`prefix_encode_ms` for SenseNova; `prompt_encode_ms`, `ref_vae_encode_ms`, and
-`target_vae_encode_ms` for Qwen-Image-Edit). The statistics time stages with
-CUDA events and wait for them at the end of each step, so leave
-`BASELINE_STATS_DIR` unset for regular training.
+The command reads the recorded `tracker_schema`, validates rank coverage, step
+consistency, and run identity (pass `--allow-incomplete` to inspect partial
+logs from an interrupted run), and writes `baseline_summary.json`. In it,
+`feature_tensor_bytes` reports the per-sample size of cached features
+(`past_key_values_bytes` and `indexes_image_bytes` for SenseNova;
+`prompt_embeds_bytes`, `edit_latents_bytes`, and `target_latents_bytes` for
+Qwen-Image-Edit), `stage_timings_ms.<stage>.share_pct` shows how much of a step
+the cache can skip (`ref_vision_encode_ms` and `prefix_encode_ms` for SenseNova;
+`prompt_encode_ms`, `ref_vae_encode_ms`, and `target_vae_encode_ms` for
+Qwen-Image-Edit), and authoritative local hit and effective reuse rates appear
+under `condition_cache` and `condition_cache_summary` when caching is enabled.
+SenseNova's baseline H2D repeat keys are path- and resolution-based (detecting
+repeats of the same path, while the cache itself keys on decoded pixel digests).
+The statistics time stages with CUDA events and wait for them at the end of each
+step, so leave `BASELINE_STATS_DIR` unset for regular training.
 
 ### Future RL Extension
 

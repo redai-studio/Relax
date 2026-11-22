@@ -5,6 +5,7 @@ import multiprocessing as mp
 import weakref
 from argparse import Namespace
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -439,3 +440,94 @@ def test_trainer_init_closes_prefetch_when_tracker_setup_fails(tmp_path, monkeyp
     with pytest.raises(RuntimeError, match="bind_tracker failed"):
         FSDPSFTTrainer(actor)
     assert len(closed) == 1
+
+
+def test_online_only_custom_adapter_starts_without_tracker_hooks_and_cleans_stale_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata = tmp_path / "train.json"
+    metadata.write_text(json.dumps([{"prompt": "edit", "image": "t.png", "edit_image": ["r.png"]}]))
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr("relax.backends.fsdp.actor._collect_weight_sync_errors", lambda err: [err] if err else [])
+    monkeypatch.setattr("relax.backends.fsdp.actor._collect_rank_objects", lambda value: [value])
+
+    class OnlineOnlyAdapter:
+        family = "custom_online"
+        supported_tasks = ("i2i",)
+        lora_target_modules = ("linear",)
+
+        def on_device_ready(self, model, device) -> None:
+            return None
+
+        def prepare_sample(self, row, root, config, index=0):
+            return row
+
+    def make_actor(adapter, extra_config=None):
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+        optimizer.defaults.update({"betas": (0.9, 0.999), "eps": 1e-8, "foreach": False})
+        args = Namespace(
+            global_batch_size=1,
+            num_rollout=1,
+            seed=42,
+            lr_warmup_iters=0,
+            clip_grad=1.0,
+            model_adapter_path="test.OnlineOnlyAdapter",
+            model_path=str(tmp_path),
+            prompt_data=str(metadata),
+            load=None,
+            save=None,
+            fsdp_param_dtype="bf16",
+            fsdp_reduce_dtype="fp32",
+            fsdp_master_dtype="fp32",
+            use_pytorch_profiler=False,
+            record_memory_history=False,
+            i2i_sft_config={
+                "data_root": str(tmp_path),
+                "dataset_size": 1,
+                "conditioning_images": 1,
+                "condition_cache_enabled": False,
+                **(extra_config or {}),
+            },
+        )
+        return SimpleNamespace(
+            args=args,
+            adapter=adapter,
+            model=model,
+            optimizer=optimizer,
+            device=torch.device("cpu"),
+            _trainable_mode="lora",
+            _device_group=lambda: None,
+            _lora_contract=lambda: {},
+        )
+
+    # 未实现 bind_tracker/tracker_schema 的自定义适配器在默认关闭缓存与统计时可正常启动。
+    trainer = FSDPSFTTrainer(make_actor(OnlineOnlyAdapter()))
+    assert trainer.tracker is None
+    trainer.close()
+
+    # 显式开启 baseline_stats_dir 时，不实现 ConditionTrackerAdapter 须给出清晰错误。
+    stats_dir = tmp_path / "stats"
+    with pytest.raises(ValueError, match="baseline condition tracking"):
+        FSDPSFTTrainer(make_actor(OnlineOnlyAdapter(), {"baseline_stats_dir": str(stats_dir)}))
+
+    # 复用已有统计目录时，启动新训练会清理旧 rank 残留日志并分配新的 run_id。
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    stale_rank = stats_dir / "rank_2_steps.jsonl"
+    stale_rank.write_text('{"rank": 2, "world_size": 4, "step": 0}\n', encoding="utf-8")
+
+    class TrackableAdapter(OnlineOnlyAdapter):
+        def bind_tracker(self, model, tracker) -> None:
+            model.tracker = tracker
+
+        @staticmethod
+        def tracker_schema():
+            from relax.engine.sft.condition_tracker import SENSENOVA_TRACKER_SCHEMA
+
+            return SENSENOVA_TRACKER_SCHEMA
+
+    tracked_trainer = FSDPSFTTrainer(make_actor(TrackableAdapter(), {"baseline_stats_dir": str(stats_dir)}))
+    assert not stale_rank.exists()
+    assert tracked_trainer.tracker is not None and tracked_trainer.tracker.run_id
+    tracked_trainer.close()

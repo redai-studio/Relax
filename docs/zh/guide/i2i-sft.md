@@ -113,12 +113,15 @@ processor 配置及实际输入摘要、dtype 和 attention 实现，因此只�
 python -m relax.engine.sft.condition_tracker /shared/runs/i2i-baseline
 ```
 
-命令按文件记录的 `tracker_schema` 生成 `baseline_summary.json`。其中 `feature_tensor_bytes`
+命令按文件记录的 `tracker_schema` 生成 `baseline_summary.json`，并校验各 rank 与步骤完整性以及
+同一运行标识（需要汇总中断任务的部分日志时可加 `--allow-incomplete`）。其中 `feature_tensor_bytes`
 给出单个样本缓存特征的大小（SenseNova 为 `past_key_values_bytes` 与 `indexes_image_bytes`；
 Qwen-Image-Edit 为 `prompt_embeds_bytes`、`edit_latents_bytes` 与 `target_latents_bytes`），
 `stage_timings_ms.<stage>.share_pct` 表示缓存可以跳过单步训练中多少比例的时间（SenseNova 为
 `ref_vision_encode_ms` 与 `prefix_encode_ms`；Qwen-Image-Edit 为 `prompt_encode_ms`、
-`ref_vae_encode_ms` 与 `target_vae_encode_ms`）。统计使用 CUDA event 计时并在每步结束时等待事件完成，
+`ref_vae_encode_ms` 与 `target_vae_encode_ms`），开启缓存时的局部命中率与全 rank 有效复用率位于
+`condition_cache` 与 `condition_cache_summary`。SenseNova 的基线重复 H2D 键基于文件路径与分辨率配置，
+仅识别同路径重复（实际缓存仍按解码后的像素摘要校验）。统计使用 CUDA event 计时并在每步结束时等待事件完成，
 常规训练不要设置 `BASELINE_STATS_DIR`。
 
 ### RL 未来接入方式

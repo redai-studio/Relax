@@ -165,6 +165,7 @@ def small_sample(adapter: QwenImageEditSFTAdapter, index: int = 0, count: int = 
             "edit_shapes": tuple((1, 2, 2) for _ in edits),
             "tracker_keys": {
                 "prompt_key": f"prompt-{index}",
+                "ref_vl_pixels_key": f"vl-{count}",
                 "ref_vae_image_keys": [f"ref-{i}" for i in range(count)],
                 "target_image_key": f"target-{index}",
             },

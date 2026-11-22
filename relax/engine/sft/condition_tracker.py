@@ -16,7 +16,11 @@ from typing import Any, Callable, Iterator, Mapping
 import numpy as np
 import torch
 
-from relax.engine.sft.image import image_tier_budget
+from relax.engine.sft.image import ImageBatchSampler, assign_image_batch_positions, image_tier_budget
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 HOST_STAGES = (
@@ -132,6 +136,7 @@ class TrackerSchema:
 def _sensenova_micro_keys(
     row: dict[str, Any], config: dict[str, Any], budget: int | None, height: int, width: int, training_mode: str
 ) -> dict[str, Any]:
+    # SenseNova 在线基线按文件路径与分辨率配置构建 H2D 键，仅识别同路径重复；实际缓存键按像素内容哈希。
     edit_paths = [str(path) for path in row["edit_image"]]
     max_pixels = int(config["max_pixels"])
     ref_image_keys = [_sha256_key([path, max_pixels, budget, len(edit_paths)]) for path in edit_paths]
@@ -334,11 +339,15 @@ class ConditionTracker:
         warmup_steps: int = 5,
         seed: int | None = None,
         schema: TrackerSchema = SENSENOVA_TRACKER_SCHEMA,
+        run_id: str | None = None,
     ) -> None:
         if rank < 0 or world_size <= 0 or micro_batches <= 0 or dataset_size <= 0 or warmup_steps < 0:
             raise ValueError("Invalid ConditionTracker configuration")
         self.rank = int(rank)
         self.schema = schema
+        self.run_id = str(run_id) if run_id is not None else None
+        self.io_failed = False
+        self.io_error: str | None = None
         self.transfer_specs = {spec.kind: spec for spec in schema.transfers}
         self.encode_specs = {spec.kind: spec for spec in schema.encodes}
         self.world_size = int(world_size)
@@ -390,10 +399,6 @@ class ConditionTracker:
                 **({spec.items_field: 0} if spec.items_field else {}),
                 "items": 0,
                 "repeated_calls": 0,
-                "cache_lookups": 0,
-                "cache_hits": 0,
-                "cache_misses": 0,
-                "cache_hit_rate": 0.0,
             }
             for spec in schema.encodes
         }
@@ -430,38 +435,13 @@ class ConditionTracker:
         self._current_step_peak_allocated: int | None = None
         self._current_step_peak_reserved: int | None = None
 
-    def _compute_step_padding_flags(self, config: dict[str, Any]) -> list[bool]:
-        epoch, offset = divmod(self.current_step, self.steps_per_epoch)
-        start = offset * self.global_batch_size
-        if start + self.global_batch_size <= self.dataset_size:
-            return [False] * self.micro_batches
-        if not config.get("dp_tier_micro_balance", False):
-            return [
-                (start + micro * self.world_size + self.rank) >= self.dataset_size
-                for micro in range(self.micro_batches)
-            ]
+    def _fallback_step_padding_flags(self, config: dict[str, Any]) -> list[bool]:
         sampler_seed = self.seed if self.seed is not None else int(config.get("seed") or 42)
-        generator = torch.Generator().manual_seed(sampler_seed + epoch)
-        order = torch.randperm(self.dataset_size, generator=generator).tolist()
-        padded_size = self.steps_per_epoch * self.global_batch_size
-        padded_order = (order * math.ceil(padded_size / self.dataset_size))[:padded_size]
-        tagged_batch = [
-            (padded_order[pos], pos >= self.dataset_size) for pos in range(start, start + self.global_batch_size)
-        ]
-        ordered = sorted(tagged_batch, key=lambda item: image_tier_budget(config, item[0]) or 0, reverse=True)
-        if config.get("dp_tier_rank_rotation", False):
-            rot = self.current_step % self.world_size
-            if rot:
-                ordered = [
-                    item
-                    for blk in range(0, len(ordered), self.world_size)
-                    for item in (
-                        ordered[blk + self.world_size - rot : blk + self.world_size]
-                        + ordered[blk : blk + self.world_size - rot]
-                    )
-                ]
-        rank_slice = ordered[self.rank :: self.world_size]
-        return [bool(is_pad) for _, is_pad in rank_slice]
+        sampler = ImageBatchSampler(self.dataset_size, self.global_batch_size, sampler_seed)
+        tagged = sampler.batch_with_padding(self.current_step)
+        ids = [sample_id for sample_id, _ in tagged]
+        positions = assign_image_batch_positions(ids, config, step=self.current_step, world=self.world_size)
+        return [bool(tagged[pos][1]) for pos in positions[self.rank :: self.world_size]]
 
     def begin_step(self, step: int, device: torch.device) -> None:
         """Start ``step`` on ``device`` and reset the per-step records.
@@ -498,6 +478,8 @@ class ConditionTracker:
         training_mode: str,
         height: int,
         width: int,
+        *,
+        is_padding: bool | None = None,
     ) -> None:
         """Start a micro-batch and derive the content keys of its sample.
 
@@ -521,16 +503,19 @@ class ConditionTracker:
         self.current_eligible = eligible
 
         self.total_samples += 1
-        if self._step_padding_flags is None:
-            self._step_padding_flags = self._compute_step_padding_flags(config)
-        if self.current_micro < len(self._step_padding_flags):
-            is_padding = self._step_padding_flags[self.current_micro]
+        if is_padding is None:
+            if self._step_padding_flags is None:
+                self._step_padding_flags = self._fallback_step_padding_flags(config)
+            if self.current_micro < len(self._step_padding_flags):
+                resolved_padding = self._step_padding_flags[self.current_micro]
+            else:
+                offset = self.current_step % self.steps_per_epoch
+                epoch_pos = offset * self.global_batch_size + self.current_micro * self.world_size + self.rank
+                resolved_padding = epoch_pos >= self.dataset_size
         else:
-            offset = self.current_step % self.steps_per_epoch
-            epoch_pos = offset * self.global_batch_size + self.current_micro * self.world_size + self.rank
-            is_padding = epoch_pos >= self.dataset_size
+            resolved_padding = bool(is_padding)
         self._epoch_seen_sample_ids.add(self.current_sample_id)
-        if is_padding:
+        if resolved_padding:
             self.padding_samples += 1
 
         is_repeated_sample = self.current_sample_id in self.seen_sample_ids
@@ -547,7 +532,7 @@ class ConditionTracker:
             "height": self.current_height,
             "width": self.current_width,
             "fixed_pixels_budget": budget,
-            "is_padding": is_padding,
+            "is_padding": resolved_padding,
             "is_repeated_sample": is_repeated_sample,
             **self.current_keys,
             **{spec.repeat_flag: False for spec in (*self.schema.transfers, *self.schema.encodes) if spec.repeat_flag},
@@ -875,11 +860,24 @@ class ConditionTracker:
             },
             "micros": micro_list,
         }
+        if self.run_id is not None:
+            step_record["run_id"] = self.run_id
         if hasattr(self, "condition_cache_stats"):
             step_record["condition_cache"] = self.condition_cache_stats
         self.step_records.append(step_record)
-        with self.steps_jsonl_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(step_record, ensure_ascii=False) + "\n")
+        if not self.io_failed:
+            try:
+                with self.steps_jsonl_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(step_record, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                self.io_failed = True
+                self.io_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "ConditionTracker rank=%s step=%s log write failed; stopping disk logging: %s",
+                    self.rank,
+                    self.current_step,
+                    exc,
+                )
 
     def build_summary(self) -> dict[str, Any]:
         """Aggregate the recorded steps of this rank into a summary."""
@@ -960,10 +958,11 @@ class ConditionTracker:
         step_res_max = int(max(step_res_vals)) if step_res_vals else 0
         gib = float(1024**3)
 
-        return {
+        summary = {
             "tracker_schema": self.schema.name,
             "rank": self.rank,
             "world_size": self.world_size,
+            "complete": not self.io_failed,
             "micro_batches": self.micro_batches,
             "global_batch_size": self.global_batch_size,
             "dataset_size": self.dataset_size,
@@ -1001,21 +1000,38 @@ class ConditionTracker:
                 "cpu_peak_rss_gib": int(cpu_peak_rss_bytes) / gib,
             },
         }
+        if self.run_id is not None:
+            summary["run_id"] = self.run_id
+        if self.io_error is not None:
+            summary["io_error"] = self.io_error
+        return summary
 
     def save_summary(self) -> dict[str, Any]:
         """Write and return the summary of this rank."""
         summary = self.build_summary()
         if hasattr(self, "condition_cache_stats"):
             summary["condition_cache"] = self.condition_cache_stats
-        self.summary_json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if self.io_failed:
+            return summary
+        try:
+            self.summary_json_path.write_text(
+                json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            self.io_failed = True
+            self.io_error = f"{type(exc).__name__}: {exc}"
+            summary["complete"] = False
+            summary["io_error"] = self.io_error
+            logger.warning("ConditionTracker rank=%s summary write failed: %s", self.rank, exc)
         return summary
 
 
-def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
+def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) -> dict[str, Any]:
     """Combine the rank files under ``output_dir`` into a run summary.
 
-    Reads every ``rank_*_steps.jsonl`` and ``rank_*_summary.json``, measures
-    local and cross-rank repeats, and writes ``baseline_summary.json``.
+    Reads every ``rank_*_steps.jsonl`` and ``rank_*_summary.json``, validates
+    rank coverage, run consistency and step alignment, measures local and
+    cross-rank repeats, and writes ``baseline_summary.json``.
     """
     out_path = Path(output_dir)
     step_files = sorted(out_path.glob("rank_*_steps.jsonl"))
@@ -1025,9 +1041,16 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     rank_step_records: dict[int, list[dict[str, Any]]] = {}
     for file_path in step_files:
         records = [json.loads(line) for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if records:
-            rank = int(records[0]["rank"])
-            rank_step_records[rank] = records
+        if not records:
+            continue
+        rank = int(records[0]["rank"])
+        if file_path.name != f"rank_{rank}_steps.jsonl":
+            raise ValueError(f"Step log filename {file_path.name} does not match recorded rank {rank}")
+        if any(int(rec["rank"]) != rank for rec in records):
+            raise ValueError(f"Step log {file_path.name} mixes records from multiple ranks")
+        if rank in rank_step_records:
+            raise ValueError(f"Duplicate baseline step log for rank {rank}")
+        rank_step_records[rank] = records
 
     if not rank_step_records:
         raise ValueError(f"Step log files under {out_path} are empty")
@@ -1035,7 +1058,10 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     rank_summaries: dict[int, dict[str, Any]] = {}
     for file_path in sorted(out_path.glob("rank_*_summary.json")):
         data = json.loads(file_path.read_text(encoding="utf-8"))
-        rank_summaries[int(data["rank"])] = data
+        rank = int(data["rank"])
+        if file_path.name != f"rank_{rank}_summary.json":
+            raise ValueError(f"Summary filename {file_path.name} does not match recorded rank {rank}")
+        rank_summaries[rank] = data
 
     ranks = sorted(rank_step_records)
     first_rank_steps = rank_step_records[ranks[0]]
@@ -1058,7 +1084,51 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
         raise TypeError(f"Invalid tracker schema: {schema_path}")
     transfer_specs = {spec.kind: spec for spec in schema.transfers}
     encode_specs = {spec.kind: spec for spec in schema.encodes}
-    world_size = int(first_rank_steps[0]["world_size"])
+
+    world_sizes = {int(record["world_size"]) for records in rank_step_records.values() for record in records} | {
+        int(data["world_size"]) for data in rank_summaries.values()
+    }
+    if len(world_sizes) != 1:
+        raise ValueError(f"Baseline files disagree on world_size: {sorted(world_sizes)}")
+    world_size = world_sizes.pop()
+    if world_size <= 0:
+        raise ValueError(f"Invalid world_size in baseline logs: {world_size}")
+
+    all_ranks = set(ranks) | set(rank_summaries)
+    unexpected_ranks = sorted(r for r in all_ranks if r < 0 or r >= world_size)
+    if unexpected_ranks:
+        raise ValueError(
+            f"Baseline files contain stale or out-of-range ranks {unexpected_ranks} for world_size={world_size}"
+        )
+
+    run_ids = {record.get("run_id") for records in rank_step_records.values() for record in records} | {
+        data.get("run_id") for data in rank_summaries.values()
+    }
+    if len(run_ids) > 1:
+        raise ValueError(f"Baseline files mix records from different runs: {sorted(str(v) for v in run_ids)}")
+    run_id = next(iter(run_ids))
+
+    missing_ranks = [r for r in range(world_size) if r not in rank_step_records]
+    steps_by_rank: dict[int, list[int]] = {}
+    for rank in ranks:
+        rank_steps = [int(rec["step"]) for rec in rank_step_records[rank]]
+        if len(rank_steps) != len(set(rank_steps)):
+            raise ValueError(f"Rank {rank} step log contains duplicate step indices")
+        steps_by_rank[rank] = rank_steps
+    expected_steps = steps_by_rank[ranks[0]]
+    mismatched_steps = [rank for rank in ranks[1:] if steps_by_rank[rank] != expected_steps]
+    incomplete_summaries = sorted(rank for rank, data in rank_summaries.items() if data.get("complete") is False)
+    is_complete = not missing_ranks and not mismatched_steps and not incomplete_summaries
+    if not is_complete and not allow_incomplete:
+        problems = []
+        if missing_ranks:
+            problems.append(f"missing ranks {missing_ranks} for world_size={world_size}")
+        if mismatched_steps:
+            problems.append(f"step mismatch across ranks { {r: steps_by_rank[r] for r in ranks} }")
+        if incomplete_summaries:
+            problems.append(f"incomplete rank summaries {incomplete_summaries}")
+        raise ValueError("Incomplete baseline records: " + "; ".join(problems))
+
     warmup_steps = int(
         rank_summaries[ranks[0]]["warmup_steps"]
         if ranks[0] in rank_summaries
@@ -1094,10 +1164,6 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
             "items": 0,
             "local_repeated_calls": 0,
             "global_repeated_calls": 0,
-            "cache_lookups": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "cache_hit_rate": 0.0,
         }
         for spec in schema.encodes
     }
@@ -1403,6 +1469,7 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     summary = {
         "world_size": world_size,
         "ranks": ranks,
+        "complete": is_complete,
         "micro_batches": micro_batches,
         "global_batch_size": global_batch_size,
         "dataset_size": dataset_size,
@@ -1451,10 +1518,29 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
     cache_stats = {
         str(rank): data["condition_cache"] for rank, data in rank_summaries.items() if "condition_cache" in data
     }
+    if run_id is not None:
+        summary["run_id"] = run_id
+    if not is_complete:
+        summary["missing_ranks"] = missing_ranks
+        summary["recorded_steps_by_rank"] = {str(rank): steps_by_rank[rank] for rank in ranks}
     if "tracker_schema" in first_rank_steps[0]:
         summary["tracker_schema"] = schema.name
     if cache_stats:
         summary["condition_cache"] = cache_stats
+        total_requests = sum(int(item.get("requests", 0)) for item in cache_stats.values())
+        total_lookups = sum(int(item.get("lookups", 0)) for item in cache_stats.values())
+        total_local_hits = sum(int(item.get("local_hits", 0)) for item in cache_stats.values())
+        total_effective_reuses = sum(int(item.get("effective_reuses", 0)) for item in cache_stats.values())
+        total_forced_online = sum(int(item.get("group_forced_online", 0)) for item in cache_stats.values())
+        summary["condition_cache_summary"] = {
+            "requests": total_requests,
+            "lookups": total_lookups,
+            "local_hits": total_local_hits,
+            "effective_reuses": total_effective_reuses,
+            "group_forced_online": total_forced_online,
+            "local_hit_rate": float(total_local_hits / total_lookups) if total_lookups > 0 else 0.0,
+            "effective_reuse_rate": float(total_effective_reuses / total_requests) if total_requests > 0 else 0.0,
+        }
     baseline_summary_path = out_path / "baseline_summary.json"
     baseline_summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return summary
@@ -1463,7 +1549,12 @@ def summarize_baseline_dir(output_dir: Path) -> dict[str, Any]:
 if __name__ == "__main__":
     from relax.engine.sft.condition_tracker import summarize_baseline_dir as summarize_directory
 
-    if len(sys.argv) != 2:
-        raise SystemExit("Usage: python3 -m relax.engine.sft.condition_tracker <output_dir>")
-    result = summarize_directory(Path(sys.argv[1]))
+    args_cli = sys.argv[1:]
+    allow_incomplete = False
+    if "--allow-incomplete" in args_cli:
+        allow_incomplete = True
+        args_cli = [arg for arg in args_cli if arg != "--allow-incomplete"]
+    if len(args_cli) != 1:
+        raise SystemExit("Usage: python3 -m relax.engine.sft.condition_tracker <output_dir> [--allow-incomplete]")
+    result = summarize_directory(Path(args_cli[0]), allow_incomplete=allow_incomplete)
     print(json.dumps(result, indent=2, ensure_ascii=False))

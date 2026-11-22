@@ -45,17 +45,29 @@ def test_training_schedule_bf16_lookup_and_weighting() -> None:
     assert torch.isfinite(noisy).all()
 
 
-def test_first_parallel_prepare_sample() -> None:
+def test_first_parallel_prepare_sample(tmp_path: Path) -> None:
     adapter = build_adapter()
     rows = [{"prompt": f"change {i}", "image": f"input_{i}.png", "edit_image": [f"input_{i}.png"]} for i in (0, 1)]
+    # 默认关闭缓存与统计时，不计算样本摘要和统计键。
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda row: adapter.prepare_sample(row, FIXTURES, CONFIG), rows))
     for row, actual in zip(rows, results, strict=True):
         expected = adapter.prepare_sample(row, FIXTURES, CONFIG)
-        assert actual["tracker_keys"] == expected["tracker_keys"]
+        for omitted in ("text_inputs_digest", "digests", "tracker_keys", "sample_preprocess_ms"):
+            assert omitted not in actual
         for field in actual["text_inputs"]:
             assert torch.equal(actual["text_inputs"][field], expected["text_inputs"][field])
         assert torch.equal(actual["target_pixels"], expected["target_pixels"])
+
+    # 仅开启缓存时仅生成缓存所需摘要，不生成统计键。
+    cache_only = adapter.prepare_sample(rows[0], FIXTURES, {**CONFIG, "condition_cache_enabled": True})
+    assert "text_inputs_digest" in cache_only and "digests" in cache_only
+    assert "tracker_keys" not in cache_only and "sample_preprocess_ms" not in cache_only
+
+    # 仅开启统计时生成统计键与预处理计时，不冗余保存缓存字段。
+    tracked = adapter.prepare_sample(rows[0], FIXTURES, {**CONFIG, "baseline_stats_dir": str(tmp_path)})
+    assert "tracker_keys" in tracked and "sample_preprocess_ms" in tracked
+    assert "text_inputs_digest" not in tracked and "digests" not in tracked
 
 
 @pytest.mark.parametrize("count", [1, 2])
@@ -197,8 +209,9 @@ def test_cache_identity_versions_and_shared_tensors() -> None:
 def test_prefetched_processor_inputs_keep_distinct_cache_identity() -> None:
     adapter, model = build_adapter(), build_model()
     row = {"prompt": "change the color", "image": "input_0.png", "edit_image": ["input_0.png"]}
+    cached_config = {**CONFIG, "condition_cache_enabled": True}
     cache = ConditionCacheBinding(model, adapter, torch.device("cpu"), {})
-    prepared = adapter.prepare_sample(row, FIXTURES, CONFIG)
+    prepared = adapter.prepare_sample(row, FIXTURES, cached_config)
     adapter.processor.image_processor.rescale_factor *= 0.5
     cache.bump_encoder_version()
     cache.decide([cache.prepare(prepared)])
@@ -206,7 +219,7 @@ def test_prefetched_processor_inputs_keep_distinct_cache_identity() -> None:
     cache.put("edit_inputs", old_condition)
     cache.end_micro()
 
-    current = adapter.prepare_sample(row, FIXTURES, CONFIG)
+    current = adapter.prepare_sample(row, FIXTURES, cached_config)
     expected = model.encode_conditions(current)
     assert not torch.equal(prepared["text_inputs"]["pixel_values"], current["text_inputs"]["pixel_values"])
     assert not torch.equal(old_condition["prompt_embeds"], expected["prompt_embeds"])
@@ -457,3 +470,55 @@ def test_tracker_qwen_schema_across_ranks_and_cli(tmp_path: Path) -> None:
         [sys.executable, "-m", "relax.engine.sft.condition_tracker", str(tmp_path)], check=True, capture_output=True
     )
     assert (tmp_path / "baseline_summary.json").read_bytes() == expected
+
+
+def test_qwen_dual_ref_skip_counter_and_vl_h2d_repeat_identity(tmp_path: Path) -> None:
+    # 双参考图缓存命中时，skipped_ref_vae_encodes 须按参考图数量累加（加 2）。
+    adapter, model = build_adapter(), build_model()
+    model._condition_config = {**CONFIG, "conditioning_images": 2}
+    dual = small_sample(adapter, index=0, count=2)
+    cache = ConditionCacheBinding(model, adapter, torch.device("cpu"), {})
+    cache.decide([cache.prepare(dual)])
+    model(dual).backward()
+    cache.end_micro()
+    cache.decide([cache.prepare(dual)])
+    model(dual).backward()
+    cache.end_micro()
+    stats = cache.stats()
+    assert stats["skipped_prompt_encodes"] == 1
+    assert stats["skipped_ref_vae_encodes"] == 2
+    assert stats["skipped_target_vae_encodes"] == 1
+    cache.close()
+
+    # 同一参考图搭配不同指令时，prompt_key 不同而 ref_vl_pixels_key 相同，重复视觉 H2D 须被识别。
+    track_dir = tmp_path / "vl_h2d"
+    track_cfg = {**CONFIG, "baseline_stats_dir": str(track_dir)}
+    row_a = {"prompt": "turn sky blue", "image": "input_0.png", "edit_image": ["input_1.png"]}
+    row_b = {"prompt": "add warm sunset", "image": "input_2.png", "edit_image": ["input_1.png"]}
+    sample_a = adapter.prepare_sample(row_a, FIXTURES, track_cfg)
+    sample_b = adapter.prepare_sample(row_b, FIXTURES, track_cfg)
+    assert sample_a["tracker_keys"]["prompt_key"] != sample_b["tracker_keys"]["prompt_key"]
+    assert sample_a["tracker_keys"]["ref_vl_pixels_key"] == sample_b["tracker_keys"]["ref_vl_pixels_key"]
+
+    tracker = ConditionTracker(
+        rank=0,
+        world_size=1,
+        micro_batches=2,
+        dataset_size=2,
+        output_dir=track_dir,
+        warmup_steps=0,
+        schema=QWEN_IMAGE_EDIT_TRACKER_SCHEMA,
+    )
+    model.tracker = tracker
+    tracker.begin_step(0, torch.device("cpu"))
+    for micro, sample in enumerate((sample_a, sample_b)):
+        tracker.begin_micro(micro, micro, {"_prepared": sample}, track_cfg, "full", 32, 32, is_padding=False)
+        model.encode_conditions(sample)
+    tracker.end_step(0, 0.001, 0.01)
+    summary = tracker.save_summary()
+    assert summary["transfer_stats"]["prompt_text_inputs"]["repeated_transfer_calls"] == 0
+    assert summary["transfer_stats"]["ref_vl_pixel_values"]["repeated_transfer_calls"] == 1
+    assert (
+        summary["transfer_stats"]["ref_vl_pixel_values"]["repeated_transfer_bytes"]
+        == sample_b["text_inputs"]["pixel_values"].nbytes
+    )

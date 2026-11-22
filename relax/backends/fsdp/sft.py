@@ -11,6 +11,7 @@ import os
 import random
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ import torch
 import torch.distributed as dist
 
 from relax.backends.fsdp import checkpoint
-from relax.engine.sft.image import ImageBatchSampler, ImageEditDataset, assign_image_batch
+from relax.engine.sft.image import ImageBatchSampler, ImageEditDataset, assign_image_batch_positions
 from relax.utils.logging_utils import get_logger
 
 
@@ -176,7 +177,9 @@ class FSDPSFTTrainer:
             raise ValueError("Image prefetch depth/workers must be nonnegative/positive integers")
         try:
             if depth:
-                cpu_only_prepare = getattr(actor.adapter, "cpu_only_prepare_sample", actor.adapter.family == "sensenova")
+                cpu_only_prepare = getattr(
+                    actor.adapter, "cpu_only_prepare_sample", actor.adapter.family == "sensenova"
+                )
                 if not cpu_only_prepare:
                     raise ValueError("Threaded image prefetch requires CPU-only sample preparation")
                 from relax.engine.sft.image_prefetch import ImagePrefetch
@@ -194,24 +197,51 @@ class FSDPSFTTrainer:
             stats_dir = config.get("baseline_stats_dir")
             if stats_dir:
                 from relax.engine.sft.condition_tracker import ConditionTracker
+                from relax.models.generative_sft import ConditionTrackerAdapter
 
+                if not isinstance(actor.adapter, ConditionTrackerAdapter):
+                    raise ValueError("The SFT adapter does not support baseline condition tracking")
+                stats_path = Path(stats_dir)
+
+                def _prepare_stats_dir() -> None:
+                    stats_path.mkdir(parents=True, exist_ok=True)
+                    for pattern in ("rank_*_steps.jsonl", "rank_*_summary.json", "baseline_summary.json"):
+                        for stale in stats_path.glob(pattern):
+                            if stale.is_file():
+                                stale.unlink()
+
+                if self.world > 1:
+                    actor._rank0_then_agree(_prepare_stats_dir, what="prepare baseline stats directory")
+                    from relax.utils.distributed_utils import get_gloo_group
+
+                    run_id_holder = [uuid.uuid4().hex if self.rank == 0 else None]
+                    dist.broadcast_object_list(run_id_holder, src=0, group=get_gloo_group())
+                    run_id = str(run_id_holder[0])
+                else:
+                    _prepare_stats_dir()
+                    run_id = uuid.uuid4().hex
                 warmup_steps = int(config.get("baseline_warmup_steps", 5))
                 self.tracker = ConditionTracker(
                     rank=self.rank,
                     world_size=self.world,
                     micro_batches=self.args.global_batch_size // self.world,
                     dataset_size=int(config["dataset_size"]),
-                    output_dir=Path(stats_dir),
+                    output_dir=stats_path,
                     warmup_steps=warmup_steps,
                     seed=int(self.args.seed),
                     schema=actor.adapter.tracker_schema(),
+                    run_id=run_id,
                 )
-            actor.adapter.bind_tracker(actor.model, self.tracker)
+                actor.adapter.bind_tracker(actor.model, self.tracker)
+            else:
+                bind_tracker = getattr(actor.adapter, "bind_tracker", None)
+                if callable(bind_tracker):
+                    bind_tracker(actor.model, None)
             if cache_enabled:
                 self._init_condition_cache()
             self.profiler.on_init_end()
         except BaseException:
-            self.close()
+            self.close(suppress_errors=True)
             raise
 
     def _init_condition_cache(self) -> None:
@@ -310,18 +340,28 @@ class FSDPSFTTrainer:
         except BaseException as exc:
             if getattr(self, "condition_cache", None) is not None:
                 traceback.clear_frames(exc.__traceback__)
-            self.close()
+            self.close(suppress_errors=True)
             raise
 
-    def close(self) -> None:
+    def close(self, *, suppress_errors: bool = False) -> None:
         try:
             if self.prefetch:
-                self.prefetch.close()
+                try:
+                    self.prefetch.close()
+                except Exception as exc:
+                    if not suppress_errors:
+                        raise
+                    logger.warning("Image SFT prefetch close skipped during error cleanup: %s", exc)
         finally:
             try:
                 tracker = getattr(self, "tracker", None)
                 if tracker is not None:
-                    tracker.save_summary()
+                    try:
+                        tracker.save_summary()
+                    except Exception as exc:
+                        if not suppress_errors:
+                            raise
+                        logger.warning("Image SFT condition tracker summary write skipped: %s", exc)
             finally:
                 cache = getattr(self, "condition_cache", None)
                 if cache is not None:
@@ -349,9 +389,12 @@ class FSDPSFTTrainer:
         from relax.utils.distributed_utils import get_gloo_group
 
         dist.broadcast_object_list(holder, src=0, group=get_gloo_group())
-        ids = assign_image_batch(holder[0], self.args.i2i_sft_config, step=step, world=self.world)[
-            self.rank :: self.world
-        ]
+        global_ids = holder[0]
+        positions = assign_image_batch_positions(global_ids, self.args.i2i_sft_config, step=step, world=self.world)
+        rank_positions = positions[self.rank :: self.world]
+        ids = [global_ids[pos] for pos in rank_positions]
+        step_start = (step % self.sampler.steps_per_epoch) * self.sampler.batch_size
+        padding_flags = [(step_start + pos) >= self.sampler.size for pos in rank_positions]
         started = time.monotonic()
         tracker = getattr(self, "tracker", None)
         if tracker is not None:
@@ -360,7 +403,7 @@ class FSDPSFTTrainer:
         optimizer.zero_grad(set_to_none=True)
         loss_sum = torch.zeros((), device=self.actor.device, dtype=torch.float32)
         data_wait = 0.0
-        for micro, sample_id in enumerate(ids):
+        for micro, (sample_id, is_padding) in enumerate(zip(ids, padding_flags, strict=True)):
             data, error = None, None
             read_started = time.monotonic()
             try:
@@ -383,6 +426,7 @@ class FSDPSFTTrainer:
                     self.actor._trainable_mode,
                     image.height,
                     image.width,
+                    is_padding=is_padding,
                 )
             cache = self.condition_cache
             loss = scaled_loss = None
@@ -474,7 +518,7 @@ class FSDPSFTTrainer:
         except BaseException as exc:
             if getattr(self, "condition_cache", None) is not None:
                 traceback.clear_frames(exc.__traceback__)
-            self.close()
+            self.close(suppress_errors=True)
             raise
 
     def _save_checkpoint(self) -> None:

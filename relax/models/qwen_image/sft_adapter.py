@@ -50,17 +50,16 @@ def _digest_json(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def _tensor_digest_info(tensor: torch.Tensor) -> dict[str, Any]:
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "sha256": hashlib.sha256(tensor.contiguous().view(torch.uint8).numpy()).hexdigest(),
+    }
+
+
 def _digest_text_inputs(inputs: Mapping[str, torch.Tensor]) -> str:
-    return _digest_json(
-        {
-            name: {
-                "shape": tuple(inputs[name].shape),
-                "dtype": str(inputs[name].dtype),
-                "sha256": hashlib.sha256(inputs[name].contiguous().view(torch.uint8).numpy()).hexdigest(),
-            }
-            for name in TEXT_INPUT_FIELDS
-        }
-    )
+    return _digest_json({name: _tensor_digest_info(inputs[name]) for name in TEXT_INPUT_FIELDS})
 
 
 def image_digest(image: Any) -> dict[str, Any]:
@@ -143,11 +142,11 @@ QWEN_IMAGE_EDIT_TRACKER_SCHEMA = TrackerSchema(
         "dit_forward_ms",
         "backward_ms",
     ),
-    key_fields=("prompt_key", "ref_vae_image_keys", "target_image_key"),
+    key_fields=("prompt_key", "ref_vl_pixels_key", "ref_vae_image_keys", "target_image_key"),
     micro_keys=_qwen_micro_keys,
     transfers=(
         TransferSpec("prompt_text_inputs", "prompt_key"),
-        TransferSpec("ref_vl_pixel_values", "prompt_key"),
+        TransferSpec("ref_vl_pixel_values", "ref_vl_pixels_key"),
         TransferSpec("ref_vae_pixels", "ref_vae_image_keys", per_image=True),
         TransferSpec("target_pixels", "target_image_key"),
     ),
@@ -334,7 +333,7 @@ class QwenImageEditSFTModel(torch.nn.Module):
         noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run condition encoding or cache reuse, then compute the SFT loss."""
-        if self.tracker is not None:
+        if self.tracker is not None and "sample_preprocess_ms" in data:
             self.tracker.add_host_time("sample_preprocess_ms", data["sample_preprocess_ms"])
         cache = self._condition_cache
         condition = cache.values.get("edit_inputs") if cache is not None else None
@@ -346,8 +345,9 @@ class QwenImageEditSFTModel(torch.nn.Module):
                 cache.put("edit_inputs", condition)
         else:
             cache.counters["restore_ms"] += (time.monotonic() - started) * 1000
-            for name in QwenImageEditSFTAdapter.condition_skip_counters:
-                cache.counters[name] += 1
+            cache.counters["skipped_prompt_encodes"] += 1
+            cache.counters["skipped_ref_vae_encodes"] += len(data["edit_pixels"])
+            cache.counters["skipped_target_vae_encodes"] += 1
         condition = {**condition, "edit_shapes": data["edit_shapes"]}
         # DiffSynth's NoiseInitializer consumes one RNG draw before the loss draws training noise.
         torch.randn(condition["target_latents"].shape, device=self.device, dtype=self.torch_dtype)
@@ -513,7 +513,9 @@ class QwenImageEditSFTAdapter:
     ) -> UserDict[str, Any]:
         """Preprocess target and conditioning inputs into a CPU
         ``UserDict``."""
-        started = time.perf_counter()
+        need_cache = bool(config.get("condition_cache_enabled", False))
+        need_tracker = bool(config.get("baseline_stats_dir"))
+        started = time.perf_counter() if need_tracker else 0.0
         if self.processor is None:
             raise RuntimeError("Load the Qwen processor before preparing samples")
         if len(row["edit_image"]) != config["conditioning_images"]:
@@ -530,33 +532,36 @@ class QwenImageEditSFTAdapter:
             text_inputs = self.processor(text=[text], images=vl_images, padding=True, return_tensors="pt")
             text_identity = self._text_identity
         self._validate_text_inputs(text_inputs)
-        text_inputs_digest = _digest_text_inputs(text_inputs)
-        digests = {
-            "target": image_digest(image),
-            "vae": [image_digest(x) for x in vae_images],
-            "vl": [image_digest(x) for x in vl_images],
+        payload: dict[str, Any] = {
+            "prompt": row["prompt"],
+            "fixed_pixels_budget": budget,
+            "image": image,
+            "edit_image": edit_images,
+            "target_pixels": preprocess_pixels(image),
+            "edit_pixels": tuple(preprocess_pixels(x) for x in vae_images),
+            "text_inputs": {name: text_inputs[name] for name in TEXT_INPUT_FIELDS},
+            "edit_shapes": tuple((1, x.height // 16, x.width // 16) for x in vae_images),
         }
-        data = UserDict(
-            {
-                "prompt": row["prompt"],
-                "fixed_pixels_budget": budget,
-                "image": image,
-                "edit_image": edit_images,
-                "target_pixels": preprocess_pixels(image),
-                "edit_pixels": tuple(preprocess_pixels(x) for x in vae_images),
-                "text_inputs": {name: text_inputs[name] for name in TEXT_INPUT_FIELDS},
-                "text_inputs_digest": text_inputs_digest,
-                "digests": digests,
-                "edit_shapes": tuple((1, x.height // 16, x.width // 16) for x in vae_images),
-                "tracker_keys": {
+        if need_cache or need_tracker:
+            tensor_digests = {name: _tensor_digest_info(text_inputs[name]) for name in TEXT_INPUT_FIELDS}
+            text_inputs_digest = _digest_json(tensor_digests)
+            digests = {
+                "target": image_digest(image),
+                "vae": [image_digest(x) for x in vae_images],
+                "vl": [image_digest(x) for x in vl_images],
+            }
+            if need_cache:
+                payload["text_inputs_digest"] = text_inputs_digest
+                payload["digests"] = digests
+            if need_tracker:
+                payload["tracker_keys"] = {
                     "prompt_key": _digest_json([row["prompt"], digests["vl"], text_identity, text_inputs_digest]),
+                    "ref_vl_pixels_key": _digest_json(tensor_digests["pixel_values"]),
                     "ref_vae_image_keys": [_digest_json(x) for x in digests["vae"]],
                     "target_image_key": _digest_json(digests["target"]),
-                },
-            }
-        )
-        data["sample_preprocess_ms"] = (time.perf_counter() - started) * 1000
-        return data
+                }
+                payload["sample_preprocess_ms"] = (time.perf_counter() - started) * 1000
+        return UserDict(payload)
 
     def condition_field_specs(self, model: QwenImageEditSFTModel) -> tuple[ConditionFieldSpec, ...]:
         """Declare the single cacheable ``edit_inputs`` condition field."""

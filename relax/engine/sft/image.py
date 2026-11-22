@@ -59,22 +59,17 @@ def load_sft_image(path: Path, max_pixels: int, *, patch_size: int, fixed_pixels
     return functional.center_crop(image, (height, width))
 
 
-def assign_image_batch(
+def assign_image_batch_positions(
     ids: list[int], config: dict[str, Any], *, step: int | None = None, world: int | None = None
 ) -> list[int]:
-    """Cluster synchronous micro columns without changing batch membership.
-
-    Rank striding is applied afterwards. Stable descending tier order minimizes
-    the sum of micro-column maxima for this tier-only cost proxy. Aspect ratio,
-    prompt length and condition-image shapes can still affect actual runtime.
-    This changes per-rank RNG/sample correspondence, not the producer cursor.
-    """
+    """Return the assigned batch order as original positions inside ``ids``."""
     rotate = config.get("dp_tier_rank_rotation", False)
     if rotate and not config.get("dp_tier_micro_balance", False):
         raise ValueError("DP tier rank rotation requires micro balancing")
+    positions = list(range(len(ids)))
     if not config.get("dp_tier_micro_balance", False):
-        return ids
-    ordered = sorted(ids, key=lambda index: image_tier_budget(config, index) or 0, reverse=True)
+        return positions
+    ordered = sorted(positions, key=lambda pos: image_tier_budget(config, ids[pos]) or 0, reverse=True)
     if not rotate:
         return ordered
     if type(step) is not int or step < 0 or type(world) is not int or world <= 0 or len(ids) % world:
@@ -85,10 +80,23 @@ def assign_image_batch(
     if not offset:
         return ordered
     return [
-        index
+        pos
         for start in range(0, len(ordered), world)
-        for index in ordered[start + world - offset : start + world] + ordered[start : start + world - offset]
+        for pos in ordered[start + world - offset : start + world] + ordered[start : start + world - offset]
     ]
+
+
+def assign_image_batch(
+    ids: list[int], config: dict[str, Any], *, step: int | None = None, world: int | None = None
+) -> list[int]:
+    """Cluster synchronous micro columns without changing batch membership.
+
+    Rank striding is applied afterwards. Stable descending tier order minimizes
+    the sum of micro-column maxima for this tier-only cost proxy. Aspect ratio,
+    prompt length and condition-image shapes can still affect actual runtime.
+    This changes per-rank RNG/sample correspondence, not the producer cursor.
+    """
+    return [ids[pos] for pos in assign_image_batch_positions(ids, config, step=step, world=world)]
 
 
 class ImageEditDataset:
@@ -146,7 +154,8 @@ class ImageBatchSampler:
         self._epoch = -1
         self._order: list[int] = []
 
-    def batch(self, step: int) -> list[int]:
+    def batch_with_padding(self, step: int) -> list[tuple[int, bool]]:
+        """Return ``(sample_id, is_padding)`` pairs for ``step``."""
         if step < 0:
             raise ValueError("Step must be nonnegative")
         epoch, offset = divmod(step, self.steps_per_epoch)
@@ -157,4 +166,7 @@ class ImageBatchSampler:
             self._order = (order * math.ceil(padded_size / self.size))[:padded_size]
             self._epoch = epoch
         start = offset * self.batch_size
-        return self._order[start : start + self.batch_size]
+        return [(self._order[pos], pos >= self.size) for pos in range(start, start + self.batch_size)]
+
+    def batch(self, step: int) -> list[int]:
+        return [sample_id for sample_id, _ in self.batch_with_padding(step)]
