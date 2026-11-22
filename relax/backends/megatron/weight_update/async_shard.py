@@ -255,6 +255,7 @@ class AsyncShardSync:
     def _initialize(self, layout: dict) -> None:
         self.native_flat_bucket = layout.get("native_flat_bucket_v1") is True
         expert = None
+        geometry = None
         args = self.backend.args
         if (
             layout.get("num_experts")
@@ -263,8 +264,12 @@ class AsyncShardSync:
             and args.context_parallel_size == 1
             and args.expert_tensor_parallel_size == 1
         ):
-            geometry = DirectExpertLayout.from_receiver(layout)
-
+            try:
+                geometry = DirectExpertLayout.from_receiver(layout)
+            except ValueError:
+                # The receiver may still support ordinary shards.
+                pass
+        if geometry is not None:
             qualified = self._checked(lambda: self.iterator.configure_direct_experts(geometry))
             enabled = torch.tensor([int(qualified)], dtype=torch.int32, device="cpu")
             dist.all_reduce(enabled, op=dist.ReduceOp.MIN, group=self.group)
@@ -276,8 +281,8 @@ class AsyncShardSync:
                     num_layers=self.backend.args.num_layers,
                     qualified=True,
                 )
-            else:
-                self._checked(lambda: self.iterator.configure_direct_experts(None))
+        if expert is None:
+            self._checked(lambda: self.iterator.configure_direct_experts(None))
         owner = SimpleNamespace(args=self.backend.args, _hf_weight_iterator=self.iterator)
         self.source = self._checked(lambda: CombinedShardSource(owner, process_group=self.group, expert=expert))
         count = [len(self.backend.rollout_engines) if self.rank == 0 else None]
@@ -398,6 +403,10 @@ class AsyncShardSync:
                 self.core._writer = writer
             self.signature = probe["signature"]
             self._checked(self.source.begin_native_seed)
+        elif self.rank == 0:
+            # A rebuilt HTTP proxy can still own the same receiver session.
+            # Keep the planned receiver order and refresh only its RPC handles.
+            self.core.engines = [backend.rollout_engines[rank] for rank in self.engine_indices]
         weights = self._checked(
             lambda: dict(
                 backend._megatron.named_params_and_buffers(

@@ -1033,6 +1033,24 @@ def control_tp(model: torch.nn.Module, weights: Sequence[tuple[str, torch.Tensor
     _control_tp(model, weights, get_server_args(), get_parallel().tp_rank, get_tp_group().cpu_group)
 
 
+def _selected_default_moe_runner(model: torch.nn.Module) -> str | None:
+    try:
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+    except ImportError:
+        return None
+    runners = set()
+    for layer in model.modules():
+        if not isinstance(layer, FusedMoE):
+            continue
+        method = getattr(layer, "quant_method", None)
+        backend = getattr(getattr(method, "runner", None), "runner_backend", None)
+        if type(method) is not UnquantizedFusedMoEMethod or backend is None:
+            return None
+        runners.add(backend.value)
+    return next(iter(runners)) if len(runners) == 1 else None
+
+
 def _control_tp(
     model: torch.nn.Module, weights: Sequence[tuple[str, torch.Tensor]], args, tp_rank: int, group
 ) -> None:
@@ -1242,6 +1260,8 @@ def _control_tp(
                             quantization_config=getattr(config, "quantization_config", None),
                             native_flat_bucket_v1=reply["native_flat_bucket_v1"],
                         )
+                        if layout["is_cuda"] and layout.get("moe_runner_backend") == "auto":
+                            layout["moe_runner_backend"] = _selected_default_moe_runner(model)
                         model._relax_async_shard_layout = layout
                     reply.update(layout=layout, session=state["session"] if state else None)
         elif command["op"] == "bind_epoch":

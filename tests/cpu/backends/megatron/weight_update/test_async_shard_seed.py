@@ -118,8 +118,11 @@ def test_initial_capability_probe_needs_no_layout_and_missing_flat_capability_st
         module.probe_receivers(backend, "group")
 
 
-@pytest.mark.parametrize("quantized", [False, True])
-def test_ep1_experts_stay_native_when_direct_export_is_unqualified(monkeypatch, quantized):
+@pytest.mark.parametrize(
+    "dtype,runner",
+    [("bfloat16", "triton"), ("float8", "triton"), ("float16", "triton"), ("bfloat16", None)],
+)
+def test_ep1_experts_stay_native_when_direct_export_is_unqualified(monkeypatch, dtype, runner):
     from megatron.core import parallel_state as mpu
 
     monkeypatch.setattr(module.dist, "get_rank", lambda group: 0)
@@ -147,7 +150,7 @@ def test_ep1_experts_stay_native_when_direct_export_is_unqualified(monkeypatch, 
             context_parallel_size=1,
             expert_tensor_parallel_size=1,
         ),
-        quantization_config={"format": "mxfp4-pack-quantized"} if quantized else None,
+        quantization_config={"format": "mxfp4-pack-quantized"} if dtype == "float8" else None,
         rollout_engines={0: object()},
     )
     sync._initialize(
@@ -159,10 +162,10 @@ def test_ep1_experts_stay_native_when_direct_export_is_unqualified(monkeypatch, 
             ep_size=1,
             moe_dp_size=1,
             pp_size=1,
-            dtype="float8" if quantized else "bfloat16",
+            dtype=dtype,
             disable_shared_experts_fusion=True,
             is_cuda=True,
-            moe_runner_backend="triton",
+            moe_runner_backend=runner,
         )
     )
     sync.native_phase = True
@@ -171,6 +174,68 @@ def test_ep1_experts_stay_native_when_direct_export_is_unqualified(monkeypatch, 
     assert not sync.iterator._packed_expert_sync
     names = ["direct", "fallback", "model.layers.0.mlp.experts.0.gate_proj.weight"]
     assert [name for name in names if not sync.skips_native(name)] == names[1:]
+
+
+def test_auto_moe_reports_the_runner_used_by_unquantized_workers():
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    model = torch.nn.Module()
+    layer = FusedMoE.__new__(FusedMoE)
+    torch.nn.Module.__init__(layer)
+    method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+    torch.nn.Module.__init__(method)
+    method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
+    layer.quant_method = method
+    model.add_module("experts", layer)
+    assert loader._selected_default_moe_runner(model) == "triton"
+    method.runner = None
+    assert loader._selected_default_moe_runner(model) is None
+
+
+def test_stable_session_uses_rebuilt_proxy_without_reseeding(monkeypatch):
+    sync = object.__new__(module.AsyncShardSync)
+    sync.rank, sync.group, sync.cache_future = 0, "group", None
+    sync.signature, sync.engine_indices = "topology", {11: 0, 17: 1}
+    expected = [object(), object()]
+    replacements = {
+        rank: SimpleNamespace(
+            update_weights_from_tensor=SimpleNamespace(remote=Mock(return_value=reply)),
+            flush_cache=SimpleNamespace(remote=Mock()),
+        )
+        for rank, reply in zip(sync.engine_indices, expected, strict=True)
+    }
+    core = object.__new__(module.ShardP2PSynchronizer)
+    core.rank, core.group, core.completed_version = 0, "group", 3
+    core.session, core.engines, core.update_loader = "resident", [None, None], "apply"
+    core.serialize = lambda values, **kwargs: values
+    core.needs_seed = False
+    commands = [[{"op": "apply", "engine": engine, "tp_rank": 0}] for engine in range(2)]
+
+    def send(weights, *, version):
+        assert version == 4
+        refs, error = core._dispatch(commands)
+        assert error is None
+        assert refs == expected
+
+    core.update = send
+    sync.core = core
+    sync._checked = lambda action: action()
+    sync._probe = lambda: dict(signature="topology", sessions=["resident", "resident"], layout={})
+    sync._initialize = Mock(side_effect=AssertionError("Existing session was reseeded"))
+    sync.backend = SimpleNamespace(
+        weight_version=3,
+        rollout_engines={rank: replacements[rank] for rank in reversed(replacements)},
+        _rollout_control_request=Mock(),
+        _megatron=SimpleNamespace(named_params_and_buffers=lambda *args, **kwargs: ()),
+        args=None,
+        model=None,
+    )
+    sync.backend.update_weights_for_rollout = lambda **kwargs: setattr(sync.backend, "weight_version", 4)
+    monkeypatch.setattr(module.ray, "get", lambda values, **kwargs: values)
+    sync.update(rollout_only=True, actor_fwd_only=False)
+    sync._initialize.assert_not_called()
 
 
 def test_topology_shrink_retires_survivor_with_its_old_identity(monkeypatch):
