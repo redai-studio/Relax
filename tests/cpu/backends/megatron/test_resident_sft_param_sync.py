@@ -72,6 +72,9 @@ def test_resident_sft_preserves_hooks_across_single_step_calls(monkeypatch, enab
         def train(self):
             pass
 
+        def parameters(self):
+            return iter(())
+
         def no_sync(self):
             return nullcontext()
 

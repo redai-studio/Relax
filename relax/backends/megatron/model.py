@@ -38,6 +38,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
+from relax.models.common.lora import finalize_lora_models
 from relax.utils import tracking_utils
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
@@ -87,14 +88,16 @@ from .model_provider import (
 logger = get_logger(__name__)
 
 
-def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
+def _finalize_model_grads_with_memory_release(
+    *args: Any, finalize_grads_func: Callable | None = None, **kwargs: Any
+) -> None:
     # Finalization itself can lazily initialize NCCL communicators (e.g. MoE
     # router bias reduction), before forward_backward_func returns to the
     # optimizer. Make unused activation cache available at that boundary too.
     memory_before = available_memory()
     device_module.empty_cache()
     logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
-    finalize_model_grads(*args, **kwargs)
+    (finalize_grads_func or finalize_model_grads)(*args, **kwargs)
 
 
 def _get_distributed_wrapper_classes() -> tuple[type[torch.nn.Module], ...]:
@@ -527,7 +530,7 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     buckets."""
     if not (
         getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_chunked_logits", False)
+        and args.sft_chunked_logits
         and getattr(args, "recompute_loss_function", False)
         and getattr(args, "overlap_grad_reduce", False)
     ):
@@ -591,6 +594,7 @@ def setup_model_and_optimizer(
             ModelType.encoder_or_decoder,
             wrap_with_ddp=role in ["actor", "critic"],
         )
+    finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
@@ -650,6 +654,9 @@ def setup_model_and_optimizer(
         config_overrides=_build_optimizer_config_overrides(args, config),
         use_gloo_process_groups=args.use_gloo_process_groups,
     )
+    from relax.utils.training.lora_grad_sync import exclude_replicated_expert_adapter_grads_from_norm
+
+    exclude_replicated_expert_adapter_grads_from_norm(optimizer, ep_rank=mpu.get_expert_model_parallel_rank())
     if skip_nonfinite:
         install_nonfinite_guard(optimizer, model, process_group=torch.distributed.group.WORLD)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -1416,6 +1423,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "rollout_topk_token_ids",
                     "rollout_topk_log_probs",
+                    "rollout_topk_support_complete",
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
@@ -1442,7 +1450,7 @@ def train_one_step(
             # build_schedule_plan path doesn't go through model() so the
             # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
             # chunked-logits incompatibility is enforced as a hard assert in
-            # arguments.py.slime_validate_args, so bypass mode is guaranteed
+            # arguments.py.relax_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
             if use_indexer_replay:
                 with IndexerReplay.forward_stage():
@@ -1496,6 +1504,14 @@ def train_one_step(
             if is_vl_model and mm_inputs:
                 forward_kwargs.update(mm_inputs)
 
+            # Score Centering upcasts response blocks internally.
+            if (
+                getattr(args, "loss_type", None) == "policy_loss"
+                and getattr(args, "advantage_estimator", None) == "score_centering"
+                and (args.bf16 or args.fp16)
+            ):
+                forward_kwargs["fp32_output"] = False
+
             _attach_mtp_forward_kwargs(args, batch, forward_kwargs)
 
             # Dynamic CP: point pg_collection.cp at this mb's dynamic CP sub-group for
@@ -1524,13 +1540,13 @@ def train_one_step(
                 fused_linear = (
                     head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
                 )
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
+                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                if args.sft_chunked_logits and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
@@ -1583,7 +1599,7 @@ def train_one_step(
     # Forward pass.
     use_streaming = (
         getattr(args, "use_dynamic_batch_size", False)
-        and getattr(args, "fully_async", False)
+        and args.fully_async
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
@@ -1861,10 +1877,20 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
+    finalize_grads_func = finalize_model_grads
+    if any(getattr(param, "expert_parallel_replicated", False) for chunk in model for param in chunk.parameters()):
+        from megatron.bridge.peft.utils import (
+            enable_expert_parallel_grad_sync_in_finalize,
+            finalize_model_grads_with_expert_adapter_sync,
+        )
+
+        # Fused accumulation writes main_grad; remove the eager grad hooks before backward.
+        enable_expert_parallel_grad_sync_in_finalize(model)
+        finalize_grads_func = finalize_model_grads_with_expert_adapter_sync
     config.finalize_model_grads_func = (
-        _finalize_model_grads_with_memory_release
+        partial(_finalize_model_grads_with_memory_release, finalize_grads_func=finalize_grads_func)
         if getattr(args, "empty_unused_memory_level", 0) >= 1
-        else finalize_model_grads
+        else finalize_grads_func
     )
 
     pre_hook_enabled = False
@@ -2187,6 +2213,8 @@ def save(
         args.head_type = "critic_value_terminal_v1"
     elif getattr(args, "task_type", "causal_lm") == "seq_cls":
         args.head_type = "sequence_classification_v1"
+    elif args.task_type == "embedding":
+        args.head_type = "embedding_v1"
     else:
         args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):

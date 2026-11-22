@@ -86,7 +86,7 @@ class UpdateWeightFromTensor:
         # shared LoraAdapterSync helper; the backend keeps only its in-memory transport below.
         self._lora_sync = LoraAdapterSync(args, model) if self.lora_adapter_mode else None
 
-        self._route_experts = getattr(args, "colocate_expert_weight_routing", False)
+        self._route_experts = args.colocate_expert_weight_routing
         self._auto_expert_routing = False
         self._auto_route_candidate = (
             not self._route_experts
@@ -94,7 +94,7 @@ class UpdateWeightFromTensor:
             and args.megatron_to_hf_mode == "bridge"
             and not self.lora_enabled
             and not quantization_config
-            and not getattr(args, "rollout_external", False)
+            and not args.rollout_external
             and isinstance(getattr(args, "num_experts", None), int)
             and args.num_experts > 0
         )
@@ -108,7 +108,7 @@ class UpdateWeightFromTensor:
             or "kimik3" not in model_name.lower().replace("_", "").replace("-", "")
             or self.lora_enabled
             or (quantization_config or {}).get("format") != "mxfp4-pack-quantized"
-            or getattr(args, "rollout_external", False)
+            or args.rollout_external
         ):
             raise ValueError("Expert routing supports only colocated Kimi K3 MXFP4 Bridge full-parameter training")
 
@@ -274,11 +274,11 @@ class UpdateWeightFromTensor:
         """Retain the audited iterator's communicator closure, independently of
         whether this receiver supports expert routing."""
         if (
-            not getattr(self.args, "offload_train", False)
-            or not getattr(self.args, "colocate", False)
+            not self.args.offload_train
+            or not self.args.colocate
             or not getattr(self.args, "num_experts", None)
-            or getattr(self.args, "megatron_to_hf_mode", None) != "bridge"
-            or getattr(self.args, "rollout_external", False)
+            or self.args.megatron_to_hf_mode != "bridge"
+            or self.args.rollout_external
             or self.use_distribute
             or self.lora_enabled
         ):

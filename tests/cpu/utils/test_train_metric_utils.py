@@ -38,7 +38,15 @@ def _collect_perf_metrics(monkeypatch, peak_tflops):
         lambda _args, metrics, step_key: logged_metrics.update(metrics),
     )
 
-    args = Namespace(wandb_always_use_train_step=False)
+    args = Namespace(
+        wandb_always_use_train_step=False,
+        freeze_vision_model=False,
+        freeze_vision_projection=False,
+        freeze_language_model=False,
+        lora_rank=0,
+        freeze_params_name_list=None,
+        only_train_params_name_list=None,
+    )
     train_metric_utils.log_perf_data_raw(
         rollout_id=3,
         args=args,
@@ -68,7 +76,15 @@ def test_log_perf_data_raw_sends_extra_metrics_in_the_same_call(monkeypatch):
 
     train_metric_utils.log_perf_data_raw(
         rollout_id=3,
-        args=Namespace(wandb_always_use_train_step=False),
+        args=Namespace(
+            wandb_always_use_train_step=False,
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+            freeze_language_model=False,
+            lora_rank=0,
+            freeze_params_name_list=None,
+            only_train_params_name_list=None,
+        ),
         is_primary_rank=True,
         extra_metrics={"straggler/self/median_ms": 700.0},
     )

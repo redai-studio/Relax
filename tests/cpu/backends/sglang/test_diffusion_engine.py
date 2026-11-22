@@ -428,7 +428,9 @@ def test_cuda_visible_devices_rejects_a_block_off_the_end_of_the_node():
 
 
 def test_launch_server_requires_a_node_width(monkeypatch):
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, num_gpus_per_node=0)
+    args = SimpleNamespace(
+        model_path="/models/Qwen-Image", model_revision=None, num_gpus_per_node=0, lora_adapter_mode=False
+    )
     eng = SGLangNativeGenerationEngine(args=args, rank=0, base_gpu_id=0, num_gpus_per_engine=1)
     monkeypatch.setattr(eng, "_get_current_node_ip_and_free_port", lambda start_port: ("127.0.0.1", 21000))
     with pytest.raises(RuntimeError, match="num_gpus_per_node"):
@@ -440,6 +442,7 @@ def test_compute_server_args_maps_model_ports_and_overrides():
         model_path="/models/Qwen-Image/",
         model_revision=None,
         rollout_num_gpus_per_engine=1,
+        lora_adapter_mode=False,
     )
     eng = SGLangNativeGenerationEngine(
         args=args, rank=0, base_gpu_id=2, sglang_overrides={"enable_torch_compile": True}
@@ -459,17 +462,22 @@ def test_compute_server_args_maps_model_ports_and_overrides():
     assert sa["enable_torch_compile"] is True
     assert "revision" not in sa
     assert "ulysses_degree" not in sa
+    assert "text_encoder_cpu_offload" not in sa and "vae_cpu_offload" not in sa
 
 
 def test_compute_server_args_rejects_an_invalid_scheduler_rendezvous_address():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=1)
+    args = SimpleNamespace(
+        model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=1, lora_adapter_mode=False
+    )
     eng = SGLangNativeGenerationEngine(args=args, rank=0)
     with pytest.raises(ValueError, match="invalid diffusion engine dist_init_addr"):
         eng._compute_server_args("127.0.0.1", 30010, num_gpus=1, engine_args={"dist_init_addr": "invalid"})
 
 
 def test_compute_server_args_multi_gpu_forces_ulysses_not_cfg_parallel():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=2)
+    args = SimpleNamespace(
+        model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=2, lora_adapter_mode=False
+    )
     eng = SGLangNativeGenerationEngine(args=args, rank=0, base_gpu_id=4, num_gpus_per_engine=2)
     sa = eng._compute_server_args("127.0.0.1", 30010, num_gpus=2, engine_args={})
     assert sa["num_gpus"] == 2
@@ -477,7 +485,9 @@ def test_compute_server_args_multi_gpu_forces_ulysses_not_cfg_parallel():
 
 
 def test_compute_server_args_override_can_replace_ulysses_degree():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=4)
+    args = SimpleNamespace(
+        model_path="/models/Qwen-Image", model_revision=None, rollout_num_gpus_per_engine=4, lora_adapter_mode=False
+    )
     eng = SGLangNativeGenerationEngine(
         args=args, rank=0, base_gpu_id=0, sglang_overrides={"ulysses_degree": 1, "sp_degree": 4}
     )
@@ -486,7 +496,9 @@ def test_compute_server_args_override_can_replace_ulysses_degree():
 
 
 def test_compute_server_args_none_override_does_not_clobber_model_path():
-    args = SimpleNamespace(model_path="/models/Qwen-Image", hf_checkpoint=None, model_revision=None)
+    args = SimpleNamespace(
+        model_path="/models/Qwen-Image", hf_checkpoint=None, model_revision=None, lora_adapter_mode=False
+    )
     eng = SGLangNativeGenerationEngine(args=args, rank=0, base_gpu_id=0, sglang_overrides={"model_path": None})
     sa = eng._compute_server_args("127.0.0.1", 30010, num_gpus=1, engine_args={})
     assert sa["model_path"] == "/models/Qwen-Image"

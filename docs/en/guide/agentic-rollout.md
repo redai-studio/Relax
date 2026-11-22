@@ -331,12 +331,27 @@ python -m my_agent \
     --output-json "${RELAX_OUTPUT_JSON}"
 ```
 
-Relax manages the process group created for the launcher. A shell wrapper may use `exec` to simplify its process tree,
-but `exec` is not required. Pass application settings with `--agent-env`:
+`--agent-command` names an executable and its arguments, with shell-style quoting. Relax starts it directly without a
+login shell. Put environment activation, variable expansion, pipelines and redirection in an explicit script, launched
+as `bash run_agent_app.sh`.
+
+Pass application settings with `--agent-env`:
 
 ```bash
 --agent-env FOO=bar BAZ=qux
 ```
+
+### Cleanup ownership
+
+When an agent times out or its Group is dropped, Relax sends SIGTERM to the still-running root process started by
+`--agent-command`. If it has not exited after the grace period, Relax sends SIGKILL to that root process.
+A normal partial-rollout pause leaves the agent process running.
+
+Whether it exits naturally or is terminated by Relax, `agent-command` is responsible for cleaning up its tools,
+subprocesses, containers, and remote jobs.
+
+After the root exits, Relax makes a best-effort attempt to clean up remaining local processes. Cleanup failures produce
+warnings and do not block training.
 
 ### Launch Training
 
@@ -348,7 +363,33 @@ Add these options to a working Relax training command:
 --agent-command "bash run_agent_app.sh"
 ```
 
-Use a recipe under `examples/` for model, data, parallelism, and algorithm settings.
+### Build a Recipe
+
+Start from a working recipe with the same model and training mode. `examples/search_r1/run_search_r1.sh` is a local
+tool-agent example; `examples/deepeyes_agentic/run_deepeyes_agentic.sh` adds images;
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh` uses an external sandbox service with fully async 4-GPU
+training and 4-GPU PD + HiCache rollout. Hardware settings in an example are recipe choices, not framework defaults.
+
+1. Map the task dataset with `--prompt-data`, `--input-key`, `--metadata-key`, and, when needed, `--multimodal-keys`.
+   Let the adapter read `RELAX_INPUT_JSON`; keep environment servers and retrievers outside the per-Session command.
+2. Add an agent entry point that reads the injected endpoint and Session credential, preserves the existing tool loop,
+   and sends complete histories. Configure reasoning/tool parsers for the actual model and allow model requests to
+   survive the selected cross-step waits. The command, working directory, and dependencies must exist on every node
+   that can host a SessionShard.
+3. Choose the output contract: a linear trajectory can write `reward`/metadata or use `--custom-rm-path`; selected
+   branches and multi-context training need explicit exports and the applicable custom-advantage configuration below.
+4. Ensure the launched `--agent-command` cleans up its resources on natural exit and on SIGTERM from Relax, then
+   configure Group concurrency and external executor quotas using
+   [Configure Runtime Behavior](#configure-runtime-behavior). `--use-agentic-rollout` selects Agentic generation for
+   both train and Eval; a configured `--custom-generate-function-path` is ignored on this path.
+5. Run a complete Group through model calls, tools, reward, export, and cleanup before scaling up. Then check a real
+   optimizer update and the configured pause/resume or prelaunch lifecycle; a single successful model call proves only
+   API connectivity.
+
+For a single-node run, check whether local Ray is running; if it is not, use a recipe that sources
+`scripts/entrypoint/local.sh` and run it with Bash. Use `scripts/entrypoint/ray-job.sh` when submitting to an existing
+cluster. Keep model/data paths and deployment settings in the recipe; no custom rollout loop is needed for this adapter
+path.
 
 ### Verify the First Rollout
 
@@ -521,61 +562,100 @@ selects that value. Leave reward unset on sibling contexts. Put any outcome need
 metadata. In multi-context training, reward reports the task outcome and custom advantage determines each export's
 advantage.
 
-## Configure Runtime Behavior
+### Background Eval Judging
 
-::: danger Required external-agent capacity
-When agents run on a centralized remote platform with a hard concurrency limit, calculate the train limit and each Eval
-dataset's limit:
+The built-in Agentic and standard SGLang eval paths can run expensive judges in the background after generating
+trajectories. Background judging is enabled by default without any flag; pass `--disable-eval-async-judge` to disable it
+and wait for scoring. This works with both colocated and separate training/rollout GPUs. Generating eval trajectories still uses
+the existing policy inference resources, and background scoring must not continue to depend on those resources.
 
-```text
-T = agentic_concurrency * n_samples_per_prompt
-G_d = dataset d's n_samples_per_eval_prompt
-C_d = explicit agentic_eval_concurrency or ceil(T / G_d)
-E_d = C_d * G_d
-E_peak = max(E_d across Eval datasets)
+The independent HTTP reward `remote_rm` uses this mechanism automatically. A custom `--custom-rm-path` must declare
+support explicitly. For example, with existing `train_reward` and `eval_reward` implementations, the entry point can
+remain a synchronous function:
+
+```python
+def reward_func(args, sample, *, evaluation=False, **kwargs):
+    if evaluation:
+        return eval_reward(args, sample)
+    return train_reward(args, sample)
+
+
+reward_func.supports_async_eval = True
 ```
 
-Eval datasets run serially, so their combined peak is `E_peak`, not the sum of all `E_d` values.
+Synchronous `def` functions still run in the Ray reward process pool; `async def` functions can also declare support.
+The built-in Agentic and standard SGLang rollout paths pass `evaluation=False` during training and `evaluation=True`
+during evaluation, for both inline and background scoring. Functions accepting an `evaluation` keyword or `**kwargs`
+receive the argument; existing strict two-argument functions receive no extra argument. If you implement a complete
+rollout or eval function, explicitly pass `evaluation` when calling `async_rm` / `batched_async_rm`; Relax does not infer
+the phase from shared `args` or metadata. You do not need metadata phase markers or an extra YAML file to distinguish
+the phases. Configure the evaluation data directly through the CLI:
 
-When `--agentic-prelaunch`, `--partial-rollout`, or `--fully-async` is enabled, select **Yes** in the
-**Train sessions remain resident during Eval** column. Prelaunch shares the training resident capacity, so the train limit
-stays `T`; it makes `T` overlap with `E_peak`.
+```bash
+--eval-prompt-data agent_eval "<eval-data-path>"
+```
 
-Then use the matching row for an executor shared by train and Eval:
+You can still use `--eval-config` for dataset-specific sampling parameters or metadata.
 
-| Eval enabled | Train sessions remain resident during Eval | Required slots |
-| --- | --- | --- |
-| No | — | `external_slots >= T` |
-| Yes | No | `external_slots >= max(T, E_peak)` |
-| Yes | Yes | `external_slots >= T + E_peak` |
+Declaring `supports_async_eval` means eval scoring only needs the exported Sample snapshot, persistent artifacts, and
+independent CPU or remote judge resources. Export the actions, tool results, and intermediate traces needed for scoring
+before the Session ends. The scorer must not depend on a live Session, temporary files, or a colocated model that may
+be offloaded. Return the final real reward; do not submit a background job yourself and return its ID or a placeholder
+score. The complete-list input and corresponding-list output contract for `group_rm` is unchanged.
 
-Fewer slots can deadlock Group startup at the all-session first-request barrier. Check this table before starting a run.
-:::
+Relax uses a CPU reward pool separate from training scoring, then records metrics and dumps under the original eval
+iteration once the real scores arrive. Ordinary rule rewards, custom rewards without the declaration, managed
+`dapo-genrm`, and native image scoring keep their existing paths. Training rewards are also unaffected by this option.
+In ordinary RM mode, a reward already supplied by the Agent is reused without another scoring call.
 
-| Goal | Option | Behavior |
-| --- | --- | --- |
-| Limit resident training Groups | `--agentic-concurrency` | Shared capacity for Prepare and Runtime |
-| Set resident Eval Groups | `--agentic-eval-concurrency` | Logical Eval prompt-Group capacity derived from training capacity when unset |
-| Start agents early | `--agentic-prelaunch` | Starts processes while resident capacity is free |
-| Reuse unfinished samples | `--partial-rollout` | Aborts and resumes backend attempts across steps |
-| Run asynchronous rollout and training | `--fully-async` | Keeps unfinished sessions while partitions advance |
-| Limit partial aborts | `--partial-rollout-max-aborted-count` | Protects a repeatedly aborted attempt |
-| Stop an agent that runs too long | `--agent-timeout` | Terminates the agent process when its Runtime active-time budget expires |
+The eval pool for synchronous judges uses `--reward-num-workers` and `--reward-max-concurrency` independently of the
+training pool. Reserve CPU resources for the additional scoring processes.
 
-`--agent-timeout` starts after a Session enters Runtime. It stops an agent that remains active for too long, for example
-because its loop or a tool call is stuck. A prelaunched Session waiting for Runtime does not consume this budget. The
-budget also pauses when partial rollout or fully async pauses a Session between steps.
+Normal training completion waits for pending judges and records their results. Background scoring failures are logged
+and raised during this final drain. This is not a durable job queue that survives the training job: failures or forced
+shutdown can interrupt scoring. Judges that consistently run slower than eval submission will accumulate a backlog,
+so set timeouts on remote calls and provision enough scoring capacity. Separate worker pools do not remove contention
+at a shared remote judge service.
 
-`--agentic-concurrency` defaults to `--over-sampling-batch-size`, which defaults to `--rollout-batch-size`.
-`--agentic-eval-concurrency` is derived separately for each Eval dataset from `T` and that dataset's Group size when
-unset. Both options count logical prompt Groups. Dataset `d` owns `E_d` sessions with either ordinary RM or Group RM;
-ordinary RM uses singleton Runtime Groups internally without changing that total. Eval datasets run serially, so with
-dedicated train and Eval executors, provision `T` and `E_peak` separately.
+## Configure Runtime Behavior
 
-Start retrievers, environment servers, and other cross-session services outside the per-session agent command.
+### Group concurrency and independent Session generation
 
-Session KV lifecycle and program-aware admission are optional controls for long-running workloads. See
-[Agentic KV Scheduling](./agentic-kv-scheduling.md).
+`--agentic-concurrency` limits resident training Groups across Prepare and Runtime. Its default is
+`--over-sampling-batch-size`, which defaults to `--rollout-batch-size`. Each Group starts all
+`--n-samples-per-prompt` original Sessions on one Shard.
+
+A registered Group can receive its Runtime lease before every member reaches its first model request. Each leased
+member generates when its own request is ready and the generation gate is open. Complete-Group reward, filtering,
+export, and replenishment still wait for the original Group. Oversampling determines the legal Group launch demand.
+
+Prelaunch retains its existing Group budget. Unleased members wait for lease; ordinary paused members wait for resume.
+`--agent-timeout` begins for each member after its first request is ready and its leased generation gate opens. Protected
+Sessions keep their active timer during a partial-rollout pause. The model client's wall-clock timeout continues while
+requests wait. Partial rollout, fully async, and dynamic global batch size retain their existing mode constraints.
+
+### External executors and Eval
+
+Each Session has 1800 seconds from scheduling its agent process task to issue its first valid inference request,
+including time spent waiting for an external executor. Receiving that request stops the startup timer, even before the
+Group is leased; generation still waits for its gate to open. Exiting before the first request or exceeding this deadline
+drops the whole Group and triggers replenishment. This startup timer is independent of `--agent-timeout`.
+
+Logical train demand is `L = agentic_concurrency * n_samples_per_prompt`. For each Eval dataset, let
+`G_d = n_samples_per_eval_prompt`; Eval Group concurrency is the explicit `--agentic-eval-concurrency`, or
+`ceil(L / G_d)` by default. Its Session ceiling is `E_d = C_d * G_d`. Eval datasets run serially.
+
+Eval members also generate independently after lease. Ordinary RM uses singleton Runtime Groups; Group RM keeps the
+sampled Group size. Both preserve their existing complete export and reward semantics.
+
+For a shared executor, budget at least `max(L, max(E_d))` available task slots when training resources are gone before
+Eval. When prelaunch, partial rollout, or fully async retains training resources during Eval, budget `L + max(E_d)`.
+Dedicated pools need separate train and Eval budgets. These are logical demand estimates: background cleanup and other
+jobs can keep additional external resources alive. The external service enforces its physical quotas.
+
+Independent member generation allows ready members to make progress when an executor queues their siblings. It does
+not resolve application dependencies on work waiting in the same saturated pool. KV controls address another resource;
+see [Agentic KV Scheduling](./agentic-kv-scheduling.md).
 
 ## Understand How Agentic Rollout Works
 
@@ -667,7 +747,8 @@ aligned rollout logprobs. An exported lineage must contain at least one committe
 #### Resident Capacity
 
 Prepare and Runtime share the resident Group capacity. Reward work is outside this capacity. A completed or dropped
-Runtime Group frees a slot. A filtered Group creates new demand.
+Runtime Group releases its logical slot before best-effort physical cleanup. Filtering creates new Group demand.
+Tests and rewards run inside the agent belong to its Session lifecycle and differ from the pipeline's Reward stage.
 
 ![Shared resident capacity and prelaunch](/agentic/resident_capacity.svg)
 
@@ -697,6 +778,9 @@ radix-cache entries when a session ends. See [Agentic KV Scheduling](./agentic-k
 ## Operations and Troubleshooting
 
 ### Metrics and Dumps
+
+Logical Group counts describe scheduling residency. Inspect the agent or executor's own state for physical process,
+container, and remote-task occupancy; background cleanup can outlive logical retirement.
 
 Set `--save-debug-rollout-data <path-with-{rollout_id}>` to save complete metadata, SessionForest state hashes, terminal
 status, turn count, request timing, abort count, and weight-version information.
@@ -932,7 +1016,11 @@ the current design.
 
 - **The agent does not start or exits with an error:** check `--agent-cwd` and `--agent-command`, then inspect `run.log`.
   Relax adds a bounded tail of the agent's stdout and stderr to `AgentExecutionError`.
-- **The first request waits:** it is held until the Group receives a Runtime lease. Use a long client timeout.
+- **The first request waits:** check the Runtime lease, generation pause, backend permits, and executor queue. Use a
+  client timeout that covers these waits. Siblings reaching their first request later do not gate a ready leased member.
+- **External resources remain after a task ends:** check that `agent-command` cleans up on natural exit and on SIGTERM
+  from Relax, and inspect executor state. Relax's fallback cleanup logs warnings independently of logical Group capacity.
+
 - **Explicit export does not match:** preserve the exact normalized `messages`, `tools`, and `chat_template_kwargs` used
   during generation.
 - **Implicit export is ambiguous:** write named explicit records for the contexts selected for training.

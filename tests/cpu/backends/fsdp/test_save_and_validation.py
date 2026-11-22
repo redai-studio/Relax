@@ -482,7 +482,7 @@ def test_validate_rejects_unconsumed_flags():
 
 
 def test_validate_warns_but_accepts_inert_flags(caplog):
-    # async_save is forced by slime_validate_args alongside --rotate-ckpt, so it
+    # async_save is forced by relax_validate_args alongside --rotate-ckpt, so it
     # must warn rather than fail.
     validate_generative_config(_valid_args(async_save=True))
 

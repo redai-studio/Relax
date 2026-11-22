@@ -26,6 +26,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.models.common.lora import resolve_lora_targets
 from relax.utils.device import is_npu_available, make_current_torch_device
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -180,6 +181,8 @@ def _configure_bridge_provider(args: argparse.Namespace, provider: Any = None) -
         "_relax_qwen35_optimized",
         "moe_aux_loss_coeff",
         "moe_token_dispatcher_type",
+        "moe_megakernel_backend",
+        "moe_megakernel_backend_config",
         "moe_shared_expert_overlap",
         "moe_enable_deepep",
         "moe_flex_dispatcher_backend",
@@ -254,6 +257,11 @@ def _configure_bridge_provider(args: argparse.Namespace, provider: Any = None) -
             if old_val != new_val:
                 logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
             setattr(provider, attr, new_val)
+
+    # Overlapped interleaved P2P and batched P2P cannot be enabled together.
+    if getattr(args, "overlap_p2p_comm", None) is not None:
+        provider.overlap_p2p_comm = args.overlap_p2p_comm
+        provider.batch_p2p_comm = not args.overlap_p2p_comm
 
     if callable(getattr(provider, "configure_runtime", None)):
         provider.configure_runtime(args)
@@ -334,6 +342,9 @@ def _configure_bridge_provider(args: argparse.Namespace, provider: Any = None) -
             )
             provider.num_layers_in_first_pipeline_stage = None
             provider.num_layers_in_last_pipeline_stage = None
+
+    if getattr(args, "dsa_kernel_backend", None) is not None:
+        provider.dsa_kernel_backend = args.dsa_kernel_backend
 
     # Bridge bypasses MCore's CLI backend resolution. Preserve DSv4's fused default
     # (FlashMLA forward + cuDNN backward), including newer MCore where the deprecated
@@ -585,7 +596,7 @@ def get_model_provider_func(
     provider = _initialize_model_provider(args)
 
     # Support custom model provider path (similar to --custom-rm-path for reward models)
-    if getattr(args, "custom_model_provider_path", None):
+    if args.custom_model_provider_path:
 
         def wrapped_model_provider(
             pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None, **kwargs: Any
@@ -613,7 +624,7 @@ def get_model_provider_func(
             _install_cp_probe(model)
             return model
 
-        if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        if is_lora_enabled(args) and args.task_type == "seq_cls":
             wrapped_model_provider = wrap_model_provider_with_lora(wrapped_model_provider, args)
         return wrapped_model_provider
 
@@ -817,13 +828,14 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
+            peft.target_modules = resolve_lora_targets(model, list(peft.target_modules), args)
             # Restrict adapter injection to the requested model region (e.g. language-only
             # for VL models). Overriding target_modules post-construction is supported:
             # PEFT.__call__ rebuilds its matcher state from the current target_modules.
-            scope = getattr(args, "lora_scope", "all")
+            scope = args.lora_scope
             if scope != "all":
-                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
-            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
+                peft.target_modules = scope_target_modules_to_region(model, list(peft.target_modules), scope)
+            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and args.freeze_params_name_list:
                 peft.target_modules = exclude_frozen_lora_target_modules(
                     model, list(peft.target_modules), args.freeze_params_name_list
                 )
@@ -1002,10 +1014,15 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                     param.requires_grad = False
                     break
 
+    if getattr(args, "task_type", "causal_lm") == "embedding":
+        from relax.utils.training.embedding import freeze_embedding_unused_heads
+
+        freeze_embedding_unused_heads(model)
+
 
 def validate_mtp_only_trainable_params(args: argparse.Namespace, model: Sequence[torch.nn.Module]) -> None:
     """Fail fast when MTP-only mode exposes any non-MTP trainable parameter."""
-    if not getattr(args, "mtp_only_training", False):
+    if not args.mtp_only_training:
         return
 
     trainable = [

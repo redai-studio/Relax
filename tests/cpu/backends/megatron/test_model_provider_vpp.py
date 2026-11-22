@@ -10,6 +10,14 @@ from relax.utils.misc import resolve_is_vl_model
 from relax.utils.training import ppo_utils
 
 
+class _FakePEFT:
+    def __init__(self) -> None:
+        self.target_modules = ["linear_qkv"]
+
+    def __call__(self, model: torch.nn.Module, training: bool) -> torch.nn.Module:
+        return model
+
+
 class _FakeProvider:
     def __init__(self, model=None):
         self.calls = []
@@ -173,6 +181,7 @@ def _load_model_provider(monkeypatch, provider=None):
 def _bridge_args(**overrides):
     values = {
         "megatron_to_hf_mode": "bridge",
+        "task_type": "causal_lm",
         "hf_checkpoint": "fake-hf",
         "attention_backend": "flash",
         "tensor_model_parallel_size": 2,
@@ -217,6 +226,8 @@ def _bridge_args(**overrides):
         "use_megatron_fsdp": False,
         "only_train_params_name_list": None,
         "freeze_params_name_list": None,
+        "custom_model_provider_path": None,
+        "lora_scope": "all",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -611,6 +622,31 @@ def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch
     assert post_process_values == [False]
 
 
+@pytest.mark.parametrize("tie_weights", [False, True])
+@pytest.mark.parametrize("distributed", [False, True])
+def test_embedding_provider_keeps_only_used_weights_trainable_after_allowlist(monkeypatch, tie_weights, distributed):
+    model = torch.nn.Module()
+    language_model = torch.nn.Module()
+    model.language_model = language_model
+    language_model.embedding = torch.nn.Embedding(8, 4)
+    language_model.output_layer = torch.nn.Linear(4, 8, bias=False)
+    if tie_weights:
+        language_model.output_layer.weight = language_model.embedding.weight
+    module, _ = _load_model_provider(monkeypatch, _FakeProvider(model))
+    args = _bridge_args(
+        task_type="embedding", only_train_params_name_list=["language_model"], freeze_params_name_list=None
+    )
+
+    if distributed:
+        assert module.get_bridge_distributed_model(args) == [model]
+    else:
+        build_model = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
+        build_model()
+
+    assert language_model.embedding.weight.requires_grad
+    assert language_model.output_layer.weight.requires_grad == tie_weights
+
+
 def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
 
@@ -678,8 +714,8 @@ def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrappe
         return model
 
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
-    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
-    args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
+    args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None, lora_scope="all")
     provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
     if "lora" in wrapper:
         provider = module.wrap_model_provider_with_lora(provider, args)
@@ -719,7 +755,7 @@ def test_custom_provider_forwards_supported_mcore_arguments(monkeypatch, accepts
 def test_bridge_provider_receives_mcore_process_groups_through_wrappers(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
-    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
     args = _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None)
     wrapped = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
     config = object()
@@ -783,6 +819,8 @@ def test_raw_provider_uses_supplied_config_and_process_groups(monkeypatch, expli
     "name,value",
     [
         ("moe_hybridep_pad_variable_tokens", True),
+        ("moe_megakernel_backend", "mok"),
+        ("moe_megakernel_backend_config", {"shared_expert_mode": "native", "fwd_num_comm_sms": 40}),
         ("gdn_pre_gated_delta_rule_fusion", True),
         ("gdn_conv_pad_alignment", 8192),
     ],
@@ -1079,6 +1117,7 @@ def test_bridge_ddp_preserves_task_head_lora_freeze_order(monkeypatch):
         model.register_parameter("adapter", torch.nn.Parameter(torch.ones(4)))
         return model
 
+    apply_peft.target_modules = []
     monkeypatch.setattr(module, "build_lora_peft", lambda args: apply_peft)
     args = _bridge_args(
         task_type="seq_cls",
@@ -1169,3 +1208,14 @@ def test_bridge_preserves_gdn_precision_and_reward_head_before_wrapping(monkeypa
     assert all(param is not lm_head.weight for param in model.parameters())
     assert args.uses_unsplit_forward is True
     assert args._relax_qwen35_optimized is False
+
+
+@pytest.mark.parametrize("overlap", [True, False, None])
+def test_bridge_provider_preserves_p2p_cli_choice(monkeypatch, overlap):
+    provider = _FakeProvider()
+    provider.overlap_p2p_comm = False
+    provider.batch_p2p_comm = True
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(overlap_p2p_comm=overlap), role="actor")
+    assert provider.overlap_p2p_comm is (False if overlap is None else overlap)
+    assert provider.batch_p2p_comm is (True if overlap is None else not overlap)

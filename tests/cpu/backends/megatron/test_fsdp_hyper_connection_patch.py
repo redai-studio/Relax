@@ -12,8 +12,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tests.cpu.backends.megatron.test_ple_packed_cp_gradients import _added_source
-
 
 @pytest.fixture
 def native_mcore():
@@ -33,7 +31,12 @@ def native_mcore():
         MegatronModule=MegatronModule,
         nvtx_decorator=lambda **kwargs: lambda fn: fn,
     )
-    source = _added_source("megatron/core/transformer/hyper_connection.py")
+    patch = Path(__file__).resolve().parents[4] / "docker/patch/latest/megatron.patch"
+    relative = "megatron/core/transformer/hyper_connection.py"
+    section = patch.read_text().split(f"diff --git a/{relative} b/{relative}\n", 1)[1].split("\ndiff --git ", 1)[0]
+    source = "\n".join(
+        line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++")
+    )
     exec(
         compile("from __future__ import annotations\n" + source, "docker hyper_connection patch", "exec"),
         module.__dict__,

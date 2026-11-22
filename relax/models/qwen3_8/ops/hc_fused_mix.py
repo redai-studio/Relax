@@ -144,6 +144,8 @@ def fused_mix(self: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, tor
 
 
 def supported(hc: Any, x: torch.Tensor) -> bool:
+    if not x.is_cuda:
+        return False
     from megatron.core import utils as mcore_utils
 
     return _supported(hc, x, getattr(mcore_utils, "ensure_params_ready", None))

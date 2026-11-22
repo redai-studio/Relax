@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Dead-engine classification for GenRM single-engine recovery.
+"""GenRM placement and dead-engine classification for recovery.
 
 ``_is_engine_dead`` decides whether a failure from an engine means "the process
 is gone, retire and rebuild it" or "this is a real bug, let it propagate". Both
@@ -16,6 +16,8 @@ builtin ``ConnectionError``, so it has to be listed explicitly.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import requests
 
@@ -23,7 +25,7 @@ import requests
 try:
     import ray
 
-    from relax.distributed.ray.genrm import _is_engine_dead
+    from relax.distributed.ray.genrm import GenRMManager, _is_engine_dead
 
     HAS_DEPS = True
 except ImportError:
@@ -104,3 +106,41 @@ def test_oserror_does_not_over_match():
     OSError -- a disk problem inside a healthy engine is not a dead process."""
     assert not _is_engine_dead(OSError("No space left on device"))
     assert _is_engine_dead(ConnectionResetError("peer reset"))  # is a ConnectionError
+
+
+@pytest.mark.parametrize("bundle_offset", [0, 4], ids=["first-instance", "second-instance"])
+@pytest.mark.parametrize(
+    ("colocate", "fully_async", "shared_with_rollout", "region_start"),
+    [
+        (False, False, False, 0),
+        (False, True, False, 0),
+        (True, True, False, 0),
+        (True, False, False, 4),
+        (True, False, True, 0),
+    ],
+    ids=["dedicated-sync", "fully-async", "hybrid", "colocate-split", "colocate-shared"],
+)
+def test_genrm_placement_keeps_engines_inside_their_gpu_region(
+    colocate, fully_async, shared_with_rollout, region_start, bundle_offset
+):
+    manager_cls = GenRMManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    # Two TP=2 engines occupy four bundles. A later instance starts after
+    # the previous instance's four bundles, within the same GenRM region.
+    pg_size = region_start + bundle_offset + 4
+    manager.pg = (object(), list(range(pg_size)), list(range(pg_size)))
+    manager.args = SimpleNamespace(
+        colocate=colocate,
+        fully_async=fully_async,
+        _genrm_colocate_with_rollout=shared_with_rollout,
+        rollout_num_gpus=pg_size if shared_with_rollout else 4,
+    )
+    manager.num_gpu_per_engine = 2
+    manager.bundle_offset = bundle_offset
+
+    for rank, expected_index in enumerate((region_start + bundle_offset, region_start + bundle_offset + 2)):
+        pg, owns_pg, gpu_index = manager._resolve_placement(rank)
+        assert pg is manager.pg
+        assert owns_pg is False
+        assert gpu_index == expected_index
+        assert gpu_index + manager.num_gpu_per_engine <= len(pg[1])

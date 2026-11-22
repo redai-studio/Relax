@@ -252,14 +252,16 @@ bash scripts/entrypoint/ray-job.sh \
 
 ### 有界同步 Checkpoint 保存
 
-两个 Dockerfile 都在主 Megatron patch 后应用 `docker/patch/megatron/sync-save-bounded-staging.patch`。全参 GRPO 脚本显式启用；设置 `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` 可让该脚本回到原同步 writer。其他启动方式默认关闭此优化。异步保存行为不变。
+两个 Dockerfile 都通过 `docker/patch/latest/megatron.patch` 的 `common` 段安装有界同步暂存实现。全参 GRPO 脚本显式启用；设置 `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` 可让该脚本回到原同步 writer。其他启动方式默认关闭此优化。异步保存行为不变。
 
 - `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=1`：分批暂存并顺序写入，避免将整个 checkpoint 预载到 CPU。
 - `MEGATRON_SYNC_SAVE_STAGE_BYTES`：每个 rank 的活跃暂存预算，默认 1 GiB。窗口为空时允许一个超过预算的大张量，因此边界为 `max(budget, largest_tensor)`。
 - 预算 `0` 表示逐张量暂存和写入，**不表示**切回原 writer。
 - 预算只约束活跃暂存张量，不约束总 RSS、optimizer/offload 内存、序列化临时空间或文件系统页缓存。降低暂存内存可能牺牲写入吞吐，需在目标存储上测量。
 
-脚本会把两个环境变量传递到训练 actor。旧镜像没有此 patch 时，即使设置变量，也仍使用原保存实现；要获得优化，需要统一重建镜像或给所有节点安装 patch。已运行的任务不会自动加载新 patch。Checkpoint 格式和加载方式不变。异常处理与验证边界见 `docker/patch/megatron/sync-save-bounded-staging.md`。
+脚本会把两个环境变量传递到训练 actor，启动前应确保所有 rank 的配置一致。旧镜像没有此 patch 时，即使设置变量，也仍使用原保存实现；要获得优化，需要在所有节点统一部署重建后的镜像。已运行的任务不会自动加载新 patch。Checkpoint 格式和加载方式不变。
+
+暂存、写入和清理异常会通过 checkpoint 完成流程向上传递，并保留首次失败；这无法恢复进程死亡或进程组损坏。需要在目标集群验证完整规模的保存和恢复，并测量每个节点的内存；CPU 测试不能证明多节点 GPU 行为正确。
 
 ### 训推差异诊断
 

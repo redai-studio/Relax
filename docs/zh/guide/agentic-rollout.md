@@ -319,12 +319,24 @@ python -m my_agent \
     --output-json "${RELAX_OUTPUT_JSON}"
 ```
 
-Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `exec` 简化 process tree，但 `exec` 不是
-必须条件。Application 配置通过 `--agent-env` 传入：
+Relax 会管理 launcher 创建的 process group。需要保留运行以管理资源的 wrapper 应自行处理并转发 SIGTERM。
+Application 配置通过 `--agent-env` 传入：
 
 ```bash
 --agent-env FOO=bar BAZ=qux
 ```
+
+### 清理责任
+
+`--agent-command` 表示可执行程序及参数，支持引号分组。Relax 直接启动程序，不隐式启动登录 Shell。
+环境激活、变量展开、管道和重定向应写入显式脚本，以 `bash run_agent_app.sh` 启动。
+
+agent 超时或所属 Group 被丢弃时，Relax 向 `--agent-command` 启动且仍在运行的 root 进程发送 SIGTERM；等待宽限期后仍未退出，则向该进程发送 SIGKILL。
+正常的 partial rollout 暂停不会终止 agent 进程。
+
+无论自然退出还是被 Relax 终止，`agent-command` 都负责清理自己使用的工具、子进程、容器和远程任务等资源。
+
+root 退出后，Relax 尽力清理本地残留进程。清理失败仅记录警告，不阻塞训练。
 
 ### 启动训练
 
@@ -336,7 +348,29 @@ Relax 会管理 launcher 创建的 process group。Shell wrapper 可以使用 `e
 --agent-command "bash run_agent_app.sh"
 ```
 
-Model、dataset、parallelism 和 algorithm 配置可参考 `examples/` 下的完整 recipe。
+### 编写 Agentic Recipe
+
+从模型和训练模式相近、已经可运行的 recipe 开始。`examples/search_r1/run_search_r1.sh` 展示本地工具任务，
+`examples/deepeyes_agentic/run_deepeyes_agentic.sh` 包含图像输入，
+`examples/mini_swe_agent/run_mini_swe_agent_pd_blackwell.sh` 使用外部沙箱服务，配置为 fully async 的 4 卡训练＋4 卡
+PD＋HiCache rollout。示例的硬件参数是该 recipe 的选择，不是框架默认值。
+
+1. 用 `--prompt-data`、`--input-key`、`--metadata-key` 映射数据集，存在多模态输入时再配置 `--multimodal-keys`。
+   Adapter 从 `RELAX_INPUT_JSON` 读取任务；环境服务和 retriever 在每个 Session 的启动命令之外运行。
+2. 增加 Agent 入口，读取注入的模型端点与 Session 凭据，保留原有工具循环，每次请求发送完整历史。
+   按实际模型配置 reasoning/tool parser，并让模型请求的超时覆盖所选模式的跨步等待。
+   所有可能运行 SessionShard 的节点都需要具备对应命令、工作目录和依赖。
+3. 选择输出契约：线性轨迹可以写 `reward`/metadata，或使用 `--custom-rm-path`；选择分支或训练多个 context 时，
+   按下文使用显式导出及适用的 custom advantage 配置。
+4. 确保启动的 `--agent-command` 在自然退出和收到 Relax 的 SIGTERM 时自行清理资源，
+   再按[配置 Runtime 行为](#配置-runtime-行为)设置 Group 并发和外部 executor 配额。
+   `--use-agentic-rollout` 接管 train 和 Eval 的生成链路，这条路径会忽略 `--custom-generate-function-path`。
+5. 先让完整一组走通模型调用、工具、奖励、导出与清理，再扩大并发。随后检查真实 optimizer update，
+   以及配置的跨步恢复或 prelaunch 行为；单次模型调用成功只能说明 API 连通。
+
+单机运行时先检查本地 Ray；未运行时，使用会加载 `scripts/entrypoint/local.sh` 的 recipe，通过 Bash 启动。
+提交到已有集群时使用 `scripts/entrypoint/ray-job.sh`。模型、数据路径和部署参数留在 recipe 中，这条 Adapter
+接入路径不需要另写一套 rollout 循环。
 
 ### 验证第一个 Rollout
 
@@ -503,60 +537,90 @@ sampled Group 处理 reward；它是否执行不由 `--normalize-advantages` 控
 值。Sibling context 不设置 reward。Custom advantage 需要的 outcome 可以保存在各 context 的 metadata 中。
 Multi-context training 中，reward 用于上报任务结果，custom advantage 决定每个 export 的 advantage。
 
-## 配置 Runtime 行为
+### 后台 Eval Judge
 
-::: danger 必须满足的 external agent 容量
-Agent 在带有硬并发限制的远程集中式平台运行时，先计算 train 上限和每个 Eval dataset 的上限：
+内置 Agentic 和标准 SGLang eval 支持在轨迹生成完成后，将耗时的 judge 评分交给后台执行。异步评分默认开启，
+无需传入开关；使用 `--disable-eval-async-judge` 关闭异步，恢复等待评分完成的流程。共卡和非共卡模式均可使用，
+但评测轨迹生成仍占用现有 policy 推理资源；后台评分不能继续依赖这些资源。
 
-```text
-T = agentic_concurrency * n_samples_per_prompt
-G_d = dataset d 的 n_samples_per_eval_prompt
-C_d = 显式配置的 agentic_eval_concurrency，未配置时为 ceil(T / G_d)
-E_d = C_d * G_d
-E_peak = 所有 Eval dataset 的 E_d 最大值
+独立 HTTP 奖励 `remote_rm` 自动使用该机制。自定义 `--custom-rm-path` 需要显式声明支持后台评分。例如，已有
+`train_reward` 和 `eval_reward` 实现时，入口可以继续使用同步函数：
+
+```python
+def reward_func(args, sample, *, evaluation=False, **kwargs):
+    if evaluation:
+        return eval_reward(args, sample)
+    return train_reward(args, sample)
+
+
+reward_func.supports_async_eval = True
 ```
 
-多个 Eval dataset 串行执行，因此组合峰值是 `E_peak`，无需把所有 `E_d` 相加。
+同步 `def` 仍由 Ray reward 进程池执行；`async def` 也可使用该声明。内置 Agentic 和标准 SGLang rollout
+在训练时传入 `evaluation=False`，评测时传入 `evaluation=True`，同步评分和后台评分都如此。函数接受
+`evaluation` 关键字参数或 `**kwargs` 时会收到该参数；旧的严格二参数函数不会被额外传参。
+自行实现完整 rollout 或 eval 函数时，调用 `async_rm` / `batched_async_rm` 也需显式传入 `evaluation`；
+框架不会从共享 `args` 或 metadata 推断当前阶段。
+无需为了区分阶段而注入 metadata 或额外编写 YAML，评测数据可以直接通过 CLI 配置：
 
-启用 `--agentic-prelaunch`、`--partial-rollout` 或 `--fully-async` 时，表格中的
-**Eval 期间是否保留 train sessions** 应选择“是”。Prelaunch 与当前 step 共享 training resident capacity，
-因此 train 上限仍是 `T`；它会让 `T` 与 `E_peak` 同时存在。
+```bash
+--eval-prompt-data agent_eval "<eval-data-path>"
+```
 
-Train 与 Eval 共用一个 executor 时，再选择对应场景：
+需要按数据集设置不同采样参数或 metadata 时，仍可使用 `--eval-config`。
 
-| 是否启用 Eval | Eval 期间是否保留 train sessions | 所需 slots |
-| --- | --- | --- |
-| 否 | — | `external_slots >= T` |
-| 是 | 否 | `external_slots >= max(T, E_peak)` |
-| 是 | 是 | `external_slots >= T + E_peak` |
+声明 `supports_async_eval` 表示 eval 评分只依赖导出的 Sample 快照、持久化 artifact，以及独立 CPU 或远端 judge
+服务。需要判分的 action、工具结果和中间轨迹应事先写入导出数据；评分不能访问已结束的 Session、临时文件，或
+共卡且会被 offload 的模型。函数仍应返回最终真实 reward，不要自行提交后台任务后返回任务 ID 或占位分。
+`group_rm` 的完整列表输入和对应列表输出契约保持不变。
 
-Slots 不足时，Group 启动可能卡在 all-session first-request barrier。启动任务前必须检查该表格。
-:::
+Relax 使用与训练评分隔离的 CPU reward 池，待真实分数返回后，按生成时的 eval 轮次记录指标和 dump。普通规则
+reward、未声明支持的 custom reward、托管 `dapo-genrm` 和 native 图像评分保持原流程；训练 reward 也不受此开关
+影响。普通 RM 路径中，Agent 已填入的 reward 继续直接使用，不会重新评分。
 
-| 目标 | 参数 | 行为 |
-| --- | --- | --- |
-| 限制 resident training Group | `--agentic-concurrency` | Prepare 与 Runtime 共享的 capacity |
-| 设置 resident Eval Group | `--agentic-eval-concurrency` | 逻辑 Eval prompt Group capacity，未配置时根据 training capacity 推导 |
-| 提前启动 agent | `--agentic-prelaunch` | Resident capacity 空闲时启动 process |
-| 复用未完成 sample | `--partial-rollout` | 跨 step abort 并恢复 backend attempt |
-| 异步执行 rollout 与 training | `--fully-async` | Partition 前进时保留未完成 session |
-| 限制 partial abort 次数 | `--partial-rollout-max-aborted-count` | 保护多次被 abort 的 attempt |
-| 终止运行过久的 agent | `--agent-timeout` | Runtime active-time budget 用尽后终止 agent process |
+同步 judge 的 eval 池沿用 `--reward-num-workers` 和 `--reward-max-concurrency` 配置，与训练池分别计数；
+需要为新增的评分进程预留 CPU 资源。
 
-`--agent-timeout` 在 Session 进入 Runtime 后开始计时。Agent 的 loop、tool call 等持续运行过久时，Relax 会终止
-该进程。Prelaunch Session 等待 Runtime 时不会消耗这段时间；partial rollout 或 fully async 让普通 Session 跨
-step 暂停时，计时也会暂停。
+正常训练结束时会等待剩余 judge 完成并记录结果；后台评分失败会写入日志，并在收尾时明确报错。该机制不提供
+训练作业退出后仍可执行的持久任务队列，失败或强制退出时可能中断评分。持续慢于评测产生速度的 judge 会积压
+任务，因此应为远端调用设置超时，并保证足够的评分容量；独立 worker 池也不能消除远端 judge 服务本身的竞争。
 
-`--agentic-concurrency` 默认使用 `--over-sampling-batch-size`，后者默认使用 `--rollout-batch-size`。
-`--agentic-eval-concurrency` 未配置时，分别根据 `T` 和每个 Eval dataset 的 Group size 推导。两个参数都以逻辑
-prompt Group 为单位。无论使用 ordinary RM 还是 Group RM，dataset `d` 都持有 `E_d` 个 Sessions；ordinary RM
-内部使用 singleton Runtime Group，但不会改变该总数。多个 Eval dataset 串行执行，因此 Train 与 Eval 使用独立
-executor 时，分别为 `T` 和 `E_peak` 配置容量。
+## 配置 Runtime 行为
 
-Retriever、environment server 等 cross-session service 应在 per-session agent command 外启动。
+### 组并发与 Session 独立生成
 
-Session KV lifecycle 与 program-aware admission 是长时间 Agentic workload 的可选能力。参见
-[Agentic KV Scheduling](./agentic-kv-scheduling.md)。
+`--agentic-concurrency` 限制 Prepare 与 Runtime 共享的驻留训练 Group 数，默认取
+`--over-sampling-batch-size`，后者默认取 `--rollout-batch-size`。每个 Group 在同一个 Shard 上启动全部
+`--n-samples-per-prompt` 个原始 Session。
+
+Group 注册完成后即可获得 Runtime lease，无需等待所有成员的首条模型请求。已 lease 的成员在自己的请求就绪且
+生成 gate 打开时独立生成。整组 reward、过滤、导出与补采样仍等待原始 Group。Oversampling 决定本步合法启动的
+Group 需求量。
+
+Prelaunch 沿用原有 Group 预算。未 lease 的成员等待 lease，普通暂停成员等待 resume。
+`--agent-timeout` 从成员自己的首请求就绪且已 lease 的生成 gate 打开后开始计时；受保护的 Session 在 partial rollout
+暂停期间继续计时。模型客户端的墙钟超时会在请求等待期间继续计时。Partial rollout、fully async 和 dynamic global
+batch size 保留原有模式约束。
+
+### 外部 Executor 与 Eval
+
+每次 Session 从进程任务开始执行算起，最多等待 1800 秒收到首个有效推理请求，包含在外部 executor 排队的时间。
+收到首个请求后停止这项计时，即使 Group 尚未分配到当前训练步；模型生成仍须等待原有生成开关放行。
+首个请求到达前退出或超时，会丢弃整组并补采样。这项启动期限与 `--agent-timeout` 分别计时。
+
+逻辑训练需求为 `L = agentic_concurrency * n_samples_per_prompt`。每个 Eval dataset 的
+`G_d = n_samples_per_eval_prompt`；Eval Group 并发取显式 `--agentic-eval-concurrency`，默认取
+`ceil(L / G_d)`，Session 上限为 `E_d = C_d * G_d`。多个 Eval dataset 串行执行。
+
+Eval 成员在 lease 后也独立生成。Ordinary RM 内部使用 singleton Runtime Group，Group RM 保留采样组大小；
+两者都保留原有完整导出与 reward 语义。
+
+共用 executor 时，如果训练资源在 Eval 前已经退出，应至少预留 `max(L, max(E_d))` 个可用任务槽位；如果 prelaunch、
+partial rollout 或 fully async 让训练资源留存到 Eval，应按 `L + max(E_d)` 预算。独立资源池分别计算训练和 Eval
+预算。这些是逻辑需求估算，后台清理和其他作业可能继续占用额外的外部资源，物理配额由外部服务约束。
+
+成员独立生成能让已就绪成员在兄弟成员排队时推进，但应用层若依赖同一饱和资源池中尚未启动的工作，仍可能等待。
+KV 控制管理另一类资源，参见 [Agentic KV Scheduling](./agentic-kv-scheduling.md)。
 
 ## 理解 Agentic Rollout 原理
 
@@ -647,8 +711,9 @@ lineage 至少包含一个 committed response。
 
 #### Resident Capacity
 
-Prepare 与 Runtime 共享 resident Group capacity。Reward work 位于该 capacity 外。Runtime Group 完成或 drop 后
-会释放 slot。Group 被 filter 后会产生新的需求。
+Prepare 与 Runtime 共享 resident Group capacity，pipeline 的 Reward 阶段位于该容量之外。
+Runtime Group 完成或 drop 后先归还逻辑槽位，物理清理在后台尽力完成。过滤会产生新的 Group 需求。
+Agent 内的测试和奖励计算属于其 Session 生命周期，与 pipeline 的 Reward 阶段不同。
 
 ![Shared resident capacity and prelaunch](/agentic/resident_capacity.svg)
 
@@ -677,6 +742,9 @@ Program-aware admission 可以根据预测的 KV 使用量延迟 backend attempt
 ## 运维与故障排除
 
 ### Metrics 与 Dump
+
+逻辑 Group 数反映调度驻留状态。进程、容器和远程任务的物理占用应结合 agent 或 executor 自身状态检查；
+后台清理可能晚于逻辑退休完成。
 
 配置 `--save-debug-rollout-data <path-with-{rollout_id}>`，可保存完整 metadata、SessionForest state hash、terminal
 status、turn count、request timing、abort count 与 weight-version 信息。
@@ -876,7 +944,11 @@ Shard 突然退出仍可能使最终复制无法完成。`tokens.jsonl` 按当�
 
 - **Agent 没有启动或异常退出：** 检查 `--agent-cwd` 和 `--agent-command`，然后查看 `run.log`。Relax 会把 agent
   stdout 与 stderr 的末尾内容附加到 `AgentExecutionError`。
-- **第一条 request 长时间等待：** Group 获得 Runtime lease 前，request 会保持等待；client 应配置长 timeout。
+- **第一条 request 长时间等待：** 检查 Runtime lease、生成暂停、backend permit 和 executor 队列；Client 超时应覆盖
+  这些等待。兄弟成员首请求尚未到达不会阻塞已 lease 且就绪的成员。
+- **任务结束后外部资源仍占用：** 检查 `agent-command` 自然退出和收到 Relax 的 SIGTERM 时是否自行清理资源，以及 executor 状态。
+  Relax 的兜底清理独立记录 warning，逻辑 Group 容量照常归还。
+
 - **显式导出无法匹配：** 保留 generation 实际使用的完整 normalized `messages`、`tools` 和
   `chat_template_kwargs`。
 - **隐式导出无法唯一确定 context：** 为需要训练的 context 写入具名显式 record。
