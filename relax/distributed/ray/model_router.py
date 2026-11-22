@@ -42,7 +42,8 @@ class ModelRouter:
         self.ready = False
         if self.endpoint is None or not any(engine is not None for engine in engines):
             raise RuntimeError("Static router has no live replica")
-        requests.get(f"{self.url}/health", timeout=5).raise_for_status()
+        # SlimeRouter proxies /health to a worker, so it is unavailable until registration.
+        requests.get(f"{self.url}/workers", timeout=5).raise_for_status()
         for engine in engines:
             if (
                 engine is not None

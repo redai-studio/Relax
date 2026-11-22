@@ -223,6 +223,16 @@
       "post": {
         "summary": "Scale Out",
         "operationId": "scale_out_scale_out_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScaleOutAPIRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -230,6 +240,16 @@
               "application/json": {
                 "schema": {
                   "title": "Response Scale Out Scale Out Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -301,6 +321,16 @@
       "post": {
         "summary": "Scale In",
         "operationId": "scale_in_scale_in_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScaleInAPIRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -308,6 +338,16 @@
               "application/json": {
                 "schema": {
                   "title": "Response Scale In Scale In Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -496,6 +536,16 @@
       "post": {
         "summary": "Cancel All Scale Out Requests",
         "operationId": "cancel_all_scale_out_requests_scale_out_cancel_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelAllScaleOutRequestsRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -503,6 +553,16 @@
               "application/json": {
                 "schema": {
                   "title": "Response Cancel All Scale Out Requests Scale Out Cancel Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -691,6 +751,43 @@
   },
   "components": {
     "schemas": {
+      "CancelAllScaleOutRequestsRequest": {
+        "properties": {
+          "model_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Name",
+            "description": "Filter: only cancel requests for this model"
+          },
+          "status_filter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Filter",
+            "description": "Filter: only cancel requests with this status"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run",
+            "description": "If true, preview what would be cancelled without actually cancelling",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "CancelAllScaleOutRequestsRequest",
+        "description": "Request model for cancel all scale-out requests."
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -703,6 +800,100 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "ScaleInAPIRequest": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name",
+            "description": "Target model name",
+            "default": "default"
+          },
+          "num_replicas": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Num Replicas",
+            "description": "Target number of remaining replicas after scale-in. If > 0, takes priority over engine_urls.",
+            "default": 0
+          },
+          "engine_urls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Engine Urls",
+            "description": "Engine URLs to remove (e.g., ['http://localhost:30000', 'http://localhost:30001'])"
+          },
+          "force": {
+            "type": "boolean",
+            "title": "Force",
+            "description": "Force removal without waiting for drain",
+            "default": false
+          },
+          "timeout_secs": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Secs",
+            "description": "Total timeout for the operation"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run",
+            "description": "Preview which engines would be removed without removing them",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ScaleInAPIRequest",
+        "description": "API request model for scale-in operation."
+      },
+      "ScaleOutAPIRequest": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name",
+            "description": "Target model name",
+            "default": "default"
+          },
+          "num_replicas": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Num Replicas",
+            "description": "Target absolute total engine count for ray_native mode (num_replicas > 0). If current engines >= target, no-op.",
+            "default": 0
+          },
+          "engine_urls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Engine Urls",
+            "description": "External engine URLs to add (external mode, when num_replicas == 0). URLs already active or in-flight are automatically filtered out (idempotent)."
+          },
+          "timeout_secs": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Secs",
+            "description": "Total timeout for the operation"
+          }
+        },
+        "type": "object",
+        "title": "ScaleOutAPIRequest",
+        "description": "API request model for scale-out operation.\n\nIdempotency guarantees:\n- If num_replicas > 0: ray_native mode. num_replicas is the target *absolute* total engine count.\n  If the current engine count (including in-flight requests) already meets or\n  exceeds the target, no scale-out occurs (returns immediately with noop status).\n- If engine_urls is provided: external mode. engine_urls are filtered to exclude engines already active\n  in the system or currently being processed by in-flight scale-out requests (status in\n  PENDING, CREATING, CONNECTING, HEALTH_CHECKING, WEIGHT_SYNCING, READY, ACTIVE).\n- num_gpus_per_engine is always taken from args.rollout_num_gpus_per_engine."
       },
       "ValidationError": {
         "properties": {

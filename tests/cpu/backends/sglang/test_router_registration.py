@@ -923,3 +923,29 @@ def test_server_health_failure_retains_started_process_on_engine(monkeypatch, sg
         module.launch_server_process(args, owner=owner)
     assert owner.process is process
     process.start.assert_called_once()
+
+
+def test_static_slime_registration_checks_worker_health(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    module = sglang_engine_module
+    engine = _make_engine(module)
+    engine.role = "genrm"
+    engine.worker_type = "regular"
+    engine.args.use_slime_router = True
+    worker_url = f"http://{engine.server_host}:{engine.server_port}"
+    engine.register_to_router = Mock(return_value=True)
+    get = Mock(side_effect=[_Response(200, {"workers": [{"url": worker_url}]}), _Response(200)])
+    monkeypatch.setattr(module.requests, "get", get)
+    assert engine.configure_model_router("router", 8000)
+    assert [call.args[0] for call in get.call_args_list] == ["http://router:8000/workers", f"{worker_url}/health"]
+
+
+def test_legacy_genrm_engine_uses_unified_genrm_initialization(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    engine = sglang_engine_module.GenRMEngine(SimpleNamespace(), rank=0)
+    initialize = Mock()
+    monkeypatch.setattr(engine, "_init_genrm", initialize)
+    engine.init("dist", 30000, 30001, host="worker")
+    initialize.assert_called_once_with("dist", 30000, 30001, "worker", None)

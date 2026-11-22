@@ -27,6 +27,7 @@ def _snapshot(*, role: Role = Role.ROLLOUT, state: LifecycleState = LifecycleSta
     return RoleSnapshot(
         role=role,
         manager_epoch="epoch-a",
+        routing=RoutingSpec(default_model="model-a", route_key_to_model=(("model-a", "model-a"),)),
         models=(
             ModelSnapshot(
                 "model-a",
@@ -747,3 +748,53 @@ async def test_public_genrm_gateway_adapts_messages_locally_under_task_permit(mo
         assert not owner.inflight
     finally:
         await InferenceGateway.close(gateway)
+
+
+@pytest.mark.asyncio
+async def test_genrm_rejects_ambiguous_or_unknown_judge_before_admission():
+    base = _snapshot(role=Role.GENRM)
+    models = (
+        replace(base.models[0], model_id="quality", router_url="http://quality"),
+        replace(base.models[0], model_id="safety", router_url="http://safety"),
+    )
+    snapshot = replace(
+        base, models=models, routing=RoutingSpec("quality", (("quality", "quality"), ("safety", "safety")))
+    )
+    owner = _owner(lambda: snapshot)
+    gateway = InferenceGateway(Role.GENRM, manager_handle=owner)
+    await _use_upstream(gateway, lambda req: httpx.Response(200, json={"judge": req.url.host}))
+    try:
+        for selector in ({}, {"route_key": "safty"}, {"route_key": "safty", "model": "safety"}):
+            response = await gateway.proxy(_request({"input_ids": [1], **selector}), "generate")
+            assert response.status_code == 400
+        assert not owner.traces
+        response = await gateway.proxy(_request({"input_ids": [1], "route_key": "safety"}), "generate")
+        assert json.loads(response.body) == {"judge": "safety"}
+    finally:
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_validates_scale_request_bodies():
+    from fastapi import FastAPI
+
+    from relax.components.inference_gateway import InferenceGatewayService
+
+    cls = InferenceGatewayService.func_or_class
+    gateway = object.__new__(cls)
+    gateway._workload = SimpleNamespace(
+        scale_out=AsyncMock(), scale_in=AsyncMock(), cancel_all_scale_out_requests=AsyncMock()
+    )
+    app = FastAPI()
+    for endpoint, method in (
+        ("/scale_out", gateway.scale_out),
+        ("/scale_in", gateway.scale_in),
+        ("/scale_out_cancel", gateway.cancel_all_scale_out_requests),
+    ):
+        app.add_api_route(endpoint, method, methods=["POST"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://service") as client:
+        for endpoint in ("/scale_out", "/scale_in"):
+            assert (await client.post(endpoint, json={"num_replicas": "invalid"})).status_code == 422
+        assert (await client.post("/scale_out_cancel", json={"dry_run": "invalid"})).status_code == 422
+    for method in vars(gateway._workload).values():
+        method.assert_not_called()

@@ -50,3 +50,24 @@ def test_model_router_retains_process_until_exit_confirmed():
     process.is_alive.return_value = False
     router.close()
     assert router.processes == []
+
+
+def test_model_router_can_register_first_slime_worker(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from relax.engine.router.router import SlimeRouter
+
+    slime = SlimeRouter(SimpleNamespace(slime_router_max_connections=4, slime_router_middleware_paths=[]))
+    router = module.ModelRouter()
+    router.endpoint = ("localhost", 8000)
+    with TestClient(slime.app, raise_server_exceptions=False) as client:
+        assert client.get("/health").status_code == 500
+
+        def register(*args):
+            return client.post("/add_worker", params={"url": "http://engine:30000"}).is_success
+
+        monkeypatch.setattr(module.requests, "get", lambda url, **kwargs: client.get(url))
+        monkeypatch.setattr(module.ray, "get", lambda ref, **kwargs: ref)
+        router.activate([SimpleNamespace(configure_model_router=SimpleNamespace(remote=register))])
+        assert router.ready
+        assert client.get("/workers").json() == {"workers": [{"url": "http://engine:30000"}]}

@@ -2631,6 +2631,7 @@ def test_deferred_agentic_close_pauses_before_scoring_and_preserves_transfer_ide
         if genrm:
             from relax.utils import misc
 
+            args._inference_phase_coordinator = SimpleNamespace()
             args._genrm_instances_resolved = {"judge": {}}
             args._genrm_colocate_with_rollout = True
             args.defer_reward_to_post_process = True
@@ -2683,3 +2684,72 @@ def test_deferred_agentic_publication_records_unknown_after_lost_ack(tmp_path, r
     assert len(rows) == 1
     assert rows[0]["reason_code"] == "transfer_outcome_unknown"
     assert not rows[0]["is_terminal"]
+
+
+@pytest.mark.asyncio
+async def test_resident_manual_genrm_runs_after_pause_and_before_publication(tmp_path, rollout_module, monkeypatch):
+    from relax.engine.rollout.deferred import PublicationReceipt, PublicationState
+    from relax.utils import utils
+
+    events = []
+    loop = asyncio.get_running_loop()
+
+    async def switch(phase):
+        events.append(phase)
+
+    coordinator = SimpleNamespace(switch=SimpleNamespace(remote=switch))
+    args = _obs_args(
+        tmp_path,
+        use_dynamic_global_batch_size=False,
+        partial_rollout=False,
+        fully_async=False,
+        num_rollout=8,
+        agentic_prelaunch=False,
+        _inference_phase_coordinator=coordinator,
+        _genrm_instances_resolved={"judge": {}},
+        _genrm_colocate_with_rollout=True,
+        defer_reward_to_post_process=False,
+        custom_reward_post_process_path="manual.hook",
+    )
+    pipeline = _obs_pipeline(rollout_module, args)
+    pipeline._opd_manager = None
+    pipeline.runtime_domain.teacher_routing_enabled = False
+    pipeline.prepare_domain.open_step = lambda **kwargs: None
+    pipeline._finish_step_progress = lambda context: None
+    group = _group("g", export_ids=[1])
+
+    async def pause():
+        events.append("pause")
+
+    def convert(args, samples):
+        for phase in ("genrm", "inference"):
+            asyncio.run_coroutine_threadsafe(switch(phase), loop).result(timeout=2)
+        return samples
+
+    async def publish(client, data, *, partition_id, operation_id, custom_meta, is_last):
+        assert data == group.samples
+        events.append((partition_id, is_last))
+        return PublicationReceipt(operation_id, PublicationState.CONFIRMED)
+
+    class StepComplete(Exception):
+        pass
+
+    async def run_to_publication(context):
+        pipeline._submit_tq_batch(context, (6, (group,), True))
+        assert not events
+        await pipeline._close_rollout_step(context)
+        raise StepComplete
+
+    pipeline._run_rollout_step = run_to_publication
+    pipeline.runtime_domain.pause_generation = pause
+    monkeypatch.setattr(rollout_module, "start_sglang_profile", AsyncMock())
+    monkeypatch.setattr(rollout_module, "stop_sglang_profile", AsyncMock())
+    monkeypatch.setattr(utils, "convert_samples_to_train_data", convert)
+    monkeypatch.setattr(utils, "build_rollout_custom_meta", lambda data: [])
+    monkeypatch.setattr("relax.utils.tq.publication.publish_confirmed", publish)
+    try:
+        with pytest.raises(StepComplete):
+            await pipeline.run_step(7)
+        assert events == ["pause", "genrm", "inference", ("train_6", True)]
+    finally:
+        await pipeline._stage_recorder.aclose()

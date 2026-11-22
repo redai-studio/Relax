@@ -52,6 +52,10 @@ POOL_METHODS = frozenset(
         "get_engines_info",
         "get_status",
         "get_lora_training_config",
+        "get_lora_version_runtime",
+        "configure_lora_training",
+        "configure_lora_versions",
+        "publish_training_lora",
         "get_training_weight_updating",
         "check_weights",
         "health_monitoring_pause",
@@ -124,6 +128,7 @@ class _ModelRuntime:
         self._closing = False
         self._cleanup_task: asyncio.Task | None = None
         self._active_calls: set[asyncio.Future] = set()
+        self._lora_publication = asyncio.Lock()
         self._recipients: set[str] = set()
 
     async def start(self, args: Any, binding: Any) -> dict[str, Any]:
@@ -408,8 +413,12 @@ class _ModelRuntime:
     async def begin_rollout(self, rollout_id: int) -> None:
         if self.pool is None or self._closing or self._disposed:
             raise RuntimeError("Inference manager is not running")
-        self.pool.backend.rollout_id = rollout_id
-        await _blocking(self.pool.backend.health_monitoring_resume)
+        backend = self.pool.backend
+        await _blocking(backend._begin_generation)
+        if self._closing:
+            raise RuntimeError("Inference manager is not running")
+        backend.rollout_id = rollout_id
+        await _blocking(backend.health_monitoring_resume)
 
     async def inject_ci_fault(self) -> None:
         if self.pool is None or self._closing or self._disposed:
@@ -448,9 +457,12 @@ class _ModelRuntime:
         completed = asyncio.get_running_loop().create_future()
         self._active_calls.add(completed)
         try:
+            if method in {"configure_lora_training", "configure_lora_versions", "publish_training_lora"}:
+                async with self._lora_publication:
+                    return await self._pool_call(method, *args, **kwargs)
             if method == "recover_rollout_engines":
                 # Recovery cannot mutate engine residency during memory transitions.
-                async with self._transition:
+                async with self._transition, self._lora_publication:
                     return await self._pool_call(method, *args, **kwargs)
             return await self._pool_call(method, *args, **kwargs)
         finally:
@@ -523,6 +535,7 @@ class _ModelRuntime:
         if method not in POOL_METHODS:
             raise ValueError(f"Unsupported inference pool operation: {method}")
         if method == "recover_rollout_engines":
+            backend._require_unmanaged_engine_pool()
             await self.ledger.drain("recovery", timeout=120)
         confirmed_version = kwargs.pop("weight_version", None) if method == "register_recovered_engines" else None
         if method == "register_recovered_engines":
@@ -634,7 +647,10 @@ class _ModelRuntime:
                 except Exception:
                     logger.exception("Could not abort residual requests during shutdown")
                 if worker is not None:
-                    await asyncio.wait_for(worker.close.remote(), timeout=30)
+                    try:
+                        await asyncio.wait_for(worker.close.remote(), timeout=30)
+                    except ray.exceptions.ActorDiedError:
+                        pass
                 await self.ledger.drain("shutdown", timeout=10)
             finally:
                 try:
@@ -681,6 +697,10 @@ class InferenceManager(_ModelRuntime):
         address = await _ModelRuntime.start(self, args, binding)
         self._check_startup(startup_token)
         return address
+
+    async def attach_workload(self, worker: Any, startup_token: str | None) -> None:
+        self._check_startup(startup_token)
+        self.pool.backend.rollout_worker = worker
 
     async def register_static(
         self, role: str, args: Any, binding: Any, options: dict[str, Any], startup_token: str | None = None
@@ -861,6 +881,8 @@ class InferenceManager(_ModelRuntime):
         self.requests.fences.add("shutdown")
         for runtime in self.models.values():
             await runtime.dispose()
+        if worker is None and self.pool is not None:
+            worker = getattr(self.pool.backend, "rollout_worker", None)
         await _ModelRuntime.dispose(self, worker)
 
 
@@ -884,6 +906,7 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
     from relax.distributed.ray.inference_handle import ManagedRolloutHandle
     from relax.distributed.ray.placement_group import _get_head_node_id
     from relax.distributed.ray.rollout_worker import RolloutWorker
+    from relax.engine.sft.runtime import is_offline_mode
     from relax.utils.agentic_obs.startup import record_run_startup
 
     node = _get_head_node_id()
@@ -898,8 +921,9 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
         },
     )
     manager = getattr(args, "_rollout_engine_manager", None)
+    owns_manager = manager is None
     startup_token = getattr(args, "_inference_startup_token", None)
-    if manager is None:
+    if owns_manager:
         startup_token = uuid4().hex
         args._inference_startup_token = startup_token
         manager = InferenceManager.options(**options).remote(startup_token=startup_token)
@@ -912,11 +936,14 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
         worker_args._inference_manager_handle = manager
         worker = RolloutWorker.options(**options).remote(worker_args, data_source, manager)
         handle = ManagedRolloutHandle(manager, worker, getattr(args, "_inference_phase_coordinator", None))
-        count = ray.get(handle.get_num_rollout_per_epoch.remote())
-        args.num_rollout_per_epoch = count
-        if args.num_epoch is not None:
-            epoch_count = count * args.num_epoch
-            args.num_rollout = min(args.num_rollout, epoch_count) if args.num_rollout is not None else epoch_count
+        if is_offline_mode(args):
+            count = args.num_rollout_per_epoch
+        else:
+            count = ray.get(handle.get_num_rollout_per_epoch.remote())
+            args.num_rollout_per_epoch = count
+            if args.num_epoch is not None:
+                epoch_count = count * args.num_epoch
+                args.num_rollout = min(args.num_rollout, epoch_count) if args.num_rollout is not None else epoch_count
         evaluation_only = (
             args.num_rollout == 0
             and args.debug_rollout_only
@@ -932,8 +959,21 @@ def create_managed_rollout(args: Any, pg: Any, data_source: Any, runtime_env: An
             ray.get(handle.check_weights.remote(action="reset_tensors"))
         if args.offload_rollout:
             ray.get(handle.offload.remote())
+        ray.get(manager.attach_workload.remote(worker, startup_token))
         return handle, count
     except BaseException:
+        if not owns_manager:
+            # Controller retains ownership of the task and its PGs.
+            if worker is not None:
+                try:
+                    ray.get(worker.close.remote(), timeout=30)
+                except Exception:
+                    logger.warning("Could not close failed RolloutWorker before stopping it", exc_info=True)
+                try:
+                    ray.kill(worker)
+                except Exception:
+                    logger.exception("Could not stop failed RolloutWorker")
+            raise
         try:
             ray.get(manager.dispose.remote(worker), timeout=60)
         except BaseException:

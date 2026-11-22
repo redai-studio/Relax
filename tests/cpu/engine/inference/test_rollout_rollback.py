@@ -104,3 +104,50 @@ def test_actual_rollout_second_lock_failure_retains_pool_until_shutdown_retry(mo
     pool.dispose()
     assert len(shutdown_attempts) == 2
     assert killed == [lock]
+
+
+@pytest.mark.parametrize("startup_failure", [False, True])
+def test_managed_sft_startup_uses_resolved_steps_and_keeps_task_owner(monkeypatch, startup_failure):
+    from unittest.mock import Mock
+
+    from relax.distributed.ray import placement_group, rollout_worker
+
+    manager = Mock()
+    manager.start.remote.return_value = {"router_ip": "127.0.0.1", "router_port": 30000}
+    worker = Mock()
+    if startup_failure:
+        worker.configure.remote.side_effect = RuntimeError("worker startup failed")
+    worker_factory = Mock()
+    worker_factory.options.return_value.remote.return_value = worker
+    monkeypatch.setattr(rollout_worker, "RolloutWorker", worker_factory)
+    monkeypatch.setattr(placement_group, "_get_head_node_id", lambda: "ab" * 28)
+    monkeypatch.setattr(module.ray, "get", lambda ref, **kwargs: ref)
+    kill = Mock()
+    monkeypatch.setattr(module.ray, "kill", kill)
+    monkeypatch.setattr("relax.utils.agentic_obs.startup.record_run_startup", Mock())
+    args = SimpleNamespace(
+        _rollout_engine_manager=manager,
+        _inference_phase_coordinator=manager,
+        _inference_startup_token="deployment",
+        loss_type="sft",
+        rollout_global_dataset=False,
+        num_epoch=2,
+        num_rollout=12,
+        num_rollout_per_epoch=6,
+        offload_rollout=False,
+        check_weight_update_equal=False,
+    )
+    if startup_failure:
+        with pytest.raises(RuntimeError, match="worker startup failed"):
+            module.create_managed_rollout(args, None, None, None)
+        worker.close.remote.assert_called_once_with()
+        kill.assert_called_once_with(worker)
+        manager.attach_workload.remote.assert_not_called()
+    else:
+        handle, count = module.create_managed_rollout(args, None, None, None)
+        assert handle.worker is worker and count == 6
+        manager.attach_workload.remote.assert_called_once_with(worker, "deployment")
+        kill.assert_not_called()
+    worker.get_num_rollout_per_epoch.remote.assert_not_called()
+    worker.configure.remote.assert_called_once_with(12, 6)
+    manager.dispose.remote.assert_not_called()

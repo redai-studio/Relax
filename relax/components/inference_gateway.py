@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
 from starlette.types import Receive, Scope, Send
 
+from relax.components.rollout_api import CancelAllScaleOutRequestsRequest, ScaleInAPIRequest, ScaleOutAPIRequest
 from relax.engine.inference.executor import AdmittedRequest, InferenceRequestExecutor, assign_backend_rids
 from relax.engine.inference.routing import RoutingError
 from relax.engine.inference.types import Role, RoleSnapshot
@@ -469,16 +470,12 @@ class InferenceGatewayService(InferenceGateway):
         return {"status": "ok"}
 
     @app.post("/scale_out")
-    async def scale_out(self, request: Request) -> Any:
-        from relax.components.rollout import ScaleOutAPIRequest
-
-        return await self._workload.scale_out(ScaleOutAPIRequest(**await request.json()))
+    async def scale_out(self, request: ScaleOutAPIRequest) -> Any:
+        return await self._workload.scale_out(request)
 
     @app.post("/scale_in")
-    async def scale_in(self, request: Request) -> Any:
-        from relax.components.rollout import ScaleInAPIRequest
-
-        return await self._workload.scale_in(ScaleInAPIRequest(**await request.json()))
+    async def scale_in(self, request: ScaleInAPIRequest) -> Any:
+        return await self._workload.scale_in(request)
 
     @app.get("/scale_out/{request_id}")
     async def scale_out_status(self, request_id: str) -> Any:
@@ -501,12 +498,8 @@ class InferenceGatewayService(InferenceGateway):
         return await self._workload.cancel_scale_out(request_id)
 
     @app.post("/scale_out_cancel")
-    async def cancel_all_scale_out_requests(self, request: Request) -> Any:
-        from relax.components.rollout import CancelAllScaleOutRequestsRequest
-
-        return await self._workload.cancel_all_scale_out_requests(
-            CancelAllScaleOutRequestsRequest(**await request.json())
-        )
+    async def cancel_all_scale_out_requests(self, request: CancelAllScaleOutRequestsRequest) -> Any:
+        return await self._workload.cancel_all_scale_out_requests(request)
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self) -> Any:

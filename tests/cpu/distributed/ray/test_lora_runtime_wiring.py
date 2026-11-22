@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,7 +15,7 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang depende
 @pytest.fixture
 def wiring(monkeypatch):
     from relax.agentic import rollout as agentic
-    from relax.distributed.ray import rollout
+    from relax.distributed.ray import policy_engine_pool, rollout_worker
     from relax.engine.lora_versions import runtime
 
     events = []
@@ -37,11 +39,16 @@ def wiring(monkeypatch):
     factory = Mock()
     factory.options.return_value.remote.return_value = host
     monkeypatch.setattr(runtime, "LoRAVersionRuntime", factory)
-    monkeypatch.setattr(rollout, "with_control_plane_affinity", lambda args, options: options)
-    monkeypatch.setattr(rollout.ray, "get", mock_ray_get)
-    monkeypatch.setattr(rollout.ray, "kill", lambda actor: events.append("host-kill"))
-    monkeypatch.setattr(rollout, "stop_launched_routers", lambda: events.append("routers-close"))
+    monkeypatch.setattr(policy_engine_pool, "with_control_plane_affinity", lambda args, options: options)
+    monkeypatch.setattr(policy_engine_pool.ray, "get", mock_ray_get)
+    monkeypatch.setattr(policy_engine_pool.ray, "kill", lambda actor: events.append("host-kill"))
+    monkeypatch.setattr(policy_engine_pool, "stop_launched_routers", lambda: events.append("routers-close"))
     monkeypatch.setattr(agentic, "bind_agentic_lora_runtime", lambda handle: events.append("sessions-bind"))
+    worker_cls = rollout_worker.RolloutWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    manager.rollout_worker = SimpleNamespace(
+        bind_lora_runtime=SimpleNamespace(remote=lambda handle: asyncio.run(worker.bind_lora_runtime(handle)))
+    )
     return manager, host, events, agentic, factory
 
 
@@ -181,13 +188,53 @@ def test_training_configuration_rejects_unsupported_modes(wiring, tmp_path, argu
     assert manager._lora_training_config is None and not events
 
 
-def test_publication_and_disposal_share_a_group_separate_from_generation():
-    from relax.distributed.ray.rollout import RolloutManager
+@pytest.mark.asyncio
+async def test_task_waits_for_lora_publication_before_disposal(wiring):
+    from relax.distributed.ray.inference_handle import ManagedRolloutHandle
+    from relax.distributed.ray.inference_manager import InferenceManager
 
-    groups = RolloutManager.__ray_metadata__.method_meta.concurrency_group_for_methods
-    publication_group = groups["publish_training_lora"]
-    assert all(
-        groups[method] == publication_group
-        for method in ("configure_lora_training", "configure_lora_versions", "dispose")
+    backend, host, events, _agentic, _factory = wiring
+    backend.rollout_worker.close = SimpleNamespace(remote=lambda: close_worker())
+    task = InferenceManager.__ray_metadata__.modified_class()
+    task.pool = SimpleNamespace(backend=backend, dispose=backend.dispose)
+    handle = ManagedRolloutHandle(
+        SimpleNamespace(pool_call=SimpleNamespace(remote=task.pool_call)), backend.rollout_worker
     )
-    assert groups.get("generate") != publication_group
+    started = threading.Event()
+    proceed = threading.Event()
+
+    async def close_worker():
+        events.append("worker-close")
+
+    def publish(path):
+        started.set()
+        if not proceed.wait(timeout=5):
+            raise TimeoutError("test publication not released")
+        events.append("publish")
+
+    host.publish.remote = publish
+    publication = asyncio.create_task(handle.configure_lora_versions.remote("artifact", [1]))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        disposal = asyncio.create_task(task.dispose())
+        await asyncio.sleep(0)
+        assert events == ["start"]
+        assert not disposal.done()
+        with pytest.raises(RuntimeError, match="not running"):
+            await task.begin_rollout(0)
+    finally:
+        proceed.set()
+        await asyncio.gather(publication, return_exceptions=True)
+    assert await publication is host
+    await disposal
+    assert events == [
+        "start",
+        "publish",
+        "sessions-bind",
+        "worker-close",
+        "sessions-and-host-close",
+        "host-kill",
+        "engines-close",
+        "routers-close",
+        "host-kill",
+    ]

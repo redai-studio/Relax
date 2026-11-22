@@ -1270,6 +1270,10 @@ class SGLangEngine(RayActor):
             ]
             if len(matches) > 1:
                 raise RuntimeError("Duplicate static replica in model Router")
+            if len(matches) == 1 and getattr(self.args, "use_slime_router", False):
+                # Its worker registry contains URLs only, and add_worker is synchronous.
+                requests.get(f"{expected}/health", timeout=5).raise_for_status()
+                return True
             if len(matches) == 1 and matches[0].get("is_healthy") is True:
                 worker_id = matches[0].get("id")
                 if self._router_worker_id is not None and worker_id != self._router_worker_id:
@@ -2030,6 +2034,31 @@ class SGLangEngine(RayActor):
             self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
+
+
+class GenRMEngine(SGLangEngine):
+    """Compatibility entry point for the legacy GenRMManager."""
+
+    def __init__(
+        self,
+        args,
+        rank: int,
+        worker_type: str = "regular",
+        base_gpu_id: int | None = None,
+        sglang_overrides: dict | None = None,
+        num_gpus_per_engine: int | None = None,
+        register_sigterm_handler: bool = False,
+    ) -> None:
+        super().__init__(
+            args,
+            rank,
+            worker_type,
+            base_gpu_id,
+            sglang_overrides,
+            num_gpus_per_engine,
+            register_sigterm_handler,
+            role="genrm",
+        )
 
 
 def _uses_target_checkpoint_for_draft(server_args: dict) -> bool:

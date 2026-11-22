@@ -47,7 +47,14 @@ async def _transfer_batch_to_data_system(
     try:
         batch_samples.sort(key=lambda group: group[0].index)
         samples = [sample for group in batch_samples for sample in group]
-        rollout_batch = convert_samples_to_train_data(args, samples)
+        from relax.engine.inference.phase_plans import manual_genrm_hook_enabled
+
+        if operation_id is not None and manual_genrm_hook_enabled(args):
+            from relax.utils.async_utils import run_sync_to_completion
+
+            rollout_batch = await run_sync_to_completion(convert_samples_to_train_data, args, samples)
+        else:
+            rollout_batch = convert_samples_to_train_data(args, samples)
         custom_meta = build_rollout_custom_meta(rollout_batch)
         if on_put_started is not None:
             on_put_started()

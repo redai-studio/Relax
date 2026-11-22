@@ -199,6 +199,11 @@ class RolloutWorker:
     def get_loaded_functions_info(self) -> dict:
         return self.workload.get_loaded_functions_info()
 
+    async def bind_lora_runtime(self, handle: Any) -> None:
+        from relax.agentic.rollout import bind_agentic_lora_runtime
+
+        await asyncio.to_thread(bind_agentic_lora_runtime, handle)
+
     async def close(self) -> None:
         self._closed = True
         try:

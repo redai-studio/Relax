@@ -131,7 +131,8 @@ def _install_managed_rollout_stubs(monkeypatch, captured):
     from relax.distributed.ray import inference_manager, rollout_worker
 
     manager = SimpleNamespace(
-        start=SimpleNamespace(remote=lambda *a, **k: {"router_ip": "localhost", "router_port": 8000})
+        start=SimpleNamespace(remote=lambda *a, **k: {"router_ip": "localhost", "router_port": 8000}),
+        attach_workload=SimpleNamespace(remote=lambda worker, token: None),
     )
     worker = SimpleNamespace(
         get_num_rollout_per_epoch=SimpleNamespace(remote=lambda: 7),
@@ -174,6 +175,7 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
         loss_type=loss_type,
         num_epoch=None,
         num_rollout=1,
+        num_rollout_per_epoch=1,
         check_weight_update_equal=False,
         offload_rollout=False,
     )

@@ -188,6 +188,7 @@ async def test_manager_recovery_confirms_captured_multinode_generation(pool, rep
     group.nodes_per_engine = 2
     group.all_engines = [actor("recovered-head"), actor("recovered-secondary")]
     group.engine_init_records[1] = SimpleNamespace(pending_router_registration=False)
+    pool.backend._require_unmanaged_engine_pool = lambda: None
     pool.backend.recover_rollout_engines = lambda: ([group.all_engines[0]], None, 1, [], [])
     owner = InferenceManager.__ray_metadata__.modified_class()
     owner.pool = pool

@@ -891,9 +891,11 @@ class PolicyEnginePool:
         self._health_monitors = []
         self._eviction_monitor_stop = threading.Event()
         self._eviction_monitor_thread = None
-        # Kept for the legacy colocated Megatron LoRA handshake. Managed
-        # independent pools expose this query through InferenceManager.
         self._lora_training_config = None
+        self._lora_runtime = None
+        self._lora_configuring = False
+        self._generation_started = False
+        self.rollout_worker: Any = None
 
         init_tracking(args, primary=False)
 
@@ -1003,6 +1005,11 @@ class PolicyEnginePool:
             self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
             for monitor in self._health_monitors:
                 monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
+            host = getattr(self, "_lora_runtime", None)
+            if host is not None:
+                ray.get(host.close.remote())
+                ray.kill(host)
+                self._lora_runtime = None
             self._shutdown_all_engines()
         finally:
             # Routers are children of the task Manager process.
@@ -1090,8 +1097,187 @@ class PolicyEnginePool:
         """
         return self._weight_sync_lock
 
+    def configure_lora_training(
+        self,
+        artifact_dir: str,
+        base_fingerprint: str,
+        probe_input_ids: list[int],
+        max_versions: int = 2,
+        reconcile_interval_s: float = 1.0,
+    ) -> Any:
+        """Prepare automatic publication before assigning this manager to
+        trainers.
+
+        The directory must be shared by the publisher and every engine and
+        isolated to this training run. The fingerprint identifies the actual
+        frozen base contents. Initial publication follows the first base sync.
+        """
+        from relax.engine.lora_versions.training import LoRATrainingConfig
+        from relax.utils.megatron_peft_utils import is_lora_adapter_mode
+
+        with self._engine_lifecycle_lock:
+            engines = [engine for server in self.servers.values() for engine in server.engines]
+            if not engines or any(engine is None for engine in engines):
+                raise ValueError("training publication requires a complete engine pool")
+            config = LoRATrainingConfig(
+                artifact_dir,
+                base_fingerprint,
+                tuple(probe_input_ids),
+                max_versions,
+                reconcile_interval_s,
+                tuple(engine._actor_id.hex() for engine in engines),
+            )
+            previous = getattr(self, "_lora_training_config", None)
+            if previous is not None:
+                if previous == config:
+                    return previous
+                raise RuntimeError("Cannot replace a training publication configuration")
+            if (
+                not self.args.fully_async
+                or getattr(self.args, "train_backend", "megatron") != "megatron"
+                or getattr(self.args, "hybrid", False)
+                or self.args.colocate
+                or self.args.offload_rollout
+                or not self.args.use_agentic_rollout
+                or not is_lora_adapter_mode(self.args)
+                or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
+                or len(self.servers) != 1
+            ):
+                raise ValueError(
+                    "automatic LoRA publication requires fully-async Megatron Agentic adapter mode, "
+                    "a fixed single-model pool, and no rollout offload or automatic recovery"
+                )
+            if (
+                self._lora_runtime is not None
+                or self._lora_configuring
+                or getattr(self, "_lora_configuration_failed", False)
+                or self._generation_started
+                or self._find_active_scale_request() is not None
+            ):
+                raise RuntimeError("training publication must be configured on a fresh, idle rollout pool")
+            self._lora_training_config = config
+        self._stop_eviction_monitor()
+        return config
+
     def get_lora_training_config(self) -> Any:
         return self._lora_training_config
+
+    def publish_training_lora(self, artifact_path: str) -> dict[str, Any]:
+        """Bootstrap after base sync, then publish without pausing Sessions."""
+        # Blocking control-plane RPCs must not occupy generate's event loop.
+        config = self._lora_training_config
+        if config is None:
+            return {"status": "failed", "error": "training publication is not configured"}
+        if getattr(self, "_lora_configuration_failed", False):
+            return {"status": "failed", "error": "initial LoRA configuration failed"}
+        if self._lora_configuring:
+            return {"status": "unconfirmed", "error": "initial LoRA configuration is still running"}
+        if self._lora_runtime is None:
+            try:
+                self._configure_lora_version_runtime(
+                    artifact_path, list(config.probe_input_ids), config.max_versions, config.reconcile_interval_s
+                )
+            except Exception as error:
+                return {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+            return {"status": "published", "version_id": self._lora_initial_publication.identity.version_id}
+        return ray.get(self._lora_runtime.publish_for_training.remote(artifact_path))
+
+    def configure_lora_versions(
+        self,
+        initial_artifact_path: str,
+        probe_input_ids: list[int],
+        max_versions: int = 2,
+        reconcile_interval_s: float = 1.0,
+    ) -> Any:
+        """Opt into immutable versions before starting any resident groups.
+
+        Requires a fixed single-model engine pool configured with managed LoRA
+        capacity. The initial artifact is published before Session injection;
+        subsequent artifacts can be published through the returned actor.
+        """
+        if getattr(self, "_lora_training_config", None) is not None:
+            raise RuntimeError("automatic training publication owns the initial LoRA bootstrap")
+        return self._configure_lora_version_runtime(
+            initial_artifact_path, probe_input_ids, max_versions, reconcile_interval_s
+        )
+
+    def _configure_lora_version_runtime(
+        self,
+        initial_artifact_path: str,
+        probe_input_ids: list[int],
+        max_versions: int,
+        reconcile_interval_s: float,
+    ) -> Any:
+        from relax.engine.lora_versions.runtime import LoRAVersionRuntime
+
+        with self._engine_lifecycle_lock:
+            if (
+                self._lora_runtime is not None
+                or self._lora_configuring
+                or getattr(self, "_lora_configuration_failed", False)
+            ):
+                raise RuntimeError("LoRA versions are already configured or being configured")
+            if (
+                not self.args.use_agentic_rollout
+                or self.args.use_fault_tolerance
+                or getattr(self.args, "use_health_check", False)
+                or len(self.servers) != 1
+            ):
+                raise ValueError("managed LoRA requires Agentic rollout, one model, and disabled automatic recovery")
+            if getattr(self, "_generation_started", False):
+                raise RuntimeError("LoRA versions must be configured before generation starts")
+            if self._find_active_scale_request() is not None:
+                raise RuntimeError("cannot configure LoRA during an engine pool transition")
+            self._lora_configuring = True
+        try:
+            # Stop automatic eviction before capturing the fixed engine pool.
+            self._stop_eviction_monitor()
+            host = LoRAVersionRuntime.options(
+                **with_control_plane_affinity(self.args, {"num_cpus": 0, "num_gpus": 0})
+            ).remote()
+            self._lora_runtime = host
+            engines = next(iter(self.servers.values())).engines
+            if not engines or any(engine is None for engine in engines):
+                raise ValueError("managed LoRA requires a complete ready engine pool")
+            urls = ray.get([engine.get_url.remote() for engine in engines])
+            if any(not url for url in urls) or len(set(urls)) != len(urls):
+                raise ValueError("managed LoRA requires unique engine endpoints")
+            ray.get(
+                host.start.remote(
+                    dict(zip(map(str, range(len(urls))), urls)), probe_input_ids, max_versions, reconcile_interval_s
+                )
+            )
+            self._lora_initial_publication = ray.get(host.publish.remote(initial_artifact_path))
+            ray.get(self.rollout_worker.bind_lora_runtime.remote(host))
+            return host
+        except BaseException:
+            # A partially published/configured pool must not resume unmanaged
+            # operation. Retain its owner for reconciliation and disposal.
+            self._lora_configuration_failed = True
+            raise
+        finally:
+            self._lora_configuring = False
+
+    def get_lora_version_runtime(self) -> Any:
+        return self._lora_runtime
+
+    def _require_unmanaged_engine_pool(self) -> None:
+        if (
+            getattr(self, "_lora_runtime", None) is not None
+            or getattr(self, "_lora_configuring", False)
+            or getattr(self, "_lora_configuration_failed", False)
+            or getattr(self, "_lora_training_config", None) is not None
+        ):
+            raise RuntimeError("managed LoRA currently requires a fixed engine pool")
+
+    def _begin_generation(self) -> None:
+        with self._engine_lifecycle_lock:
+            if getattr(self, "_lora_configuring", False) or getattr(self, "_lora_configuration_failed", False):
+                raise RuntimeError("LoRA configuration is incomplete")
+            if getattr(self, "_lora_training_config", None) is not None and self._lora_runtime is None:
+                raise RuntimeError("initial training LoRA publication has not completed")
+            self._generation_started = True
 
     async def offload(self):
         self._offload_local()
@@ -1135,6 +1321,7 @@ class PolicyEnginePool:
     def recover_rollout_engines(self, model_name: str | None = None):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
+        self._require_unmanaged_engine_pool()
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
         if self.rollout_id == -1 or srv is None:
@@ -1414,6 +1601,7 @@ class PolicyEnginePool:
         Returns:
             Dict with request_id and initial status (or NOOP if idempotent no-op)
         """
+        self._require_unmanaged_engine_pool()
         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
         if num_replicas > 0:
             scale_mode = ScaleOutMode.RAY_NATIVE
@@ -1496,6 +1684,7 @@ class PolicyEnginePool:
             # Idempotency: filter out URLs already in the system or in-flight
             # (_collect_existing/in_flight already return normalized addrs)
             existing_urls = self._collect_existing_engine_addrs(srv)
+            self._require_unmanaged_engine_pool()
             in_flight_urls = self._collect_in_flight_engine_addrs(model_name)
             already_known = existing_urls | in_flight_urls
 
@@ -1538,6 +1727,7 @@ class PolicyEnginePool:
                         f"request_id={active['request_id']}, status={active['status']}"
                     ),
                 }
+            self._require_unmanaged_engine_pool()
             self._scale_out_requests[request.request_id] = request
             self._gc_terminal_requests()
         return request.to_dict()
@@ -1555,6 +1745,7 @@ class PolicyEnginePool:
         Args:
             request_id: The request ID returned by create_scale_out_request
         """
+        self._require_unmanaged_engine_pool()
         request = self._scale_out_requests.get(request_id)
         if request is None:
             logger.error(f"Scale-out request {request_id} not found")
@@ -3529,6 +3720,7 @@ class PolicyEnginePool:
         force: bool = False,
         dry_run: bool = False,
     ) -> dict:
+        self._require_unmanaged_engine_pool()
         # Mutual exclusion: reject if any scale operation is in progress
         active = self._find_active_scale_request()
         if active is not None:
@@ -3602,11 +3794,13 @@ class PolicyEnginePool:
                         f"request_id={active['request_id']}, status={active['status']}"
                     ),
                 }
+            self._require_unmanaged_engine_pool()
             self._scale_in_requests[request.request_id] = request
             self._gc_terminal_requests()
         return request.to_dict()
 
     async def execute_scale_in(self, request_id: str) -> None:
+        self._require_unmanaged_engine_pool()
         request = self._scale_in_requests.get(request_id)
         if request is None:
             logger.error(f"Scale-in request {request_id} not found")
@@ -4184,6 +4378,7 @@ class PolicyEnginePool:
         """Fence a ready eviction batch before performing one live removal."""
         claimed = []
         with self._engine_lifecycle_lock:
+            self._require_unmanaged_engine_pool()
             for srv_name, group, node0_idx in eviction_infos:
                 srv = self.servers.get(srv_name)
                 if (

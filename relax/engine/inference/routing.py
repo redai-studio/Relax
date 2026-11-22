@@ -10,6 +10,7 @@ requests.
 from relax.engine.inference.types import (
     LifecycleState,
     ModelSnapshot,
+    Role,
     RoleSnapshot,
     RouteTarget,
 )
@@ -26,13 +27,22 @@ class RoutingError(ValueError):
 def resolve_model(snapshot: RoleSnapshot, *, model: str | None = None, route_key: str | None = None) -> ModelSnapshot:
     """Resolve explicit model, then route key mapping, then the default model.
 
-    An unmapped route key falls through to the default model; only a request
-    that none of the three resolves is rejected.
+    GenRM rejects unknown route keys and requires a selector for multiple
+    judges. Other roles may fall back to their default model.
 
     OpenAI clients send the served model's real name (e.g. "Qwen3-8B"), which
     the router used to accept. A single-model role keeps serving it through
     its default model; only a multi-model role must be named exactly.
     """
+    if snapshot.role is Role.GENRM:
+        routes = dict(snapshot.routing.route_key_to_model)
+        if route_key is not None and (not isinstance(route_key, str) or route_key not in routes):
+            raise RoutingError(
+                "unknown_route", f"No GenRM model configured for route key {route_key!r}", status_code=400
+            )
+        if model is None and route_key is None and len(snapshot.models) > 1:
+            raise RoutingError("model_required", "Select a GenRM model or route_key", status_code=400)
+
     selected = model
     if (
         selected is not None

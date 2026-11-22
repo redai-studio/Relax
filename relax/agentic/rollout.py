@@ -46,7 +46,6 @@ from relax.agentic.stage_recorder import (
     StageRecorder,
 )
 from relax.distributed.ray.policy_engine_pool import _log_rollout_data
-from relax.engine.inference.phase_plans import deferred_genrm_enabled
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.deferred import PublicationReceipt
@@ -336,17 +335,19 @@ class AgenticResidentPipeline:
                 raise RuntimeError("Deferred Agentic transfer identity changed")
             return await self._transfer_and_record(context, partition_id, batch[1], is_last, operation_id=operation_id)
 
-        if deferred_genrm_enabled(self.args) or (self._opd_manager is not None and deferred_opd_active(self.args)):
+        encode_multimodal_inputs = None
+        if self._opd_manager is not None:
             from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
-            context.deferred_session = DeferredOpdSession.maybe_create(
-                self.args,
-                rollout_id,
-                self._data_system_client,
-                self._opd_manager,
-                publish=publish,
-                encode_multimodal_inputs=_encode_multimodal_inputs,
-            )
+            encode_multimodal_inputs = _encode_multimodal_inputs
+        context.deferred_session = DeferredOpdSession.maybe_create(
+            self.args,
+            rollout_id,
+            self._data_system_client,
+            self._opd_manager,
+            publish=publish,
+            encode_multimodal_inputs=encode_multimodal_inputs,
+        )
         self._active_step = context
         if self.runtime_domain.teacher_routing_enabled:
             self._opd_manager.response_stats.new_window()
