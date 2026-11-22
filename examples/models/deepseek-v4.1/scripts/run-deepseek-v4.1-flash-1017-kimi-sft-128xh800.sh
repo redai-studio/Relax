@@ -11,8 +11,8 @@ export PROMPT_DATA="${PROMPT_DATA:-${DATA_DIR}/train.kimi_k3.jsonl}"
 export VAL_DATA="${VAL_DATA-}"
 export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/kimi-business}"
 export EXP_NAME="${EXP_NAME:-deepseek-v41-1017-kimi-full-sft-128xh800}"
-export NUM_NODES=16 TP_SIZE="${TP_SIZE:-2}" PP_SIZE="${PP_SIZE:-2}" CP_SIZE="${CP_SIZE:-32}"
-export EP_SIZE="${EP_SIZE:-$((128 / PP_SIZE))}" MOE_DISPATCHER=alltoall
+export NUM_NODES="${V41_KIMI_SFT_NODES:-16}" TP_SIZE="${TP_SIZE:-2}" PP_SIZE="${PP_SIZE:-2}" CP_SIZE="${CP_SIZE:-32}"
+export EP_SIZE="${EP_SIZE:-$((8 * NUM_NODES / PP_SIZE))}" MOE_DISPATCHER=alltoall
 export SEQ_LENGTH=131072
 export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((SEQ_LENGTH / CP_SIZE))}"
 export GLOBAL_BATCH_SIZE=64 NUM_EPOCHS=2 SEED=1234
