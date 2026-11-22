@@ -434,7 +434,7 @@ for precision in (None, 'e4m3'):
     provider.finalize = lambda: setattr(provider, 'finalized', True)
     bridge = SimpleNamespace(to_megatron_provider=lambda **kw: provider)
     args = SimpleNamespace(custom_model_provider_path=None, megatron_to_hf_mode='bridge',
-        hf_checkpoint='unused', fp16=False, bf16=True, fp8=precision,
+        hf_checkpoint='unused', fp16=False, bf16=True, fp8=precision, vision_dp_when_tp=False,
         fp8_recipe='blockwise' if precision else 'delayed')
     with patch.object(AutoBridge, 'from_hf_pretrained', return_value=bridge), \
          patch.object(model_provider, '_dump_provider_config'):
