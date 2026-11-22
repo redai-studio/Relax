@@ -33,6 +33,7 @@ def test_retention_checks_contracts_and_integration_gaps_not_training_recipe():
 
     assert check(optimizer="adam", decoupled_weight_decay=True) is None
     assert check(optimizer="adam", decoupled_weight_decay=False) is None
+    assert "MoK workspaces" in check(moe_megakernel_backend="mok")
     for optimizer in ("sgd", "muon", "lion", "soap", "adaptive_muon", "dist_muon", "adamw", "unknown"):
         assert "optimizer=adam" in check(optimizer=optimizer)
 

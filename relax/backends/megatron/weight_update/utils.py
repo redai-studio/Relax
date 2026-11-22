@@ -33,6 +33,8 @@ def validate_actor_weight_retention(
         return "requires a single actor snapshot"
     if getattr(args, "optimizer", "adam") != "adam":
         return "requires optimizer=adam (including its AdamW mode)"
+    if getattr(args, "moe_megakernel_backend", None) == "mok":
+        return "MoK workspaces require cleanup before training groups are destroyed"
     for name in ("colocate", "offload_train", "offload_rollout", "enable_weights_backuper"):
         if not getattr(args, name, False):
             return f"requires {name}"
