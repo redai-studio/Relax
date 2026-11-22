@@ -141,7 +141,10 @@ def test_configuration_validation() -> None:
         validate_i2i_sft_config(arguments({"unknown": True}))
 
 
-def test_adapter_loads_component_directories(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["full", "lora"])
+def test_adapter_loads_component_directories(tmp_path: Path, mode: str) -> None:
+    from relax.backends.fsdp.lora import inject_lora_adapter
+
     source = build_model()
     source.transformer.save_pretrained(tmp_path / "transformer")
     source.text_encoder.save_pretrained(tmp_path / "text_encoder")
@@ -151,18 +154,93 @@ def test_adapter_loads_component_directories(tmp_path: Path) -> None:
     loaded = adapter.load_train_model(
         Namespace(
             model_path=str(tmp_path),
-            fsdp_trainable_mode="full",
+            fsdp_trainable_mode=mode,
             i2i_sft_config={**CONFIG, "attention_implementation": "torch"},
         )
     )
+    assert all(parameter.device.type == "cpu" for parameter in loaded.parameters())
+    if mode == "lora":
+        inject_lora_adapter(loaded, rank=2, alpha=2, target_modules=adapter.lora_target_modules)
     adapter.prepare_for_sharding(loaded)
     adapter.on_device_ready(loaded, torch.device("cpu"))
     assert loaded.transformer.is_gradient_checkpointing
-    assert all(parameter.dtype == torch.bfloat16 for parameter in loaded.parameters())
     assert all(
-        parameter.requires_grad == name.startswith("transformer.") for name, parameter in loaded.named_parameters()
+        parameter.device.type == "cpu" and parameter.dtype == torch.bfloat16 for parameter in loaded.parameters()
     )
+    if mode == "full":
+        assert all(
+            parameter.requires_grad == name.startswith("transformer.") for name, parameter in loaded.named_parameters()
+        )
+    else:
+        assert any(p.requires_grad for p in loaded.parameters())
+        assert all(
+            name.startswith("transformer.") and ".lora_" in name
+            for name, parameter in loaded.named_parameters()
+            if parameter.requires_grad
+        )
     data = small_sample(adapter)
     loss = loaded(data)
     assert torch.isfinite(loss)
     loss.backward()
+
+
+class _LegacyCustomSFTAdapter:
+    family = "legacy_custom"
+    supported_tasks = ("i2i",)
+    lora_target_modules = ("linear",)
+
+    def load_train_model(self, args):
+        return torch.nn.Linear(2, 2)
+
+    def prepare_for_sharding(self, model):
+        return None
+
+    def on_device_ready(self, model, device):
+        return None
+
+    def prepare_sample(self, row, root, config, index=0):
+        return row
+
+
+def test_legacy_custom_adapter_compatibility() -> None:
+    legacy_path = f"{__name__}._LegacyCustomSFTAdapter"
+    args = Namespace(
+        loss_type="sft",
+        generation_task="i2i",
+        train_backend="fsdp",
+        model_path="/model",
+        prompt_data="/data.json",
+        i2i_sft_config={"data_root": "/data", "dataset_size": 2},
+        global_batch_size=2,
+        rollout_batch_size=2,
+        fsdp_trainable_mode="lora",
+        lora_rank=4,
+        lora_alpha=4,
+        num_rollout=2,
+        num_epoch=None,
+        seed=42,
+        model_adapter_path=legacy_path,
+    )
+    validate_i2i_sft_config(args)
+    assert args.i2i_sft_config["prefix_gradient_checkpointing"] is True
+
+    bad_args = Namespace(
+        **{
+            **vars(args),
+            "i2i_sft_config": {"data_root": "/data", "dataset_size": 2, "transformer_gradient_checkpointing": True},
+        }
+    )
+    with pytest.raises(ValueError, match="transformer_gradient_checkpointing"):
+        validate_i2i_sft_config(bad_args)
+
+    linear = torch.nn.Linear(2, 2)
+    actor = SimpleNamespace(
+        model=linear,
+        adapter=_LegacyCustomSFTAdapter(),
+        _trainable_mode="full",
+        args=Namespace(loss_type="sft", generation_task="i2i"),
+    )
+    FSDPTrainRayActor._assert_trainable_boundary(actor)
+    linear.bias.requires_grad_(False)
+    with pytest.raises(ValueError, match="all transformer params trainable"):
+        FSDPTrainRayActor._assert_trainable_boundary(actor)

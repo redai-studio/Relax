@@ -29,6 +29,36 @@ def image_tier_budget(config: dict[str, Any], index: int) -> int | None:
     return int(tiers[torch.randint(len(tiers), (1,), generator=stream).item()])
 
 
+def load_sft_image(path: Path, max_pixels: int, *, patch_size: int, fixed_pixels: int | None = None) -> Any:
+    """Load an RGB image, resize to the pixel budget and center-crop to
+    ``patch_size`` multiples."""
+    from PIL import Image
+    from torchvision.transforms import InterpolationMode, functional
+
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be positive: {patch_size}")
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+    width, height = image.size
+    if fixed_pixels is not None and fixed_pixels > 0:
+        scale = (width * height / fixed_pixels) ** 0.5
+        height, width = int(round(height / scale)), int(round(width / scale))
+    elif width * height > max_pixels:
+        scale = (width * height / max_pixels) ** 0.5
+        height, width = int(height / scale), int(width / scale)
+    height, width = height // patch_size * patch_size, width // patch_size * patch_size
+    if fixed_pixels is not None and fixed_pixels > 0:
+        height, width = max(patch_size, height), max(patch_size, width)
+    if min(height, width) <= 0:
+        raise ValueError(f"Image is smaller than patch size ({patch_size}): {path}")
+    old_width, old_height = image.size
+    scale = max(width / old_width, height / old_height)
+    image = functional.resize(
+        image, (round(old_height * scale), round(old_width * scale)), interpolation=InterpolationMode.BILINEAR
+    )
+    return functional.center_crop(image, (height, width))
+
+
 def assign_image_batch(
     ids: list[int], config: dict[str, Any], *, step: int | None = None, world: int | None = None
 ) -> list[int]:

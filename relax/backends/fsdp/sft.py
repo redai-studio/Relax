@@ -86,7 +86,8 @@ class FSDPSFTTrainer:
         if self.args.global_batch_size % self.world:
             raise ValueError("Image SFT global batch size must be divisible by the FSDP world size")
         config = self.args.i2i_sft_config
-        if config.get("dp_tier_micro_balance", False) and not actor.adapter.image_tier_policy:
+        has_tier_policy = getattr(actor.adapter, "image_tier_policy", actor.adapter.family == "sensenova")
+        if config.get("dp_tier_micro_balance", False) and not has_tier_policy:
             raise ValueError("DP tier micro balancing requires an adapter with a per-row image tier policy")
         from relax.utils.profile_utils import TrainProfiler
 
@@ -156,7 +157,8 @@ class FSDPSFTTrainer:
         if type(depth) is not int or depth < 0 or type(workers) is not int or workers <= 0:
             raise ValueError("Image prefetch depth/workers must be nonnegative/positive integers")
         if depth:
-            if not actor.adapter.cpu_only_prepare_sample:
+            cpu_only_prepare = getattr(actor.adapter, "cpu_only_prepare_sample", actor.adapter.family == "sensenova")
+            if not cpu_only_prepare:
                 raise ValueError("Threaded image prefetch requires CPU-only sample preparation")
             from relax.engine.sft.image_prefetch import ImagePrefetch
 

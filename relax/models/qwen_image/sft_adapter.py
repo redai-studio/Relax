@@ -11,7 +11,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from relax.engine.sft.image import image_tier_budget
+from relax.engine.sft.image import image_tier_budget, load_sft_image
 from relax.models.qwen_image.scheduler import QwenImageTrainingSchedule
 
 
@@ -43,28 +43,7 @@ LORA_TARGETS = (
 def load_image(path: Path, max_pixels: int, fixed_pixels: int | None = None) -> Any:
     """Load an RGB image, resize to the pixel budget and center-crop to 16
     px."""
-    from PIL import Image
-    from torchvision.transforms import InterpolationMode, functional
-
-    with Image.open(path) as source:
-        image = source.convert("RGB")
-    width, height = image.size
-    if fixed_pixels is not None:
-        scale = (width * height / fixed_pixels) ** 0.5
-        height, width = int(round(height / scale)), int(round(width / scale))
-    elif width * height > max_pixels:
-        scale = (width * height / max_pixels) ** 0.5
-        height, width = int(height / scale), int(width / scale)
-    height, width = height // 16 * 16, width // 16 * 16
-    if fixed_pixels is not None:
-        height, width = max(16, height), max(16, width)
-    if min(height, width) <= 0:
-        raise ValueError(f"Image is smaller than one 16-pixel patch: {path}")
-    scale = max(width / image.width, height / image.height)
-    image = functional.resize(
-        image, (round(image.height * scale), round(image.width * scale)), interpolation=InterpolationMode.BILINEAR
-    )
-    return functional.center_crop(image, (height, width))
+    return load_sft_image(path, max_pixels, patch_size=16, fixed_pixels=fixed_pixels)
 
 
 def resize_condition(image: Any, area: int) -> Any:
@@ -301,12 +280,8 @@ class QwenImageEditSFTAdapter:
             torch.use_deterministic_algorithms(True)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-        device = (
-            torch.device("cpu")
-            if args.fsdp_trainable_mode == "full"
-            else torch.device("cuda", torch.cuda.current_device())
-        )
-        load_options = {"torch_dtype": torch.bfloat16, "device_map": {"": device}}
+        # full 和 LoRA 均先在 CPU 加载，再通过 fsdp2_wrap 分片到各 CUDA 设备，避免分片前在每张 GPU 驻留完整权重。
+        load_options = {"torch_dtype": torch.bfloat16, "device_map": {"": torch.device("cpu")}}
         transformer = QwenImageTransformer2DModel.from_pretrained(
             args.model_path, subfolder="transformer", **load_options
         )

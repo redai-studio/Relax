@@ -9,17 +9,16 @@ import torch
 
 
 class GenerativeSFTAdapter(Protocol):
+    """Required image-edit SFT adapter interface.
+
+    Adapters may optionally declare ``validate_sft_config``,
+    ``image_tier_policy``, ``cpu_only_prepare_sample`` and
+    ``frozen_module_prefixes`` to override the legacy defaults.
+    """
+
     family: str
     supported_tasks: tuple[str, ...]
     lora_target_modules: tuple[str, ...]
-    image_tier_policy: bool
-    cpu_only_prepare_sample: bool
-    frozen_module_prefixes: tuple[str, ...]
-
-    @staticmethod
-    def validate_sft_config(config: dict[str, Any]) -> list[str]:
-        """Return model-specific configuration errors."""
-        ...
 
     def load_train_model(self, args: Any) -> torch.nn.Module:
         """Return the complete forward root: model(sample) yields scalar

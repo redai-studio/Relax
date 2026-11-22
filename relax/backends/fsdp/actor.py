@@ -602,7 +602,7 @@ class FSDPTrainRayActor(TrainRayActor):
         if callable(validate_boundary):
             validate_boundary(self.model)
             return
-        frozen_prefixes = self.adapter.frozen_module_prefixes if is_i2i_sft(self.args) else ()
+        frozen_prefixes = tuple(getattr(self.adapter, "frozen_module_prefixes", ())) if is_i2i_sft(self.args) else ()
         unexpected_trainable = [
             n for n, p in self.model.named_parameters() if n.startswith(frozen_prefixes) and p.requires_grad
         ]

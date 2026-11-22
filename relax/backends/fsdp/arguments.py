@@ -854,7 +854,22 @@ def validate_i2i_sft_config(args: Namespace) -> None:
     args.model_adapter_path = args.model_adapter_path or "relax.models.sensenova.adapter.SenseNovaSFTAdapter"
     from relax.utils.misc import load_function
 
-    errors.extend(load_function(args.model_adapter_path).validate_sft_config(config))
+    adapter_cls = load_function(args.model_adapter_path)
+    validate_sft_config = getattr(adapter_cls, "validate_sft_config", None)
+    if callable(validate_sft_config):
+        errors.extend(validate_sft_config(config))
+    else:
+        config.setdefault("prefix_gradient_checkpointing", True)
+        _fail(
+            errors,
+            type(config["prefix_gradient_checkpointing"]) is not bool,
+            "prefix_gradient_checkpointing must be boolean",
+        )
+        _fail(
+            errors,
+            "transformer_gradient_checkpointing" in config,
+            "Adapter does not declare transformer_gradient_checkpointing support",
+        )
     # These controls have no implementation in the supervised image path.
     for field in (
         "fully_async",
