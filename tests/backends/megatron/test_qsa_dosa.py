@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -188,6 +189,70 @@ def test_qsa_dosa_512k_radix_accumulation_layout(operators):
     torch.testing.assert_close(actual, select(q, k, visible * 4 - 1, 512, "triton"), atol=0, rtol=0)
     assert (stats["survivors"] < visible // 4).all()
     assert not stats["overflow"].any()
+
+
+@pytest.mark.parametrize("capacity", [256, 768], ids=["smaller-than-topk", "non-power-of-two"])
+def test_qsa_dosa_small_topk_requires_compatible_capacity(operators, capacity):
+    select, _ = operators
+    from relax.models.qwen3_8.ops.qsa_cute.dosa_interval import IntervalConfig, select_interval_ids
+
+    query = torch.zeros(1, 4, 128, dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros(4097, 128, dtype=torch.bfloat16, device="cuda")
+    visible = torch.tensor([17], dtype=torch.int32, device="cuda")
+    config = IntervalConfig(capacity=capacity, prefix_threshold=True, small_topk=True)
+
+    stats = {}
+    result = select_interval_ids(query, keys, visible, 512, stats=stats, config=config)
+    radix = select(query, keys, visible * 4 - 1, 512, impl="triton")
+    torch.testing.assert_close(result, radix, atol=0, rtol=0)
+    assert stats["refined"].tolist() == [17]
+    assert stats["fallback"].tolist() == [0]
+
+
+@pytest.mark.parametrize("boundary_only", [False, True], ids=["interval", "boundary"])
+def test_qsa_dosa_interval_preserves_fp32_topk_membership(operators, monkeypatch, boundary_only):
+    select, _ = operators
+    from relax.models.qwen3_8.ops.qsa_cute import dosa_interval
+    from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import _has_cudnn_topk
+
+    if not _has_cudnn_topk():
+        pytest.skip("DoSA interval and boundary selection require cuDNN DSA indexer TopK")
+
+    query = torch.zeros(1, 4, 128, dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros(8192, 128, dtype=torch.bfloat16, device="cuda")
+    query[:, :, 0] = 1
+    query[:, :, 1] = 2.0**-12
+    keys[:511, 0] = 2
+    keys[511:513, 0] = 1
+    keys[512, 1] = 1
+    positions = torch.tensor([len(keys) * 4 - 1], device="cuda")
+    near_scores = torch.tensor([1.0, 1.0 + 2.0**-12], dtype=torch.float32) * (4 * 128**-0.5)
+    assert near_scores[1] > near_scores[0]
+    assert near_scores.bfloat16()[1] == near_scores.bfloat16()[0]
+
+    config = (
+        {"capacity": 256, "half_scores": True, "boundary_reuse_topk": True} if boundary_only else {"capacity": 1024}
+    )
+    monkeypatch.setenv("QWEN38_DOSA_VARIANT", "boundary" if boundary_only else "interval")
+    monkeypatch.setenv("QWEN38_DOSA_INTERVAL_CONFIG", json.dumps(config))
+
+    stats = {}
+    select_interval_ids = dosa_interval.select_interval_ids
+
+    def record_stats(*args, **kwargs):
+        return select_interval_ids(*args, **kwargs, stats=stats)
+
+    monkeypatch.setattr(dosa_interval, "select_interval_ids", record_stats)
+    result = select(query, keys, positions, 512, impl="dosa-set" if boundary_only else "dosa")
+    radix = select(query, keys, positions, 512, impl="triton")
+    expected = torch.arange(512, dtype=torch.int32, device="cuda").unsqueeze(0)
+    expected[0, -1] = 512
+    torch.testing.assert_close(radix, expected, atol=0, rtol=0)
+    torch.testing.assert_close(result.sort(dim=-1).values if boundary_only else result, radix, atol=0, rtol=0)
+    assert stats["fallback"].tolist() == [0]
+    assert stats["refined"].tolist() == ([2] if boundary_only else [513])
+    if boundary_only:
+        assert stats["certified"].tolist() == [511]
 
 
 def test_qsa_dosa_fp16_boundary_keeps_radix_membership_and_fallback(operators):

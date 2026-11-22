@@ -218,6 +218,9 @@ def select_interval_ids(
     # IEEE refinement uses the same 64/128-wide accumulation as dense radix.
     fused_refine = boundary_only and config.boundary_fused_refine and 64 <= capacity <= 128
     kp = triton.next_power_of_2(budget)
+    use_small_topk = (
+        not boundary_only and config.small_topk and capacity >= kp and capacity == triton.next_power_of_2(capacity)
+    )
     query, keys = query.contiguous(), keys.contiguous()
     visible = visible.int().contiguous()
     norms = torch.empty(blocks, device=keys.device)
@@ -330,7 +333,7 @@ def select_interval_ids(
             num_warps=4,
             enable_fp_fusion=False,
         )
-        selection_lengths = fallback if (boundary_only or config.small_topk) else lengths
+        selection_lengths = fallback if (boundary_only or use_small_topk) else lengths
         _qsa_select_topk_kernel[(count,)](
             scores,
             selection_lengths,
@@ -370,7 +373,7 @@ def select_interval_ids(
                 enable_fp_fusion=False,
             )
         else:
-            if config.small_topk:
+            if use_small_topk:
                 _small_topk[(count,)](
                     scores, lengths, fallback, codes, blocks, capacity, kp, ID_BITS, _MAX_ID_CODE, num_warps=8
                 )

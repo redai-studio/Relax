@@ -88,6 +88,8 @@ ENV_ARGS=(
     RELAX_QWEN38_QSA_CP=1
     RELAX_QWEN38_QSA_MIXED_LONG_BACKEND=cute
     "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-torch}"
+    "QWEN38_DOSA_VARIANT=${QWEN38_DOSA_VARIANT:-}"
+    "QWEN38_DOSA_INTERVAL_CONFIG=${QWEN38_DOSA_INTERVAL_CONFIG:-"{}"}"
     "RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE=${RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE:-0}"
     RELAX_QWEN38_PLE_CP_FUSED_CONV=0
     RELAX_QWEN38_QSA_CP_TP_SELECTOR=0
@@ -375,7 +377,7 @@ from pathlib import Path
 runtime = json.loads(sys.argv[2])
 # Only record explicitly selected training settings, not inherited credentials.
 selected = {key: value for key, value in runtime.get("env_vars", {}).items()
-            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_", "QWEN38_PLE_")) or key in
+            if key.startswith(("RELAX_QWEN38_", "RELAX_SFT_", "QWEN38_PLE_", "QWEN38_DOSA_")) or key in
             ("MCORE_QSA_SPARSE_BACKEND", "CUDA_DEVICE_MAX_CONNECTIONS", "RELAX_HYBRID_EP_COMMIT")}
 Path(sys.argv[1]).write_text(json.dumps({"argv": sys.argv[3:], "env_vars": selected}, indent=2) + "\n")
 PYCONFIG
