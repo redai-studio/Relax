@@ -42,7 +42,16 @@ def _load_common(source: Any) -> Any:
         "transfer_queue.utils.enum_utils": ("Role", "TransferQueueRole"),
         "megatron.core.rerun_state_machine": ("RerunMode", "RerunState"),
         "signal": ("Signals",),
-        "relax.core.registry": ("ROLES_SFT_ONLY",),
+        "relax.core.registry": (
+            "ROLES",
+            "ROLES_TRAIN_ONLY",
+            "ROLES_COLOCATE",
+            "ROLES_SFT_ONLY",
+            "ROLES_FULLY_ASYNC_ON_POLICY",
+            "ROLES_PPO_COLOCATE",
+            "ROLES_PPO_FULLY_ASYNC",
+            "ROLES_PPO_FULLY_ASYNC_ON_POLICY",
+        ),
     }
     allowed = [Namespace, io.BytesIO, dict, list, int, defaultdict, Any]
     # Old streaming-data checkpoints retain connection metadata. Export only
@@ -63,6 +72,7 @@ def _load_common(source: Any) -> Any:
             "omegaconf.dictconfig.DictConfig",
             "omegaconf.listconfig.ListConfig",
             "relax.utils.data.identity_window_sampler.IdentityWindowSampler",
+            "relax.utils.data.wholepack.WholepackSampler",
             "relax.utils.model_source.ModelSource",
             "transfer_queue.sampler.seqlen_balanced_sampler.SeqlenBalancedSampler",
         )
@@ -113,8 +123,8 @@ def validate_lora_base(args: dict[str, Any], model: Path) -> bool:
     marker = args.get("relax_lora_checkpoint_metadata")
     if marker is None:
         return False
-    expected = verified_lora_base_identity(args, marker)
-    if hf_checkpoint_identity(model) != expected:
+    expected = verified_lora_base_identity(args, marker, model)
+    if hf_checkpoint_identity(model, version=marker["format_version"]) != expected:
         raise ValueError("LoRA-only checkpoint base HF identity mismatch; use the exact training base")
     for key in ("lora_rank", "lora_alpha", "tensor_model_parallel_size"):
         if key in marker and marker[key] != args.get(key):

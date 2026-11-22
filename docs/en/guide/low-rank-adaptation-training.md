@@ -228,6 +228,8 @@ The HF export reads the complete in-memory model after the native checkpoint is 
 
 To resume, supply the original frozen base through `--hf-checkpoint` or `--ref-load` and set `--load /path/to/run/native`. Relax loads the base, then restores the LoRA parameters and training state; no offline merge is needed. Keep the base, LoRA settings, and parallel topology consistent with the saved run. Use this lightweight checkpoint for full training resumption, without `--finetune`, `--no-load-optim`, or `--no-load-rng`.
 
+The current format fingerprints the contents of the weight shards with SHA-256 on initialization and verification, so a fresh local copy can have different file timestamps. Each training node reads its local source once per check. Use a full DCP when MoE router expert bias updates are enabled, since those updates modify a base-model buffer.
+
 Older v1 lightweight checkpoints can resume or export when their saved source arguments identify the same base unambiguously. If the source is ambiguous, recover from a full DCP. A full DCP with unknown base provenance can still be saved in full and converted using its own weights.
 
 ::: tip

@@ -173,7 +173,7 @@ def test_checkpoint_lora_iteration_resume_order(checkpoint, monkeypatch, tmp_pat
                     "base_hf_checkpoint": {
                         "config_sha256": "c",
                         "index_sha256": None,
-                        "shard_stat_sha256": "s",
+                        "shard_content_sha256": "s",
                         "shard_count": "1",
                     },
                 }

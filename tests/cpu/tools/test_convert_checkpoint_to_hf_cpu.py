@@ -466,14 +466,22 @@ def test_cpu_export_lora_merges_tp_gdn_experts_hc_ple_and_vision(
 def test_cpu_lora_reads_default_sampler_metadata(tmp_path: Path, embedded: bool) -> None:
     from omegaconf import OmegaConf
 
+    from relax.core.registry import ROLES_COLOCATE, ROLES_PPO_FULLY_ASYNC
     from relax.utils.data.identity_window_sampler import IdentityWindowSampler
+    from relax.utils.data.wholepack import WholepackSampler
     from scripts.tools.convert_checkpoint_lora import read_lora_args
 
+    sampler = (
+        WholepackSampler(dp_size=4, tp_size=2, global_batch_size=4)
+        if embedded
+        else IdentityWindowSampler(dp_size=2, placement="sequential")
+    )
     config = OmegaConf.create(
-        {"controller": {"sampler": IdentityWindowSampler(dp_size=2, placement="sequential")}, "worker_ids": [0, 1]},
+        {"controller": {"sampler": sampler}, "worker_ids": [0, 1]},
         flags={"allow_objects": True},
     )
-    common = {"args": Namespace(tq_config=config, lora_rank=8, lora_alpha=16)}
+    role = ROLES_PPO_FULLY_ASYNC.actor if embedded else ROLES_COLOCATE.actor
+    common = {"args": Namespace(tq_config=config, checkpoint_role=role, lora_rank=8, lora_alpha=16)}
     if embedded:
         payload = io.BytesIO()
         torch.save([common], payload)
@@ -502,7 +510,15 @@ def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> N
         args = torch.load(checkpoint / "common.pt", weights_only=True)["args"]
     args.hf_checkpoint, args.load, args.ref_load = str(other), str(trained), None
     marker = args.relax_lora_checkpoint_metadata
-    marker.update(format_version=2, base_hf_checkpoint=hf_checkpoint_identity(trained))
+    # Matching timestamps and sizes do not establish matching contents.
+    original_stat = (trained / "model.safetensors").stat()
+    os.utime(other / "model.safetensors", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    (other / "pytorch_model-extra.bin").write_bytes((trained / "pytorch_model-extra.bin").read_bytes())
+    extra_stat = (trained / "pytorch_model-extra.bin").stat()
+    os.utime(other / "pytorch_model-extra.bin", ns=(extra_stat.st_atime_ns, extra_stat.st_mtime_ns))
+    assert hf_checkpoint_identity(other) == hf_checkpoint_identity(trained)
+    marker.update(format_version=2, base_hf_checkpoint=hf_checkpoint_identity(trained, version=2))
+    os.utime(trained / "model.safetensors", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 10**9))
     torch.save({"args": args}, checkpoint / "common.pt")
     out = tmp_path / "actual"
     with pytest.raises(ValueError, match="identity mismatch"):
@@ -521,6 +537,9 @@ def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> N
     marker["base_hf_checkpoint"] = hf_checkpoint_identity(trained)
     torch.save({"args": args}, checkpoint / "common.pt")
     assert export_checkpoint(checkpoint, trained, tmp_path / "legacy", dry_run=True)["lora_only_checkpoint"]
+    (trained / "latest_checkpointed_iteration.txt").write_text("7")
+    with pytest.raises(ValueError, match="legacy v1"):
+        export_checkpoint(checkpoint, trained, tmp_path / "mixed-native-and-hf", dry_run=True)
 
 
 @pytest.mark.parametrize(

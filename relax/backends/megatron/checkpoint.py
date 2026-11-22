@@ -19,7 +19,11 @@ from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
-from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity, verified_lora_base_identity
+from relax.utils.lora_checkpoint_identity import (
+    has_mutable_router_bias,
+    hf_checkpoint_identity,
+    verified_lora_base_identity,
+)
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.training.ppo_utils import (
     use_critic_lm_head_for_hf_load,
@@ -316,11 +320,13 @@ def _global_trainable_lora_parameter_names(model, *, required: bool = True) -> t
     return tuple(all_lora)
 
 
-def _lora_checkpoint_metadata(args, trainable_names: tuple[str, ...], base: dict | None) -> dict:
-    if not base or not base.get("shard_stat_sha256"):
+def _lora_checkpoint_metadata(
+    args, trainable_names: tuple[str, ...], base: dict | None, *, version: int = _LORA_CHECKPOINT_FORMAT_VERSION
+) -> dict:
+    if not base or not base.get("shard_stat_sha256" if version == 1 else "shard_content_sha256"):
         raise RuntimeError("Cannot save a LoRA-only checkpoint without a verified frozen HF base; save a full DCP")
     return {
-        "format_version": _LORA_CHECKPOINT_FORMAT_VERSION,
+        "format_version": version,
         "base_hf_checkpoint": base,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
@@ -539,40 +545,72 @@ def _resolve_checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | No
     return path / f"iter_{iteration:07d}"
 
 
+def _actor_hf_identity(path: str, version: int) -> dict | None:
+    """Hash each node-local source once.
+
+    Every rank agrees before loading or saving a lightweight checkpoint.
+    """
+    import socket
+
+    import torch.distributed as dist
+
+    def read() -> dict | None:
+        if not path:
+            return None
+        try:
+            identity = hf_checkpoint_identity(path, version=version)
+        except (OSError, ValueError) as error:
+            logger.warning("Cannot identify the HF base at %s: %s", path, error)
+            return None
+        return identity if identity.get("shard_count") else None
+
+    if not dist.is_initialized():
+        return read()
+    group = get_gloo_group()
+    rank, size = dist.get_rank(group), dist.get_world_size(group)
+    locations = [None] * size
+    location = (socket.gethostname(), os.path.abspath(path))
+    dist.all_gather_object(locations, location, group=group)
+    leaders = {locations.index(item) for item in locations}
+    identities = [None] * size
+    dist.all_gather_object(identities, read() if rank in leaders else None, group=group)
+    first = identities[0]
+    if any(identities[i] != first for i in leaders):
+        logger.warning("Training ranks disagree on the HF base contents")
+        return None
+    return first
+
+
 def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> str:
     # On resume --load names the native checkpoint. Either HF argument may
     # supply the original weights, including a relocated identical base.
     names = _global_trainable_lora_parameter_names(model)
-    candidates = tuple(dict.fromkeys((args.hf_checkpoint, getattr(args, "ref_load", None))))
-
-    def select_base() -> int:
-        for index, requested in enumerate(candidates):
-            if not requested:
-                continue
-            path = _select_hf_load_source(args, requested)
-            try:
-                if _is_hf_checkpoint(path) and hf_checkpoint_identity(path) == metadata["base_hf_checkpoint"]:
-                    return index
-            except FileNotFoundError:
-                continue
-        raise ValueError("Lightweight LoRA checkpoint base HF identity mismatch; supply the exact training base")
-
-    source = candidates[_collective_checkpoint_probe(select_base)]
-    expected = _lora_checkpoint_metadata(args, names, metadata["base_hf_checkpoint"])
-    expected["format_version"] = metadata["format_version"]
+    for requested in (args.hf_checkpoint, getattr(args, "ref_load", None)):
+        path = _select_hf_load_source(args, requested) if requested else ""
+        if _actor_hf_identity(path, metadata["format_version"]) == metadata["base_hf_checkpoint"]:
+            break
+    else:
+        raise RuntimeError("Lightweight LoRA checkpoint base HF identity mismatch; supply the exact training base")
+    expected = _lora_checkpoint_metadata(
+        args, names, metadata["base_hf_checkpoint"], version=metadata["format_version"]
+    )
     mismatches = {
         key: (metadata.get(key), expected.get(key)) for key in expected if metadata.get(key) != expected.get(key)
     }
     if mismatches:
         details = ", ".join(f"{key}: checkpoint={old!r}, current={new!r}" for key, (old, new) in mismatches.items())
         raise RuntimeError(f"Lightweight LoRA checkpoint is incompatible with the current run: {details}")
-    return source
+    return requested
 
 
 def save_checkpoint(*args, lora_only: bool = False, **kwargs):
     """Save either the regular full DCP or a resumable LoRA-only DCP."""
     runtime_args = get_args()
     model = args[1] if len(args) > 1 else kwargs["model"]
+    if has_mutable_router_bias(vars(runtime_args)):
+        setattr(runtime_args, _LORA_FROZEN_BASE, None)
+        if lora_only:
+            raise RuntimeError("--save-lora-only omits updates to the MoE expert bias; save a full DCP")
     if not lora_only:
         if getattr(runtime_args, _LORA_FROZEN_BASE, None) and not _global_trainable_lora_parameter_names(
             model, required=False
@@ -728,6 +766,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     optimizer=optimizer,
                     args=args,
                     load_path=source,
+                    verified_base=lora_metadata["base_hf_checkpoint"]
+                    if lora_metadata["format_version"] == 2
+                    else None,
                 )
             with (
                 _patch_lora_checkpoint_state_dict(),
@@ -857,15 +898,23 @@ def _select_hf_load_source(args: Namespace, load_path: str | None) -> str:
     return args.hf_checkpoint
 
 
-def _record_lora_base(args, model, optimizer, identity: dict | None) -> None:
+def _record_lora_base(args, model, optimizer, identity: dict | None, *, source_path: str | None = None) -> None:
     # Reference and teacher loads temporarily reuse the actor with optimizer=None.
-    if optimizer is not None and getattr(args, "lora_rank", 0):
-        if identity and not _global_trainable_lora_parameter_names(model, required=False):
-            identity = None
-        setattr(args, _LORA_FROZEN_BASE, identity)
+    if optimizer is None or not getattr(args, "lora_rank", 0):
+        return
+    if (
+        (identity or source_path)
+        and not has_mutable_router_bias(vars(args))
+        and _global_trainable_lora_parameter_names(model, required=False)
+    ):
+        if identity is None:
+            identity = _actor_hf_identity(source_path, 2)
+    else:
+        identity = None
+    setattr(args, _LORA_FROZEN_BASE, identity)
 
 
-def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
+def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None, *, verified_base: dict | None = None):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
 
@@ -884,8 +933,7 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
                 with _patch_scatter_dtype_cast():
                     bridge.load_hf_weights(ddp_model)
 
-    if optimizer is not None and getattr(args, "lora_rank", 0):
-        _record_lora_base(args, ddp_model, optimizer, hf_checkpoint_identity(source_path))
+    _record_lora_base(args, ddp_model, optimizer, verified_base, source_path=source_path)
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
     if (args.fp16 or args.bf16) and optimizer is not None:

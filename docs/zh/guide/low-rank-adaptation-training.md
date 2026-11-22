@@ -228,6 +228,8 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 续训时，通过 `--hf-checkpoint` 或 `--ref-load` 提供训练时冻结的原始基座，并设置 `--load /path/to/run/native`。Relax 会先加载底模，再恢复 LoRA 参数和训练状态，不需要离线合并。底模、LoRA 配置和并行拓扑须与保存时一致。轻量 checkpoint 当前按完整续训方式恢复，不要添加 `--finetune`、`--no-load-optim` 或 `--no-load-rng`。
 
+当前格式在初始化和校验基座时使用 SHA-256 核对权重分片内容，允许重新下载的文件具有不同时间戳。每次校验时，每台训练节点读取一次本地基座。启用 MoE 路由器 expert bias 更新时请使用完整 DCP，因为训练会直接更新基座的缓冲区。
+
 旧版 v1 轻量 checkpoint 在保存的来源参数能唯一确定同一基座时可以续训或导出。来源不明确时，请使用完整 DCP 恢复。即使基座来源未知，完整 DCP 仍可继续完整保存，也可用其自带的权重转换。
 
 ::: tip

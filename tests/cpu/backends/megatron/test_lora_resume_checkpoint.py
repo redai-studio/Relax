@@ -96,7 +96,7 @@ def test_save_lora_only_filters_model_after_optimizer_state_is_built(monkeypatch
 
     seen = {}
     args = _runtime_args()
-    args.relax_lora_frozen_hf_base = {"shard_stat_sha256": "frozen-base"}
+    args.relax_lora_frozen_hf_base = {"shard_content_sha256": "frozen-base"}
 
     def fake_generate_state_dict(*_args, **_kwargs):
         seen["optimizer_saw_base"] = True
@@ -152,7 +152,7 @@ def test_lora_only_save_keeps_full_model_for_hf_export(monkeypatch, tmp_path):
     from relax.backends.megatron import model as model_mod
 
     args = _runtime_args()
-    args.relax_lora_frozen_hf_base = {"shard_stat_sha256": "frozen-base"}
+    args.relax_lora_frozen_hf_base = {"shard_content_sha256": "frozen-base"}
     args.save_lora_only = True
     args.save_hf = str(tmp_path / "hf")
     args.save_hf_dtype = "bf16"
@@ -194,6 +194,37 @@ def test_lora_only_save_keeps_full_model_for_hf_export(monkeypatch, tmp_path):
     assert not hasattr(args, checkpoint._LORA_CHECKPOINT_METADATA_ATTR)
 
 
+def _check_local_hf_copies(rank: int, directory: str) -> None:
+    from datetime import timedelta
+
+    from relax.utils.distributed_utils import init_gloo_group
+
+    root = Path(directory)
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=(root / "store").as_uri(), timeout=timedelta(seconds=60)
+    )
+    try:
+        init_gloo_group(1)
+        local = root / str(rank)
+        expected = checkpoint.hf_checkpoint_identity(local, version=2)
+        assert checkpoint._actor_hf_identity(str(local), 2) == expected
+        if rank == 1:
+            (local / "model.safetensors").write_bytes(b"changed")
+        assert checkpoint._actor_hf_identity(str(local), 2) is None
+        assert checkpoint._actor_hf_identity(str(root / "0") if rank == 0 else "", 2) is None
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_distributed_lora_identity_agrees_on_localized_weights(tmp_path):
+    for rank in range(2):
+        local = tmp_path / str(rank)
+        local.mkdir()
+        (local / "config.json").write_text("{}")
+        (local / "model.safetensors").write_bytes(b"matching")
+    torch.multiprocessing.spawn(_check_local_hf_copies, args=(str(tmp_path),), nprocs=2, join=True)
+
+
 @pytest.mark.parametrize("use_ref", [False, True])
 def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, tmp_path, use_ref):
     from argparse import Namespace
@@ -213,7 +244,7 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
 
     def from_hf(path, **kwargs):
         weights = load_file(Path(path) / "model.safetensors")["weight"]
-        return SimpleNamespace(load_hf_weights=lambda chunks: chunks[0].base.weight.data.copy_(weights))
+        return SimpleNamespace(load_hf_weights=lambda chunks: chunks[0].base.load_state_dict({"weight": weights}))
 
     monkeypatch.setattr(AutoBridge, "from_hf_pretrained", from_hf)
     monkeypatch.setattr(checkpoint.megatron_bridge_utils, "patch_megatron_model", lambda _: nullcontext())
@@ -221,10 +252,12 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
         monkeypatch.setattr(checkpoint, name, lambda _: nullcontext())
     checkpoint._load_checkpoint_hf(model, object(), args, None if use_ref else str(b))
     torch.testing.assert_close(model[0].base.weight, torch.full((2, 2), 2.0))
-    expected_identity = checkpoint.hf_checkpoint_identity(b)
+    expected_identity = checkpoint.hf_checkpoint_identity(b, version=2)
     assert args.relax_lora_frozen_hf_base == expected_identity
+    actor_state = {key: value.clone() for key, value in model[0].state_dict().items()}
     checkpoint._load_checkpoint_hf(model, None, args, str(a))
     assert args.relax_lora_frozen_hf_base == expected_identity
+    model[0].load_state_dict(actor_state)
 
     # Save the native common arguments and exercise the full-DCP loader
     # followed by a lightweight save, without bringing up distributed ranks.
@@ -248,6 +281,14 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     args.ref_load = None
     with pytest.raises(RuntimeError, match="base HF identity mismatch"):
         checkpoint._validate_lora_checkpoint_metadata(args, model, marker)
+
+    args.moe_router_enable_expert_bias = True
+    args.moe_router_bias_update_rate = 1e-3
+    checkpoint.save_checkpoint(2, model, None, None)
+    assert saved["relax_lora_frozen_hf_base"] is None
+    with pytest.raises(RuntimeError, match="MoE expert bias"):
+        checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
+    args.moe_router_bias_update_rate = 0
 
     # An old full DCP still loads and can be saved in full. Discarding its
     # base would lose the only authoritative copy of those weights.
@@ -318,7 +359,7 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
             "config_sha256": "c",
             "index_sha256": None,
             "shard_count": "1",
-            "shard_stat_sha256": "s",
+            "shard_content_sha256": "s",
         },
     }
     common = {
