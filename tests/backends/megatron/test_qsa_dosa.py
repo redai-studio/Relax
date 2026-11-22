@@ -29,7 +29,10 @@ def operators(monkeypatch):
     existing = set(sys.modules)
     selector = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.selector")
     dosa = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.dosa_selector")
+    # The selector may already have been imported by a different test module.
+    selector._interval_config.cache_clear()
     yield selector.select_ids, dosa.dosa_select_ids
+    selector._interval_config.cache_clear()
     for name in set(sys.modules) - existing:
         if name.startswith("relax.models."):
             sys.modules.pop(name, None)
@@ -212,12 +215,12 @@ def test_qsa_dosa_small_topk_requires_compatible_capacity(operators, capacity):
 @pytest.mark.parametrize("boundary_only", [False, True], ids=["interval", "boundary"])
 def test_qsa_dosa_interval_preserves_fp32_topk_membership(operators, monkeypatch, boundary_only):
     select, _ = operators
-    from relax.models.qwen3_8.ops.qsa_cute import dosa_interval
     from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import _has_cudnn_topk
 
     if not _has_cudnn_topk():
         pytest.skip("DoSA interval and boundary selection require cuDNN DSA indexer TopK")
 
+    dosa_interval = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.dosa_interval")
     query = torch.zeros(1, 4, 128, dtype=torch.bfloat16, device="cuda")
     keys = torch.zeros(8192, 128, dtype=torch.bfloat16, device="cuda")
     query[:, :, 0] = 1
@@ -240,6 +243,8 @@ def test_qsa_dosa_interval_preserves_fp32_topk_membership(operators, monkeypatch
     select_interval_ids = dosa_interval.select_interval_ids
 
     def record_stats(*args, **kwargs):
+        assert kwargs["config"] == dosa_interval.IntervalConfig(**config)
+        assert kwargs["boundary_only"] is boundary_only
         return select_interval_ids(*args, **kwargs, stats=stats)
 
     monkeypatch.setattr(dosa_interval, "select_interval_ids", record_stats)
