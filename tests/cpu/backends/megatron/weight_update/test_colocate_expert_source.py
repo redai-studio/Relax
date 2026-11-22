@@ -497,13 +497,21 @@ def test_expert_consumer_qualifies_without_enabling_backup_overlap(module, monke
     monkeypatch.setenv("RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP", "0")
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater.shard_p2p_requested = True
-    dimensions = dict(pipeline_model_parallel_size=1, context_parallel_size=1, expert_tensor_parallel_size=1)
+    dimensions = dict(
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        rollout_num_gpus_per_engine=1,
+    )
     if rejected in dimensions:
         dimensions[rejected] = 2
     updater.args = SimpleNamespace(**dimensions)
     updater.actor_weight_retention_enabled = True
     updater._expert_ipc_receiver_support = rejected != "receiver"
-    updater._direct_expert_layout = None if rejected == "layout" else SimpleNamespace(ep_size=1, moe_dp_size=1)
+    updater._direct_expert_layout = (
+        None if rejected == "layout" else SimpleNamespace(ep_size=1, moe_dp_size=1, tp_size=1)
+    )
+    updater.rollout_engines = [object()]
     monkeypatch.setattr(module.dist, "get_rank", lambda group: 0)
     monkeypatch.setattr(
         module.dist, "all_reduce", lambda value, **kwargs: value.zero_() if rejected == "peer" else None
@@ -559,8 +567,13 @@ def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_act
 
     updater = object.__new__(module.UpdateWeightFromTensor)
     updater.shard_p2p_requested = updater.actor_weight_retention_enabled = True
-    updater.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
-    updater._direct_expert_layout = None
+    updater.args = SimpleNamespace(
+        rollout_num_gpus_per_engine=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_tensor_parallel_size=1,
+    )
+    updater._direct_expert_layout = SimpleNamespace(ep_size=1, moe_dp_size=1, tp_size=1)
     updater._expert_ipc_receiver_support = updater._ordinary_tp_receiver_support = False
     updater.lora_enabled = updater.quantization_config = updater._route_experts = updater.use_distribute = False
     updater._hf_weight_iterator = SimpleNamespace(_bridge_converter=object())
@@ -570,12 +583,12 @@ def test_ordinary_receiver_requalification_keeps_native_fallback_and_rejects_act
     updater._configure_colocate_expert_ipc(["node"])
     assert not updater._colocate_tp_ipc_enabled and not updater._colocate_expert_ipc_enabled
 
-    updater._ordinary_tp_receiver_support = True
+    updater._expert_ipc_receiver_support = updater._ordinary_tp_receiver_support = True
     # MOPD's four TP1 student engines use only half the eight Actor GPUs.
     updater.rollout_engines = [object() for _ in range(4)]
     monkeypatch.setattr(module.dist, "get_world_size", lambda group: 8)
     updater._configure_colocate_expert_ipc(["node"])
-    assert updater._colocate_tp_ipc_enabled
+    assert updater._colocate_tp_ipc_enabled and not updater._colocate_expert_ipc_enabled
     source = object.__new__(CombinedShardSource)
     source.expert, source.has_experts, source.has_ordinary = None, False, True
     from relax.backends.megatron.weight_update.tp_shard_source import OrdinaryTPSource

@@ -527,6 +527,8 @@ class UpdateWeightFromTensor:
         self._colocate_tp_ipc_enabled = False
         if not self.shard_p2p_requested:
             return
+        group = get_gloo_group()
+        actor_count = dist.get_world_size(group)
         layout = self._direct_expert_layout
         local_receivers = bool(
             self.actor_weight_retention_enabled and actor_nodes and all(actor_nodes) and len(set(actor_nodes)) == 1
@@ -536,13 +538,15 @@ class UpdateWeightFromTensor:
             and self._expert_ipc_receiver_support
             and layout is not None
             and (layout.ep_size, layout.moe_dp_size) == (1, 1)
+            and layout.tp_size == self.args.rollout_num_gpus_per_engine
+            and layout.tp_size * len(self.rollout_engines) == actor_count
             and all(
                 getattr(self.args, name, None) == 1
                 for name in ("pipeline_model_parallel_size", "context_parallel_size", "expert_tensor_parallel_size")
             )
         )
         decision = torch.tensor([int(ready)], dtype=torch.int32, device="cpu")
-        dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
+        dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=group)
         self._colocate_expert_ipc_enabled = bool(decision.item())
         ordinary = bool(
             local_receivers
@@ -552,11 +556,10 @@ class UpdateWeightFromTensor:
             and not self._route_experts
             and not self.use_distribute
             and hasattr(self._hf_weight_iterator, "_bridge_converter")
-            and self.args.rollout_num_gpus_per_engine * len(self.rollout_engines)
-            <= dist.get_world_size(get_gloo_group())
+            and self.args.rollout_num_gpus_per_engine * len(self.rollout_engines) <= actor_count
         )
         decision = torch.tensor([int(ordinary)], dtype=torch.int32, device="cpu")
-        dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
+        dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=group)
         self._colocate_tp_ipc_enabled = bool(decision.item())
         helper = getattr(self, "_colocate_expert_ipc", None)
         if helper is not None:
@@ -567,7 +570,7 @@ class UpdateWeightFromTensor:
                     raise ValueError("Shard P2P receiver capabilities changed after activation; restart is required")
 
             helper._phase(check_receiver_capabilities)
-        if dist.get_rank(get_gloo_group()) == 0:
+        if dist.get_rank(group) == 0:
             logger.info(
                 "ShardP2P ordinary TP requested=%s eligible=%s; effective coverage requires native seed qualification",
                 self.shard_p2p_requested,
