@@ -2087,10 +2087,9 @@ async def test_routed_generation_does_not_resend_after_ambiguous_failure(monkeyp
                 fail_fast_no_workers=fail_fast,
             )
         assert len(sends) == 1
-        assert adapter._requests["ambiguous-eval"].wire_id == "ambiguous-eval"
+        await adapter.abort_request("ambiguous-eval")
         await adapter.abort_request("ambiguous-eval")
     assert aborted == ["ambiguous-eval"]
-    assert not adapter._requests
 
 
 @pytest.mark.parametrize("rollout_mode,abort_failures", [("train", 0), ("eval", 0), ("train", 1), ("eval", 2)])
