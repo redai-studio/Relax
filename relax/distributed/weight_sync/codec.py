@@ -8,6 +8,8 @@ training partition, inference loader, snapshot, or update lifecycle.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Iterable
 from typing import Any
@@ -26,6 +28,12 @@ _DTYPES = {
     "float64": 8,
 }
 WIRE_ALIGNMENT = max(_DTYPES.values())
+
+
+def schema_digest(schema: dict[str, tuple]) -> str:
+    """Bind final capability ordinals to the exact ordered HF names, shapes and
+    dtypes."""
+    return hashlib.sha256(json.dumps(list(schema.items()), separators=(",", ":")).encode()).hexdigest()
 
 
 def encode(weights: Iterable[tuple[str, tuple[int, ...], Any, Any, Any]], *, max_bytes: int) -> tuple[dict, Any]:

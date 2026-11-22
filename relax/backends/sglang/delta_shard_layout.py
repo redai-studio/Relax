@@ -220,6 +220,8 @@ class BroadcastTargets(TorchDispatchMode):
         self.direct: frozenset[int] = frozenset()
         self.writes: dict[tuple, list] = {}
         self.conflicts: set[str] = set()
+        self.name = ""
+        self.source = None
 
     def observe(self, name: str, value: torch.Tensor):
         self.name, self.source = name, value
@@ -227,11 +229,11 @@ class BroadcastTargets(TorchDispatchMode):
         self.region = None
         self.supported = value.dtype in (torch.float16, torch.bfloat16, torch.float32) and value.numel() > 0
         try:
-            with self:
-                yield name, value
+            yield name, value
             if self.supported:
                 self.targets[name] = self.region
         finally:
+            self.name = ""
             self.source = None
 
     def __torch_dispatch__(self, func: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
@@ -247,7 +249,7 @@ class BroadcastTargets(TorchDispatchMode):
                     starts = self.starts[value.device]
                     if idx < len(starts) and starts[idx] < span[1]:
                         self.writes.setdefault(value.device, []).append((*span, self.name))
-        if self.supported:
+        if self.source is not None and self.supported:
             if func == torch.ops.aten.copy_.default:
                 dest, source = args[:2]
                 region = self._copy(dest, source)
@@ -314,18 +316,29 @@ class BroadcastTargets(TorchDispatchMode):
             return None
         return CopyRegion(weight, base, offset, rows, stride, width)
 
-    def seal(self, receiver: Any) -> bool:
-        # Two HF spellings can write the same destination, even when one
-        # fell back to the ordinary loader. A changed earlier input would
-        # otherwise survive an unchanged later writer. At final ACK force a
-        # complete refresh if earlier per-frame capabilities were optimistic.
+    def seal(self, receiver: Any, *, final_mask: bool) -> bool:
+        # Sweep connected components of overlapping physical intervals. If a
+        # component has multiple writers, every name in it must replay FULL
+        # in native order, even when that writer's source bits did not change.
         for writes in self.writes.values():
-            end, owner = 0, None
+            end, first, mixed = 0, None, False
             for lo, hi, name in sorted(writes):
-                if lo < end and name != owner:
-                    self.conflicts.update((name, owner))
-                if hi > end:
-                    end, owner = hi, name
+                if lo >= end:
+                    first, mixed = name, False
+                elif name != first:
+                    self.conflicts.add(first)
+                    mixed = True
+                if mixed:
+                    self.conflicts.add(name)
+                end = max(end, hi)
+        if "" in self.conflicts:
+            # A buffered loader wrote live bytes outside the active input. We
+            # cannot name every writer of that interval in a per-input ACK.
+            return False
+        if final_mask:
+            receiver.full_only.update(self.conflicts)
+            for name in self.conflicts:
+                self.targets.pop(name, None)
         self.writes.clear()
         self.starts.clear()
         self.ends.clear()
@@ -334,7 +347,7 @@ class BroadcastTargets(TorchDispatchMode):
         self.by_owner = {binding[0]: (name, binding) for name, binding in self.signature}
         self.owners.clear()
         return (
-            bool(self.targets)
+            (bool(self.targets) or (final_mask and receiver.full_only.issuperset(receiver.schema)))
             and not (self.conflicts - receiver.full_only)
             and validate_shard_storage(receiver.model, receiver.destinations, (), self.direct)
         )

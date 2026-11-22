@@ -408,3 +408,43 @@ def test_missing_ordinary_ack_keeps_ipc_storage_and_old_version(monkeypatch):
     with pytest.raises(RuntimeError, match="final acknowledgement"):
         proxy.finalize("2", timeout=10)
     assert operations == ["export", "update_weights_from_tensor", "status"] * 2
+
+
+@pytest.mark.parametrize("fault", ["short", "unwritten", "missing_stage", "flush_result", "flush_timeout"])
+def test_pipeline_final_mask_requires_every_stage_and_flush_before_release(monkeypatch, fault):
+    proxy = WeightSyncProxy(None)
+    proxy.tp_size, proxy.pp_size = 1, 2
+    proxy.children = [None, None]
+    proxy.version, proxy.batch, proxy.staging_budget, proxy._workspace_budget = "2", 2, 128, 128
+    operations = []
+    confirmations = []
+
+    def commands(cmds, *, deadline):
+        op = cmds[0]["op"]
+        operations.append(op)
+        if op == "export":
+            control = cmds[0]["control"]
+            confirm = control["op"] == "confirm_flush"
+            confirmations.append(confirm)
+            assert all(c["count"] == (0 if confirm else 3) for c in cmds)
+            return [dict(serialized="ipc")] * 2
+        if op == "status":
+            if confirmations[-1]:
+                if fault == "flush_timeout":
+                    raise TimeoutError
+                return [dict(full_required=[]), dict(full_required=[1])]
+            if fault == "missing_stage":
+                return [dict(full_required=[0, 0, 0])]
+            second = {"short": [0, 1], "unwritten": [0, 1, 255]}.get(fault, [0, 1, 1])
+            return [dict(full_required=[0, 0, 0]), dict(full_required=second)]
+        pytest.fail(op)
+
+    monkeypatch.setattr(proxy, "receive", lambda *a, **kw: None)
+    monkeypatch.setattr(proxy, "ready", lambda *a, **kw: None)
+    monkeypatch.setattr(proxy, "_payload", lambda *a, **kw: {})
+    monkeypatch.setattr(proxy, "_request", lambda action, *a, **kw: operations.append(action))
+    monkeypatch.setattr(proxy, "_commands", commands)
+    with pytest.raises((RuntimeError, TimeoutError)):
+        proxy.finalize("2", timeout=20, final_schema=dict(count=2, digest="0" * 64))
+    assert "release" not in operations and "update_weight_version" not in operations
+    assert len(confirmations) == (2 if fault.startswith("flush") else 1)
