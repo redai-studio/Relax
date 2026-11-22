@@ -369,3 +369,20 @@ def test_unknown_model_type_missing_fields_returns_zero():
     counter = FlopsCounter(config)
     estimated, _ = counter.estimate([1024, 2048], delta_time=1.0)
     assert estimated == 0
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_heterogeneous_fallback_does_not_read_global_dimensions(nested):
+    class HeterogeneousConfig:
+        model_type = "custom_heterogeneous_text"
+        per_layer_config = {"full_attention": {}, "sliding_attention": {}}
+
+        @property
+        def num_attention_heads(self):
+            raise ValueError("Attention heads must be read per layer")
+
+    config = HeterogeneousConfig()
+    if nested:
+        config = types.SimpleNamespace(model_type="custom_heterogeneous", text_config=config)
+    estimated, _ = FlopsCounter(config).estimate([128, 256], delta_time=1.0)
+    assert math.isnan(estimated)

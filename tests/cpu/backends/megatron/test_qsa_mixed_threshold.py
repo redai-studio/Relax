@@ -19,6 +19,7 @@ def mixed_dispatcher(monkeypatch):
     from relax.utils.env import Envs
 
     monkeypatch.delenv("RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN", raising=False)
+    monkeypatch.setenv("RELAX_QWEN38_QSA_MIXED_LONG_BACKEND", "grouped")
     prefix = "relax.models.qwen3_8.ops.qsa_mixed_ops"
     flex = ModuleType(f"{prefix}.flex")
     grouped = ModuleType(f"{prefix}.grouped")
@@ -33,9 +34,41 @@ def mixed_dispatcher(monkeypatch):
     with monkeypatch.context() as imports:
         imports.setitem(sys.modules, flex.__name__, flex)
         imports.setitem(sys.modules, grouped.__name__, grouped)
+        geometry_spec = importlib.util.spec_from_file_location(f"{prefix}.geometry", path.with_name("geometry.py"))
+        geometry = importlib.util.module_from_spec(geometry_spec)
+        imports.setitem(sys.modules, geometry_spec.name, geometry)
+        geometry_spec.loader.exec_module(geometry)
         spec.loader.exec_module(mixed)
     assert mixed.Envs is Envs
     return mixed
+
+
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,q_dim,k_dim,valid",
+    [
+        (12, 1, 256, 256, True),
+        (24, 2, 256, 256, True),
+        (6, 1, 256, 256, True),
+        (3, 1, 256, 256, True),
+        (8, 2, 256, 256, True),
+        (0, 1, 256, 256, False),
+        (12, 0, 256, 256, False),
+        (3, 2, 256, 256, False),
+        (12, 1, 128, 256, False),
+        (12, 1, 256, 128, False),
+    ],
+)
+def test_grouped_long_geometry_contract(monkeypatch, mixed_dispatcher, q_heads, kv_heads, q_dim, k_dim, valid):
+    q = torch.empty((7, q_heads, q_dim))
+    k = torch.empty((7, kv_heads, k_dim))
+    indices = torch.empty((7, 2052), dtype=torch.int32)
+    if valid:
+        monkeypatch.setattr(mixed_dispatcher, "attention_bf16", lambda q, *args, **kwargs: q)
+        assert mixed_dispatcher.long_attention(q, k, k, indices, 0.0625) is q
+    else:
+        # The fixture's kernel sentinel fails if validation accidentally admits the input.
+        with pytest.raises(NotImplementedError, match="backend=grouped"):
+            mixed_dispatcher.long_attention(q, k, k, indices, 0.0625)
 
 
 @pytest.mark.parametrize(

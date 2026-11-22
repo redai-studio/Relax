@@ -1,0 +1,2 @@
+# Native GDN must expose its convolution and recurrent state interfaces.
+gdn_pre_gated_delta_rule_fusion: false

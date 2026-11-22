@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import atexit
 import os
 import signal
@@ -20,6 +21,7 @@ try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
+from relax.utils.agentic_obs.run_hooks import RunRecorder  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
@@ -35,6 +37,8 @@ _shutdown_done = False
 _training_completed = False
 _kernel_cache_heartbeat = None
 _fault_runtime = None
+_run_recorder: RunRecorder | None = None
+_unhandled_exit_code = 0
 _SHUTDOWN_TIMEOUT_SEC = 60
 _NORMAL_SHUTDOWN_TIMEOUT_SEC = 1800
 
@@ -66,8 +70,8 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     # Shutdown itself can block in a remote call. Always arm a watchdog so a
     # hang cannot keep the Ray Job alive forever; the normal path uses a much
     # larger budget so checkpoint/cache flushes still finish under load.
-    effective_exit_code = exit_code if exit_code is not None else 0
-    timeout_sec = _SHUTDOWN_TIMEOUT_SEC if exit_code else _NORMAL_SHUTDOWN_TIMEOUT_SEC
+    effective_exit_code = exit_code if exit_code is not None else _unhandled_exit_code
+    timeout_sec = _SHUTDOWN_TIMEOUT_SEC if effective_exit_code else _NORMAL_SHUTDOWN_TIMEOUT_SEC
     if _kernel_cache_heartbeat is not None:
         timeout_sec += int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600"))
     watchdog = threading.Timer(timeout_sec, os._exit, args=(effective_exit_code,))
@@ -75,6 +79,10 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     watchdog.start()
     try:
         sig_name = signal.Signals(sig).name if sig else "atexit"
+        if _run_recorder is not None:
+            if sig is not None:
+                _run_recorder.record_outcome("cancelled", reason=f"Received {sig_name}")
+            _run_recorder.flush()
         logger.info(f"Graceful shutdown triggered ({sig_name}) — cleaning up SGLang engines...")
 
         fault_runtime = globals().get("_fault_runtime")
@@ -138,13 +146,15 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
 
 
 def main(args):
-    global _ctrl, _fault_runtime, _kernel_cache_heartbeat, _training_completed
+    global _ctrl, _fault_runtime, _kernel_cache_heartbeat, _run_recorder, _training_completed, _unhandled_exit_code
 
     # Startup failures need the same cleanup as failures in the training loop.
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
     atexit.register(_graceful_shutdown)
 
+    _run_recorder = RunRecorder(args)
+    _run_recorder.start()
     try:
         if getattr(args, "fault_events_enabled", False):
             try:
@@ -197,13 +207,28 @@ def main(args):
         _ctrl = Controller.__new__(Controller)
         fault_options = {"fault_events": _fault_runtime} if _fault_runtime is not None else {}
         _ctrl.__init__(args, runtime_env, **fault_options)
+        _run_recorder.set_phase("training")
         _ctrl.training_loop()
         _training_completed = True
     except Exception as e:
+        _run_recorder.record_outcome("failed", error=e)
         logger.exception(f"Training startup or loop failed with error: {e}")
         _graceful_shutdown(exit_code=1)
+    except BaseException as error:
+        cancelled = isinstance(error, (KeyboardInterrupt, asyncio.CancelledError)) or (
+            isinstance(error, SystemExit) and error.code in (None, 0)
+        )
+        _run_recorder.record_outcome("cancelled" if cancelled else "failed", error=error)
+        if isinstance(error, SystemExit):
+            _unhandled_exit_code = error.code if isinstance(error.code, int) else (0 if error.code is None else 1)
+        else:
+            _unhandled_exit_code = 128 + signal.SIGINT if isinstance(error, KeyboardInterrupt) else 1
+        # Preserve the exception; atexit flushes under the shutdown watchdog,
+        # which must retain the original nonzero exit code if cleanup hangs.
+        raise
 
     logger.info("Main func successfully")
+    _run_recorder.record_outcome("completed")
     # Gracefully shut down SGLang engine processes before tearing down Ray Serve.
     _graceful_shutdown(exit_code=0)
 

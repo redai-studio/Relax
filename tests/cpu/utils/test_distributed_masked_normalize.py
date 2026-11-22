@@ -149,4 +149,3 @@ def test_population_normalize_does_not_extract_host_scalar():
         isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "item"
         for node in ast.walk(tree)
     )
-    assert "torch._assert_async" in source

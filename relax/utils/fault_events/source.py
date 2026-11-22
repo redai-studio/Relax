@@ -11,6 +11,7 @@ from .context import (
     parse_trace_contexts,
 )
 from .models import ROLES, FaultContext, new_id, service_role, valid_uint
+from .receipts import ReceiptInbox
 
 
 class FaultSource:
@@ -180,7 +181,12 @@ def fault_details(fault: object, source: FaultSource | None, role: str, observat
     return result
 
 
-def snapshot_details(observed: object, generation: int | None, observation_error: bool) -> dict:
+def snapshot_details(
+    observed: object,
+    generation: int | None,
+    observation_error: bool,
+    receipts: ReceiptInbox | None = None,
+) -> dict:
     """Normalize observation metadata before it joins authoritative health
     roles."""
     if type(observed) is not dict or type(observed.get("faults")) is not list or len(observed["faults"]) > 9:
@@ -193,4 +199,6 @@ def snapshot_details(observed: object, generation: int | None, observation_error
     contexts = _validated_trace_contexts(observed.get("trace_contexts"))
     if contexts:
         result["trace_contexts"] = contexts
+    if receipts is not None:
+        result["receipts"] = receipts.snapshot()
     return result

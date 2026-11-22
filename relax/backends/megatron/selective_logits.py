@@ -10,9 +10,9 @@ import torch
 def prepare_selective_logits(batch: dict, args: Namespace) -> None:
     """Attach per-microbatch indices before pinning/copying the CPU batch.
 
-    The caller restricts this to CP=1, THD text batches. Indices travel with
-    the batch/packed metadata, including asynchronous copy stream lifetime. No
-    CUDA nonzero, scalar reads, or cross-microbatch mutable state are used.
+    The caller restricts this to CP=1 THD batches. Indices travel with the
+    batch/packed metadata, including asynchronous copy stream lifetime. No CUDA
+    nonzero, scalar reads, or cross-microbatch mutable state are used.
     """
     masks = batch["loss_masks"]
     full_mask = batch["full_loss_masks"]

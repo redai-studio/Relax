@@ -29,6 +29,9 @@ def _args(**overrides):
         partial_rollout=False,
         fully_async=False,
         rollout_num_gpus=2,
+        sglang_speculative_algorithm=None,
+        custom_reward_post_process_path=None,
+        agentic_custom_advantage_path=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -53,7 +56,7 @@ from relax.utils.metrics.rollout_metrics import compute_metrics_from_samples
 from relax.utils.types import Sample
 
 args = SimpleNamespace(advantage_estimator='grpo', reward_key=None,
-                       log_reward_category=None, log_passrate=False, opd_teacher_key='source')
+                       log_reward_category=None, log_passrate=False, opd_teacher_key='source', sglang_speculative_algorithm=None)
 sample = Sample(response='ok', response_length=1, reward=1.0,
                 metadata={'source': 'fixture'}, teacher_log_probs=[-2.0], rollout_log_probs=[-1.0])
 assert compute_metrics_from_samples(args, [sample])['by_source/fixture/logp_gap'] == 1.0

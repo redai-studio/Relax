@@ -20,8 +20,8 @@ COPY docker/patch/sglang/v0.5.21.patch /tmp/tree-core.patch
 COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
 RUN cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
-    git apply --check --exclude=python/pyproject.toml /tmp/tree-core.patch && \
-    git apply --exclude=python/pyproject.toml /tmp/tree-core.patch && \
+    git apply --check --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/tree-core.patch && \
+    git apply --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/tree-core.patch && \
     python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core
 
 # Build the patched R3 + PD DP-aware router, as Dockerfile.cu13 does.
@@ -122,8 +122,8 @@ COPY docker/patch/sglang/v0.5.21.patch /tmp/sglang.patch
 COPY docker/patch/rocm/sglang-v0.5.21-rocm.patch /tmp/sglang-rocm.patch
 RUN cd /sgl-workspace/sglang && \
     test "$(git rev-parse HEAD)" = "e00930c5489053f26d86b179cee0d087f846acbb" && \
-    git apply --check --exclude=python/pyproject.toml /tmp/sglang.patch && \
-    git apply --exclude=python/pyproject.toml /tmp/sglang.patch && \
+    git apply --check --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/sglang.patch && \
+    git apply --exclude=python/pyproject.toml --exclude=python/sglang/kernels/aot/CMakeLists.txt /tmp/sglang.patch && \
     sha256sum /tmp/sglang.patch > /etc/relax-sglang-patch.sha256 && \
     git apply --check /tmp/sglang-rocm.patch && \
     git apply /tmp/sglang-rocm.patch && \
@@ -160,32 +160,15 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
     rsync -a /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
     rm -rf /root/Megatron-Bridge
 
-# Same Megatron patch sequence and checks as Dockerfile.cu13.
-COPY docker/patch/latest/megatron.patch \
-    docker/patch/megatron/sync-save-bounded-staging.patch \
-    docker/patch/megatron/kimi-packed-sequence-api.patch \
-    docker/patch/megatron/20261016-qwen38-models.patch \
-    docker/patch/megatron/20261020-qwen35-optimized.patch \
-    docker/patch/megatron/20261020-model-operators.patch \
-    docker/patch/megatron/mtp-cp-normalization.patch \
-    docker/patch/megatron/20261028-dp-reshardable-checkpoint.patch /root/Megatron-LM/
+# The common and cu13 sections retain the existing ROCm Kimi/checkpoint fixes.
+COPY docker/patch/latest/megatron.patch /root/Megatron-LM/
 RUN cd /root/Megatron-LM && \
+    for profile in common cu13; do \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply --check - && \
+        sed -n "/^# BEGIN $profile\$/,/^# END $profile\$/p" megatron.patch | git apply - || exit 1; \
+    done && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
-    patch --batch --forward --fuzz=0 -p1 < megatron.patch && \
-    patch --batch --forward --fuzz=0 -p1 < sync-save-bounded-staging.patch && \
-    patch --batch --forward --fuzz=0 -p1 < kimi-packed-sequence-api.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261016-qwen38-models.patch && \
-    sha256sum 20261016-qwen38-models.patch > /etc/relax-qwen38-model-patch.sha256 && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-qwen35-optimized.patch && \
-    patch --batch --forward --fuzz=0 -p1 < 20261020-model-operators.patch && \
-    patch --batch --forward --fuzz=0 -p1 < mtp-cp-normalization.patch && \
-    echo 'e8cbb2b2a895154622678516a6f67ef47e4b934dc7dc196115cd56a6cea235e6  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
-    patch --batch --forward --fuzz=0 -p1 < 20261028-dp-reshardable-checkpoint.patch && \
-    echo 'e88edbe5c69536a4dcfdd9bf6e24d79634d1058ccdd62660bab5ae0b48ae7f76  megatron/core/optimizer/distrib_optimizer.py' | sha256sum --check - && \
-    sha256sum 20261020-model-operators.patch > /etc/relax-model-operators-patch.sha256 && \
-    sha256sum 20261020-qwen35-optimized.patch > /etc/relax-qwen35-model-patch.sha256 && \
-    python -m compileall -q megatron && \
-    rm ./*.patch
+    python -m compileall -q megatron
 
 RUN wget -q https://github.com/apptainer/apptainer/releases/download/v1.4.1/apptainer_1.4.1_amd64.deb && \
     apt-get update && \

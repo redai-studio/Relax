@@ -8,6 +8,8 @@ import random
 import re
 import socket
 from collections.abc import Iterable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import httpx
@@ -19,6 +21,16 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 MAX_RETRIES = 6
+
+
+@dataclass
+class PostObservation:
+    """Per-call retry visibility; never changes request/retry behavior."""
+
+    token_count_complete: bool = True
+
+
+post_observation: ContextVar[PostObservation | None] = ContextVar("post_observation", default=None)
 
 
 def is_expected_sglang_499(error: httpx.HTTPStatusError) -> bool:
@@ -256,6 +268,9 @@ async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None, fai
             except json.JSONDecodeError:
                 output = content.decode() if isinstance(content, bytes) else content
         except Exception as e:
+            observation = post_observation.get()
+            if observation is not None:
+                observation.token_count_complete = False
             retry_count += 1
 
             if isinstance(e, httpx.HTTPStatusError):
@@ -377,6 +392,11 @@ def _init_ray_distributed_post(args):
 async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
+        observation = post_observation.get()
+        if observation is not None:
+            # Retries happen in another process; their generated prefixes are
+            # not returned by the existing distributed POST protocol.
+            observation.token_count_complete = False
         try:
             actor = _next_actor()
             if actor is not None:

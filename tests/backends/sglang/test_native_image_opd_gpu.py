@@ -155,6 +155,7 @@ async def test_native_image_opd_manager_completes_real_rollout_and_teacher_prefi
         opd_kl_coef=1.0,
         opd_loss_coef=0.0,
         opd_teacher_url=os.environ["OPD_GPU_ENDPOINT"].rstrip("/") + "/generate",
+        opd_teacher_routes_map=None,
         opd_teacher_timeout_s=300,
         opd_teacher_prompt_key="teacher_prompt" if override_teacher else None,
         opd_teacher_response_prefix_token_ids=[] if override_teacher else processor.tokenizer.encode("Answer:"),

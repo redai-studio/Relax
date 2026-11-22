@@ -14,6 +14,50 @@ import pytest
 import torch
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Precision-aware TE Adam requires CUDA")
+def test_checkpoint_initialization_preserves_fp32_masters_with_bf16_remainders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    te = pytest.importorskip("transformer_engine.pytorch.optimizers", exc_type=ImportError)
+    from relax.backends.megatron.compat import patch_te_optimizer_remainder_initialization
+
+    # Restore the process-wide compatibility patch when this test finishes.
+    monkeypatch.setattr(te.FusedAdam, "initialize_state", te.FusedAdam.initialize_state)
+    patch_te_optimizer_remainder_initialization()
+    parameters = [
+        torch.nn.Parameter(torch.linspace(-0.5, 0.5, 32, device="cuda", dtype=dtype))
+        for dtype in (torch.bfloat16, torch.float32)
+    ]
+    reference_parameters = [torch.nn.Parameter(p.detach().clone()) for p in parameters]
+    options = dict(
+        lr=0.003,
+        master_weights=True,
+        master_weight_dtype=torch.float32,
+        store_param_remainders=True,
+        use_decoupled_grad=True,
+    )
+    optimizer = te.FusedAdam(parameters, **options)
+    reference = te.FusedAdam(reference_parameters, **options)
+    for parameter in parameters:
+        # This is the global setting passed by MCore's checkpoint initializer.
+        optimizer.initialize_state(parameter, store_param_remainders=True)
+    saved = optimizer.state_dict()  # Previously asserted on the FP32 parameter.
+    assert saved["state"][0]["master_param"].dtype == torch.int16
+    assert saved["state"][1]["master_param"].dtype == torch.float32
+    torch.testing.assert_close(saved["state"][1]["master_param"], parameters[1], rtol=0, atol=0)
+    for parameter, expected in zip(parameters, reference_parameters, strict=True):
+        parameter.decoupled_grad = torch.ones_like(parameter, dtype=torch.float32)
+        expected.decoupled_grad = parameter.decoupled_grad.clone()
+    optimizer.step()
+    reference.step()  # TE's normal lazy initialization is the independent reference.
+    for parameter, expected in zip(parameters, reference_parameters, strict=True):
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+        for name in ("master_param", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                optimizer.state[parameter][name], reference.state[expected][name], rtol=0, atol=0
+            )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Optimizer DMA and TE Adam require CUDA")
 @pytest.mark.parametrize("chunk_size_bytes", [0, 1024 * 1024], ids=["full_window", "multiple_chunks"])
 def test_forward_offload_preserves_adam_updates_and_releases_master_memory(

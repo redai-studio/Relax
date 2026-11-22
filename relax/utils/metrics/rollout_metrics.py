@@ -128,7 +128,7 @@ def _compute_zero_std_metrics(args: Namespace, all_samples: list[Sample]) -> dic
 
 
 def _compute_spec_metrics(args: Namespace, all_samples: list[Sample]) -> dict[str, float]:
-    if getattr(args, "sglang_speculative_algorithm", None) is None:
+    if args.sglang_speculative_algorithm is None:
         return {}
     return compute_spec_decoding_metrics(all_samples)
 

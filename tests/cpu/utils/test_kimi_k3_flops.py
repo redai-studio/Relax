@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from relax.utils.training.flops_counter import FlopsCounter
-from relax.utils.training.kimi_k3_flops import _vision_flops
+from relax.utils.training.kimi_k3_flops import _dsa_forward_flops, _vision_flops
 
 
 def k3_config():
@@ -55,6 +55,15 @@ def k3_config():
             text_hidden_size=7168,
         ),
     )
+
+
+def k31_config():
+    config = k3_config()
+    config.model_type = "kimi_k31"
+    config.text_config.dsa_config = dict(
+        dsa_layers=[*range(4, 93, 4), 93], index_topk=2048, index_num_heads=32, index_head_dim=128
+    )
+    return config
 
 
 @pytest.fixture(autouse=True)
@@ -261,12 +270,13 @@ def test_k3_metric_pipeline_reports_per_gpu_rates_and_separate_forward_work(monk
         dict(only_train_params_name_list=["linear_fc2"]),
     ],
 )
-def test_k3_unsupported_trainability_omits_mfu_but_keeps_throughput(monkeypatch, options):
+@pytest.mark.parametrize("config_factory", [k3_config, k31_config])
+def test_k3_unsupported_trainability_omits_mfu_but_keeps_throughput(monkeypatch, options, config_factory):
     from unittest.mock import Mock
 
     warning = Mock()
     monkeypatch.setattr("relax.utils.training.flops_counter.logger.warning", warning)
-    counter = FlopsCounter(k3_config())
+    counter = FlopsCounter(config_factory())
     for _ in range(2):
         logs = _logged_metrics(monkeypatch, counter, **options)
         assert "perf/actor_train_tflops" not in logs
@@ -285,3 +295,83 @@ def test_legacy_models_keep_train_and_forward_metric_values(monkeypatch):
     logs = _logged_metrics(monkeypatch, counter, freeze_vision_model=True, lora_rank=8)
     assert logs["perf/actor_train_tflops"] == pytest.approx(train / 128 / 2)
     assert logs["perf/log_probs_tflops"] == pytest.approx(train / 3 / 128)
+
+
+def test_k31_reports_train_and_inference_mfu_with_frozen_indexer(monkeypatch):
+    config = k31_config()
+    opts = dict(freeze_vision_model=True, freeze_vision_projection=True)
+    logs = _logged_metrics(monkeypatch, FlopsCounter(config), **opts)
+    train = flops(config, [8192], image_grid_thw=[(3, 4, 6)], **opts)
+    forward = flops(config, [8192], image_grid_thw=[(3, 4, 6)], forward_only=True)
+    assert logs["perf/actor_train_tflops"] == pytest.approx(train / 1e12 / 128 / 2)
+    assert logs["perf/mfu/actor_train"] == pytest.approx(train / 1e12 / 128 / 2 / 2250)
+    assert logs["perf/mfu/actor_infer"] == pytest.approx(forward / 1e12 / 128 / 2250)
+    assert logs["perf/mfu/ref_infer"] == logs["perf/mfu/actor_infer"]
+    assert logs["perf/actor_train_tok_per_s"] == 4096
+
+
+@pytest.mark.parametrize("lengths", [[], [1], [9, 5], [2048], [2049], [8192]])
+def test_k31_full_config_counts_sparse_pairs_and_forward_only_indexer(lengths):
+    # Independent full-architecture constants from the concrete GEMM shapes.
+    # 24 indexers: 7,438,336 weights/layer; score QK + weighted head sum.
+    pairs = sum(sum(min(query + 1, 2048) for query in range(length)) for length in lengths)
+    causal = sum(sum(range(1, length + 1)) for length in lengths)
+    indexer = 357_040_128 * sum(lengths) + 198_144 * causal
+    text_forward = 209_019_699_200 * sum(lengths) + 1_474_560 * pairs
+    assert flops(k31_config(), lengths, forward_only=True) == pytest.approx(text_forward + indexer)
+    assert flops(k31_config(), lengths) == pytest.approx(3 * text_forward + indexer)
+    assert flops(k31_config(), lengths, freeze_language_model=True) == pytest.approx(text_forward + indexer)
+
+
+@pytest.mark.parametrize("topk", [2, 16])
+def test_k31_sparse_attention_and_indexer_match_cpu_matmul_counts(topk):
+    from torch.utils.flop_counter import FlopCounterMode
+
+    text = SimpleNamespace(
+        hidden_size=7,
+        q_lora_rank=3,
+        num_attention_heads=2,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        dsa_config=dict(index_topk=topk, index_num_heads=2, index_head_dim=4),
+    )
+    lengths = [3, 5]
+    # Real per-document causal sparse QK/AV; no cross-document or padded pairs.
+    with FlopCounterMode(display=False) as attention_counter:
+        for length in lengths:
+            q = torch.randn(length, 2, 6)
+            k = torch.randn(length, 2, 6)
+            v = torch.randn(length, 2, 3)
+            for row in range(length):
+                count = min(row + 1, topk)
+                scores = q[row].unsqueeze(1) @ k[:count].permute(1, 2, 0)
+                scores.softmax(-1) @ v[:count].transpose(0, 1)
+    with FlopCounterMode(display=False) as indexer_counter:
+        for length in lengths:
+            x, qr = torch.randn(length, 7), torch.randn(length, 3)
+            q = (qr @ torch.randn(3, 8)).reshape(length, 2, 4)
+            k = x @ torch.randn(7, 4)
+            weights = x @ torch.randn(7, 2)
+            for row in range(length):
+                scores = (q[row] @ k[: row + 1].T).relu()
+                weights[row].unsqueeze(0) @ scores
+    attention, indexer = _dsa_forward_flops(text, lengths)
+    assert attention == attention_counter.get_total_flops()
+    assert indexer == indexer_counter.get_total_flops()
+
+
+def test_k31_reduced_layers_count_only_present_dsa_layers():
+    config = k31_config()
+    config.text_config.num_hidden_layers = 4
+    before = flops(config, [2049])
+    config.text_config.dsa_config["dsa_layers"] = [4]
+    config.text_config.linear_attn_config["kda_layers"] = [1, 2, 3]
+    assert flops(config, [2049]) == before
+
+
+def test_k31_missing_dsa_config_does_not_report_dense_mfu():
+    config = k3_config()
+    config.model_type = "kimi_k31"
+    with pytest.raises(ValueError, match="dsa_config"):
+        flops(config)

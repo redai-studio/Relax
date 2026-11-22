@@ -62,6 +62,7 @@ def test_actor_cold_start_and_explicit_step_are_preserved():
     assert _resolve_start_rollout_id(0, 200, explicitly_set=True) == 0
     assert _resolve_start_rollout_id(100, 200, explicitly_set=True) == 100
     assert _resolve_start_rollout_id(None, 200, explicitly_set=False) == 200
+    assert _resolve_start_rollout_id(None, 1, explicitly_set=False) == 1
 
 
 @pytest.mark.parametrize(

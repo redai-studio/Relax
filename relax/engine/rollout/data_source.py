@@ -1,12 +1,18 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import abc
+import hashlib
 import os
+import tempfile
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
 
+from relax.engine.rollout.base_types import DatasetStateMismatchError
+from relax.utils.agentic_obs.config import agentic_obs_enabled
 from relax.utils.data.data import Dataset
+from relax.utils.data.data_utils import parse_generalized_path, resolve_path_plan
 from relax.utils.data.processing_utils import load_processor, load_tokenizer
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -16,6 +22,50 @@ from relax.utils.types import Sample
 
 
 logger = get_logger(__name__)
+
+
+def _dataset_resume_contract(args) -> dict:
+    """Hash the ordered manifest once at startup, not on checkpoint saves.
+
+    Reuse the reader's file and slice resolution. File contents, not sizes or
+    paths alone, identify data; media referenced by rows must remain immutable.
+    """
+    paths, outer_slice = resolve_path_plan(args.prompt_data)
+    files = []
+    for spec in paths:
+        path, row_slice = parse_generalized_path(spec)
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files.append((Path(path).suffix, digest.hexdigest(), row_slice))
+    fields = (
+        "rollout_seed",
+        "rollout_shuffle",
+        "n_samples_per_prompt",
+        "use_streaming_dataset",
+        "input_key",
+        "multimodal_keys",
+        "label_key",
+        "tool_key",
+        "metadata_key",
+        "system_prompt",
+        "apply_chat_template",
+        "apply_chat_template_kwargs",
+        "rollout_max_prompt_len",
+        "custom_prompt_path",
+        "hf_checkpoint",
+        "use_audio_in_video",
+        "opd_teacher_prompt_key",
+        "opd_teacher_image_key",
+    )
+    return {
+        "version": 1,
+        "files": files,
+        "slice": outer_slice,
+        "config": {key: getattr(args, key, None) for key in fields},
+        "multimodal": asdict(MultimodalConfig.from_args(args)),
+    }
 
 
 def _shallow_copy_sample(src: Sample) -> Sample:
@@ -103,6 +153,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             custom_prompt_func=custom_prompt_func,
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
+            record_source=agentic_obs_enabled(args),
         )
     else:
         logger.info("Using traditional Dataset (eager loading)")
@@ -125,6 +176,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             custom_prompt_func=custom_prompt_func,
             teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
             teacher_multimodal_keys=teacher_mm_keys,
+            record_source=agentic_obs_enabled(args),
         )
 
 
@@ -168,6 +220,7 @@ class RolloutDataSource(DataSource):
         # Check if using streaming dataset
         self._use_streaming = getattr(args, "use_streaming_dataset", False)
         self.dataset = None
+        self._dataset_resume_contract = None
 
         if args.rollout_global_dataset:
             if getattr(args, "hf_checkpoint", None):
@@ -192,6 +245,7 @@ class RolloutDataSource(DataSource):
 
             # Use factory function to create dataset
             self.dataset = _create_dataset(args, tokenizer, processor, multimodal_config)
+            self._dataset_resume_contract = _dataset_resume_contract(args)
 
             if self.args.rollout_shuffle:
                 self.dataset.shuffle(self.epoch_id)
@@ -252,6 +306,20 @@ class RolloutDataSource(DataSource):
             "metadata": self.metadata,
             "use_streaming": self._use_streaming,
         }
+        if getattr(self, "_dataset_resume_contract", None) is not None:
+            state_dict["dataset_contract"] = self._dataset_resume_contract
+        if (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art":
+            state_dict["rollout_id"] = rollout_id
+            from relax.backends.fsdp.checkpoint import COMMITTED_MARKER, iter_dir_name, load_art_dataset_state
+
+            committed = Path(self.args.save) / self.args.generation_task / iter_dir_name(rollout_id) / COMMITTED_MARKER
+            if committed.is_file():
+                original = load_art_dataset_state(self.args.save, rollout_id, self.args.n_samples_per_prompt)
+                if original != state_dict:
+                    raise DatasetStateMismatchError(
+                        "Refusing to replace the dataset cursor of a committed ART checkpoint."
+                    )
+                return
 
         # Add streaming dataset state if applicable
         if self._use_streaming and self.dataset is not None:
@@ -259,7 +327,17 @@ class RolloutDataSource(DataSource):
 
         path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+        # Publish only a complete snapshot, including when replacing an earlier
+        # save of the same rollout after recovery.
+        fd, temporary = tempfile.mkstemp(prefix=".dataset-", suffix=".tmp", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                torch.save(state_dict, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -272,7 +350,12 @@ class RolloutDataSource(DataSource):
             return
 
         path = os.path.join(self.args.load, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
-        if not os.path.exists(path):
+        is_art = (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
+        if is_art:
+            from relax.backends.fsdp.checkpoint import load_art_dataset_state
+
+            state_dict = load_art_dataset_state(self.args.load, rollout_id, self.args.n_samples_per_prompt)
+        elif not os.path.exists(path):
             # Backwards compat: older checkpoints wrote to rollout/ instead of dataset/.
             legacy_path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
             if os.path.exists(legacy_path):
@@ -283,7 +366,15 @@ class RolloutDataSource(DataSource):
                 return
 
         logger.info(f"load metadata from {path}")
-        state_dict = torch.load(path)
+        if not is_art:
+            state_dict = torch.load(path, map_location="cpu", weights_only=False)
+        recorded = state_dict.get("dataset_contract")
+        if recorded is None:
+            logger.warning("Legacy dataset cursor has no content/order fingerprint; dataset identity is unverified.")
+        elif recorded != getattr(self, "_dataset_resume_contract", None):
+            raise DatasetStateMismatchError(
+                "Dataset contents, parsing or sampling order differ from the saved cursor."
+            )
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)

@@ -240,9 +240,7 @@ def create_stream_dataloader(
     # Choose the appropriate fetch function based on fully_async mode
     # Use partial to bind the broadcast_pp parameter
     # broadcast_pp is the inverse of fully_async: True for colocate, False for fully async
-    fetch_batch_fn = partial(
-        get_data_from_transfer_queue, args=args, broadcast_pp=not getattr(args, "fully_async", False)
-    )
+    fetch_batch_fn = partial(get_data_from_transfer_queue, args=args, broadcast_pp=not args.fully_async)
     dataset = StreamingDataset(
         config=args.tq_config,
         batch_size=args.micro_batch_size * args.n_samples_per_prompt,
@@ -329,8 +327,7 @@ class MicroBatchListIterator:
         return out, meta
 
     def get_buffer(self) -> List[Tuple[Dict[str, Any], Any]]:
-        """Return the full mb list — used by actor for end-of-rollout
-        logging."""
+        """Return cached batches, including VPP alignment padding."""
         return self.mbs
 
     def step(self, partition_id: str) -> None:  # noqa: ARG002
@@ -578,10 +575,11 @@ def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
             return tensor.to(dtype=dtype).contiguous()
         return torch.empty(shape, dtype=dtype)
 
-    # --- Step 1: CP broadcast (CP=0 -> other CP ranks of TP=0/PP=0) ---
-    # Only the global source's CP group has real data on its rank-0; the rest
-    # broadcast a placeholder that the TP / PP stages below overwrite.
-    if not cp_trivial:
+    # --- Step 1: CP broadcast among TP=0 peers ---
+    # TP is constant within a CP group. Other TP ranks receive real data in
+    # step 2, so their CP placeholders are unnecessary. Keep every PP stage:
+    # with broadcast_pp=False, each stage has its own (TP=0, CP=0) source.
+    if not cp_trivial and mpu.get_tensor_model_parallel_rank() == 0:
         tensor = _bcast(tensor, is_src, mpu.get_context_parallel_group())
 
     # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
@@ -1087,7 +1085,13 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Keep scalar metadata as Python values across the TensorDict boundary,
             # including NestedTensor values reconstructed by TransferQueue.
-            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
+            if k == "agentic_group_ids":
+                from relax.utils.agentic_obs.records import decode_group_ids
+
+                new_rollout_data[k] = decode_group_ids(v)
+            elif (
+                "lengths" in k or "reward" in k or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
+            ):
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path
@@ -1176,6 +1180,14 @@ def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> Non
 
 
 def post_process_rollout_data(args, rollout_data):
+    from relax.engine.sft.runtime import is_embedding_sft_mode
+
+    if is_embedding_sft_mode(args):
+        from relax.utils.training.embedding import expand_embedding_pairs
+
+        expanded = expand_embedding_pairs(rollout_data)
+        rollout_data.clear()
+        rollout_data.update(expanded)
     _add_sft_token_lengths(args, rollout_data)
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
@@ -1250,6 +1262,7 @@ def post_process_rollout_data(args, rollout_data):
         *iter_opd_cp_float_fields(),
     ]
     response_field_dtypes = dict.fromkeys(response_float_fields, torch.float32)
+    response_field_dtypes["rollout_topk_support_complete"] = torch.bool
     for key, dtype in (("rollout_topk_token_ids", torch.long), ("rollout_topk_log_probs", torch.float32)):
         if key in rollout_data:
             rollout_data[key] = [
@@ -1441,7 +1454,6 @@ class StreamingTQIterator:
         # all-reduce stays in lockstep.  After real data is exhausted, the
         # iterator MAX-reduces its real mb count across DP and yields dummy
         # mbs (tagged __is_dummy__, zero gradient) up to that maximum.
-        self._last_batch: Optional[Tuple[Dict[str, Any], Any]] = None
         self._dummies_remaining: Optional[int] = None  # computed at end-of-stream
 
         # ── tail prefetch ────────────────────────────────────────────────
@@ -1537,7 +1549,7 @@ class StreamingTQIterator:
         """Build a dummy micro-batch from the last real one, tagged so the loss
         contributes zero gradient (keeps all DP ranks at the same micro-batch
         count)."""
-        if self._last_batch is None:
+        if not self._buffer:
             # A dp asked to emit a dummy before ever seeing a real batch = it got
             # ZERO samples this window. With the fair per-window quota
             # (mini_global_samples % dp_size == 0) every dp normally gets >= 1
@@ -1548,7 +1560,7 @@ class StreamingTQIterator:
                 f"dp={self.dp_rank} must emit a dummy micro-batch but received zero real samples "
                 "this window (no template to build a dummy from)."
             )
-        data, meta = self._last_batch
+        data, meta = self._buffer[-1]
         dummy = dict(data)
         dummy["__is_dummy__"] = True
         dummy["__loss_scale__"] = self.loss_scale
@@ -1597,7 +1609,7 @@ class StreamingTQIterator:
             reason,
         )
         pad = k_global - k_real
-        if pad > 0 and self._last_batch is None:
+        if pad > 0 and not self._buffer:
             self._shutdown_prefetch()
             raise RuntimeError(
                 f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
@@ -1624,18 +1636,6 @@ class StreamingTQIterator:
         data["__loss_scale__"] = self.loss_scale
         self._sample_count += n_samples
         self._buffer.append((data, meta))
-        # Snapshot for dummy padding.  ``get_batch`` mutates the batch
-        # dict IN PLACE (e.g. reassigns ``batch["tokens"]`` to the
-        # concatenated+padded packed tensor), and the schedule passes
-        # this very ``data`` object to ``get_batch``.  If we kept a
-        # reference to it, a later ``_make_dummy_batch`` would copy the
-        # ALREADY-PACKED ``tokens`` while ``loss_masks`` / ``total_lengths``
-        # stay per-sample lists → loss_mask/token shape mismatch in
-        # ``get_batch`` (tok length = sum of two samples).  Store a
-        # shallow dict copy (new top-level dict, same per-sample list
-        # values, which get_batch does not mutate) so the dummy always
-        # rebuilds from the pristine raw fields.
-        self._last_batch = (dict(data), meta)
         self._batch_index += 1
         self._mb_count += 1
 
@@ -1676,7 +1676,9 @@ class StreamingTQIterator:
         # Warm the controller cache for the next mb while the trainer
         # computes this one (tail prefetch; meta-only).
         self._warm_next_batch_index(self._batch_index)
-        return data, meta
+        # get_batch repacks tokens and replaces other top-level fields during training.
+        # A shallow copy keeps the original rows intact for metrics and dummy padding.
+        return dict(data), meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
         # Dummy-padding phase: real data exhausted, emit dummies up to k_global.

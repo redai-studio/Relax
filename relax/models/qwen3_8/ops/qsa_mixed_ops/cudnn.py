@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 from torch.autograd.function import once_differentiable
 
+from relax.models.qwen3_8.ops.qsa_mixed_ops.geometry import validate_geometry
 from relax.utils.env import Envs
 
 
@@ -191,13 +192,14 @@ def attention_for_selection(
 
     Document-local NV calls avoid a quadratic byte mask across unrelated packed
     documents. Routing, copies and metadata remain part of end-to-end timing.
-    The caller retains the existing TP2/CP1/frozen-indexer mixed contract.
+    The caller retains the existing CP1/frozen-indexer mixed contract.
     """
     if query.ndim != 4 or key.ndim != 4 or value.shape != key.shape:
         raise ValueError("Flash/cuDNN mixed attention requires batch-major BTHD Q/K/V")
     batch, total, heads, dim = query.shape
-    if heads != 12 or dim != 256 or key.shape != (batch, total, 1, 256):
-        raise NotImplementedError("PR1765 mixed integration requires TP2 local 12Q/1KV/D256")
+    validate_geometry("cudnn_pr1765", heads, key.shape[2], dim, key.shape[-1])
+    if key.shape[:2] != (batch, total):
+        raise NotImplementedError("PR1765 mixed integration requires matching Q/K batch and token dimensions")
     if query.dtype != torch.bfloat16 or key.dtype != query.dtype or value.dtype != query.dtype:
         raise NotImplementedError("PR1765 mixed integration requires BF16 Q/K/V")
     if selection.compress_ratio != 4 or selection.selected_ids is None:

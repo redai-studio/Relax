@@ -1,0 +1,3 @@
+# Native state interfaces; QSA Stage-2 auxiliary loss is not supported by prefix replay.
+gdn_pre_gated_delta_rule_fusion: false
+qsa_indexer_loss_coeff: 0.0

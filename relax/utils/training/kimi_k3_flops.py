@@ -1,20 +1,50 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Useful K3 model FLOPs, independent of TP/PP/CP/EP and kernel tiling.
+"""Useful K3/K3.1 model FLOPs, independent of TP/PP/CP/EP and kernel tiling.
 
 Count matmul multiply-adds as two operations, plus depthwise convolutions
 and the three KDA state contractions. Trainable text uses the conventional
 forward + 2 * forward backward estimate. Exclude recomputation, padding,
 communication, embedding lookups, AttnRes reductions, normalization and
 elementwise activations/gates. This is model MFU, not hardware FLOPs.
+
+DSA uses logical (unabsorbed) QK/AV dimensions, like the K3 MLA estimate.
+Its frozen indexer contributes forward work only, including head reduction;
+top-k comparisons are not FLOPs. Count valid causal pairs per document, not
+the packed buffer size. Replicated indexers and absorbed MLA kernel work are
+implementation costs, not additional useful model FLOPs.
 """
 
 from collections.abc import Sequence
 from typing import Any
 
 
-def _text_forward_flops(config: Any, lengths: Sequence[int]) -> tuple[float, float]:
-    """Return (parameterized linear/conv FLOPs, attention/state FLOPs)."""
+def _dsa_forward_flops(config: Any, lengths: Sequence[int]) -> tuple[float, float]:
+    """Return sparse attention and frozen indexer forward FLOPs per DSA
+    layer."""
+    dsa = config.dsa_config
+    topk = dsa["index_topk"]
+    if topk <= 0:
+        raise ValueError("K3.1 FLOPs estimation requires a positive index_topk.")
+    # sum_{query=1..length} min(query, topk), including the causal diagonal.
+    selected_pairs = sum(
+        min(length, topk) * (min(length, topk) + 1) // 2 + max(length - topk, 0) * topk for length in lengths
+    )
+    causal_pairs = sum(length * (length + 1) // 2 for length in lengths)
+    q_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+    attention = 2 * selected_pairs * config.num_attention_heads * (q_dim + config.v_head_dim)
+
+    heads, dim = dsa["index_num_heads"], dsa["index_head_dim"]
+    # qr -> index Q, hidden -> index K, hidden -> head weights. qr's
+    # projection is shared with MLA and already counted in text linears.
+    weights = config.q_lora_rank * heads * dim + config.hidden_size * (dim + heads)
+    indexer = 2 * sum(lengths) * weights + 2 * causal_pairs * heads * (dim + 1)
+    return attention, indexer
+
+
+def _text_forward_flops(config: Any, lengths: Sequence[int]) -> tuple[float, float, float]:
+    """Return (linear/conv FLOPs, attention/state FLOPs, frozen indexer
+    FLOPs)."""
     tokens = sum(lengths)
     hidden = config.hidden_size
     layers = config.num_hidden_layers
@@ -49,9 +79,16 @@ def _text_forward_flops(config: Any, lengths: Sequence[int]) -> tuple[float, flo
 
     # Causal MLA: QK^T and AV, each with half of the square attention matrix.
     attention = sum(length * length for length in lengths) * mla_heads * (q_dim + v_dim) * mla_layers
+    indexer = 0.0
+    if getattr(config, "dsa_config", None) is not None:
+        dsa_attention, dsa_indexer = _dsa_forward_flops(config, lengths)
+        dsa_layers = sum(1 <= layer <= layers for layer in set(config.dsa_config["dsa_layers"]))
+        attention -= sum(length * length for length in lengths) * mla_heads * (q_dim + v_dim) * dsa_layers
+        attention += dsa_layers * dsa_attention
+        indexer = dsa_layers * dsa_indexer
     # KDA: k^T S prediction, rank-one state update, q^T S readout (2*d*d each).
     attention += 6 * tokens * heads * dim * dim * kda_layers
-    return 2 * tokens * weights, attention
+    return 2 * tokens * weights, attention, indexer
 
 
 def _vision_flops(
@@ -109,7 +146,7 @@ def estimate_kimi_k3_flops(
     images_seqlens: Sequence[int] | None = None,
     **kwargs: Any,
 ) -> float:
-    """Estimate full-parameter K3 TFLOPS; frozen region flags are independent.
+    """Estimate full-parameter K3/K3.1 TFLOPS; frozen flags are independent.
 
     ``image_grid_thw`` is the original CPU metadata, before spatial/temporal
     merging. Legacy ``images_seqlens`` callers are treated as still images.
@@ -118,6 +155,8 @@ def estimate_kimi_k3_flops(
     """
     del tokens_sum, kwargs
     text = getattr(config, "text_config", config)
+    if getattr(config, "model_type", None) == "kimi_k31" and not getattr(text, "dsa_config", None):
+        raise ValueError("K3.1 FLOPs estimation requires text_config.dsa_config.")
     grids = image_grid_thw
     vision = getattr(config, "vision_config", None)
     if grids is None:
@@ -126,11 +165,11 @@ def estimate_kimi_k3_flops(
         merge_h = vision.merge_kernel_size[0] if vision is not None else 1
         grids = [(1, merge_h, length // merge_h) for length in (images_seqlens or [])]
 
-    linears, attention = _text_forward_flops(text, batch_seqlens)
+    linears, attention, indexer = _text_forward_flops(text, batch_seqlens)
     input_grad = bool(grids) and vision is not None and not (freeze_vision_model and freeze_vision_projection)
     backward = not forward_only and (not freeze_language_model or input_grad)
     linear_factor = 1 + int(backward) + int(not forward_only and not freeze_language_model)
-    flops = linear_factor * linears + (3 if backward else 1) * attention
+    flops = linear_factor * linears + (3 if backward else 1) * attention + indexer
     if vision is not None:
         flops += _vision_flops(
             vision,

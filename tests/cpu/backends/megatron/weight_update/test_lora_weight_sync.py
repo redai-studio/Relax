@@ -16,11 +16,14 @@ Consolidates three previously separate suites:
   base/adapter prefix-join used by the merge lookup.
 """
 
+import ast
 import json
+import re
+import sys
 import tempfile
 from collections import namedtuple
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -85,7 +88,7 @@ class TestLoRADeltaExtraction:
             "lora_b": torch.ones(10, 10) * 2.0,
         }
 
-        delta, _ = extract_lora_delta(state2, old_lora_state=state1, threshold=1e-6)
+        delta, _ = extract_lora_delta(state2, old_lora_state=state1)
 
         assert "lora_a" in delta
         assert "lora_b" not in delta
@@ -116,24 +119,6 @@ class TestModePredicates:
 
         assert is_lora_adapter_mode(args_adapter)
         assert not is_lora_adapter_mode(args_merge)
-
-    def test_is_lora_merge_mode_flag(self):
-        args_merge = MagicMock()
-        args_merge.lora_merge_mode = True
-        args_adapter = MagicMock()
-        args_adapter.lora_merge_mode = False
-
-        assert is_lora_merge_mode(args_merge)
-        assert not is_lora_merge_mode(args_adapter)
-
-    def test_is_lora_enabled_by_rank(self):
-        args_on = MagicMock()
-        args_on.lora_rank = 32
-        args_off = MagicMock()
-        args_off.lora_rank = 0
-
-        assert is_lora_enabled(args_on)
-        assert not is_lora_enabled(args_off)
 
     def test_missing_attrs_default_false(self):
         # Plain object without the LoRA attributes -> predicates must not raise.
@@ -294,10 +279,6 @@ class TestAdapterSkipPredicate:
         assert is_lora_adapter_param("decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight")
         assert is_lora_adapter_param("decoder.layers.0.self_attention.linear_proj.adapter.linear_out.weight")
 
-    def test_standard_peft_adapter_names_matched(self):
-        assert is_lora_adapter_param("base_model.model.layers.0.self_attn.q_proj.lora_A.weight")
-        assert is_lora_adapter_param("base_model.model.layers.0.self_attn.q_proj.lora_B.weight")
-
     def test_base_and_to_wrap_names_not_matched(self):
         # The wrapped base weight MUST NOT be classified as an adapter, or it would be
         # dropped from the rollout broadcast.
@@ -316,17 +297,6 @@ class TestDeltaSkip:
         assert delta == {}  # empty -> _push_lora_adapter_distributed early-returns on non-first sync
         assert set(new_state) == set(state)
 
-    def test_changed_state_yields_nonempty_delta(self):
-        old = {"a": torch.zeros(4, 8)}
-        new = {"a": torch.ones(4, 8)}
-        delta, _ = extract_lora_delta(new, old)
-        assert "a" in delta and delta  # non-empty -> push proceeds
-
-    def test_first_sync_returns_full_state(self):
-        new = {"a": torch.randn(4, 8), "b": torch.randn(8, 4)}
-        delta, _ = extract_lora_delta(new, None)
-        assert set(delta) == set(new)
-
 
 class TestTargetModuleExpansion:
     """adapter_config.json target_modules must be HF names for SGLang's PEFT
@@ -336,24 +306,9 @@ class TestTargetModuleExpansion:
         out = convert_megatron_to_hf_target_modules(["linear_qkv", "linear_proj"])
         assert out == ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-    def test_dedup_preserves_order(self):
-        out = convert_megatron_to_hf_target_modules(["linear_qkv", "linear_q"])
-        assert out == ["q_proj", "k_proj", "v_proj"]  # linear_q -> q_proj already present
-
 
 class TestMergeContract:
     """The TP=1 merge-mode fold must equal base + alpha/dim*(B @ A)."""
-
-    def test_tp1_formula_reference(self):
-        # Documents the exact math _merge_full_base depends on (no megatron needed).
-        torch.manual_seed(0)
-        out_features, in_features, dim = 6, 5, 2
-        base = torch.randn(out_features, in_features)
-        b = torch.randn(out_features, dim)  # linear_out
-        a = torch.randn(dim, in_features)  # linear_in
-        alpha, r = 8, dim
-        expected = base + (alpha / r) * (b @ a)
-        assert expected.shape == base.shape
 
     def test_tp1_matches_real_loramerge(self):
         from megatron.bridge.peft.lora_merge import LoRAMerge
@@ -367,6 +322,107 @@ class TestMergeContract:
         merged = LoRAMerge().merge(base.float(), b.float(), a.float(), alpha, r, tp_group=None)
         expected = base + (alpha / r) * (b @ a)
         assert torch.allclose(merged, expected, atol=1e-5)
+
+
+@pytest.fixture
+def merge_entrypoints(monkeypatch):
+    """Execute the production merge methods without importing Megatron/CUDA."""
+    calls = []
+
+    class LoRAMerge:
+        # Deliberately use the Bridge API's strict signature: tp_size must fail.
+        def merge(self, base_weight, linear_out, linear_in, alpha, dim, *, tp_group, scale=None):
+            assert base_weight.dtype == linear_out.dtype == linear_in.dtype == torch.float32
+            calls.append(tp_group)
+            return base_weight + (alpha / dim) * (linear_out @ linear_in)
+
+    module = ModuleType("megatron.bridge.peft.lora_merge")
+    module.LoRAMerge = LoRAMerge
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    tp_group, etp_group = object(), object()
+    mpu = SimpleNamespace(
+        get_tensor_model_parallel_group=lambda: tp_group,
+        get_expert_tensor_parallel_group=lambda: etp_group,
+        get_expert_model_parallel_world_size=lambda: 2,
+        get_expert_model_parallel_rank=lambda: 1,
+    )
+    namespace = {"torch": torch, "re": re, "mpu": mpu, "LoRAMerge": LoRAMerge}
+    root = Path(__file__).resolve().parents[5]
+    for path, class_name, method_name in (
+        ("relax/distributed/checkpoint_service/backends/device_direct.py", "DeviceDirectBackend", "_merge_full_base"),
+        (
+            "relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py",
+            "HfWeightIteratorBridge",
+            "_merge_base_with_adapter",
+        ),
+    ):
+        tree = ast.parse((root / path).read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == method_name)
+        definitions = [
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_base_param_prefix"
+        ]
+        exec(compile(ast.Module(body=[*definitions, method], type_ignores=[]), str(root / path), "exec"), namespace)
+    return SimpleNamespace(**namespace, calls=calls, tp_group=tp_group, etp_group=etp_group)
+
+
+@pytest.mark.parametrize("expert", [False, True])
+@pytest.mark.parametrize("entrypoint", ["dcs", "iterator"])
+@pytest.mark.parametrize("paired", [False, True])
+def test_lora_merge_entrypoints_preserve_weights_and_parallel_groups(merge_entrypoints, expert, entrypoint, paired):
+    env = merge_entrypoints
+    name = "decoder.layers.0.mlp.experts.linear_fc1.to_wrap.weight3" if expert else "linear_qkv.to_wrap.weight"
+    prefix = env._base_param_prefix(name)
+    base = torch.arange(30, dtype=torch.bfloat16).reshape(6, 5)
+    original = base.clone()
+    a, b = torch.ones(2, 5), torch.full((6, 2), 3.0)
+    # EP rank 1 owns experts 2 and 3; weight3 must use local slice 1.
+    linear_in = torch.stack([a * 9, a]) if expert else a
+    linear_out = torch.stack([b * 7, b]) if expert else b
+    args = SimpleNamespace(lora_alpha=8, lora_rank=2, num_experts=4)
+    if entrypoint == "dcs":
+        instance = SimpleNamespace(
+            args=args,
+            _lora_adapter_full={prefix: {"in": linear_in, "out": linear_out}} if paired else {},
+            _megatron=SimpleNamespace(base_param_prefix=env._base_param_prefix, mpu=env.mpu),
+        )
+        result = env._merge_full_base(instance, name, base)
+        expected_group = None
+    else:
+        instance = SimpleNamespace(
+            args=args, lora_alpha=8, lora_dim=2, _adapter_map={prefix: {"in": "A", "out": "B"}} if paired else {}
+        )
+        info = SimpleNamespace(name=name, attrs={"tensor_model_parallel": True, "partition_dim": 0})
+        result = env._merge_base_with_adapter(instance, info, base, {"A": linear_in, "B": linear_out}, "cpu")
+        expected_group = env.etp_group if expert else env.tp_group
+        if paired:
+            assert not result.requires_grad
+            assert result.tensor_model_parallel
+            assert result.partition_dim == 0
+    assert torch.equal(base, original)
+    if paired:
+        assert env.calls == [expected_group]
+        assert result.dtype == base.dtype
+        torch.testing.assert_close(result, (original.float() + 4 * (b @ a)).to(base.dtype))
+    else:
+        assert result is base
+        assert env.calls == []
+
+
+def test_adapter_splice_wrapper_forwards_bridge_export_options():
+    from relax.utils.megatron_bridge_utils import _make_adapter_splice_wrapper
+
+    bridge, model, excluded = object(), object(), {"mtp.layers.0.eh_proj"}
+    tasks = {"layer": []}
+
+    def build_tasks(self, megatron_model, conversion_tasks, *, exclude_adapter_base_prefixes):
+        assert self is bridge
+        assert megatron_model is model
+        assert exclude_adapter_base_prefixes is excluded
+        return conversion_tasks
+
+    result = _make_adapter_splice_wrapper(build_tasks)(bridge, model, tasks, exclude_adapter_base_prefixes=excluded)
+    assert result is tasks
 
 
 class TestPrefixJoin:

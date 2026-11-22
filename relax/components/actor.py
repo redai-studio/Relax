@@ -22,6 +22,7 @@ from relax.engine.sft.runtime import (
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.training.intervals import should_save_checkpoint
 
 
 app = FastAPI()
@@ -114,15 +115,7 @@ class Actor(Base):
         self.rollout_manager = rollout_manager
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
-        # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
-        # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
-        # Offline training skips the init-time weight sync. SFT syncs weights to SGLang
-        # right before periodic predict (gated in `train_actor`); between
-        # predicts SGLang stays fully offloaded. Sync-at-init would leave
-        # SGLang with `weights` resumed but no follow-up offload, causing
-        # the first predict-step `onload_weights` to crash on a non-idempotent
-        # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
-        # fires on the first real `update_weights` instead.
+        # The backend owns sync and offload lifecycles. SFT syncs before predict.
         if (not self.config.fully_async or self.config.hybrid) and not is_offline_mode(self.config):
             self.actor_model.update_weights()
 
@@ -153,8 +146,20 @@ class Actor(Base):
         set_managed_opd_teacher_on_train_group(self.actor_model, teacher_manager)
         self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
-    def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
-        self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+    def update_weights_fully_async(
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        recovery_token: dict | None = None,
+    ) -> None:
+        from relax.utils.fault_events.receipts import emit_receipt
+
+        try:
+            self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        except Exception:
+            emit_receipt(self, recovery_token, "actor_send", "failed")
+            raise
+        emit_receipt(self, recovery_token, "actor_send", "succeeded")
 
     async def run(self) -> None:
         await self._loop_runner.run(self._background_run, before_start=self._reset_consumption)
@@ -309,14 +314,8 @@ class Actor(Base):
 
     def _maybe_save_model(self) -> None:
         """Save model checkpoint if save interval is reached."""
-        if self.config.save is None or self.config.save_interval is None:
-            return
-
-        is_save_step = (self.step + 1) % self.config.save_interval == 0
-        is_final_step = (self.step + 1) == self.config.num_rollout
-
-        if self.config.rotate_ckpt or is_save_step or is_final_step:
-            self.actor_model.save_model(self.step, force_sync=is_final_step)
+        if should_save_checkpoint(self.config, self.step + 1):
+            self.actor_model.save_model(self.step, force_sync=self.step + 1 == self.config.num_rollout)
 
     def train(self, step: int, clear_data: bool = True) -> Dict[str, Any]:
         """Execute a single training step (for external control).

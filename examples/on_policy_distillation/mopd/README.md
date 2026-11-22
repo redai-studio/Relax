@@ -25,7 +25,9 @@ actor 卡池（一整块 placement group，大小 = ACTOR_GPUS）
 - **训练阶段**：actor 用满整块卡池训练 student。
 - **rollout 阶段**：student rollout 占前段 bundle，teacher 占后段 bundle，两边都从 offload 状态 onload 回显存。
 - **硬约束（框架强制校验）**：`ROLLOUT_GPUS + TEACHER_GPUS == ACTOR_GPUS`，不满足会在启动时直接抛 `ValueError`。
-- `--colocate --offload` 必须同时开启；`--rollout-num-gpus` 必须等于 `ROLLOUT_GPUS`。
+- 训练时使用 `--colocate --offload`，`--rollout-num-gpus` 对应 `ROLLOUT_GPUS`。
+
+只验证采样和打分时，在同一份 MOPD 配置中加上 `--debug-rollout-only`，并把示例中的 `--sglang-load-format dummy` 改为 `auto`。Student 从 `--hf-checkpoint` 加载权重，按原 GPU 分区生成样本并交给对应的 Teacher 打分。此模式跳过 Actor 训练，Student 和 Teacher 在批次之间保持驻留。
 
 ## 提供的脚本
 
@@ -117,7 +119,13 @@ MODEL_DIR=/root/models DATA_DIR=/root/data bash run-mopd-qwen35-35ba3b-16xgpu-co
 }
 ```
 
-rollout 阶段按每条样本的 `data_source` 找到对应教师，请求 token 级 log-probability；某个教师请求失败或超时会逐样本回退到 rollout log-probs，仅当一整步内所有非空样本都失败才报错中断。
+Student 生成前，Relax 从配置的路由字段（默认 `data_source`）确定 `Sample.metadata["teacher_id"]`。
+回答生成后，评分直接使用这个 Teacher 身份选择副本，结果写回对应回答。
+
+普通 rollout 和 Agentic rollout 每轮按 Teacher 记录两项指标。Agentic 在放行 Session 生成前登记，同一个 Session 导出多条样本只计一条回答。
+
+- `mopd/by_teacher/<teacher_id>/responses` 统计本轮登记的 Student 回答，也包括上轮仍待提交的回答。同一回答在本轮重试只算一次。
+- `mopd/by_teacher/<teacher_id>/awaiting_submission` 统计其中尚待提交评分的回答。回答进入 `_teacher_prefill()`、逐条生成被取消或整组跳过评分时移出，重试时重新计入。
 
 > `--resource` 里 `teacher` 的 GPU 数是教师总预算，先在教师间平均分配（要求整除），每个教师再按 `--teacher-num-gpus-per-engine` 拆成若干副本（副本 TP=该值），rollout 时先路由到教师再在其副本间 round-robin。
 

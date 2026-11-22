@@ -8,11 +8,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import Any
 
 import torch
 from torch import Tensor
+
+from relax.models.qwen3_8.ops.qsa_mixed_ops.geometry import validate_geometry
 
 
 def attention_for_selection(
@@ -20,23 +23,24 @@ def attention_for_selection(
 ) -> Tensor:
     """Preserve native selected blocks, expanding the causal tail exactly
     once."""
+    from relax.utils.env import Envs
+
     batch, length, heads, width = query.shape
-    if width != 256 or heads != 12 or key.shape[2:] != (1, 256):
-        raise NotImplementedError("Mixed QSA requires TP2 local geometry 12Q/1KV/D256")
+    long_backend = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND
+    validate_geometry(long_backend, heads, key.shape[2], width, key.shape[-1])
     if selection.compress_ratio != 4 or selection.selected_ids is None:
         raise ValueError("Mixed QSA requires native selected four-token block IDs")
     bounds = getattr(selection, "_relax_qsa_mixed_bounds", None) if is_thd else (0, length)
     if bounds is None or bounds[0] != 0 or bounds[-1] != length:
         raise ValueError("Mixed packed QSA requires producer CPU document boundaries")
-    from relax.utils.env import Envs
+    if long_backend == "cute":
+        from relax.models.qwen3_8.ops.qsa_cute.adapter import attention_for_selection as cute_mixed
 
-    long_backend = Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND
+        return cute_mixed(query, key, value, selection, scale, bounds)
     if long_backend == "cudnn_pr1765":
         from relax.models.qwen3_8.ops.qsa_mixed_ops.cudnn import attention_for_selection as cudnn_mixed
 
         return cudnn_mixed(query, key, value, selection, scale, bounds)
-    if long_backend != "grouped":
-        raise ValueError(f"Unknown mixed QSA long backend: {long_backend}")
     from relax.models.qwen3_8.ops.qsa_mixed_ops.mixed import attention
     from relax.models.qwen3_8.ops.qsa_mixed_ops.routes import token_routes
 
@@ -64,11 +68,36 @@ def forward(
 
     if Envs.RELAX_QWEN38_QSA_FUSED_ATTENTION:
         raise ValueError("Mixed QSA must not be combined with fused attention")
-    if self.config.context_parallel_size != 1 or self.config.qsa_indexer_loss_coeff != 0:
+    if self.config.context_parallel_size != 1:
+        if not Envs.RELAX_QWEN38_QSA_CP or Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND != "cute":
+            raise NotImplementedError("Mixed QSA CP requires the opt-in CuTe CP path")
+        return selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
+    if self.config.qsa_indexer_loss_coeff != 0:
         raise NotImplementedError("Mixed QSA supports CP1 frozen Stage-1 indexers")
     if any(parameter.requires_grad for parameter in self.parameters()):
         raise NotImplementedError("Mixed QSA requires a frozen indexer")
-    selection = selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
+    if os.environ.get("RELAX_QWEN38_QSA_MIXED_PRESERVE_BITS_SELECTOR", "0") == "1":
+        from relax.models.qwen3_8.ops.qsa_mixed_ops.bits_to_ids import bits_to_ids
+        from relax.models.qwen3_8.qsa_cp import _cached
+
+        if not Envs.RELAX_QWEN38_QSA_FUSED_SELECTOR:
+            raise ValueError("Preserved-bit mixed QSA requires the original fused bits selector")
+        selection = selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, "bits")
+        # Consume the selector replay entry before recording conversion; nested
+        # tape builds would reverse the order consumed during recomputation.
+        ids = _cached(
+            "mixed_ids_from_bits",
+            self,
+            lambda: bits_to_ids(
+                selection.selected_bits.view(selection.positions.numel(), selection.bits_per_row),
+                selection.positions,
+                self.block_topk,
+                selection.compress_ratio,
+            ),
+        )
+        selection = replace(selection, selected_ids=ids)
+    else:
+        selection = selector_forward(self, hidden_states, rotary_pos_emb, packed_seq_params, output_format)
     # Keep all-short batches on the source's Flash varlen path as well.
     # Native all_selected would otherwise bypass this backend through TE.
     selection = replace(selection, all_selected=False)

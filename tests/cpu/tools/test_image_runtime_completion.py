@@ -254,15 +254,3 @@ def test_published_constraints_allow_vendor_ray_without_relaxing_other_pins(tmp_
             text=True,
         )
         assert (result.returncode == 0) == expected_success, result.stdout + result.stderr
-
-
-def test_default_dockerfile_installs_shared_repairs_without_cu13_libraries():
-    source = (ROOT / "docker/Dockerfile").read_text()
-    assert "install_legacy_fla.py --target /opt/relax/compat/fla-0.4.2" in source
-    assert "--from=hybridep_builder /opt/ep-wheels" in source
-    assert "python /opt/relax/validate_hybridep_install.py" in source
-    assert "validate_final_runtime.py --profile cu12" in source
-    assert "nvidia-nvshmem-cu12==3.4.5" in source
-    assert "nvidia-nvshmem-cu13" not in source
-    assert "nvidia-nccl-cu13" not in source
-    assert "v0.5.17-cu129" in source

@@ -9,6 +9,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.utils.agentic_obs.config import train_generation_args
 from relax.utils.env import Envs
 from relax.utils.utils import get_ray_accelerator_kwargs
 
@@ -137,8 +138,9 @@ class RayTrainGroup:
         """Allocate GPU resourced and initialize model, optimzier, local ckpt,
         etc."""
         self.args = args
+        init_args = train_generation_args(args)
         return [
-            actor.init.remote(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+            actor.init.remote(init_args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
             for actor in self._actor_handlers
         ]
 

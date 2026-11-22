@@ -15,7 +15,7 @@ def initialize():
     assert _KEEPALIVE is None
     assert base._ub_communicators is None and not base.is_ub_initialized()
     assert tex.device_supports_multicast() and not tex.ubuf_built_with_mpi()
-    assert dist.get_world_size(dist.group.WORLD) in (8, 64)
+    assert dist.get_world_size(dist.group.WORLD) >= 8 and dist.get_world_size(dist.group.WORLD) % 8 == 0
     world = dist.new_group(backend="gloo")
     size = dist.get_world_size(world)
     domain, _ = dist.new_subgroups_by_enumeration([list(range(i, i + 4)) for i in range(0, size, 4)], backend="gloo")

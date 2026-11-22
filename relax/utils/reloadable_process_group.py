@@ -95,6 +95,9 @@ def monkey_patch_torch_dist(args=None):
     dist.all_reduce = get_new_comm_function(dist.all_reduce)
     dist.all_gather = get_new_comm_function(dist.all_gather)
     dist.all_gather_into_tensor = get_new_comm_function(dist.all_gather_into_tensor)
+    for name in ("all_gather_single", "reduce_scatter_single"):
+        if hasattr(dist, name):
+            setattr(dist, name, get_new_comm_function(getattr(dist, name)))
     dist.all_gather_object = get_new_comm_function(dist.all_gather_object)
     dist.all_to_all = get_new_comm_function(dist.all_to_all)
     dist.all_to_all_single = get_new_comm_function(dist.all_to_all_single)

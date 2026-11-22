@@ -7,21 +7,13 @@ import os
 import threading
 from types import SimpleNamespace
 from typing import Any, Awaitable, Iterator, TypeVar
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 
 try:
     import ray
-
-    if not ray.is_initialized():
-        try:
-            ray.init(num_cpus=8, ignore_reinit_error=True)
-        except ValueError as exc:
-            if "When connecting to an existing cluster" in str(exc):
-                ray.init(ignore_reinit_error=True)
-            else:
-                raise
 
     from relax.engine import rewards as rewards_module
     from relax.engine.rewards import RewardExecutionError, RewardExecutor, async_rm, batched_async_rm
@@ -118,7 +110,7 @@ async def _ready_workers(args: SimpleNamespace) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_executor() -> Iterator[None]:
+def _reset_executor(reward_ray_cluster: None) -> Iterator[None]:
     _kill_workers(RewardExecutor._instance)
     RewardExecutor._instance = None
     yield
@@ -140,6 +132,73 @@ def loaded_reward_paths(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 class TestCustomRewardDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("batched", [False, True])
+    async def test_inline_custom_keeps_nested_rewards_inline(self, monkeypatch, batched):
+        from relax.engine.rewards.async_eval import collect_eval_rewards, eval_reward_deferral_enabled
+
+        async def nested_reward(args, sample_or_group, **kwargs):
+            if isinstance(sample_or_group, list):
+                scores = await batched_async_rm(args, sample_or_group, ignore_custom=True, **kwargs)
+                return [{"score": score["score"] - 0.25} for score in scores]
+            score = await async_rm(args, sample_or_group, ignore_custom=True, **kwargs)
+            return {"score": score["score"] - 0.25}
+
+        monkeypatch.setattr(rewards_module, "_test_nested_reward", nested_reward, raising=False)
+        response = MagicMock()
+        response.json = AsyncMock(return_value={"score": 1.0})
+        session = MagicMock()
+        session.post.return_value.__aenter__.return_value = response
+        monkeypatch.setattr(rewards_module, "_get_shared_session", lambda: session)
+        args = _make_args(custom_rm_path="relax.engine.rewards._test_nested_reward", rm_type="remote_rm")
+        samples = [_make_sample(index=index) for index in range(2)]
+        payload = samples if batched else samples[0]
+        call = batched_async_rm if batched else async_rm
+
+        with collect_eval_rewards(args) as pending:
+            result = await _wait(call(args, payload, evaluation=True))
+            assert result == ([{"score": 0.75}] * 2 if batched else {"score": 0.75})
+            assert session.post.call_count == (2 if batched else 1)
+            assert pending.calls == []
+
+            # Restore the surrounding collector for other eligible calls.
+            assert await async_rm(args, samples[0], ignore_custom=True, evaluation=True) is None
+            assert len(pending.calls) == 1
+            nested_reward.supports_async_eval = True
+            assert await call(args, payload, evaluation=True) == ([None] * 2 if batched else None)
+            assert len(pending.calls) == 2
+            assert session.post.call_count == (2 if batched else 1)
+
+        assert not eval_reward_deferral_enabled()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reward_kind", ["sync", "async"])
+    async def test_custom_reward_receives_evaluation_when_supported(self, reward_kind: str):
+        args = _make_args(reward_num_workers=1)
+        samples = [_make_sample(index=index) for index in range(3)]
+        if reward_kind == "sync":
+            await _ready_workers(args)
+
+        for reward_suffix, supports_evaluation in (
+            ("evaluation_reward", True),
+            ("evaluation_kwargs_reward", True),
+            ("legacy_reward", False),
+        ):
+            reward_name = f"{reward_kind}_{reward_suffix}"
+            args.custom_rm_path = f"{CUSTOM_REWARD_MODULE}.{reward_name}"
+            for batched in (False, True):
+                for evaluation in (False, True):
+                    if batched:
+                        results = await _wait(batched_async_rm(args, samples, evaluation=evaluation))
+                        expected_samples = samples
+                    else:
+                        results = [await _wait(async_rm(args, samples[0], evaluation=evaluation))]
+                        expected_samples = samples[:1]
+                    assert results == [
+                        {"index": sample.index, "evaluation": evaluation if supports_evaluation else None}
+                        for sample in expected_samples
+                    ], (reward_name, batched, evaluation)
+
     @pytest.mark.asyncio
     async def test_sync_reward_runs_in_worker_without_blocking_event_loop(self, monkeypatch):
         event_loop_thread = threading.get_ident()
@@ -264,6 +323,87 @@ class TestRewardExecutorConfiguration:
 
 
 class TestCustomRewardLoading:
+    @pytest.mark.asyncio
+    async def test_independent_executor_keeps_batch_refresh_and_cleanup_local(self, monkeypatch):
+        from tests.engine.rewards import custom_reward_fixtures
+
+        args = _make_args(custom_rm_path=ASYNC_BATCH_PID_REWARD)
+        samples = [_make_sample(index=index) for index in range(2)]
+        default = RewardExecutor.get_or_create()
+        independent = RewardExecutor(worker_name_prefix="independent_test")
+        original = await batched_async_rm(args, samples, evaluation=True)
+        assert await independent.execute_batch(args, samples, evaluation=True) == original
+        assert all(reward["batch_size"] == 2 for reward in original)
+
+        monkeypatch.setattr(
+            custom_reward_fixtures, "async_batch_pid_reward", custom_reward_fixtures.async_evaluation_kwargs_reward
+        )
+        independent.refresh_custom_reward(ASYNC_BATCH_PID_REWARD)
+        refreshed = [{"index": index, "evaluation": True} for index in range(2)]
+        assert await independent.execute_batch(args, samples, evaluation=True) == refreshed
+        assert await batched_async_rm(args, samples, evaluation=True) == original
+        RewardExecutor.reload_custom_reward(ASYNC_BATCH_PID_REWARD)
+        assert await batched_async_rm(args, samples, evaluation=True) == refreshed
+
+        default_worker, independent_worker = MagicMock(), MagicMock()
+        default._workers, independent._workers = [default_worker], [independent_worker]
+        kill_worker = MagicMock()
+        session = MagicMock()
+        monkeypatch.setattr(ray, "kill", kill_worker)
+        monkeypatch.setattr(rewards_module, "_shared_session", session)
+        independent.close_workers()
+        independent.close_workers()
+        kill_worker.assert_called_once_with(independent_worker)
+        assert default._workers == [default_worker]
+        session.close.assert_not_called()
+        default.close_workers()
+
+    @pytest.mark.asyncio
+    async def test_explicit_reload_refreshes_background_eval_executor_and_workers(self):
+        from relax.distributed.ray.rollout import RolloutManager
+        from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker
+
+        args = _make_args(reward_num_workers=1, eval_reward_key=None)
+        judge = EvalJudgeWorker.remote(args)
+        owner = object.__new__(RolloutManager.__ray_metadata__.modified_class)
+        owner.args, owner._eval_judge = args, judge
+
+        async def evaluate():
+            sample = _make_sample(index=0)
+            result = SimpleNamespace(data={"eval": {"samples": [sample]}})
+            result = await _wait(
+                judge.score.remote(args, (result, [DeferredReward(sample, {"evaluation": True})])),
+                timeout=RAY_WORKER_STARTUP_TIMEOUT,
+            )
+            return result.data["eval"]["samples"][0].reward
+
+        try:
+            await _wait(judge.__ray_ready__.remote(), timeout=RAY_WORKER_STARTUP_TIMEOUT)
+            # Reuse one owner and one eval worker across both signatures;
+            # the existing reload tests already cover the ordinary pool.
+            for path in (SYNC_RELOAD_COUNT_REWARD, ASYNC_RELOAD_COUNT_REWARD):
+                args.custom_rm_path = path
+                before_eval = await evaluate()
+                reloaded = await _wait(asyncio.to_thread(owner.reload_module, "custom_rm"))
+                after_eval = await evaluate()
+
+                assert reloaded["success"] is True
+                assert before_eval["pid"] != os.getpid()
+                assert after_eval["pid"] == before_eval["pid"]
+                assert after_eval["reload_count"] == before_eval["reload_count"] + 1, path
+
+            failed_judge = MagicMock()
+            failed_judge.reload_custom_reward.remote.side_effect = RuntimeError("background reload failed")
+            owner._eval_judge = failed_judge
+            reloaded = await _wait(asyncio.to_thread(owner.reload_module, "custom_rm"))
+            assert reloaded["success"] is False
+            assert "background reload failed" in reloaded["error"]
+        finally:
+            try:
+                await _wait(judge.close.remote())
+            finally:
+                ray.kill(judge)
+
     @pytest.mark.asyncio
     async def test_sync_custom_reward_is_loaded_once_per_process(self, loaded_reward_paths):
         args = _make_args(
