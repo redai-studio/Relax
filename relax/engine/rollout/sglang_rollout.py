@@ -385,7 +385,9 @@ async def _post_generation(
                     aborted.cancel()
                     if not generation.done():
                         generation.cancel()
-                    await asyncio.gather(generation, aborted, return_exceptions=True)
+                    outcome, _ = await asyncio.gather(generation, aborted, return_exceptions=True)
+                    if isinstance(outcome, http_utils.DistributedPostUnconfirmed):
+                        raise outcome
             return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):

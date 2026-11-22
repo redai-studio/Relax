@@ -363,6 +363,79 @@ async def test_shutdown_cancellation_failure_still_disposes_pool():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_disconnected_poster_requires_stop_receipt_before_returning_permit(monkeypatch, cancelled, confirmed):
+    import httpx
+
+    from relax.engine.inference.executor import InferenceRequestExecutor
+    from relax.utils import http_utils
+
+    owner = manager()
+    remote = SimpleNamespace(
+        **{
+            name: SimpleNamespace(remote=getattr(owner, name))
+            for name in ("snapshot", "admit_request", "complete_request", "fail_request_transport")
+        }
+    )
+    started, disconnected, stopping, stopped = (asyncio.Event() for _ in range(4))
+    paths = []
+
+    async def do_request(*args):
+        started.set()
+        await disconnected.wait()
+        raise ray.exceptions.ActorUnavailableError("connection lost", None)
+
+    async def stop_requests():
+        stopping.set()
+        await stopped.wait()
+        if not confirmed:
+            raise ray.exceptions.ActorDiedError()
+
+    def upstream(request):
+        paths.append(request.url.path)
+        if request.url.path == "/workers":
+            return httpx.Response(200, json={"workers": [{"url": "http://engine"}]})
+        return httpx.Response(200)
+
+    poster = SimpleNamespace(
+        do_request=SimpleNamespace(remote=do_request), stop_requests=SimpleNamespace(remote=stop_requests)
+    )
+    monkeypatch.setattr(http_utils, "_post_actors", [poster])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        executor = InferenceRequestExecutor(
+            Role.ROLLOUT, remote, client, send_request=http_utils.send_distributed_request
+        )
+        generation = asyncio.create_task(executor.generate_json({"text": "generate"}))
+        await asyncio.wait_for(started.wait(), 1)
+        if cancelled:
+            generation.cancel()
+        disconnected.set()
+        try:
+            await asyncio.wait_for(stopping.wait(), 1)
+            assert owner.ledger.permits and not paths
+            assert not http_utils._post_actors
+        finally:
+            stopped.set()
+        expected = (
+            (asyncio.CancelledError if cancelled else ray.exceptions.ActorUnavailableError)
+            if confirmed
+            else http_utils.DistributedPostUnconfirmed
+        )
+        with pytest.raises(expected):
+            await asyncio.wait_for(generation, 2)
+
+    if confirmed:
+        assert not owner.ledger.permits
+        assert paths == ["/workers", "/abort_request"]
+    else:
+        assert owner.ledger.permits and not paths
+        assert not (await owner.snapshot()).models[0].admission
+        with pytest.raises(RuntimeError, match="cannot confirm distributed POST"):
+            await owner.wait_ready("rollout")
+
+
+@pytest.mark.asyncio
 async def test_internal_generation_waits_for_weight_update_then_resumes():
     import httpx
 

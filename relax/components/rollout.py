@@ -23,7 +23,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.inference_handle import ManagedRolloutHandle
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
-from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.http_utils import DistributedPostUnconfirmed, _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
@@ -403,7 +403,10 @@ class Rollout(Base):
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)
-                    self.healthy.report_error.remote("rollout", error_msg)
+                    if isinstance(e, DistributedPostUnconfirmed):
+                        self.healthy.report_error.remote("rollout", error_msg, fatal=True)
+                    else:
+                        self.healthy.report_error.remote("rollout", error_msg)
                     if not getattr(self.config, "use_health_check", False):
                         raise
                     break
@@ -472,7 +475,10 @@ class Rollout(Base):
         except Exception as e:
             error_msg = f"Rollout failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
-            self.healthy.report_error.remote("rollout", error_msg)
+            if isinstance(e, DistributedPostUnconfirmed):
+                self.healthy.report_error.remote("rollout", error_msg, fatal=True)
+            else:
+                self.healthy.report_error.remote("rollout", error_msg)
             if not getattr(self.config, "use_health_check", False):
                 raise
 

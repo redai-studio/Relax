@@ -151,28 +151,37 @@ async def test_weight_sync_failure_never_registers_engine_to_dcs():
 
 
 @pytest.mark.asyncio
-async def test_failed_native_scale_out_keeps_placement_group_until_shutdown_is_confirmed(monkeypatch, patch_ray_get):
+async def test_failed_native_scale_out_reports_cleanup_failure_and_keeps_placement_group(monkeypatch, patch_ray_get):
     from relax.distributed.ray import policy_engine_pool as policy
 
     engine = make_mock_engine()
     pg = SimpleNamespace(ready=lambda: AwaitableValue(None))
+    healthy_pg = SimpleNamespace(ready=lambda: AwaitableValue(None))
     server = make_rollout_server()
     manager = create_test_manager(servers={"default": server})
     manager._scale_out_requests["request"] = ScaleOutRequest(
-        request_id="request", status=ScaleOutStatus.PENDING, num_replicas=1
+        request_id="request", status=ScaleOutStatus.PENDING, num_replicas=2
     )
 
     async def fail_bringup(**kwargs):
+        if kwargs["pg"] is healthy_pg:
+            return SimpleNamespace(success=True, reason=None)
         assert kwargs["pg"] is pg
         await manager._rollback_engines([engine], confirm_router_removal=True)
 
     manager._bring_up_single_replica = fail_bringup
-    monkeypatch.setattr(policy.ray.util, "placement_group", lambda *args, **kwargs: pg)
+    create = MagicMock(side_effect=[healthy_pg, pg])
+    monkeypatch.setattr(policy.ray.util, "placement_group", create)
     remove = MagicMock()
     monkeypatch.setattr(policy.ray.util, "remove_placement_group", remove)
     engine.shutdown.remote.side_effect = TimeoutError("exit pending")
     with pytest.raises(RuntimeError, match="did not confirm resource release"):
         await manager.execute_scale_out("request")
+    status = manager.get_scale_out_status("request")
+    assert status["status"] == "FAILED"
+    assert status["engine_ids"] == ["engine_1"]
+    assert status["failure_categories"][0] == "ROLLBACK_UNCONFIRMED"
+    assert "rollback resource release is unconfirmed" in status["error_message"]
     remove.assert_not_called()
     with pytest.raises(RuntimeError, match="resource release is unconfirmed"):
         manager._shutdown_all_engines()
@@ -180,6 +189,38 @@ async def test_failed_native_scale_out_keeps_placement_group_until_shutdown_is_c
     engine.shutdown.remote.side_effect = None
     manager._shutdown_all_engines()
     remove.assert_called_once_with(pg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_ok", [True, False])
+async def test_healthy_replica_waits_for_live_rollback(patch_ray_get, cleanup_ok):
+    seed = make_mock_engine(url="http://seed:1", weight_version="7")
+    healthy, failed = make_mock_engine(), make_mock_engine()
+    server = make_rollout_server(engine_groups=[make_engine_group(engines=[seed])])
+    manager = create_test_manager(servers={"default": server})
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def shutdown():
+        entered.set()
+        await finish.wait()
+        if not cleanup_ok:
+            raise RuntimeError("unconfirmed shutdown")
+
+    failed.shutdown.remote.side_effect = shutdown
+    manager._sync_single_engine_weights = AsyncMock(return_value=True)
+    rollback = asyncio.create_task(manager._rollback_engines([failed], confirm_router_removal=True))
+    await asyncio.wait_for(entered.wait(), 1)
+    sync = asyncio.create_task(manager._sync_weights_from_seed_engine([healthy], timeout=2))
+    await asyncio.sleep(0)
+    assert not sync.done()
+    manager._weight_sync_lock.acquire.remote.assert_not_called()
+    finish.set()
+    if cleanup_ok:
+        await rollback
+    else:
+        with pytest.raises(RuntimeError, match="unconfirmed"):
+            await rollback
+    assert await asyncio.wait_for(sync, 2) is cleanup_ok
 
 
 @pytest.mark.asyncio

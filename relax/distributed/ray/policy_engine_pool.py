@@ -1783,6 +1783,9 @@ class PolicyEnginePool:
         finally:
             if getattr(self, "_unconfirmed_rollback_engines", ()):
                 self._scale_out_cleanup_failed = True
+                failure = ScaleOutFailureCategory.ROLLBACK_UNCONFIRMED
+                request.failure_categories = [failure.name, *request.failure_categories]
+                request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {failure.value}")
                 raise _ScaleOutReleaseUnconfirmed("Scale-out rollback did not confirm resource release")
 
     async def _scale_out_ray_native(self, request: ScaleOutRequest) -> None:
@@ -2576,6 +2579,9 @@ class PolicyEnginePool:
         reason_str = scale_utils._aggregate_scale_out_reasons(failure_reasons)
         request.failure_categories = scale_utils._scale_out_failure_categories(failure_reasons)
 
+        if getattr(self, "_unconfirmed_rollback_engines", ()):
+            # execute_scale_out publishes the cleanup failure with these IDs.
+            return
         if not succeeded_engine_ids:
             if reason_str:
                 message = f"scale-out failed: {reason_str}. Failed engines: {failed_engine_ids}"
@@ -3119,15 +3125,19 @@ class PolicyEnginePool:
             owner_deadline = time.monotonic() + timeout
             while True:
                 with self._engine_lifecycle_lock:
-                    if getattr(self, "_unconfirmed_rollback_engines", ()):
-                        _record(ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, "pending scale-out rollback"))
+                    if getattr(self, "_scale_out_cleanup_failed", False):
+                        _record(ScaleOutFailure(ScaleOutFailureCategory.ROLLBACK_UNCONFIRMED))
                         return False
                     has_draining_elastic_group = any(
                         group.is_scaled_out and group.lifecycle_status is EngineGroupLifecycle.DRAINING
                         for srv in self.servers.values()
                         for group in srv.engine_groups
                     )
-                    if not has_draining_elastic_group and not self._scale_out_weight_updating:
+                    if (
+                        not has_draining_elastic_group
+                        and not self._scale_out_weight_updating
+                        and not getattr(self, "_unconfirmed_rollback_engines", ())
+                    ):
                         self._scale_out_weight_updating = True
                         scale_out_owner_acquired = True
                         break
@@ -3435,9 +3445,10 @@ class PolicyEnginePool:
             if result is None:
                 retained.remove(engine)
         if failures:
+            if attempts > 1 or confirm_router_removal:
+                self._scale_out_cleanup_failed = True
             if confirm_router_removal:
                 # Set the failure while the trainer's DCS lock is still held.
-                self._scale_out_cleanup_failed = True
                 raise _ScaleOutReleaseUnconfirmed(
                     f"Rollback resource release is unconfirmed: {failures}"
                 ) from failures[0]

@@ -26,6 +26,7 @@ import torch.distributed as dist
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.http_utils import DistributedPostUnconfirmed
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.utils import get_serve_url
@@ -46,6 +47,7 @@ def run_sft_predict(actor, rollout_id: int) -> None:
     args = actor.args
     scoring = bool(getattr(args, "custom_rm_path", None) or getattr(args, "rm_type", None))
     predict_error = None
+    fatal_predict_error = None
     # Cache the topology-derived role while Megatron process groups are live.
     # sleep() and update_weights() intentionally destroy the reloadable NCCL
     # groups until wake_up(), so querying mpu ranks during predict would access
@@ -76,13 +78,16 @@ def run_sft_predict(actor, rollout_id: int) -> None:
                 timeout=1800,
             )
             response.raise_for_status()
-            if scoring and response.json().get("status") != "ok":
-                raise RuntimeError(response.json().get("message", "SFT predict reward evaluation failed"))
+            result = response.json()
+            if result.get("fatal"):
+                fatal_predict_error = result["message"]
+            if scoring and result.get("status") != "ok":
+                raise RuntimeError(result.get("message", "SFT predict reward evaluation failed"))
         except Exception as e:
             logger.warning(f"SFT predict at rollout_id {rollout_id} failed: {e}")
             predict_error = str(e)
         _t_http = time.monotonic() - _t
-    if scoring:
+    if scoring and fatal_predict_error is None:
         # A colocated judge must release memory before the actor wakes up.
         # Eligible background judges promise to use independent resources.
         # Use the HTTP caller rank: with PP it may differ from global rank 0,
@@ -94,11 +99,11 @@ def run_sft_predict(actor, rollout_id: int) -> None:
                 ray.get([manager.offload.remote() for manager in (getattr(actor, "genrm_manager", None) or [])])
             except Exception as exc:
                 predict_error = f"SFT judge offload failed: {exc}"
-        errors = [None] * dist.get_world_size(group=get_gloo_group())
-        dist.all_gather_object(errors, predict_error, group=get_gloo_group())
-        if any(error is not None for error in errors):
-            raise RuntimeError(f"SFT predict/reward failed at step {rollout_id}: {errors}")
-    dist.barrier(group=get_gloo_group())
+    group = get_gloo_group()
+    errors = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(errors, fatal_predict_error or (predict_error if scoring else None), group=group)
+    if any(error is not None for error in errors):
+        raise RuntimeError(f"SFT predict/reward failed at step {rollout_id}: {errors}")
     if args.offload_train:
         _t = time.monotonic()
         actor.wake_up()
@@ -128,12 +133,17 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
     Returns the JSON payload the FastAPI handler should send back.
     """
     rollout._logger.info(f"Received request to predict train_step {train_step}")
+    fatal = False
     try:
         await rollout.rollout_manager.run_predict.remote(train_step)
         return {"status": "ok", "rollout_id": train_step}
     except Exception as e:
         error_msg = f"Predict failed for train_step {train_step}: {type(e).__name__}: {str(e)}"
         rollout._logger.exception(error_msg)
+        fatal = isinstance(e, DistributedPostUnconfirmed)
+        if fatal:
+            rollout.healthy.report_error.remote("rollout", error_msg, fatal=True)
+            return {"status": "error", "message": error_msg, "fatal": True}
         rollout.healthy.report_error.remote("rollout", error_msg)
         return {"status": "error", "message": error_msg}
     finally:
@@ -146,7 +156,7 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
         # leaking KV/weights would starve the next training step's GPU
         # memory. RL: rollout manages its own offload in `_async_run`,
         # skip here.
-        if is_sft_mode(rollout.config) and rollout.config.offload_rollout:
+        if not fatal and is_sft_mode(rollout.config) and rollout.config.offload_rollout:
             try:
                 await rollout.rollout_manager.offload.remote()
             except Exception as exc:

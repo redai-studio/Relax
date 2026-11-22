@@ -341,6 +341,8 @@ class _ModelRuntime:
             if self._closing or self._disposed:
                 raise RuntimeError("Inference manager is closing")
             if self.state is LifecycleState.DEAD:
+                if "unconfirmed_dispatch" in self.ledger.fences:
+                    raise RuntimeError("Inference manager cannot confirm distributed POST dispatch has stopped")
                 if self.pool is not None and getattr(self.pool.backend, "_scale_out_cleanup_failed", False):
                     raise RuntimeError("Inference manager cannot confirm scale-out rollback")
                 raise RuntimeError("Inference manager cannot restore engine residency")
@@ -353,6 +355,11 @@ class _ModelRuntime:
 
     async def complete_request(self, permit: str) -> None:
         await self.ledger.complete(permit)
+
+    async def fail_request_transport(self, permit: str) -> None:
+        if permit in self.ledger.permits:
+            self.ledger.fences.add("unconfirmed_dispatch")
+            self.state = LifecycleState.DEAD
 
     def _capture_sync_generations(self) -> None:
         self._sync_generations = {}

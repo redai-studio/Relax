@@ -29,6 +29,7 @@ import ray
 from relax.engine.inference.routing import RoutingError, resolve_model, select_target
 from relax.engine.inference.types import Role, RoleSnapshot
 from relax.utils.env import Envs
+from relax.utils.http_utils import DistributedPostUnconfirmed
 from relax.utils.logging_utils import get_logger
 
 
@@ -63,6 +64,7 @@ class AdmittedRequest:
     dispatched: bool = False
     finished: bool = False
     released: bool = False
+    transport_unconfirmed: bool = False
     replica_cursor: int | None = None
 
 
@@ -244,6 +246,9 @@ class InferenceRequestExecutor:
                 if self._send_request is not None:
                     return await self._send_request(upstream)
                 return await self.client.send(upstream, stream=True)
+            except DistributedPostUnconfirmed:
+                request.transport_unconfirmed = True
+                raise
             except _NOT_SENT_ERRORS as exc:
                 request.dispatched = False
                 if attempt >= attempts:
@@ -330,6 +335,14 @@ class InferenceRequestExecutor:
         if request.released:
             return
         request.released = True
+        if request.transport_unconfirmed:
+            try:
+                await self.manager_call("fail_request_transport", request.permit)
+            except Exception:
+                logger.exception("Could not notify the Manager about unconfirmed dispatch for %s", request.rid)
+            # A late POST can still reach the engine. Keep the permit in the
+            # ledger so weight sync and memory handoff cannot pass the drain.
+            return
         try:
             if request.dispatched and not request.finished:
                 await self.abort(request)

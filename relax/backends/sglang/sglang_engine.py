@@ -1478,7 +1478,12 @@ class SGLangEngine(RayActor):
                     while (remaining := deadline - time.monotonic()) > 0:
                         status = requests.get(worker_endpoint, timeout=min(5.0, remaining))
                         status.raise_for_status()
-                        if status.json().get("job_status") is None:
+                        job = status.json().get("job_status")
+                        if job is None or (
+                            isinstance(job, dict)
+                            and job.get("job_type") == "AddWorker"
+                            and job.get("status") == "failed"
+                        ):
                             self._router_registration_pending = False
                             timeout = remaining
                             break

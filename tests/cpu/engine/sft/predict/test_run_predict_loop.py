@@ -6,12 +6,50 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.engine.sft.predict import loop as predict_loop
+from relax.utils.http_utils import DistributedPostUnconfirmed
 from relax.utils.types import Sample
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_predict_dispatch_blocks_gpu_handoff(monkeypatch):
+    from relax.backends.megatron import initialize
+    from relax.engine.sft.predict import runner
+
+    config = SimpleNamespace(loss_type="sft", offload_train=True, offload_rollout=True)
+    rollout = SimpleNamespace(
+        config=config,
+        _logger=Mock(),
+        healthy=Mock(),
+        rollout_manager=SimpleNamespace(
+            run_predict=SimpleNamespace(remote=AsyncMock(side_effect=DistributedPostUnconfirmed("poster lost"))),
+            offload=SimpleNamespace(remote=AsyncMock()),
+        ),
+    )
+    reply = await runner.handle_predict(rollout, 1)
+    assert reply["fatal"] and reply["status"] == "error"
+    rollout.rollout_manager.offload.remote.assert_not_awaited()
+    rollout.healthy.report_error.remote.assert_called_once_with("rollout", reply["message"], fatal=True)
+
+    monkeypatch.setattr(initialize, "is_megatron_main_rank", lambda: True)
+    monkeypatch.setattr(runner, "get_serve_url", lambda role: "http://rollout")
+    monkeypatch.setattr(runner, "get_gloo_group", lambda: "test-gloo")
+    monkeypatch.setattr(runner.dist, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(runner.dist, "get_world_size", lambda **kwargs: 1)
+    monkeypatch.setattr(runner.dist, "all_gather_object", lambda result, error, **kwargs: result.__setitem__(0, error))
+    response = Mock()
+    response.json.return_value = reply
+    monkeypatch.setattr(runner.requests, "get", lambda *args, **kwargs: response)
+    actor = Mock(args=config)
+    with pytest.raises(RuntimeError, match="poster lost"):
+        runner.run_sft_predict(actor, 1)
+    actor.sleep.assert_called_once()
+    actor.wake_up.assert_not_called()
 
 
 def _sample(messages: list[tuple[str, str, bool]]) -> CanonicalSample:

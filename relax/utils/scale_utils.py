@@ -36,6 +36,7 @@ class ScaleOutFailureCategory(enum.Enum):
     label; ``.name`` is serialized to ``failure_categories`` for the
     monitor."""
 
+    ROLLBACK_UNCONFIRMED = "rollback resource release is unconfirmed"
     NCCL_PRECHECK_TRANSPORT_MISMATCH = "NCCL transport mismatch"
     NCCL_PRECHECK_FAIL = "NCCL precheck FAIL"
     PROVISION_TIMEOUT = "provision timed out (elastic node)"
@@ -68,6 +69,7 @@ _DETAIL_SURFACED_CATEGORIES = frozenset(
 # never silently dropped behind provisioning noise. Categories absent here sort
 # last but keep their arrival order (stable sort).
 _CATEGORY_DIAGNOSTIC_PRIORITY = (
+    ScaleOutFailureCategory.ROLLBACK_UNCONFIRMED,
     ScaleOutFailureCategory.NCCL_PRECHECK_TRANSPORT_MISMATCH,
     ScaleOutFailureCategory.NCCL_PRECHECK_FAIL,
     ScaleOutFailureCategory.PROVISION_TIMEOUT,

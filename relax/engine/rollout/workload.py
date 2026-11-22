@@ -292,7 +292,10 @@ class RolloutWorkload(ReloadableMixin):
         finally:
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, http_utils.DistributedPostUnconfirmed):
+                    raise outcome
 
     # ------------------------------ debug dump -----------------------------
 

@@ -484,11 +484,12 @@ def test_unregister_waits_for_all_dp_rank_workers_to_leave(monkeypatch, sglang_e
     ]
 
 
-def test_rollback_waits_for_queued_router_add_before_removing_worker(monkeypatch, sglang_engine_module):
+@pytest.mark.parametrize("terminal_job", [None, {"job_type": "AddWorker", "status": "failed"}])
+def test_rollback_waits_for_queued_router_add_before_removing_worker(monkeypatch, sglang_engine_module, terminal_job):
     router = _RouterRequests(worker_lists=[[]])
     engine = _make_engine(sglang_engine_module)
     engine._skip_router_registration = True
-    add_statuses = iter([{"job_status": {"status": "pending"}}, {"job_status": None}])
+    add_statuses = iter([{"job_status": {"status": "pending"}}, {"job_status": terminal_job}])
     router_get = router.get
 
     def get(url, timeout=None):
