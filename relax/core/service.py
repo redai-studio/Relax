@@ -156,7 +156,7 @@ class Service:
             self.role in ("rollout", "genrm", "teacher")
             and getattr(self.config, "_rollout_engine_manager", None) is not None
         ):
-            from relax.components.inference_gateway import InferenceGatewayService
+            from relax.components.inference_gateway import gateway_deployment
             from relax.utils.env import Envs
 
             limits = {
@@ -164,7 +164,8 @@ class Service:
                 "genrm": Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS,
                 "teacher": Envs.TEACHER_GATEWAY_MAX_ONGOING_REQUESTS,
             }
-            self.service = InferenceGatewayService.options(
+            deployment = gateway_deployment(self.role)
+            self.service = deployment.options(
                 ray_actor_options=ray_actor_options,
                 max_constructor_retry_count=1,
                 max_ongoing_requests=limits[self.role],

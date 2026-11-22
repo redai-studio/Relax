@@ -362,7 +362,14 @@ async def _post_generation(
                 from relax.engine.inference.executor import InferenceRequestExecutor
                 from relax.utils import http_utils
 
-                executor = InferenceRequestExecutor("rollout", manager, http_utils._http_client)
+                executor = InferenceRequestExecutor(
+                    "rollout",
+                    manager,
+                    http_utils._http_client,
+                    send_request=http_utils.send_distributed_request
+                    if getattr(args, "use_distributed_post", False)
+                    else None,
+                )
                 if evaluation:
                     return await executor.generate_json(payload, headers)
                 if state.abort_event.is_set():

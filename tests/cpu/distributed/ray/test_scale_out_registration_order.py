@@ -8,9 +8,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from relax.distributed.ray.inference_manager import InferenceManager
+from relax.distributed.ray.inference_pool import RolloutPool
+from relax.engine.inference.types import LifecycleState
+
 
 try:
-    from relax.distributed.ray.policy_engine_pool import EngineFinalizeResult, ScaleOutRequest, ScaleOutStatus
+    from relax.distributed.ray.policy_engine_pool import (
+        EngineFinalizeResult,
+        ScaleOutRequest,
+        ScaleOutStatus,
+        _EngineInitRecord,
+    )
     from relax.utils.scale_utils import ScaleOutFailure, ScaleOutFailureCategory
 
     HAS_DEPS = True
@@ -28,6 +37,95 @@ from conftest import (
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
+
+
+async def _sync_success(*args, publish, **kwargs):
+    await publish()
+    return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["published", "retry_rollback", "unconfirmed"])
+async def test_scale_out_holds_training_lock_through_router_and_group_publication(patch_ray_get, outcome):
+    registered = outcome == "published"
+    seed = make_mock_engine(url="http://seed:1", weight_version="7")
+    engine = make_mock_engine(url="http://elastic:1")
+    seed._actor_id.hex.return_value = "seed"
+    engine._actor_id.hex.return_value = "elastic"
+    server = make_rollout_server(engine_groups=[make_engine_group(engines=[seed])])
+    manager = create_test_manager(servers={"actor": server})
+    for running in (seed, engine):
+        running._get_local_state.return_value = manager._engine_actor_states.ALIVE
+    seed_record = {"url": "http://seed:1", "pid": 1, "node_id": "seed-node"}
+    new_record = {"url": "http://elastic:1", "pid": 2, "node_id": "elastic-node"}
+    server.engine_groups[0].engine_init_records[0] = _EngineInitRecord(seed_record)
+    pool = RolloutPool.__new__(RolloutPool)
+    pool.backend, pool.synced_actor_ids = manager, {"seed"}
+    pool.requires_weight_confirmation, pool.actor_weight_versions = True, {"seed": "7"}
+    owner = InferenceManager.__ray_metadata__.modified_class()
+    owner.pool, owner.memory_ready, owner.state = pool, True, LifecycleState.READY
+    owner.required_weight_version = "7"
+    lock = manager._weight_sync_lock
+    held = False
+
+    def acquire():
+        nonlocal held
+        if held:
+            return AwaitableValue(False)
+        held = True
+        return AwaitableValue(True)
+
+    def release():
+        nonlocal held
+        assert held
+        assert (len(server.engine_groups) == 2) is registered
+        if outcome == "retry_rollback":
+            engine.shutdown.remote.assert_called_once()
+        held = False
+        return AwaitableValue(None)
+
+    lock.acquire.remote.side_effect = acquire
+    lock.release.remote.side_effect = release
+
+    def register_router():
+        assert not acquire().value  # training tries to advance the seed here
+        return AwaitableValue(registered)
+
+    engine.register_to_router.remote.side_effect = register_router
+    if not registered:
+        engine.unregister_from_router.remote.side_effect = [
+            AwaitableValue(False),
+            AwaitableValue(outcome == "retry_rollback"),
+        ]
+    manager._sync_single_engine_weights = AsyncMock(return_value=True)
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING, model_name="actor")
+    finalization = manager._finalize_engine_group_registration(
+        request, server, [engine], engine_init_pairs=[(engine, new_record)], rank_offset=1
+    )
+    if outcome == "unconfirmed":
+        with pytest.raises(RuntimeError, match="Rollback resource release is unconfirmed"):
+            await asyncio.wait_for(finalization, 3)
+        assert not (await owner.snapshot()).models[0].admission
+        with pytest.raises(RuntimeError, match="cannot confirm scale-out rollback"):
+            await asyncio.wait_for(owner.wait_ready("rollout"), 1)
+        engine.shutdown.remote.assert_not_called()
+        assert not held
+        return
+    result = await asyncio.wait_for(finalization, 3)
+    assert result.success is registered
+    assert not held
+    snapshot = (await owner.snapshot()).models[0]
+    assert snapshot.admission and snapshot.required_weight_version == "7"
+    if registered:
+        assert [(item.base_url, item.weight_version) for item in snapshot.replicas] == [
+            ("http://seed:1", "7"),
+            ("http://elastic:1", "7"),
+        ]
+    else:
+        assert result.cleanup_confirmed
+        assert result.reason.category is ScaleOutFailureCategory.ROUTER_REGISTRATION_FAILED
+        assert engine.unregister_from_router.remote.call_count == 2
+        assert len(snapshot.replicas) == 1
 
 
 @pytest.mark.asyncio
@@ -50,6 +148,62 @@ async def test_weight_sync_failure_never_registers_engine_to_dcs():
     assert result.reason is not None and result.reason.category is ScaleOutFailureCategory.WEIGHT_SYNC_FAILED
     engine.register_dcs.remote.assert_not_called()
     engine.register_to_router.remote.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_native_scale_out_keeps_placement_group_until_shutdown_is_confirmed(monkeypatch, patch_ray_get):
+    from relax.distributed.ray import policy_engine_pool as policy
+
+    engine = make_mock_engine()
+    pg = SimpleNamespace(ready=lambda: AwaitableValue(None))
+    server = make_rollout_server()
+    manager = create_test_manager(servers={"default": server})
+    manager._scale_out_requests["request"] = ScaleOutRequest(
+        request_id="request", status=ScaleOutStatus.PENDING, num_replicas=1
+    )
+
+    async def fail_bringup(**kwargs):
+        assert kwargs["pg"] is pg
+        await manager._rollback_engines([engine], confirm_router_removal=True)
+
+    manager._bring_up_single_replica = fail_bringup
+    monkeypatch.setattr(policy.ray.util, "placement_group", lambda *args, **kwargs: pg)
+    remove = MagicMock()
+    monkeypatch.setattr(policy.ray.util, "remove_placement_group", remove)
+    engine.shutdown.remote.side_effect = TimeoutError("exit pending")
+    with pytest.raises(RuntimeError, match="did not confirm resource release"):
+        await manager.execute_scale_out("request")
+    remove.assert_not_called()
+    with pytest.raises(RuntimeError, match="resource release is unconfirmed"):
+        manager._shutdown_all_engines()
+    remove.assert_not_called()
+    engine.shutdown.remote.side_effect = None
+    manager._shutdown_all_engines()
+    remove.assert_called_once_with(pg)
+
+
+@pytest.mark.asyncio
+async def test_external_scale_out_reserves_ranks_after_another_model(monkeypatch):
+    from relax.distributed.ray import policy_engine_pool as policy
+
+    server = make_rollout_server()
+    manager = create_test_manager(
+        servers={"default": server, "other": make_rollout_server(engine_groups=[make_engine_group(rank_offset=8)])}
+    )
+    engine = make_mock_engine()
+    engine.init.remote.return_value = AwaitableValue(None)
+    actor_cls = MagicMock()
+    actor_cls.options.return_value.remote.return_value = engine
+    monkeypatch.setattr(policy.ray, "remote", lambda actor: actor_cls)
+    manager._finalize_engine_group_registration = AsyncMock(return_value=EngineFinalizeResult(True))
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.PENDING, engine_urls=["remote:30000"])
+
+    await manager._scale_out_external(request)
+
+    assert request.status is ScaleOutStatus.ACTIVE
+    assert request.engine_ids == ["engine_9"]
+    assert actor_cls.options.return_value.remote.call_args.kwargs["rank"] == 9
+    assert manager._finalize_engine_group_registration.call_args.kwargs["rank_offset"] == 9
 
 
 @pytest.mark.asyncio
@@ -197,7 +351,7 @@ async def test_router_false_is_registration_failure():
     server = make_rollout_server()
     request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
     manager._health_check_engines = AsyncMock(return_value=True)
-    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(side_effect=_sync_success)
 
     result = await manager._finalize_engine_group_registration(
         request=request,
@@ -342,9 +496,8 @@ async def test_external_outer_catch_does_not_leak_exception_args():
     secret = "sk-supersecret-0123456789 host=192.0.2.7"
     server = MagicMock()
     server.router_ip = "10.0.0.1"
-    server.router_port = 8000
     # Force the outer try/except to trip with a secret-bearing exception.
-    type(server).engine_groups = PropertyMock(side_effect=RuntimeError(secret))
+    type(server).router_port = PropertyMock(side_effect=RuntimeError(secret))
     manager._get_server = MagicMock(return_value=server)
     manager._rollback_engines = AsyncMock()
 

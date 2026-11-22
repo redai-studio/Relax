@@ -139,7 +139,7 @@ def test_teacher_placement_borrows_model_binding(monkeypatch, shared):
     binding, owned, offset = pool._resolve_placement(1)
     assert binding is pool._shared_pg_tuple
     assert owned is False
-    assert offset == (84 if shared else 2)
+    assert offset == (84 if shared else 4)
 
 
 @pytest.mark.parametrize("bundle_offset", [0, 16, 32, 48, 64])
@@ -157,11 +157,30 @@ def test_tp16_teachers_use_two_distinct_node_slots_in_their_own_slice(monkeypatc
 
 
 def test_dedicated_multinode_replicas_use_distinct_full_node_slices(monkeypatch):
-    _, pool = _make_teacher_manager(monkeypatch, num_replicas=2, shared_pg=False)
+    _, pool = _make_teacher_manager(monkeypatch, num_replicas=2, shared_pg=False, bundle_offset=8)
     placements = [pool._resolve_placement(rank) for rank in range(4)]
-    assert [item[2] for item in placements] == [0, 8, 16, 24]
+    assert [item[2] for item in placements] == [8, 16, 24, 32]
     assert all(item[0] is pool._shared_pg_tuple and item[1] is False for item in placements)
     assert pool.engines == [None, None]  # Followers never advertise HTTP replicas.
+
+
+def test_teacher_replicas_on_one_node_allocate_disjoint_port_blocks(monkeypatch):
+    from relax.distributed.ray.policy_engine_pool import _allocate_rollout_engine_addr_and_ports_normal
+
+    module, pool = _make_teacher_manager(monkeypatch, num_replicas=2, gpus_per_replica=2, shared_pg=False)
+    monkeypatch.setattr(
+        module, "_allocate_rollout_engine_addr_and_ports_normal", _allocate_rollout_engine_addr_and_ports_normal
+    )
+    monkeypatch.setattr(module, "find_available_port", lambda start: start)
+    monkeypatch.setattr(module.ray, "get", lambda ref: ref)
+
+    def probe(start_port=10000, consecutive=1):
+        return "192.0.2.1", start_port
+
+    engine = SimpleNamespace(_get_current_node_ip_and_free_port=SimpleNamespace(remote=probe))
+    addresses = pool._allocate_engine_addr_and_ports(new_engines=[(0, engine), (1, engine)])
+    first_dist_port = int(addresses[0]["dist_init_addr"].rsplit(":", 1)[1])
+    assert addresses[1]["port"] >= first_dist_port + 31
 
 
 def test_multinode_teacher_allocates_each_replicas_node_addresses_together(monkeypatch):

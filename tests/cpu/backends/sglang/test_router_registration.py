@@ -34,7 +34,7 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "sglang.srt.utils", sglang_utils)
 
     checkpoint_client = ModuleType("relax.distributed.checkpoint_service.client.engine")
-    checkpoint_client.create_client = lambda **_kwargs: None
+    checkpoint_client.CheckpointEngineClient = object
     monkeypatch.setitem(sys.modules, "relax.distributed.checkpoint_service.client.engine", checkpoint_client)
 
     ray_actor = ModuleType("relax.distributed.ray.ray_actor")
@@ -390,6 +390,26 @@ def test_unregister_falls_back_to_exact_non_dp_worker(monkeypatch, sglang_engine
     assert requests.deletes == ["http://router:30000/workers/listed-worker-id"]
 
 
+@pytest.mark.parametrize("response_lost", [False, True])
+def test_scale_out_rollback_distinguishes_rejected_and_unconfirmed_registration(
+    monkeypatch, sglang_engine_module, response_lost
+):
+    router = _RouterRequests(worker_lists=[[]])
+    monkeypatch.setattr(sglang_engine_module, "requests", router)
+    engine = _make_engine(sglang_engine_module)
+    engine._skip_router_registration = True
+
+    def post(*args, **kwargs):
+        if response_lost:
+            raise ReadTimeout("registration could have been accepted")
+        return _Response(400)
+
+    router.post = post
+    assert not engine.register_to_router()
+    assert engine.unregister_from_router(wait_for_removal=True) is not response_lost
+    assert router.deletes == []
+
+
 def test_unregister_does_not_delete_dp_rank_worker_as_fallback(monkeypatch, sglang_engine_module):
     requests = _RouterRequests(worker_lists=[[{"id": "rank-worker-id", "url": "http://worker:8000@0"}]])
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
@@ -462,6 +482,27 @@ def test_unregister_waits_for_all_dp_rank_workers_to_leave(monkeypatch, sglang_e
         "http://router:30000/workers",
         "http://router:30000/workers",
     ]
+
+
+def test_rollback_waits_for_queued_router_add_before_removing_worker(monkeypatch, sglang_engine_module):
+    router = _RouterRequests(worker_lists=[[]])
+    engine = _make_engine(sglang_engine_module)
+    engine._skip_router_registration = True
+    add_statuses = iter([{"job_status": {"status": "pending"}}, {"job_status": None}])
+    router_get = router.get
+
+    def get(url, timeout=None):
+        if url.endswith("/physical-worker-id"):
+            assert not router.deletes
+            return _Response(200, next(add_statuses))
+        return router_get(url, timeout)
+
+    monkeypatch.setattr(router, "get", get)
+    monkeypatch.setattr(sglang_engine_module, "requests", router)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+    assert engine.register_to_router()
+    assert engine.unregister_from_router(wait_for_removal=True, timeout=5)
+    assert router.deletes == ["http://router:30000/workers/physical-worker-id"]
 
 
 def test_unregister_timeout_allows_a_later_retry(monkeypatch, sglang_engine_module):
@@ -934,7 +975,7 @@ def test_static_slime_registration_checks_worker_health(monkeypatch, sglang_engi
     engine.worker_type = "regular"
     engine.args.use_slime_router = True
     worker_url = f"http://{engine.server_host}:{engine.server_port}"
-    engine.register_to_router = Mock(return_value=True)
+    monkeypatch.setattr(module.requests, "post", Mock(return_value=_Response(200)))
     get = Mock(side_effect=[_Response(200, {"workers": [{"url": worker_url}]}), _Response(200)])
     monkeypatch.setattr(module.requests, "get", get)
     assert engine.configure_model_router("router", 8000)
@@ -949,3 +990,27 @@ def test_legacy_genrm_engine_uses_unified_genrm_initialization(monkeypatch, sgla
     monkeypatch.setattr(engine, "_init_genrm", initialize)
     engine.init("dist", 30000, 30001, host="worker")
     initialize.assert_called_once_with("dist", 30000, 30001, "worker", None)
+
+
+def test_static_regular_registration_reconciles_lost_reply_and_replacement(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    engine = _make_engine(module)
+    engine.role = "teacher"
+    worker = {"url": "http://worker:8000", "worker_type": "regular", "is_healthy": True, "id": "physical-worker-id"}
+    requests = _RouterRequests(worker_lists=[[worker]])
+    monkeypatch.setattr(module, "requests", requests)
+    original_post = requests.post
+
+    def lost_reply(*args, **kwargs):
+        original_post(*args, **kwargs)
+        raise ReadTimeout("accepted, reply lost")
+
+    requests.post = lost_reply
+    assert not engine.configure_model_router("router", 8000)
+    assert engine._router_registration_pending
+    assert engine.configure_model_router("router", 8000)
+    assert len(requests.posts) == 1
+    requests.post = original_post
+    assert engine.configure_model_router("replacement", 8001)
+    assert len(requests.posts) == 2
+    assert engine._router_worker_id == "physical-worker-id"

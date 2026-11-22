@@ -367,6 +367,9 @@ def _init_ray_distributed_post(args):
                 self._client, url, payload, max_retries, headers, fail_fast_no_workers
             )
 
+        async def do_request(self, url, body, headers):
+            return await _request_once(self._client, url, body, headers)
+
     # Create actors per node
     created = []
     total_actors = max(1, len(nodes) * args.num_gpus_per_node)
@@ -387,6 +390,60 @@ def _init_ray_distributed_post(args):
             created.append(actor)
 
     _post_actors = created
+
+
+async def _request_once(client, url, body, headers):
+    """Serialize one admitted request without replaying an unknown outcome."""
+    try:
+        response = await client.post(url, content=body, headers=headers)
+        try:
+            content = await response.aread()
+            # HTTPX has already decoded and buffered the body.
+            headers = [
+                (key, value)
+                for key, value in response.headers.multi_items()
+                if key not in {"content-encoding", "content-length", "transfer-encoding"}
+            ]
+            return response.status_code, headers, content, None
+        finally:
+            await response.aclose()
+    except httpx.RequestError as error:
+        return None, {}, b"", (type(error).__name__, str(error))
+
+
+async def send_distributed_request(request: httpx.Request) -> httpx.Response:
+    actor = _next_actor()
+    if actor is None:
+        return await _http_client.send(request, stream=True)
+    import ray
+
+    ref = actor.do_request.remote(str(request.url), await request.aread(), request.headers.multi_items())
+    pending = asyncio.ensure_future(ref)
+    try:
+        status, headers, body, error = await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        # The executor aborts the backend ID and returns admission after this
+        # call exits. Wait until the poster can no longer dispatch the POST.
+        if isinstance(ref, ray.ObjectRef) and not pending.done():
+            try:
+                ray.cancel(ref, recursive=False)
+            except Exception:
+                logger.exception("Could not send cancellation to the distributed HTTP poster")
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not pending.cancelled():
+            pending.exception()
+        raise
+    if error is not None:
+        safe_errors = {name: getattr(httpx, name) for name in ("ConnectError", "ConnectTimeout", "PoolTimeout")}
+        error_type = safe_errors.get(error[0], httpx.ReadError)
+        raise error_type(error[1], request=request)
+    return httpx.Response(status, headers=headers, content=body, request=request)
 
 
 async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):

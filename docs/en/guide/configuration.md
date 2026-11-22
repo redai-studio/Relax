@@ -19,10 +19,10 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--rollout-num-gpus-per-engine` | int | 1 | GPUs per SGLang inference engine, equivalent to SGLang's `tp_size` |
 | `--num-gpus-per-node` | int | 8 | GPUs per node. Set this if using fewer than 8 GPUs per node in colocate mode |
 | `--resource` | json | - | Ray resource configuration in JSON format. Example: `'{"actor":[replicas, gpus], "rollout":[replicas, gpus]}'` |
-| `--colocate` | flag | False | Whether to colocate inference engines and training Actors on the same GPUs. Automatically sets `--offload` to True |
+| `--colocate` | flag | False | Whether to colocate inference engines and training Actors on the same GPUs. Synchronous colocate defaults both offloads to True; hybrid uses separate rollout GPUs |
 | `--offload` | flag | False | Equivalent to setting both `--offload-train` and `--offload-rollout` |
-| `--offload-train` | flag | None | Whether to offload training Actor to CPU during training. Always True when `--colocate` is enabled |
-| `--offload-rollout` | flag | None | Whether to offload Rollout generator to CPU during training. Always True when `--colocate` is enabled |
+| `--offload-train` | flag | None | Whether to offload training Actor to CPU during training. Defaults to True for synchronous colocate, False for hybrid; debug rollout disables offload |
+| `--offload-rollout` | flag | None | Whether to offload Rollout generator to CPU during training. Defaults to True for synchronous colocate, False for hybrid; debug rollout disables offload |
 | `--distributed-backend` | str | nccl | Distributed backend |
 | `--distributed-timeout-minutes` | int | 10 | Distributed timeout in minutes |
 

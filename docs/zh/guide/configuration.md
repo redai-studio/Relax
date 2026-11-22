@@ -19,10 +19,10 @@
 | `--rollout-num-gpus-per-engine` | int | 1 | 每个 SGLang 推理引擎使用的 GPU 数，等同于 SGLang 的 tp_size |
 | `--num-gpus-per-node` | int | 8 | 每个节点的 GPU 数。如果在 colocate 模式下每个节点使用少于 8 张 GPU 需要设置此值 |
 | `--resource` | json | - | Ray 资源配置，JSON 格式。`'{"actor":[副本数, 卡数], "rollout":[副本数, 卡数]}'` |
-| `--colocate` | flag | False | 是否将推理引擎和训练 Actor 共置在相同的 GPU 上。开启后会同时将 `--offload` 设为 True |
+| `--colocate` | flag | False | 是否将推理引擎和训练 Actor 共置在相同的 GPU 上。同步 colocate 默认开启两项 offload；hybrid 使用独立 Rollout GPU |
 | `--offload` | flag | False | 等同于同时设置 `--offload-train` 和 `--offload-rollout` |
-| `--offload-train` | flag | None | 训练期间是否将训练 Actor 卸载到 CPU。`--colocate` 时始终为 True |
-| `--offload-rollout` | flag | None | 训练期间是否将 Rollout 生成器卸载到 CPU。`--colocate` 时始终为 True |
+| `--offload-train` | flag | None | 训练期间是否将训练 Actor 卸载到 CPU。同步 colocate 默认 True，hybrid 默认 False；debug rollout 关闭 offload |
+| `--offload-rollout` | flag | None | 训练期间是否将 Rollout 生成器卸载到 CPU。同步 colocate 默认 True，hybrid 默认 False；debug rollout 关闭 offload |
 | `--distributed-backend` | str | nccl | 分布式后端 |
 | `--distributed-timeout-minutes` | int | 10 | 分布式超时时间（分钟） |
 

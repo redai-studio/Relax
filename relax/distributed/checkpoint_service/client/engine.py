@@ -228,9 +228,11 @@ class CheckpointEngineClient:
                     raise RuntimeError(f"Failed to register with coordinator: {e}")
         return self._rank
 
-    async def unregister(self) -> None:
+    async def unregister(self, *, strict: bool = False) -> None:
         """Unregister node from coordinator."""
-        if not self._registered:
+        # Rollout ranks are assigned before registration; strict cleanup must
+        # also reconcile a registration whose response was lost.
+        if not self._registered and not (strict and self._http_client is not None and self.rank is not None):
             return
 
         try:
@@ -238,9 +240,13 @@ class CheckpointEngineClient:
                 f"{self.coordinator_url}/unregister",
                 params={"role": self.role, "rank": self.rank},
             )
-            response.raise_for_status()
+            if not (strict and response.status_code == 404):
+                response.raise_for_status()
+            self._registered = False
             logger.info(f"Unregistered from coordinator: {self.node_id}")
         except Exception as e:
+            if strict:
+                raise
             logger.warning(f"Failed to unregister from coordinator: {e}")
 
     async def _init_backend(self, lock) -> None:

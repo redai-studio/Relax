@@ -299,6 +299,7 @@ class Rollout(Base):
 
         self._stop_event = asyncio.Event()
         self._run_task: Optional[asyncio.Task] = None  # pyright: ignore[reportMissingTypeArgument]
+        self._scale_out_tasks: set[asyncio.Task[None]] = set()
         # Set by can_do_update_weight_for_async when it finishes; end_update_weight waits on it.
         self._weight_update_ready = asyncio.Event()
         self._weight_update_ready.set()
@@ -657,12 +658,22 @@ class Rollout(Base):
                 message=result.get("message", "Already at or above target engine count; no scale-out needed"),
             )
         # Step 3: Fire-and-forget execution (non-blocking)
-        self.rollout_manager.execute_scale_out.remote(result["request_id"])
+        task = asyncio.create_task(self._execute_scale_out(result["request_id"]))
+        self._scale_out_tasks.add(task)
+        task.add_done_callback(self._scale_out_tasks.discard)
         return ScaleOutResponse(
             request_id=result["request_id"],
             status=result["status"],
             message="Scale-out request accepted",
         )
+
+    async def _execute_scale_out(self, request_id: str) -> None:
+        try:
+            await self.rollout_manager.execute_scale_out.remote(request_id)
+        except Exception as exc:
+            message = f"Rollout scale-out execution failed for request {request_id}: {type(exc).__name__}"
+            self._logger.exception(message)
+            self.healthy.report_error.remote("rollout", message)
 
     @app.get("/scale_out", response_model=ListScaleOutRequestsResponse)
     async def list_scale_out_requests(self, model_name: Optional[str] = None, status: Optional[str] = None):

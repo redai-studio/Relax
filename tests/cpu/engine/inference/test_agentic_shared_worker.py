@@ -69,11 +69,12 @@ async def test_shared_worker_failure_prevents_partition_replay(monkeypatch, canc
     implementation = module.RolloutWorker.__ray_metadata__.modified_class
     worker = object.__new__(implementation)
     worker.args = SimpleNamespace(
-        _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=AsyncMock()))
+        colocate=True, _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=AsyncMock()))
     )
     worker._closed = False
     worker._generation_running = False
     worker._generation_failed = False
+    worker._training_ready = False
     worker._phase_lock = asyncio.Lock()
     worker._active = set()
     entered = asyncio.Event()
@@ -96,8 +97,9 @@ async def test_shared_worker_failure_prevents_partition_replay(monkeypatch, canc
     await entered.wait()
     with pytest.raises(RuntimeError, match="already running"):
         await worker.generate(0)
-    with pytest.raises(RuntimeError, match="already running"):
-        await worker.eval(0)
+    evaluation = asyncio.create_task(worker.eval(0))
+    await asyncio.sleep(0)
+    assert not evaluation.done()
     if cancel:
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -114,7 +116,7 @@ async def test_shared_worker_failure_prevents_partition_replay(monkeypatch, canc
     release.set()
     await asyncio.gather(*tuple(worker._active), return_exceptions=True)
     with pytest.raises(RuntimeError, match="new RolloutWorker"):
-        await worker.eval(0)
+        await asyncio.wait_for(evaluation, 1)
     await worker.save(0)
     workload.eval.assert_awaited_once_with(0)
     workload.save.assert_awaited_once_with(0)
@@ -169,3 +171,61 @@ async def test_fully_async_startup_timeout_includes_phase_rpc(monkeypatch):
     with pytest.raises(asyncio.TimeoutError):
         await worker._activate_generation()
     assert not getattr(worker, "_startup_ready", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [True, False])
+async def test_eval_can_run_on_independent_gpus_and_waits_for_shared_training(shared):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    worker = object.__new__(module.RolloutWorker.__ray_metadata__.modified_class)
+    switch = AsyncMock()
+    ready = asyncio.Event()
+    generating = asyncio.Event()
+    release = asyncio.Event()
+
+    async def generate(step):
+        generating.set()
+        await release.wait()
+
+    worker.args = SimpleNamespace(
+        colocate=shared,
+        _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=switch)),
+    )
+    worker._closed = worker._generation_running = worker._generation_failed = worker._training_ready = False
+    worker._phase_lock = asyncio.Lock()
+    worker._active = set()
+    worker.workload = SimpleNamespace(generate=generate, eval=AsyncMock())
+    worker.manager = SimpleNamespace(
+        wait_ready=SimpleNamespace(remote=lambda role: ready.wait()),
+        begin_rollout=SimpleNamespace(remote=AsyncMock()),
+    )
+    ready.set()
+    train = asyncio.create_task(worker.generate(7))
+    await asyncio.wait_for(generating.wait(), 1)
+    evaluation = asyncio.create_task(worker.eval(6))
+    try:
+        if shared:
+            await asyncio.sleep(0)
+            assert not evaluation.done()
+        else:
+            await asyncio.wait_for(evaluation, 1)
+            worker.workload.eval.assert_awaited_once_with(6)
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(train, evaluation), 1)
+
+    if shared:
+        await worker.offload()
+        ready.clear()
+        switch.reset_mock()
+        evaluation = asyncio.create_task(worker.eval(7))
+        await asyncio.sleep(0)
+        assert not evaluation.done()
+        switch.assert_not_awaited()
+        ready.set()
+        await asyncio.wait_for(evaluation, 1)
+        switch.assert_not_awaited()
+    assert worker.manager.begin_rollout.remote.await_args_list[0].args == (7,)
+    assert all(call.args == (None,) for call in worker.manager.begin_rollout.remote.await_args_list[1:])

@@ -360,12 +360,12 @@ class TestCustomRewardLoading:
 
     @pytest.mark.asyncio
     async def test_explicit_reload_refreshes_background_eval_executor_and_workers(self):
-        from relax.distributed.ray.rollout import RolloutManager
         from relax.engine.rewards.async_eval import DeferredReward, EvalJudgeWorker
+        from relax.engine.rollout.workload import RolloutWorkload
 
         args = _make_args(reward_num_workers=1, eval_reward_key=None)
         judge = EvalJudgeWorker.remote(args)
-        owner = object.__new__(RolloutManager.__ray_metadata__.modified_class)
+        owner = object.__new__(RolloutWorkload)
         owner.args, owner._eval_judge = args, judge
 
         async def evaluate():

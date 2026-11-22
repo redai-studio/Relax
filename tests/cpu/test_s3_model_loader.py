@@ -92,7 +92,7 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "sglang.srt.utils", sglang_utils)
 
     checkpoint_client = ModuleType("relax.distributed.checkpoint_service.client.engine")
-    checkpoint_client.create_client = lambda **_kwargs: None
+    checkpoint_client.CheckpointEngineClient = object
     monkeypatch.setitem(sys.modules, "relax.distributed.checkpoint_service.client.engine", checkpoint_client)
 
     ray_actor = ModuleType("relax.distributed.ray.ray_actor")

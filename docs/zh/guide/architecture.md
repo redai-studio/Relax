@@ -74,7 +74,7 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 | 组件 | 文件 | 职责 |
 |------|------|------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | 策略训练（Megatron 后端） |
-| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | 统一 Gateway 入口与 RolloutWorker 工作负载编排 |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | RolloutWorker 工作负载编排；公共入口位于 `inference_gateway.py` |
 | **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value 估计与裁剪 value loss 训练 |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | 前向推理 log-prob（fully-async 模式） |
 | **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | 优势计算（PPO/GRPO/GSPO/SAPO/CISPO 等） |
@@ -95,7 +95,13 @@ CPU `RolloutWorker` 执行生成、评估与数据传输。Worker 通过公共�
 
 Rollout 工作负载负责样本暂存、评分完整性和 TransferQueue 发布。Resident Agentic 路径区分 Group、Session 和导出的训练行；延迟评分保留 export identity 与物理分区边界。发布需确认数据对消费者可见；流式终批还需确认结束标记。确认结果未知会使 attempt 失败，不会盲目重放。
 
-自定义/native 引擎和外部引擎也由统一控制面编排，必须遵守引擎能力及资源释放契约，不再通过旧角色 Manager 管理。Rollout、GenRM 和 Teacher 使用同一 CPU Gateway 部署类。`/<role>/engines` 默认返回 v2 发现协议；旧投影需显式请求 `?schema_version=1`。自动扩缩容从 v2 读取逻辑副本。
+自定义/native 引擎和外部引擎也由统一控制面编排，必须遵守引擎能力及资源释放契约，不再通过旧角色 Manager 管理。Rollout、GenRM 和 Teacher 复用 CPU Gateway 实现，并按角色暴露 HTTP 路由；评估、预测和扩缩容接口仅属于 Rollout。`/<role>/engines` 默认返回 v2 发现协议；旧投影需显式请求 `?schema_version=1`。自动扩缩容从 v2 读取逻辑副本。
+
+自定义集成迁移到此控制面时：
+
+- 将 `relax.distributed.ray.rollout` 导入迁到 `relax.distributed.ray.policy_engine_pool`；通过任务 Manager 的角色句柄或公共 Gateway 调用，替代查找具名 GenRM 或 Teacher manager actor。
+- Gateway `/health` 表示入口存活。派发前检查 `model_status` 以及 v2 发现中模型的 `state`、`admission`；GenRM `/metrics` 改为按 `models` 分组，并提供 `manager_epoch`、`topology_revision`。
+- 调用方 `rid` 用于追踪，executor 另行分配后端请求 ID；取消应遵循 Gateway 请求生命周期，不能把调用方 ID 直接发给引擎。
 
 引擎层提供 Rollout 数据生成和奖励计算能力：
 

@@ -119,10 +119,13 @@ class InferenceRequestExecutor:
     executor keeps none besides a round-robin cursor.
     """
 
-    def __init__(self, role: str | Role, manager_handle: Any, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, role: str | Role, manager_handle: Any, client: httpx.AsyncClient, *, send_request: Any = None
+    ) -> None:
         self.role = Role(role)
         self.manager_handle = manager_handle
         self.client = client
+        self._send_request = send_request
         # Rotates across direct-eligible replicas; a Router target ignores it.
         self._cursor = itertools.count()
 
@@ -237,7 +240,10 @@ class InferenceRequestExecutor:
             # Set first: a cancellation mid-send may already have reached an engine.
             request.dispatched = True
             try:
-                return await self.client.send(build(request.target), stream=True)
+                upstream = build(request.target)
+                if self._send_request is not None:
+                    return await self._send_request(upstream)
+                return await self.client.send(upstream, stream=True)
             except _NOT_SENT_ERRORS as exc:
                 request.dispatched = False
                 if attempt >= attempts:

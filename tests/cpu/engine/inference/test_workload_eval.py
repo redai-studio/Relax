@@ -71,3 +71,32 @@ async def test_managed_workload_drains_background_scores_before_reporting(monkey
         assert reported[0][3]["eval/async_judge"] == 1
     await workload.close()
     assert killed == [judge]
+
+
+def test_sft_eval_reports_completed_train_step_and_uses_eval_reward_key(monkeypatch):
+    from relax.distributed.ray import policy_engine_pool
+
+    published = []
+    monkeypatch.setattr(policy_engine_pool.tracking_utils, "log", lambda args, data, **kwargs: published.append(data))
+    monkeypatch.setattr(policy_engine_pool.tracking_utils, "flush_metrics", lambda *args: None)
+    workload = object.__new__(module.RolloutWorkload)
+    workload.save_debug_rollout_data = lambda *args, **kwargs: None
+    workload.args = SimpleNamespace(
+        loss_type="sft",
+        reward_key="train_score",
+        eval_reward_key="eval_score",
+        wandb_always_use_train_step=True,
+        n_samples_per_prompt=2,
+        rollout_batch_size=4,
+        global_batch_size=2,
+        log_reward_category=None,
+        advantage_estimator="grpo",
+        custom_eval_rollout_log_function_path=None,
+        log_passrate=False,
+    )
+    sample = Sample(response="ready", reward={"eval_score": 1.0})
+    data = {"sft_predict": {"rewards": [1.0], "samples": [sample]}}
+    workload._record_eval_result(7, RolloutFnEvalOutput(data, {}))
+    assert published[0]["eval/step"] == 7
+    assert published[0]["eval/sft_predict/zero_std/count_1.0"] == 1
+    assert workload.args.reward_key == "train_score"

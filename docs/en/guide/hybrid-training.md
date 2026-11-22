@@ -7,7 +7,7 @@
 - the **streaming data pipeline** of Fully Async (TransferQueue + `max-staleness` for off-policy tolerance), with
 - the **in-process weight sharing** of Colocate (TensorBackuper + `_switch_model`, so ref / actor_fwd / advantages all run on the actor's own GPUs).
 
-Concretely, Actor and Rollout still run on **separate GPU placement groups** (like Fully Async), but the actor no longer ships weights to standalone ActorFwd / Reference / Advantages services. Instead it cycles a single set of weights between `actor`, `ref`, `old_actor`, and `teacher` tags via a CPU/GPU `TensorBackuper`, computing every forward pass locally and pushing weights to rollout through the sync `UpdateWeightFromTensor` path.
+Concretely, Actor and Rollout still run on **separate GPU placement groups** (like Fully Async), but the actor no longer ships weights to standalone ActorFwd / Reference / Advantages services. Instead it cycles a single set of weights between `actor`, `ref`, `old_actor`, and `teacher` tags via a CPU/GPU `TensorBackuper`, computing every forward pass locally and pushing weights to rollout through DCS (Checkpoint Engine).
 
 ### Mode Comparison
 
@@ -97,7 +97,7 @@ Passing `--fully-async --colocate` directly is rejected; use `--hybrid` instead.
 │       │    ├─ advantages    (in-process)  │              │                 │
 │       │    └─ train         (switch:actor)│                                │
 │       └──────────────┬────────────────────┘              │                 │
-│                      │ UpdateWeightFromTensor (sync) ───┘                  │
+│                      │ DCS weight synchronization   ───┘                   │
 └──────────────────────┼─────────────────────────────────────────────────────┘
                        ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -111,7 +111,7 @@ ______________________________________________________________________
 
 ## The `train_hybrid` Loop
 
-`relax/backends/megatron/actor.py:708` implements the hybrid training step in three phases:
+`MegatronTrainRayActor.train_hybrid()` in `relax/backends/megatron/actor.py` implements the hybrid training step in three phases:
 
 1. **Collect sub-batches and compute forward log-probs (small memory footprint)**
 
@@ -129,7 +129,7 @@ ______________________________________________________________________
 
 3. **Train on the merged batch and push weights**
 
-   A single `train(...)` call runs the optimizer step on the merged batch. Afterwards the actor backs up the new weights to the `actor` tag and (on the ref-update interval) refreshes the `ref` tag, then calls `self.update_weights()` to push the updated weights to rollout via `UpdateWeightFromTensor`.
+   A single `train(...)` call runs the optimizer step on the merged batch. Afterwards the actor backs up the new weights to the `actor` tag and (on the ref-update interval) refreshes the `ref` tag, then calls `self.update_weights()` to push the updated weights to rollout via DCS.
 
 The sub-batched forward keeps peak activation memory bounded — matching Fully Async behavior — while the merged training step preserves Colocate-style global statistics.
 
@@ -231,7 +231,7 @@ With `--fully-async` or `--hybrid` plus `--use-dynamic-batch-size`, DP token bal
 
 ### Rollout sees stale weights for a long time
 
-Hybrid uses the sync `UpdateWeightFromTensor` path at the end of each `train_hybrid` call. If you see large weight-update gaps, check:
+Hybrid uses DCS at the end of each `train_hybrid` call. If you see large weight-update gaps, check:
 
 - `update_weights()` timing in actor logs
 - Whether rollout health-checks are paging the actor (`_check_services_health()` is called before weight sync)
@@ -242,7 +242,7 @@ ______________________________________________________________________
 
 Planned follow-ups for hybrid mode:
 
-- ~~**Integrate DCS for weight sync**~~ — landed as the default Hybrid synchronization path (see the Configuration section above). The DCS backend lets Hybrid reuse fully async's elastic scaling chain (scaled-out engines register with DCS and receive weights on every broadcast), see [Elastic Rollout](./elastic-rollout.md). Follow-ups: cover multimodal models under this backend and evaluate overlapping the push with the next training iteration.
+- ~~**Integrate DCS for weight sync**~~ — landed as the default Hybrid synchronization path (see the Configuration section above). The DCS backend lets Hybrid reuse fully async's elastic scaling chain (scaled-out engines synchronize from a confirmed seed replica after each DCS update), see [Elastic Rollout](./elastic-rollout.md). Follow-ups: cover multimodal models under this backend and evaluate overlapping the push with the next training iteration.
 - **Split `train_actor` into `num_iters_per_train_update` iterations** — today `num_iters_per_train_update` only chunks the forward phase; the merged training step still runs once on the full global batch. Extend the actor train step to also iterate `num_iters_per_train_update` times so optimizer updates can be pipelined with TransferQueue consumption and peak training-side memory drops further.
 
 Related docs:

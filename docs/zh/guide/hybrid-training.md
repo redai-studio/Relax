@@ -7,7 +7,7 @@
 - Fully Async 的 **流式数据流水线**（TransferQueue + `max-staleness` 控制 off-policy 容忍度），以及
 - Colocate 的 **进程内权重共享**（TensorBackuper + `_switch_model`，使 ref / actor_fwd / advantages 全部在 actor 自身 GPU 上完成）。
 
-具体来说，Actor 与 Rollout 仍然部署在 **独立的 GPU placement group** 上（与 Fully Async 一致），但 actor 不再把权重广播到独立的 ActorFwd / Reference / Advantages 服务，而是通过 CPU/GPU `TensorBackuper` 在 `actor`、`ref`、`old_actor`、`teacher` 等 tag 之间切换同一套权重，所有 forward 在本地完成，最后通过同步的 `UpdateWeightFromTensor` 路径把权重推给 rollout。
+具体来说，Actor 与 Rollout 仍然部署在 **独立的 GPU placement group** 上（与 Fully Async 一致），但 actor 不再把权重广播到独立的 ActorFwd / Reference / Advantages 服务，而是通过 CPU/GPU `TensorBackuper` 在 `actor`、`ref`、`old_actor`、`teacher` 等 tag 之间切换同一套权重，所有 forward 在本地完成，最后通过 DCS（Checkpoint Engine）把权重推给 rollout。
 
 ### 模式对比
 
@@ -99,7 +99,7 @@ ASCII 图中保留英文以避免框线对齐错乱：
 │       │    ├─ advantages    (in-process)  │              │                 │
 │       │    └─ train         (switch:actor)│                                │
 │       └──────────────┬────────────────────┘              │                 │
-│                      │ UpdateWeightFromTensor (sync) ───┘                  │
+│                      │ DCS weight synchronization   ───┘                   │
 └──────────────────────┼─────────────────────────────────────────────────────┘
                        ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -113,7 +113,7 @@ ______________________________________________________________________
 
 ## `train_hybrid` 训练流程
 
-`relax/backends/megatron/actor.py:708` 实现的 Hybrid 训练步骤分为三个阶段：
+`relax/backends/megatron/actor.py` 中 `MegatronTrainRayActor.train_hybrid()` 实现的 Hybrid 训练步骤分为三个阶段：
 
 1. **采集子批次并完成小批次 forward 计算（峰值显存小）**
 
@@ -131,7 +131,7 @@ ______________________________________________________________________
 
 3. **在合并批次上训练并推送权重**
 
-   一次 `train(...)` 调用基于合并后的 batch 完成优化器步进。随后 actor 把新权重备份到 `actor` tag（如果到达 ref 更新间隔，也刷新 `ref` tag），然后调用 `self.update_weights()` 通过 `UpdateWeightFromTensor` 把最新权重同步给 rollout。
+   一次 `train(...)` 调用基于合并后的 batch 完成优化器步进。随后 actor 把新权重备份到 `actor` tag（如果到达 ref 更新间隔，也刷新 `ref` tag），然后调用 `self.update_weights()` 通过 DCS 把最新权重同步给 rollout。
 
 子批次 forward 控制了激活峰值显存（与 Fully Async 行为一致），而合并后的训练步则保留了 Colocate 风格的全局统计量。
 
@@ -233,7 +233,7 @@ ______________________________________________________________________
 
 ### Rollout 长时间看到旧权重
 
-Hybrid 在每次 `train_hybrid` 结束时通过同步的 `UpdateWeightFromTensor` 路径推送权重。如果观察到权重更新间隔过大，请检查：
+Hybrid 在每次 `train_hybrid` 结束时通过 DCS 推送权重。如果观察到权重更新间隔过大，请检查：
 
 - Actor 日志中的 `update_weights()` 耗时
 - Rollout 健康检查是否触发了 actor 等待（权重同步前会调用 `_check_services_health()`）
@@ -244,7 +244,7 @@ ______________________________________________________________________
 
 Hybrid 模式计划推进的工作：
 
-- ~~**接入 DCS 做权重同步**~~ —— 已作为 Hybrid 默认同步机制落地（见上方配置节）。DCS 后端让 Hybrid 直接复用 fully async 的弹性扩缩容链路（扩出的引擎注册 DCS 后随每步广播获得权重），见 [弹性 Rollout](./elastic-rollout.md)。后续将多模态模型纳入该后端，并评估推送与下一轮训练重叠的优化。
+- ~~**接入 DCS 做权重同步**~~ —— 已作为 Hybrid 默认同步机制落地（见上方配置节）。DCS 后端让 Hybrid 直接复用 fully async 的弹性扩缩容链路（扩容引擎在每次 DCS 更新后从已确认的种子副本同步权重），见 [弹性 Rollout](./elastic-rollout.md)。后续将多模态模型纳入该后端，并评估推送与下一轮训练重叠的优化。
 - **将 `train_actor` 拆分为 `num_iters_per_train_update` 次训练迭代** —— 目前 `num_iters_per_train_update` 只对 forward 阶段做了切分，合并后的训练步仍然在整个全局 batch 上跑一次。下一步将训练步同样切成 `num_iters_per_train_update` 次，让优化器更新与 TransferQueue 数据消费形成流水线，并进一步压低训练侧峰值显存。
 
 相关文档：

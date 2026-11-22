@@ -116,6 +116,12 @@ def shared_task_enabled(args: Any) -> bool:
     if not managed:
         return False
     shared_teacher = deferred_opd_enabled(args)
+    selection = getattr(args, "opd_token_selection", "student_sampled")
+    if shared_teacher and getattr(args, "use_agentic_rollout", False) and selection in {"student_topk", "union"}:
+        raise ValueError(
+            f"Resident Agentic rollout with a shared OPD Teacher cannot export the Student candidates required by "
+            f"--opd-token-selection {selection}. Use --opd-token-selection student_sampled."
+        )
     if shared_teacher and deferred_genrm_enabled(args) and not uses_managed_genrm_hook(args):
         raise ValueError(
             "A shared OPD Teacher with deferred GenRM requires a scoring-only post-process hook "

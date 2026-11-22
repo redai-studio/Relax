@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import ray
 from ray import serve
 
-from relax.components.inference_gateway import InferenceGatewayService
+from relax.components.inference_gateway import gateway_deployment
 from relax.engine.inference.types import (
     LifecycleState,
     ModelSnapshot,
@@ -122,12 +122,16 @@ if __name__ == "__main__":
             _genrm_instances_resolved={"judge": {"model_path": "stub", "sampling_config": {}}},
         )
         for role in ("rollout", "genrm", "teacher"):
-            serve.run(InferenceGatewayService.bind(None, None, 0, config, role), name=role, route_prefix=f"/{role}")
+            serve.run(gateway_deployment(role).bind(None, None, 0, config, role), name=role, route_prefix=f"/{role}")
             url = f"http://127.0.0.1:{port}/{role}"
             discovery = requests.get(url + "/engines", timeout=30)
             assert discovery.status_code == 200, discovery.text
             assert discovery.json()["schema_version"] == 2
             assert discovery.json()["role"] == role
+            schema = requests.get(url + "/openapi.json", timeout=30).json()
+            assert ("/evaluate" in schema["paths"]) == (role == "rollout")
+            if role != "rollout":
+                assert requests.get(url + "/evaluate?train_step=0", timeout=30).status_code == 404
             body = {"messages": []} if role == "genrm" else {"input_ids": [1, 2]}
             response = requests.post(url + "/generate", json=body, timeout=30)
             assert response.status_code == 200, response.text

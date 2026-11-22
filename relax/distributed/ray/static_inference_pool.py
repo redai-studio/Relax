@@ -143,10 +143,17 @@ class StaticInferencePool:
         return dead
 
     def recover(self, dead: list[int]) -> None:
-        self.backend._retire_engines(dead)
         # Dedicated teachers can now move: clients resolve a fresh Manager
         # snapshot instead of keeping URLs captured at startup.
+        if dead:
+            # A dead actor cannot withdraw its Router entry. Clear that
+            # registry before a replacement can reuse the worker endpoint.
+            self.backend._close_router()
+        self.backend._retire_engines(dead)
+        self.backend._ensure_router_running()
         self.backend.recover()
+        if not self.backend.router.ready:
+            self.backend.router.activate(self.backend.engines)
 
     def dispose(self) -> None:
         if self.backend is None:

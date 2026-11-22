@@ -3361,9 +3361,20 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
         print_memory("before update_weights")
 
+        from relax.distributed.ray.inference_handle import ManagedRolloutHandle
+        from relax.engine.lora_versions.training import run_on_training_rank_zero
+
+        task_manager = (
+            self.rollout_manager.inference_manager if isinstance(self.rollout_manager, ManagedRolloutHandle) else None
+        )
+        policy_token = None
+        if task_manager is not None and not actor_fwd_only:
+            policy_token = run_on_training_rank_zero(
+                lambda: ray.get(task_manager.begin_weight_update.remote("dcs")), phase="DCS weight-update fence"
+            )
+
         managed = getattr(self, "_managed_lora_publication", False)
         if managed:
-            from relax.engine.lora_versions.training import run_on_training_rank_zero
 
             def acquire_topology_lease() -> None:
                 if not ray.get(self.rollout_manager.set_weight_updating.remote(True)):
@@ -3380,13 +3391,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
         lock_acquired = False
         try:
-            if managed:
-                run_on_training_rank_zero(acquire_sync_lock, phase="LoRA weight-sync lock")
-            elif dist.get_rank() == 0:
-                acquire_sync_lock()
-            lock_acquired = True
-            # Every PP source must select recipients after rank 0 owns the sync lock.
-            dist.barrier(group=get_gloo_group())
+            if weight_sync_lock is not None:
+                run_on_training_rank_zero(acquire_sync_lock, phase="DCS weight-sync lock acquisition")
+                lock_acquired = True
+            if policy_token is not None:
+                run_on_training_rank_zero(
+                    lambda: ray.get(task_manager.capture_dcs_recipients.remote(policy_token)),
+                    phase="DCS recipient selection",
+                )
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
             synced_actor_ids = run(
@@ -3409,28 +3421,40 @@ class MegatronTrainRayActor(TrainRayActor):
                     # sync without stranding other ranks at their barrier.
                     logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
-            if managed:
+            if managed or lock_acquired:
 
-                def release_managed_locks() -> None:
+                def release_sync_locks() -> None:
                     try:
-                        if lock_acquired and weight_sync_lock is not None:
+                        if lock_acquired:
                             ray.get(weight_sync_lock.release.remote())
                     finally:
-                        ray.get(self.rollout_manager.set_weight_updating.remote(False))
+                        if managed:
+                            ray.get(self.rollout_manager.set_weight_updating.remote(False))
 
-                run_on_training_rank_zero(release_managed_locks, phase="LoRA weight-sync cleanup")
-            elif lock_acquired and weight_sync_lock is not None and dist.get_rank() == 0:
-                ray.get(weight_sync_lock.release.remote())
+                run_on_training_rank_zero(release_sync_locks, phase="DCS weight-sync cleanup")
 
         # Remote replicas copy from a confirmed seed. This must happen after
         # releasing the DCS lock, since their native sync acquires the same lock.
-        if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0:
-            result = ray.get(
-                self.rollout_manager.sync_weights_for_scaled_out_engines.remote(),
-                timeout=self.args.rollout_http_timeout,
-            )
-            if not result.get("success"):
-                raise RuntimeError(f"Scaled-out replica weight sync failed: {result}")
+        if not actor_fwd_only:
+
+            def sync_scaled_out_engines() -> None:
+                result = ray.get(
+                    self.rollout_manager.sync_weights_for_scaled_out_engines.remote(),
+                    timeout=self.args.rollout_http_timeout,
+                )
+                if not result.get("success"):
+                    raise RuntimeError(f"Scaled-out replica weight sync failed: {result}")
+
+            run_on_training_rank_zero(sync_scaled_out_engines, phase="Scaled-out replica weight sync")
+            if policy_token is not None:
+                run_on_training_rank_zero(
+                    lambda: ray.get(
+                        task_manager.end_weight_update.remote(
+                            policy_token, str(self.checkpoint_engine_client.backend.weight_version)
+                        )
+                    ),
+                    phase="DCS weight-update publication",
+                )
 
     @timer
     def recv_weight_fully_async(self, rollout_id) -> None:

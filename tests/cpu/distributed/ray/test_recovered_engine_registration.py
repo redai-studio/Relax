@@ -5,7 +5,7 @@ alone."""
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from conftest import (
@@ -22,10 +22,15 @@ from relax.distributed.checkpoint_service.client import engine as client_module
 from relax.distributed.checkpoint_service.client.engine import CheckpointEngineClient
 
 
+async def _sync_success(*args, publish, **kwargs):
+    await publish()
+    return True
+
+
 @pytest.fixture(autouse=True)
 def single_rank_collective(monkeypatch):
     monkeypatch.setattr(client_module, "get_gloo_group", lambda: "gloo")
-    monkeypatch.setattr(client_module.dist, "get_rank", lambda **kwargs: 0)
+    monkeypatch.setattr(client_module.dist, "get_rank", lambda *args, **kwargs: 0)
     monkeypatch.setattr(client_module.dist, "get_world_size", lambda **kwargs: 1)
     monkeypatch.setattr(client_module.dist, "broadcast_object_list", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -187,9 +192,12 @@ def test_actor_publishes_only_after_successful_rollout_update(monkeypatch, fail,
         ("publish", ids, metadata)
     )
     actor._weight_sync_lock = None
+    from relax.utils import distributed_utils
+
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: "gloo")
     monkeypatch.setattr(actor_module, "get_gloo_group", lambda: "gloo")
     monkeypatch.setattr(actor_module.dist, "barrier", lambda **kwargs: None)
-    monkeypatch.setattr(actor_module.dist, "get_rank", lambda **kwargs: 0)
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda *args, **kwargs: 0)
     monkeypatch.setattr(actor_module, "print_memory", lambda *args, **kwargs: None)
     monkeypatch.setattr(actor_module, "run", asyncio.run)
     monkeypatch.setattr(actor_module.ray, "get", lambda ref, **kwargs: ref)
@@ -217,15 +225,18 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
     engine.server_port = 30000
     engine._sync_nextn_draft = False
     engine.args = SimpleNamespace(fully_async=True, coordinator_url="http://coordinator")
-    create_client = AsyncMock()
-    monkeypatch.setattr(sglang_engine, "create_client", create_client)
+    client = SimpleNamespace(start=AsyncMock(side_effect=RuntimeError("registration reply lost")))
+    client_factory = Mock(return_value=client)
+    monkeypatch.setattr(sglang_engine, "CheckpointEngineClient", client_factory)
     monkeypatch.setattr(sglang_engine, "run", asyncio.run)
     monkeypatch.setattr(
         sglang_engine.ray, "get_runtime_context", lambda: SimpleNamespace(get_actor_id=lambda: "actor-b")
     )
-    engine.register_dcs()
-    assert create_client.call_args.kwargs["metadata"]["actor_id"] == "actor-b"
-    assert create_client.call_args.kwargs["metadata"]["sync_nextn_draft"] is False
+    with pytest.raises(RuntimeError, match="registration reply lost"):
+        engine.register_dcs()
+    assert engine.checkpoint_engine_client is client
+    assert client_factory.call_args.kwargs["metadata"]["actor_id"] == "actor-b"
+    assert client_factory.call_args.kwargs["metadata"]["sync_nextn_draft"] is False
 
 
 @pytest.mark.asyncio
@@ -237,7 +248,7 @@ async def test_initial_scaleout_success_clears_pending_without_changing_recovery
     server = make_rollout_server(engine_groups=[])
     request = rollout.ScaleOutRequest(request_id="scale", status=rollout.ScaleOutStatus.CREATING)
     manager._health_check_engines = AsyncMock(return_value=True)
-    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(side_effect=_sync_success)
     result = await manager._finalize_engine_group_registration(
         request=request, srv=server, engines=[engine], engine_group=group
     )
@@ -260,7 +271,8 @@ async def test_delta_receipt_never_publishes_replacement_without_base(base_previ
     pool.actor_weight_versions = {"actor-b": "6"} if base_previously_confirmed else {}
     owner = InferenceManager.__ray_metadata__.modified_class()
     owner.pool = pool
-    await owner.begin_weight_update("dcs")
+    token = await owner.begin_weight_update("dcs")
+    await owner.capture_dcs_recipients(token)
     await owner.pool_call("register_recovered_engines", ["actor-b"], weight_version="7", base_weights_confirmed=False)
     if base_previously_confirmed:
         engine.register_to_router.remote.assert_called_once()

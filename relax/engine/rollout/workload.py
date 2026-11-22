@@ -152,7 +152,15 @@ class RolloutWorkload(ReloadableMixin):
 
         data = result.data
         self.save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        args = self.args
+        if getattr(args, "loss_type", None) == "sft":
+            from copy import copy
+
+            args = copy(args)
+            args.wandb_always_use_train_step = False
+            args.reward_key = args.eval_reward_key or args.reward_key
+            args.n_samples_per_prompt = 1
+        _log_eval_rollout_data(rollout_id, args, data, result.metrics)
 
     def _on_custom_reward_reloaded(self, module_path: str) -> None:
         """Wait for this manager's background judge to refresh as well."""
@@ -213,14 +221,28 @@ class RolloutWorkload(ReloadableMixin):
         await run_predict_loop(self, self.args, train_step)
 
     async def generate_predict(
-        self, prompts: list[str], multimodal_inputs_list: list[dict | None] | None = None
+        self,
+        prompts: list[str],
+        multimodal_inputs_list: list[dict | None] | None = None,
+        *,
+        samples: list[Any] | None = None,
     ) -> list[str]:
         from relax.engine.inference.executor import InferenceRequestExecutor
         from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
         from relax.utils import http_utils
+        from relax.utils.types import Sample
 
+        if samples is not None and len(samples) != len(prompts):
+            raise ValueError("SFT predict samples must align with prompts")
         await self.inference.resume_health_monitoring()
-        executor = InferenceRequestExecutor("rollout", self.args._inference_manager_handle, http_utils._http_client)
+        executor = InferenceRequestExecutor(
+            "rollout",
+            self.args._inference_manager_handle,
+            http_utils._http_client,
+            send_request=http_utils.send_distributed_request
+            if getattr(self.args, "use_distributed_post", False)
+            else None,
+        )
         params = {
             "temperature": getattr(self.args, "eval_temperature", None),
             "max_new_tokens": getattr(self.args, "eval_max_response_len", None),
@@ -230,15 +252,47 @@ class RolloutWorkload(ReloadableMixin):
         params = {key: defaults[key] if value is None else value for key, value in params.items()}
         media = multimodal_inputs_list if multimodal_inputs_list is not None else [None] * len(prompts)
 
-        async def one(prompt: str, multimodal: dict | None) -> str:
+        async def one(index: int, prompt: str, multimodal: dict | None) -> str:
             payload: dict[str, Any] = {"text": prompt, "sampling_params": params}
+            if getattr(self.args, "lora_rank", 0) > 0 and getattr(self.args, "lora_adapter_mode", False):
+                from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
+
+                payload["lora_path"] = LORA_ADAPTER_NAME
+            if samples is not None:
+                payload["return_logprob"] = True
+                payload["logprob_start_len"] = -1
             if multimodal:
                 encoded, _ = await _encode_multimodal_inputs(multimodal)
                 payload.update(encoded)
             output = await executor.generate_json(payload)
+            if samples is not None:
+                sample = samples[index]
+                sample.response = output["text"]
+                meta_info = output["meta_info"]
+                token_logprobs = meta_info.get("output_token_logprobs")
+                if token_logprobs is not None:
+                    response_tokens = [item[1] for item in token_logprobs]
+                    sample.rollout_log_probs = [item[0] for item in token_logprobs]
+                else:
+                    response_tokens = output["output_ids"]
+                sample.tokens.extend(response_tokens)
+                sample.rollout_tokens = list(sample.tokens)
+                sample.response_length = len(response_tokens)
+                sample.update_from_meta_info(self.args, meta_info)
+                if sample.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
+                    raise RuntimeError(f"SFT predict sample {sample.index} did not complete: {sample.status}")
             return output["text"] if isinstance(output, dict) and "text" in output else str(output)
 
-        return await asyncio.gather(*(one(prompt, mm) for prompt, mm in zip(prompts, media, strict=True)))
+        tasks = [
+            asyncio.create_task(one(index, prompt, mm))
+            for index, (prompt, mm) in enumerate(zip(prompts, media, strict=True))
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # ------------------------------ debug dump -----------------------------
 

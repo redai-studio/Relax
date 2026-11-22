@@ -59,6 +59,14 @@ class _Owner:
         async def complete_request(permit):
             self.inflight.discard(permit)
 
+        async def pool_call(method, model_name=None):
+            assert method == "get_engines_info"
+            value = provider().to_legacy_dict()
+            if model_name is not None:
+                value["models"] = {k: v for k, v in value["models"].items() if k == model_name}
+            return value
+
+        self.pool_call = SimpleNamespace(remote=pool_call)
         self.snapshot = SimpleNamespace(remote=snapshot)
         self.admit_request = SimpleNamespace(remote=admit_request)
         self.complete_request = SimpleNamespace(remote=complete_request)
@@ -76,6 +84,36 @@ async def _use_upstream(gateway: InferenceGateway, upstream) -> None:
 def test_gateway_requires_the_task_owner_handle() -> None:
     with pytest.raises(ValueError, match="task inference manager"):
         InferenceGateway(Role.ROLLOUT, manager_handle=None)
+
+
+@pytest.mark.asyncio
+async def test_v1_rollout_discovery_preserves_pool_metadata_and_model_filter():
+    from relax.distributed.ray.inference_manager import InferenceManager
+
+    owner = InferenceManager.__ray_metadata__.modified_class()
+    value = {
+        "models": {
+            "policy": {
+                "router_ip": "router",
+                "router_port": 8000,
+                "engine_groups": [{"num_gpus_per_engine": 8, "engines": [{"pid": 7, "node_id": "node"}]}],
+            }
+        },
+        "total_engines": 1,
+    }
+
+    def legacy(model_name):
+        assert model_name == "policy"
+        return value
+
+    owner.pool = SimpleNamespace(backend=SimpleNamespace(get_engines_info=legacy))
+    gateway = InferenceGateway(
+        Role.ROLLOUT, manager_handle=SimpleNamespace(pool_call=SimpleNamespace(remote=owner.pool_call))
+    )
+    try:
+        assert await gateway.engines(schema_version=1, model_name="policy") == value
+    finally:
+        await gateway.close()
 
 
 @pytest.mark.asyncio

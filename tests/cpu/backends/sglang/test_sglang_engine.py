@@ -57,6 +57,7 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     module = sglang_engine_module
     events = []
     http_server = ModuleType("sglang.srt.entrypoints.http_server")
+    monkeypatch.setattr(module.os, "setsid", lambda: events.append("session"))
     http_server.launch_server = Mock(side_effect=lambda *_args, **_kwargs: events.append("launch"))
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
     monkeypatch.setattr(
@@ -76,11 +77,11 @@ def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
     module._launch_server_with_patches(server_args, 123)
 
     if parent_alive:
-        assert events == ["guard", "parent_check", "launch"]
+        assert events == ["session", "guard", "parent_check", "launch"]
         kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
         http_server.launch_server.assert_called_once_with(server_args, **kwargs)
     else:
-        assert events == ["guard", "parent_check"]
+        assert events == ["session", "guard", "parent_check"]
         http_server.launch_server.assert_not_called()
 
 
@@ -637,5 +638,5 @@ def test_static_model_router_waits_for_healthy_regular_worker(monkeypatch, sglan
     monkeypatch.setattr(module.requests, "get", get)
     monkeypatch.setattr(module.time, "sleep", lambda _: None)
     assert engine.configure_model_router("router", 3000) is True
-    assert get.call_count == 3
+    assert get.call_count == 2
     assert engine._router_worker_id == "replica"

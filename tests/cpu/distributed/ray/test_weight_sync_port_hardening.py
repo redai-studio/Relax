@@ -79,7 +79,7 @@ def test_rollout_ports_exclude_configured_genrm_windows(
 ):
     """A free-but-not-yet-bound judge port must not become a rollout
     TCPStore."""
-    from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
+    from relax.distributed.ray.policy_engine_pool import _allocate_rollout_engine_addr_and_ports_normal
 
     args = SimpleNamespace(num_gpus_per_node=1, rollout_num_gpus_per_engine=1, sglang_dp_size=1, **genrm_config)
     engine = make_mock_engine()

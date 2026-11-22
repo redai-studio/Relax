@@ -76,6 +76,11 @@ def zero_wait_get(monkeypatch):
     return calls
 
 
+async def _sync_success(*args, publish, **kwargs):
+    await publish()
+    return True
+
+
 def make_manager(engines, refs):
     group = rollout.EngineGroup(
         args=SimpleNamespace(num_gpus_per_node=8),
@@ -87,6 +92,7 @@ def make_manager(engines, refs):
     group.engine_init_records = {slot: SimpleNamespace(value=ref) for slot, ref in enumerate(refs)}
     server = rollout.RolloutServer(engine_groups=[group], router_ip="127.0.0.1", router_port=3000, model_name="actor")
     manager = object.__new__(rollout.PolicyEnginePool)
+    manager._engine_lifecycle_lock = threading.RLock()
     manager._engine_actor_states = ActorState
     manager.servers = {"actor": server}
     manager.args = SimpleNamespace(
@@ -634,9 +640,12 @@ def test_start_engines_preserves_submitted_record_on_later_synchronous_failure(m
 
 def prepare_external_manager(monkeypatch, *, policy="keep_partial", finalize_success=True, creation_error=False):
     manager, initial_group = make_manager([make_engine()], [engine_metadata(pid=100)])
+    manager._next_engine_rank = initial_group.rank_offset + len(initial_group.all_engines)
     manager.args.scale_out_partial_success_policy = policy
     manager._health_check_engines = AsyncMock(return_value=True)
-    manager._sync_weights_from_seed_engine = AsyncMock(return_value=finalize_success)
+    manager._sync_weights_from_seed_engine = (
+        AsyncMock(side_effect=_sync_success) if finalize_success else AsyncMock(return_value=False)
+    )
     manager._rollback_engines = AsyncMock()
     engines = [make_engine(), make_engine(), make_engine()]
     refs = [InitResult(engine_metadata(pid=i)) for i in range(3)]
@@ -714,7 +723,7 @@ def test_native_finalizer_keeps_existing_init_record_identity():
     server = manager.servers["actor"]
     server.engine_groups = []
     manager._health_check_engines = AsyncMock(return_value=True)
-    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(side_effect=_sync_success)
     engine.register_dcs.remote.side_effect = lambda: InitResult(None)
     engine.register_to_router.remote.side_effect = lambda: InitResult(True)
     request = rollout.ScaleOutRequest(

@@ -233,6 +233,8 @@ def create_test_manager(args=None, servers=None):
     manager._engine_lifecycle_lock = threading.RLock()
     manager._training_weight_updating = False
     manager._scale_out_weight_updating = False
+    manager._unconfirmed_rollback_engines = []
+    manager._unconfirmed_rollback_placement_groups = []
     manager._next_engine_rank = max(
         (
             group.rank_offset + len(group.all_engines)

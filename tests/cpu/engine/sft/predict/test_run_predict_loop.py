@@ -380,7 +380,8 @@ async def test_generate_and_write_predictions_rejects_missing_scored_completions
 
 
 @pytest.mark.asyncio
-async def test_predict_workload_uses_managed_admission_and_returns_permits(monkeypatch):
+@pytest.mark.parametrize("scoring", [False, True])
+async def test_predict_workload_uses_managed_admission_and_returns_permits(monkeypatch, scoring):
     import httpx
 
     from relax.engine.inference.lifecycle import AdmissionLedger
@@ -439,13 +440,48 @@ async def test_predict_workload_uses_managed_admission_and_returns_permits(monke
         assert ledger.permits
         payload = json.loads(request.content)
         requests.append(payload)
-        return httpx.Response(200, json={"text": payload["text"] + " done"})
+        return httpx.Response(
+            200,
+            json={
+                "text": payload["text"] + " done",
+                "meta_info": {"output_token_logprobs": [[-0.5, 42, None]], "finish_reason": {"type": "stop"}},
+            },
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as client:
         monkeypatch.setattr(http_utils, "_http_client", client)
         workload = RolloutWorkload.__new__(RolloutWorkload)
-        workload.args = SimpleNamespace(_inference_manager_handle=owner)
+        workload.args = SimpleNamespace(
+            _inference_manager_handle=owner,
+            lora_rank=8,
+            lora_adapter_mode=True,
+            use_distributed_post=scoring,
+            sglang_speculative_algorithm=None,
+        )
+        remote_requests = []
+
+        async def remote_send(url, body, headers):
+            remote_requests.append(url)
+            return await http_utils._request_once(client, url, body, headers)
+
+        monkeypatch.setattr(
+            http_utils, "_post_actors", [SimpleNamespace(do_request=SimpleNamespace(remote=remote_send))]
+        )
         workload.inference = SimpleNamespace(resume_health_monitoring=ready)
-        assert await workload.generate_predict(["one", "two"]) == ["one done", "two done"]
+        samples = [Sample(index=i, tokens=[10]) for i in range(2)] if scoring else None
+        assert await workload.generate_predict(["one", "two"], samples=samples) == ["one done", "two done"]
+        if scoring:
+            assert all(sample.tokens == [10, 42] and sample.rollout_tokens == [10, 42] for sample in samples)
+            assert all(sample.response_length == 1 and sample.rollout_log_probs == [-0.5] for sample in samples)
+            assert all(sample.status is Sample.Status.COMPLETED for sample in samples)
+            assert all(request["return_logprob"] for request in requests)
+            from relax.engine.rollout.sglang_rollout import _post_generation
+
+            output = await _post_generation(workload.args, None, "unused", {"text": "native"}, None, evaluation=True)
+            assert output["text"] == "native done"
+            assert len(remote_requests) == 3
+        else:
+            assert not remote_requests
     assert not ledger.permits
-    assert all(request["sampling_params"]["max_new_tokens"] == 512 for request in requests)
+    assert all(request["sampling_params"]["max_new_tokens"] == 512 for request in requests[:2])
+    assert all(request["lora_path"] == "relax_policy_lora" for request in requests[:2])

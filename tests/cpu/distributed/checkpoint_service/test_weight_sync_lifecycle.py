@@ -4,11 +4,33 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 import torch
 
 from relax.distributed.checkpoint_service.backends import device_direct
 from relax.distributed.checkpoint_service.client import engine as engine_module
+
+
+@pytest.mark.asyncio
+async def test_strict_rollout_unregistration_reconciles_lost_registration_reply():
+    client = engine_module.CheckpointEngineClient(
+        args=SimpleNamespace(), coordinator_url="http://dcs", role="rollout", rank=4
+    )
+    responses = iter([503, 404])
+    calls = []
+
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(next(responses))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as transport:
+        client._http_client = transport
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.unregister(strict=True)
+        await client.unregister(strict=True)
+    assert len(calls) == 2
+    assert all(dict(call.url.params) == {"role": "rollout", "rank": "4"} for call in calls)
 
 
 @pytest.mark.parametrize("rank", [0, 1])

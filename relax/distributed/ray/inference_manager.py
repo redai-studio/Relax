@@ -185,8 +185,9 @@ class _ModelRuntime:
             if not self.memory_ready:
                 return
             dead = await _blocking(self.pool.unhealthy_ranks)
+            router_healthy = await _blocking(self.pool.backend.router.is_healthy)
             self._last_health = asyncio.get_running_loop().time()
-            if not dead:
+            if not dead and router_healthy:
                 return
             await self.ledger.drain("health", timeout=120)
             self.state = LifecycleState.DRAINING
@@ -266,6 +267,8 @@ class _ModelRuntime:
     async def snapshot(self, role: Role | str = Role.ROLLOUT) -> RoleSnapshot:
         if Role(role) is not self.role or self.pool is None:
             raise RuntimeError("Inference role is not registered")
+        if getattr(self.pool.backend, "_scale_out_cleanup_failed", False):
+            self.state = LifecycleState.DEAD
         if (
             self.role is not Role.ROLLOUT
             and not self._closing
@@ -338,6 +341,8 @@ class _ModelRuntime:
             if self._closing or self._disposed:
                 raise RuntimeError("Inference manager is closing")
             if self.state is LifecycleState.DEAD:
+                if self.pool is not None and getattr(self.pool.backend, "_scale_out_cleanup_failed", False):
+                    raise RuntimeError("Inference manager cannot confirm scale-out rollback")
                 raise RuntimeError("Inference manager cannot restore engine residency")
             if any(
                 model.admission and (model_id is None or model.model_id == model_id)
@@ -388,12 +393,19 @@ class _ModelRuntime:
             raise ValueError("Static models do not receive policy weight updates")
         token = uuid4().hex
         if source == "dcs":
-            self._capture_sync_generations()
             self._policy_version_pending = True
             self.ledger.fences.add("transport_version")
         self._updates[token] = source
         await self.ledger.drain(token, timeout=120)
         return token
+
+    async def capture_dcs_recipients(self, token: str) -> None:
+        """Record replica generations while the trainer owns the DCS lock."""
+        if self._closing or self._disposed or self._updates.get(token) != "dcs":
+            raise RuntimeError("DCS weight update is not active")
+        if getattr(self.pool.backend, "_scale_out_cleanup_failed", False):
+            raise RuntimeError("DCS weight update cannot proceed after unconfirmed scale-out rollback")
+        self._capture_sync_generations()
 
     async def end_weight_update(self, token: str, weight_version: str | int | None = None) -> None:
         if token not in self._updates:
@@ -410,14 +422,15 @@ class _ModelRuntime:
         self.ledger.fences.discard(token)
         self.ledger.fences.discard("recovery")
 
-    async def begin_rollout(self, rollout_id: int) -> None:
+    async def begin_rollout(self, rollout_id: int | None) -> None:
         if self.pool is None or self._closing or self._disposed:
             raise RuntimeError("Inference manager is not running")
         backend = self.pool.backend
         await _blocking(backend._begin_generation)
         if self._closing:
             raise RuntimeError("Inference manager is not running")
-        backend.rollout_id = rollout_id
+        if rollout_id is not None:
+            backend.rollout_id = rollout_id
         await _blocking(backend.health_monitoring_resume)
 
     async def inject_ci_fault(self) -> None:
@@ -556,6 +569,14 @@ class _ModelRuntime:
                 args = (sorted(confirmed), *args[1:])
             else:
                 kwargs["synced_actor_ids"] = sorted(confirmed)
+        if method == "sync_weights_for_scaled_out_engines" and getattr(
+            self.pool, "requires_weight_confirmation", False
+        ):
+            version = self.required_weight_version
+            kwargs["required_version"] = version
+            kwargs["confirmed_actor_ids"] = {
+                actor_id for actor_id, confirmed in self.pool.actor_weight_versions.items() if confirmed == version
+            }
         result = await _blocking(getattr(backend, method), *args, **kwargs)
         if method in {"get_rollout_engines_and_lock", "recover_rollout_engines"}:
             # The sync transport exposes only each replica's first node. Capture

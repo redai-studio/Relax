@@ -107,7 +107,10 @@ class RolloutPool:
             )
         try:
             ready = (
-                ready and not self.backend._training_weight_updating and not self.backend._scale_out_weight_updating
+                ready
+                and not self.backend._training_weight_updating
+                and not self.backend._scale_out_weight_updating
+                and not getattr(self.backend, "_unconfirmed_rollback_engines", ())
             )
             for name, server in self.backend.servers.items():
                 direct = getattr(self.backend, "route_mode", "router") == "direct"

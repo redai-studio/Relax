@@ -6,6 +6,8 @@
 
 未启用 `--colocate` 的标准 SGLang 任务通过公共推理管理器和请求执行链调用 Relax 管理的单 Teacher。副本恢复后，请求会读取当前端点；`--opd-teacher-timeout-s` 限制包括准入与响应读取在内的 Teacher 请求总时长。Teacher 保持自己的 checkpoint 权重，不接收 Actor 权重更新。所有托管角色共用一个任务级 CPU InferenceManager，角色句柄仅是转发视图，不是独立 owner。共置任务遵循下文的阶段顺序，包括 native 和 resident Agentic 工作负载。托管多 Teacher 路由仍仅支持 colocate。
 
+Resident Agentic rollout 与 Teacher 复用 Rollout GPU 时，请使用 `student_sampled` 或 `teacher_topk`。启动时会拒绝 `student_topk` 和 `union`，因为 resident 导出缺少这两种模式需要的 Student 候选 token ID 与 log probability。
+
 使用 `--opd-teacher-url` 时，Teacher 为外部服务：Relax 发送请求，但不分配其 GPU，也不会在训练结束时关闭外部进程。原有外部 Teacher 路由继续适用。
 
 ## 共置 Teacher 的执行阶段

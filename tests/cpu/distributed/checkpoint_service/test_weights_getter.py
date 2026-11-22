@@ -167,6 +167,8 @@ def _import_actor_module():
 
 
 def test_rollout_only_skips_actor_fwd_group_init(monkeypatch):
+    from relax.utils import distributed_utils
+
     pytest.importorskip("megatron.core")
     actor_mod = _import_actor_module()
 
@@ -186,9 +188,11 @@ def test_rollout_only_skips_actor_fwd_group_init(monkeypatch):
     monkeypatch.setattr(actor_mod, "run", fake_run)
     monkeypatch.setattr(actor_mod, "print_memory", lambda *args, **kwargs: None)
     monkeypatch.setattr(actor_mod, "get_gloo_group", lambda: None)
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: None)
     monkeypatch.setattr(actor_mod.ray, "get", lambda ref, **kwargs: ref)
     monkeypatch.setattr(dist, "barrier", lambda *args, **kwargs: None)
     monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda *args, **kwargs: None)
 
     actor.update_weights_fully_async(0, rollout_only=True)
 

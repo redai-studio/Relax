@@ -21,16 +21,14 @@ class ModelRouter:
         from relax.distributed.ray import policy_engine_pool
 
         config = copy(args)
-        before = tuple(policy_engine_pool._LAUNCHED_ROUTER_PROCESSES)
-        try:
-            host, port = policy_engine_pool._start_router(config, force_new=True)
-            if not host or not port:
-                raise RuntimeError("Static model router did not start")
-            self.endpoint = (host, port)
-        finally:
-            self.processes.extend(
-                process for process in policy_engine_pool._LAUNCHED_ROUTER_PROCESSES if process not in before
-            )
+        # Route to each auxiliary server's own dispatcher. Policy-only
+        # middleware can rewrite input_ids with the wrong model tokenizer.
+        config.router_dp_aware = False
+        config.slime_router_middleware_paths = []
+        host, port = policy_engine_pool._start_router(config, force_new=True, owned_processes=self.processes)
+        if not host or not port:
+            raise RuntimeError("Static model router did not start")
+        self.endpoint = (host, port)
 
     @property
     def url(self) -> str | None:
@@ -51,6 +49,17 @@ class ModelRouter:
             ):
                 raise RuntimeError("Static replica router registration is unconfirmed")
         self.ready = True
+
+    def is_healthy(self) -> bool:
+        if self.endpoint is None or any(not process.is_alive() for process in self.processes):
+            self.ready = False
+            return False
+        try:
+            requests.get(f"{self.url}/workers", timeout=5).raise_for_status()
+        except requests.RequestException:
+            self.ready = False
+            return False
+        return True
 
     def withdraw(self, engines: list[Any]) -> None:
         self.ready = False

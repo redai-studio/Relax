@@ -119,7 +119,7 @@ async def test_shared_rollout_allows_training_only_after_round_and_all_releases(
         "RolloutWorkload",
         Mock(return_value=SimpleNamespace(generate=generate, get_dynamic_global_batch_size=lambda: dynamic_size)),
     )
-    args = SimpleNamespace(_inference_phase_coordinator=coordinator_rpc, tq_config=None)
+    args = SimpleNamespace(colocate=True, _inference_phase_coordinator=coordinator_rpc, tq_config=None)
     manager = SimpleNamespace(
         begin_rollout=SimpleNamespace(remote=AsyncMock()), wait_ready=SimpleNamespace(remote=AsyncMock())
     )

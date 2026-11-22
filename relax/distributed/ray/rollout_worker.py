@@ -105,37 +105,49 @@ class RolloutWorker:
         self._startup_ready = True
 
     async def generate(self, rollout_id: int) -> None:
-        shared = getattr(self.args, "_inference_phase_coordinator", None) is not None
-        if shared:
-            async with self._phase_lock:
-                if self._closed:
-                    raise RuntimeError("Rollout worker is closed")
-                if self._generation_failed:
-                    raise RuntimeError("Shared generation attempt failed; recovery requires a new RolloutWorker")
-                if self._generation_running:
-                    raise RuntimeError("Shared generation is already running")
-                self._generation_running = True
-                self._generation_completed = False
-                self._training_ready = False
-        try:
-            await self._activate_generation()
-            await self.manager.begin_rollout.remote(rollout_id)
-            await self._run("generate", rollout_id)
-            if shared:
+        if not self._shares_training_gpus():
+            await self._generate(rollout_id)
+            return
+        if self._generation_running:
+            raise RuntimeError("Shared generation is already running")
+        async with self._phase_lock:
+            self._check_shared_workload()
+            self._generation_running = True
+            self._generation_completed = False
+            self._training_ready = False
+            try:
+                await self._generate(rollout_id)
                 self._generation_completed = True
-        except BaseException:
-            if shared:
-                # Cancellation may leave shielded work or an unknown TQ write
-                # alive. This owner must never begin another attempt.
+            except BaseException:
+                # A cancelled attempt may still own a thread or an unknown TQ write.
                 self._generation_failed = True
-            raise
-        finally:
-            if shared:
+                raise
+            finally:
                 self._generation_running = False
 
+    def _shares_training_gpus(self) -> bool:
+        return (
+            getattr(self.args, "_inference_phase_coordinator", None) is not None
+            and getattr(self.args, "colocate", False)
+            and not getattr(self.args, "hybrid", False)
+        )
+
+    def _check_shared_workload(self) -> None:
+        if self._closed:
+            raise RuntimeError("Rollout worker is closed")
+        if self._generation_failed:
+            raise RuntimeError("Shared generation attempt failed; recovery requires a new RolloutWorker")
+
+    async def _generate(self, rollout_id: int) -> None:
+        await self._activate_generation()
+        await self.manager.begin_rollout.remote(rollout_id)
+        await self._run("generate", rollout_id)
+
     async def offload(self) -> None:
+        if self._generation_running:
+            raise RuntimeError("Cannot release shared rollout GPUs before generation and scoring complete")
         async with self._phase_lock:
-            if self._generation_running or self._generation_failed:
+            if self._generation_failed:
                 raise RuntimeError("Cannot release shared rollout GPUs before generation and scoring complete")
             await self.args._inference_phase_coordinator.switch.remote("startup")
             self._training_ready = self._generation_completed
@@ -144,13 +156,28 @@ class RolloutWorker:
         return "offload" if self._training_ready else "onload"
 
     async def eval(self, rollout_id: int) -> None:
-        if getattr(self.args, "_inference_phase_coordinator", None) is not None:
-            if self._generation_failed:
-                raise RuntimeError("Shared generation attempt failed; recovery requires a new RolloutWorker")
-            if self._generation_running:
-                raise RuntimeError("Shared generation is already running")
+        if self._shares_training_gpus():
+            # HTTP evaluation schedules this RPC in the background. Wait here
+            # before touching residency, and hold the phase through evaluation.
+            async with self._phase_lock:
+                self._check_shared_workload()
+                try:
+                    if self._training_ready:
+                        # Only the trainer may restore inference after this
+                        # worker has handed it the shared GPU bundles.
+                        await self.manager.wait_ready.remote("rollout")
+                    else:
+                        await self._activate_generation()
+                    await self._run_eval(rollout_id)
+                except asyncio.CancelledError:
+                    self._generation_failed = True
+                    raise
+            return
         await self._activate_generation()
-        await self.manager.begin_rollout.remote(rollout_id)
+        await self._run_eval(rollout_id)
+
+    async def _run_eval(self, rollout_id: int) -> None:
+        await self.manager.begin_rollout.remote(None)
         await self._run("eval", rollout_id)
 
     async def drain_eval_judges(self) -> None:
@@ -161,10 +188,14 @@ class RolloutWorker:
         await self._run("run_predict", train_step)
 
     async def generate_predict(
-        self, prompts: list[str], multimodal_inputs_list: list[dict | None] | None = None
+        self,
+        prompts: list[str],
+        multimodal_inputs_list: list[dict | None] | None = None,
+        *,
+        samples: list[Any] | None = None,
     ) -> Any:
         await self._activate_generation()
-        return await self._run("generate_predict", prompts, multimodal_inputs_list)
+        return await self._run("generate_predict", prompts, multimodal_inputs_list, samples=samples)
 
     async def save(self, rollout_id: int) -> None:
         await self._run("save", rollout_id)

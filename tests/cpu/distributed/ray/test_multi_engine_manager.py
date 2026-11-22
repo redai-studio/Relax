@@ -38,7 +38,7 @@ class _RemoteCall:
         self._engine = engine
         self._method = method
 
-    def remote(self, **kwargs):
+    def remote(self, *args, **kwargs):
         return (self._engine, self._method)
 
 
@@ -401,7 +401,7 @@ def test_unknown_release_preserves_slot_and_placement(_patch_ray, monkeypatch, o
 
 @pytest.mark.parametrize("exit_confirmed", [True, False])
 def test_permanently_dead_actor_requires_independent_exit_confirmation(_patch_ray, monkeypatch, exit_confirmed):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     manager = _FakeManager(num_slots=1)
     engine = manager.all_engines[0]
@@ -435,7 +435,7 @@ def test_permanently_dead_actor_requires_independent_exit_confirmation(_patch_ra
 
 
 def test_dead_actor_without_process_receipt_keeps_ownership(_patch_ray, monkeypatch):
-    import relax.distributed.ray.multi_engine_manager as mem
+    import relax.distributed.ray.engine_pool as mem
 
     manager = _FakeManager(num_slots=1)
     engine = manager.all_engines[0]
@@ -448,6 +448,32 @@ def test_dead_actor_without_process_receipt_keeps_ownership(_patch_ray, monkeypa
         manager.shutdown()
     assert manager.all_engines == [engine]
     assert engine not in _patch_ray.killed
+
+
+def test_dead_static_actor_closes_router_before_retirement(_patch_ray, monkeypatch):
+    from relax.distributed.ray import engine_pool, model_router
+
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    router = model_router.ModelRouter()
+    router.endpoint, router.ready = ("router", 8000), True
+    manager.router = router
+    monkeypatch.setattr(
+        model_router.requests, "get", lambda *args, **kwargs: SimpleNamespace(raise_for_status=lambda: None)
+    )
+    original_get = engine_pool.ray.get
+
+    def get(ref, timeout=None):
+        if isinstance(ref, tuple) and ref[0] is engine:
+            raise engine_pool.ray.exceptions.ActorDiedError()
+        return original_get(ref, timeout=timeout)
+
+    monkeypatch.setattr(engine_pool.ray, "get", get)
+    monkeypatch.setattr(manager, "_confirm_dead_engine_exit", lambda rank: True)
+    manager.offload()
+    assert not router.ready and router.endpoint is None
+    assert manager.all_engines == [None]
+    assert engine in _patch_ray.killed
 
 
 @pytest.mark.parametrize("failure", ["address", "init"])
@@ -534,10 +560,16 @@ def test_static_router_withdrawal_precedes_release_and_registration_follows_resu
         trace.append("register")
 
     def close():
-        assert engine in _patch_ray.killed
+        assert engine not in _patch_ray.killed
         trace.append("router exit")
 
-    manager.router = SimpleNamespace(withdraw=withdraw, activate=activate, close=close)
+    manager.router = SimpleNamespace(
+        is_healthy=lambda: True,
+        endpoint=("router", 1),
+        withdraw=withdraw,
+        activate=activate,
+        close=close,
+    )
     manager.offload()
     manager.onload()
     manager.shutdown()
@@ -551,7 +583,7 @@ def test_static_router_unknown_withdrawal_does_not_release_memory(_patch_ray):
     def fail(engines):
         raise TimeoutError("Router withdrawal unconfirmed")
 
-    manager.router = SimpleNamespace(withdraw=fail)
+    manager.router = SimpleNamespace(is_healthy=lambda: True, withdraw=fail)
     with pytest.raises(TimeoutError, match="withdrawal unconfirmed"):
         manager.offload()
     assert "release_memory_occupation" not in engine.calls

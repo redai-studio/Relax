@@ -51,6 +51,8 @@ def register_sft_rollout(config: Namespace, algo: dict) -> list:
 def register_extra_roles(config: Namespace, algo: dict) -> list:
     """Register optional roles and return them in controller iteration
     order."""
+    if getattr(config, "debug_train_only", False):
+        return []
     extras = []
     extras.extend(register_genrm(config, algo))
     from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled

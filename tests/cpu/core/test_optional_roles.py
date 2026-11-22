@@ -62,3 +62,7 @@ def test_auxiliary_roles_register_the_same_gateway_class():
     roles = {}
     assert register_extra_roles(config, roles) == ["genrm", "teacher"]
     assert roles["genrm"] is roles["teacher"] is InferenceGatewayService
+    config.debug_train_only = True
+    replay_roles = {}
+    assert register_extra_roles(config, replay_roles) == []
+    assert replay_roles == {}

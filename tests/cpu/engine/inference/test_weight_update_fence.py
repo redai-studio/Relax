@@ -53,7 +53,46 @@ def _rank(rank: int, rendezvous: str, directory: str, fail: bool | str) -> None:
 
     value = torch.ones(1)
     try:
-        Backend().update()
+        if fail in {"scaled", "lock_acquire", "lock_release"}:
+            import asyncio
+
+            from relax.backends.megatron import actor as actor_module
+
+            async def transfer(*args):
+                Path(directory, f"transfer-{rank}.txt").touch()
+                return []
+
+            def acquire():
+                if fail == "lock_acquire":
+                    raise RuntimeError("lock unavailable")
+                return True
+
+            def release():
+                if fail == "lock_release":
+                    raise RuntimeError("lock release unavailable")
+
+            def scaled():
+                Path(directory, f"scaled-{rank}.txt").touch()
+                return {"success": False}
+
+            actor_module.print_memory = lambda *args, **kwargs: None
+            actor_module.run = asyncio.run
+            train_actor = object.__new__(actor_module.MegatronTrainRayActor)
+            train_actor.args = SimpleNamespace(rollout_http_timeout=5)
+            train_actor._weight_sync_lock = SimpleNamespace(
+                acquire=SimpleNamespace(remote=acquire), release=SimpleNamespace(remote=release)
+            )
+            train_actor.checkpoint_engine_client = SimpleNamespace(
+                backend=SimpleNamespace(weight_version="1"), update_weights_for_rollout=transfer
+            )
+            train_actor.rollout_manager = SimpleNamespace(
+                register_recovered_engines=SimpleNamespace(remote=lambda *args, **kwargs: None),
+                sync_weights_for_scaled_out_engines=SimpleNamespace(remote=scaled),
+            )
+            entered = True
+            train_actor.update_weights_fully_async(0, rollout_only=True)
+        else:
+            Backend().update()
         result = f"entered={entered},sum={int(value[0])}"
     except RuntimeError as exc:
         result = f"entered={entered},error={exc}"
@@ -127,14 +166,23 @@ def test_managed_fence_publishes_transport_version_after_sync(monkeypatch, trans
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="requires CPU Gloo collectives")
-def test_post_sync_rank_local_failure_never_strands_peers_in_end_broadcast(tmp_path):
+@pytest.mark.parametrize(
+    ("failure", "message", "transferred", "scaled"),
+    [
+        ("body", "Policy weight synchronization failed on ranks [1]", False, False),
+        ("scaled", "Scaled-out replica weight sync failed", True, True),
+        ("lock_acquire", "DCS weight-sync lock acquisition failed: RuntimeError: lock unavailable", False, False),
+        ("lock_release", "DCS weight-sync cleanup failed: RuntimeError: lock release unavailable", True, False),
+    ],
+)
+def test_rank_local_sync_failure_never_strands_peers(tmp_path, failure, message, transferred, scaled):
     """Two bounded CPU ranks exercise the real collective error handshake.
 
     Local mocks cannot reveal a peer stuck waiting for the end broadcast. This
     reuses the existing Gloo harness (two processes, 45-second parent timeout).
     """
     rendezvous = f"file://{tmp_path / 'post-sync-rendezvous'}"
-    context = mp.spawn(_rank, args=(rendezvous, str(tmp_path), "body"), nprocs=2, join=False)
+    context = mp.spawn(_rank, args=(rendezvous, str(tmp_path), failure), nprocs=2, join=False)
     deadline = monotonic() + 45
     try:
         while not context.join(timeout=1):
@@ -145,7 +193,11 @@ def test_post_sync_rank_local_failure_never_strands_peers_in_end_broadcast(tmp_p
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
-    results = [(tmp_path / f"rank-{rank}.txt").read_text() for rank in range(2)]
-    assert all("Policy weight synchronization failed on ranks [1]" in result for result in results)
-    assert all("rank-local post-sync failed" in result for result in results)
+    for rank in range(2):
+        result = (tmp_path / f"rank-{rank}.txt").read_text()
+        assert message in result, f"rank {rank} reported {result!r}"
+        assert (tmp_path / f"transfer-{rank}.txt").exists() is transferred
+        assert (tmp_path / f"scaled-{rank}.txt").exists() is (scaled and rank == 0)
+        if failure == "body":
+            assert "rank-local post-sync failed" in result
     assert not list(tmp_path.glob("end-*.txt"))

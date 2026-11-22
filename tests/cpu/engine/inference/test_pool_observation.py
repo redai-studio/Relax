@@ -63,6 +63,77 @@ def observe(pool):
     return pool.observe(ready=True, state=LifecycleState.READY)[0]
 
 
+@pytest.mark.parametrize("replaced", [False, True])
+def test_async_actor_captures_current_dcs_recipients_before_first_publication(pool, monkeypatch, replaced):
+    import asyncio
+
+    from relax.backends.megatron import actor as actor_module
+    from relax.distributed.ray.inference_handle import ManagedRolloutHandle
+    from relax.distributed.ray.inference_manager import InferenceManager
+    from relax.utils import distributed_utils
+
+    pool.requires_weight_confirmation = True
+    pool.actor_weight_versions = {}
+    pool.backend.register_recovered_engines = lambda ids: None
+    pool.backend.sync_weights_for_scaled_out_engines = lambda **kwargs: {"success": True}
+    owner = InferenceManager.__ray_metadata__.modified_class()
+    owner.pool, owner.memory_ready, owner.state = pool, True, LifecycleState.READY
+    group = pool.backend.servers["default"].engine_groups[0]
+    identity = "replacement" if replaced else "original"
+    held = False
+
+    def acquire():
+        nonlocal held
+        assert not held and owner.ledger.fences
+        if replaced:
+            # The expansion publishes after admission has drained and before
+            # the trainer obtains the transport lock.
+            group.all_engines[0] = actor(identity)
+        held = True
+        return True
+
+    def release():
+        nonlocal held
+        assert held
+        held = False
+
+    def rpc(method):
+        return SimpleNamespace(remote=lambda *args, **kwargs: asyncio.run(method(*args, **kwargs)))
+
+    handle = SimpleNamespace(
+        **{
+            name: rpc(getattr(owner, name))
+            for name in ("begin_weight_update", "capture_dcs_recipients", "end_weight_update", "pool_call")
+        }
+    )
+    train_actor = object.__new__(actor_module.MegatronTrainRayActor)
+    train_actor.rollout_manager = ManagedRolloutHandle(handle, None)
+    train_actor.args = SimpleNamespace(rollout_http_timeout=10)
+    train_actor._weight_sync_lock = SimpleNamespace(
+        acquire=SimpleNamespace(remote=acquire), release=SimpleNamespace(remote=release)
+    )
+
+    async def transfer(*args):
+        assert owner.ledger.fences and held
+        return [identity]
+
+    train_actor.checkpoint_engine_client = SimpleNamespace(
+        backend=SimpleNamespace(weight_version="1"), update_weights_for_rollout=transfer
+    )
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: "test")
+    monkeypatch.setattr(actor_module, "get_gloo_group", lambda: "test")
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(actor_module.dist, "broadcast_object_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(actor_module.dist, "barrier", lambda **kwargs: None)
+    monkeypatch.setattr(actor_module.ray, "get", lambda ref, **kwargs: ref)
+    monkeypatch.setattr(actor_module, "run", asyncio.run)
+    monkeypatch.setattr(actor_module, "print_memory", lambda *args, **kwargs: None)
+    train_actor.update_weights_fully_async(0, rollout_only=True)
+    assert pool.actor_weight_versions == {identity: "1"}
+    assert asyncio.run(owner.snapshot()).models[0].admission
+    assert not owner.ledger.fences
+
+
 def test_recovered_process_is_not_ready_until_its_weights_are_synced(pool):
     assert observe(pool).admission
     pool.backend.servers["default"].engine_groups[0].all_engines[0] = actor("replacement")
@@ -336,6 +407,7 @@ async def test_dcs_head_receipt_confirms_only_the_pre_sync_whole_replica(pool, r
     owner.memory_ready = True
     owner.state = LifecycleState.READY
     token = await owner.begin_weight_update("dcs")
+    await owner.capture_dcs_recipients(token)
     if replace_secondary:
         group.all_engines[1] = actor("replacement")
     await owner.pool_call("register_recovered_engines", ["original"], weight_version="dcs-5")

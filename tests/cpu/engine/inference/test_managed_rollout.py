@@ -15,6 +15,7 @@ from relax.engine.inference.types import LifecycleState, ModelSnapshot, ReplicaS
 
 class FakeBackend:
     def __init__(self):
+        self.router = SimpleNamespace(is_healthy=lambda: True)
         self._is_weight_updating = False
         self.reject_update = False
         self.fail_offload = False

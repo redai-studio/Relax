@@ -13,7 +13,9 @@ class MemoryPool:
     def __init__(self, role, args, binding, options):
         self.model_id = options["model_id"]
         self.start_sleeping = False
-        self.backend = SimpleNamespace(engines=[], offload=self.offload, onload=self.onload)
+        self.backend = SimpleNamespace(
+            engines=[], offload=self.offload, onload=self.onload, router=SimpleNamespace(is_healthy=lambda: True)
+        )
         self.resident = True
         self.url = "http://engine"
         self.disposed = False
@@ -59,11 +61,15 @@ async def test_task_registers_all_models_in_one_request_and_placement_domain(mon
         for runtime in task.models.values()
     )
     offload = asyncio.create_task(task.dispatch("teacher", "math", "offload"))
-    for _ in range(100):
-        if "memory" in task.models[(Role.TEACHER, "math")].ledger.fences:
-            break
-        await asyncio.sleep(0)
+
+    async def wait_for_drain():
+        while "memory" not in task.models[(Role.TEACHER, "math")].ledger.fences:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_drain(), 1)
     assert not offload.done()
+    with pytest.raises(RuntimeError, match="not ready"):
+        await task.admit_request("teacher", "math")
     await task.complete_request(first)
     await asyncio.wait_for(offload, 1)
     assert second in task.requests.permits

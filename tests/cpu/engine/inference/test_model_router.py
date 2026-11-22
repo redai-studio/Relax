@@ -52,6 +52,38 @@ def test_model_router_retains_process_until_exit_confirmed():
     assert router.processes == []
 
 
+@pytest.mark.parametrize("launch_fails", [False, True])
+def test_static_router_owns_only_its_process_and_does_not_inherit_policy_routing(monkeypatch, launch_fails):
+    from relax.distributed.ray import policy_engine_pool as policy
+
+    router = module.ModelRouter()
+    other_process, child = Mock(), Mock()
+    monkeypatch.setattr(policy, "_LAUNCHED_ROUTER_PROCESSES", [other_process])
+    monkeypatch.setattr(policy.multiprocessing, "Process", Mock(return_value=child))
+    monkeypatch.setattr(policy.time, "sleep", lambda _: None)
+    monkeypatch.setattr(policy, "find_available_port", lambda start: 8000)
+    monkeypatch.setattr(policy, "get_host_info", lambda: ("local", "127.0.0.1"))
+    child.is_alive.return_value = not launch_fails
+    args = SimpleNamespace(
+        sglang_router_ip=None,
+        sglang_router_port=None,
+        use_slime_router=True,
+        router_dp_aware=True,
+        slime_router_middleware_paths=["policy.middleware"],
+    )
+    if launch_fails:
+        with pytest.raises(AssertionError):
+            router.start(args)
+    else:
+        router.start(args)
+        assert router.endpoint[1] == 8000
+    (child_config,) = policy.multiprocessing.Process.call_args.kwargs["args"]
+    assert not child_config.router_dp_aware and child_config.slime_router_middleware_paths == []
+    assert args.router_dp_aware and args.slime_router_middleware_paths == ["policy.middleware"]
+    assert router.processes == [child]
+    assert policy._LAUNCHED_ROUTER_PROCESSES == [other_process]
+
+
 def test_model_router_can_register_first_slime_worker(monkeypatch):
     from fastapi.testclient import TestClient
 

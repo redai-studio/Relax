@@ -13,20 +13,14 @@ import ray
 
 from relax.backends.sglang.sglang_engine import GenRMEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.engine_pool import _allocate_genrm_engine_addr_and_ports
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.http_utils import init_http_client
-from relax.utils.logging_utils import get_logger
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-logger = get_logger(__name__)
-
-_GENRM_PORT_BASE = 16000
-_GENRM_PORT_WINDOW_SIZE = 1000
-_MAX_PORT = 65535
 
 
 @ray.remote
@@ -142,85 +136,3 @@ class GenRMManager(MultiEngineManager):
             new_engines=new_engines,
             port_window_index=self.port_window_index,
         )
-
-
-def _allocate_genrm_engine_addr_and_ports(*, args, new_engines, port_window_index=0):
-    """Allocate network addresses and ports for genRM engines.
-
-    Similar to _allocate_rollout_engine_addr_and_ports_normal but for genRM.
-
-    ``port_window_index`` selects a disjoint range per GenRM instance (multi-instance
-    --genrm-instances): every instance is a separate GenRMManager that probes
-    for free ports independently and in parallel during Serve replica
-    initialization, so two instances starting from the same base port can both
-    see a given port as free (probe-then-bind race) and then collide when
-    their SGLang servers actually bind it.
-    """
-    window_start = _GENRM_PORT_BASE + port_window_index * _GENRM_PORT_WINDOW_SIZE
-    window_end = window_start + _GENRM_PORT_WINDOW_SIZE - 1
-    if port_window_index < 0 or window_end > _MAX_PORT:
-        raise ValueError(
-            f"GenRM port window index {port_window_index} is out of range; "
-            f"at most {(_MAX_PORT - _GENRM_PORT_BASE + 1) // _GENRM_PORT_WINDOW_SIZE} instances are supported."
-        )
-
-    num_engines_per_node = max(1, min(args.num_gpus_per_node, args.genrm_num_gpus) // args.genrm_num_gpus_per_engine)
-    addr_and_ports = {}
-
-    visited_nodes = set()
-    for rank, engine in new_engines:
-        if rank // num_engines_per_node in visited_nodes:
-            continue
-        visited_nodes.add(rank // num_engines_per_node)
-        num_engines_on_this_node = num_engines_per_node - (rank % num_engines_per_node)
-
-        def get_addr_and_ports(engine):
-            # Use a different, bounded port range from rollout (15000).
-            start_port = window_start
-
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                        max_port=window_end,
-                    )
-                )
-                start_port = port + consecutive
-                return port
-
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-        if args.genrm_num_gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = args.genrm_num_gpus_per_engine // args.num_gpus_per_node
-            if rank % num_node_per_engine == 0:
-                # First node in the engine, allocate dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
-        else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports.setdefault(rank + i, {})
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
-    for rank, _ in new_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[rank], f"GenRM engine rank={rank} {key} is not set."
-        logger.info(f"Ports for genRM engine rank={rank}: {addr_and_ports[rank]}")
-
-    return addr_and_ports

@@ -304,7 +304,7 @@ class Controller:
         if getattr(self.config, "disable_s3_model_cleanup", False):
             logger.info("S3 model SHM cleanup is disabled")
             return
-        if not _uses_s3_model_prefetch(self.config) and not getattr(self, "_shared_inference_startup", False):
+        if not _uses_s3_model_prefetch(self.config):
             return
         if not force and not _can_cleanup_s3_model_weights(self.config, self.serve_dict):
             logger.info("Keeping S3 model weights in SHM because the rollout load plan may retain SHM-backed weights")

@@ -59,3 +59,27 @@ def test_genrm_phase_is_independent_of_automatic_scoring(shared, deferred, phase
     spec = static_role_spec(Role.GENRM, args, {})
     assert spec.deployment.phase == phase
     assert spec.deployment.mode is (DeploymentMode.DEFER if shared else DeploymentMode.SPLIT)
+
+
+@pytest.mark.parametrize("selection", ["student_sampled", "teacher_topk", "student_topk", "union"])
+def test_shared_resident_opd_validates_candidate_requirements(selection):
+    from relax.distributed.ray.inference_handle import shared_task_enabled
+
+    args = SimpleNamespace(
+        use_agentic_rollout=True,
+        use_opd=True,
+        opd_type="sglang",
+        opd_token_selection=selection,
+        teacher_hf_checkpoint="teacher",
+        colocate=True,
+        resource={"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 4]},
+        rollout_num_gpus=8,
+        offload_rollout=True,
+    )
+    if selection in {"student_topk", "union"}:
+        with pytest.raises(ValueError, match=f"{selection}.*student_sampled"):
+            shared_task_enabled(args)
+    else:
+        assert shared_task_enabled(args)
+    args.use_agentic_rollout = False
+    assert shared_task_enabled(args)

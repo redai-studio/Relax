@@ -177,7 +177,7 @@ SERVICES: list[tuple[str, str, str, str]] = [
         ),
     ),
     (
-        "relax.components.rollout",
+        "relax.components.inference_gateway",
         "rollout",
         "Rollout Service",
         (
@@ -230,7 +230,7 @@ def main() -> None:
     for module_path, name, title, description in SERVICES:
         # Import the module – this triggers class definition & route registration
         mod = importlib.import_module(module_path)
-        app: FastAPI = getattr(mod, "app")
+        app: FastAPI = mod.gateway_app(name) if module_path.endswith("inference_gateway") else getattr(mod, "app")
 
         # Inject metadata (the source code typically uses bare FastAPI())
         app.title = title

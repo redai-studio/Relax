@@ -553,11 +553,12 @@ class TestSyncWeightsFromSeedEngine:
 
 class TestSyncWeightsForScaledOutEngines:
     @pytest.mark.asyncio
-    async def test_no_scaled_out_engines(self, patch_async_helpers):
+    @pytest.mark.parametrize("name", ["default", "policy"])
+    async def test_no_scaled_out_engines(self, patch_async_helpers, name):
         """Returns success with synced_count=0 when no scaled-out engines."""
         g = make_engine_group(engines=[make_mock_engine()], is_scaled_out=False)
         srv = make_rollout_server(engine_groups=[g])
-        manager = create_test_manager(servers={"default": srv})
+        manager = create_test_manager(servers={name: srv})
 
         result = await manager.sync_weights_for_scaled_out_engines()
         assert result["success"] is True
@@ -581,6 +582,24 @@ class TestSyncWeightsForScaledOutEngines:
         result = await manager.sync_weights_for_scaled_out_engines()
         assert result["success"] is True
         assert result["synced_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_scaled_out_sync_needs_a_current_seed_unless_dcs_confirmed_the_replica(self, patch_async_helpers):
+        seed = make_mock_engine(url="http://seed:1", weight_version="7")
+        elastic = make_mock_engine(url="http://elastic:1", weight_version="8")
+        elastic._actor_id.hex.return_value = "elastic"
+        server = make_rollout_server(
+            engine_groups=[make_engine_group(engines=[seed]), make_engine_group(engines=[elastic], is_scaled_out=True)]
+        )
+        manager = create_test_manager(servers={"policy": server})
+        result = await manager.sync_weights_for_scaled_out_engines(required_version="8")
+        assert not result["success"]
+        elastic.send_weights_to_remote_instance.remote.assert_not_called()
+        result = await manager.sync_weights_for_scaled_out_engines(
+            required_version="8", confirmed_actor_ids={"elastic"}
+        )
+        assert result["success"] and result["synced_count"] == 0
+        elastic.pause_generation.remote.assert_called_once()
 
 
 @pytest.mark.asyncio

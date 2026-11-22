@@ -74,7 +74,7 @@ The components layer contains all RL service components, each deployed as a `@se
 | Component | File | Responsibility |
 |-----------|------|----------------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | Policy training (Megatron backend) |
-| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Shared Gateway ingress and RolloutWorker workload orchestration |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | RolloutWorker workload orchestration; public ingress is in `inference_gateway.py` |
 | **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value estimation and clipped value-loss training |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | Forward inference log-prob (fully-async mode) |
 | **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | Advantage computation (PPO/GRPO/GSPO/SAPO/CISPO etc.) |
@@ -97,7 +97,13 @@ Each inference task has one CPU InferenceManager that owns all Rollout, GenRM an
 
 The rollout workload owns sample staging, scoring completeness and TransferQueue publication. The resident Agentic path keeps Groups, Sessions and exported training rows distinct; deferred scoring preserves export identities and physical partition boundaries. Publication requires consumer-visible data and, for streaming tails, terminal-marker confirmation. Unknown acknowledgements fail the attempt without blind replay.
 
-Custom/native engines and external engines also use the unified control plane and must satisfy its engine capability and resource-release contracts. Old role Managers no longer provide a separate orchestration path. Rollout, GenRM and Teacher use the same CPU Gateway deployment class. `/<role>/engines` defaults to discovery schema v2; request `?schema_version=1` explicitly for the legacy projection. Autoscaling reads logical replicas from v2.
+Custom/native engines and external engines also use the unified control plane and must satisfy its engine capability and resource-release contracts. Old role Managers no longer provide a separate orchestration path. Rollout, GenRM and Teacher share the CPU Gateway implementation, with role-specific HTTP routes. Evaluation, prediction and scaling endpoints belong to Rollout only. `/<role>/engines` defaults to discovery schema v2; request `?schema_version=1` explicitly for the legacy projection. Autoscaling reads logical replicas from v2.
+
+For custom integrations migrating to this control plane:
+
+- Replace imports from `relax.distributed.ray.rollout` with `relax.distributed.ray.policy_engine_pool`; use task Manager role handles or the public Gateway instead of looking up named GenRM or Teacher manager actors.
+- Treat Gateway `/health` as ingress liveness. Check `model_status` and the v2 discovery model's `state` and `admission` before dispatching; GenRM `/metrics` now groups observations under `models`, with `manager_epoch` and `topology_revision`.
+- Caller `rid` values are tracing identifiers. The executor assigns backend request IDs; cancellation must follow the Gateway request lifecycle rather than sending the caller's ID directly to an engine.
 
 The engine layer provides rollout data generation and reward computation:
 

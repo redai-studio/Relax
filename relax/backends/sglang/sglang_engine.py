@@ -31,7 +31,7 @@ except ImportError:
     # imports working, but fail closed if S3 streaming is requested.
     _SGLANG_LOAD_FORMAT_CHOICES = None
 
-from relax.distributed.checkpoint_service.client.engine import create_client
+from relax.distributed.checkpoint_service.client.engine import CheckpointEngineClient
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
@@ -508,6 +508,8 @@ class SGLangEngine(RayActor):
         self.num_gpus_per_engine = num_gpus_per_engine
         self._is_scaled_out = register_sigterm_handler
         self._evicted = threading.Event()
+        self.router_ip: str | None = None
+        self.router_port = 0
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
         self._sync_nextn_draft = False
@@ -625,21 +627,20 @@ class SGLangEngine(RayActor):
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
             effective_num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
-            self.checkpoint_engine_client = run(
-                create_client(
-                    args=self.args,
-                    coordinator_url=self.args.coordinator_url,
-                    role="rollout",
-                    ip=self.server_host,
-                    port=self.server_port,
-                    rank=self.rank,
-                    metadata={
-                        "num_gpus_per_engine": effective_num_gpus,
-                        "actor_id": ray.get_runtime_context().get_actor_id(),
-                        "sync_nextn_draft": self._sync_nextn_draft,
-                    },
-                )
+            self.checkpoint_engine_client = CheckpointEngineClient(
+                args=self.args,
+                coordinator_url=self.args.coordinator_url,
+                role="rollout",
+                ip=self.server_host,
+                port=self.server_port,
+                rank=self.rank,
+                metadata={
+                    "num_gpus_per_engine": effective_num_gpus,
+                    "actor_id": ray.get_runtime_context().get_actor_id(),
+                    "sync_nextn_draft": self._sync_nextn_draft,
+                },
             )
+            run(self.checkpoint_engine_client.start())
 
     def _init_external(self, expect_server_args, external_engine_need_check_fields, timeout: float = 300):
         logger.info(f"Use external SGLang engine (rank={self.rank}, expect_server_args={expect_server_args})")
@@ -1247,21 +1248,38 @@ class SGLangEngine(RayActor):
             pass
         return {"pid": os.getpid(), "node_id": node_id}
 
+    def detach_model_router(self, host: str, port: int) -> None:
+        """Forget a static Router whose owner has confirmed its exit."""
+        if self.role not in {"genrm", "teacher"} or (self.router_ip, self.router_port) != (host, port):
+            return
+        self.router_ip, self.router_port = None, None
+        self._router_worker_id = None
+        self._router_registration_pending = False
+        self._router_unregister_submitted = False
+
     def configure_model_router(self, host: str, port: int) -> bool:
         """Attach a static replica head to its model's task-owned Router."""
         if self.role not in {"teacher", "genrm"}:
             raise ValueError("Only static inference roles attach a model Router")
+        if (self.router_ip, self.router_port) != (host, port):
+            self._router_worker_id = None
+            self._router_registration_pending = False
+            self._router_unregister_submitted = False
         self.router_ip, self.router_port = host, port
         self._skip_router_registration = False
         self._require_router_registration = True
         if not self.register_to_router(strict=True):
             return False
-        # Regular static workers have no PD spec, so the PD readiness helper
-        # cannot confirm their registration. Check the actual model registry.
+        return True
+
+    def _wait_for_registered_worker(self) -> None:
+        if self.worker_type != "regular":
+            self._wait_for_registered_pd_worker()
+            return
         expected = f"http://{self.server_host}:{self.server_port}".rstrip("/")
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            response = requests.get(f"http://{host}:{port}/workers", timeout=5)
+            response = requests.get(f"http://{self.router_ip}:{self.router_port}/workers", timeout=5)
             response.raise_for_status()
             matches = [
                 worker
@@ -1273,19 +1291,20 @@ class SGLangEngine(RayActor):
             if len(matches) == 1 and getattr(self.args, "use_slime_router", False):
                 # Its worker registry contains URLs only, and add_worker is synchronous.
                 requests.get(f"{expected}/health", timeout=5).raise_for_status()
-                return True
+                return
             if len(matches) == 1 and matches[0].get("is_healthy") is True:
                 worker_id = matches[0].get("id")
                 if self._router_worker_id is not None and worker_id != self._router_worker_id:
                     raise RuntimeError("Static Router worker identity changed before readiness")
                 if worker_id is not None:
                     self._router_worker_id = str(worker_id)
-                return True
+                return
             time.sleep(0.25)
         raise TimeoutError("Static replica registration did not become healthy")
 
     def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
         required = getattr(self, "_require_router_registration", False)
+        track_registration = required or getattr(self, "_skip_router_registration", False)
         if self.node_rank != 0:
             return True
         if not self.router_ip or not self.router_port:
@@ -1301,7 +1320,7 @@ class SGLangEngine(RayActor):
             ):
                 # A POST may be accepted before health registration completes.
                 # Retry its readiness check, not the mutation that creates a worker.
-                self._wait_for_registered_pd_worker()
+                self._wait_for_registered_worker()
                 self._router_registration_pending = False
                 return True
             if required and self.worker_type == "prefill" and bootstrap_port is None:
@@ -1328,7 +1347,7 @@ class SGLangEngine(RayActor):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
-                if required:
+                if track_registration:
                     # The router may accept the worker before its HTTP response
                     # is lost. Reconcile that mutation instead of posting twice.
                     self._router_registration_pending = True
@@ -1340,10 +1359,10 @@ class SGLangEngine(RayActor):
                         timeout=30,
                     )
                 except ConnectTimeout:
-                    if required:
+                    if track_registration:
                         self._router_registration_pending = False
                     raise
-                if required and response.status_code >= 400:
+                if track_registration and response.status_code >= 400:
                     # Client rejections and the router's queue errors prove
                     # that no registration was submitted. A gateway timeout
                     # or an unrecognized server error can still hide acceptance.
@@ -1387,8 +1406,11 @@ class SGLangEngine(RayActor):
             self._router_unregister_submitted = False
             if required:
                 self._router_registration_pending = True
-                self._wait_for_registered_pd_worker()
-                self._router_registration_pending = False
+                self._wait_for_registered_worker()
+            if track_registration:
+                self._router_registration_pending = (
+                    not required and response.status_code == 202 and parse(sglang_router.__version__) >= parse("0.3.0")
+                )
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
@@ -1446,8 +1468,25 @@ class SGLangEngine(RayActor):
                     timeout=timeout,
                 )
             elif self._router_worker_id is not None:
+                worker_endpoint = (
+                    f"http://{self.router_ip}:{self.router_port}/workers/{quote(self._router_worker_id, safe='')}"
+                )
+                if wait_for_removal and getattr(self, "_router_registration_pending", False):
+                    # The add and remove jobs can run concurrently. A registry
+                    # listing alone cannot rule out a late add.
+                    deadline = time.monotonic() + timeout
+                    while (remaining := deadline - time.monotonic()) > 0:
+                        status = requests.get(worker_endpoint, timeout=min(5.0, remaining))
+                        status.raise_for_status()
+                        if status.json().get("job_status") is None:
+                            self._router_registration_pending = False
+                            timeout = remaining
+                            break
+                        time.sleep(min(0.5, remaining))
+                    else:
+                        return False
                 response = requests.delete(
-                    f"http://{self.router_ip}:{self.router_port}/workers/{quote(self._router_worker_id, safe='')}",
+                    worker_endpoint,
                     timeout=timeout,
                 )
             else:
@@ -1476,6 +1515,10 @@ class SGLangEngine(RayActor):
                     )
                     return False
                 if exact_worker is None:
+                    if getattr(self, "_skip_router_registration", False) and not getattr(
+                        self, "_router_registration_pending", False
+                    ):
+                        return True
                     logger.warning(f"Worker {worker_url} not found in router during unregister.")
                     return False
 
@@ -1915,10 +1958,10 @@ class SGLangEngine(RayActor):
         logger.info(f"Simulating crash on engine {self.server_host}:{self.server_port}...")
         self.shutdown()
 
-    def unregister_dcs(self):
-        if self.node_rank == 0 and self.checkpoint_engine_client is not None:
+    def unregister_dcs(self, *, strict: bool = False) -> None:
+        if self.node_rank == 0 and getattr(self, "checkpoint_engine_client", None) is not None:
             logger.info(f"Unregistering checkpoint engine client for engine {self.server_host}:{self.server_port}...")
-            run(self.checkpoint_engine_client.unregister())
+            run(self.checkpoint_engine_client.unregister(strict=strict))
 
     def _init_genrm(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
         """Initialize the genRM engine with genrm-specific arguments."""

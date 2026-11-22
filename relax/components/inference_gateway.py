@@ -133,13 +133,21 @@ class InferenceGateway:
             ) from exc
         return target, model_id
 
-    async def engines(self, schema_version: int | None = None, status_filter: str | None = None) -> Any:
+    async def engines(
+        self, schema_version: int | None = None, status_filter: str | None = None, model_name: str | None = None
+    ) -> Any:
         """Serve the common discovery schema; ``schema_version=1`` keeps the
         legacy engine-group projection for older clients."""
         if schema_version not in (None, 1, 2):
             raise HTTPException(status_code=400, detail=f"Unsupported discovery schema_version {schema_version}")
-        snapshot = await self._snapshot()
         try:
+            if schema_version == 1 and self.role is Role.ROLLOUT:
+                return await self._executor.manager_call("pool_call", "get_engines_info", model_name)
+            snapshot = await self._snapshot()
+            if model_name is not None:
+                from dataclasses import replace
+
+                snapshot = replace(snapshot, models=tuple(m for m in snapshot.models if m.model_id == model_name))
             if schema_version == 1:
                 return snapshot.to_legacy_dict(status_filter)
             return snapshot.to_dict(status_filter)
@@ -344,9 +352,7 @@ class _LocalAdapterMethod:
         self.remote = method
 
 
-@serve.deployment(name="InferenceGateway")
-@serve.ingress(app)
-class InferenceGatewayService(InferenceGateway):
+class _InferenceGatewayService(InferenceGateway):
     def __init__(
         self,
         healthy: Any,
@@ -506,8 +512,10 @@ class InferenceGatewayService(InferenceGateway):
         return await self._workload.recover_rollout_engines()
 
     @app.get("/engines")
-    async def get_engines(self, schema_version: int = 2, status_filter: str | None = None) -> Any:
-        return await self.engines(schema_version, status_filter)
+    async def get_engines(
+        self, schema_version: int = 2, status_filter: str | None = None, model_name: str | None = None
+    ) -> Any:
+        return await self.engines(schema_version, status_filter, model_name)
 
     @app.get("/health")
     async def get_health(self) -> JSONResponse:
@@ -542,3 +550,46 @@ class InferenceGatewayService(InferenceGateway):
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request) -> Response:
         return await self.proxy(request, "v1/chat/completions")
+
+
+_ROLLOUT_ROUTES = frozenset(
+    {
+        "/evaluate",
+        "/predict",
+        "/can_do_update_weight_for_async",
+        "/end_update_weight",
+        "/is_eval_done",
+        "/recover_rollout_engines",
+        "/scale_out",
+        "/scale_in",
+        "/scale_out/{request_id}",
+        "/scale_in/{request_id}",
+        "/scale_out/{request_id}/cancel",
+        "/scale_out_cancel",
+    }
+)
+
+
+def gateway_app(role: str | Role) -> FastAPI:
+    """Build the routes supported by this role, for Serve and OpenAPI alike."""
+    from fastapi.routing import APIRoute
+
+    result = FastAPI()
+    for route in app.routes:
+        if isinstance(route, APIRoute) and (Role(role) is Role.ROLLOUT or route.path not in _ROLLOUT_ROUTES):
+            result.add_api_route(route.path, route.endpoint, methods=route.methods, name=route.name)
+    return result
+
+
+_rollout_app = gateway_app(Role.ROLLOUT)
+_static_app = gateway_app(Role.GENRM)
+InferenceGatewayService = serve.deployment(name="InferenceGateway")(
+    serve.ingress(_rollout_app)(_InferenceGatewayService)
+)
+StaticInferenceGatewayService = serve.deployment(name="InferenceGateway")(
+    serve.ingress(_static_app)(_InferenceGatewayService)
+)
+
+
+def gateway_deployment(role: str | Role) -> Any:
+    return InferenceGatewayService if Role(role) is Role.ROLLOUT else StaticInferenceGatewayService
