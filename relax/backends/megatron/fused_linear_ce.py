@@ -39,6 +39,53 @@ def _hopper_runtime_available() -> bool:
         return False
 
 
+_mfsdp_persistent_head_enabled = False
+
+
+def enable_mfsdp_persistent_head() -> None:
+    global _mfsdp_persistent_head_enabled
+    _mfsdp_persistent_head_enabled = True
+
+
+def _mfsdp_nonunit_bucket(weight: torch.Tensor) -> tuple[Any, int] | None:
+    owner = getattr(weight, "_megatron_fsdp_model", None)
+    if not _mfsdp_persistent_head_enabled or owner is None or type(weight) is not torch.nn.Parameter:
+        return None
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
+
+    if not isinstance(owner, MegatronFSDP):
+        return None
+    if owner.dist_index.use_hybrid_fsdp or owner.enable_fine_grained_param_gather_backward_hook:
+        return None
+    if owner.data_parallel_sharding_strategy not in ("optim", "optim_grads", "optim_grads_params"):
+        return None
+    buffer = owner.param_and_grad_buffer
+    bucket_id = buffer.param_to_param_group.get(weight)
+    if bucket_id is None or buffer.parameter_groups[bucket_id].fsdp_unit_id is not None:
+        return None
+    return owner, bucket_id
+
+
+def _is_mfsdp_hook(hook: Any, name: str) -> bool:
+    return (
+        getattr(hook, "__module__", "") == "megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp"
+        and getattr(hook, "__qualname__", "") == f"MegatronFSDP._register_fsdp_hooks.<locals>.{name}"
+    )
+
+
+def _ensure_mfsdp_weight_ready(weight: torch.Tensor, accumulate: bool) -> None:
+    if not _mfsdp_persistent_head_enabled or getattr(weight, "_megatron_fsdp_model", None) is None:
+        return
+    state = _mfsdp_nonunit_bucket(weight)
+    if state is None or accumulate or weight.dtype != torch.bfloat16:
+        raise ValueError("Fused CE requires an unfused BF16 MFSDP head in a persistent non-unit bucket")
+    owner, bucket_id = state
+    # Non-unit weights persist through all chunks and backward. Publish them
+    # without resetting grad_added_to_main_grad or the owner's training state.
+    owner.all_gather_pipeline.all_gather_params([weight], prefetch=False, bwd=False)
+    owner.all_gather_pipeline.wait_bucket_ready(bucket_id, bwd=False)
+
+
 def supported(
     layer: Any, hidden: torch.Tensor, weight: torch.Tensor | None, gather_output: bool | None = None
 ) -> bool:
@@ -59,7 +106,20 @@ def supported(
             return False
     if layer.bias is not None or (gather_output if gather_output is not None else layer.gather_output):
         return False
-    if layer._forward_hooks or layer._backward_hooks or layer._backward_pre_hooks:
+    mfsdp = _mfsdp_persistent_head_enabled and (
+        getattr(weight, "_megatron_fsdp_model", None) is not None
+        or getattr(getattr(layer, "weight", None), "_megatron_fsdp_model", None) is not None
+    )
+    if mfsdp and (
+        weight is not layer.weight or layer.gradient_accumulation_fusion or _mfsdp_nonunit_bucket(weight) is None
+    ):
+        return False
+    if layer._backward_hooks or layer._backward_pre_hooks:
+        return False
+    if any(
+        not (mfsdp and _is_mfsdp_hook(hook, "_release_module_fp8_transpose_cache"))
+        for hook in layer._forward_hooks.values()
+    ):
         return False
     if any(getattr(layer, name, False) for name in ("disable_grad_reduce", "explicit_expert_comm", "is_expert")):
         return False
@@ -76,6 +136,8 @@ def supported(
     ):
         return False
     for hook in layer._forward_pre_hooks.values():
+        if mfsdp and _is_mfsdp_hook(hook, "_pre_forward_param_unshard"):
+            continue
         if (
             getattr(hook, "__module__", "") != "megatron.core.distributed.distributed_data_parallel"
             or getattr(hook, "__qualname__", "") != "DistributedDataParallel._make_forward_pre_hook.<locals>.hook"
@@ -204,6 +266,7 @@ def linear_cross_entropy(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return unreduced losses in hidden row order; SP gathering is the
     caller's job."""
+    _ensure_mfsdp_weight_ready(weight, accumulate)
     # The backport uses Blackwell TCGEN05/TMEM instructions. Hopper instead
     # reuses the Quack epilogues below, which have an SM90 GEMM backend.
     hopper = hidden.is_cuda and torch.cuda.get_device_capability(hidden.device)[0] == 9

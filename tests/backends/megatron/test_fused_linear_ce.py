@@ -74,6 +74,25 @@ def test_linear_ce_per_row_loss_gradients_and_metrics(temperature, frozen):
 
 
 @gpu
+def test_linear_ce_sum_loss_accepts_broadcast_gradient(monkeypatch):
+    from relax.backends.megatron.fused_linear_ce import linear_cross_entropy
+
+    monkeypatch.setenv("RELAX_SFT_FUSED_LINEAR_CE", "1")
+    torch.manual_seed(83)
+    hidden = torch.randn(17, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.nn.Parameter(torch.randn(512, 64, device="cuda", dtype=torch.bfloat16) * 0.05)
+    labels = torch.randint(512, (17,), device="cuda")
+    expected = F.cross_entropy(F.linear(hidden, weight).float(), labels, reduction="sum")
+    reference = torch.autograd.grad(expected, (hidden, weight))
+    losses, _ = linear_cross_entropy(hidden, weight, labels, None)
+    # sum() supplies a zero-stride expanded gradient to the custom backward.
+    actual = torch.autograd.grad(losses.sum(), (hidden, weight))
+    torch.testing.assert_close(losses.sum(), expected, atol=2e-4, rtol=2e-4)
+    for got, want in zip(actual, reference, strict=True):
+        assert (got.float() - want.float()).norm() / want.float().norm().clamp_min(1e-12) < 0.008
+
+
+@gpu
 def test_linear_ce_fp32_main_grad_accumulates_with_checkpoint():
     from torch.utils.checkpoint import checkpoint
 

@@ -54,6 +54,30 @@ def _qwen38_mix(
     return gated_residual_mix(x, norm_weight, down_weight, up_weight, inject_weight, n, eps)
 
 
+def _output_mix(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    inject_weight: None,
+    n: int,
+    eps: float,
+) -> tuple[torch.Tensor, None]:
+    return gated_residual_mix(x, norm_weight, down_weight, up_weight, inject_weight, n, eps)
+
+
+def _qwen38_output_mix(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    inject_weight: None,
+    n: int,
+    eps: float,
+) -> tuple[torch.Tensor, None]:
+    return _qwen38_mix(x, norm_weight, down_weight, up_weight, inject_weight, n, eps)
+
+
 def _supported(hc: Any, x: torch.Tensor, ensure_ready: Callable | None) -> bool:
     if x.device.type != "cuda" or x.dtype != torch.bfloat16 or x.ndim != 3 or hc.n != 4:
         return False
@@ -90,14 +114,19 @@ def _supported(hc: Any, x: torch.Tensor, ensure_ready: Callable | None) -> bool:
     return True
 
 
-@lru_cache(maxsize=2)
-def compiled_mix(fixed_width: bool) -> Callable:
+@lru_cache(maxsize=4)
+def compiled_mix(fixed_width: bool, use_combine: bool = True) -> Callable:
     # Other models and CPU fallbacks need not initialize Inductor at all.
     options = {"emulate_precision_casts": True}
     if fixed_width:
         options.update(shape_padding=False, unroll_reductions_threshold=0)
+    # Dynamo caches by code object. Separate entry points keep output-head
+    # variants (inject=None) out of the decoder/MTP checkpoint cache.
+    fn = _qwen38_mix if fixed_width else gated_residual_mix
+    if not use_combine:
+        fn = _qwen38_output_mix if fixed_width else _output_mix
     return torch.compile(
-        _qwen38_mix if fixed_width else gated_residual_mix,
+        fn,
         dynamic=True,
         fullgraph=True,
         options=options,
@@ -121,7 +150,18 @@ def fused_mix(self: Any, hidden_states: torch.Tensor) -> tuple[torch.Tensor, tor
         and weights[2].shape == (10240, 320)
         and (inject is None or inject.shape == (4, 10240))
     )
-    fn = compiled_mix(fixed_width)
+    # Checkpoint replay detaches inputs, removing their _base. Dynamo otherwise
+    # guards on the forward view's base shape/strides and recompiles on replay.
+    # Keep the gradient edge and storage; cloning long activations is expensive.
+    if torch.is_grad_enabled():
+        hidden_states = mcore_utils.make_viewless_tensor(
+            hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+    else:
+        # requires_grad on a checkpoint's first input is irrelevant in no_grad;
+        # detach also makes later layer inputs share the same compiler guards.
+        hidden_states = hidden_states.detach()
+    fn = compiled_mix(fixed_width, inject is not None)
     if os.environ.get("RELAX_QWEN38_HC_RECOMPUTE", "0") == "1" and torch.is_grad_enabled():
         from megatron.core.tensor_parallel.random import is_checkpointing
         from torch.utils.checkpoint import checkpoint
