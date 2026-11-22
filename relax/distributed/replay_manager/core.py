@@ -4,13 +4,14 @@
 state."""
 
 import importlib
+import json
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, MutableMapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from .config import ReplayConfig, get_store
+from .config import ReplayConfig, default_reference_r3, get_store, rollout_kinds, validate_reference_training
 from .consumer import ConsumerRecord, ConsumerSource
 from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, register_kind
 
@@ -278,8 +279,7 @@ class ReplayManager:
         self.initialize(kinds=definitions, engine=engine)
 
     def start_run(self) -> None:
-        """Called by Relax's training entry point, before constructing
-        workers."""
+        """Open the driver-owned registry before constructing workers."""
         if self.uses_references:
             self.store().start_run()
             self._owns_run = True
@@ -1166,3 +1166,15 @@ def enable_reference_replay() -> None:
         manager.config = replace(manager.config, delivery="reference", run_id=manager.config.run_id or new_data_id())
     os.environ["RELAX_REPLAY_REFERENCES"] = "1"
     os.environ["RELAX_REPLAY_RUN_ID"] = manager.config.run_id
+
+
+def configure_training_replay(args: Any, runtime_env: dict) -> None:
+    """Resolve delivery on the driver and register worker hooks before Ray
+    starts."""
+    if replay_data_manager.uses_references or default_reference_r3(args):
+        enable_reference_replay()
+    validate_reference_training(args)
+    replay_data_manager.initialize(kinds=rollout_kinds(args))
+    if not isinstance(runtime_env.get("env_vars"), dict):
+        runtime_env["env_vars"] = {}
+    runtime_env["env_vars"]["RELAX_REPLAY_REGISTRATION"] = json.dumps(replay_data_manager.export_registration())

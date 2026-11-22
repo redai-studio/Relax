@@ -39,19 +39,23 @@ def test_reference_cleanup_precedes_tq_teardown_and_failure_is_not_retried(monke
     monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "a")
     monkeypatch.setattr(controller_module, "close_tq_owner", lambda owner: events.append("tq_close"))
     controller = object.__new__(Controller)
-    controller._restarting = restarting
+    controller.requires_clean_shutdown = True
+    controller._shutdown_services = lambda: events.append("stop_services")
     controller.runtime_env = {}
     controller._tq_legacy_init = False
     controller._tq_owner = object()
     if fail_finish:
         with pytest.raises(RuntimeError, match="body cleanup failed"):
-            controller._close_data_system()
+            controller.shutdown()
         with pytest.raises(RuntimeError, match="previously failed"):
             manager.finish_run()
-        assert events == ["finish", "abandon", "tq_close"]
+        assert events == ["stop_services", "finish", "abandon", "tq_close"]
+    elif restarting:
+        controller._close_data_system(restarting=True)
+        assert events == ["abandon", "tq_close"]
     else:
-        controller._close_data_system()
-        assert events == ["abandon" if restarting else "finish", "tq_close"]
+        controller.shutdown()
+        assert events == ["stop_services", "finish", "tq_close"]
     assert controller._tq_owner is None
 
 

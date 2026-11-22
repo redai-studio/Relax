@@ -19,6 +19,7 @@ from relax.distributed.replay_manager.ref_data import (
     iter_refs,
     moe_route_spans,
     validate_mm_envelope,
+    validate_sample,
 )
 
 
@@ -64,7 +65,7 @@ class ReplayHoldings:
         with producer.response(meta):
             refs = producer.response_refs(meta)
             media = meta.get(META_FIELD, []) if "mm_embedding" in kinds else []
-            if media:
+            if "mm_embedding" in kinds and META_FIELD in meta:
                 validate_mm_envelope({"version": 1, "media": media})
             if not is_current():
                 await manager.store().invoke_async("discard", refs, unadopted=True, media=media)
@@ -79,8 +80,16 @@ class ReplayHoldings:
                 return False
         return True
 
-    def accept_routes(self, args: Any, ir: InflightRequest, result: Any) -> None:
+    def apply_response(self, args: Any, ir: InflightRequest, result: Any) -> None:
+        kinds = rollout_kinds(args)
         meta = result.meta_info
+        if "mm_embedding" in kinds:
+            if META_FIELD in meta:
+                ir.pending_mm_embedding_refs = {"version": 1, "media": meta[META_FIELD]}
+            elif result.new_tokens and result.finish_type != "abort":
+                raise ValueError("Backend omitted multimodal embedding references")
+        if "moe" not in kinds:
+            return
         if meta.get("routed_experts") is None:
             if result.new_tokens:
                 raise ValueError("Backend omitted routed experts for newly accepted tokens")
@@ -108,3 +117,15 @@ class ReplayHoldings:
                 expected_rows=len(tokens) - 1,
             )
             self.refs[ref.record] = ref
+
+
+def validate_reference_exports(args: Any, exports: Sequence[dict]) -> None:
+    kinds = rollout_kinds(args)
+    if not kinds:
+        return
+    for export in exports:
+        sample = export["sample_payload"]
+        manifests = sample["rollout_replay_refs"] or {}
+        if not kinds.issubset(manifests):
+            raise ValueError("Agentic export is missing enabled replay kinds")
+        validate_sample(manifests, sample["tokens"])

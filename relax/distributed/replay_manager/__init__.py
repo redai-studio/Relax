@@ -7,12 +7,13 @@ Backend adapters are loaded only when registered.
 
 from .config import ReplayConfig, reference_environment, references_enabled, replay_fields, rollout_kinds
 from .consumer import ConsumerExecutor, ConsumerRequest
-from .core import ReplayKind, ReplayManager, ReplayRegion, replay_data_manager
+from .core import ReplayKind, ReplayManager, ReplayRegion, configure_training_replay, replay_data_manager
 from .ref_data import ReplayRef, register_kind
 
 
 __all__ = [
     "ReplayConfig",
+    "configure_training_replay",
     "ReplayKind",
     "ConsumerRequest",
     "ConsumerExecutor",

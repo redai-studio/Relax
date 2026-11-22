@@ -45,7 +45,7 @@ from relax.agentic.stage_recorder import (
     StageRecorder,
 )
 from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
-from relax.distributed.replay_manager.core import replay_data_manager
+from relax.distributed.replay_manager import replay_data_manager
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -141,19 +141,14 @@ async def _run_group(
             operation=operation,
         )
 
-    group = None
-
-    async def collect() -> None:
-        nonlocal group
-        group = await runtime_domain.collect_group(stream)
-
-    retain_for_transfer = False
+    collect = asyncio.create_task(runtime_domain.collect_group(stream))
+    handed_off = False
     try:
         if requires_complete_group:
-            await collect()
+            group = await collect
         else:
             tasks = (
-                asyncio.create_task(collect()),
+                collect,
                 asyncio.create_task(
                     reward_domain.score_sessions(stream, observe_reward=observe_reward)
                     if stage_recorder is not None
@@ -161,7 +156,7 @@ async def _run_group(
                 ),
             )
             try:
-                await asyncio.gather(*tasks)
+                group, _ = await asyncio.gather(*tasks)
             finally:
                 for task in tasks:
                     task.cancel()
@@ -236,7 +231,7 @@ async def _run_group(
             from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
             await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
-        retain_for_transfer = True
+        handed_off = True
         return scored_group
     except BaseException as error:
         reward_domain.discard_group_progress(stream)
@@ -254,8 +249,9 @@ async def _run_group(
             )
         raise
     finally:
-        if group is not None and not retain_for_transfer:
-            await replay_data_manager.discard_async(group.samples)
+        if not handed_off and collect.done() and not collect.cancelled() and collect.exception() is None:
+            if (group := collect.result()) is not None:
+                await replay_data_manager.discard_async(group.samples)
 
 
 class AgenticResidentPipeline:
@@ -568,11 +564,9 @@ class AgenticResidentPipeline:
             await self._transfer_and_record(context, partition_id, groups, is_last)
 
         def transfer_done(task: asyncio.Task) -> None:
-            try:
-                if task.cancelled() and not started:
-                    replay_data_manager.discard([sample for group in groups for sample in group.samples])
-            finally:
-                self._changed.set()
+            if task.cancelled() and not started:
+                self._finalized_groups.extend(groups)
+            self._changed.set()
 
         task = asyncio.create_task(transfer(), name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups")
         task.add_done_callback(transfer_done)

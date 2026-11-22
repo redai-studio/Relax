@@ -102,6 +102,22 @@ class MoERouteSpan:
         return self.ref.rows - (self.stop - self.start)
 
 
+def merge_route_spans(
+    previous: tuple[MoERouteSpan, ...], incoming: tuple[MoERouteSpan, ...], expected_rows: int
+) -> tuple[MoERouteSpan, ...]:
+    """Keep accepted rows and append only the uncovered tail of a resumed
+    capture."""
+    start = previous[-1].stop if previous else 0
+    end = incoming[-1].stop if incoming else start
+    if not start <= end == expected_rows or (incoming and incoming[0].start > start):
+        raise ValueError("Replay references do not cover the accepted Agentic token rows")
+    return previous + tuple(
+        MoERouteSpan(span.ref, max(span.start, start), span.stop, span.training_tokens)
+        for span in incoming
+        if span.stop > start
+    )
+
+
 def selection_route_spans(value: dict[str, Any], kind: str) -> tuple[MoERouteSpan, ...]:
     """Read immutable selection tails at their original document
     coordinates."""

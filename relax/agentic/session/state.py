@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
-from relax.distributed.replay_manager.ref_data import MoERouteSpan, moe_route_manifest
+from relax.distributed.replay_manager.ref_data import MoERouteSpan, merge_route_spans, moe_route_manifest
 from relax.utils.types import Sample
 
 
@@ -56,18 +56,7 @@ def merge_routed_experts(
     if isinstance(previous, tuple) or isinstance(incoming, tuple):
         if isinstance(previous, np.ndarray) or isinstance(incoming, np.ndarray):
             raise ValueError("Cannot mix inline and reference MoE replay in an Agentic session")
-        previous = previous or ()
-        start = previous[-1].stop if previous else 0
-        end = incoming[-1].stop if incoming else start
-        if not start <= end == expected_rows or (incoming and incoming[0].start > start):
-            raise ValueError("Replay references do not cover the accepted Agentic token rows")
-        if not incoming:
-            return previous
-        return previous + tuple(
-            MoERouteSpan(span.ref, max(span.start, start), span.stop, span.training_tokens)
-            for span in incoming
-            if span.stop > start
-        )
+        return merge_route_spans(previous or (), incoming or (), expected_rows)
     if incoming is None:
         if previous is None:
             return None
@@ -503,6 +492,7 @@ class ExecutionPrefix:
     backend_image_data: list[str] = field(default_factory=list)
     backend_audio_data: list[str] = field(default_factory=list)
     backend_video_data: list[str] = field(default_factory=list)
+    route_spans: tuple[MoERouteSpan, ...] | None = None
 
 
 @dataclass
@@ -595,7 +585,10 @@ class SessionForest:
         backend_image_data: list[str] = []
         backend_audio_data: list[str] = []
         backend_video_data: list[str] = []
+        route_spans = None
         for node in self.lineage(state_hash):
+            if isinstance(node.rollout_routed_experts, tuple):
+                route_spans = node.rollout_routed_experts
             train_token_prefix.extend(node.train_token_delta)
             rollout_token_prefix.extend(node.rollout_token_delta)
             _extend_media_data(backend_image_data, node.backend_image_data_delta)
@@ -607,6 +600,7 @@ class SessionForest:
             backend_image_data=backend_image_data,
             backend_audio_data=backend_audio_data,
             backend_video_data=backend_video_data,
+            route_spans=route_spans,
         )
 
     def export_leaf_hashes(self) -> list[str]:

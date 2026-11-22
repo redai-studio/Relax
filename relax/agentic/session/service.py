@@ -58,7 +58,7 @@ from relax.agentic.runner import (
 )
 from relax.agentic.session.admission import compute_reservation_tokens
 from relax.agentic.session.admission_coordinator import AdmissionCoordinator, RayAdmissionClient
-from relax.agentic.session.replay import ReplayHoldings
+from relax.agentic.session.replay import ReplayHoldings, validate_reference_exports
 from relax.agentic.session.state import (
     InflightRequest,
     MsgNode,
@@ -73,7 +73,6 @@ from relax.agentic.session.state import (
     normalize_tools,
 )
 from relax.distributed import replay_manager
-from relax.distributed.replay_manager.ref_data import validate_sample
 from relax.engine.lora_versions.identity import VersionIdentity
 from relax.engine.lora_versions.manager import SessionKey
 from relax.utils.agentic_obs.records import utc_now
@@ -1886,9 +1885,16 @@ class AgenticSessionShard:
     async def _interrupt_running_requests(self) -> None:
         """Ask selected backend attempts to return their generated prefix."""
 
-        async def abort_owned_request(session: _SessionRecord, ir: InflightRequest) -> None:
+        async def abort_owned_request(session: _SessionRecord, request_id: str) -> None:
             try:
-                await self._abort_backend_ir(ir, drain_response=True)
+                # A pause ACK can precede generation. Keep tracking this RID until the response arrives.
+                await finish_before_cancellation(
+                    asyncio.wait_for(
+                        self._generation_backend.abort_request(request_id, retain_request=True),
+                        _SESSION_CLOSE_TIMEOUT_S,
+                    ),
+                    f"backend-pause:{request_id}",
+                )
             except BaseException as error:
                 cancelled = isinstance(error, asyncio.CancelledError) or _is_ray_task_cancelled(error)
                 if cancelled and session.phase is SessionPhase.FINALIZING:
@@ -1896,7 +1902,7 @@ class AgenticSessionShard:
                 raise
 
         runner_tasks: list[asyncio.Task[None]] = []
-        backend_aborts: list[tuple[_SessionRecord, InflightRequest]] = []
+        backend_aborts: list[tuple[_SessionRecord, str]] = []
         try:
             for group in tuple(self._groups.values()):
                 self._raise_group_error(group)
@@ -1926,13 +1932,13 @@ class AgenticSessionShard:
                                 runner.cancel()
                                 runner_tasks.append(runner)
                                 continue
-                            backend_aborts.append((session, ir))
+                            backend_aborts.append((session, _backend_request_id(ir)))
                             runner_tasks.append(runner)
                         session.queued_irs.extendleft(reversed(requeued_irs))
                 self._notify_state_change(group)
         finally:
             abort_outcomes = await asyncio.gather(
-                *(abort_owned_request(session, ir) for session, ir in backend_aborts),
+                *(abort_owned_request(session, request_id) for session, request_id in backend_aborts),
                 return_exceptions=True,
             )
             await asyncio.gather(*runner_tasks, return_exceptions=True)
@@ -2388,18 +2394,8 @@ class AgenticSessionShard:
                 history_backend_image_data=prefix.backend_image_data,
                 history_backend_audio_data=prefix.backend_audio_data,
                 history_backend_video_data=prefix.backend_video_data,
+                pending_routed_experts=prefix.route_spans,
             )
-            if replay_manager.replay_data_manager.uses_references and getattr(
-                self.args, "use_rollout_routing_replay", False
-            ):
-                ir.pending_routed_experts = next(
-                    (
-                        node.rollout_routed_experts
-                        for node in reversed(forest.lineage(generation_parent.state_hash))
-                        if isinstance(node.rollout_routed_experts, tuple)
-                    ),
-                    None,
-                )
             profile = agentic_trace_events(ir.pending_export_metadata_patch)
             profile.update(copy.deepcopy(compiler_timing))
             mark_agentic_event(profile, "chat_request_arrive_at", chat_request_arrive_at)
@@ -2722,24 +2718,13 @@ class AgenticSessionShard:
             except Exception as error:
                 raise RuntimeGroupError(f"SGLang permit release failed: {type(error).__name__}: {error}") from error
 
-    async def _abort_backend_ir(self, ir: InflightRequest, *, drain_response: bool = False) -> None:
+    async def _abort_backend_ir(self, ir: InflightRequest) -> None:
         """Keep one abort owner until the original backend attempt
         acknowledges."""
 
         if not ir.backend_started:
             return
         request_id = _backend_request_id(ir)
-        if drain_response:
-            # A pause ACK can precede worker registration. Keep the RID and
-            # targets until generate returns or retirement confirms a final abort.
-            await finish_before_cancellation(
-                asyncio.wait_for(
-                    self._generation_backend.abort_request(request_id, retain_request=True),
-                    timeout=_SESSION_CLOSE_TIMEOUT_S,
-                ),
-                f"backend-pause:{request_id}",
-            )
-            return
         task = ir.backend_abort_task
         if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
 
@@ -3087,25 +3072,9 @@ class AgenticSessionShard:
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
-        if getattr(self.args, "use_rollout_mm_embedding_replay", False) and (
-            session is not None and session.group.rollout_mode == "train"
-        ):
-            from relax.distributed.replay_manager.backend.mm_sglang import META_FIELD
-            from relax.distributed.replay_manager.ref_data import validate_mm_envelope
-
-            media = result.meta_info.get(META_FIELD)
-            if media is not None:
-                envelope = {"version": 1, "media": media}
-                validate_mm_envelope(envelope)
-                ir.pending_mm_embedding_refs = copy.deepcopy(envelope)
-            elif result.new_tokens and result.finish_type != "abort":
-                raise ValueError("Backend omitted multimodal embedding references")
-        if (
-            getattr(self.args, "use_rollout_routing_replay", False)
-            and replay_manager.replay_data_manager.uses_references
-        ):
+        if replay_manager.replay_data_manager.uses_references and replay_manager.rollout_kinds(self.args):
             if session is not None and session.group.rollout_mode == "train":
-                session.replay.accept_routes(self.args, ir, result)
+                session.replay.apply_response(self.args, ir, result)
             return
         routed_experts = _decode_routed_experts(
             args=self.args,
@@ -3413,22 +3382,15 @@ class AgenticSessionShard:
         # Retain only compact payloads; full Samples contain long training arrays.
         del sample
         export_payloads = [payload for _, payload in prepared]
-        from relax.distributed.replay_manager.config import rollout_kinds
-
-        required_replay = rollout_kinds(self.args)
-        if session.group.rollout_mode == "train" and required_replay:
+        if session.group.rollout_mode == "train" and replay_manager.replay_data_manager.uses_references:
+            try:
+                validate_reference_exports(self.args, export_payloads)
+            except ValueError as error:
+                raise _NonFinalizableExportError(str(error)) from error
+        elif session.group.rollout_mode == "train" and self.args.use_rollout_routing_replay:
             # NOTE(wulumeng): An observation leaf has no routed experts (None). Samples should never end there, so this safeguard should never trigger.
             for export_payload in export_payloads:
                 sample_payload = export_payload["sample_payload"]
-                if replay_manager.replay_data_manager.uses_references:
-                    try:
-                        manifests = sample_payload["rollout_replay_refs"] or {}
-                        if not required_replay.issubset(manifests):
-                            raise ValueError("Agentic export is missing enabled replay kinds")
-                        validate_sample(manifests, sample_payload["tokens"])
-                    except ValueError as error:
-                        raise _NonFinalizableExportError(str(error)) from error
-                    continue
                 expected_shape = (len(sample_payload["tokens"]) - 1, self.args.num_layers, self.args.moe_router_topk)
                 routed_experts = sample_payload["rollout_routed_experts"]
                 actual_shape = None if routed_experts is None else routed_experts.shape
@@ -3530,8 +3492,6 @@ class AgenticSessionShard:
             await asyncio.shield(finish_task)
 
     async def _finish_session_once(self, session: _SessionRecord, outcome: _SessionResultPayload) -> None:
-        from relax.distributed.replay_manager.config import rollout_kinds
-
         group = session.group
         if session.replay and isinstance(outcome, SessionExportTransport):
             session.replay.transfer_exports(group.replay, outcome.exports)
@@ -3547,7 +3507,7 @@ class AgenticSessionShard:
             # discard its manifest. Backend cleanup sends the abort first.
             drain_replay_response = ir.backend_started and (
                 replay_manager.replay_data_manager.uses_references
-                and bool(rollout_kinds(self.args))
+                and replay_manager.rollout_kinds(self.args)
                 and group.rollout_mode == "train"
             )
             if ir.runner_task is not None and not drain_replay_response:

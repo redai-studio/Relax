@@ -20,9 +20,13 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
-from relax.distributed.replay_manager import ReplayConfig, ReplayManager, reference_environment, rollout_kinds
-from relax.distributed.replay_manager.config import default_reference_r3, validate_reference_training
-from relax.distributed.replay_manager.core import ReplayInventory, enable_reference_replay
+from relax.distributed.replay_manager import (
+    ReplayConfig,
+    ReplayManager,
+    configure_training_replay,
+    reference_environment,
+)
+from relax.distributed.replay_manager.core import ReplayInventory
 from relax.distributed.replay_manager.storage import TQReplayStorage
 from relax.utils.agentic_obs.run_hooks import RunRecorder
 
@@ -45,12 +49,7 @@ def _load_definitions(path, names, namespace):
 def _train_namespace():
     namespace = {
         "asyncio": asyncio,
-        "json": json,
-        "replay_data_manager": ReplayManager(),
-        "rollout_kinds": rollout_kinds,
-        "default_reference_r3": default_reference_r3,
-        "validate_reference_training": validate_reference_training,
-        "enable_reference_replay": enable_reference_replay,
+        "configure_training_replay": Mock(),
         "os": os,
         "sys": sys,
         "signal": Mock(SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT, Signals=signal.Signals),
@@ -119,7 +118,7 @@ def test_train_resolves_r3_delivery_before_ray_workers_start(monkeypatch, settin
         lambda: TQReplayStorage(manager.config, inventory=ReplayInventory(manager.config, lambda _: None))
     )
     ns = _train_namespace()
-    ns["replay_data_manager"] = manager
+    ns["configure_training_replay"] = configure_training_replay
     ns["ray"].is_initialized.return_value = False
 
     def post_process_env(args, env):
@@ -373,8 +372,7 @@ ns['_run_recorder'] = recorder
 ns["_SHUTDOWN_TIMEOUT_SEC"] = 0.05
 ns["_NORMAL_SHUTDOWN_TIMEOUT_SEC"] = 0.05
 if {hang_at!r} == "controller":
-    ns["_ctrl"] = ns["Controller"].return_value
-    ns["_ctrl"].shutdown.side_effect = threading.Event().wait
+    ns["_ctrl"] = SimpleNamespace(shutdown=threading.Event().wait)
 else:
     ns["serve"].shutdown.side_effect = threading.Event().wait
 ns["_graceful_shutdown"](exit_code={exit_code})
@@ -644,7 +642,8 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"shutdown", "_shutdown_services", "_dispose_rollout_manager"}
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
@@ -667,6 +666,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
+    partial_controller._shutdown_services = ns["_shutdown_services"].__get__(partial_controller)
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
     stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
     if mode != "missing_config":
@@ -713,7 +713,8 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"shutdown", "_shutdown_services", "_dispose_rollout_manager"}
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
@@ -740,6 +741,7 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
         _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
+    controller._shutdown_services = ns["_shutdown_services"].__get__(controller)
     controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(controller)
 
     ns["shutdown"](controller)

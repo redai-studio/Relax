@@ -60,7 +60,7 @@ def get_async_loop():
     return async_loop
 
 
-def shutdown_async_loop(timeout: float = 5.0):
+def shutdown_async_loop(timeout: float | None = 5.0):
     """Stop the global async event loop and **block** until its thread exits.
 
     Must be called before ``ray.shutdown()`` during global restart.  The call

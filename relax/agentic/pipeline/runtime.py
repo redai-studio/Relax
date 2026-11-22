@@ -560,8 +560,7 @@ class SGLangBackendAdapter:
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
         self._session_lifecycle = args.agentic_session_lifecycle
-        self._request_wire_ids: dict[str, str] = {}
-        self._request_targets: dict[str, set[str]] = {}
+        self._requests: dict[str, tuple[str, set[str]]] = {}
         self._session_endpoints: dict[str, set[str]] = {}
         # The shared request permit already bounds concurrency.
         self._managed_http = httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None))
@@ -626,14 +625,13 @@ class SGLangBackendAdapter:
             payload["session_id"] = session_id
         if lora_path is not None:
             payload["lora_path"] = lora_path
-            self._request_targets[request_id] = {engine_url}
             if session_id:
                 self._session_endpoints.setdefault(session_id, set()).add(engine_url)
         headers = None
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
-        self._request_wire_ids[request_id] = payload["rid"]
+        self._requests[request_id] = (payload["rid"], {engine_url} if engine_url else set())
         try:
             send = self._managed_post if engine_url else post
             if not engine_url and fail_fast_no_workers:
@@ -647,19 +645,16 @@ class SGLangBackendAdapter:
                 fail_fast_no_workers=fail_fast_no_workers,
             )
         except httpx.HTTPStatusError as error:
-            if error.response.status_code == 400:
-                # An explicit parameter rejection has no accepted generation
-                # for backend abort to acknowledge.
-                self._forget_request(request_id)
+            aborted = is_expected_sglang_499(error)
+            if (
+                aborted
+                or error.response.status_code == 400
+                or (not engine_url and fail_fast_no_workers and is_router_no_available_workers(error))
+            ):
+                self._requests.pop(request_id, None)
             if _is_context_length_error(error):
-                self._forget_request(request_id)
                 raise BackendContextLengthExceededError(error.response.text) from error
-            if not engine_url and fail_fast_no_workers and is_router_no_available_workers(error):
-                # The router explicitly rejected this attempt before dispatch;
-                # no engine request remains for abort to acknowledge.
-                self._forget_request(request_id)
-            if is_expected_sglang_499(error):
-                self._forget_request(request_id)
+            if aborted:
                 return BackendGenerateResult(
                     new_tokens=[],
                     new_log_probs=[],
@@ -668,10 +663,7 @@ class SGLangBackendAdapter:
                     elapsed=time.monotonic() - started,
                 )
             raise
-        else:
-            # A cancelled/failed transport can leave generation alive. Preserve
-            # its exact wire namespace until abort acknowledges cleanup.
-            self._forget_request(request_id)
+        self._requests.pop(request_id, None)
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])
         # A sealed body must survive parsing only if its manifest reaches the Session.
@@ -720,43 +712,29 @@ class SGLangBackendAdapter:
         return response.json()
 
     async def abort_request(self, request_id: str, *, retain_request: bool = False) -> None:
-        wire_id = self._request_wire_ids.get(request_id)
-        if wire_id is None:
+        attempt = self._requests.get(request_id)
+        if attempt is None:
             return
-        urls = self._request_targets.get(request_id)
-        if urls is None:
-            urls = set(await self._worker_urls())
-        if self._request_wire_ids.get(request_id) != wire_id:
-            return
-        if not urls:
-            raise RuntimeError("Cannot confirm backend abort without any worker targets")
-        # A failed worker must remain a target even if the router removes it
-        # before a later retry. Only abort acknowledgements release this set.
-        self._request_targets[request_id] = urls
-        targets = sorted(urls)
-        outcomes = await asyncio.gather(
-            *(
-                post(
-                    f"{url}/abort_request",
-                    {"rid": wire_id},
-                )
-                for url in targets
-            ),
-            return_exceptions=True,
-        )
-        failures = {
-            url: outcome for url, outcome in zip(targets, outcomes, strict=True) if isinstance(outcome, BaseException)
-        }
-        if failures:
-            if not retain_request and self._request_wire_ids.get(request_id) == wire_id:
-                self._request_targets[request_id] = set(failures)
-            raise next(iter(failures.values()))
-        if not retain_request:
-            self._forget_request(request_id)
+        wire_id, targets = attempt
+        if not targets:
+            targets.update(await self._worker_urls())
+            if self._requests.get(request_id) is not attempt:
+                return
+            if not targets:
+                raise RuntimeError("Cannot confirm backend abort without any worker targets")
 
-    def _forget_request(self, request_id: str) -> None:
-        self._request_wire_ids.pop(request_id, None)
-        self._request_targets.pop(request_id, None)
+        async def abort(url: str) -> None:
+            await post(f"{url}/abort_request", {"rid": wire_id})
+            if not retain_request:
+                targets.discard(url)
+
+        # Keep failed targets even if they disappear from subsequent worker discovery.
+        outcomes = await asyncio.gather(*(abort(url) for url in sorted(targets)), return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        if not retain_request and self._requests.get(request_id) is attempt:
+            self._requests.pop(request_id)
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""
