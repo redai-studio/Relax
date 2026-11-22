@@ -569,7 +569,8 @@ class SGLangBackendAdapter:
         self._session_lifecycle = args.agentic_session_lifecycle
         self._requests: dict[str, _BackendAttempt] = {}
         self._session_endpoints: dict[str, set[str]] = {}
-        # The shared request permit already bounds concurrency.
+        # Worker discovery and cleanup must not queue behind routed generation.
+        # Managed generation also uses this client and is already bounded by request permits.
         self._managed_http = httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None))
         self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
@@ -731,7 +732,7 @@ class SGLangBackendAdapter:
                 raise RuntimeError("Cannot confirm backend abort without any worker targets")
 
         async def abort(url: str, *, final: bool) -> None:
-            await post(f"{url}/abort_request", {"rid": attempt.wire_id})
+            await post(f"{url}/abort_request", {"rid": attempt.wire_id}, client=self._managed_http)
             if final:
                 targets.discard(url)
 
@@ -769,7 +770,7 @@ class SGLangBackendAdapter:
             if not urls:
                 raise RuntimeError("Cannot close a backend session without any worker targets")
             return await asyncio.gather(
-                *(post(f"{url}/close_session", {"session_id": session_id}) for url in urls),
+                *(post(f"{url}/close_session", {"session_id": session_id}, client=self._managed_http) for url in urls),
                 return_exceptions=True,
             )
 
@@ -786,10 +787,10 @@ class SGLangBackendAdapter:
         """Include unhealthy workers: health is not proof that a request
         ended."""
         try:
-            response = await get(f"{self._router_url}/workers")
+            response = await get(f"{self._router_url}/workers", client=self._managed_http)
             urls = [worker["url"] for worker in response["workers"] if worker["url"]]
         except Exception:
-            response = await get(f"{self._router_url}/list_workers")
+            response = await get(f"{self._router_url}/list_workers", client=self._managed_http)
             urls = response["urls"]
         return router_worker_base_urls(urls)
 

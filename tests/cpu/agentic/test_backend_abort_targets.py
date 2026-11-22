@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -24,7 +26,9 @@ def adapter(monkeypatch, client: httpx.AsyncClient, *, lifecycle: bool = False):
     backend._session_endpoints = {}
     backend._session_lifecycle = lifecycle
 
-    async def get(url):
+    backend._managed_http = client
+
+    async def get(url, **_kwargs):
         response = await client.get(url)
         response.raise_for_status()
         return response.json()
@@ -123,3 +127,62 @@ async def test_rejected_generate_400_releases_wire_owner(monkeypatch, context_er
                 input_ids=[1], sampling_params={"max_new_tokens": 1}, session_id="session", request_id="request"
             )
         assert not backend._requests
+
+
+@pytest.mark.asyncio
+async def test_terminal_abort_reaches_worker_while_generate_holds_only_connection(monkeypatch):
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from relax.utils import http_utils
+
+    started, aborted = asyncio.Event(), asyncio.Event()
+    wire_ids = []
+
+    async def generate(request):
+        wire_ids.append((await request.json())["rid"])
+        started.set()
+        await aborted.wait()
+        return web.json_response({"output_ids": [], "meta_info": {"finish_reason": {"type": "abort"}}})
+
+    async def workers(request):
+        return web.json_response({"workers": [{"url": f"http://{request.host}"}]})
+
+    async def abort(request):
+        wire_ids.append((await request.json())["rid"])
+        aborted.set()
+        return web.json_response({})
+
+    app = web.Application()
+    app.add_routes([web.post("/generate", generate), web.get("/workers", workers), web.post("/abort_request", abort)])
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    monkeypatch.setattr(http_utils, "_http_client", None)
+    monkeypatch.setattr(http_utils, "_distributed_post_enabled", False)
+    monkeypatch.setattr(http_utils, "_client_concurrency", 0)
+    monkeypatch.setattr(runtime, "load_agentic_compiler_resources", lambda _: Mock(processor=None))
+    async with TestServer(app) as server:
+        args = SimpleNamespace(
+            sglang_router_ip=server.host,
+            sglang_router_port=server.port,
+            sglang_server_concurrency=1,
+            rollout_num_gpus=1,
+            rollout_num_gpus_per_engine=1,
+            use_distributed_post=False,
+            agentic_session_lifecycle=False,
+            apply_chat_template_kwargs={},
+            use_audio_in_video=False,
+        )
+        backend = runtime.SGLangBackendAdapter(args)
+        task = asyncio.create_task(
+            backend.generate(input_ids=[1], sampling_params={}, session_id=None, request_id="r")
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            await asyncio.wait_for(backend.abort_request("r"), 2)
+            assert (await asyncio.wait_for(task, 2)).finish_type == "abort"
+            assert len(wire_ids) >= 2 and set(wire_ids) == {"r"}
+        finally:
+            aborted.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await backend.shutdown()
+            await http_utils._http_client.aclose()

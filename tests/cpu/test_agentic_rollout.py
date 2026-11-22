@@ -932,6 +932,7 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
+    adapter._managed_http = MagicMock(spec=httpx.AsyncClient)
     adapter._requests = {}
     adapter._session_endpoints = {}
     adapter.tokenizer = _FakeTokenizer()
@@ -1131,7 +1132,7 @@ async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     adapter._worker_urls = AsyncMock(return_value=["http://engine-0", "http://engine-1"])
     posts: list[tuple[str, dict[str, Any]]] = []
 
-    async def fake_post(url, payload):
+    async def fake_post(url, payload, **_kwargs):
         posts.append((url, payload))
         if url.startswith("http://engine-1"):
             raise RuntimeError("engine unavailable")
@@ -2073,6 +2074,7 @@ async def test_routed_generation_does_not_resend_after_ambiguous_failure(monkeyp
         return httpx.Response(503, json={"error": {"code": "no_available_workers"}})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter._managed_http = client
         monkeypatch.setattr(http_utils, "_http_client", client)
         monkeypatch.setattr(http_utils, "_distributed_post_enabled", False)
         with pytest.raises(httpx.ReadError):
