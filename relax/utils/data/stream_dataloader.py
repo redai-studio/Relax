@@ -1203,7 +1203,7 @@ def post_process_rollout_data(args, rollout_data):
 
     replay_consumer = replay_data_manager.register_consumer(rollout_kinds(args))
     replay_consumer.receive_references(rollout_data)
-    if Envs.RELAX_SFT_SELECTIVE_LOGITS and getattr(args, "loss_type", None) == "sft":
+    if Envs.RELAX_SFT_SELECTIVE_LOGITS and args.loss_type == "sft":
         masks = rollout_data["loss_masks"]
         # Per-rank fetch supplies CPU masks. Never copy CUDA masks back in the
         # training path; unsupported producers simply retain the original head.

@@ -20,6 +20,7 @@ except Exception as exc:
 def _args(*, reference_free: bool = False, beta: float = 0.2) -> Namespace:
     return Namespace(
         loss_type="dpo",
+        task_type="causal_lm",
         dpo_reference_free=reference_free,
         dpo_beta=beta,
         qkv_format="thd",

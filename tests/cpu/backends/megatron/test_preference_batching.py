@@ -87,6 +87,7 @@ def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch, p
         global_batch_size=4,
         max_tokens_per_gpu=capacity,
         loss_type="dpo",
+        task_type="causal_lm",
         dpo_reference_free=True,
         dpo_beta=0.2,
         qkv_format="thd",

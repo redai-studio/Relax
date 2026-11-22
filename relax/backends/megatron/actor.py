@@ -3210,7 +3210,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # intentionally absent — either true_on_policy_mode (log_probs
             # recomputed inline by train forward) or hybrid mode (actor
             # handles forward via _switch_model, no separate service).
-            if actor_fwd_absent or getattr(self.args, "hybrid", False):
+            if actor_fwd_absent or self.args.hybrid:
                 rollout_only = True
             else:
                 try:
