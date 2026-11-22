@@ -2087,8 +2087,8 @@ def _compute_genrm_server_args(
         and "mm_feature_transport" not in (args.genrm_engine_config or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
-        and kwargs.get("device", "npu" if device_utils.is_npu_available else "cuda") == "cuda"
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2221,8 +2221,8 @@ def _compute_server_args(
         and "mm_feature_transport" not in (sglang_overrides or {})
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
-        and kwargs.get("device", "npu" if device_utils.is_npu_available else "cuda") == "cuda"
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 

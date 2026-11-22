@@ -53,7 +53,9 @@
 
 使用 `--train-backend fsdp_turbo --turbo-config <配置文件> --colocate` 选择该后端。当前支持离线 SFT 和同步 colocate 文本 GRPO；不支持 fully-async、hybrid、critic/reference 模型及独立 log-prob 服务入口，`--kl-coef` 必须为 `0`。
 
-GRPO 要求 SGLang DP=1、PP=1，每个 rollout 的全局样本数不能超过 `--global-batch-size`；暂不支持图像 GRPO。
+Turbo 仅接受 `sft` 和 `policy_loss`。GRPO 要求 SGLang DP=1、attention-DP=1、PP=1，包括 engine group 的覆盖配置。每个 rollout 的全局样本数不能超过 `--global-batch-size`；不支持多模态 GRPO，包括自定义生成 hook 添加的多模态输入。
+
+SFT 使用可训练视觉塔时，各 rank 每个对齐后的 microbatch 必须进入相同的图像/视频分支。不支持的混合 rank 批次会在模型 forward 前报错；冻结视觉塔保留原有行为。
 
 优化器和学习率调度以 Turbo YAML 的 `optimizer` 字段为准，包括 `lr`、`min_lr`、`warmup_ratio` / `warmup_steps`、betas 和 weight decay。`--lr`、`--lr-decay-style` 等 Megatron 参数不会覆盖这些值；`--turbo-config` 使用内联 JSON 时遵循相同规则。`warmup_steps` 显式设置时优先于 `warmup_ratio`，包括 `warmup_steps: 0`。全局 batch size、数据路径等 Relax 参数仍通过 CLI 设置。
 
@@ -64,6 +66,8 @@ Ulysses CP 目前仅支持 SFT。Qwen4 Exp SFT 可以组合 CP 与 `memory.chunk
 直接多机启动时，在八个节点分别设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。配方固定 `WORLD_SIZE=8`、`NUM_NPUS=16`。
 
 FSDPTurbo 的 DCP 和 legacy 检查点均需包含 `lr_scheduler.pt` 才能通过 `--load` 恢复 scheduler 进度。缺少该文件的旧检查点会明确报错，不会根据 rollout 编号猜测 optimizer 更新次数。若只复用权重，应先导出为当前模型可加载的 HF 目录，再通过 `--hf-checkpoint` 开始新训练；不要将 DCP 分片目录直接作为 HF 目录使用。
+
+保存时会拒绝已存在的步目录，以保护已发布的 checkpoint。重启旧训练时应选择新的保存目录。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，整表和 VP sidecar 导出不能用于这种初始化；恢复其训练 checkpoint 应使用 `--load`。
 
 ---
 

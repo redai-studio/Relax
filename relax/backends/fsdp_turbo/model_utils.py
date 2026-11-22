@@ -1166,6 +1166,18 @@ def load_qwen4_exp_weights_sharded(model: torch.nn.Module, src_path: str, strict
         # loading pass from ngram_embedding.shard_* keys. Their config buffers
         # are also restored separately after to_empty().
         if target_key.endswith("ngram_embedding.weight"):
+            prefix = target_key.removesuffix(".weight") + ".shard_"
+            exported_table = target_key in weight_map or os.path.isfile(
+                os.path.join(src_path, "ngram_shards", "meta.json")
+            )
+            if exported_table and not (
+                os.path.isfile(os.path.join(src_path, "model.safetensors.index.json"))
+                and any(key.startswith(prefix) for key in weight_map)
+            ):
+                raise ValueError(
+                    "PLE HF initialization requires indexed ngram_embedding.shard_* weights; "
+                    "whole-table/VP checkpoint exports are unsupported. Use --load for checkpoint resume."
+                )
             skipped_ngram.append(target_key)
             continue
 

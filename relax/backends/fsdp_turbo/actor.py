@@ -145,6 +145,9 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         self.tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
 
         self.turbo = build_turbo_model(args, turbo_config, self.hf_config)
+        self._has_trainable_visual = any(
+            param.requires_grad and "visual" in name.split(".") for name, param in self.turbo.named_parameters()
+        )
 
         # MTP (Qwen3.8/qwen4_exp multi-token prediction): scaling applied to
         # the MTP loss stashed by the patched forward; None disables it.
@@ -405,6 +408,25 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         dist.all_reduce(count, group=self.parallel_state.get_group("data"))
         return float(count.item()) / self._dp_size
 
+    def _validate_visual_microbatches(self, rollout_data: dict, microbatches: list[list[int]]) -> None:
+        if not self._has_trainable_visual:
+            return
+        inputs = rollout_data.get("multimodal_train_inputs") or []
+        schedule = [
+            tuple(
+                any(inputs[index] is not None and inputs[index].get(key) is not None for index in batch)
+                if inputs
+                else False
+                for key in ("pixel_values", "pixel_values_videos")
+            )
+            for batch in microbatches
+        ]
+        group = get_gloo_group()
+        schedules = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(schedules, schedule, group=group)
+        if any(other != schedule for other in schedules):
+            raise ValueError("fsdp_turbo requires matching visual forward participation across ranks per microbatch")
+
     def _train_actor(self, rollout_id: int, rollout_data: dict) -> None:
         # Close stale half-open intervals before starting full-step train so a prior exception cannot
         # leave timer state that masks the next error.
@@ -511,7 +533,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
 
         evaluation_step = evaluation_step_for_rollout(self.args, rollout_id)
         if is_sft_mode(self.args) and should_run_sft_eval(self.args, evaluation_step):
-            self._run_sft_eval(evaluation_step)
+            self._run_sft_eval(rollout_id, evaluation_step)
 
         # Close full-step train before the perf logger resets timers, then reopen train_wait.
         Timer().end("train")
@@ -557,6 +579,8 @@ class FSDPTurboTrainRayActor(TrainRayActor):
                 )
                 skip_optimizer_step = True
                 metrics["loss"] = 0.0
+        if not skip_optimizer_step:
+            self._validate_visual_microbatches(rollout_data, microbatches)
         for microbatch in microbatches:
             if skip_optimizer_step:
                 break
@@ -740,7 +764,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
     # SFT eval (PPL over the producer's eval chunks)
     # ------------------------------------------------------------------
 
-    def _run_sft_eval(self, rollout_id: int) -> None:
+    def _run_sft_eval(self, rollout_id: int, evaluation_step: int) -> None:
         """Consume SFT eval chunks and log PPL.
 
         All-reduce sufficient statistics over Gloo, then divide out TP/CP
@@ -764,7 +788,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
                 run(self.data_system_client.async_clear_partition(partition_id=partition_id))
         dist.barrier(group=get_gloo_group())
 
-        pattern = re.compile(rf"^sft_eval_{rollout_id}_n(\d+)_\d+$")
+        pattern = re.compile(rf"^sft_eval_{evaluation_step}_n(\d+)_\d+$")
         n_chunks = 0
         while n_chunks == 0:
             partitions = run(self.data_system_client.async_get_partition_list())
@@ -783,7 +807,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         self.turbo.eval()
         try:
             for chunk_idx in range(n_chunks):
-                partition_id = f"sft_eval_{rollout_id}_n{n_chunks}_{chunk_idx}"
+                partition_id = f"sft_eval_{evaluation_step}_n{n_chunks}_{chunk_idx}"
                 # Wait for the chunk so a missing partition cannot end the loop early.
                 while True:
                     partitions = run(self.data_system_client.async_get_partition_list())
@@ -791,7 +815,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
                         break
                     time.sleep(1)
                 batch_index = 0
-                while not self.all_consumed(task_name, rollout_id, partition_id=partition_id, all_data=True):
+                while not self.all_consumed(task_name, evaluation_step, partition_id=partition_id, all_data=True):
                     eval_data = self._fetch_batch_with_agreement(
                         task_name, partition_id, data_fields, batch_size, batch_index, all_data=True
                     )
@@ -799,7 +823,9 @@ class FSDPTurboTrainRayActor(TrainRayActor):
                         time.sleep(0.25)
                         continue
                     batch_index += 1
-                    for microbatch in self._aligned_microbatches(eval_data["total_lengths"], max_tokens):
+                    microbatches = self._aligned_microbatches(eval_data["total_lengths"], max_tokens)
+                    self._validate_visual_microbatches(eval_data, microbatches)
+                    for microbatch in microbatches:
                         nll, count = sft_microbatch_nll_stats(self.turbo, eval_data, microbatch, device)
                         local_neg_log_prob += nll
                         local_num_tokens += count
@@ -816,7 +842,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         # Only TP/CP ranks replay identical data; FSDP samples are distinct.
         stats /= len(self._same_data_ranks)
         metrics = compute_ppl_metrics(float(stats[0].item()), int(stats[1].item()))
-        logger.info(f"[fsdp_turbo] SFT eval @ rollout_id={rollout_id}: {metrics}")
+        logger.info(f"[fsdp_turbo] SFT eval @ step={evaluation_step}: {metrics}")
 
     # ------------------------------------------------------------------
     # Weight sync / checkpointing / lifecycle

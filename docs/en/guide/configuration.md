@@ -53,7 +53,9 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 
 Select this backend with `--train-backend fsdp_turbo --turbo-config <config> --colocate`. It currently supports offline SFT and synchronous colocated text GRPO. Fully async and hybrid training, critic/reference models, and standalone log-probability services are unsupported; `--kl-coef` must be `0`.
 
-GRPO requires SGLang DP=1 and PP=1. The global sample count per rollout must not exceed `--global-batch-size`; image GRPO is unsupported.
+Turbo accepts only `sft` and `policy_loss`. GRPO requires SGLang DP=1, attention-DP=1 and PP=1, including engine-group overrides. The global sample count per rollout must not exceed `--global-batch-size`; multimodal GRPO is unsupported, including payloads added by custom generation hooks.
+
+For SFT with a trainable visual tower, every rank must enter the same image/video branches in each aligned microbatch. Unsupported mixed-rank batches fail before model forward; frozen visual towers retain the existing behavior.
 
 The Turbo YAML `optimizer` section controls the optimizer and learning-rate schedule, including `lr`, `min_lr`, `warmup_ratio` / `warmup_steps`, betas, and weight decay. Megatron arguments such as `--lr` and `--lr-decay-style` do not override these values. Inline JSON passed through `--turbo-config` follows the same rules. An explicit `warmup_steps` takes priority over `warmup_ratio`, including `warmup_steps: 0`. Relax arguments such as global batch size and data paths remain CLI settings.
 
@@ -64,6 +66,8 @@ The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-nex
 For direct multinode launch, set `MASTER_ADDR` to the head node name, `POD_NAME` to each node name, and `HOST_IP` to its communication IP on all eight nodes. The recipe fixes `WORLD_SIZE=8` and `NUM_NPUS=16`.
 
 Both DCP and legacy FSDPTurbo checkpoints need `lr_scheduler.pt` to restore scheduler progress with `--load`. Older checkpoints without it fail explicitly instead of inferring optimizer update counts from rollout IDs. To reuse only the weights, first export a compatible HF model directory and start a new run with `--hf-checkpoint`; a DCP shard directory is not an HF model directory.
+
+Saving refuses an existing step directory to protect published checkpoints. Use a new save directory when restarting an earlier run. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are not compatible HF initialization sources. Resume their training checkpoint with `--load` instead.
 
 ---
 

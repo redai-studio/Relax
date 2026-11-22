@@ -210,5 +210,5 @@ RUN python -m pip install --no-cache-dir --no-deps \
 RUN pip cache purge && \
     rm -rf /tmp/*
 
-ENTRYPOINT ["/bin/bash", "-c", "set -e; source /usr/local/Ascend/ascend-toolkit/set_env.sh; source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh; source /usr/local/Ascend/nnal/atb/set_env.sh ${ATB_CXX_ABI}; source \"$(command -v hyper_multicore_set_env.bash)\"; exec \"$@\"", "--"]
+ENTRYPOINT ["/bin/bash", "-c", "set -e; source /usr/local/Ascend/ascend-toolkit/set_env.sh; source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh; source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=${ATB_CXX_ABI:-1}; source \"$(command -v hyper_multicore_set_env.bash)\"; exec \"$@\"", "--"]
 CMD ["/bin/bash"]

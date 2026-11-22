@@ -107,6 +107,11 @@ def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
 
 def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[Sample]]):
     """Convert inference generated samples to training data."""
+    if getattr(args, "train_backend", None) == "fsdp_turbo" and getattr(args, "loss_type", None) != "sft":
+        for item in samples:
+            for sample in item if isinstance(item, list) else [item]:
+                if sample.multimodal_inputs or sample.multimodal_train_inputs:
+                    raise ValueError("fsdp_turbo supports text GRPO only; multimodal rollout payloads are unsupported")
     # Native generative RL emits a lightweight diffusion TQ row (numeric-only)
     # via a declared hook, so the default token converter below is bypassed
     # (design doc 8.3). When unset the standard token path runs unchanged.

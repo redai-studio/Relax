@@ -43,6 +43,7 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu-multinode.sh"
 fi
 
+if [ "${RELAX_ENTRYPOINT_MODE:-}" = "ray-job" ]; then
 RUNTIME_ENV_JSON=$(python3 - <<'PYENV'
 import json
 import os
@@ -57,6 +58,7 @@ print(json.dumps(runtime))
 PYENV
 )
 export RUNTIME_ENV_JSON
+fi
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/sft/qwen3.8}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"

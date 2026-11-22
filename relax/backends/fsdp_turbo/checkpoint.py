@@ -257,6 +257,7 @@ if _HAS_DCP:
             self.optimizer = optimizer
             self.rollout_id = int(rollout_id)
             self.initialize_optimizer = False
+            self.saved_optimizer_keys: set[str] | None = None
 
         def state_dict(self) -> dict[str, Any]:
             from torch.distributed.checkpoint.state_dict import get_state_dict
@@ -282,12 +283,21 @@ if _HAS_DCP:
             return {"model": model_sd, "optim": optim_sd, "rollout_id": self.rollout_id}
 
         def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, set_state_dict
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                set_model_state_dict,
+                set_optimizer_state_dict,
+            )
 
             model_sd = state_dict.get("model", {})
+            optim_sd = state_dict.get("optim", {})
+            if self.saved_optimizer_keys is not None:
+                optim_sd["state"] = {
+                    name: entry
+                    for name, entry in optim_sd.get("state", {}).items()
+                    if name in self.saved_optimizer_keys
+                }
             if not state_dict.get("optim", {}).get("state"):
-                from torch.distributed.checkpoint.state_dict import set_model_state_dict
-
                 set_model_state_dict(self.model, model_sd, options=StateDictOptions(strict=False))
                 if self.optimizer is not None:
                     self.optimizer.load_state_dict(state_dict["optim"])
@@ -300,11 +310,9 @@ if _HAS_DCP:
                 for name in missing_ngram:
                     model_sd[name] = params[name]
             try:
-                set_state_dict(
+                set_model_state_dict(
                     self.model,
-                    self.optimizer,
-                    model_state_dict=model_sd,
-                    optim_state_dict=state_dict.get("optim", {}),
+                    model_sd,
                     options=StateDictOptions(strict=True),
                 )
             except RuntimeError as e:
@@ -313,17 +321,19 @@ if _HAS_DCP:
                 # This known fork refusal happens after DCP has written values
                 # through shared storage, so the restored weights remain intact.
                 logger.warning(
-                    "[fsdp_turbo] load_checkpoint: set_state_dict refused with a known fork "
+                    "[fsdp_turbo] load_checkpoint: model state restore refused with a known fork "
                     f"signature after the DCP load ({e}); values were already landed in place "
                     "by the DCP reader itself"
                 )
+            if self.optimizer is not None:
+                set_optimizer_state_dict(self.model, self.optimizer, optim_sd, options=StateDictOptions(strict=False))
             self.rollout_id = int(state_dict.get("rollout_id", 0))
 
     class _OptimStateTolerantLoadPlanner(DefaultLoadPlanner):
         """Drop absent lazy Adam state and frozen replicated n-gram reads.
 
-        Parameters that never received gradients keep fresh zero state. The
-        ~102 GiB frozen tables are identical to their HF-built values and would
+        Parameters that never received gradients remain uninitialized. The ~102
+        GiB frozen tables are identical to their HF-built values and would
         otherwise be read in full per rank. VP tables and all other keys remain
         strict so real mismatches still fail.
         """
@@ -355,9 +365,8 @@ if _HAS_DCP:
                 if dropped:
                     logger.info(
                         "[fsdp_turbo] load_checkpoint: "
-                        f"{len(dropped)} key(s) excluded from the DCP load (fresh optimizer state / "
-                        f"frozen n-gram tables identical to the HF materialization, e.g. '{dropped[0]}'); "
-                        "keeping current values for them"
+                        f"{len(dropped)} key(s) excluded from the DCP load (uninitialized optimizer state / "
+                        f"frozen n-gram tables identical to the HF materialization, e.g. '{dropped[0]}')"
                     )
             return super().create_local_plan()
 
@@ -381,7 +390,10 @@ if _HAS_DCP:
         """
         app = _AppState(model, optimizer, 0)
         metadata = dcp.FileSystemReader(load_dir).read_metadata()
-        app.initialize_optimizer = any(key.startswith("app.optim.state.") for key in metadata.state_dict_metadata)
+        app.saved_optimizer_keys = {
+            path[3] for path in metadata.planner_data.values() if path[:3] == ("app", "optim", "state")
+        }
+        app.initialize_optimizer = bool(app.saved_optimizer_keys)
         dcp.load(
             {"app": app},
             checkpoint_id=load_dir,
@@ -396,45 +408,42 @@ if _HAS_DCP:
 
 
 def _save_vp_shards(output_dir: str, vp_params: dict[str, torch.nn.Parameter], rollout_id: int) -> None:
-    """Write per-rank VP shards without a full gather.
-
-    Rank 0 publishes ``meta.json`` after a barrier to certify all shard files;
-    loading rejects mismatched VP configurations.
-    """
+    """Publish VP metadata only after all ranks have written their shards."""
     from safetensors.torch import save_file
 
     rank = dist.get_rank()
     shard_dir = os.path.join(output_dir, "ngram_shards")
-    os.makedirs(shard_dir, exist_ok=True)
-    shard = {
-        _strip_param_prefix(name): param.to_local().detach().cpu().contiguous() for name, param in vp_params.items()
-    }
-    save_file(shard, os.path.join(shard_dir, f"rank-{rank:05d}.safetensors"), metadata={"format": "pt"})
-    # Rank 0 publishes metadata only after every shard file is complete.
-    dist.barrier(group=get_gloo_group())
-    if rank == 0:
-        first_mesh = next(iter(vp_params.values()))._spec.mesh
-        meta = {
-            "rollout_id": int(rollout_id),
-            "vp_size": int(first_mesh.size(0)),
-            "params": {
-                _strip_param_prefix(name): {
-                    "global_shape": list(param.shape),
-                    "dtype": str(param.dtype).replace("torch.", ""),
-                    "local_shape": list(param.to_local().shape),
-                }
-                for name, param in vp_params.items()
-            },
+    with _checkpoint_write_phase():
+        os.makedirs(shard_dir, exist_ok=True)
+        shard = {
+            _strip_param_prefix(name): param.to_local().detach().cpu().contiguous()
+            for name, param in vp_params.items()
         }
-        meta_path = os.path.join(shard_dir, "meta.json")
-        tmp_path = meta_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f)
-        os.replace(tmp_path, meta_path)
-        logger.info(
-            f"[fsdp_turbo] save_checkpoint: wrote {len(vp_params)} VP table param(s) as "
-            f"{dist.get_world_size()} per-rank shards under {shard_dir} (optimizer moments NOT persisted)"
-        )
+        save_file(shard, os.path.join(shard_dir, f"rank-{rank:05d}.safetensors"), metadata={"format": "pt"})
+    with _checkpoint_write_phase():
+        if rank == 0:
+            first_mesh = next(iter(vp_params.values()))._spec.mesh
+            meta = {
+                "rollout_id": int(rollout_id),
+                "vp_size": int(first_mesh.size(0)),
+                "params": {
+                    _strip_param_prefix(name): {
+                        "global_shape": list(param.shape),
+                        "dtype": str(param.dtype).replace("torch.", ""),
+                        "local_shape": list(param.to_local().shape),
+                    }
+                    for name, param in vp_params.items()
+                },
+            }
+            meta_path = os.path.join(shard_dir, "meta.json")
+            tmp_path = meta_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            os.replace(tmp_path, meta_path)
+            logger.info(
+                f"[fsdp_turbo] save_checkpoint: wrote {len(vp_params)} VP table param(s) as "
+                f"{dist.get_world_size()} per-rank shards under {shard_dir} (optimizer moments NOT persisted)"
+            )
 
 
 def _write_hf_model_file(output_dir: str, model_state: dict[str, Any]) -> None:
@@ -527,8 +536,7 @@ def _export_hf_weights(
     finally:
         _restore_vp_tables_after_gather(model, optimizer, detach_receipt)
     if vp_params:
-        with _checkpoint_write_phase():
-            _save_vp_shards(output_dir, vp_params, rollout_id)
+        _save_vp_shards(output_dir, vp_params, rollout_id)
     with _checkpoint_write_phase():
         if dist.get_rank() == 0:
             os.makedirs(output_dir, exist_ok=True)
@@ -560,9 +568,10 @@ def save_checkpoint(
     rank = dist.get_rank()
 
     with _checkpoint_write_phase():
-        if rank == 0 and lr_scheduler is not None:
-            os.makedirs(output_dir, exist_ok=True)
-            torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "lr_scheduler.pt"))
+        if rank == 0:
+            os.makedirs(output_dir, exist_ok=False)
+            if lr_scheduler is not None:
+                torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "lr_scheduler.pt"))
 
     use_dcp = Envs.RELAX_FSDPTURBO_CKPT_DCP and _HAS_DCP
     if Envs.RELAX_FSDPTURBO_CKPT_DCP and not _HAS_DCP and rank == 0:
@@ -603,8 +612,7 @@ def save_checkpoint(
     finally:
         _restore_vp_tables_after_gather(model, optimizer, detach_receipt)
     if vp_params:
-        with _checkpoint_write_phase():
-            _save_vp_shards(output_dir, vp_params, rollout_id)
+        _save_vp_shards(output_dir, vp_params, rollout_id)
 
     with _checkpoint_write_phase():
         if rank == 0:
@@ -689,6 +697,35 @@ def _load_vp_shards(load_dir: str, vp_params: dict[str, torch.nn.Parameter]) -> 
         f"[fsdp_turbo] load_checkpoint: restored {len(vp_params)} VP table param(s) from ngram_shards "
         f"(rank {rank}); their optimizer moments are NOT persisted and re-zero on resume"
     )
+
+
+def _localize_full_tensor(value: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Convert a full CPU checkpoint tensor to the target's local layout."""
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(value, DTensor):
+        local = value.to_local()
+        if local.shape != value.shape:
+            raise ValueError("Legacy checkpoint contains rank-local tensors instead of full weights")
+        value = local
+    if value.shape != target.shape:
+        raise ValueError(f"Checkpoint shape mismatch: {value.shape} != {target.shape}")
+    if not isinstance(target, DTensor):
+        return value.to(device=target.device)
+
+    from relax.backends.fsdp_turbo.model_utils import _compose_dtensor_local_indices
+
+    for dim, indices in enumerate(_compose_dtensor_local_indices(target.shape, target.device_mesh, target.placements)):
+        if isinstance(indices, range):
+            slices = [slice(None)] * value.ndim
+            slices[dim] = slice(indices.start, indices.stop, indices.step)
+            value = value[tuple(slices)]
+        else:
+            value = value.index_select(dim, torch.tensor(indices, dtype=torch.long, device=value.device))
+    result = torch.empty_like(target, dtype=value.dtype)
+    with torch.no_grad():
+        result.to_local().copy_(value)
+    return result
 
 
 def load_checkpoint(
@@ -796,15 +833,17 @@ def load_checkpoint(
             value = model_state[stripped]
             if tuple(value.shape) != tuple(tensor.shape):
                 raise ValueError(f"Checkpoint shape mismatch for {name}: {value.shape} != {tensor.shape}")
-            aligned[name] = value
+            aligned[name] = _localize_full_tensor(value, tensor)
         elif "ngram_embedding" not in name:
             raise ValueError(f"Checkpoint is missing model parameter {name}")
-    # The state-dict APIs distribute full tensors using the actual DTensor placements,
-    # including repeated shards of the same dimension and uneven shards.
-    options = StateDictOptions(full_state_dict=True, strict=False)
+    options = StateDictOptions(strict=False)
     set_model_state_dict(model, aligned, options=options)
     if optimizer is not None and optimizer_state is not None:
         if optimizer_state.get("state"):
+            for name, entry in optimizer_state["state"].items():
+                for key, value in entry.items():
+                    if isinstance(value, torch.Tensor) and key != "step":
+                        entry[key] = _localize_full_tensor(value, skeleton[name])
             set_optimizer_state_dict(model, optimizer, optimizer_state, options=options)
         else:
             optimizer.load_state_dict(optimizer_state)

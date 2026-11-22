@@ -566,12 +566,14 @@ def _compute_engine_server_args(
         use_rollout_routing_replay=False,
         fp16=False,
         sglang_mm_feature_transport=parsed.sglang_mm_feature_transport,
+        sglang_device=getattr(parsed, "sglang_device", None),
     )
     module = request.getfixturevalue("sglang_engine_module")
     monkeypatch.setattr(module, "ServerArgs", ServerArgs)
     monkeypatch.setattr(module, "_to_local_gpu_id", lambda gpu: gpu)
     # The fixture stubs relax.utils.device, so the flag may not exist yet.
     monkeypatch.setattr(module.device_utils, "is_rocm", is_rocm, raising=False)
+    monkeypatch.setattr(module.device_utils, "is_npu_available", False, raising=False)
     compute = module._compute_genrm_server_args if engine == "genrm" else module._compute_server_args
     options = {} if engine == "genrm" else {"sglang_overrides": overrides, "num_gpus_per_engine": engine_gpus}
     actual, _ = compute(
