@@ -1,14 +1,59 @@
 # Replay Manager
 
-Replay Manager 将 SGLang rollout 的模型决策和冻结视觉输出交给 Megatron 训练复用。本分支一期实现 `moe`（专家路由 R3）与 `mm_embedding`（视觉 embedding）；QSA/DSA indexer 只保留扩展接口，不包含其 replay 实现。
+Replay Manager 让 Megatron 在训练时复用 SGLang 在 rollout 中产生的 MoE 专家路由和冻结视觉模型的 embedding。当前内置两种 replay 类型：`moe`（R3）和 `mm_embedding`。下图沿在线 **reference 模式** 展示一次生成请求的数据如何进入实际消费它的训练 microbatch。离线复现训练步骤见[轨迹重放](./trajectory-replay.md)。
 
-Reference 模式下，sample 携带描述符，不可变 body 存放在 TransferQueue（TQ）。它与用于离线复现的[轨迹重放](./trajectory-replay.md)不同。
+## 架构与所有权
 
-## 数据流
+```mermaid
+flowchart TB
+    S["SGLang 采集<br/>MoE 路由、merger 后的视觉输出"]
+    P["SGLangProducer<br/>写完不可变数据后发布引用"]
+    S --> P
+    P -->|引用| N["Native rollout<br/>一次请求可返回多行"]
+    P -->|引用| A["Agentic Session<br/>接受的 token 区间和选中的分支"]
+    N --> W["共用样本写入入口<br/>put_rollout_batch / ReplayRegion.put"]
+    A -->|选中的样本及图像 lease| W
+    W -->|关联分区 / 确认写入| I["ReplayInventory<br/>发布者、分区与 reader 持有的引用"]
+    I -->|回收已释放的数据块| B
+    C -->|获取 / 释放读取权| I
+    D["训练调度<br/>colocated · hybrid · fully async"] -->|绑定时机与模型 chunk| C
+    subgraph TQ["TransferQueue"]
+        B["Replay 数据块"]
+        Q["训练分区<br/>样本字段及 rollout_replay_refs"]
+    end
+    P -->|数据块| B
+    W -->|先关联分区，再写入样本| Q
+    Q -->|样本引用| C["MegatronConsumer"]
+    B -->|持有 lease 读取| C
+    C --> R["本 rank 的 MoE 层<br/>按 microbatch 的 token 顺序绑定路由"]
+    C --> M["输入 PP stage<br/>复用冻结的视觉输出"]
+    K["ReplayKind 注册接口<br/>QSA / DSA indexer · 未实现"]
+    K -. 预留采集适配器 .-> P
+    K -. 预留模型绑定接口 .-> C
+```
 
-SGLang 采集路由和视觉 embedding，将 body 写入现有 TQ；sample 只携带 reference。Megatron 按本 rank 的 layer、microbatch 和 token 布局读取并重放。
+SGLang 按 token 和层采集专家编号，在视觉 merger 之后采集 embedding。生产端等数据块写完再发布引用。训练样本保留常规训练字段，replay 数据通过 `rollout_replay_refs` 中的描述符传递。Replay Manager 跟踪发布者、训练分区和活跃 reader 各自持有的引用。分区退役后，仍在读取的数据会保留到最后一个持有者释放。全局恢复会创建新的 replay run。
 
-写入完成后才发布 reference。队列和 reader 分别持有数据引用，所有使用方释放后才回收；全局恢复会生成新的 run 标识，避免读取旧数据。
+**样本选择。** Native rollout 的自定义 R3 生成器可以为一次请求导出多行，各行沿用原请求的 sample index。丢弃一行只释放该行持有的路由。Agentic rollout 由 Session 决定接受哪些 token、哪些分支进入训练。多轮生成或中断续跑时，已接受的前缀沿用原来的路由区间。Replay Manager 据此把选中的路由记录和每次图像引用各自的 lease 移交给导出的 Group，回收被丢弃分支持有的数据。
+
+**写入训练队列。** 两条 rollout 路径共用 `put_rollout_batch`。Replay Manager 先把选中的数据关联到训练分区，再发送样本。确定在发送前失败时，释放未发送样本持有的引用。一旦开始发送，即使收不到 ACK，也会保留数据，因为训练端可能已经看到了样本。收到 ACK 后完成向分区的移交。
+
+**训练调度。** `MegatronConsumer` 选择队列字段并解析引用。R3 按 packed microbatch 的 token 布局，为本 rank 上各个 MoE 层映射路由行。MM 由输入 PP stage 读取冻结的视觉输出，并在 TP 组内共享。
+
+| 调度模式 | consumer 在何时绑定数据 |
+| --- | --- |
+| Colocated | 收齐 batch 后，在训练前准备路由和视觉输入。 |
+| Hybrid | 按已排定的 microbatch 准备 R3。子批次合并后，只需把视觉输入重新绑定到合并后的 batch。 |
+| Fully async | 调度器取到实际 microbatch 时，绑定当前模型 chunk 的路由，并在需要时绑定视觉输入。MM 的 PP 限制见下文。 |
+
+### 相比原有 R3 路径的两处变化
+
+1. **样本携带的数据。** 原来的 SGLang rollout 将完整路由数组解码到 `Sample.rollout_routed_experts`，再把该字段写进训练队列。Reference R3 单独存放不可变数据。多行样本可以共享一条记录，各 rank 按本地层和 token 布局读取所需的路由行。
+2. **绑定时机和释放责任。** 原先由 Megatron Actor 重排队列中的数组并填充 router replay 状态。现在训练调度决定何时绑定，Replay Manager 管理 reader 和底层记录的生命周期。Agentic 分支取舍、队列写入结果未知时的引用归属也有了明确的处理路径。兼容配置仍可使用 R3 全量张量传递模式。
+
+### QSA / DSA indexer replay 的扩展位置
+
+图中虚线标出了未来 indexer 的决策采集和模型绑定位置。各参与进程在安装引擎 hook 前，通过 `ReplayManager.register_kind` 注册 `ReplayKind`，指定 replay 字段、生产端和消费端适配器，以及可选的引擎 patch hook。接入方还需实现 indexer 的采集格式、token 与布局校验、面向具体模型的读取和绑定逻辑。**本 PR 未实现 QSA 或 DSA 的 indexer 引用回放。** Qwen3.8 QSA 和 Keye DSA 的布局设计见独立的 [Draft PR #730](https://github.com/redai-studio/Relax/pull/730)。
 
 ## 开启 R3 与 MM replay
 

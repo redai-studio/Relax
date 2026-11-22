@@ -1,14 +1,59 @@
 # Replay Manager
 
-Replay Manager carries SGLang rollout decisions and frozen visual outputs into Megatron training. Phase one implements `moe` (R3 expert routing) and `mm_embedding` (visual embeddings). QSA/DSA indexer replay is reserved for extensions and is not implemented in this branch.
+Replay Manager lets Megatron reuse the MoE expert routes and frozen visual embeddings that SGLang produced during rollout. The two built-in replay kinds are `moe` (R3) and `mm_embedding`. The diagram follows online **reference delivery** from one generation request to the training microbatch that consumes it. For offline reproduction of a training step, see [Trajectory Replay](./trajectory-replay.md).
 
-With reference delivery, samples carry descriptors and immutable bodies live in TransferQueue (TQ). This is separate from [Trajectory Replay](./trajectory-replay.md), which supports offline reproduction.
+## Architecture and ownership
 
-## Data flow
+```mermaid
+flowchart TB
+    S["SGLang capture<br/>MoE routes · post-merger visual embeddings"]
+    P["SGLangProducer<br/>publish immutable bodies, then return references"]
+    S --> P
+    P -->|references| N["Native rollout<br/>one request may return several rows"]
+    P -->|references| A["Agentic Session<br/>accepted token spans and selected branches"]
+    N --> W["Shared sample write<br/>put_rollout_batch / ReplayRegion.put"]
+    A -->|selected exports and image leases| W
+    W -->|attach / commit| I["ReplayInventory<br/>publisher, partition and reader holds"]
+    I -->|collect released bodies| B
+    C -->|acquire / release reader| I
+    D["Training schedule<br/>colocated · hybrid · fully async"] -->|binding time and model chunk| C
+    subgraph TQ["TransferQueue"]
+        B["Replay body storage"]
+        Q["Training partition<br/>sample fields and rollout_replay_refs"]
+    end
+    P -->|body blocks| B
+    W -->|attach to partition, then enqueue| Q
+    Q -->|sample references| C["MegatronConsumer"]
+    B -->|leased reads| C
+    C --> R["Local MoE layers<br/>route rows in microbatch token order"]
+    C --> M["Input pipeline stage<br/>frozen visual outputs"]
+    K["ReplayKind registration<br/>QSA / DSA indexer · unimplemented"]
+    K -. future capture adapter .-> P
+    K -. future model binding .-> C
+```
 
-SGLang captures routes and visual embeddings and writes their bodies to the existing TQ storage. Samples carry references only. Megatron reads and replays the data for each rank's layers, microbatches, and token layout.
+SGLang captures expert IDs by token and layer, and captures visual embeddings after the vision merger. The producer publishes a reference once the body writes finish. A training sample carries its normal training fields and a compact replay manifest in `rollout_replay_refs`. Replay Manager tracks publisher ownership, partition holds and active readers so that retiring a training partition can reclaim bodies after the last holder releases them. Global recovery starts a new replay run.
 
-References are published only after writes finish. Queues and readers hold separate references; reclamation waits for all users to release them. Global recovery creates a new run identity to reject stale data.
+**Sample selection.** Native rollout can export several training rows from a custom R3 generator. Rows from one request keep its sample index, and dropping one row releases only its share of a route. In Agentic rollout the Session determines which tokens were accepted and which branches enter training. Across turns or resumed requests it preserves the route spans for the accepted prefix. The manager transfers the selected route records and the lease for each selected image occurrence to the exported group. Rejected branches release their holdings.
+
+**Queue handoff.** Both rollout paths use `put_rollout_batch`. Replay Manager attaches the selected bodies to the training partition before sending the samples. A failure known to precede dispatch releases the unsent holds. Once dispatch begins, a missing acknowledgement leaves the bodies available because a trainer may already see the samples. Acknowledged writes complete the handoff to the partition.
+
+**Training schedule.** `MegatronConsumer` selects the queue fields and resolves the references. For R3, it maps the packed microbatch tokens to recorded rows for each local MoE layer. For MM, the input pipeline stage reads the frozen outputs and shares them within its tensor-parallel group.
+
+| Schedule | When the consumer binds replay |
+| --- | --- |
+| Colocated | Prepare the routes and visual inputs before training from the collected batch. |
+| Hybrid | Prepare R3 for the scheduled microbatches. After merging sub-batches, rebind the visual inputs to the merged batch. |
+| Fully async | When the schedule fetches the actual microbatch, bind the routes for the current model chunk and the visual inputs where needed. MM has the PP restrictions below. |
+
+### How reference R3 differs from the original path
+
+1. **What travels with the sample.** The original SGLang rollout decoded the full route array into `Sample.rollout_routed_experts` and sent that field through the training queue. Reference R3 stores the immutable body separately. Multiple selected rows can refer to the same record, and each rank can read the rows for its own layers and token layout.
+2. **Who decides when to replay and release.** The original Megatron Actor reshaped the queued arrays and filled router replay state itself. The training schedule now chooses the binding point, while Replay Manager owns the readers and the lifetime of the underlying records. This also gives Agentic branch selection and uncertain queue writes explicit ownership rules. The full-tensor R3 delivery path remains available in compatible configurations.
+
+### Extension point for QSA and DSA indexer replay
+
+The dotted edges show where a future indexer would capture its decisions and bind them to the consuming model. Register a `ReplayKind` with `ReplayManager.register_kind` before installing engine hooks. The definition names the replay field, producer and consumer adapters, and optional engine patch hooks. An indexer implementation must supply its capture format, token/layout validation and model-specific read and binding logic. **QSA and DSA indexer reference replay are unimplemented in this PR.** The separate draft explores the Qwen3.8 QSA and Keye DSA layouts. [Draft PR #730](https://github.com/redai-studio/Relax/pull/730)
 
 ## Enable R3 and MM replay
 

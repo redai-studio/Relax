@@ -87,6 +87,16 @@ def test_cli_reference_enable_preserves_manager_and_retires_after_successful_tq_
     store.invoke_async.assert_awaited_once_with("retire_partition", "train_0")
 
 
+def test_rollout_staleness_counts_only_pending_training_steps():
+    from relax.components.rollout import satisfy_staleness
+    from relax.distributed.replay_manager.storage import BODY_PARTITION_PREFIX
+
+    other = [f"{BODY_PARTITION_PREFIX}abcd", "sft_0"]
+    assert satisfy_staleness(other, current_rollout_id=6, max_staleness=2)
+    assert satisfy_staleness([*other, "train_5"], current_rollout_id=6, max_staleness=2)
+    assert not satisfy_staleness([*other, "train_5", "train_4"], current_rollout_id=6, max_staleness=2)
+
+
 def test_cli_reference_enable_refuses_initialized_full_manager_without_mutation(monkeypatch):
     from relax.distributed.replay_manager import core
 
@@ -226,13 +236,20 @@ async def test_debug_dump_materializes_routes_for_another_run(published, monkeyp
         assert not restored.rollout_replay_refs
 
 
-@pytest.mark.asyncio
-async def test_cancel_before_queue_put_releases_only_this_writer(published, monkeypatch):
+async def test_native_cancel_reclaims_exclusive_route_while_peer_commits(published, native_write, monkeypatch):
+    from dataclasses import replace
     from unittest.mock import AsyncMock
 
-    config, store, body, inventory, ref, _ = published
-    manager = ReplayManager(config=config, store_factory=lambda: store)
-    sample = SimpleNamespace(rollout_replay_refs={"moe": ref.to_dict()})
+    from relax.utils.utils import transfer_batch_to_data_system
+
+    _, store, body, inventory, shared, _ = published
+    args, sample, producer = native_write
+    await producer.adopt_native_response(sample, args, {"routed_experts": shared.to_dict()})
+    publication = store.begin_publication(kind="moe", layers=1, topk=1)
+    publication.append(2, lambda _: np.zeros((2, 1), dtype=np.int32))
+    other = publication.finish([1, 2, 3])
+    exclusive = replace(sample, index=1, tokens=[1, 2, 3], rollout_replay_refs={"moe": other.to_dict()})
+    await producer.adopt_native_response(exclusive, args, {"routed_experts": other.to_dict()})
     attached, acknowledge = asyncio.Event(), asyncio.Event()
     invoke = store.invoke_async
 
@@ -244,20 +261,325 @@ async def test_cancel_before_queue_put_releases_only_this_writer(published, monk
         return result
 
     monkeypatch.setattr(store, "invoke_async", delay_ack)
-    write = AsyncMock()
-    task = asyncio.create_task(manager.region("train_0").put([sample], write))
+    client = SimpleNamespace(async_put=AsyncMock())
+    task = asyncio.create_task(transfer_batch_to_data_system(args, [[sample, exclusive]], 0, 0, client))
     await asyncio.wait_for(attached.wait(), 5)
-    # Another sample sharing the same body can finish while the first waits.
-    store.attach([ref], "train_0")
-    store.commit([ref])
+    store.attach([shared], "train_0")
+    store.commit([shared])
     task.cancel()
     acknowledge.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    write.assert_not_awaited()
-    assert inventory.state["objects"][ref.record]["partitions"] == ["train_0"]
+    client.async_put.assert_not_awaited()
+    assert set(inventory.state["objects"]) == {shared.record}
+    assert inventory.state["objects"][shared.record]["partitions"] == ["train_0"]
     store.retire_partition("train_0")
     assert not body.blocks
+
+
+@pytest.fixture
+def native_write(published, monkeypatch):
+    from relax.utils import utils
+    from relax.utils.types import Sample
+
+    config, store, _, _, ref, _ = published
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(utils, "replay_data_manager", manager)
+    monkeypatch.setattr(utils, "CURRENT_ROLLOUT_BATCH", [])
+    sample = Sample(
+        index=0,
+        group_index=0,
+        session_id="native",
+        tokens=[10, 11, 12, 13, 14],
+        response_length=1,
+        reward=1.0,
+        rollout_replay_refs={"moe": ref.to_dict()},
+    )
+    args = SimpleNamespace(
+        custom_reward_post_process_path=None,
+        reward_key=None,
+        rewards_normalization=False,
+        use_rollout_routing_replay=True,
+        multimodal_keys=None,
+        use_opd=False,
+        debug_train_only=False,
+    )
+    return args, sample, manager.register_producer({"moe"})
+
+
+@pytest.mark.parametrize("failure", ["invalid-sample", "uninitialized-client", "lost-ack"])
+async def test_native_queue_failure_keeps_only_possibly_delivered_bodies(published, native_write, failure):
+    from unittest.mock import AsyncMock
+
+    from transfer_queue.client import AsyncTransferQueueClient
+
+    from relax.utils.utils import transfer_batch_to_data_system
+
+    _, _, body, inventory, ref, _ = published
+    args, sample, producer = native_write
+    await producer.adopt_native_response(sample, args, {"routed_experts": ref.to_dict()})
+    put = AsyncMock(side_effect=ConnectionError("TQ write ACK lost"))
+    client = SimpleNamespace(async_put=put)
+    if failure == "invalid-sample":
+        sample.tokens[-1] = 99
+        error, message = ValueError, "tokens"
+    elif failure == "uninitialized-client":
+        client = object.__new__(AsyncTransferQueueClient)
+        client.storage_manager = None
+        client.async_get_meta = AsyncMock()
+        error, message = RuntimeError, "storage manager"
+    else:
+        error, message = ConnectionError, "ACK lost"
+
+    with pytest.raises(error, match=message):
+        await transfer_batch_to_data_system(args, [[sample]], 0, 0, client)
+    if failure == "lost-ack":
+        put.assert_awaited_once()
+        assert inventory.state["objects"][ref.record]["partitions"] == ["train_0"]
+        assert body.blocks
+    else:
+        if failure == "uninitialized-client":
+            client.async_get_meta.assert_not_awaited()
+        put.assert_not_awaited()
+        assert not inventory.state["objects"] and not body.blocks
+
+
+@pytest.mark.parametrize("custom", [False, True], ids=["borrowed-native-route", "custom-fanout"])
+async def test_invalid_sibling_preserves_route_for_later_write(published, native_write, custom):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from relax.utils.utils import transfer_batch_to_data_system
+
+    _, store, body, _, ref, _ = published
+    args, sample, producer = native_write
+    if custom:
+        args.custom_generate_function_path = "custom_generator"
+    await producer.adopt_native_response(sample, args, {"routed_experts": ref.to_dict()})
+    # In a custom generator even the originating row may fail before its sibling submits.
+    sibling = replace(sample)
+    bad, good = (sample, sibling) if custom else (sibling, sample)
+    bad.loss_mask = [1, 1]
+    client = SimpleNamespace(async_put=AsyncMock())
+    with pytest.raises(AssertionError, match="loss mask"):
+        await transfer_batch_to_data_system(args, [[bad]], 0, 0, client)
+    await transfer_batch_to_data_system(args, [[good]], 1, 1, client)
+    client.async_put.assert_awaited_once()
+    assert body.blocks
+    store.retire_partition("train_1")
+    assert not body.blocks
+
+
+@pytest.fixture
+def run_custom(native_write, monkeypatch):
+    from contextlib import nullcontext
+
+    from relax.engine.rollout import sglang_rollout
+
+    args, _, producer = native_write
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    args.custom_generate_function_path = "custom"
+    args.partial_rollout = False
+    args.group_rm = True
+    args.use_dynamic_batch_size = True
+    args.sglang_enable_deterministic_inference = False
+    state = SimpleNamespace(aborted=False, dp_rank_context=nullcontext, semaphore=asyncio.Semaphore(2))
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", producer.manager)
+    monkeypatch.setattr("relax.distributed.replay_manager.replay_data_manager", producer.manager)
+
+    async def run(generate, source):
+        monkeypatch.setattr(sglang_rollout, "load_function", lambda _: generate)
+        if isinstance(source, list):
+            return await sglang_rollout.generate_and_rm_group(args, source, {})
+        return await sglang_rollout.generate_and_rm(args, source, {})
+
+    return run
+
+
+@pytest.mark.parametrize("dynamic_batch", [True, False], ids=["queue-all-rows", "reject-fixed-batch"])
+async def test_custom_group_hands_off_or_releases_all_rows(
+    published, native_write, run_custom, monkeypatch, dynamic_batch
+):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from relax.engine.rollout import sglang_rollout
+    from relax.utils.utils import transfer_batch_to_data_system
+
+    _, store, body, inventory, ref, values = published
+    args, source, producer = native_write
+    args.use_dynamic_batch_size = dynamic_batch
+    score = AsyncMock(return_value=[1.0, 2.0, 3.0])
+    monkeypatch.setattr(sglang_rollout, "batched_async_rm", score)
+
+    async def generate(args, row, params):
+        if row.index == 0:
+            await producer.adopt_native_response(row, args, {"routed_experts": ref.to_dict()})
+            return [replace(row, index=None), replace(row, index=None)]
+        route = producer._publish_response(values, kind="moe", tokens=row.tokens)
+        row.rollout_replay_refs = {"moe": route}
+        await producer.adopt_native_response(row, args, {"routed_experts": route})
+        return row
+
+    second = replace(source, index=1, rollout_replay_refs=None)
+    if not dynamic_batch:
+        with pytest.raises(ValueError, match="use-dynamic-batch-size"):
+            await run_custom(generate, [source, second])
+        assert not inventory.state["objects"] and not body.blocks
+        return
+
+    rows = await run_custom(generate, [source, second])
+    score.assert_awaited_once_with(args, rows, evaluation=False)
+    assert [row.reward for row in rows] == [1.0, 2.0, 3.0]
+    put = AsyncMock()
+    await transfer_batch_to_data_system(args, [rows], 1, 0, SimpleNamespace(async_put=put), is_last=True)
+    put.assert_awaited_once()
+    sent = put.await_args.kwargs
+    assert [meta["sample_index"] for meta in sent["custom_meta"]] == [0, 0, 1]
+    assert sent["data"]["sample_index_mask_sums"].tolist() == [2, 2, 1]
+    assert sent["is_last"]
+    assert inventory.state["objects"][ref.record]["partitions"] == ["train_0"]
+    store.retire_partition("train_0")
+    assert not inventory.state["objects"] and not body.blocks
+
+
+@pytest.mark.parametrize(
+    "outcomes", [("reject",), ("reject", "reject"), ("reject", "ack"), ("ack", "ack"), ("unknown", "reject")]
+)
+async def test_custom_route_lives_until_last_output_finishes(published, native_write, run_custom, outcomes):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from relax.utils.utils import transfer_batch_to_data_system
+
+    _, store, body, inventory, ref, expected = published
+    args, sample, producer = native_write
+
+    async def generate(args, source, sampling_params):
+        await producer.adopt_native_response(source, args, {"routed_experts": ref.to_dict()})
+        # The generator may return copies and omit the sample that received the response.
+        copies = (
+            [replace(source)] * len(outcomes) if outcomes == ("reject", "ack") else [replace(source) for _ in outcomes]
+        )
+        return copies[0] if len(copies) == 1 else copies
+
+    result = await run_custom(generate, sample)
+    outputs = result if isinstance(result, list) else [result]
+    for index, (outcome, row) in enumerate(zip(outcomes, outputs, strict=True)):
+        put = AsyncMock()
+        client = SimpleNamespace(async_put=put)
+        if outcome == "reject":
+            row.loss_mask = [1, 1]
+            with pytest.raises(AssertionError, match="loss mask"):
+                await transfer_batch_to_data_system(args, [[row]], 0, index, client)
+            put.assert_not_awaited()
+        elif outcome == "unknown":
+            put.side_effect = ConnectionError("lost ACK")
+            with pytest.raises(ConnectionError, match="lost ACK"):
+                await transfer_batch_to_data_system(args, [[row]], 0, index, client)
+            put.assert_awaited_once()
+        else:
+            await transfer_batch_to_data_system(args, [[row]], 0, index, client)
+            put.assert_awaited_once()
+            store.retire_partition(f"train_{index}")
+        if index + 1 < len(outputs):
+            assert body.blocks
+
+    if "unknown" in outcomes:
+        assert inventory.state["objects"][ref.record]["partitions"] == ["train_0"]
+        with store.reader([ref], partition="train_0") as reader:
+            output = np.empty((ref.rows, ref.topk), dtype=np.int32)
+            rows = np.arange(ref.rows)
+            reader.read_into(0, 0, rows, output, rows)
+            np.testing.assert_array_equal(output, expected[:, 0])
+        store.retire_partition("train_0")
+        store.close_run()
+    assert not inventory.state["objects"] and not body.blocks
+
+
+async def test_custom_route_skips_collected_candidate(published, native_write, run_custom):
+    from dataclasses import replace
+
+    _, store, body, inventory, ref, values = published
+    _, sample, producer = native_write
+
+    async def select(args, row, params):
+        await producer.adopt_native_response(row, args, {"routed_experts": ref.to_dict()})
+        candidate = producer._publish_response(values, kind="moe", tokens=row.tokens)
+        rejected = replace(row, rollout_replay_refs={"moe": candidate})
+        await producer.adopt_native_response(rejected, args, {"routed_experts": candidate})
+        await producer.manager.discard_async([rejected])
+        return row
+
+    selected = await run_custom(select, sample)
+    assert set(inventory.state["objects"]) == {ref.record}
+    await producer.manager.discard_async([selected], unsent=True, native=True)
+    assert not body.blocks
+
+
+async def test_custom_route_resume_splits_only_input_hold(published, native_write, run_custom):
+    from copy import copy
+
+    _, _, body, _, ref, _ = published
+    _, sample, producer = native_write
+
+    async def first(args, row, params):
+        await producer.adopt_native_response(row, args, {"routed_experts": ref.to_dict()})
+        return [copy(row), copy(row)]
+
+    async def resume(args, row, params):
+        return [copy(row), copy(row)]
+
+    original, peer = await run_custom(first, sample)
+    left, right = await run_custom(resume, original)
+    for dropped in (left, peer):
+        await producer.manager.discard_async([dropped], unsent=True, native=True)
+        assert body.blocks
+    await producer.manager.discard_async([right], unsent=True, native=True)
+    assert not body.blocks
+
+
+@pytest.mark.parametrize("late", ["native-response", "nested-response", "nested-output"])
+async def test_late_route_after_custom_failure_is_reclaimed(published, native_write, run_custom, late):
+    from copy import copy
+
+    _, _, body, inventory, ref, _ = published
+    _, sample, producer = native_write
+    sample.rollout_replay_refs = None
+    started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def wait_for_group_exit():
+        started.set()
+        await release.wait()
+
+    async def receive(args, row, params):
+        if late != "nested-output":
+            await wait_for_group_exit()
+        row.rollout_replay_refs = {"moe": ref.to_dict()}
+        await producer.adopt_native_response(row, args, {"routed_experts": ref.to_dict()})
+        if late == "nested-output":
+            await wait_for_group_exit()
+        return [row, copy(row)]
+
+    async def fail(args, row, params):
+        candidate = copy(row)
+        work = (
+            receive(SimpleNamespace(), candidate, params)
+            if late == "native-response"
+            else run_custom(receive, candidate)
+        )
+        task = asyncio.create_task(work)
+        task.add_done_callback(lambda _: finished.set())
+        await asyncio.wait_for(started.wait(), 5)
+        raise ValueError("other request failed")
+
+    with pytest.raises(ValueError, match="other request failed"):
+        await run_custom(fail, [sample])
+    assert body.blocks
+    release.set()
+    await asyncio.wait_for(finished.wait(), 5)
+    assert not inventory.state["objects"] and not body.blocks
 
 
 def test_normalized_sample_roundtrip_keeps_capture_manifest(published):

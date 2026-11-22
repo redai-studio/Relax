@@ -46,6 +46,7 @@ from relax.agentic.stage_recorder import (
 )
 from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
 from relax.distributed.replay_manager import replay_data_manager
+from relax.distributed.replay_manager.producer import PendingSampleWrite
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -584,15 +585,12 @@ class AgenticResidentPipeline:
         of them.
         """
 
-        put_started = False
-
-        def on_put_started() -> None:
-            nonlocal put_started
-            put_started = True
+        samples = [sample for group in groups for sample in group.samples]
+        handoff = PendingSampleWrite(replay_data_manager, samples)
 
         try:
             await self._stage_recorder.begin_samples(
-                [sample for group in groups for sample in group.samples],
+                samples,
                 rollout_id=context.rollout_id,
                 partition_id=partition_id,
                 stage="transfer",
@@ -607,10 +605,11 @@ class AgenticResidentPipeline:
                 partition_id=partition_id,
                 data_system_client=self._data_system_client,
                 is_last=is_last,
-                on_put_started=on_put_started,
+                on_put_started=handoff.mark_started,
             )
         except BaseException as error:
-            if put_started:
+            await handoff.discard_if_unsent(error)
+            if handoff.started:
                 event = self._stage_recorder.record_transfer_unknown(
                     groups,
                     rollout_id=context.rollout_id,
@@ -619,7 +618,6 @@ class AgenticResidentPipeline:
                     cancelled=isinstance(error, asyncio.CancelledError),
                 )
             else:
-                await replay_data_manager.discard_async([sample for group in groups for sample in group.samples])
                 event = self._stage_recorder.record_groups_dropped(
                     groups,
                     rollout_id=context.rollout_id,

@@ -8,25 +8,135 @@ import importlib
 import importlib.util
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import copy
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pybase64
 
 from ..core import ReplayManager, replay_data_manager
 from ..producer import Producer
-from ..ref_data import ReplayRef, decode_refs, encode_refs, validate_sample
+from ..ref_data import (
+    MoERouteSpan,
+    ReplayRef,
+    decode_refs,
+    encode_refs,
+    iter_refs,
+    moe_route_spans,
+    validate_mm_envelope,
+    validate_sample,
+)
 
 
 _CAPTURE_FIELDS = {"moe": "routed_experts"}
 ROUTE_ATTEMPT_PREFIX = "relax-r3-attempt-"
 AGENTIC_R3_REQUEST_PREFIX = "relax-agentic-r3-"
+
+
+@dataclass
+class _CustomRouteCapture:
+    # Child tasks inherit the capture object. Closing it also fences late responses in those tasks.
+    refs: dict[str, ReplayRef] | None
+    previous: dict[str, set[str]]
+    parent: "_CustomRouteCapture | None"
+
+    @property
+    def active_refs(self) -> dict[str, ReplayRef] | None:
+        if self.parent is not None and self.parent.active_refs is None:
+            return None
+        return self.refs
+
+
+_custom_routes: ContextVar[_CustomRouteCapture | None] = ContextVar("custom_routes", default=None)
+
+
+def track_custom_replay_outputs(generate: Callable) -> Callable:
+    """Transfer newly adopted routes and the input's existing holds to the
+    returned rows."""
+
+    @wraps(generate)
+    async def tracked(args, sample, sampling_params, evaluation=False):
+        from relax.utils.async_utils import finish_before_cancellation
+
+        from .. import replay_data_manager as manager
+
+        custom = getattr(sample, "generate_function_path", None) or getattr(
+            args, "custom_generate_function_path", None
+        )
+        parent = _custom_routes.get()
+        if evaluation or not custom or not manager.uses_references:
+            return await generate(args, sample, sampling_params, evaluation=evaluation)
+
+        previous = {record: {lease} for record, lease in getattr(sample, "_replay_route_holds", {}).items()}
+        # Generation can replace the input manifest in place. Snapshot the owned input refs first.
+        refs = (
+            {ref.record: ref for ref in iter_refs(sample.rollout_replay_refs or {}) if ref.record in previous}
+            if previous
+            else {}
+        )
+        capture = _CustomRouteCapture(refs, previous, parent)
+        token = _custom_routes.set(capture)
+        holders: dict[str, set[str]] = {}
+        try:
+            try:
+                result = await generate(args, sample, sampling_params, evaluation=evaluation)
+            finally:
+                capture.refs = None
+                _custom_routes.reset(token)
+            if refs:
+                rows = result if isinstance(result, list) else [result]
+                seen = set()
+                for index, row in enumerate(rows):
+                    visible = {ref.record for ref in iter_refs(row.rollout_replay_refs or {})}
+                    records = visible & refs.keys()
+                    existing = getattr(row, "_replay_route_holds", {})
+                    if not records and not existing:
+                        continue
+                    if id(row) in seen:
+                        row = rows[index] = copy(row)
+                    seen.add(id(row))
+                    row._replay_route_holds = {key: lease for key, lease in existing.items() if key in visible}
+                    for record in records:
+                        lease = uuid4().hex
+                        row._replay_route_holds[record] = lease
+                        holders.setdefault(record, set()).add(lease)
+                await finish_before_cancellation(
+                    manager.store().invoke_async("assign_route_outputs", list(refs.values()), holders, previous),
+                    "replay-assign-outputs",
+                )
+                if parent is not None:
+                    parent_refs = parent.active_refs
+                    if parent_refs is None:
+                        raise asyncio.CancelledError
+                    # Only finished child outputs pass to a still-running parent.
+                    for record, leases in holders.items():
+                        parent_refs[record] = refs[record]
+                        parent.previous.setdefault(record, set()).update(leases)
+            return result
+        except BaseException as error:
+            if refs:
+                try:
+                    await finish_before_cancellation(
+                        manager.store().invoke_async(
+                            "discard",
+                            list(refs.values()),
+                            keep_queued=True,
+                            output_ids=set().union(*previous.values(), *holders.values()),
+                        ),
+                        "replay-discard-custom-generation",
+                    )
+                except Exception as cleanup:
+                    error.add_note(f"Custom generation replay cleanup failed: {cleanup!r}")
+            raise
+
+    return tracked
 
 
 def _response_references(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -71,8 +181,6 @@ class SGLangProducer(Producer):
     """
 
     def request_options(self, *, evaluation: bool = False, request_id: str | None = None) -> dict[str, Any]:
-        from uuid import uuid4
-
         from ..config import references_enabled
         from .mm_sglang import ATTEMPT_PREFIX, REQUEST_PREFIX
 
@@ -165,6 +273,50 @@ class SGLangProducer(Producer):
             validate_sample(refs, tokens)
         return refs
 
+    def response_media(self, meta: dict, *, required: bool = False) -> dict | None:
+        """Decode the media envelope, preserving a distinct lease for each
+        occurrence."""
+        from .mm_sglang import response_media
+
+        if "mm_embedding" not in self.kinds:
+            return None
+        envelope = response_media(meta)
+        if required and envelope is None:
+            raise ValueError("Backend omitted multimodal embedding references")
+        return envelope
+
+    @contextmanager
+    def response_holds(self, meta: dict) -> Iterator[tuple[list[ReplayRef], list[dict]]]:
+        """Keep wire ownership guarded while the receiver adopts decoded
+        records and leases."""
+        with self.response(meta):
+            envelope = self.response_media(meta)
+            if envelope is not None:
+                validate_mm_envelope(envelope)
+            yield self.response_refs(meta), envelope["media"] if envelope is not None else []
+
+    @contextmanager
+    def response_route_span(
+        self, meta: dict, args: Any, tokens: list[int], captured_tokens: list[int], start: int, *, required: bool
+    ) -> Iterator[MoERouteSpan | None]:
+        """Guard the route publication through validation and merge into the
+        accepted lineage."""
+        if meta.get("routed_experts") is None:
+            if required:
+                raise ValueError("Backend omitted routed experts for newly accepted tokens")
+            yield None
+            return
+
+        # The receiver already holds the media leases. A failed route merge
+        # must clean up only the route (including inline ingress publication).
+        routes = self if self.kinds == {"moe"} else self.manager.register_producer({"moe"})
+        with routes.response(meta):
+            refs = routes.accept_route_refs(meta, args, tokens[start:], captured_tokens[start:])
+            (span,) = moe_route_spans(refs["moe"])
+            if (span.ref.layers, span.ref.topk) != (args.num_layers, args.moe_router_topk):
+                raise ValueError("Agentic MoE replay shape does not match the model")
+            yield MoERouteSpan(span.ref, start, len(tokens) - 1, span.training_tokens)
+
     @staticmethod
     def response_refs(meta: dict) -> list[ReplayRef]:
         return [
@@ -173,6 +325,29 @@ class SGLangProducer(Producer):
             if isinstance(value := meta.get(field), dict)
             for ref in _response_references(value).values()
         ]
+
+    async def adopt_native_response(self, sample: Any, args: Any, meta: dict) -> None:
+        # Custom generators may fan one response out to independently queued samples.
+        custom = getattr(sample, "generate_function_path", None) or getattr(
+            args, "custom_generate_function_path", None
+        )
+        refs = self.response_refs(meta)
+        owner = uuid4().hex
+        await self.adopt_response(refs, owner)
+        scope = _custom_routes.get()
+        if refs and scope is not None:
+            active_refs = scope.active_refs
+            if active_refs is None:
+                from relax.utils.async_utils import finish_before_cancellation
+
+                await finish_before_cancellation(
+                    self.manager.store().invoke_async("discard", refs, owner=owner), "replay-discard-late-response"
+                )
+                raise asyncio.CancelledError
+            active_refs.update((ref.record, ref) for ref in refs)
+        elif not custom:
+            for ref in refs:
+                self.manager.native_route_owners[ref.record] = sample
 
     async def adopt_response(self, refs: list[ReplayRef], owner: str) -> None:
         """Settle any in-flight adoption before compensating a cancelled

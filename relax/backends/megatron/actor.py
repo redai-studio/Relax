@@ -59,8 +59,6 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
-from relax.utils.agentic_obs import agentic_obs_enabled
-from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.agentic_obs.run_hooks import annotate_failure_stage
 from relax.utils.async_utils import run
 from relax.utils.data.data import get_minimum_num_micro_batch_size
@@ -106,7 +104,7 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.data_fields import base_rollout_fields, build_data_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.types import RolloutBatch
@@ -2348,7 +2346,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.multimodal_keys is not None:
             data_fields.append("multimodal_train_inputs")
         if self.args.use_rollout_routing_replay:
-            data_fields.append("rollout_routed_experts")
+            data_fields = replay_data_manager.register_consumer({"moe"}).fields(data_fields)
 
         if self._use_streaming_fwd():
             self._streaming_fwd_putback(
@@ -2581,6 +2579,8 @@ class MegatronTrainRayActor(TrainRayActor):
         def mark_rollout_mini_boundary(sub_batch: RolloutBatch) -> None:
             sub_batch[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [len(sub_batch["total_lengths"])]
 
+        kinds = rollout_kinds(self.args)
+        consumer = replay_data_manager.register_consumer(kinds) if kinds else None
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -2602,8 +2602,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
+            data_fields = base_rollout_fields(self.args)
+            if self.args.advantage_estimator == "score_centering":
+                data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
+            if self.args.use_opd and self.args.opd_type == "sglang":
+                data_fields.append("teacher_log_probs")
+            if consumer is not None:
+                data_fields = consumer.fields(data_fields)
             replay_options = {}
-            if rollout_kinds(self.args) and replay_data_manager.uses_references:
+            if consumer is not None and replay_data_manager.uses_references:
                 from relax.distributed.replay_manager.consumer import ConsumerTensorCache
 
                 replay_options = {
@@ -2620,27 +2627,6 @@ class MegatronTrainRayActor(TrainRayActor):
             last_progress = loop_start
             last_warn = loop_start
             while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id, streaming=True):
-                data_fields = [
-                    "tokens",
-                    "total_lengths",
-                    "response_lengths",
-                    "loss_masks",
-                    "rollout_log_probs",
-                    "rewards",
-                    "sample_indices",
-                    "sample_index_mask_sums",
-                    "group_index",
-                ]
-                if rollout_kinds(self.args):
-                    data_fields = replay_data_manager.register_consumer(rollout_kinds(self.args)).fields(data_fields)
-                if self.args.advantage_estimator == "score_centering":
-                    data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
-                if self.args.multimodal_keys is not None:
-                    data_fields.append("multimodal_train_inputs")
-                if self.args.use_opd and self.args.opd_type == "sglang":
-                    data_fields.append("teacher_log_probs")
-                if agentic_obs_enabled(self.args):
-                    data_fields.extend(OBSERVATION_DATA_FIELDS)
                 with timer("train_get_data"):
                     sub_batch, batch_meta = self._get_data_from_transfer_queue(
                         "train", rollout_id, data_fields, batch_size, batch_index
@@ -2702,12 +2688,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
             # ── Phase 3: Train on the full merged batch ──
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
-            if getattr(self.args, "use_rollout_mm_embedding_replay", False):
-                from relax.distributed.replay_manager.backend.mm_megatron import prepare_mm_replay
-
-                prepare_mm_replay(
-                    replay_data_manager, self, rollout_data, replay_data_manager.region(f"train_{rollout_id}")
-                )
+            if consumer is not None:
+                consumer.bind_batch_inputs(self.model, rollout_data, replay_data_manager.region(f"train_{rollout_id}"))
             if self.args.use_rollout_routing_replay:
                 RoutingReplay.clear_all_forward()
             if self.args.use_routing_replay:
@@ -2827,19 +2809,7 @@ class MegatronTrainRayActor(TrainRayActor):
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train step.")
-        data_fields = [
-            "tokens",
-            "total_lengths",
-            "response_lengths",
-            "loss_masks",
-            "advantages",
-            "returns",
-            "rollout_log_probs",
-            "rewards",
-            "sample_indices",
-            "sample_index_mask_sums",
-            "group_index",
-        ]
+        data_fields = base_rollout_fields(self.args) + ["advantages", "returns"]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
         if self.args.advantage_estimator == "score_centering":
@@ -2848,14 +2818,10 @@ class MegatronTrainRayActor(TrainRayActor):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
             data_fields.append("ref_log_probs")
-        if self.args.multimodal_keys is not None:
-            data_fields.append("multimodal_train_inputs")
         if self.args.use_opd:
             consume_opd_train_data(data_fields, self.args)
-        if agentic_obs_enabled(self.args):
-            data_fields.extend(OBSERVATION_DATA_FIELDS)
-        if rollout_kinds(self.args):
-            data_fields = replay_data_manager.register_consumer(rollout_kinds(self.args)).fields(data_fields)
+        if kinds := rollout_kinds(self.args):
+            data_fields = replay_data_manager.register_consumer(kinds).fields(data_fields)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs

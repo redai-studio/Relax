@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from relax.engine.rollout.base_types import DatasetStateMismatchError
+from relax.engine.rollout.base_types import DatasetStateMismatchError, request_slots
 from relax.utils.agentic_obs.config import agentic_obs_enabled
 from relax.utils.data.data import Dataset
 from relax.utils.data.data_utils import parse_generalized_path, resolve_path_plan
@@ -431,11 +431,8 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             return
         assert isinstance(samples, list), f"samples must be a list, got {type(samples)}"
         assert isinstance(samples[0], list), f"the elements of samples must be list, got {type(samples[0])}"
-        for i in range(0, len(samples)):
-            assert len(samples[i]) == self.args.n_samples_per_prompt, (
-                f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
-            )
-            group = samples[i]  # type: ignore
+        for group in samples:
+            assert len(set(request_slots(group))) == self.args.n_samples_per_prompt
             self.buffer.append(group)
 
     # TODO remove

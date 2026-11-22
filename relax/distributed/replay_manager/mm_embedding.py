@@ -8,7 +8,38 @@ from time import monotonic, sleep
 from typing import Any
 
 from .codecs import BF16_RAW
-from .ref_data import ReplayRef, validate_mm_envelope
+from .ref_data import ReplayRef, validate_mm_envelope, validate_sample
+
+
+def training_needs_pixels(args: Any) -> bool:
+    """A separate reference-policy forward runs its native vision encoder."""
+    return getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False)
+
+
+def prepare_mm_sample(sample: Any, envelope: dict, *, keep_pixels: bool) -> None:
+    """Check the exported media against the training sample before dropping
+    pixels."""
+    validate_sample({"mm_embedding": envelope}, sample.tokens)
+    entries = envelope["media"]
+    inputs = sample.multimodal_train_inputs or {}
+    for modality, key in (("image", "image_grid_thw"), ("video", "video_grid_thw")):
+        grid = inputs.get(key)
+        expected = [entry["grid"] for entry in entries if entry["modality"] == modality]
+        if grid is None:
+            if expected:
+                raise ValueError("MM replay is missing training media grid metadata")
+            continue
+        if hasattr(grid, "device") and grid.device.type != "cpu":
+            raise ValueError("MM replay ingress requires CPU grid metadata")
+        actual = grid.numpy().reshape(-1, 3).tolist() if hasattr(grid, "numpy") else [list(row) for row in grid]
+        if actual != expected:
+            raise ValueError("Rollout MM replay and training media grids differ")
+    if any(key in inputs for key in ("pixel_values", "pixel_values_videos")) and not entries:
+        raise ValueError("MM replay response omitted visual embeddings")
+    if not keep_pixels:
+        sample.multimodal_train_inputs = {
+            key: value for key, value in inputs.items() if key not in ("pixel_values", "pixel_values_videos")
+        }
 
 
 def _geometry(image_hash: str, grid: Sequence[int], modality: str) -> list[int]:

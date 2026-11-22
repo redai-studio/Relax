@@ -17,11 +17,10 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
-from relax.distributed.replay_manager.storage import BODY_PARTITION_PREFIX
 from relax.engine.rollout.base_types import DatasetStateMismatchError
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
-from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client, training_partition_steps
 
 
 app = FastAPI()
@@ -308,15 +307,8 @@ def satisfy_staleness(partition_list: Optional[List[str]], current_rollout_id: i
     Returns:
         True if within staleness bounds (or partition_list is empty/None), False otherwise.
     """
-    # Replay bodies share TQ storage but are not pending training batches.
-    partition_list = [p for p in partition_list or () if not p.startswith(BODY_PARTITION_PREFIX)]
-    if not partition_list:
-        return True
-
-    def split_partition(partition: str) -> int:
-        return int(partition.split("_")[-1])
-
-    return current_rollout_id + 1 - min(list(map(split_partition, partition_list))) <= max_staleness
+    steps = training_partition_steps(partition_list)
+    return not steps or current_rollout_id + 1 - min(steps) <= max_staleness
 
 
 # Ray Serve's default max_ongoing_requests (5) throttles concurrent load; env-tunable like the genrm knob.

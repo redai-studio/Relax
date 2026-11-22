@@ -308,42 +308,28 @@ class MMCapture:
         self._drain_releases()
 
 
+def response_media(meta: dict) -> dict | None:
+    """Convert SGLang wire metadata to the canonical sample envelope."""
+    return {"version": 1, "media": meta[META_FIELD]} if META_FIELD in meta else None
+
+
 def accept_training_mm_response(sample: Any, meta: dict, args: Any) -> dict:
-    keep_pixels = getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False)
-    return accept_mm_response(sample, meta, keep_pixels=keep_pixels)
+    from ..mm_embedding import training_needs_pixels
+
+    return accept_mm_response(sample, meta, keep_pixels=training_needs_pixels(args))
 
 
 def accept_mm_response(sample: Any, meta: dict, *, keep_pixels: bool = False) -> dict:
     """Validate CPU layout and retain pixels when a reference policy needs
     them."""
-    from ..ref_data import validate_sample
+    from ..mm_embedding import prepare_mm_sample
 
     if (meta.get("finish_reason") or {}).get("type") == "abort":
         return {"version": 1, "media": []}
-    entries = meta.get(META_FIELD)
-    if not isinstance(entries, list):
+    envelope = response_media(meta)
+    if envelope is None or not isinstance(envelope["media"], list):
         raise RuntimeError("SGLang did not return MM embedding references")
-    envelope = {"version": 1, "media": entries}
-    validate_sample({"mm_embedding": envelope}, sample.tokens)
-    inputs = sample.multimodal_train_inputs or {}
-    for modality, key in (("image", "image_grid_thw"), ("video", "video_grid_thw")):
-        grid = inputs.get(key)
-        expected = [entry["grid"] for entry in entries if entry["modality"] == modality]
-        if grid is None:
-            if expected:
-                raise ValueError("MM replay is missing training media grid metadata")
-            continue
-        if hasattr(grid, "device") and grid.device.type != "cpu":
-            raise ValueError("MM replay ingress requires CPU grid metadata")
-        actual = grid.numpy().reshape(-1, 3).tolist() if hasattr(grid, "numpy") else [list(row) for row in grid]
-        if actual != expected:
-            raise ValueError("Rollout MM replay and training media grids differ")
-    if any(key in inputs for key in ("pixel_values", "pixel_values_videos")) and not entries:
-        raise ValueError("MM replay response omitted visual embeddings")
-    if not keep_pixels:
-        sample.multimodal_train_inputs = {
-            key: value for key, value in inputs.items() if key not in ("pixel_values", "pixel_values_videos")
-        }
+    prepare_mm_sample(sample, envelope, keep_pixels=keep_pixels)
     return envelope
 
 

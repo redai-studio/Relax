@@ -6,20 +6,25 @@ state."""
 import importlib
 import json
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, MutableMapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 from .config import ReplayConfig, default_reference_r3, get_store, rollout_kinds, validate_reference_training
 from .consumer import ConsumerRecord, ConsumerSource
-from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, register_kind
+from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, iter_refs, publisher_holds, register_kind
 
 
 if TYPE_CHECKING:
     from .consumer import Consumer, ConsumerReadSession
     from .producer import Producer
     from .storage import TQReplayStorage
+
+
+def _output_ids(samples: Sequence[Any]) -> set[str]:
+    return {token for sample in samples for token in getattr(sample, "_replay_route_holds", {}).values()}
 
 
 def _sample_media(samples: Sequence[Any]) -> list[dict]:
@@ -205,6 +210,8 @@ class ReplayManager:
         self._closed = False
         self._store_factory = store_factory
         self._store_instance: TQReplayStorage | None = None
+        # A copied native sample can borrow the same manifest, even with the same index.
+        self.native_route_owners: WeakValueDictionary[str, Any] = WeakValueDictionary()
         self._owns_run = False
         self._run_stopped = False
         self._finalization_error: Exception | None = None
@@ -387,23 +394,34 @@ class ReplayManager:
         return refs_from_samples(samples) if self.uses_references else []
 
     def discard(self, samples: Sequence[Any]) -> None:
-        refs = self.sample_refs(samples)
-        if refs:
-            self.store().invoke(
-                "discard", [ref for ref in refs if ref.kind != "mm_embedding"], media=_sample_media(samples)
-            )
+        if self.uses_references:
+            refs, media = publisher_holds(sample.rollout_replay_refs or {} for sample in samples)
+            if refs or media:
+                self.store().invoke("discard", refs, media=media, output_ids=_output_ids(samples))
 
-    async def discard_async(self, samples: Sequence[Any]) -> None:
-        refs = self.sample_refs(samples)
-        if refs:
-            from relax.utils.async_utils import finish_before_cancellation
+    async def discard_async(self, samples: Sequence[Any], *, unsent: bool = False, native: bool = False) -> None:
+        from relax.utils.async_utils import finish_before_cancellation
 
-            await finish_before_cancellation(
-                self.store().invoke_async(
-                    "discard", [ref for ref in refs if ref.kind != "mm_embedding"], media=_sample_media(samples)
-                ),
-                "replay-discard",
-            )
+        if self.uses_references:
+            refs, media = [], []
+            for sample in samples:
+                routes, leases = publisher_holds((sample.rollout_replay_refs or {},))
+                if native:
+                    owned = getattr(sample, "_replay_route_holds", {})
+                    routes = [
+                        ref
+                        for ref in routes
+                        if ref.record in owned or self.native_route_owners.get(ref.record) is sample
+                    ]
+                refs.extend(routes)
+                media.extend(leases)
+            if refs or media:
+                await finish_before_cancellation(
+                    self.store().invoke_async(
+                        "discard", refs, media=media, keep_queued=unsent, output_ids=_output_ids(samples)
+                    ),
+                    "replay-discard",
+                )
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -535,7 +553,14 @@ class ReplayRegion:
             raise
         await write()
         await finish_before_cancellation(
-            store.invoke_async("commit", refs, self.partition, reservation, media=_sample_media(samples)),
+            store.invoke_async(
+                "commit",
+                refs,
+                self.partition,
+                reservation,
+                media=_sample_media(samples),
+                output_ids=_output_ids(samples),
+            ),
             "replay-commit",
         )
 
@@ -767,6 +792,7 @@ class ReplayInventory:
             record: objects[record]
             for record in (tuple(objects) if records is None else records)
             if record in objects
+            and not objects[record].get("output_holders")
             and not any(objects[record][name] for name in ("writing", "publisher", "partitions", "readers"))
         }
         if collected:
@@ -802,6 +828,7 @@ class ReplayInventory:
             producer_readers = item["media_producer_readers"]
             item["readers"] = [lease for lease in item["readers"] if lease not in producer_readers]
             producer_readers.clear()
+            item.pop("output_holders", None)
             item["publisher"] = False
         self._collect(self.state)
         self.state["closed"] = True
@@ -826,6 +853,32 @@ class ReplayInventory:
                 raise RuntimeError("Replay response already transferred to another owner")
             for item in items:
                 item["response_owner"] = owner
+
+    def assign_route_outputs(
+        self, refs: list[ReplayRef], holders: dict[str, set[str]], previous: dict[str, set[str]]
+    ) -> None:
+        """Hand off each publisher or input hold, preserving other outputs
+        sharing the record."""
+        with self._state() as state:
+            items = []
+            for ref in refs:
+                selected = holders.get(ref.record, set())
+                if not selected and ref.record not in state["objects"]:
+                    continue  # The generator already discarded this rejected candidate.
+                item = self._object(state, ref)
+                old = previous.get(ref.record)
+                owned = not old.isdisjoint(item.get("output_holders", ())) if old else item["publisher"]
+                if selected and not owned:
+                    raise RuntimeError("Custom generation no longer owns a selected replay route")
+                items.append((item, old, selected))
+            for item, old, selected in items:
+                owners = item.setdefault("output_holders", set())
+                if old:
+                    owners.difference_update(old)
+                else:
+                    item["publisher"] = False
+                owners.update(selected)
+            self._collect(state, (ref.record for ref in refs))
 
     def register_engine_publisher(self, slot: int, generation: str) -> None:
         """Fence the replaced engine before reusing its capacity."""
@@ -1066,6 +1119,7 @@ class ReplayInventory:
         reservation: str | None = None,
         *,
         media: Sequence[dict] = (),
+        output_ids: Collection[str] = (),
     ) -> None:
         with self._state() as state:
             items = [self._object(state, m) for m in refs]
@@ -1076,6 +1130,8 @@ class ReplayInventory:
                     writers = item["partition_writers"][partition]
                     writers.discard(reservation)
                     writers.add(None)  # A confirmed sample keeps the partition hold until retirement.
+                if "output_holders" in item:
+                    item["output_holders"].difference_update(output_ids)
                 item["publisher"] = False
             if media:
                 self.release_media(
@@ -1092,6 +1148,8 @@ class ReplayInventory:
         unadopted: bool = False,
         owner: str | None = None,
         media: Sequence[dict] = (),
+        output_ids: Collection[str] = (),
+        keep_queued: bool = False,
     ) -> None:
         """Release known discarded samples before queue ownership transfers."""
         with self._state() as state:
@@ -1105,10 +1163,14 @@ class ReplayInventory:
                         continue
                     if owner is not None and item.get("response_owner") not in (None, owner):
                         continue
-                    if item["partitions"]:
+                    if item["partitions"] and not (output_ids and "output_holders" in item):
+                        if keep_queued:
+                            continue
                         raise RuntimeError("Cannot discard queued replay; retire its partition instead")
                     items.append(item)
             for item in items:
+                if "output_holders" in item:
+                    item["output_holders"].difference_update(output_ids)
                 item["publisher"] = False
             if media:
                 self.release_media(

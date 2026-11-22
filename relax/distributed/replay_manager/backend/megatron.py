@@ -15,7 +15,7 @@ from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
-from ..config import references_enabled
+from ..config import references_enabled, rollout_kinds
 from ..consumer import (
     Consumer,
     ConsumerBatchLayout,
@@ -66,13 +66,75 @@ class MegatronConsumer(Consumer):
                 fill_reference_replay(actor, data_iterator, num_microbatches, "moe", region or self.manager, cache)
             else:
                 fill_full_moe_replay(actor, data_iterator, num_microbatches, batch)
+        self.bind_batch_inputs(actor.model, batch, region)
+        return cache
+
+    def bind_batch_inputs(self, models: Any, batch: dict[str, Any], region: ReplayRegion | None) -> None:
+        """Rebind inputs that follow the batch, including after Hybrid merges
+        its sub-batches.
+
+        R3 bindings follow the microbatch schedule and survive the merge.
+        """
         if "mm_embedding" in self.kinds:
-            from .mm_megatron import prepare_mm_replay
+            from .mm_megatron import prepare_mm_replay_models
 
             if region is None:
                 raise ValueError("MM replay requires a queue partition consumption region")
-            prepare_mm_replay(self.manager, actor, batch, region)
-        return cache
+            prepare_mm_replay_models(self.manager, models, batch, region)
+
+    def streaming_binding(self, args: Any, models: Any, partition: str) -> Callable[[Any, dict], None]:
+        """Bind only the current pipeline chunk after the schedule fetches a
+        microbatch."""
+        routers = {id(model): [] for model in models}
+        has_media = "mm_embedding" in self.kinds
+        has_moe = "moe" in self.kinds
+        if has_moe:
+            for chunk, layer, router in local_moe_routers(models, args.num_layers):
+                routers[id(models[chunk])].append((chunk, layer, router))
+
+        if not self.manager.uses_references:
+
+            def bind_full(model: Any, batch: dict) -> None:
+                bind_full_moe_batch(args, batch, routers[id(model)], batch["unconcat_tokens"])
+
+            return bind_full
+
+        region = self.manager.region(partition)
+        if has_media:
+            from .mm_megatron import bind_mm_replay_batch
+
+            def bind_media(model: Any, batch: dict) -> None:
+                self.bind_batch_inputs(models, batch, region)
+                bind_mm_replay_batch(batch, model)
+
+            if not has_moe:
+                return bind_media
+
+        layouts = {model_id: _moe_layout(args, layers) for model_id, layers in routers.items()}
+        cache = ConsumerTensorCache(self.manager.config.materialization_bytes)
+        device = device_utils.make_current_torch_device()
+
+        next_microbatch = {model_id: 0 for model_id in layouts}
+
+        def bind(model: Any, batch: dict) -> None:
+            if has_media:
+                bind_media(model, batch)
+            if not has_moe:
+                return
+            model_id = id(model)
+            _bind_reference_batch(
+                args,
+                batch,
+                batch["unconcat_tokens"],
+                layouts[model_id],
+                region,
+                cache,
+                device,
+                next_microbatch[model_id],
+            )
+            next_microbatch[model_id] += 1
+
+        return bind
 
 
 def log_reference_replay_metrics(cache: ConsumerTensorCache | None, args: Any, rollout_id: int) -> None:
@@ -333,44 +395,12 @@ def _bind_reference_batch(
 
 
 def streaming_moe_replay(args: Any, models: Any, partition: str) -> Callable[[Any, dict], None]:
-    """Bind the current pipeline chunk after the schedule fetches its next
-    batch."""
-    routers = {id(model): [] for model in models}
-    has_media = getattr(args, "use_rollout_mm_embedding_replay", False)
-    has_moe = getattr(args, "use_rollout_routing_replay", not has_media)
-    if has_moe:
-        for chunk, layer, router in local_moe_routers(models, args.num_layers):
-            routers[id(models[chunk])].append((chunk, layer, router))
-
-    if not replay_data_manager.uses_references:
-
-        def bind_full(model: Any, batch: dict) -> None:
-            bind_full_moe_batch(args, batch, routers[id(model)], batch["unconcat_tokens"])
-
-        return bind_full
-
-    layouts = {model_id: _moe_layout(args, layers) for model_id, layers in routers.items()}
-    region = replay_data_manager.region(partition)
-    cache = ConsumerTensorCache(replay_data_manager.config.materialization_bytes)
-    device = device_utils.make_current_torch_device()
-
-    next_microbatch = {model_id: 0 for model_id in layouts}
-
-    def bind(model: Any, batch: dict) -> None:
-        if has_media:
-            from .mm_megatron import bind_mm_replay_batch, prepare_mm_replay_models
-
-            prepare_mm_replay_models(replay_data_manager, models, batch, region)
-            bind_mm_replay_batch(batch, model)
-        if not has_moe:
-            return
-        model_id = id(model)
-        _bind_reference_batch(
-            args, batch, batch["unconcat_tokens"], layouts[model_id], region, cache, device, next_microbatch[model_id]
-        )
-        next_microbatch[model_id] += 1
-
-    return bind
+    """Compatibility entry point for callers that historically requested R3
+    implicitly."""
+    kinds = rollout_kinds(args)
+    if not kinds and not hasattr(args, "use_rollout_routing_replay"):
+        kinds = {"moe"}
+    return replay_data_manager.register_consumer(kinds).streaming_binding(args, models, partition)
 
 
 def fill_full_moe_replay(actor: Any, data_iterator: list, num_microbatches: list[int], batch: dict) -> None:

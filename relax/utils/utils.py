@@ -15,6 +15,7 @@ from tensordict import TensorDict
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
 from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+from relax.distributed.replay_manager.producer import PendingSampleWrite
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID, encode_group_ids, group_ids_to_tensor
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
@@ -660,12 +661,14 @@ async def put_rollout_batch(
     client: Any,
     partition: str,
     samples: list[Sample],
-    batch: TensorDict,
-    is_last: bool,
+    batch: TensorDict | None = None,
+    is_last: bool = False,
     on_put_started: Callable[[], None] | None = None,
 ) -> None:
     """Attach replay holds before sending samples and sampler metadata to
     TQ."""
+    if batch is None:
+        batch = convert_samples_to_train_data(args, samples)
     custom_meta = build_rollout_custom_meta(batch)
     if getattr(args, "save_debug_rollout_data", None) and replay_data_manager.uses_references:
         from relax.distributed.replay_manager.consumer import read_debug_routes
@@ -681,6 +684,11 @@ async def put_rollout_batch(
         await client.async_put(data=batch, partition_id=partition, custom_meta=custom_meta, is_last=is_last)
 
     if replay_data_manager.uses_references:
+        from transfer_queue.client import AsyncTransferQueueClient
+
+        # The native client rejects this before any controller or storage RPC.
+        if isinstance(client, AsyncTransferQueueClient) and getattr(client, "storage_manager", None) is None:
+            raise RuntimeError("TransferQueue storage manager is not initialized")
         await replay_data_manager.region(partition).put(samples, write)
     else:
         await write()
@@ -721,11 +729,19 @@ async def transfer_batch_to_data_system(
             batch_samples = sum(batch_samples, [])
         global CURRENT_ROLLOUT_BATCH
         CURRENT_ROLLOUT_BATCH.extend(batch_samples)
-        rollout_batch = convert_samples_to_train_data(args, batch_samples)
-        logger.info(f"Prepared rollout batch {batch_count} with {rollout_batch.numel()} samples for transfer")
-        logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
-
-        await put_rollout_batch(args, data_system_client, f"train_{rollout_id}", batch_samples, rollout_batch, is_last)
+        handoff = PendingSampleWrite(replay_data_manager, batch_samples)
+        try:
+            await put_rollout_batch(
+                args,
+                data_system_client,
+                f"train_{rollout_id}",
+                batch_samples,
+                is_last=is_last,
+                on_put_started=handoff.mark_started,
+            )
+        except BaseException as error:
+            await handoff.discard_if_unsent(error, native=True)
+            raise
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
         logger.error(f"Error transferring batch {batch_count}: {e}")

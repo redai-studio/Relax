@@ -5,7 +5,7 @@ choices."""
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Sequence
 
 from relax.utils.env import Envs
 
@@ -43,8 +43,9 @@ class ReplayConfig:
             capacity_bytes=Envs.RELAX_REPLAY_CAPACITY_MB << 20,
         )
 
-    def fields(self, fields: Sequence[str]) -> list[str]:
-        result = list(dict.fromkeys(fields))
+    def fields(self, fields: Sequence[str], *, kinds: Iterable[str] = ()) -> list[str]:
+        replay = [FIELDS[kind] for kind in sorted(kinds)]
+        result = list(dict.fromkeys([*fields, *replay]))
         if self.delivery == "reference":
             has_replay = bool(set(FIELDS.values()).intersection(result))
             result = [field for field in result if field not in FIELDS.values()]
@@ -130,8 +131,8 @@ def validate_reference_training(args: Any) -> None:
         raise ValueError(f"Reference R3 does not support {layout}")
 
 
-def replay_fields(fields: list[str]) -> list[str]:
-    return ReplayConfig.from_env().fields(fields)
+def replay_fields(fields: list[str], *, kinds: Iterable[str] = ()) -> list[str]:
+    return ReplayConfig.from_env().fields(fields, kinds=kinds)
 
 
 if TYPE_CHECKING:

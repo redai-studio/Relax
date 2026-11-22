@@ -73,7 +73,7 @@ from relax.agentic.session.state import (
     normalize_tools,
 )
 from relax.distributed import replay_manager
-from relax.distributed.replay_manager.backend.mm_sglang import META_FIELD, accept_training_mm_response
+from relax.distributed.replay_manager.producer import prepare_replay_export
 from relax.engine.lora_versions.identity import VersionIdentity
 from relax.engine.lora_versions.manager import SessionKey
 from relax.utils.agentic_obs.records import utc_now
@@ -3438,9 +3438,7 @@ class AgenticSessionShard:
             _merge_export_metadata(node.export_metadata_patch, metadata)
             agentic_trace_events(node.export_metadata_patch).update(finalize_events)
         sample = forest.build_sample(leaf_state_hash=state_hash, tokenizer=self._generation_backend.tokenizer)
-        envelope = (sample.rollout_replay_refs or {}).get("mm_embedding")
-        if envelope is not None:
-            accept_training_mm_response(sample, {META_FIELD: envelope["media"]}, self.args)
+        prepare_replay_export(sample, self.args)
         if reward is not None:
             sample.reward = copy.deepcopy(reward)
         if not mutate_node:

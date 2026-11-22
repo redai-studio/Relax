@@ -1,10 +1,11 @@
 import taskLists from 'markdown-it-task-lists'
 import { fileURLToPath } from 'node:url'
-import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 import sourceLinks from './plugins/source-links'
 
 // https://vitepress.dev/reference/site-config
-export default defineConfig({
+export default withMermaid({
+  mermaid: { securityLevel: 'strict' },
   vite: {
     build: {
       chunkSizeWarningLimit: 1500,

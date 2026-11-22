@@ -301,6 +301,13 @@ def _bounded_tq_init(conf: Any, deadline: float, *, role: str) -> None:
         raise error[0]
 
 
+def training_partition_steps(partitions: list[str] | None) -> list[int]:
+    """Return rollout steps from the training queue's train_<step>
+    partitions."""
+    steps = (name.removeprefix("train_") for name in partitions or () if name.startswith("train_"))
+    return [int(step) for step in steps if step.isdecimal()]
+
+
 async def clear_training_partition(client: Any, partition_id: str) -> Any:
     """Retire replay bodies only after the corresponding sample partition
     clears."""

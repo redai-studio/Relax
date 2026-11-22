@@ -1303,18 +1303,18 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
+    from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
     from relax.distributed.replay_manager.backend.megatron import RoutingReplay
 
     bind_routing_replay = None
     if (
-        (getattr(args, "use_rollout_routing_replay", False) or getattr(args, "use_rollout_mm_embedding_replay", False))
+        (kinds := rollout_kinds(args))
         and args.fully_async
         and not args.hybrid
         and getattr(model[0], "role", None) == "actor"
     ):
-        from relax.distributed.replay_manager.backend.megatron import streaming_moe_replay
-
-        bind_routing_replay = streaming_moe_replay(args, model, f"train_{rollout_id}")
+        consumer = replay_data_manager.register_consumer(kinds)
+        bind_routing_replay = consumer.streaming_binding(args, model, f"train_{rollout_id}")
 
     use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
     if use_indexer_replay:

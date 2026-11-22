@@ -3,17 +3,107 @@
 """Engine-independent publication, admission and immutable reference
 handoff."""
 
+import asyncio
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Condition
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .codecs import replay_codec
-from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, token_digest
+from .config import rollout_kinds
+from .ref_data import FIELDS, REFERENCE_FIELD, ReplayRef, publisher_holds, token_digest
 
 
 if TYPE_CHECKING:
     from .core import ReplayManager
+
+
+def prepare_replay_export(sample: Any, args: Any) -> None:
+    """Apply the training input policy to a selected export in canonical sample
+    format."""
+    envelope = (sample.rollout_replay_refs or {}).get("mm_embedding")
+    if envelope is not None:
+        from .mm_embedding import prepare_mm_sample, training_needs_pixels
+
+        prepare_mm_sample(sample, envelope, keep_pixels=training_needs_pixels(args))
+
+
+@dataclass
+class PublisherHoldings:
+    """Published route records and per-occurrence media leases held by one
+    owner."""
+
+    refs: dict[str, ReplayRef] = field(default_factory=dict)
+    media: dict[str, dict] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.refs or self.media)
+
+    def transfer_to(self, target: "PublisherHoldings", manifests: Iterable[dict]) -> None:
+        refs, media = publisher_holds(manifests)
+        for ref in refs:
+            target.refs[ref.record] = ref
+            self.refs.pop(ref.record, None)
+        for entry in media:
+            target.media[entry["lease"]] = entry
+            self.media.pop(entry["lease"], None)
+
+    async def discard(self) -> None:
+        if self:
+            await self._release(list(self.refs.values()), list(self.media.values()))
+
+    async def _release(self, refs: list[ReplayRef], media: list[dict]) -> None:
+        from . import replay_data_manager
+
+        await replay_data_manager.store().discard_async(refs, media=media)
+        for ref in refs:
+            self.refs.pop(ref.record, None)
+        for entry in media:
+            self.media.pop(entry["lease"], None)
+
+    async def adopt_response(
+        self, args: Any, session_id: str, meta: dict, is_current: Callable[[], bool], *, cleanup_timeout: float
+    ) -> bool:
+        from . import replay_data_manager as manager
+
+        kinds = rollout_kinds(args)
+        if not manager.uses_references or not kinds:
+            return True
+        producer = manager.register_producer(kinds)
+        with producer.response_holds(meta) as (refs, media):
+            if not is_current():
+                await manager.store().invoke_async("discard", refs, unadopted=True, media=media)
+                return False
+            # Media holds are distinct even for repeated occurrences of one record.
+            self.media.update((entry["lease"], entry) for entry in media)
+            if refs:
+                await producer.adopt_response(refs, session_id)
+                self.refs.update((ref.record, ref) for ref in refs)
+            if not is_current():
+                await asyncio.wait_for(self._release(refs, media), cleanup_timeout)
+                return False
+        return True
+
+
+@dataclass
+class PendingSampleWrite:
+    """Track whether TQ may already own the samples when a transfer fails."""
+
+    manager: "ReplayManager"
+    samples: Sequence[Any]
+    started: bool = False
+
+    def mark_started(self) -> None:
+        self.started = True
+
+    async def discard_if_unsent(self, error: BaseException, *, native: bool = False) -> None:
+        if self.started:
+            return
+        try:
+            await self.manager.discard_async(self.samples, unsent=True, native=native)
+        except Exception as cleanup:
+            error.add_note(f"Replay cleanup before TQ dispatch failed: {cleanup!r}")
 
 
 @dataclass(frozen=True)

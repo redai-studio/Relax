@@ -23,12 +23,16 @@ from tqdm import tqdm
 
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.distributed.replay_manager import references_enabled, replay_data_manager, rollout_kinds
-from relax.distributed.replay_manager.backend.sglang import discard_failed_generation, post_generation_request
+from relax.distributed.replay_manager.backend.sglang import (
+    discard_failed_generation,
+    post_generation_request,
+    track_custom_replay_outputs,
+)
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
-from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, request_slots
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
@@ -683,7 +687,7 @@ async def _generate(
     sample.metadata["_timing"] = _timing
 
     if sample.rollout_replay_refs and not evaluation:
-        await replay_producer.adopt_response(replay_producer.response_refs(meta_info), uuid.uuid4().hex)
+        await replay_producer.adopt_native_response(sample, args, meta_info)
     return sample
 
 
@@ -730,6 +734,7 @@ async def _dispatch_generate(
         return sample
 
 
+@track_custom_replay_outputs
 async def generate_and_rm(
     args: Namespace,
     sample: Sample,
@@ -860,18 +865,28 @@ async def generate_and_rm_group(
             state.opd_manager.response_stats.admit(sample.response_key, sample.metadata["teacher_id"])
 
     tasks = []
-    for idx, sample in enumerate(group):
+    for slot, sample in zip(request_slots(group), group, strict=True):
         current_sampling_params = sampling_params.copy()
         if args.sglang_enable_deterministic_inference:
-            seed = state.group_sampling_seeds[idx]
+            seed = state.group_sampling_seeds[slot]
             current_sampling_params["sampling_seed"] = seed
         tasks.append(
             asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
         )
 
     try:
-        group = await asyncio.gather(*tasks)
-        return await _score_generated_group(args, state, group, evaluation, teacher_routing_enabled)
+        results = await asyncio.gather(*tasks)
+        rows = []
+        for source, result in zip(group, results, strict=True):
+            outputs = result if isinstance(result, list) else [result]
+            if not outputs:
+                raise ValueError("A custom generator must return at least one Sample per request")
+            if not evaluation and len(outputs) > 1 and not args.use_dynamic_batch_size:
+                raise ValueError("Multiple training rows per request require --use-dynamic-batch-size")
+            for row in outputs:
+                row.index, row.group_index = source.index, source.group_index
+            rows.extend(outputs)
+        return await _score_generated_group(args, state, rows, evaluation, teacher_routing_enabled)
     except BaseException as error:
         if references_enabled() and not evaluation:
             await discard_failed_generation(replay_data_manager, tasks, group, error)
@@ -1131,13 +1146,13 @@ async def _generate_rollout_async(
             group: list[Sample] = task.result()
 
             if do_print:
-                sample = group[0][0] if isinstance(group[0], list) else group[0]
+                sample = group[0]
                 logger.info(
                     f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
                 )
                 do_print = False
 
-            assert len(group) == args.n_samples_per_prompt
+            assert len(set(request_slots(group))) == args.n_samples_per_prompt
 
             # An aborted group (e.g. a weight-sync pre-dispatch 499) is incomplete:
             # recognize it BEFORE the dynamic filter so it is never dropped as
@@ -1317,7 +1332,7 @@ async def _generate_rollout_async(
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
     await stop_sglang_profile(args, rollout_id)
 
-    sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
+    sample = data[-1][0]
     logger.info(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
     )
@@ -1416,9 +1431,7 @@ async def _generate_rollout_async(
         )
         rollout_metrics = {**timing_metrics, **filter_metrics}
         if args.partial_rollout and not args.fully_async:
-            assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
-                f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
-            )
+            assert len(CURRENT_ROLLOUT_BATCH) == sum(len(group) for group in data)
         _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")

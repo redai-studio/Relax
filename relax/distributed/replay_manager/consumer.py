@@ -161,8 +161,7 @@ class Consumer:
 
     def fields(self, fields: Sequence[str]) -> list[str]:
         self.manager._ensure_open()
-        requested = list(fields) + [FIELDS[kind] for kind in sorted(self.kinds)]
-        return self.manager.config.fields(requested)
+        return self.manager.config.fields(fields, kinds=self.kinds)
 
     def allows_per_rank_fetch(self, fields: Sequence[str]) -> bool:
         return not set(FIELDS.values()).intersection(self.fields(fields))

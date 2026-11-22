@@ -5,7 +5,7 @@
 import hashlib
 import json
 import struct
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -433,3 +433,14 @@ def iter_refs(value: dict[str, Any]) -> Iterator[ReplayRef]:
             if ref.kind != kind:
                 raise ValueError("Replay kind mismatch")
             yield ref
+
+
+def publisher_holds(manifests: Iterable[dict[str, Any]]) -> tuple[list[ReplayRef], list[dict]]:
+    """Route publishers own records; media occurrences each own an independent
+    lease."""
+    refs = []
+    media = []
+    for manifest in manifests:
+        refs.extend(ref for ref in iter_refs(manifest) if ref.kind != "mm_embedding")
+        media.extend(manifest.get("mm_embedding", {}).get("media", ()))
+    return refs, media
