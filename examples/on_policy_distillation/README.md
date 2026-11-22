@@ -37,15 +37,9 @@ For top-K modes (`student_topk`, `teacher_topk`, `union`), `--opd-norm-mode` con
 
 ## SGLang Patch
 
-The Relax v0.5.17 training images include the independent per-position top-K patch. Cross-model top-K queries (`student_topk`, `union`, and `teacher_topk` advantage mode) require this patch; stock SGLang queries the same token set at every position. The patch preserves returned query IDs and supports scheduler and logits chunking.
+The Relax v0.5.17 training images include per-position top-K queries in the main SGLang patch. Cross-model top-K queries (`student_topk`, `union`, and `teacher_topk` advantage mode) require this support; stock SGLang queries the same token set at every position. The patch preserves returned query IDs and supports scheduler and logits chunking.
 
-For an existing v0.5.17 environment that does not have the patch, apply it once after the main Relax SGLang patch:
-
-```bash
-cd /sgl-workspace/sglang
-git apply --check /path/to/Relax/docker/patch/latest/sglang_per_pos_topk.patch
-git apply /path/to/Relax/docker/patch/latest/sglang_per_pos_topk.patch
-```
+Rebuild `docker/Dockerfile` to update an existing v0.5.17 environment. The complete patch is applied to the pinned base during the image build; do not apply it again to an already patched environment.
 
 ## Native Image OPD
 

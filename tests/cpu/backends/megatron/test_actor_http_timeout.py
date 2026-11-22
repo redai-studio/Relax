@@ -91,7 +91,8 @@ def test_run_step_evaluation_probes_carry_timeout(monkeypatch):
             assert kwargs.get("timeout") == shell.args.rollout_http_timeout, url
 
 
-def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypatch):
+@pytest.mark.parametrize("managed", [False, True])
+def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypatch, managed):
     # Regression: /evaluate failing must NOT skip the /end_update_weight cleanup,
     # otherwise rollout + health monitoring stay paused forever.
 
@@ -110,11 +111,12 @@ def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypat
 
     shell = _shell()
     shell.rollout_manager = object()  # non-None -> has_rollout
+    shell._managed_lora_publication = managed
 
     shell._run_step_evaluation(3, end_update_weight=True)
 
     assert any(u.endswith("/evaluate") for u in calls)
-    assert any(u.endswith("/end_update_weight") for u in calls), "cleanup must run even when /evaluate fails"
+    assert any(u.endswith("/end_update_weight") for u in calls) is (not managed)
 
 
 def test_run_step_evaluation_swallows_timeout(monkeypatch):

@@ -140,8 +140,10 @@ def _local_shard(args: argparse.Namespace, coordinator: Any, backend: _CpuBacken
     shard._sglang_request_limiter = coordinator
     shard._admission_client = None
     shard._permit_cleanup_tasks = set()
+    shard._agent_cleanup_tasks = set()
     shard._trajectory_recorder = ShardTrajectoryRecorder(args, shard_ordinal=0)
     shard._train_generation_open = True
+    shard._generation_gate_lock = asyncio.Lock()
     shard._state_revision = 0
     shard._state_changed = asyncio.Event()
     cell = service._SessionResultCell()
@@ -270,6 +272,8 @@ async def _scenario(args: argparse.Namespace, coordinator: Any) -> dict[str, Any
     finally:
         for active in tuple(shard._session_records.values()):
             await shard._finish_session(active, None)
+        while shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks))
         await shard._trajectory_recorder.aclose()
 
 

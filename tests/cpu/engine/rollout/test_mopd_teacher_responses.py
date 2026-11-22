@@ -26,6 +26,7 @@ def rollout(monkeypatch):
         opd_teacher_timeout_s=10,
         opd_teacher_key="data_source",
         opd_teacher_routes_map={"A": ["http://a/generate"], "B": ["http://b/generate"]},
+        sglang_enable_deterministic_inference=False,
     )
     manager = opd.OpdManager(args)
     state = SimpleNamespace(
@@ -78,7 +79,8 @@ async def test_out_of_order_generation_keeps_bound_teacher(monkeypatch, rollout)
         sample.response_length = 1
         return sample
 
-    async def reward(args, sample):
+    async def reward(args, sample, *, evaluation=False):
+        assert evaluation is False
         return 1.0
 
     async def post(session, url, payload, sample, tag, expected_ids):
@@ -143,7 +145,8 @@ async def test_group_retry_scores_both_responses_but_only_regenerates_aborted_me
     assert all(s.reward is None and s.teacher_log_probs is None for s in group)
     assert _counts(manager, "A") == (2, 0)
 
-    async def group_reward(args, samples):
+    async def group_reward(args, samples, *, evaluation=False):
+        assert evaluation is False
         assert _counts(manager, "A") == (2, 2)
         return [1.0, 1.0]
 

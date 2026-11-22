@@ -4,6 +4,7 @@
 from dataclasses import dataclass, fields
 
 from megatron.core.transformer.experimental_attention_variant.qsa import QSASelection
+from torch import Tensor
 
 
 @dataclass
@@ -11,6 +12,9 @@ class MixedQSASelection(QSASelection):
     # Megatron strips/restores indexer tensors with dataclasses.replace twice.
     # A declared field survives both copies; an ad-hoc attribute does not.
     _relax_qsa_mixed_bounds: tuple[int, ...] | None = None
+    # These are invocation-owned and survive selective checkpoint's replace().
+    _relax_qsa_query_positions: Tensor | None = None
+    _relax_qsa_key_reorder: Tensor | None = None
 
 
 def bind_document_bounds(selection: QSASelection, bounds: tuple[int, ...] | None) -> MixedQSASelection:

@@ -124,7 +124,7 @@ def resolve_agentic_obs_config(args: Optional[Namespace]) -> Optional[AgenticObs
     root_dir = getattr(args, "dump_agentic_obs", None)
     run_id = getattr(args, "agentic_obs_run_id", None)
     if not run_id:
-        # Derived in slime_validate_args, never parsed, so a missing value means
+        # Derived in relax_validate_args, never parsed, so a missing value means
         # the caller built a Namespace by hand rather than that the operator
         # forgot a flag. Fall back rather than crash a training run.
         run_id = "run_unknown"

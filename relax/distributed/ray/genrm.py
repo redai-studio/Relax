@@ -101,7 +101,7 @@ class GenRMManager(MultiEngineManager):
     def _resolve_placement(self, rank):
         gpu_idx = rank * self.num_gpu_per_engine + self.bundle_offset
         shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        if not self.args.fully_async and not shared_with_rollout:
+        if self.args.colocate and not self.args.fully_async and not shared_with_rollout:
             gpu_idx += self.args.rollout_num_gpus
 
         return self.pg, False, gpu_idx

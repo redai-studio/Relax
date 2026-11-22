@@ -22,6 +22,7 @@ from relax.engine.sft.runtime import (
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.training.intervals import should_save_checkpoint
 
 
 app = FastAPI()
@@ -313,14 +314,8 @@ class Actor(Base):
 
     def _maybe_save_model(self) -> None:
         """Save model checkpoint if save interval is reached."""
-        if self.config.save is None or self.config.save_interval is None:
-            return
-
-        is_save_step = (self.step + 1) % self.config.save_interval == 0
-        is_final_step = (self.step + 1) == self.config.num_rollout
-
-        if self.config.rotate_ckpt or is_save_step or is_final_step:
-            self.actor_model.save_model(self.step, force_sync=is_final_step)
+        if should_save_checkpoint(self.config, self.step + 1):
+            self.actor_model.save_model(self.step, force_sync=self.step + 1 == self.config.num_rollout)
 
     def train(self, step: int, clear_data: bool = True) -> Dict[str, Any]:
         """Execute a single training step (for external control).

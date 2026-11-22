@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import torch
 
 from relax.distributed.checkpoint_service.backends import device_direct
 from relax.distributed.checkpoint_service.client import engine as engine_module
@@ -171,6 +172,41 @@ def test_receiver_control_failure_reaches_every_training_rank(rollout_backend, m
     monkeypatch.setattr(device_direct.dist, "broadcast_object_list", broadcast)
     with pytest.raises(RuntimeError, match=f"Rollout {endpoint} failed: receiver unavailable"):
         backend._rollout_control_request(endpoint)
+
+
+@pytest.mark.parametrize("audit_rejection", [False, True])
+def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch, audit_rejection):
+    backend = object.__new__(device_direct.DeviceDirectBackend)
+    backend._group_name = "pp0"
+    backend._model_update_groups = object()
+    backend.weight_version = 1
+    backend.lock = Mock()
+    backend.lock.acquire.remote.return_value = True
+    backend.rollout_topology = {
+        "0": {"metadata": {"sync_nextn_draft": True}},
+        "1": {"metadata": {"sync_nextn_draft": False}},
+        "2": {},
+    }
+    backend.rollout_engines = {rank: Mock() for rank in range(3)}
+    if audit_rejection:
+        backend.args = SimpleNamespace(dump_agentic_obs=True, use_agentic_rollout=True)
+        backend._weight_audit_label = "epoch:1"
+        backend.rollout_engines[1].make_request.remote.return_value = {"success": False}
+    monkeypatch.setattr(device_direct.ray, "get", lambda value: value)
+    monkeypatch.setattr(device_direct.dist, "broadcast", Mock())
+
+    backend._update_bucket_weights_from_distributed([("mtp.layers.0.o_proj.weight_scale_inv", torch.ones(1))])
+
+    for rank, engine in backend.rollout_engines.items():
+        endpoint, payload = engine.make_request.remote.call_args.args
+        assert endpoint == "/update_weights_from_distributed"
+        assert payload["weight_version"] == ("epoch:1" if audit_rejection else "1")
+        if rank == 0:
+            assert payload["selector"] == "all"
+        else:
+            assert "selector" not in payload
+    if audit_rejection:
+        assert backend._weight_audit_rejected
 
 
 @pytest.mark.parametrize("generate", [False, True])

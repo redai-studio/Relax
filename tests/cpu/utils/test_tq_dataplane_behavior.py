@@ -8,6 +8,7 @@ import faulthandler
 import importlib.util
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -171,15 +172,26 @@ def _get(client: Any, partition: str, fields: list[str], size: int) -> Any:
 def _ray_cluster(request: pytest.FixtureRequest) -> Iterator[None]:
     import ray
 
+    if ray.is_initialized():
+        pytest.fail("TransferQueue tests must not reuse or shut down another test's Ray runtime")
     # Module setup/teardown run outside the per-test watchdog. Arm separate
     # deadlines so cluster lifecycle calls are covered without timing the module.
-    try:
-        with _ray_wait_deadline(request):
-            ray.init(ignore_reinit_error=True, logging_level="ERROR")
-        yield
-    finally:
-        with _ray_wait_deadline(request):
-            ray.shutdown()
+    with tempfile.TemporaryDirectory(prefix="tq-ray-", dir="/tmp") as runtime_dir:
+        try:
+            with _ray_wait_deadline(request):
+                ray.init(
+                    address="local",
+                    _temp_dir=runtime_dir,
+                    num_cpus=8,
+                    num_gpus=0,
+                    object_store_memory=256 * 1024 * 1024,
+                    include_dashboard=False,
+                    logging_level="ERROR",
+                )
+            yield
+        finally:
+            with _ray_wait_deadline(request):
+                ray.shutdown()
 
 
 @pytest.fixture

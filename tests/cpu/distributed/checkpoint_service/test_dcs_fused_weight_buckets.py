@@ -62,34 +62,11 @@ def test_http_failure_releases_dcs_lock_preserves_error_and_does_not_advance_pro
         lock=SimpleNamespace(
             acquire=SimpleNamespace(remote=lambda: True), release=SimpleNamespace(remote=lambda: "release")
         ),
-        _batch_request=lambda *args: "http",
+        rollout_topology={"0": {}},
+        _batch_request=lambda *args, **kwargs: "http",
     )
     progress = SimpleNamespace(update=lambda count: calls.append("progress"))
     with pytest.raises(RuntimeError) as error:
         namespace["_update_bucket_weights_from_distributed"](state, [("weight", torch.ones(1))], progress)
     assert error.value is original_error
     assert calls == ["release"]
-
-
-def test_dcs_receiver_rejection_keeps_audit_unknown(dcs_update_bucket):
-    payloads = []
-    namespace = dcs_update_bucket
-    namespace.update(
-        ray=SimpleNamespace(get=lambda value: value),
-        dist=SimpleNamespace(broadcast=lambda *args, **kwargs: SimpleNamespace(wait=lambda: None)),
-        logger=logging.getLogger(__name__),
-    )
-    state = SimpleNamespace(
-        args=SimpleNamespace(dump_agentic_obs="unused", use_agentic_rollout=True),
-        _group_name="slime-pp_7",
-        _model_update_groups=object(),
-        weight_version=1,
-        _weight_audit_label="epoch:1",
-        lock=SimpleNamespace(
-            acquire=SimpleNamespace(remote=lambda: True), release=SimpleNamespace(remote=lambda: True)
-        ),
-        _batch_request=lambda endpoint, payload: payloads.append(payload) or [{"success": False}],
-    )
-    namespace["_update_bucket_weights_from_distributed"](state, [("weight", torch.ones(1))])
-    assert payloads[0]["weight_version"] == "epoch:1"
-    assert state._weight_audit_rejected

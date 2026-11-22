@@ -2,6 +2,8 @@
 """CPU correctness contracts for the optional Qwen training optimizations."""
 
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,25 @@ def load(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_deepep_compiler_runs_from_cold_cache_with_relative_worker_paths(tmp_path, monkeypatch):
+    from relax.models.qwen3_5.tilelang_nvcc import _configure_deepep_nvcc
+
+    (tmp_path / "wrapper").symlink_to(ROOT / "scripts/tools/nvcc-without-preload.sh")
+    compiler = tmp_path / "toolchain/compiler"
+    compiler.parent.mkdir()
+    compiler.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    compiler.chmod(0o755)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EP_JIT_NVCC_COMPILER", "./wrapper")
+    monkeypatch.setenv("RELAX_DEEPEP_NVCC", "toolchain/compiler")
+
+    _configure_deepep_nvcc()
+    result = subprocess.check_output([os.environ["EP_JIT_NVCC_COMPILER"], "-cubin", "kernel.cu"], cwd=cache, text=True)
+    assert result.splitlines() == ["-cubin", "kernel.cu"]
 
 
 @pytest.mark.parametrize("tampered", [False, True])
