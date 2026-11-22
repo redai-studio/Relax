@@ -159,7 +159,6 @@ async def test_sglang_rollout_logs_dynamic_filter_drops_and_preserves_timing(
     result = await run_rollout([[rejected], [accepted]], fully_async=fully_async, reward_key=reward_key)
 
     assert result.output.samples == [accepted]
-    assert result.output.partition_complete is (True if fully_async else None)
     assert result.transferred == [accepted]
     assert result.buffered == []
     assert result.fetch.call_count == 2  # A dropped group causes replacement sampling.
@@ -171,7 +170,7 @@ async def test_sglang_rollout_logs_dynamic_filter_drops_and_preserves_timing(
     assert result.logged_metrics["perf_detail/rollout/get_samples_time/total"] >= 0
 
 
-async def test_async_rollout_reports_debt_when_aborted_group_moves_to_next_step(run_rollout: Callable) -> None:
+async def test_async_rollout_transfers_completed_group_and_buffers_aborted_group(run_rollout: Callable) -> None:
     accepted, aborted = _group(0), _group(1)
     aborted[0].status = Sample.Status.ABORTED
     result = await run_rollout(
@@ -180,7 +179,6 @@ async def test_async_rollout_reports_debt_when_aborted_group_moves_to_next_step(
 
     assert result.transferred == [accepted]
     assert result.buffered == [aborted]
-    assert result.output.partition_complete is False
 
 
 @pytest.mark.parametrize("filter_kind", ["structured", "legacy", "disabled"])

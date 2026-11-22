@@ -421,7 +421,6 @@ class Rollout(Base):
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:
                 await self._run_eval_with_mark(rollout_id=0)
-            partition_complete = None
             while True:
                 local_step = self.step
 
@@ -443,7 +442,6 @@ class Rollout(Base):
                     if (
                         local_step == self.config.num_rollout
                         and getattr(self.config, "fully_async", False)
-                        and partition_complete is not True
                         and not await self._async_check_partition_production_complete(final_partition_id)
                     ):
                         self._logger.warning(
@@ -456,8 +454,7 @@ class Rollout(Base):
 
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
-                    # Actor may clear a completed partition before our next poll.
-                    partition_complete = await self.rollout_manager.generate.remote(rollout_id=local_step)
+                    await self.rollout_manager.generate.remote(rollout_id=local_step)
                     if self.config.offload_rollout:
                         await self.rollout_manager.offload.remote()
                 except Exception as e:
@@ -525,9 +522,7 @@ class Rollout(Base):
                 self.step += 1
                 if is_final_backfill_step:
                     final_partition_id = f"train_{self.config.num_rollout - 1}"
-                    if partition_complete is not True and not await self._async_check_partition_production_complete(
-                        final_partition_id
-                    ):
+                    if not await self._async_check_partition_production_complete(final_partition_id):
                         raise RuntimeError(f"Final rollout partition {final_partition_id} is still incomplete")
                     self._logger.info("All rollouts finished")
                     break

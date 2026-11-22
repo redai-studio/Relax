@@ -64,14 +64,14 @@ class MMPublisher:
         validate_mm_envelope({"version": 1, "media": [entry]})
         return entry
 
-    def _acquire(self, method: str, *args: Any) -> dict | None:
+    def _acquire(self, method: str, *args: Any, **kwargs: Any) -> dict | None:
         from .core import new_data_id
 
         # Allocate at the caller so an acknowledgement lost after registration
         # can roll back the exact hold, as in TQReplayStorage.acquire_many.
         lease = new_data_id()
         try:
-            return self.store.invoke(method, *args, lease=lease, publisher=self.publisher)
+            return self.store.invoke(method, *args, lease=lease, publisher=self.publisher, **kwargs)
         except BaseException as error:
             try:
                 self.store.invoke("rollback_acquire", [lease])
@@ -85,9 +85,15 @@ class MMPublisher:
                     error.add_note(f"Media claim cleanup failed: {cleanup!r}")
             raise
 
-    def lookup(self, image_hash: str, grid: Sequence[int], modality: str = "image") -> dict | None:
+    def lookup(
+        self, image_hash: str, grid: Sequence[int], modality: str = "image", *, attempt: str | None = None
+    ) -> dict | None:
         grid = _geometry(image_hash, grid, modality)
-        result = self._acquire("lookup_media", image_hash, grid, modality)
+        result = self._acquire("lookup_media", image_hash, grid, modality, attempt=attempt)
+        if result is not None and result["status"] == "closed":
+            return None
+        if result is None and attempt is not None:
+            raise RuntimeError("MM replay is missing the complete media embedding")
         return None if result is None else self._entry(image_hash, grid, modality, result)
 
     def publish(

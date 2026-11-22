@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
 import torch
@@ -185,6 +186,54 @@ def test_mm_close_retries_aborted_release_without_submitting_after_shutdown(capt
     finally:
         runtime.release = release
         runtime.close()
+
+
+@pytest.mark.parametrize("delivery", ["success", "response-lost", "late-publication"])
+async def test_builtin_mm_generation_transfers_only_delivered_response_leases(capture, monkeypatch, delivery):
+    from relax.engine.rollout import sglang_rollout
+    from relax.utils import http_utils
+
+    runtime, store, inventory = capture
+    manager = ReplayManager(config=store.config, store_factory=lambda: store)
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+    payload = manager.register_producer({"mm_embedding"}).request_options()
+    rid, image = payload["rid"], item()
+    expected = torch.ones(4, 2560, dtype=torch.bfloat16)
+    calls = []
+
+    def publish():
+        runtime.bind(rid, SimpleNamespace(mm_items=[image]))
+        runtime.capture(image, expected)
+        return finish(runtime, rid)
+
+    def worker(request):
+        calls.append(request.url.path)
+        if delivery == "late-publication":
+            raise httpx.ReadError("response lost before capture completes")
+        entries = publish()
+        assert len(entries) == 1
+        if delivery == "response-lost":
+            raise httpx.ReadError("response lost after capture completes")
+        return httpx.Response(200, json={"meta_info": {META_FIELD: entries}})
+
+    args = SimpleNamespace(fully_async=True, use_slime_router=False)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(worker)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        monkeypatch.setattr(http_utils, "_distributed_post_enabled", False)
+        result = sglang_rollout._post_generation(args, None, "http://worker/generate", payload, None, False)
+        if delivery == "success":
+            entries = (await result)["meta_info"][META_FIELD]
+            runtime.flush()
+            torch.testing.assert_close(read_mm_embedding(store, entries[0]), expected)
+            release_media_entries(store, entries)
+        else:
+            with pytest.raises(httpx.ReadError):
+                await result
+            if delivery == "late-publication":
+                assert publish() == []
+            runtime.flush()
+    assert calls == ["/generate"]
+    assert not inventory.state["objects"]
 
 
 def test_mm_request_marker_is_absent_in_evaluation():

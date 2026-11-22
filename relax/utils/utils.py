@@ -3,6 +3,7 @@
 import os
 import socket
 from argparse import Namespace
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -654,6 +655,37 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     return convert_samples_to_train_data(args, selected_rows)
 
 
+async def put_rollout_batch(
+    args: Namespace,
+    client: Any,
+    partition: str,
+    samples: list[Sample],
+    batch: TensorDict,
+    is_last: bool,
+    on_put_started: Callable[[], None] | None = None,
+) -> None:
+    """Attach replay holds before sending samples and sampler metadata to
+    TQ."""
+    custom_meta = build_rollout_custom_meta(batch)
+    if getattr(args, "save_debug_rollout_data", None) and replay_data_manager.uses_references:
+        from relax.distributed.replay_manager.consumer import read_debug_routes
+
+        # Actor may retire the partition as soon as the write becomes visible.
+        for sample in samples:
+            if "moe" in (sample.rollout_replay_refs or {}):
+                sample.rollout_routed_experts = read_debug_routes(sample.tokens, sample.rollout_replay_refs["moe"])
+
+    async def write() -> None:
+        if on_put_started is not None:
+            on_put_started()
+        await client.async_put(data=batch, partition_id=partition, custom_meta=custom_meta, is_last=is_last)
+
+    if replay_data_manager.uses_references:
+        await replay_data_manager.region(partition).put(samples, write)
+    else:
+        await write()
+
+
 async def transfer_batch_to_data_system(
     args: Namespace,
     batch_samples: List,
@@ -693,18 +725,7 @@ async def transfer_batch_to_data_system(
         logger.info(f"Prepared rollout batch {batch_count} with {rollout_batch.numel()} samples for transfer")
         logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
 
-        # Pass sampler metadata inline so it lands atomically with ready samples.
-        custom_meta = build_rollout_custom_meta(rollout_batch)
-
-        async def write() -> None:
-            await data_system_client.async_put(
-                data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
-            )
-
-        if replay_data_manager.uses_references:
-            await replay_data_manager.region(f"train_{rollout_id}").put(batch_samples, write)
-        else:
-            await write()
+        await put_rollout_batch(args, data_system_client, f"train_{rollout_id}", batch_samples, rollout_batch, is_last)
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
         logger.error(f"Error transferring batch {batch_count}: {e}")

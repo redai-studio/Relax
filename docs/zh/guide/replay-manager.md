@@ -29,7 +29,7 @@ MM 支持 Qwen3.5 MoE 和 Qwen3.8 多模态 checkpoint，分别要求 2048 和 2
 
 采集发生在视觉 merger 之后，训练在输入 PP stage 读取并向 TP 组广播，复用 BF16 视觉输出，不做量化。R3 reference 要求静态 CP，关闭 combined 1F1B MoE overlap。需要带匹配 SGLang 和 Megatron patch 的镜像；本轮实验使用 SGLang 0.5.21。
 
-仅开启 R3 且保存 debug rollout 数据时，默认保存完整路由，便于跨作业重放。显式开启 reference 或 MM replay 时，引用只在当前作业有效。
+启用 rollout 调试转储后，生产端会在向训练发送样本前复制 MoE 路由，分区清理后仍可读取转储。MM embedding 引用只在当前作业有效。
 
 ## 拆分分支实验记录（2026-11-22）
 

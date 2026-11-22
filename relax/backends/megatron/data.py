@@ -428,6 +428,7 @@ def get_batch(
     allgather_cp: bool = False,
     is_vl_model: bool = False,
     pack_device: torch.device | None = None,
+    model_chunk: Any = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -878,7 +879,7 @@ def get_batch(
         batch["multimodal_num_items"] = multimodal_num_items
 
     if replay_mm:
-        bind_mm_replay_batch(batch)
+        bind_mm_replay_batch(batch, model_chunk)
 
     # Dynamic CP: forward_only merged its per-sample outputs back to full-length
     # responses (dynamic_cp_merge_output), so rollout_data stores full fields.

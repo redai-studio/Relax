@@ -932,8 +932,8 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
-    adapter._request_endpoints = {}
     adapter._request_wire_ids = {}
+    adapter._request_targets = {}
     adapter._session_endpoints = {}
     adapter.tokenizer = _FakeTokenizer()
     adapter.compiler = SimpleNamespace(processor=None)
@@ -1166,6 +1166,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
     shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
     shard = object.__new__(shard_cls)
     shard.args = SimpleNamespace(agentic_session_lifecycle=True)
+    shard._pending_backend_cleanups = {}
     shard._generation_backend = SimpleNamespace(
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
@@ -1675,7 +1676,7 @@ async def test_admission_lease_uses_train_prefix_and_releases_after_backend_atte
 def _shard_new():
     shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
     shard.args = SimpleNamespace(fully_async=True, partial_rollout=False)
-    shard._pending_backend_aborts = {}
+    shard._pending_backend_cleanups = {}
     return shard
 
 
@@ -1739,7 +1740,8 @@ def _router_recovery_shard():
 
 
 @pytest.mark.asyncio
-async def test_agentic_replay_cleanup_allows_backend_abort_while_storage_is_busy(monkeypatch):
+@pytest.mark.parametrize("fail_once", [False, True])
+async def test_agentic_replay_cleanup_allows_backend_abort_while_storage_is_busy(monkeypatch, fail_once):
     from relax.distributed.replay_manager.config import ReplayConfig
     from relax.distributed.replay_manager.core import ReplayInventory
     from relax.distributed.replay_manager.storage import TQReplayStorage
@@ -1750,8 +1752,11 @@ async def test_agentic_replay_cleanup_allows_backend_abort_while_storage_is_busy
     deletion_started, release = Event(), Event()
 
     def delete(keys):
+        first = not deletion_started.is_set()
         deletion_started.set()
         assert release.wait(2), "Replay deletion blocked the session shard"
+        if fail_once and first:
+            raise ConnectionError("storage unavailable")
         body.delete(keys)
 
     inventory = ReplayInventory(config, delete)
@@ -1772,16 +1777,22 @@ async def test_agentic_replay_cleanup_allows_backend_abort_while_storage_is_busy
 
     shard._generation_backend = SimpleNamespace(abort_request=abort_request)
     ir.backend_started = True
-    session.replay_refs[reference.record] = reference
+    session.replay.refs[reference.record] = reference
     shard._schedule_agent_cleanup(session, None)
     try:
         assert await asyncio.to_thread(deletion_started.wait, 2)
         await asyncio.wait_for(abort_called.wait(), 2)
-        assert session.replay_refs == {reference.record: reference}
+        assert session.replay.refs == {reference.record: reference}
     finally:
         release.set()
+        await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+    if fail_once:
+        assert shard._pending_backend_cleanups == {session.session_id: session}
+        assert session.replay.refs == {reference.record: reference} and body.blocks
+        shard._schedule_agent_cleanup(session, None)
         await asyncio.gather(*tuple(shard._agent_cleanup_tasks))
-    assert not session.replay_refs and not body.blocks
+    assert not shard._pending_backend_cleanups
+    assert not session.replay.refs and not body.blocks
 
 
 @pytest.mark.asyncio
@@ -2079,58 +2090,6 @@ async def test_shard_owned_retry_does_not_resend_ambiguous_generation(monkeypatc
     assert not adapter._request_wire_ids
 
 
-async def test_abort_reaches_unhealthy_worker_after_empty_discovery(monkeypatch):
-    adapter = _backend_adapter(lifecycle_enabled=False)
-    worker = "http://original"
-    registry = []
-    aborted = []
-
-    async def discover(url):
-        if url.endswith("/list_workers"):
-            return {"urls": []}
-        return {"workers": registry}
-
-    async def post(url, payload, **_kwargs):
-        if url.endswith("/generate"):
-            raise httpx.ReadError("response lost")
-        aborted.append((url, payload["rid"]))
-        if url.startswith(worker) and len(aborted) == 1:
-            raise httpx.ReadError("abort response lost")
-        return {}
-
-    monkeypatch.setattr(runtime_mod, "post", post)
-    monkeypatch.setattr(runtime_mod, "get", discover)
-    with pytest.raises(httpx.ReadError):
-        await adapter.generate(input_ids=[1], sampling_params={}, session_id=None, request_id="r")
-    with pytest.raises(RuntimeError, match="no workers"):
-        await adapter.abort_request("r")
-    registry.extend([{"url": worker, "is_healthy": False}, {"url": "http://other", "is_healthy": True}])
-    with pytest.raises(httpx.ReadError):
-        await adapter.abort_request("r")
-    registry.pop(0)
-    await adapter.abort_request("r")
-    assert aborted.count((worker + "/abort_request", "r")) == 2
-    assert not adapter._request_wire_ids
-
-
-async def test_backend_validation_error_only_fails_its_request(monkeypatch):
-    shard, group, session, ir = _router_recovery_shard()
-    adapter = _backend_adapter(lifecycle_enabled=False)
-    shard._generation_backend = adapter
-    request = httpx.Request("POST", "http://router/generate")
-    error = httpx.HTTPStatusError("invalid sampling parameter", request=request, response=httpx.Response(400))
-    send = AsyncMock(side_effect=error)
-    monkeypatch.setattr(runtime_mod, "post", send)
-    runner = asyncio.create_task(shard._run_ir(session, ir))
-    ir.runner_task = runner
-    await runner
-    with pytest.raises(httpx.HTTPStatusError):
-        await ir.waiter
-    assert session.phase is service_mod.SessionPhase.ACTIVE and not group.drop_committed
-    assert not ir.backend_started and not adapter._request_wire_ids
-    send.assert_awaited_once()
-
-
 @pytest.mark.parametrize("rollout_mode,abort_failures", [("train", 0), ("eval", 0), ("train", 1), ("eval", 2)])
 async def test_shard_response_loss_aborts_original_wire_id_and_retains_failed_cleanup(
     monkeypatch, rollout_mode, abort_failures
@@ -2163,21 +2122,24 @@ async def test_shard_response_loss_aborts_original_wire_id_and_retains_failed_cl
     ir.runner_task = runner
     await asyncio.wait_for(runner, 2)
     while shard._agent_cleanup_tasks:
-        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
     assert len(generated) == 1
     assert aborted
     assert isinstance(session.result_cell.payload, RuntimeGroupError)
-    assert not session.live_irs
+    assert session.live_irs == ({ir} if abort_failures else set())
     assert await adapter.close_session(session.session_id, timeout_s=1)
-    if abort_failures == 2:
+    if abort_failures:
         assert ir.backend_started
-        assert list(shard._pending_backend_aborts.values()) == [ir]
+        assert list(shard._pending_backend_cleanups.values()) == [session]
         assert list(adapter._request_wire_ids.values()) == generated
-        # Even after Session retirement the Shard still owns a retryable abort.
-        await shard._abort_backend_ir(ir)
+        # The same Session cleanup owns retries and all later resource release.
+        for _ in range(abort_failures):
+            shard._schedule_agent_cleanup(session, session.result_cell.payload)
+            while shard._agent_cleanup_tasks:
+                await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
     assert aborted == generated * (abort_failures + 1)
     assert not ir.backend_started
-    assert not adapter._request_wire_ids and not shard._pending_backend_aborts
+    assert not adapter._request_wire_ids and not shard._pending_backend_cleanups
 
 
 @pytest.mark.parametrize("finish_mode", ["concurrent-finish", "cancel-at-ack"])
@@ -2199,17 +2161,18 @@ async def test_shard_failed_request_cleanup_survives_finish_and_cancellation(mon
         entered.set()
         await acknowledge.wait()
         if finish_mode == "cancel-at-ack":
-            runner.cancel()
+            for task in tuple(shard._agent_cleanup_tasks):
+                if task.get_name() == f"backend-cleanup:{session.session_id}":
+                    task.cancel()
         return {}
 
     monkeypatch.setattr(runtime_mod, "post", post)
     runner = asyncio.create_task(shard._run_ir(session, ir))
     ir.runner_task = runner
     await asyncio.wait_for(entered.wait(), 2)
-    # Logical termination must not depend on the worker answering abort.
-    assert session.result_cell.terminal and isinstance(session.result_cell.payload, RuntimeGroupError)
     assert ir in session.live_irs and ir.backend_started
-    assert shard._pending_backend_aborts
+    assert session.result_cell.terminal
+    assert shard._pending_backend_cleanups
     finishing = None
     if finish_mode == "concurrent-finish":
         finishing = asyncio.create_task(shard._finish_session(session, None))
@@ -2217,11 +2180,126 @@ async def test_shard_failed_request_cleanup_survives_finish_and_cancellation(mon
     acknowledge.set()
     await asyncio.wait_for(asyncio.gather(runner, return_exceptions=True), 2)
     while shard._agent_cleanup_tasks:
-        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
+    if shard._pending_backend_cleanups:
+        shard._schedule_agent_cleanup(session, session.result_cell.payload)
+        while shard._agent_cleanup_tasks:
+            await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     assert len(aborted) == 1
     assert session.result_cell.terminal
-    assert not ir.backend_started and not shard._pending_backend_aborts
+    assert not ir.backend_started and not shard._pending_backend_cleanups
     assert not adapter._request_wire_ids
+
+
+async def test_unresponsive_abort_does_not_block_group_after_agent_timeout(monkeypatch):
+    shard, group, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    abort_entered = asyncio.Event()
+    acknowledge = asyncio.Event()
+
+    async def post(url, payload, **_kwargs):
+        if url.endswith("/generate"):
+            raise httpx.ReadError("worker accepted then disconnected")
+        abort_entered.set()
+        await acknowledge.wait()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    monkeypatch.setattr(service_mod, "_SESSION_CLOSE_TIMEOUT_S", 0.05)
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(runner, 1)
+    await asyncio.wait_for(abort_entered.wait(), 1)
+    assert session.result_cell.terminal and group.terminal
+    assert ir.backend_started and shard._pending_backend_cleanups
+    # The real process watcher also sees a completed logical Session; an agent
+    # timeout cannot strand a Group behind the unresponsive abort RPC.
+    session.first_ir_ready.set()
+    process_wait = asyncio.create_task(asyncio.sleep(0, result=service_mod.AgentExecutionError("agent timed out")))
+    await asyncio.wait_for(shard._watch_agent_process(session, process_wait), 1)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert group.terminal and adapter._request_wire_ids and shard._pending_backend_cleanups
+    acknowledge.set()
+    shard._schedule_agent_cleanup(session, session.result_cell.payload)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert not adapter._request_wire_ids and not shard._pending_backend_cleanups
+
+
+async def test_pause_abort_keeps_wire_id_until_ambiguous_generation_is_cleaned_up(monkeypatch):
+    shard, _, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_mm_embedding_replay = True
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    entered, acknowledged, lose_response = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    generated, aborted = [], []
+
+    async def post(url, payload, **_kwargs):
+        if url.endswith("/generate"):
+            generated.append(payload["rid"])
+            entered.set()
+            await lose_response.wait()
+            raise httpx.ReadError("response lost after pause acknowledged abort")
+        aborted.append(payload["rid"])
+        acknowledged.set()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    ir.runner_task = asyncio.create_task(shard._run_ir(session, ir))
+    await asyncio.wait_for(entered.wait(), 2)
+    pause = asyncio.create_task(shard._interrupt_running_requests())
+    await asyncio.wait_for(acknowledged.wait(), 2)
+    lose_response.set()
+    await asyncio.wait_for(pause, 2)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+    assert len(generated) == 1
+    assert aborted == generated * 2
+    assert not ir.backend_started and not adapter._request_wire_ids
+
+
+@pytest.mark.parametrize("managed", [False, True])
+async def test_parameter_rejection_fails_only_current_ir(monkeypatch, managed):
+    shard, group, session, ir, _host, _manager = _managed_shard_session()
+    if not managed:
+        session.lora_key = None
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = adapter
+    request = httpx.Request("POST", "http://worker/generate")
+    response = httpx.Response(400, request=request, json={"error": "invalid sampling parameter"})
+
+    async def rejected(*_args, **_kwargs):
+        raise httpx.HTTPStatusError("invalid parameter", request=request, response=response)
+
+    adapter._managed_post = rejected
+    monkeypatch.setattr(runtime_mod, "post", rejected)
+    sibling = _requeue_ir()
+    sibling.request_id = "sibling"
+    session.live_irs.add(sibling)
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(runner, 1)
+    with pytest.raises(httpx.HTTPStatusError):
+        await ir.waiter
+    assert session.live_irs == {sibling}
+    assert session.phase is service_mod.SessionPhase.ACTIVE
+    assert not session.result_cell.terminal and not group.drop_committed
+    assert not adapter._request_wire_ids and not shard._pending_backend_cleanups
+    session.live_irs.clear()
+    sibling.waiter.cancel()
+    if managed:
+        await shard._release_lora_session(session)
 
 
 @pytest.mark.asyncio
@@ -2416,13 +2494,19 @@ async def test_managed_cleanup_failure_keeps_result_and_retries_release(failure_
         shard._lora_runtime.release = remote(AsyncMock(side_effect=TimeoutError("release unavailable")))
     await shard._finish_session(session, None)
     while shard._agent_cleanup_tasks:
-        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 2)
     assert session.result_cell.dropped and not group.sessions
     assert shard._lora_pending_releases == ({session.lora_key} if failure_stage == "release" else set())
     shard._lora_runtime.release = remote(host.release)
     await shard.lora_heartbeat()
     assert not shard._lora_pending_releases and not shard._lora_live_sequences
     assert manager.publication(0).session_count == 0
+    if failure_stage == "release":
+        assert shard._pending_backend_cleanups == {session.session_id: session}
+        shard._schedule_agent_cleanup(session, session.result_cell.payload)
+        while shard._agent_cleanup_tasks:
+            await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
+    assert not shard._pending_backend_cleanups
 
 
 async def test_managed_release_retries_after_cleanup_cancels_pending_bind():
@@ -2512,18 +2596,44 @@ async def test_managed_generation_transport_error_aborts_and_ends_session():
     ir.runner_task = task
     await asyncio.wait_for(task, 2)
     backend.generate.assert_awaited_once()
-    backend.abort_request.assert_awaited_once()
-    assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
     assert isinstance(session.result_cell.payload, RuntimeGroupError)
     assert session.session_id not in shard._session_records
     while shard._agent_cleanup_tasks:
         await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks)), 2)
     assert manager.publication(0).session_count == 0
+    backend.abort_request.assert_awaited_once()
+    assert backend.abort_request.call_args.args[0] == backend.generate.call_args.kwargs["request_id"]
     observation = session.observation
     assert not observation.token_count_complete
     (attempt,) = observation.calls[ir.request_id]["attempts"]
     assert attempt["status"] == "failed" and attempt["reason_code"] == "ReadError"
     assert attempt["started_at"] <= attempt["finished_at"]
+
+
+async def test_managed_abort_failure_keeps_version_until_session_cleanup_retries():
+    shard, _group, session, ir, _host, manager = _managed_shard_session()
+    backend = SimpleNamespace(
+        generate=AsyncMock(side_effect=httpx.ReadError("accepted then disconnected")),
+        abort_request=AsyncMock(side_effect=[TimeoutError("abort unavailable"), None]),
+        close_session=AsyncMock(return_value=True),
+        tokenizer=_FakeTokenizer(),
+    )
+    shard._generation_backend = backend
+    runner = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = runner
+    await asyncio.wait_for(runner, 1)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert session.result_cell.terminal
+    assert list(shard._pending_backend_cleanups.values()) == [session]
+    assert manager.publication(0).session_count == 1
+    backend.close_session.assert_not_awaited()
+    shard._schedule_agent_cleanup(session, session.result_cell.payload)
+    while shard._agent_cleanup_tasks:
+        await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
+    assert backend.abort_request.await_count == 2
+    assert manager.publication(0).session_count == 0
+    assert not shard._pending_backend_cleanups
 
 
 async def test_managed_backend_direct_transport_never_resends_and_cleans_endpoint_maps(monkeypatch):
@@ -2555,10 +2665,7 @@ async def test_managed_backend_direct_transport_never_resends_and_cleans_endpoin
             await adapter.abort_request("r")
         assert cleanup.call_args.args[0] == "http://managed/abort_request"
         assert not await adapter.close_session("s", timeout_s=1)
-        cleanup.side_effect = None
-        await adapter.abort_request("r")
-        assert cleanup.call_args.args[0] == "http://managed/abort_request"
-        assert not adapter._request_endpoints
+        assert adapter._request_targets == {"r": {"http://managed"}}
         assert not adapter._session_endpoints
     finally:
         await adapter._managed_http.aclose()
@@ -2630,7 +2737,8 @@ async def test_pause_abort_propagates_ordinary_error_after_finalization() -> Non
     shard, _group, session, ir = _router_recovery_shard()
     runner_done = asyncio.Event()
 
-    async def abort_request(_request_id: str) -> None:
+    async def abort_request(_request_id: str, *, retain_request: bool) -> None:
+        assert retain_request
         session.phase = service_mod.SessionPhase.FINALIZING
         runner_done.set()
         raise RuntimeError("abort failed")
@@ -2701,7 +2809,7 @@ async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkey
     store = TQReplayStorage(config, inventory=inventory)
     store._backend = body
     manager = ReplayManager(config=config, store_factory=lambda: store)
-    for module in (service_mod.replay_manager, transfer_mod, utils):
+    for module in (service_mod.replay_manager, utils):
         monkeypatch.setattr(module, "replay_data_manager", manager)
     monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: cp_size)
     monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -2773,13 +2881,13 @@ async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkey
         transport = service_mod.SessionExportTransport(exports=({"sample_payload": sample.to_dict()},))
         shard._schedule_agent_cleanup = lambda *_: None
         await shard._finish_session_once(session, transport)
-        assert not session.replay_refs and group.replay_refs == {first, second}
+        assert not session.replay.refs and set(group.replay.refs.values()) == {first, second}
         if cp_size == 0:
             shard._trajectory_recorder = SimpleNamespace(record_export_failure=MagicMock())
             discard_started = asyncio.Event()
             fail_discard = asyncio.Event()
 
-            async def discard(_refs):
+            async def discard(_refs, *, media):
                 discard_started.set()
                 await fail_discard.wait()
                 raise TimeoutError("discard acknowledgement lost")
@@ -2797,7 +2905,7 @@ async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkey
                     fail_discard.set()
                     with pytest.raises(TimeoutError, match="discard acknowledgement lost"):
                         await dropping
-            assert group.replay_refs == {first, second} and body.blocks
+            assert set(group.replay.refs.values()) == {first, second} and body.blocks
             await shard.drop_group(group.group_id)
             assert not body.blocks and not inventory.state["objects"]
             return
@@ -2909,7 +3017,9 @@ async def test_agentic_media_holds_follow_selected_lineage_and_retired_responses
     first = publisher.lookup("a" * 64, [1, 4, 4])
     second = [publisher.lookup(digest * 64, [1, 4, 4]) for digest in ("a", "b")]
     try:
-        assert await shard._adopt_reference_response(session, {META_FIELD: [first]}, lambda: True)
+        assert await session.replay.adopt_response(
+            shard.args, session.session_id, {META_FIELD: [first]}, lambda: True, cleanup_timeout=2
+        )
         forest, root = _forest_with_initial_obs(
             session_id=session.session_id,
             messages=[{"role": "user", "content": "image"}],
@@ -2926,10 +3036,12 @@ async def test_agentic_media_holds_follow_selected_lineage_and_retired_responses
             rollout_mm_embedding_refs={"version": 1, "media": [first]},
         )
         current = iter((True, not retired))
-        accepted = await shard._adopt_reference_response(session, {META_FIELD: second}, lambda: next(current))
+        accepted = await session.replay.adopt_response(
+            shard.args, session.session_id, {META_FIELD: second}, lambda: next(current), cleanup_timeout=2
+        )
         assert accepted is not retired
         if retired:
-            assert set(session.replay_media) == {first["lease"]}
+            assert set(session.replay.media) == {first["lease"]}
             assert all(
                 entry["lease"] not in inventory.state["objects"][entry["ref"]["record"]]["readers"] for entry in second
             )
@@ -2959,9 +3071,9 @@ async def test_agentic_media_holds_follow_selected_lineage_and_retired_responses
         await shard._finish_session_once(
             session, service_mod.SessionExportTransport(exports=({"sample_payload": sample.to_dict()},))
         )
-        assert set(group.replay_media) == {entry["lease"] for entry in second}
-        assert set(session.replay_media) == {first["lease"]}
-        await shard._discard_session_media(session, [first])
+        assert set(group.replay.media) == {entry["lease"] for entry in second}
+        assert set(session.replay.media) == {first["lease"]}
+        await session.replay.discard()
         await manager.region("train_0").put([sample], AsyncMock())
         refs = [ReplayRef.from_dict(entry["ref"]) for entry in second]
         leases = store.acquire_many(refs, partition="train_0")
@@ -2971,7 +3083,7 @@ async def test_agentic_media_holds_follow_selected_lineage_and_retired_responses
         manager.region("train_0").retire()
         store.release_many(refs, leases)
     finally:
-        await shard._discard_session_media(session, list(session.replay_media.values()))
+        await session.replay.discard()
         release_media_entries(store, [*caches, first, *second])
         assert not body.blocks and not inventory.state["objects"]
         store._writer.close()

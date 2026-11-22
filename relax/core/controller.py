@@ -633,12 +633,6 @@ class Controller:
         return backend_dict
 
     def _close_data_system(self) -> None:
-        """Tear down the data system.
-
-        Default in-process path keeps upstream's plain ``tq.close()``;
-        owner-mediated runs delegate to
-        :func:`relax.utils.tq.lifecycle.close_tq_owner`.
-        """
         from relax.distributed.replay_manager import replay_data_manager
 
         try:
@@ -647,12 +641,21 @@ class Controller:
             else:
                 replay_data_manager.finish_run()
         finally:
-            if self._tq_legacy_init:
-                self._tq_legacy_init = False
-                tq.close()
-            else:
-                close_tq_owner(self._tq_owner)
-                self._tq_owner = None
+            self._close_transfer_queue()
+
+    def _close_transfer_queue(self) -> None:
+        """Tear down the data system.
+
+        Default in-process path keeps upstream's plain ``tq.close()``;
+        owner-mediated runs delegate to
+        :func:`relax.utils.tq.lifecycle.close_tq_owner`.
+        """
+        if self._tq_legacy_init:
+            self._tq_legacy_init = False
+            tq.close()
+            return
+        close_tq_owner(self._tq_owner)
+        self._tq_owner = None
 
     def _deploy_metrics_service(self):
         """Deploy the MetricsService as a lightweight Ray Serve deployment.

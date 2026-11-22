@@ -20,6 +20,7 @@ from typing import Any
 
 
 REQUEST_PREFIX = "relax-mm-"
+ATTEMPT_PREFIX = REQUEST_PREFIX + "attempt-"
 META_FIELD = "mm_embedding_refs"
 
 
@@ -68,6 +69,7 @@ class _Media:
     digest: str
     grid: tuple[int, int, int]
     modality: str
+    attempt: str | None = None
     future: Future | None = None
 
 
@@ -123,7 +125,8 @@ class MMCapture:
             if [(m.digest, m.grid, m.modality) for m in previous] != metadata:
                 raise ValueError("MM replay request changed its media layout")
             return
-        self.requests[rid] = [_Media(*description) for description in metadata]
+        attempt = rid if rid.startswith(ATTEMPT_PREFIX) else None
+        self.requests[rid] = [_Media(*description, attempt=attempt) for description in metadata]
 
     def capture(self, item: Any, embedding: Any) -> None:
         import torch
@@ -211,11 +214,11 @@ class MMCapture:
                 raise ValueError("One media hash has incompatible request geometry")
             media.future = self._worker.submit(self._acquire, media, ready)
 
-    def _acquire(self, media: _Media, ready: Future | None = None) -> dict:
+    def _acquire(self, media: _Media, ready: Future | None = None) -> dict | None:
         if ready is not None:
             ready.result()  # cache owns a separate lease; never copy it to a request
-        entry = self.publisher.lookup(media.digest, media.grid, media.modality)
-        if entry is None:
+        entry = self.publisher.lookup(media.digest, media.grid, media.modality, attempt=media.attempt)
+        if entry is None and media.attempt is None:
             raise RuntimeError(
                 "MM replay is missing the complete media embedding, including its prefix-cache reference"
             )
@@ -239,7 +242,7 @@ class MMCapture:
             raise RuntimeError("MM replay body publication has not completed")
         media = self.requests[rid]
         try:
-            result = [item.future.result() for item in media]
+            result = [entry for item in media if (entry := item.future.result()) is not None]
         except BaseException:
             self.abort(rid)
             raise
@@ -248,7 +251,8 @@ class MMCapture:
 
     def _release_future(self, future: Future) -> None:
         if not future.cancelled() and future.exception() is None:
-            self.release(self.store, [future.result()])
+            if (entry := future.result()) is not None:
+                self.release(self.store, [entry])
 
     def _release_pending(self, future: Future) -> None:
         self._release_future(future)

@@ -15,7 +15,6 @@ from typing import Any, Callable, List, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
-from relax.distributed.replay_manager.core import replay_data_manager
 from relax.utils.types import Sample
 
 
@@ -38,7 +37,7 @@ async def _transfer_batch_to_data_system(
     partition open at once.
     """
 
-    from relax.utils.utils import build_rollout_custom_meta, convert_samples_to_train_data
+    from relax.utils.utils import convert_samples_to_train_data, put_rollout_batch
 
     samples = [sample for group in batch_samples for sample in group]
     for sample in samples:
@@ -47,23 +46,9 @@ async def _transfer_batch_to_data_system(
         batch_samples.sort(key=lambda group: group[0].index)
         samples = [sample for group in batch_samples for sample in group]
         rollout_batch = convert_samples_to_train_data(args, samples)
-        custom_meta = build_rollout_custom_meta(rollout_batch)
-        partition = f"train_{partition_id}"
-
-        async def write() -> None:
-            if on_put_started is not None:
-                on_put_started()
-            await data_system_client.async_put(
-                data=rollout_batch,
-                partition_id=partition,
-                custom_meta=custom_meta,
-                is_last=is_last,
-            )
-
-        if replay_data_manager.uses_references:
-            await replay_data_manager.region(partition).put(samples, write)
-        else:
-            await write()
+        await put_rollout_batch(
+            args, data_system_client, f"train_{partition_id}", samples, rollout_batch, is_last, on_put_started
+        )
     finally:
         for sample in samples:
             mark_sample_agentic_event(sample, "transfer_release_end_at")

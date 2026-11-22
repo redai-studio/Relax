@@ -102,7 +102,6 @@ def default_reference_r3(args: Any) -> bool:
         and _supports_reference_training(args, rollout_kinds(args))
         and _r3_unsupported_layout(args) is None
         and not is_offline_mode(args)
-        and not getattr(args, "save_debug_rollout_data", None)
         and not getattr(args, "debug_train_only", False)
         and not getattr(args, "load_forge_rollout_data", None)
         and getattr(args, "rollout_function_path", "relax.engine.rollout.sglang_rollout.generate_rollout")

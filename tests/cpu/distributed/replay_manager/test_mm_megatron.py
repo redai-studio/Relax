@@ -46,7 +46,35 @@ def test_visual_replay_refuses_trainable_merger_before_installation():
 def test_visual_replay_batch_fails_closed_outside_reference_region():
     close_mm_replay()
     with pytest.raises(RuntimeError, match="no active reference"):
-        bind_mm_replay_batch({})
+        bind_mm_replay_batch({}, None)
+
+
+def test_mm_replay_reads_embeddings_only_for_the_input_virtual_pipeline_chunk():
+    from unittest.mock import Mock
+
+    from relax.distributed.replay_manager.backend import mm_megatron
+    from relax.distributed.replay_manager.ref_data import ReplayRef
+
+    ref = ReplayRef(2, "abcd", "abcd", "f" * 32, "mm_embedding", 4, 1, 2560, 4, "a" * 64, "bf16-raw-v1")
+    media = dict(hash=ref.tokens, grid=[1, 4, 4], modality="image", ref=ref.to_dict(), lease="b" * 32)
+    manifests = [{"mm_embedding": {"version": 1, "media": [media]}}]
+    grids = torch.tensor([[1, 4, 4]])
+    embeddings = torch.ones(4, 2560, dtype=torch.bfloat16)
+    reader = SimpleNamespace(enabled=True, load=Mock(return_value=embeddings))
+    token = mm_megatron._active_reader.set(reader)
+    try:
+        for input_chunk in (True, False):
+            inputs = {"image_grid_thw": grids}
+            batch = {"rollout_replay_refs": manifests, "multimodal_train_inputs": inputs}
+            bind_mm_replay_batch(batch, SimpleNamespace(module=SimpleNamespace(pre_process=input_chunk)))
+            assert inputs["image_grid_thw"] is grids
+            if input_chunk:
+                assert inputs["_relax_mm_embedding_replay"].embeddings is embeddings
+            else:
+                assert "_relax_mm_embedding_replay" not in inputs
+        reader.load.assert_called_once_with([media])
+    finally:
+        mm_megatron._active_reader.reset(token)
 
 
 class _FrozenVision(torch.nn.Module):

@@ -139,7 +139,7 @@ def test_replay_delivery_replaces_stale_worker_mode_and_store_identity(monkeypat
     assert env["OMP_NUM_THREADS"] == "24"
 
 
-def test_worker_delivery_override_is_preserved_without_replay(monkeypatch):
+def test_worker_delivery_override_is_preserved_without_rollout_replay(monkeypatch):
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
     monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
     env = post_process_env(_make_args(), {"env_vars": {"RELAX_REPLAY_REFERENCES": "0"}})["env_vars"]

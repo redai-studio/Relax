@@ -55,20 +55,17 @@ class MegatronConsumer(Consumer):
         *,
         region: ReplayRegion | None = None,
         cache: ConsumerTensorCache | None = None,
-    ) -> ConsumerTensorCache:
+    ) -> ConsumerTensorCache | None:
         self.manager._ensure_open()
         if region is not None and region.manager is not self.manager:
             raise ValueError("Replay region belongs to another manager")
-        # Actor retains full-tensor packing; share one cache across reference kinds.
-        if cache is None:
-            cache = ConsumerTensorCache(self.manager.config.materialization_bytes)
-        if REFERENCE_FIELD in batch:
-            for kind in ("moe",):
-                if kind in self.kinds:
-                    fill_reference_replay(actor, data_iterator, num_microbatches, kind, region or self.manager, cache)
-        else:
-            if "moe" in self.kinds:
-                actor.fill_routing_replay(data_iterator, num_microbatches, batch)
+        if "moe" in self.kinds:
+            if REFERENCE_FIELD in batch:
+                if cache is None:
+                    cache = ConsumerTensorCache(self.manager.config.materialization_bytes)
+                fill_reference_replay(actor, data_iterator, num_microbatches, "moe", region or self.manager, cache)
+            else:
+                fill_full_moe_replay(actor, data_iterator, num_microbatches, batch)
         if "mm_embedding" in self.kinds:
             from .mm_megatron import prepare_mm_replay
 
@@ -78,7 +75,7 @@ class MegatronConsumer(Consumer):
         return cache
 
 
-def log_reference_replay_metrics(cache: ConsumerTensorCache, args: Any, rollout_id: int) -> None:
+def log_reference_replay_metrics(cache: ConsumerTensorCache | None, args: Any, rollout_id: int) -> None:
     """Report foreground CPU waits without adding CUDA syncs or collectives.
 
     Every rank logs its own counters; ClearML uses the same primary rank as the
@@ -87,6 +84,8 @@ def log_reference_replay_metrics(cache: ConsumerTensorCache, args: Any, rollout_
     from .mm_megatron import log_mm_replay_metrics
 
     log_mm_replay_metrics(args, rollout_id)
+    if cache is None:
+        return
     ahead = cache._read_ahead
     if not ahead.read_calls:
         return
@@ -362,7 +361,7 @@ def streaming_moe_replay(args: Any, models: Any, partition: str) -> Callable[[An
             from .mm_megatron import bind_mm_replay_batch, prepare_mm_replay_models
 
             prepare_mm_replay_models(replay_data_manager, models, batch, region)
-            bind_mm_replay_batch(batch)
+            bind_mm_replay_batch(batch, model)
         if not has_moe:
             return
         model_id = id(model)
@@ -372,6 +371,25 @@ def streaming_moe_replay(args: Any, models: Any, partition: str) -> Callable[[An
         next_microbatch[model_id] += 1
 
     return bind
+
+
+def fill_full_moe_replay(actor: Any, data_iterator: list, num_microbatches: list[int], batch: dict) -> None:
+    if "rollout_routed_experts" not in batch:
+        raise ValueError("rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set.")
+    routers = list(local_moe_routers(actor.model, actor.args.num_layers))
+    keys = ["rollout_routed_experts", "tokens"]
+    if "multimodal_train_inputs" in batch:
+        keys.append("multimodal_train_inputs")
+    for iterator in data_iterator:
+        iterator.reset()
+    try:
+        for _ in range(sum(num_microbatches)):
+            microbatch = data_iterator[0].get_next(keys)
+            bind_full_moe_batch(actor.args, microbatch, routers, microbatch["tokens"])
+        del batch["rollout_routed_experts"]
+    finally:
+        for iterator in data_iterator:
+            iterator.reset()
 
 
 def fill_reference_replay(
@@ -476,10 +494,7 @@ class RoutingReplay:
 
     @classmethod
     @contextmanager
-    def forward_stage(cls, *, enabled: bool = True) -> Iterator[None]:
-        if not enabled:
-            yield
-            return
+    def forward_stage(cls) -> Iterator[None]:
         previous = cls.phase.enter_forward()
         try:
             yield

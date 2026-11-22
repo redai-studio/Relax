@@ -24,6 +24,42 @@ if TYPE_CHECKING:
     from .core import ConsumerChannel, ReplayManager, ReplayRegion
 
 
+def materialize_debug_routes(sample: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot live MoE references before their run-local bodies are
+    retired."""
+    refs = sample.get("rollout_replay_refs") or {}
+    if "moe" not in refs:
+        return sample
+    result = dict(sample)
+    if result.get("rollout_routed_experts") is None:
+        result["rollout_routed_experts"] = read_debug_routes(sample["tokens"], refs["moe"])
+    result["rollout_replay_refs"] = {kind: value for kind, value in refs.items() if kind != "moe"}
+    return result
+
+
+def read_debug_routes(tokens: list[int], manifest: dict[str, Any]) -> "NDArray":
+    import numpy as np
+
+    from relax.distributed.replay_manager import replay_data_manager
+
+    from .ref_data import selection_route_spans
+
+    spans = selection_route_spans(manifest, "moe")
+    rows = len(tokens) - 1
+    if spans[-1].stop != rows:
+        raise ValueError("Debug dump MoE replay rows differ from training tokens")
+    bodies = list(dict.fromkeys(span.ref for span in spans))
+    body_indices = {ref: index for index, ref in enumerate(bodies)}
+    values = np.empty((rows, bodies[0].layers, bodies[0].topk), dtype=np.int32)
+    with replay_data_manager.store().reader(bodies) as reader:
+        for span in spans:
+            source = np.arange(span.source_start, span.ref.rows, dtype=np.int64)
+            destination = np.arange(span.start, span.stop, dtype=np.int64)
+            for layer in range(span.ref.layers):
+                reader.read_into(body_indices[span.ref], layer, source, values[:, layer, :], destination)
+    return values
+
+
 @dataclass(frozen=True)
 class ConsumerRecord:
     """Bind one layer/microbatch to a tensor, (tensor, mask), or lazy reader.

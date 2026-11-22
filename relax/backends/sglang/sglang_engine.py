@@ -577,27 +577,14 @@ class SGLangEngine(RayActor):
         )
         reference_publication = False
         if Envs.RELAX_REPLAY_REFERENCES:
-            from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
-            from relax.distributed.replay_manager.backend.sglang import validate_configuration
+            from relax.distributed.replay_manager.backend.sglang import configure_engine_publication
 
-            kinds = rollout_kinds(self.args)
-            local_publication = not (
-                getattr(self.args, "rollout_external", False) or init_external_kwargs
-            ) and server_args_dict.get("disaggregation_mode", "null") in (None, "null")
-            if kinds:
-                validate_configuration(self.args, server_args_dict, local_publication=local_publication)
-            reference_publication = bool(kinds) and local_publication
-            if reference_publication:
-                # Register resolved TQ endpoints before spawning scheduler processes.
-                # Children construct their own clients; no sockets cross spawn.
-                replay_data_manager.initialize(kinds=kinds, connection=self.args.tq_config)
-                os.environ["RELAX_REPLAY_REGISTRATION"] = json.dumps(replay_data_manager.export_registration())
-                os.environ["RELAX_REPLAY_RAY_ADDRESS"] = ray.get_runtime_context().gcs_address
-                publisher = (self.rank, ray.get_runtime_context().get_actor_id())
-                replay_data_manager.store().invoke("register_engine_publisher", *publisher)
-                os.environ["RELAX_REPLAY_ENGINE_PUBLISHER"] = json.dumps(publisher)
-            elif kinds:
-                logger.info("SGLang retains its native HTTP payload; Replay publishes references at rollout ingress")
+            reference_publication = configure_engine_publication(
+                self.args,
+                server_args_dict,
+                self.rank,
+                external=bool(init_external_kwargs or self.args.rollout_external),
+            )
 
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6

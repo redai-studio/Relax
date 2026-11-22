@@ -334,11 +334,11 @@ def close_mm_replay() -> None:
         _active_reader.set(None)
 
 
-def bind_mm_replay_batch(batch: dict[str, Any]) -> None:
+def bind_mm_replay_batch(batch: dict[str, Any], model_chunk: Any) -> None:
     reader = _active_reader.get()
     if reader is None:
         raise RuntimeError("MM replay batch has no active reference consumption region")
-    if not reader.enabled:
+    if not reader.enabled or not _model_module(model_chunk).pre_process:
         return
     manifests = batch.get("rollout_replay_refs")
     if manifests is None:

@@ -68,6 +68,7 @@ async def harness(*, mode="train", **overrides):
     shard._generation_gate_lock = asyncio.Lock()
     shard._state_revision, shard._state_changed = 0, asyncio.Event()
     shard._agent_cleanup_tasks, shard._permit_cleanup_tasks = set(), set()
+    shard._pending_backend_cleanups = {}
     shard._admission_client = None
     shard._lifecycle_close_count = shard._lifecycle_close_failure_count = 0
     shard._trajectory_recorder = ShardTrajectoryRecorder(args, shard_ordinal=0)

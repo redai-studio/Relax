@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 import torch
 from PIL import Image
 
+from relax.distributed.replay_manager.consumer import materialize_debug_routes
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.types import Sample
@@ -110,7 +111,9 @@ def save_debug_train_data(args, *, rollout_id, rollout_data, tokenizer=None):
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # Reorganize data by sample
-        samples = _reorganize_train_data_by_sample(rollout_data, tokenizer)
+        samples = [
+            materialize_debug_routes(sample) for sample in _reorganize_train_data_by_sample(rollout_data, tokenizer)
+        ]
 
         torch.save(
             dict(
@@ -163,6 +166,8 @@ def save_debug_rollout_data(args, data, rollout_id: int, evaluation: bool, token
         else:
             # Regular rollout data is a list of Sample objects
             samples_list = [sample.to_dict() for sample in data]
+
+        samples_list = [materialize_debug_routes(sample) for sample in samples_list]
 
         # Add decoded_tokens field for each sample if tokenizer is provided
         for sample_dict in samples_list:

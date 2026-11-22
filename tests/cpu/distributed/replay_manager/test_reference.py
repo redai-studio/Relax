@@ -35,34 +35,6 @@ def test_debug_dump_replay_uses_self_contained_fields(tmp_path):
         load_debug_rollout_samples(path, SimpleNamespace())
 
 
-def test_r3_rollout_dump_round_trips_routes_across_runs(tmp_path, monkeypatch):
-    import base64
-
-    from relax.distributed.replay_manager.config import default_reference_r3
-    from relax.utils.training.train_dump_utils import load_debug_rollout_samples, save_debug_rollout_data
-    from relax.utils.types import Sample
-
-    monkeypatch.delenv("RELAX_REPLAY_REFERENCES", raising=False)
-    args = SimpleNamespace(
-        train_backend="megatron",
-        colocate=True,
-        use_rollout_routing_replay=True,
-        num_layers=1,
-        moe_router_topk=1,
-        save_debug_rollout_data=None,
-    )
-    assert default_reference_r3(args)
-    args.save_debug_rollout_data = str(tmp_path / "rollout-{rollout_id}.pt")
-    manager = ReplayManager(config=ReplayConfig(delivery="reference" if default_reference_r3(args) else "full"))
-    sample = Sample(tokens=[1, 2, 3])
-    routes = np.array([[[7]], [[3]]], dtype=np.int32)
-    producer = manager.register_producer(["moe"])
-    producer.accept_response(sample, {"routed_experts": base64.b64encode(routes).decode()}, args)
-    save_debug_rollout_data(args, [sample], 0, evaluation=False)
-    [restored] = load_debug_rollout_samples(tmp_path / "rollout-0.pt", args)
-    np.testing.assert_array_equal(restored.rollout_routed_experts, routes)
-
-
 class MemoryBody:
     """Replace remote body I/O; publication, ownership and reads stay real."""
 
@@ -207,6 +179,51 @@ def published():
     ref = publication.finish([10, 11, 12, 13, 14])
     yield config, store, body, inventory, ref, values
     store._writer.close()
+
+
+@pytest.mark.parametrize("dump_kind", ["rollout", "train"])
+async def test_debug_dump_materializes_routes_for_another_run(published, monkeypatch, tmp_path, dump_kind):
+    from relax.distributed import replay_manager
+    from relax.utils.training import train_dump_utils
+    from relax.utils.types import Sample
+
+    config, store, _, inventory, ref, expected = published
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(replay_manager, "replay_data_manager", manager)
+    sample = Sample(tokens=[10, 11, 12, 13, 14], rollout_replay_refs={"moe": ref.to_dict()})
+    path = tmp_path / "replay.pt"
+    args = SimpleNamespace(save_debug_rollout_data=str(path), save_debug_train_data=str(path))
+    if dump_kind == "rollout":
+        from relax.utils import utils
+
+        monkeypatch.setattr(utils, "replay_data_manager", manager)
+
+        async def consume(data, partition_id, **kwargs):
+            assert "rollout_routed_experts" not in data
+            await manager.on_partition_cleared(partition_id)
+
+        batch = {"total_lengths": [5], "sample_indices": [0], "rollout_replay_refs": [sample.rollout_replay_refs]}
+        await utils.put_rollout_batch(args, SimpleNamespace(async_put=consume), "train_0", [sample], batch, True)
+        assert not inventory.state["objects"]
+        train_dump_utils.save_debug_rollout_data(args, [sample], 0, False)
+    else:
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        train_dump_utils.save_debug_train_data(
+            args, rollout_id=0, rollout_data={key: [value] for key, value in sample.to_dict().items()}
+        )
+        assert sample.rollout_routed_experts is None
+        assert not inventory.state["objects"][ref.record]["readers"]
+        store.discard([ref])
+    assert sample.rollout_replay_refs == {"moe": ref.to_dict()}
+    assert not inventory.state["objects"]
+    monkeypatch.setattr(replay_manager, "replay_data_manager", ReplayManager(config=ReplayConfig(run_id="other")))
+    for replay in (False, True):
+        [restored] = train_dump_utils.load_debug_rollout_samples(
+            str(path), SimpleNamespace(use_rollout_routing_replay=replay)
+        )
+        np.testing.assert_array_equal(restored.rollout_routed_experts, expected)
+        assert restored.tokens == sample.tokens
+        assert not restored.rollout_replay_refs
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 """SGLang/rollout integration: request, capture, response and publication."""
 
 import ast
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -24,6 +25,7 @@ from ..ref_data import ReplayRef, decode_refs, encode_refs, validate_sample
 
 
 _CAPTURE_FIELDS = {"moe": "routed_experts"}
+ROUTE_ATTEMPT_PREFIX = "relax-r3-attempt-"
 AGENTIC_R3_REQUEST_PREFIX = "relax-agentic-r3-"
 
 
@@ -39,6 +41,25 @@ def _response_references(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {ref.kind: value}
 
 
+async def discard_failed_generation(
+    manager: ReplayManager, tasks: list[asyncio.Task], group: list, error: BaseException
+) -> None:
+    """Drain sibling requests before releasing samples that will never enter
+    the training queue."""
+    for task in tasks:
+        task.cancel()
+    completed = await asyncio.gather(*tasks, return_exceptions=True)
+    samples = list(group)
+    for result in completed:
+        if not isinstance(result, BaseException):
+            samples.extend(result if isinstance(result, list) else [result])
+    for sample in samples:
+        try:
+            await manager.discard_async([sample])
+        except Exception as cleanup:
+            error.add_note(f"Replay group cleanup failed: {cleanup!r}")
+
+
 @dataclass(frozen=True)
 class SGLangProducer(Producer):
     """Rollout-facing adapter: request capture, accept references, build TQ
@@ -49,19 +70,30 @@ class SGLangProducer(Producer):
     format.
     """
 
-    def request_options(self, *, evaluation: bool = False) -> dict[str, Any]:
+    def request_options(self, *, evaluation: bool = False, request_id: str | None = None) -> dict[str, Any]:
+        from uuid import uuid4
+
+        from ..config import references_enabled
+        from .mm_sglang import ATTEMPT_PREFIX, REQUEST_PREFIX
+
         self.manager._ensure_open()
         options = {}
-        if "moe" in self.kinds and not (evaluation and self.manager.uses_references):
+        reference = self.manager.uses_references if request_id is None else references_enabled()
+        media = "mm_embedding" in self.kinds and not evaluation
+        if "moe" in self.kinds and not (evaluation and reference):
             options["return_routed_experts"] = True
-        if "mm_embedding" in self.kinds and not evaluation:
-            from uuid import uuid4
-
-            from .mm_sglang import REQUEST_PREFIX
-
-            options["rid"] = REQUEST_PREFIX + uuid4().hex
-            # Eval prefixes have no replay body; keep training KV references in
-            # their own existing SGLang cache namespace.
+        if request_id is not None:
+            # Agentic retries and aborts address this same wire request.
+            if "moe" in self.kinds and reference:
+                request_id = AGENTIC_R3_REQUEST_PREFIX + ("mm-" if media else "") + request_id
+            elif media:
+                request_id = REQUEST_PREFIX + request_id
+            options["rid"] = request_id
+        elif media:
+            options["rid"] = ATTEMPT_PREFIX + uuid4().hex
+        elif reference and "moe" in self.kinds and not evaluation:
+            options["rid"] = ROUTE_ATTEMPT_PREFIX + uuid4().hex
+        if media:
             options["cache_salt"] = "relax-mm-embedding-replay"
         return options
 
@@ -124,7 +156,8 @@ class SGLangProducer(Producer):
             validate_sample(refs, tokens)
         return refs
 
-    def response_refs(self, meta: dict) -> list[ReplayRef]:
+    @staticmethod
+    def response_refs(meta: dict) -> list[ReplayRef]:
         return [
             ReplayRef.from_dict(ref)
             for field in _CAPTURE_FIELDS.values()
@@ -194,6 +227,63 @@ class SGLangProducer(Producer):
             except Exception as cleanup:
                 error.add_note(f"Replay response cleanup failed: {cleanup!r}")
             raise
+
+
+async def post_generation_request(
+    manager: ReplayManager,
+    post: Callable,
+    url: str,
+    payload: dict,
+    *,
+    headers: dict | None,
+    fail_fast_no_workers: bool,
+) -> dict:
+    """Keep response leases with the attempt until the receiver has its
+    manifest."""
+    import httpx
+
+    from relax.utils.async_utils import finish_before_cancellation
+    from relax.utils.http_utils import MAX_RETRIES
+
+    from .mm_sglang import ATTEMPT_PREFIX, META_FIELD
+
+    rid = payload.get("rid", "")
+    if not rid.startswith((ATTEMPT_PREFIX, ROUTE_ATTEMPT_PREFIX)):
+        return await post(url, payload, headers=headers, fail_fast_no_workers=fail_fast_no_workers)
+
+    store = manager.store()
+    meta = {}
+    try:
+        await finish_before_cancellation(store.invoke_async("open_response_attempt", rid), "open-replay-attempt")
+        attempts = MAX_RETRIES if rid.startswith(ROUTE_ATTEMPT_PREFIX) else 1
+        for index in range(attempts):
+            try:
+                output = await post(
+                    url, payload, headers=headers, fail_fast_no_workers=fail_fast_no_workers, max_retries=1
+                )
+                break
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                # These failures precede dispatch, so the same wire ID is safe to retry.
+                if index + 1 == attempts:
+                    raise
+                await asyncio.sleep(1)
+        meta = output["meta_info"]
+        accepted = [entry["lease"] for entry in meta.get(META_FIELD, ())]
+        accepted.extend(ref.record for ref in SGLangProducer.response_refs(meta))
+        await finish_before_cancellation(
+            store.invoke_async("finish_response_attempt", rid, accepted), "accept-replay-response"
+        )
+        return output
+    except BaseException:
+        try:
+            await finish_before_cancellation(
+                store.invoke_async("finish_response_attempt", rid), "close-replay-attempt"
+            )
+        finally:
+            # Acceptance may have committed just before its waiter was cancelled.
+            if meta:
+                manager.register_producer({"mm_embedding"}).discard_response(meta)
+        raise
 
 
 def decode_routed_experts(meta_info: dict[str, Any], num_rows: int, num_layers: int, topk: int) -> np.ndarray:
@@ -458,16 +548,15 @@ def _advance_publication(
         if len(unpadded) == len(prompt_ids):
             prompt_ids = unpadded
         tokens = list(prompt_ids) + list(output_ids)
-        if asynchronous:
-            return {
-                kind: publication.finish_async(tokens[moe_start:] if kind == "moe" else tokens)
-                for kind, publication in streams.items()
-            }
-        refs = {
-            kind: publication.finish(tokens[moe_start:] if kind == "moe" else tokens).to_dict()
+        from .mm_sglang import ATTEMPT_PREFIX
+
+        rid = getattr(req, "rid", "")
+        attempt = rid if rid.startswith((ATTEMPT_PREFIX, ROUTE_ATTEMPT_PREFIX)) else None
+        pending = {
+            kind: publication.finish_async(tokens[moe_start:] if kind == "moe" else tokens, attempt=attempt)
             for kind, publication in streams.items()
         }
-        return refs
+        return pending if asynchronous else {kind: future.result().to_dict() for kind, future in pending.items()}
     except BaseException as primary:
         try:
             _abort_request_publication(req)
@@ -892,6 +981,35 @@ def _install_tq_topology_cache() -> None:
     from .._tq_compat import install_tq_topology_cache
 
     install_tq_topology_cache()
+
+
+def configure_engine_publication(args: Any, server_args: dict, rank: int, *, external: bool) -> bool:
+    from ..config import rollout_kinds
+
+    kinds = rollout_kinds(args)
+    if not kinds:
+        return False
+    local = not external and server_args.get("disaggregation_mode") in (None, "null")
+    validate_configuration(args, server_args, local_publication=local)
+    if not local:
+        from relax.utils.logging_utils import get_logger
+
+        get_logger(__name__).info(
+            "SGLang retains its native HTTP payload; Replay publishes references at rollout ingress"
+        )
+        return False
+
+    import ray
+
+    # Spawned scheduler processes construct their own clients from this registration.
+    replay_data_manager.initialize(kinds=kinds, connection=args.tq_config)
+    context = ray.get_runtime_context()
+    os.environ["RELAX_REPLAY_REGISTRATION"] = json.dumps(replay_data_manager.export_registration())
+    os.environ["RELAX_REPLAY_RAY_ADDRESS"] = context.gcs_address
+    publisher = (rank, context.get_actor_id())
+    replay_data_manager.store().invoke("register_engine_publisher", *publisher)
+    os.environ["RELAX_REPLAY_ENGINE_PUBLISHER"] = json.dumps(publisher)
+    return True
 
 
 def run_reference_scheduler(*args, **kwargs):

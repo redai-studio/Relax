@@ -8,8 +8,8 @@
 
 import torch
 
-from relax.models.qwen3_8.ops.qsa_mixed_ops.flex import _bounds_tensor, attention_auto
 from relax.models.qwen3_8.ops.qsa_mixed_ops.flex import attention as flex
+from relax.models.qwen3_8.ops.qsa_mixed_ops.flex import attention_auto
 from relax.models.qwen3_8.ops.qsa_mixed_ops.geometry import validate_geometry
 from relax.models.qwen3_8.ops.qsa_mixed_ops.grouped import attention_bf16
 from relax.utils.env import Envs
@@ -64,7 +64,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.
         if kind == 0:
             from flash_attn import flash_attn_varlen_func
 
-            cu = _bounds_tensor(local_bounds, q.device)
+            cu = torch.tensor(local_bounds, device=q.device, dtype=torch.int32)
             maximum = max(b - a for a, b in group)
             output = flash_attn_varlen_func(*local, cu, cu, maximum, maximum, softmax_scale=scale, causal=True)
         else:

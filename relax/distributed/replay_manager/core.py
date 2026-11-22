@@ -574,6 +574,7 @@ class ReplayInventory:
         self._lock = RLock()
         self.state = {"objects": {}, "closed_partitions": [], "closed": False}
         self._media: dict[str, dict] = {}
+        self._response_attempts: dict[str, dict[str, ReplayRef]] = {}
         self._engine_publishers: dict[int, str] = {}
         self._retired_publishers: set[tuple[int, str]] = set()
 
@@ -582,7 +583,7 @@ class ReplayInventory:
         with self._lock:
             yield self.state
 
-    def finish_publication(self, record: str, rows: int, token_identity: str) -> ReplayRef:
+    def finish_publication(self, record: str, rows: int, token_identity: str, attempt: str | None = None) -> ReplayRef:
         if self.state["closed"] or self.state.get("closing"):
             raise RuntimeError("Replay run is closing")
         item = self.state["objects"].get(record)
@@ -606,6 +607,13 @@ class ReplayInventory:
             if media is None or media["record"] != record:
                 raise RuntimeError("Media publication no longer owns its claim")
         self.seal(ref)
+        if attempt is not None:
+            # The HTTP receiver can disappear while the writer is sealing this body.
+            holds = self._response_attempts.get(attempt)
+            if holds is None:
+                self.discard([ref], unadopted=True)
+            else:
+                holds[record] = ref
         if ref.kind == "mm_embedding":
             # Seal and install the first publisher/cache reader hold in this
             # same inventory transaction, before any other producer can drop it.
@@ -909,6 +917,24 @@ class ReplayInventory:
             item["media_producer_readers"].setdefault(lease, publisher if cache else None)
             return {"status": "ready", "ref": ref.to_dict(), "lease": lease}
 
+    def open_response_attempt(self, rid: str) -> None:
+        with self._state():
+            self._response_attempts.setdefault(rid, {})
+
+    def finish_response_attempt(self, rid: str, accepted: Sequence[str] = ()) -> None:
+        """Transfer delivered leases and reclaim those whose response was
+        lost."""
+        with self._state():
+            holds = self._response_attempts.get(rid, {})
+            unused = holds.keys() - set(accepted)
+            routes = [holds[key] for key in unused if holds[key].kind == "moe"]
+            media = [key for key in unused if holds[key].kind == "mm_embedding"]
+            if routes:
+                self.discard(routes, unadopted=True)
+            if media:
+                self.release_media([holds[key] for key in media], media)
+            self._response_attempts.pop(rid, None)
+
     def lookup_media(
         self,
         image_hash: str,
@@ -917,15 +943,22 @@ class ReplayInventory:
         *,
         lease: str | None = None,
         publisher: tuple[int, str] | None = None,
+        attempt: str | None = None,
     ) -> dict | None:
         with self._state():
+            if attempt is not None and attempt not in self._response_attempts:
+                return {"status": "closed"}
             previous = self._media.get(image_hash)
             if previous is None:
                 return None
             result = self.claim_media(
                 image_hash, grid, previous["record"], modality, lease=lease, publisher=publisher, cache=False
             )
-            return result if result["status"] == "ready" else None
+            if result["status"] != "ready":
+                return None
+            if attempt is not None:
+                self._response_attempts[attempt][result["lease"]] = ReplayRef.from_dict(result["ref"])
+            return result
 
     def abort_media_claim(self, image_hash: str, record: str) -> None:
         with self._state() as state:

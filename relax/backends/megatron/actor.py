@@ -35,6 +35,7 @@ from relax.distributed.ray.train_actor import TrainRayActor
 from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
 from relax.distributed.replay_manager.backend.megatron import (
     RoutingReplay,
+    fill_full_moe_replay,
     log_reference_replay_metrics,
     reference_execution,
 )
@@ -1088,27 +1089,7 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
-        if "rollout_routed_experts" not in rollout_data:
-            raise ValueError(
-                "rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set."
-            )
-
-        from relax.distributed.replay_manager.backend.megatron import bind_full_moe_batch, local_moe_routers
-
-        routers = list(local_moe_routers(self.model, self.args.num_layers))
-        for iterator in data_iterator:
-            iterator.reset()
-        for _ in range(sum(num_microbatches)):
-            keys = ["rollout_routed_experts", "tokens"]
-            if "multimodal_train_inputs" in rollout_data:
-                keys.append("multimodal_train_inputs")
-            batch = data_iterator[0].get_next(keys)
-            bind_full_moe_batch(self.args, batch, routers, batch["tokens"])
-
-        del rollout_data["rollout_routed_experts"]
-
-        for iterator in data_iterator:
-            iterator.reset()
+        fill_full_moe_replay(self, data_iterator, num_microbatches, rollout_data)
 
     def fill_indexer_replay(self, data_iterator, num_microbatches, rollout_data):
         """Pack SGLang's logical C4 IDs into Megatron's local CP/PP layout."""
@@ -1301,7 +1282,12 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
         collect_topk: bool = False,
     ) -> dict[str, list[torch.Tensor]]:
-        with timer(f"{store_prefix}log_probs"):
+        vision = nullcontext()
+        if store_prefix == "ref_" and getattr(self.args, "use_rollout_mm_embedding_replay", False):
+            from relax.distributed.replay_manager.backend.mm_megatron import native_vision_forward
+
+            vision = native_vision_forward()
+        with timer(f"{store_prefix}log_probs"), vision:
             log_prob_func = get_log_probs_and_entropy
             if collect_topk:
                 log_prob_func = partial(log_prob_func, with_topk=True, topk_k=self.args.opd_log_prob_top_k)
@@ -2087,13 +2073,15 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
-        replay_cache = replay_data_manager.register_consumer(rollout_kinds(self.args)).prepare(
-            self,
-            data_iterator,
-            num_microbatches,
-            rollout_data,
-            region=replay_data_manager.region(sft_partition_id(self.args, rollout_id)),
-        )
+        replay_cache = None
+        if kinds := rollout_kinds(self.args):
+            replay_cache = replay_data_manager.register_consumer(kinds).prepare(
+                self,
+                data_iterator,
+                num_microbatches,
+                rollout_data,
+                region=replay_data_manager.region(sft_partition_id(self.args, rollout_id)),
+            )
         if use_indexer_replay:
             self.fill_indexer_replay(data_iterator, num_microbatches, rollout_data)
 
@@ -2114,21 +2102,15 @@ class MegatronTrainRayActor(TrainRayActor):
                         RoutingReplay.set_stage("fallthrough")
                     if use_indexer_replay:
                         IndexerReplay.set_stage("fallthrough")
-                    vision = nullcontext()
-                    if getattr(self.args, "use_rollout_mm_embedding_replay", False):
-                        from relax.distributed.replay_manager.backend.mm_megatron import native_vision_forward
-
-                        vision = native_vision_forward()
                     try:
                         self._switch_model("ref")
-                        with vision:
-                            rollout_data.update(
-                                self.compute_log_prob(
-                                    data_iterator_logprobs,
-                                    num_microbatches_logprobs,
-                                    store_prefix="ref_",
-                                )
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator_logprobs,
+                                num_microbatches_logprobs,
+                                store_prefix="ref_",
                             )
+                        )
                     finally:
                         self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
 
@@ -2285,7 +2267,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_reference_replay_metrics(replay_cache, self.args, rollout_id)
+        if kinds:
+            log_reference_replay_metrics(replay_cache, self.args, rollout_id)
         log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
@@ -2447,15 +2430,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self.args.use_routing_replay:
                     RoutingReplay.set_stage("fallthrough")
                 self._switch_model("ref")
-                vision = nullcontext()
-                if getattr(self.args, "use_rollout_mm_embedding_replay", False):
-                    from relax.distributed.replay_manager.backend.mm_megatron import native_vision_forward
-
-                    vision = native_vision_forward()
-                with vision:
-                    sub_batch.update(
-                        self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="ref_")
-                    )
+                sub_batch.update(
+                    self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="ref_")
+                )
 
             # Teacher forward for Megatron-based OPD
             if "teacher" in self.weights_backuper.backup_tags:

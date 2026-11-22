@@ -15,8 +15,6 @@ class DatasetStateMismatchError(ValueError):
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
     metrics: dict[str, Any] = None
-    # True after the producer's final sample write to this partition is acknowledged.
-    partition_complete: bool | None = None
 
 
 @dataclass

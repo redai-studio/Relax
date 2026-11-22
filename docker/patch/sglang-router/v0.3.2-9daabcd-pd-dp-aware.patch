@@ -1285,20 +1285,7 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
              // on_backoff hook
              |delay, attempt| {
                  // Layer 3 worker metrics
-@@ -328,7 +340,7 @@
-         inject_trace_context_http(&mut headers_with_trace);
-         let headers = Some(&headers_with_trace);
- 
--        let response = self
-+        let mut response = self
-             .send_typed_request(
-                 headers,
-                 request_body,
-@@ -339,10 +351,14 @@
-             )
-             .await;
- 
-+        response.extensions_mut().insert(WorkerDispatched);
+@@ -342,7 +354,10 @@
          events::RequestReceivedEvent {}.emit();
  
          let status = response.status();
@@ -1310,13 +1297,26 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
  
          // Record worker errors for server errors (5xx)
          if status.is_server_error() {
-@@ -599,15 +615,22 @@
+@@ -592,22 +607,34 @@
+                     worker_url, route, e
+                 );
+
+-                return convert_reqwest_error(e);
++                let connect_failed = e.is_connect();
++                let mut response = convert_reqwest_error(e);
++                if !connect_failed {
++                    response.extensions_mut().insert(WorkerDispatched);
++                }
++                return response;
+             }
+         };
+
          let status = StatusCode::from_u16(res.status().as_u16())
              .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
  
 -        if !is_stream {
 -            // For non-streaming requests, preserve headers
-+        if !is_stream || status.as_u16() == 499 {
++        let mut response = if !is_stream || status.as_u16() == 499 {
 +            // Error bodies are finite even for a streaming request. Preserve headers
              let response_headers = header_utils::preserve_response_headers(res.headers());
  
@@ -1335,3 +1335,14 @@ diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
                      response
                  }
                  Err(e) => {
+@@ -658,7 +685,9 @@
+                 response = AttachedBody::wrap_response(response, guard);
+             }
+             response
+-        }
++        };
++        response.extensions_mut().insert(WorkerDispatched);
++        response
+     }
+
+     async fn build_rerank_response(

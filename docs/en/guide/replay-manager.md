@@ -23,7 +23,7 @@ Add these flags to an online Megatron recipe:
 --freeze-vision-projection
 ```
 
-The first three flags control rollout route capture, training replay, and routing optimizations. Supported online R3 recipes default to references; R3-only runs that save debug rollout data default to full routes so the dump can be replayed in another run. Explicit reference delivery and MM replay produce run-local references. Baselines remove the four replay flags while keeping the vision encoder and projection frozen.
+The first three flags control rollout route capture, training replay, and routing optimizations. Supported online R3 recipes default to references. When rollout dumps are enabled, the producer copies MoE routes before sending the batch to training so the dump remains readable after partition cleanup. MM embedding references are local to the run. Baselines remove the four replay flags while keeping the vision encoder and projection frozen.
 
 MM supports Qwen3.5 MoE and multimodal Qwen3.8 checkpoints with visual widths of 2048 and 2560 respectively, spatial merge size 2, and no DeepStack. It requires BF16, packed THD, CP1, and frozen vision encoder and merger/projection. Colocated, hybrid, and fully async modes support built-in SGLang and Agentic rollout. Asynchronous MM requires PP1 without interleaving; fully async additionally requires dynamic token batching and inline actor log-probabilities, without a separate reference policy. MM does not support Critic, partial rollout, MTP, speculative decoding, hierarchical cache, custom generation, Slime router, or OPD.
 

@@ -83,6 +83,67 @@ def test_multimodal_r3_hashes_the_original_placeholder_tokens(monkeypatch):
         store.close_run()
 
 
+@pytest.mark.parametrize("delivery", ["success", "connection-refused", "response-lost", "late-publication"])
+async def test_builtin_r3_owns_routes_until_http_handoff(monkeypatch, delivery):
+    import httpx
+    import torch
+
+    from relax.distributed.replay_manager.backend import sglang
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a")
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(sglang, "replay_data_manager", manager)
+    producer = manager.register_producer({"moe"})
+    payload = producer.request_options()
+    request = SimpleNamespace(origin_input_ids=[1], output_ids=[2], req_pool_idx=0, **payload)
+    processor = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[0]])))
+    capturer = SimpleNamespace(host_cache=SimpleNamespace(buffer=torch.tensor([[[3]]], dtype=torch.int32)))
+
+    def publish():
+        return sglang._advance_publication(processor, request, 1, {"moe": lambda: capturer}, final=True)["moe"]
+
+    attempts = []
+
+    async def send(url, sent, **kwargs):
+        attempts.append(sent["rid"])
+        if delivery == "connection-refused" and len(attempts) == 1:
+            raise httpx.ConnectError("connection refused")
+        if delivery == "late-publication":
+            raise httpx.ReadError("connection lost before sealing")
+        route = publish()
+        if delivery == "response-lost":
+            raise httpx.ReadError("connection lost after sealing")
+        return {"meta_info": {"routed_experts": route}}
+
+    try:
+        post = sglang.post_generation_request(
+            manager, send, "/generate", payload, headers=None, fail_fast_no_workers=False
+        )
+        if delivery in {"success", "connection-refused"}:
+            meta = (await post)["meta_info"]
+            refs = producer.response_refs(meta)
+            await producer.adopt_response(refs, "receiver")
+            assert body.blocks
+            store.discard(refs)
+        else:
+            with pytest.raises(httpx.ReadError):
+                await post
+            if delivery == "late-publication":
+                publish()
+        assert attempts == [request.rid] * (2 if delivery == "connection-refused" else 1)
+        assert not inventory.snapshot()["objects"] and not body.blocks
+    finally:
+        store.close_run()
+
+
 @pytest.mark.parametrize("component_output", [False, True], ids=["legacy", "component"])
 def test_reference_response_waits_for_publication_and_drains_on_empty_input(monkeypatch, component_output):
     # Match SGLang's independent, slotted output component. It intentionally

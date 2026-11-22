@@ -750,8 +750,8 @@ class TQReplayStorage:
             registry = await asyncio.to_thread(self._registry)
         return await registry.invoke.remote(method, args, kwargs)
 
-    async def discard_async(self, refs: list[ReplayRef]) -> None:
-        await self.invoke_async("discard", refs)
+    async def discard_async(self, refs: list[ReplayRef], *, media: Sequence[dict] = ()) -> None:
+        await self.invoke_async("discard", refs, media=media)
 
     def validate_partition(self, refs: list[ReplayRef], partition: str) -> None:
         self.invoke("validate_partition", refs, partition)
@@ -901,11 +901,6 @@ class TQReplayStorage:
 
     def retire_partition(self, partition: str) -> None:
         self.invoke("retire_partition", partition)
-
-    def reclaim_stopped_publishers(self) -> int:
-        # Never infer remote process death from a local PID. Uncertain writes
-        # remain visible for recovery instead of being deleted by a timeout.
-        return len(self.invoke("snapshot")["objects"])
 
     def abandon_run(self) -> None:
         """Drop failed-job metadata before its owning TQ is destroyed."""

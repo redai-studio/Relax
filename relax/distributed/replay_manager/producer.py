@@ -257,7 +257,7 @@ class ProducerPublication:
             raise ValueError("Replay publication is closed")
         return self.finish_async(tokens).result()
 
-    def finish_async(self, tokens: list[int]) -> Future:
+    def finish_async(self, tokens: list[int], *, attempt: str | None = None) -> Future:
         """Seal on the writer; callers publish the reference only once
         ready."""
         if self._aborted:
@@ -268,7 +268,7 @@ class ProducerPublication:
             return self._finish_future
         if self._sealed or self.rows != len(tokens) - 1:
             raise ValueError("Replay publication does not cover the finalized request")
-        return self._finish_with_digest(token_digest(tokens))
+        return self._finish_with_digest(token_digest(tokens), attempt)
 
     def finish_media(self, image_hash: str) -> ReplayRef:
         """Seal media coordinates with their hash, not generated token
@@ -279,7 +279,7 @@ class ProducerPublication:
             raise ValueError("Invalid media hash or empty publication")
         return self._finish_with_digest(image_hash).result()
 
-    def _finish_with_digest(self, digest: str) -> Future:
+    def _finish_with_digest(self, digest: str, attempt: str | None = None) -> Future:
         self._finish_digest = digest
         writes = tuple(self._futures)
 
@@ -287,7 +287,7 @@ class ProducerPublication:
             # Writes were enqueued first, but may still run on another worker.
             for future in writes:
                 future.result()
-            ref = self.store.invoke("finish_publication", self.record, self.rows, digest)
+            ref = self.store.invoke("finish_publication", self.record, self.rows, digest, attempt)
             self._futures.clear()
             self._sealed = True
             return ref

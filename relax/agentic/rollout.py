@@ -142,13 +142,18 @@ async def _run_group(
         )
 
     group = None
+
+    async def collect() -> None:
+        nonlocal group
+        group = await runtime_domain.collect_group(stream)
+
     retain_for_transfer = False
     try:
         if requires_complete_group:
-            group = await runtime_domain.collect_group(stream)
+            await collect()
         else:
             tasks = (
-                asyncio.create_task(runtime_domain.collect_group(stream)),
+                asyncio.create_task(collect()),
                 asyncio.create_task(
                     reward_domain.score_sessions(stream, observe_reward=observe_reward)
                     if stage_recorder is not None
@@ -156,18 +161,13 @@ async def _run_group(
                 ),
             )
             try:
-                group, _ = await asyncio.gather(*tasks)
+                await asyncio.gather(*tasks)
             finally:
                 for task in tasks:
                     task.cancel()
-                try:
-                    await finish_before_cancellation(
-                        asyncio.gather(*tasks, return_exceptions=True), "agentic-group-reward-cleanup"
-                    )
-                finally:
-                    collected = tasks[0]
-                    if collected.done() and not collected.cancelled() and collected.exception() is None:
-                        group = collected.result()
+                await finish_before_cancellation(
+                    asyncio.gather(*tasks, return_exceptions=True), "agentic-group-reward-cleanup"
+                )
         if group is None:
             reward_domain.discard_group_progress(stream)
             await runtime_domain.drop_group(stream)
@@ -742,11 +742,7 @@ class AgenticResidentPipeline:
             await self.prepare_domain.discard_step()
 
         await self.runtime_domain.trim_memory()
-        return RolloutFnTrainOutput(
-            samples=context.output_groups,
-            metrics={},
-            partition_complete=(self.transfer_domain.total_debt == 0) if self.args.fully_async else None,
-        )
+        return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
 
     async def _seal_dynamic_partition(self, context: _StepContext) -> None:
         """Seal with the DP-aligned FIFO prefix of completed Group tasks."""

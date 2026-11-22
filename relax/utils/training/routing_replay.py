@@ -1,28 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Compatibility entry point for Megatron patches using the legacy R3 path."""
+"""Import alias for Megatron images built before the replay manager migration.
 
-from typing import Any
+Retire this path once those images and their patches are out of support.
+"""
 
-from relax.distributed.replay_manager.backend.megatron import (
-    RoutingReplay,
-    get_routing_replay_compute_topk,
-    register_routing_replay,
-    set_routing_replay,
-)
+import sys
+
+from relax.distributed.replay_manager.backend import megatron
 
 
-__all__ = [
-    "RoutingReplay",
-    "get_routing_replay_compute_topk",
-    "register_routing_replay",
-    "set_routing_replay",
-]
-
-
-def __getattr__(name: str) -> Any:
-    if name == "ROUTING_REPLAY":
-        from relax.distributed.replay_manager.backend import megatron
-
-        return megatron.ROUTING_REPLAY
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+sys.modules[__name__] = megatron
