@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.backends.sglang.delta_capability import _trivial_expert_layout, full_loader_inputs, sparse_loader_identity
+from relax.backends.sglang.delta_capability import full_loader_inputs, sparse_loader_identity
 from relax.backends.sglang.delta_loader import load_delta_weights
+from relax.backends.sglang.delta_model_loaders import _trivial_expert_layout
 from relax.distributed.weight_sync.codec import encode
 
 
@@ -275,3 +276,219 @@ def test_conditional_moe_sparse_scope_keeps_gated_attention_dense(monkeypatch):
         "model.visual.layers.0.mlp.experts.down_proj",
     ):
         assert requires_full_input(model, name)
+
+
+@pytest.mark.parametrize("family", ["llama", "qwen3"])
+def test_real_model_dispatchers_reuse_observed_tp3_pp_copy_without_admission_override(family):
+    """Only stage-local source columns are installed, preserving FP32 words."""
+    pytest.importorskip("sglang.srt.layers.linear")
+    from sglang.srt.layers.linear import RowParallelLinear
+    from sglang.srt.layers.parameter import ModelWeightParameter
+
+    if family == "llama":
+        from sglang.srt.models.llama import LlamaForCausalLM as model_class
+    else:
+        from sglang.srt.models.qwen3 import Qwen3ForCausalLM as model_class
+
+    def make_model():
+        model = model_class.__new__(model_class)
+        torch.nn.Module.__init__(model)
+        model.quant_config = None
+        model.config = SimpleNamespace(tie_word_embeddings=False)
+        model.pp_group = SimpleNamespace(is_last_rank=True)
+        model.model = torch.nn.Module()
+        model.model.start_layer, model.model.end_layer = 2, 3
+        row = RowParallelLinear(6, 2, bias=False, params_dtype=torch.float32, tp_rank=1, tp_size=3)
+        if family == "llama":
+            # Some SG checkpoints bind the v2 loader through a native Parameter
+            # subclass. Exercise its real source slicing and physical copy.
+            row.weight = ModelWeightParameter(
+                data=torch.zeros_like(row.weight), input_dim=1, output_dim=0, weight_loader=row.weight_loader_v2
+            )
+        model.model.row = row
+        return model
+
+    actual, reference = make_model(), make_model()
+    names = ("model.layers.0.missing.weight", "model.row.weight")
+    words = torch.arange(12, dtype=torch.int32)
+    positions = torch.tensor([0, 2, 3, 8, 10], dtype=torch.int32)
+    for seed in (True, False):
+        version = str(int(not seed))
+        begin(actual, version, seed=seed, base=None if seed else "0")
+        if not seed:
+            words[positions.long()] = torch.tensor([-7, 2143289345, -2147483648, -43, 55], dtype=torch.int32)
+        value = words.view(torch.float32)
+        inputs = [
+            (name, (2, 6), value.dtype, None if seed else positions, value if seed else value[positions.long()])
+            for name in names
+        ]
+        meta, raw = encode(inputs, max_bytes=1024)
+        status = torch.full((2,), 80, dtype=torch.uint8)
+        load_delta_weights(
+            actual,
+            [
+                (json.dumps(dict(op="consume", version=version, frame=0, metadata=meta)), raw),
+                ("__delta_capability__", status),
+            ],
+        )
+        assert not status.any()
+        load_delta_weights(actual, [(json.dumps(dict(op="finalize", version=version, frames=1)), torch.empty(0))])
+        reference.load_weights([(name, value.view(2, 6)) for name in names])
+        assert torch.equal(actual.model.row.weight.view(torch.int32), reference.model.row.weight.view(torch.int32))
+    metrics = actual._relax_delta_receiver.target_shard_metrics
+    assert (metrics["entries"], metrics["ordinary_entries"], metrics["words"], metrics["local_words"]) == (2, 0, 10, 3)
+
+
+@pytest.mark.parametrize(("dtype", "nan_word"), [(torch.bfloat16, 0x7FC1), (torch.float16, 0x7E01)])
+def test_declared_dispatcher_keeps_full_derived_inputs_and_checks_epoch_before_sparse_writes(dtype, nan_word):
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.raw = torch.nn.Parameter(torch.zeros(4, dtype=dtype), requires_grad=False)
+            self.register_buffer("derived", torch.zeros(4))
+            self.invocations = 0
+            self.epoch = 1
+
+        def load_weights(self, items):
+            for name, source in items:
+                if name == "independent":
+                    self.raw.copy_(source)
+                else:
+                    self.cached = source.clone()
+                    self.derived.copy_(source.float() * 2)
+            self.invocations += 1
+
+        load_weights.relax_copy_layout = lambda model: (model.epoch, frozenset({"independent"}))
+
+    model = Model()
+    reference = Model()
+    words = torch.tensor([-32768, 2, 3, 4], dtype=torch.int16)
+    for seed in (True, False):
+        version = str(int(not seed))
+        begin(model, version, seed=seed, base=None if seed else "0")
+        pos = None if seed else torch.tensor([1], dtype=torch.int32)
+        if not seed:
+            words[1] = nan_word
+        val = words.view(dtype)
+        full = torch.arange(4, dtype=torch.float32) + int(not seed)
+        metadata, raw = encode(
+            [
+                ("independent", (4,), val.dtype, pos, val if seed else val[1:2]),
+                ("cache", (4,), full.dtype, None, full),
+            ],
+            max_bytes=1024,
+        )
+        status = torch.empty(2, dtype=torch.uint8)
+        load_delta_weights(
+            model,
+            [
+                (json.dumps(dict(op="consume", version=version, frame=0, metadata=metadata)), raw),
+                ("__delta_capability__", status),
+            ],
+        )
+        assert status.tolist() == [0, 1]
+        load_delta_weights(model, [(json.dumps(dict(op="finalize", version=version, frames=1)), torch.empty(0))])
+        reference.load_weights([("independent", val), ("cache", full)])
+        assert model.invocations == reference.invocations
+        assert torch.equal(model.raw.view(torch.int16), reference.raw.view(torch.int16))
+        assert torch.equal(model.derived, reference.derived) and torch.equal(model.cached, reference.cached)
+    assert model._relax_delta_receiver.target_shard_metrics["local_words"] == 1
+    model.epoch += 1
+    with pytest.raises(ValueError, match="acknowledged loader geometry"):
+        begin(model, "2", base="1")
+
+
+def test_overlapping_seed_writes_require_full_even_for_transient_dlpack_destination():
+    class Aliased(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+        def load_weights(self, items):
+            for name, tensor in items:
+                dst = self.weight if name == "first" else torch.from_dlpack(self.weight.detach())
+                dst.copy_(tensor)
+
+        load_weights.relax_copy_layout = lambda model: (1, frozenset({"first"}))
+
+    model = Aliased()
+    begin(model, "0", seed=True)
+    meta, raw = encode(
+        [(n, (4,), torch.float32, None, torch.full((4,), float(i))) for i, n in enumerate(("first", "alias"))],
+        max_bytes=1024,
+    )
+    ack = torch.empty(2, dtype=torch.uint8)
+    load_delta_weights(
+        model,
+        [(json.dumps(dict(op="consume", version="0", frame=0, metadata=meta)), raw), ("__delta_capability__", ack)],
+    )
+    load_delta_weights(
+        model,
+        [(json.dumps(dict(op="finalize", version="0", frames=1)), torch.empty(0)), ("__delta_capability__", ack[:1])],
+    )
+    assert ack[0] == 1 and torch.equal(model.weight, torch.ones(4))
+
+
+def test_declared_dispatcher_setup_cannot_redirect_a_seeded_write():
+    class Rebinding(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+            self.rebind = False
+
+        def load_weights(self, weights):
+            if self.rebind:
+                self.weight = torch.nn.Parameter(torch.zeros_like(self.weight), requires_grad=False)
+            for _, value in weights:
+                self.weight.copy_(value)
+
+        load_weights.relax_copy_layout = lambda model: (1, frozenset({"weight"}))
+
+    m = Rebinding()
+    begin(m, "0", seed=True)
+
+    def send(v, pos, values):
+        meta, raw = encode([("weight", (4,), torch.float32, pos, values)], max_bytes=1024)
+        ack = torch.empty(1, dtype=torch.uint8)
+        load_delta_weights(
+            m,
+            [(json.dumps(dict(op="consume", version=v, frame=0, metadata=meta)), raw), ("__delta_capability__", ack)],
+        )
+
+    send("0", None, torch.arange(4.0))
+    load_delta_weights(m, [(json.dumps(dict(op="finalize", version="0", frames=1)), torch.empty(0))])
+    old = m.weight
+    begin(m, "1", base="0")
+    m.rebind = True
+    with pytest.raises(ValueError, match="setup changed"):
+        send("1", torch.tensor([0], dtype=torch.int32), torch.tensor([17.0]))
+    assert m._relax_delta_receiver.failed and m._relax_delta_receiver.version == "0"
+    assert torch.equal(old, torch.arange(4.0)) and not m.weight.any()
+
+
+def test_declared_loader_that_materializes_iterator_keeps_unobserved_input_full():
+    class Buffered(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+        def load_weights(self, weights):
+            for _, value in list(weights):
+                self.weight.copy_(value)
+
+        load_weights.relax_copy_layout = lambda model: (1, frozenset({"weight"}))
+
+    model = Buffered()
+    begin(model, "0", seed=True)
+    expected = torch.arange(4.0)
+    directory, raw = encode([("weight", (4,), expected.dtype, None, expected)], max_bytes=1024)
+    status = torch.zeros(1, dtype=torch.uint8)
+    load_delta_weights(
+        model,
+        [
+            (json.dumps(dict(op="consume", version="0", frame=0, metadata=directory)), raw),
+            ("__delta_capability__", status),
+        ],
+    )
+    assert torch.equal(model.weight, expected)
+    assert status.tolist() == [1]

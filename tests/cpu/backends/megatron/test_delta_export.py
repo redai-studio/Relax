@@ -636,3 +636,77 @@ def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monk
         assert source._backup.storage is not prior
         source.abort()
         assert source._ack_bank is second_bank
+
+
+def _export_empty_pipeline_stage(rank, rendezvous):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    group = dist.group.WORLD
+
+    class PipelineIterator:
+        def get_hf_weight_chunks(self, shards):
+            values = shards["layer"].clone() if rank == 1 else torch.empty(8)
+            dist.broadcast(values, src=1, group=group)
+            yield [("model.layers.3.weight", values)]
+
+    try:
+        source = ShardDeltaExporter(
+            PipelineIterator(), PipelineIterator(), snapshot_budget_bytes=256, config=DeltaSyncConfig(stream="pp")
+        )
+        frames = []
+        source.transfer = SimpleNamespace(
+            connect=lambda *_args, **_kwargs: False,
+            begin=lambda **kwargs: None,
+            send=lambda directory, _raw, **_kwargs: frames.append(directory) or set(),
+            ordered_target_consume=False,
+            finalize=lambda: {"receivers": [{"force_full_seed": False}]},
+        )
+        model = {"layer": torch.zeros(8)} if rank == 1 else {}
+        args = dict(engines=[], gpu_counts=[], group=group)
+        for version in range(2):
+            if version and rank == 1:
+                model["layer"][2] = 2.5
+            status = source.synchronize(lambda: model, version=str(version), **args)
+            assert status["full"] is (version == 0)
+            source.commit()
+        if rank == 0:
+            full, delta = (frame["tensors"][0] for frame in frames)
+            assert full["full"] and not delta["full"] and delta["count"] == 1
+        if rank == 1:
+            model["extra"] = torch.zeros(1)
+        with pytest.raises(RuntimeError, match="Source shard schema changed"):
+            source.synchronize(lambda: model, version="2", **args)
+        assert source._version == "1" and source._pending is None
+    finally:
+        dist.destroy_process_group()
+
+
+def test_empty_pipeline_stage_participates_in_both_delta_conversions(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _export_empty_pipeline_stage, args=((tmp_path / "pp-ranks").as_uri(),), nprocs=2, start_method="fork"
+    )
+
+
+def test_requested_delta_admits_single_node_tp_pp_mesh(tmp_path):
+    from types import SimpleNamespace
+
+    from relax.backends.megatron.weight_update.delta_export import delta_sync_config
+    from relax.distributed.weight_sync.config import supports_delta_layout
+
+    settings = tmp_path / "delta.json"
+    settings.write_text('{"stream":"test"}')
+    args = SimpleNamespace(memory_weight_sync_config=settings, sglang_pp_size=2, rollout_num_gpus_per_engine=4)
+    assert delta_sync_config(args, None).stream == "test"
+    layout = dict(nnodes=1, pp_size=2, tp_size=2, dp_size=1)
+    assert supports_delta_layout(layout, 4)
+    assert not supports_delta_layout(layout, 2)
+    for changed in [dict(nnodes=2), dict(dp_size=2), dict(pp_size=0), dict(tp_size=False), dict(tp_size=None)]:
+        assert not supports_delta_layout(dict(layout, **changed), 4)

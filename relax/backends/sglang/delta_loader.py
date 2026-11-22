@@ -14,8 +14,10 @@ import base64
 import hashlib
 import json
 import math
+import sys
 import zlib
 from collections.abc import Iterable
+from itertools import chain
 from typing import Any
 
 import torch
@@ -26,8 +28,10 @@ from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, tensors, validat
 from relax.utils.logging_utils import get_logger
 from relax.utils.sparse_tensor import FullTensorRequired, SparseTensor, storage_identity
 
-from .delta_capability import full_loader_inputs, requires_full_input, sparse_loader_identity
-from .delta_shard_layout import ExpertTargets, ShardFrame, marked_ordinals, validate_transport_storage
+from .delta_capability import declared_copy_layout, full_loader_inputs, requires_full_input, sparse_loader_identity
+from .delta_model_loaders import stock_rank_skips_input
+from .delta_shard_layout import BroadcastTargets, ShardFrame, marked_ordinals, validate_transport_storage
+from .delta_target_lane import ExpertTargets
 
 
 logger = get_logger(__name__)
@@ -68,19 +72,12 @@ def _decode_directory(compressed: bytes, size: int, identity: str) -> Any:
 
 
 def _model_storage(model: Any) -> frozenset[tuple[str, int]]:
-    return frozenset(storage_identity(tensor) for tensor in (*model.parameters(), *model.buffers()))
-
-
-def _model_signature(model: Any) -> tuple:
-    result = []
-    for name, tensor in (
-        *model.named_parameters(remove_duplicate=False),
-        *model.named_buffers(remove_duplicate=False),
-    ):
+    destinations = set()
+    for tensor in chain(model.parameters(), model.buffers()):
         if isinstance(tensor, SparseTensor):
             raise FullTensorRequired("The ordinary loader retained a sparse input as live model state")
-        result.append((name, tuple(tensor.shape), tensor.dtype, tuple(tensor.stride()), storage_identity(tensor)))
-    return tuple(result)
+        destinations.add(storage_identity(tensor))
+    return frozenset(destinations)
 
 
 class _ImmutableInputs(TorchFunctionMode):
@@ -138,7 +135,9 @@ class DeltaReceiver:
         self.capability: tuple | None = None
         self.destinations = _model_storage(model)
         self._target_plan: ExpertTargets | None = None
-        self._broadcast_plan: ExpertTargets | None = None
+        self._broadcast_plan: BroadcastTargets | None = None
+        self._capture: BroadcastTargets | None = None
+        self._declared: tuple | None = None
         self._seed_directory: tuple = ()
         self.target_shard_metrics: dict | None = None
 
@@ -157,6 +156,7 @@ class DeltaReceiver:
             raise ValueError("Invalid target shard request binding")
         if control["seed"]:
             self._broadcast_plan = None
+            self.full_only.clear()
         if control["seed"] or not requested:
             self._target_plan = None
             self._seed_directory = ()
@@ -169,6 +169,8 @@ class DeltaReceiver:
         if not control["seed"] and destinations != self.destinations and capability is not None:
             raise ValueError("Reallocated sparse model storage requires a new FULL seed")
         self.capability = capability
+        self._declared = declared_copy_layout(self.model)
+        self._capture = BroadcastTargets(self.model) if control["seed"] and capability is not None else None
         if capability is not None:
             self.full_only.update(full_loader_inputs(self.model))
         self.destinations = destinations
@@ -197,6 +199,7 @@ class DeltaReceiver:
                 wire_bytes=0,
                 tiles=0,
                 scatter_launches=0,
+                local_words=0,
             )
 
     def _workspace_key(self, metadata: dict, local: frozenset = frozenset()) -> tuple:
@@ -270,7 +273,7 @@ class DeltaReceiver:
             48 * ((metadata["tensors"][i]["count"] + ShardFrame.BLOCK - 1) // ShardFrame.BLOCK) for i in local
         )
         required = max(
-            decode_peak + tile_bytes + (4 if local else 0),
+            decode_peak + ((tile_bytes + 511) // 512 * 512 + 1024 if local and raw.is_cuda else tile_bytes),
             self.workspace_peaks.get(self._workspace_key(metadata, local), 0) + indices,
         )
         # Proxy-owned resident staging and SG-owned workspace are distinct
@@ -289,7 +292,10 @@ class DeltaReceiver:
             shape = tuple(entry["shape"])
             if positions is None:
                 value = values.clone().view(shape)
-                yield entry["name"], value
+                if self._capture is not None:
+                    yield from self._capture.observe(entry["name"], value)
+                else:
+                    yield entry["name"], value
                 continue
             if values.dtype not in (torch.bfloat16, torch.float32):
                 raise FullTensorRequired("This storage dtype requires FULL loader input")
@@ -327,8 +333,7 @@ class DeltaReceiver:
             or status.numel() != sum(len(frame) for frame in frames)
         ):
             raise ValueError("Invalid ordered target payload or capability storage")
-        # A pure target run invokes no Python model loader or buffer hook.
-        # Check its complete IPC ranges and model bindings once at this boundary.
+        # Validate every frame before the first loader invocation or sparse write.
         self._target_plan.check(self, raw, status)
         if sparse_loader_identity(self.model) != self.capability:
             raise FullTensorRequired("Receiver loader geometry changed before ordered installation")
@@ -395,9 +400,9 @@ class DeltaReceiver:
             raise ValueError("Ordered target directory did not cover its IPC arena span")
         if invalid and bool(torch.stack(invalid).any().cpu()):
             raise ValueError("Ordered sparse coordinates must be sorted, unique and in bounds")
-        for shard in pending:
-            for _, batch in shard.runs:
-                shard.scatter(batch)
+        with _ImmutableInputs():
+            for shard in pending:
+                self._load_group(shard.runs, shard, raw, status, recheck=True)
         status.zero_()
         if raw.is_cuda:
             torch.cuda.synchronize(raw.device)
@@ -462,6 +467,7 @@ class DeltaReceiver:
         else:
             raise ValueError("Delta frame lacks its complete metadata document")
         local = frozenset()
+        lane_ordinals = None
         plan = None
         if isinstance(metadata, dict) and "target_shard" in metadata:
             if (
@@ -475,20 +481,33 @@ class DeltaReceiver:
             if "loader_ends" in metadata:
                 raise ValueError("A target-lane frame cannot contain packed ordinary groups")
             plan = self._target_plan
-            local = frozenset(marked_ordinals(marker, plan.rank, len(metadata["tensors"])))
-        elif self._broadcast_plan is not None and not self.active["control"].get("target_shard_request"):
+            lane_ordinals = frozenset(marked_ordinals(marker, plan.rank, len(metadata["tensors"])))
+            local = lane_ordinals
+            # Declared loaders accept sparse data only through observed copies.
+            # Unmarked slots in a mixed lane keep their original HF coordinates.
+            if self._declared is not None:
+                local = local.union(
+                    i
+                    for i, entry in enumerate(metadata["tensors"])
+                    if not entry["full"] and entry["name"] in plan.bindings.targets
+                )
+        elif self._broadcast_plan is not None:
             validate_directory(metadata, max_bytes=raw.numel())
             plan = self._broadcast_plan
             local = frozenset(
                 i for i, entry in enumerate(metadata["tensors"]) if not entry["full"] and entry["name"] in plan.targets
             )
             if local and (not plan.current(self, raw, status) or not status.is_contiguous()):
+                if self._declared is not None:
+                    raise FullTensorRequired("Declared copy layout changed before installation")
                 self._broadcast_plan, plan, local = None, None, frozenset()
         if pending is None:
             self._admit(metadata, raw, local, ipc_directory_bytes)
         entries = list(tensors(metadata, raw))
         if status.dtype != torch.uint8 or status.shape != (len(entries),) or status.device != raw.device:
             raise ValueError("Delta capability output must have one byte per input tensor on the same device")
+        if pending is None and not ipc_directory_bytes and not (local and plan.broadcast):
+            validate_transport_storage(self.model, (raw, status))
         if storage_identity(status) == storage_identity(raw) or storage_identity(status) in self.destinations:
             raise ValueError("Capability output cannot alias immutable payloads or model storage")
         invalid_positions = []
@@ -498,14 +517,18 @@ class DeltaReceiver:
                 raise ValueError("Target shard capability output must be contiguous")
             if pending is None and not plan.broadcast:
                 plan.check(self, raw, status)
-            shard = ShardFrame(plan, local, entries, raw, metadata.get("loader_ends"))
+            shard = ShardFrame(plan, local, entries, raw, metadata.get("loader_ends"), lane_ordinals=lane_ordinals)
             invalid = shard.invalid_positions()
             if invalid is not None:
                 invalid_positions.append(invalid)
         for i, (entry, positions, _values) in enumerate(entries):
             if entry["name"] in self.active["schema"]:
                 raise ValueError("Duplicate HF input across delta frames")
-            if self.active["control"]["seed"] and requires_full_input(self.model, entry["name"]):
+            if self.active["control"]["seed"] and (
+                entry["name"] not in self._declared[-1]
+                if self._declared is not None
+                else requires_full_input(self.model, entry["name"])
+            ):
                 self.full_only.add(entry["name"])
             if self.active["control"]["seed"] and not entry["full"]:
                 raise ValueError("A FULL seed cannot contain omitted values")
@@ -526,7 +549,7 @@ class DeltaReceiver:
                 raise ValueError("Only pure target frames may defer their install fence")
             pending[0].append(shard)
             pending[1].extend(invalid_positions)
-            self._record_shard(shard, local, entries)
+            self._record_shard(shard, lane_ordinals if lane_ordinals is not None else local, entries)
             self.active["next_frame"] += 1
             return
         if invalid_positions and bool(torch.stack(invalid_positions).any().cpu()):
@@ -536,6 +559,10 @@ class DeltaReceiver:
             raise FullTensorRequired("Receiver loader/layout capability changed before sparse installation")
         full_group = all(entry["full"] for entry, _, _ in entries)
         full_required = self.capability is None
+        if self._declared is not None and any(
+            not entry["full"] and i not in local for i, (entry, _, _) in enumerate(entries)
+        ):
+            raise FullTensorRequired("Sparse input has no acknowledged copy region")
         if not full_group and full_required:
             raise FullTensorRequired("Unknown receiver loader requires complete ordinary FULL inputs")
         allocated_before = None
@@ -549,42 +576,33 @@ class DeltaReceiver:
         # is established from reviewed code/layout, never by running speculative
         # writes or replaying unknown Python side effects on the live model.
         with _ImmutableInputs():
-            if shard is not None and not plan.broadcast and len(local) == len(entries):
-                for _, batch in shard.runs:
-                    shard.scatter(batch)
-            else:
-                # The Qwen3.5 loader wraps each original invocation in model-owned
-                # setup/teardown (including LazyValue), even for pure direct runs.
-                start = 0
-                ordinary_ran = False
-                for group, end in enumerate(metadata.get("loader_ends", [len(entries)])):
-                    if ordinary_ran:
-                        if sparse_loader_identity(self.model) != self.capability:
-                            raise FullTensorRequired("Ordinary loader capability changed between packed groups")
-                        _model_signature(self.model)
-                        self.destinations = _model_storage(self.model)
-                    runs = shard.group_runs[group] if shard is not None else [(False, entries[start:end])]
+            # Keep model-owned setup/teardown at every original invocation.
+            start = 0
+            ordinary_ran = False
+            for group, end in enumerate(metadata.get("loader_ends", [len(entries)])):
+                if ordinary_ran:
+                    if sparse_loader_identity(self.model) != self.capability:
+                        raise FullTensorRequired("Ordinary loader capability changed between packed groups")
+                    self.destinations = _model_storage(self.model)
+                runs = shard.group_runs[group] if shard is not None else [(False, entries[start:end])]
 
-                    def ordered_weights(runs: list = runs):
-                        nonlocal ordinary_ran
-                        for direct, batch in runs:
-                            if direct:
-                                if ordinary_ran and (
-                                    not plan.current(self, raw, status)
-                                    or sparse_loader_identity(self.model) != self.capability
-                                ):
-                                    raise FullTensorRequired("Ordinary loader changed the admitted expert storage")
-                                shard.scatter(batch)
-                                ordinary_ran = False
-                            else:
-                                yield from self._decoded_weights(batch)
-                                ordinary_ran = True
-
-                    self.model.load_weights(ordered_weights())
-                    ordinary_ran = any(not direct for direct, _ in runs)
-                    start = end
-        _model_signature(self.model)
+                self._load_group(runs, shard, raw, status, recheck=ordinary_ran)
+                ordinary_ran = any(not direct for direct, _ in runs)
+                start = end
         self.destinations = _model_storage(self.model)
+        if self._capture is not None:
+            for entry, _, _ in entries:
+                name = entry["name"]
+                # A loader can consume the iterator into a list, then write
+                # later in the same call. Only a known off-stage input can
+                # turn an unobserved copy into an acknowledged local no-op.
+                if name in self.full_only or (
+                    self._capture.targets.get(name) is None
+                    and (self._declared is not None or not stock_rank_skips_input(self.model, name))
+                ):
+                    self._capture.targets.pop(name, None)
+                    if self._declared is not None:
+                        self.full_only.add(name)
         if full_required:
             self.full_only.update(entry["name"] for entry, _, _ in entries)
         required = [full_required or entry["name"] in self.full_only for entry, _, _ in entries]
@@ -604,7 +622,7 @@ class DeltaReceiver:
             ):
                 raise ValueError("Measured receiver workspace plus proxy staging exceeds its GPU budget")
         if shard is not None:
-            self._record_shard(shard, local, entries)
+            self._record_shard(shard, lane_ordinals if lane_ordinals is not None else local, entries)
         if self.target_shard_metrics is not None and self.target_shard_metrics.get("mode") == "broadcast_hf":
             self.target_shard_metrics["nonempty_entries"] += sum(entries[i][0]["count"] > 0 for i in local)
             self.target_shard_metrics["ordinary_entries"] += len(entries) - len(local)
@@ -612,15 +630,48 @@ class DeltaReceiver:
         self.active["next_frame"] += 1
         self.document = None
 
+    def _load_group(
+        self, runs: list, shard: ShardFrame | None, raw: torch.Tensor, status: torch.Tensor, *, recheck: bool
+    ) -> None:
+        pending = sum(direct for direct, _ in runs)
+
+        def weights():
+            nonlocal recheck, pending
+            for direct, batch in runs:
+                if direct:
+                    plan = shard.plan
+                    plan.check_run(self.model, batch)
+                    if (recheck or self._declared is not None) and (
+                        not plan.current(self, raw, status) or sparse_loader_identity(self.model) != self.capability
+                    ):
+                        raise FullTensorRequired("Ordinary loader changed the admitted destination")
+                    shard.scatter(batch)
+                    pending -= 1
+                    recheck = False
+                else:
+                    yield from self._decoded_weights(batch)
+                    recheck = True
+
+        self.model.load_weights(weights())
+        if pending:
+            raise FullTensorRequired("Ordinary loader did not consume every admitted scatter")
+
     def _record_shard(self, shard: ShardFrame, local: frozenset, entries: list) -> None:
         m = self.target_shard_metrics
+        if shard.plan.broadcast:
+            if m.get("mode") != "broadcast_hf":
+                return  # A negotiated lane connection may still deliver an ordinary HF frame.
+            m["local_words"] += shard.local_words
         m["frames"] += 1
         m["entries"] += len(local)
         m["wire_bytes"] += shard.raw.numel()
         m["words"] += sum(entries[i][0]["count"] for i in local)
         m["tiles"] += 0 if shard.table is None else shard.table.shape[0]
         m["scatter_launches"] += sum(
-            first != end for direct, batch in shard.runs if direct for _, first, end, _ in batch
+            first != end and (not shard.plan.broadcast or key[0] is not None)
+            for direct, batch in shard.runs
+            if direct
+            for key, first, end, _ in batch
         )
 
     def finalize(self, control: dict) -> None:
@@ -645,8 +696,13 @@ class DeltaReceiver:
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
         self.schema = schema
-        if self.active["control"]["seed"] and not self.active["control"].get("target_shard_request"):
-            self._broadcast_plan = ExpertTargets.build(self, broadcast=True)
+        if self.active["control"]["seed"]:
+            if self._capture is not None and self._capture.seal(self) and not self.force_full_seed:
+                self._broadcast_plan = self._capture
+            elif self._declared is not None or (self._capture and self._capture.conflicts - self.full_only):
+                self.force_full_seed = True
+                self.full_only.update(schema)
+            self._capture = None
         if self.active["control"].get("target_shard_request"):
             if self.active["control"]["seed"]:
                 self._target_plan = ExpertTargets.build(self)
@@ -660,11 +716,16 @@ class DeltaReceiver:
             ):
                 self._target_plan = None
         if self.target_shard_metrics is not None and self.target_shard_metrics.get("mode") == "broadcast_hf":
+            if isinstance(self.target_shard_metrics["local_words"], torch.Tensor):
+                self.target_shard_metrics["local_words"] = int(self.target_shard_metrics["local_words"].cpu())
+            runtime = sys.modules.get("sglang.srt.runtime_context")
+            parallel = runtime.get_parallel() if runtime is not None and hasattr(runtime, "get_parallel") else None
             logger.info(
-                "Broadcast delta receiver version=%s seed=%s tp_rank=%s metrics=%s",
+                "Broadcast delta receiver version=%s seed=%s tp_rank=%s pp_rank=%s metrics=%s",
                 self.active["control"]["version"],
                 self.active["control"]["seed"],
-                self._broadcast_plan.rank if self._broadcast_plan is not None else None,
+                getattr(parallel, "tp_rank", None),
+                getattr(parallel, "pp_rank", None),
                 self.target_shard_metrics,
             )
         self.version = self.active["control"]["version"]
@@ -702,16 +763,14 @@ def load_delta_weights(model: Any, weights: Iterable[tuple[str, torch.Tensor]]) 
                     or status.numel() != (2 if requested else 1)
                 ):
                     raise ValueError("Invalid final receiver capability output")
-                if requested and (
-                    status.shape != (2,)
+                if (
+                    type(status) is not torch.Tensor
+                    or status.shape != ((2,) if requested else (1,))
                     or not status.is_contiguous()
                     or status.device != next(model.parameters()).device
-                    or storage_identity(status) in receiver.destinations
                 ):
-                    raise ValueError("Invalid target shard status storage")
-                if requested or receiver._broadcast_plan is not None:
-                    # Final status may be a fresh StorageImpl wrapping live bytes.
-                    validate_transport_storage(model, (weights[0][1], status))
+                    raise ValueError("Invalid final receiver status storage")
+                validate_transport_storage(model, (weights[0][1], status))
             receiver.finalize(control)
             if len(weights) == 2:
                 if requested:

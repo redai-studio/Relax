@@ -19,7 +19,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from relax.distributed.weight_sync.config import RETAINED_DIRECTORY_BYTES, DeltaSyncConfig
+from relax.distributed.weight_sync.config import RETAINED_DIRECTORY_BYTES, DeltaSyncConfig, supports_delta_layout
 from relax.utils.logging_utils import get_logger
 
 from . import target_shard
@@ -50,13 +50,12 @@ def delta_sync_config(args: Any, quantization_config: Any) -> DeltaSyncConfig | 
         or getattr(args, "sglang_speculative_algorithm", None)
         or getattr(args, "mtp_num_layers", 0)
         or getattr(args, "rollout_external", False)
-        or getattr(args, "sglang_pp_size", 1) != 1
         or getattr(args, "sglang_dp_size", 1) != 1
         or getattr(args, "rollout_num_gpus_per_engine", 1) > getattr(args, "num_gpus_per_node", 8)
     )
     if incompatible:
         logger.info(
-            "Delta export retains original FULL for quantized, adapter, draft or external/inference-PP/DP state"
+            "Delta export retains original FULL for quantized, adapter, draft or external/multinode/inference-DP state"
         )
         return None
     return config
@@ -198,11 +197,7 @@ class ShardDeltaExporter:
                 layouts = ray.get([engine.get_delta_weight_sync_layout.remote() for engine in engines], timeout=60)
                 result[0] = (
                     all(
-                        layout["nnodes"] == 1
-                        and layout["pp_size"] == 1
-                        and layout["dp_size"] == 1
-                        and layout["tp_size"] == count
-                        for layout, count in zip(layouts, gpu_counts, strict=True)
+                        supports_delta_layout(layout, count) for layout, count in zip(layouts, gpu_counts, strict=True)
                     ),
                     None,
                 )
@@ -359,6 +354,8 @@ class ShardDeltaExporter:
             if error is None:
                 try:
                     self.begin(shards, live_locked=live)
+                    if self._force_full and not seed:
+                        raise ValueError("Source shard schema changed during an acknowledged delta stream")
                 except Exception as exc:
                     error = exc
             agree(error)
@@ -596,7 +593,7 @@ class ShardDeltaExporter:
         self._attempt = object()
         self._stream = None
         self._exported = False
-        if self._acknowledged and self._schema(self._pending) != self._schema(self._acknowledged):
+        if not self._force_full and self._schema(self._pending) != self._schema(self._acknowledged):
             self._force_full = True
 
     @staticmethod
@@ -626,7 +623,8 @@ class ShardDeltaExporter:
     ) -> Iterator[list[DeltaWeight]]:
         if self._attempt is not attempt:
             raise RuntimeError("The delta export attempt is no longer active")
-        full = full or self._force_full or not self._acknowledged
+        # An empty PP stage still participates in current and baseline collectives.
+        full = full or self._force_full
         payload_group = None
         owner_diff = self._target_shards or self._owner_local_diff or self.sender_pipeline_active
         if owner_diff and not full and metadata_group is not None:

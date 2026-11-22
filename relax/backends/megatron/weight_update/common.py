@@ -4,6 +4,7 @@ import inspect
 import re
 from argparse import Namespace
 from collections.abc import Iterator, Mapping, Sequence
+from itertools import chain
 
 import torch
 import torch.distributed as dist
@@ -36,7 +37,20 @@ def gdn_component_sizes(config, tp_size: int, name: str) -> tuple[int, ...] | No
     return (qk, qk, value) if "conv1d" in name else (qk, qk, value, value, heads, heads)
 
 
-def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
+def fc1_gating_by_parameter(model: Sequence[torch.nn.Module]) -> dict[int, bool]:
+    """Read each MLP's actual FC1 layout once, before exchanging PP/EP
+    metadata."""
+    layouts = {}
+    for chunk in model:
+        for module in chunk.modules():
+            fc1 = getattr(module, "linear_fc1", None)
+            gated = getattr(getattr(module, "config", None), "gated_linear_unit", None)
+            if isinstance(fc1, torch.nn.Module) and type(gated) is bool:
+                layouts.update((id(param), gated) for param in fc1.parameters())
+    return layouts
+
+
+def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None, gated_fc1=None):
     if split_sizes is not None:
         # At TP=1 the gathered tensor already has every GDN component in order.
         if len(partitions) == 1:
@@ -44,7 +58,11 @@ def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
         assert partition_dim == 0, "GDN components must be sharded along rows"
         components = [part.split(split_sizes, dim=0) for part in partitions]
         return torch.cat([parts[index] for index in range(len(split_sizes)) for parts in components], dim=0)
-    if "linear_fc1.weight" in name and "vision_model" not in name:
+    # A nongated MLP partitions one projection. A gated FC1 partitions
+    # each half separately, including its bias when present.
+    if gated_fc1 is None:
+        gated_fc1 = "linear_fc1.weight" in name
+    if gated_fc1 and "vision_model" not in name and re.search(r"(?:^|\.)linear_fc1\.(?:weight|bias)\d*$", name):
         components = [part.chunk(2, dim=0) for part in partitions]
         partitions = [part[0] for part in components] + [part[1] for part in components]
         if is_npu_available:
@@ -75,16 +93,23 @@ def _gather_tp_weights(named_params, *, split_sizes, async_op):
             size, group = mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()
         if "linear_fc1" not in name:
             assert getattr(param, "partition_stride", 1) == 1, f"Unsupported partition stride for {name}"
+        if size == 1:
+            # TP1/ETP1 already holds the complete tensor. Preserve the gather's
+            # independent storage for converters that mutate their input.
+            tasks.append((name, param.detach().clone(memory_format=torch.contiguous_format), None, None))
+            continue
         partitions = [torch.empty_like(param.data) for _ in range(size)]
         handle = dist.all_gather(partitions, param.data, group=group, async_op=async_op)
         if handle is not None:
             handles.append(handle)
-        tasks.append((name, None, partitions, param.partition_dim))
+        tasks.append((name, param, partitions, param.partition_dim))
     # All async collectives launch before any wait. Results remain in input order.
     for handle in handles:
         handle.wait()
     return [
-        direct if partitions is None else _restore_tp_weight(name, partitions, dim, split_sizes.get(name))
+        direct
+        if partitions is None
+        else _restore_tp_weight(name, partitions, dim, split_sizes.get(name), getattr(direct, "gated_fc1", None))
         for name, direct, partitions, dim in tasks
     ]
 
@@ -203,8 +228,7 @@ def _named_params_and_buffers_global(
     """
     ep_size = mpu.get_expert_model_parallel_world_size()
     ep_rank = mpu.get_expert_model_parallel_rank()
-    if args.num_experts:
-        expert_offset = ep_rank * args.num_experts // ep_size
+    expert_offset = ep_rank * (args.num_experts or 0) // ep_size
 
     sig = inspect.signature(get_transformer_layer_offset)
     need_vp_stage = "vp_stage" in sig.parameters
@@ -214,81 +238,29 @@ def _named_params_and_buffers_global(
             layer_offset = get_transformer_layer_offset(model_module.config, vp_stage)
         else:
             layer_offset = get_transformer_layer_offset(model_module.config)
-        for name, param in model_module.named_parameters():
-            # for model without ddp wrap
-            if not name.startswith("module.module."):
-                name = "module." + name
-
-            decoder_layers_pattern = r"module\.module\.(?:(.*)\.)?decoder\.layers\.(\d+)\.(.+)"
-            match = re.match(decoder_layers_pattern, name)
-            if not match:
-                # MTP (Multi-Token Prediction) layers for speculative decoding
-                mtp_layers_pattern = r"module\.module\.(?:(.*)\.)?mtp\.layers\.(\d+)\.(.+)"
-                match = re.match(mtp_layers_pattern, name)
-                if not match:
-                    yield name, param
-                    continue
-
-                # MTP layer indices start from 0
-                middle_path, layer_idx, rest = match.groups()
-                # GPT MTP uses transformer_layer; hybrid MTP (e.g. Qwen3.8)
-                # nests its transformer layer inside mtp_model_layer.layers.
-                expert_pattern = (
-                    r"((?:transformer_layer|mtp_model_layer\.layers\.\d+)\.mlp\.experts\..+)\.weight(\d+)$"
+        for name, tensor in chain(
+            model_module.named_parameters(), _named_buffers_for_weight_update(model_module, include_persistent_buffers)
+        ):
+            # Both raw converters and Bridge accept the canonical DDP prefix.
+            # Bare modules and nested wrappers must resolve to the same global slot.
+            name = "module.module." + strip_param_name_prefix(name)
+            decoder = re.match(r"(.+?\.decoder\.layers\.)(\d+)(\..+)$", name)
+            if decoder:
+                prefix, local_layer, tail = decoder.groups()
+                name = f"{prefix}{int(local_layer) + layer_offset}{tail}"
+            if expert_offset and ".mlp.experts." in name:
+                # MTP layers keep their own layer numbering. Their experts, like
+                # decoder experts, use the global EP index in Bridge's registry.
+                name = re.sub(
+                    r"(\.mlp\.experts\.local_experts\.)(\d+)(?=\.)",
+                    lambda match: match[1] + str(int(match[2]) + expert_offset),
+                    name,
+                    count=1,
                 )
-                match = re.match(expert_pattern, rest)
-                if not match:
-                    yield name, param
-                    continue
-
-                rest, expert_idx = match.groups()
-                expert_idx = int(expert_idx) + expert_offset
-                if middle_path is None:
-                    middle_path = ""
-                else:
-                    middle_path += "."
-                yield (
-                    f"module.module.{middle_path}mtp.layers.{layer_idx}.{rest}.weight{expert_idx}",
-                    param,
+                name = re.sub(
+                    r"(\.mlp\.experts\.(?!local_experts\.).+?\.(?:weight|bias))(\d+)(?=$|\.)",
+                    lambda match: match[1] + str(int(match[2]) + expert_offset),
+                    name,
+                    count=1,
                 )
-                continue
-
-            middle_path, layer_idx, rest = match.groups()
-            if middle_path is None:
-                middle_path = ""
-            else:
-                middle_path += "."
-            layer_idx = int(layer_idx) + layer_offset
-
-            # this is hardcoded for te grouped matmul
-            expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
-            match = re.match(expert_pattern, rest)
-            if match:
-                rest, expert_idx = match.groups()
-                expert_idx = int(expert_idx) + expert_offset
-                yield (
-                    f"module.module.{middle_path}decoder.layers.{layer_idx}.mlp.experts.{rest}.weight{expert_idx}",
-                    param,
-                )
-            else:
-                yield f"module.module.{middle_path}decoder.layers.{layer_idx}.{rest}", param
-
-        # Treat selected model-state buffers needed by rollout as normal parameters.
-        for name, buffer in _named_buffers_for_weight_update(model_module, include_persistent_buffers):
-            # for model without ddp wrap
-            if not name.startswith("module.module."):
-                name = "module." + name
-
-            decoder_layers_pattern = r"module\.module\.(?:(.*)\.)?decoder\.layers\.(\d+)\.(.+)"
-
-            match = re.match(decoder_layers_pattern, name)
-            if not match:
-                yield name, buffer
-            else:
-                middle_path, layer_idx, rest = match.groups()
-                if middle_path is None:
-                    middle_path = ""
-                else:
-                    middle_path += "."
-                layer_idx = int(layer_idx) + layer_offset
-                yield f"module.module.{middle_path}decoder.layers.{layer_idx}.{rest}", buffer
+            yield name, tensor

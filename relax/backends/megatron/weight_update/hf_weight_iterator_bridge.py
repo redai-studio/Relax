@@ -31,7 +31,13 @@ from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
-from .common import all_gather_param, all_gather_params_async, gdn_component_sizes, named_params_and_buffers
+from .common import (
+    all_gather_param,
+    all_gather_params_async,
+    fc1_gating_by_parameter,
+    gdn_component_sizes,
+    named_params_and_buffers,
+)
 from .expert_gather import (
     Bf16ExpertGather,
     PackedExpertGather,
@@ -739,6 +745,7 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
     vanilla_iter = named_params_and_buffers(args, model, convert_to_global_name=False, include_persistent_buffers=True)
     global_iter = named_params_and_buffers(args, model, convert_to_global_name=True, include_persistent_buffers=True)
 
+    fc1_gating = fc1_gating_by_parameter(model)
     local_infos = {}
     vanilla_key_map = {}
     adapter_map: dict[str, dict[str, str]] = {}
@@ -767,6 +774,8 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
             size=v_param.numel() * v_param.element_size(),
             src_rank=rank,
         )
+        if id(v_param) in fc1_gating:
+            local_infos[g_name].attrs["gated_fc1"] = fc1_gating[id(v_param)]
         vanilla_key_map[g_name] = v_name
 
     # Exchange across PP so every rank has all PP stages' param infos.

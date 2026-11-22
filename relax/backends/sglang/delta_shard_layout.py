@@ -4,101 +4,22 @@
 
 from __future__ import annotations
 
-import hashlib
-import inspect
-import sys
-from functools import lru_cache
+import math
+from bisect import bisect_right
+from dataclasses import dataclass
 from itertools import chain
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
 from relax.utils.sparse_tensor import storage_identity
 
 
-@lru_cache(maxsize=4)
-def _reviewed(codes: tuple, broadcast: bool) -> bool:
-    # Hash the live code objects, including the actual Qwen dispatcher and
-    # all reachable ordinary expert loader helpers, against native SGLang.
-    try:
-        digest = hashlib.sha256()
-        for code in codes:
-            digest.update(inspect.getsource(code).encode())
-        expected = (
-            "c860b97a950c35e3f9d66d2ceba578f3558f6b4e6adfba6e6504f040ccd60544"
-            if broadcast
-            else "b762ab721b208ea30d9bf23bb8759de5a2f78cbfa7171a589f9b537357b51ac0"
-        )
-        return digest.hexdigest() == expected
-    except (OSError, TypeError):
-        return False
-
-
-def _runtime(model: Any, broadcast: bool = False) -> tuple | None:
-    qwen = sys.modules.get("sglang.srt.models.qwen3_5" if broadcast else "sglang.srt.models.qwen3_moe")
-    cls = getattr(qwen, "Qwen3_5MoeForConditionalGeneration" if broadcast else "Qwen3MoeForCausalLM", None)
-    if type(model) is not cls:
-        return None
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-
-    runtime = sys.modules.get("sglang.srt.runtime_context")
-    location = sys.modules.get("sglang.srt.eplb.expert_location")
-    try:
-        parallel = runtime.get_parallel()
-        functions = (
-            model.load_weights.__func__,
-            FusedMoE.make_expert_params_mapping.__func__,
-            *(
-                getattr(FusedMoE, name)
-                for name in (
-                    "weight_loader",
-                    "_weight_loader_physical",
-                    "_weight_loader_impl",
-                    "_map_global_expert_id_to_local_expert_id",
-                    "_maybe_load_fp8_shared_expert_as_fp4",
-                    "_load_gguf_weight",
-                    "_load_model_weight_or_group_weight_scale",
-                    "_load_w13",
-                    "_load_w2",
-                )
-            ),
-            UnquantizedFusedMoEMethod.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load,
-            UnquantizedFusedMoEMethod.load_up_proj_weight_first.fget,
-            location.ExpertLocationMetadata.logical_to_all_physical,
-        )
-        if broadcast:
-            mapper = qwen.QWEN3_5_KV_SCALE_MAPPER
-            if (
-                type(mapper) is not qwen.WeightsMapper
-                or vars(mapper).keys() != {"orig_to_new_prefix", "orig_to_new_substr", "orig_to_new_suffix"}
-                or mapper.orig_to_new_prefix
-                or mapper.orig_to_new_suffix
-                or mapper.orig_to_new_substr
-                != {
-                    ".self_attn.k_proj.k_scale": ".attn.k_scale",
-                    ".self_attn.v_proj.v_scale": ".attn.v_scale",
-                    ".self_attn.k_scale": ".attn.k_scale",
-                    ".self_attn.v_scale": ".attn.v_scale",
-                }
-            ):
-                return None
-            functions += (mapper.apply, mapper._map_name)
-        tp = 2 if broadcast else 4
-        lazy_attr = "_routed_experts_weights_of_layer" if broadcast else "routed_experts_weights_of_layer"
-        if (
-            not _reviewed(tuple(f.__code__ for f in functions), broadcast)
-            or model.named_parameters.__func__ is not torch.nn.Module.named_parameters
-            or type(vars(model).get(lazy_attr)) is not qwen.LazyValue
-            or (parallel.tp_size, parallel.dp_size, parallel.pp_size, parallel.moe_ep_size, parallel.moe_tp_size)
-            != (tp, 1, 1, 1, tp)
-            or not 0 <= parallel.tp_rank == parallel.moe_tp_rank < tp
-        ):
-            return None
-        return parallel.tp_rank, FusedMoE, UnquantizedFusedMoEMethod
-    except (AttributeError, RuntimeError, TypeError):
-        return None
+if TYPE_CHECKING:
+    from .delta_target_lane import ExpertTargets
 
 
 def marked_ordinals(marker: dict, rank: int, count: int) -> list[int]:
@@ -119,149 +40,6 @@ def marked_ordinals(marker: dict, rank: int, count: int) -> list[int]:
     ):
         raise ValueError("Invalid target shard entry ordinals")
     return ordinals
-
-
-def _parameter(module: Any, name: str, shape: tuple, fused: type) -> torch.Tensor | None:
-    value = getattr(module, name, None)
-    if (
-        type(value) is not torch.nn.Parameter
-        or value.dtype != torch.bfloat16
-        or tuple(value.shape) != shape
-        or not value.is_contiguous()
-        or value.storage_offset()
-        or value.untyped_storage().nbytes() != value.numel() * 2
-        or value.is_neg()
-        or any(
-            getattr(value, flag, False)
-            for flag in ("is_transposed", "weight_padded", "_sglang_require_global_experts")
-        )
-        or getattr(getattr(value, "weight_loader", None), "__func__", None) is not fused.weight_loader
-        or getattr(value.weight_loader, "__self__", None) is not module
-    ):
-        return None
-    return value
-
-
-def _layer(model: Any, layer: int, rank: int, fused: type, method: type, geometry: tuple, tp: int) -> tuple | None:
-    experts, hidden, local = geometry
-    module = model.model.layers[layer].mlp.experts
-    if type(module) is not fused or type(module.quant_method) is not method:
-        return None
-    if (
-        (
-            module.layer_id,
-            module.moe_ep_size,
-            module.moe_ep_rank,
-            module._expert_storage_rank,
-            module.moe_tp_size,
-            module.moe_tp_rank,
-        )
-        != (layer, 1, 0, 0, tp, rank)
-        or (module._num_local_routed, module._num_global_routed, module.num_local_experts)
-        != (experts, experts, experts)
-        or module.intermediate_size_per_partition != local
-        or module.num_fused_shared_experts != 0
-        or module.moe_runner_config.is_gated is not True
-        or any(
-            getattr(module, flag, None) is not False
-            for flag in (
-                "_has_fused_shared",
-                "use_presharded_weights",
-                "use_padded_loading",
-                "use_flashinfer_trtllm_moe",
-                "use_triton_kernels",
-            )
-        )
-        or module.quant_method.load_up_proj_weight_first is not False
-    ):
-        return None
-    w13 = _parameter(module, "w13_weight", (experts, 2 * local, hidden), fused)
-    w2 = _parameter(module, "w2_weight", (experts, hidden, local), fused)
-    if w13 is None or w2 is None:
-        return None
-    return w13, w2
-
-
-class ExpertTargets:
-    """A complete seed-admitted HF → local projection view mapping, owned by
-    the existing receiver."""
-
-    @classmethod
-    def build(cls, receiver: Any, *, broadcast: bool = False) -> ExpertTargets | None:
-        model = receiver.model
-        runtime = _runtime(model, broadcast)
-        if runtime is None or receiver.capability is None or receiver.force_full_seed:
-            return None
-        try:
-            tp = 2 if broadcast else 4
-            rank, fused, method = runtime
-            layers, experts, hidden, width = (
-                getattr(model.config, k)
-                for k in ("num_hidden_layers", "num_experts", "hidden_size", "moe_intermediate_size")
-            )
-            if (
-                any(type(x) is not int or x <= 0 for x in (layers, experts, hidden, width))
-                or width % tp
-                or (getattr(model, "start_layer", 0), getattr(model, "end_layer", layers)) != (0, layers)
-                or len(model.model.layers) != layers
-                or (getattr(model.model, "start_layer", 0), getattr(model.model, "end_layer", layers)) != (0, layers)
-                or layers * experts * 3 > len(receiver.schema)
-            ):
-                return None
-            geometry = experts, hidden, width // tp
-            local_size = hidden * (width // tp)
-            targets = {}
-            owners = []
-            for layer in range(layers):
-                weights = _layer(model, layer, rank, fused, method, geometry, tp)
-                if weights is None:
-                    return None
-                w13, w2 = weights
-                if w13.device != w2.device or w13.device != next(model.parameters()).device:
-                    return None
-                owners.append(weights)
-                for expert in range(experts):
-                    prefix = f"model.layers.{layer}.mlp.experts.{expert}."
-                    for projection, weight, offset, shape in (
-                        ("gate_proj", w13, 2 * expert * local_size, (width, hidden)),
-                        ("up_proj", w13, (2 * expert + 1) * local_size, (width, hidden)),
-                        ("down_proj", w2, expert * local_size, (hidden, width)),
-                    ):
-                        name = prefix + projection + ".weight"
-                        if broadcast and name not in receiver.schema:
-                            name = name.replace("model.layers.", "model.language_model.layers.", 1)
-                        if name in receiver.full_only or receiver.schema.get(name) != (shape, "bfloat16"):
-                            return None
-                        targets[name] = (weight, offset, local_size)
-            # A fused or duplicate spelling can address the same physical words.
-            if broadcast and any(".mlp.experts." in n and n not in targets for n in receiver.schema):
-                return None
-            direct = frozenset(id(p) for pair in owners for p in pair) if broadcast else None
-            if not validate_shard_storage(model, receiver.destinations, (), direct):
-                return None
-        except (AttributeError, TypeError, IndexError, ValueError):
-            return None
-        plan = cls()
-        plan.rank, plan.geometry, plan.runtime, plan.owners, plan.targets = rank, geometry, runtime, owners, targets
-        plan.tp, plan.broadcast, plan.direct = tp, broadcast, direct
-        plan.down_weights = frozenset(id(pair[1]) for pair in owners)
-        return plan
-
-    def current(self, receiver: Any, raw: torch.Tensor, status: torch.Tensor) -> bool:
-        model = receiver.model
-        if not validate_shard_storage(model, receiver.destinations, (raw, status), self.direct):
-            return False
-        if _runtime(model, self.broadcast) != self.runtime:
-            return False
-        for layer, saved in enumerate(self.owners):
-            current = _layer(model, layer, *self.runtime, self.geometry, self.tp)
-            if current is None or any(a is not b for a, b in zip(current, saved, strict=True)):
-                return False
-        return True
-
-    def check(self, receiver: Any, raw: torch.Tensor, status: torch.Tensor) -> None:
-        if not self.current(receiver, raw, status):
-            raise ValueError("Changed or aliased target shard layout")
 
 
 def _byte_span(tensor: torch.Tensor) -> tuple[int, int] | None:
@@ -303,6 +81,18 @@ def _live_tensors(model: Any) -> list[tuple[str, torch.Tensor]]:
     ]
 
 
+def _tensor_attributes(model: Any) -> list[tuple[str, torch.Tensor]]:
+    # Native model loaders also store derived weights directly on a module,
+    # e.g. the MLA K/V projections. These are live bytes, but are not writable
+    # ordinary parameter destinations.
+    return [
+        ("buffer", value)
+        for module in model.modules()
+        for value in vars(module).values()
+        if isinstance(value, torch.Tensor)
+    ]
+
+
 def _check_address_ranges(live: list[tuple[str, torch.Tensor]], io: tuple[torch.Tensor, ...]) -> bool:
     """Reject transport collisions and report whether live parameters are
     disjoint."""
@@ -330,7 +120,9 @@ def _check_address_ranges(live: list[tuple[str, torch.Tensor]], io: tuple[torch.
 def validate_transport_storage(model: Any, io: tuple[torch.Tensor, ...]) -> None:
     # Final ACK only needs safe I/O, even when the ordinary layout cannot shard.
     devices = {tensor.device for tensor in io}
-    _check_address_ranges([(kind, t) for kind, t in _live_tensors(model) if t.device in devices], io)
+    _check_address_ranges(
+        [(kind, t) for kind, t in (*_live_tensors(model), *_tensor_attributes(model)) if t.device in devices], io
+    )
 
 
 def validate_shard_storage(
@@ -341,13 +133,13 @@ def validate_shard_storage(
         # Only the direct expert parameters must be disjoint. Ordinary dense
         # parameters can be tied, padded, FP32, or SGLang Parameter subclasses.
         ranges = [(kind if id(tensor) in direct else "buffer", tensor) for kind, tensor in live]
-        eligible = _check_address_ranges(ranges, io)
+        eligible = _check_address_ranges(ranges + _tensor_attributes(model), io)
         return (
             eligible
             and all(type(t) is torch.Tensor for t in io)
             and {storage_identity(t) for _, t in live} == destinations
         )
-    if not _check_address_ranges(live, io) or any(
+    if not _check_address_ranges(live + _tensor_attributes(model), io) or any(
         type(t) is not torch.Tensor or t.layout != torch.strided for t in io
     ):
         return False
@@ -368,6 +160,213 @@ def validate_shard_storage(
     return storage == destinations
 
 
+@dataclass(frozen=True)
+class CopyRegion:
+    """A contiguous destination receives rows of width from a strided HF
+    view."""
+
+    weight: torch.Tensor
+    base: int
+    offset: int
+    rows: int
+    stride: int
+    width: int
+
+
+class BroadcastTargets(TorchDispatchMode):
+    """Observe real seed copies without replacing inputs or repeating a loader.
+
+    Only a dispatcher with an independent copy-only input contract may enter
+    this mode. ATen cannot observe arbitrary Python cache or lifecycle effects.
+    The mode runs while the dispatcher consumes one complete, ordinary input.
+    """
+
+    broadcast = True
+
+    def __init__(self, model: Any):
+        super().__init__()
+        self.owners = {
+            storage_identity(p): p
+            for p in model.parameters()
+            if isinstance(p, torch.nn.Parameter)
+            and p.layout == torch.strided
+            and p.device.type in ("cpu", "cuda")
+            and p.is_contiguous()
+            and not p.is_neg()
+            and not p.is_conj()
+            and type(p).__torch_dispatch__ is torch.nn.Parameter.__torch_dispatch__
+            and type(p).__torch_function__ is torch.nn.Parameter.__torch_function__
+        }
+        # A transient DLPack view can have another StorageImpl for live bytes.
+        # Merge physical intervals to recognize every write to model storage.
+        ranges = {}
+        for _, tensor in _live_tensors(model):
+            if tensor.device.type in ("cpu", "cuda"):
+                span = _byte_span(tensor)
+                if span is not None:
+                    ranges.setdefault(tensor.device, []).append(span)
+        self.ends = {}
+        self.starts = {}
+        for device, intervals in ranges.items():
+            starts, ends = [], []
+            for lo, hi in sorted(intervals):
+                if ends and lo <= ends[-1]:
+                    ends[-1] = max(ends[-1], hi)
+                else:
+                    starts.append(lo)
+                    ends.append(hi)
+            self.starts[device], self.ends[device] = starts, ends
+        self.targets: dict[str, CopyRegion | None] = {}
+        self.direct: frozenset[int] = frozenset()
+        self.writes: dict[tuple, list] = {}
+        self.conflicts: set[str] = set()
+
+    def observe(self, name: str, value: torch.Tensor):
+        self.name, self.source = name, value
+        self.source_storage = storage_identity(value)
+        self.region = None
+        self.supported = value.dtype in (torch.float16, torch.bfloat16, torch.float32) and value.numel() > 0
+        try:
+            with self:
+                yield name, value
+            if self.supported:
+                self.targets[name] = self.region
+        finally:
+            self.source = None
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: tuple = (), kwargs: dict | None = None) -> Any:
+        kwargs = kwargs or {}
+        for i, argument in enumerate(func._schema.arguments):
+            if argument.alias_info is None or not argument.alias_info.is_write:
+                continue
+            value = args[i] if i < len(args) else kwargs.get(argument.name)
+            if isinstance(value, torch.Tensor) and value.layout == torch.strided:
+                span = _byte_span(value)
+                if span is not None and value.device in self.starts:
+                    idx = bisect_right(self.ends[value.device], span[0])
+                    starts = self.starts[value.device]
+                    if idx < len(starts) and starts[idx] < span[1]:
+                        self.writes.setdefault(value.device, []).append((*span, self.name))
+        if self.supported:
+            if func == torch.ops.aten.copy_.default:
+                dest, source = args[:2]
+                region = self._copy(dest, source)
+                if region is None or self.region is not None:
+                    self.supported = False
+                else:
+                    self.region = region
+            elif func._schema.name not in {
+                "aten::alias",
+                "aten::as_strided",
+                "aten::detach",
+                "aten::select",
+                "aten::slice",
+                "aten::view",
+                "aten::squeeze",
+                "aten::unsqueeze",
+                "aten::transpose",
+                "aten::t",
+                "aten::permute",
+            }:
+                # Reject arithmetic, additional stores and value-dependent decisions.
+                # Geometry work on unrelated runtime tensors can conservatively decline.
+                touches_input = any(
+                    isinstance(t, torch.Tensor)
+                    and t.layout == torch.strided
+                    and storage_identity(t) == self.source_storage
+                    for t in tree_leaves((args, kwargs))
+                )
+                if touches_input or any(
+                    a.alias_info is not None and a.alias_info.is_write for a in func._schema.arguments
+                ):
+                    self.supported = False
+        return func(*args, **kwargs)
+
+    def _copy(self, dest: torch.Tensor, source: torch.Tensor) -> CopyRegion | None:
+        weight = self.owners.get(storage_identity(dest))
+        if (
+            weight is None
+            or storage_identity(source) != storage_identity(self.source)
+            or dest.dtype != source.dtype
+            or weight.dtype != source.dtype
+            or source.dtype != self.source.dtype
+            or source.shape != dest.shape
+            or not dest.is_contiguous()
+            or source.is_conj()
+            or source.is_neg()
+            or dest.is_neg()
+            or dest.is_conj()
+            or not source.numel()
+        ):
+            return None
+        base = dest.storage_offset() - weight.storage_offset()
+        offset = source.storage_offset() - self.source.storage_offset()
+        if source.is_contiguous():
+            rows, width, stride = 1, source.numel(), source.numel()
+        elif source.ndim == 2 and source.stride(1) == 1 and source.stride(0) >= source.shape[1]:
+            (rows, width), stride = source.shape, source.stride(0)
+        else:
+            return None
+        if not (
+            0 <= base <= weight.numel() - dest.numel()
+            and 0 <= offset <= self.source.numel() - (rows - 1) * stride - width
+        ):
+            return None
+        return CopyRegion(weight, base, offset, rows, stride, width)
+
+    def seal(self, receiver: Any) -> bool:
+        # Two HF spellings can write the same destination, even when one
+        # fell back to the ordinary loader. A changed earlier input would
+        # otherwise survive an unchanged later writer. At final ACK force a
+        # complete refresh if earlier per-frame capabilities were optimistic.
+        for writes in self.writes.values():
+            end, owner = 0, None
+            for lo, hi, name in sorted(writes):
+                if lo < end and name != owner:
+                    self.conflicts.update((name, owner))
+                if hi > end:
+                    end, owner = hi, name
+        self.writes.clear()
+        self.starts.clear()
+        self.ends.clear()
+        self.direct = frozenset(id(r.weight) for r in self.targets.values() if r is not None)
+        self.signature = self._bindings(receiver.model)
+        self.by_owner = {binding[0]: (name, binding) for name, binding in self.signature}
+        self.owners.clear()
+        return (
+            bool(self.targets)
+            and not (self.conflicts - receiver.full_only)
+            and validate_shard_storage(receiver.model, receiver.destinations, (), self.direct)
+        )
+
+    @staticmethod
+    def _binding(t: torch.Tensor) -> tuple:
+        return id(t), storage_identity(t), t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype
+
+    def _bindings(self, model: Any) -> tuple:
+        return tuple(
+            (name, self._binding(t))
+            for name, t in model.named_parameters(remove_duplicate=False)
+            if id(t) in self.direct
+        )
+
+    def check_run(self, model: Any, batch: list) -> None:
+        # The dispatcher has executed its per-invocation setup since frame
+        # admission. Verify the actual parameters touched by this run before
+        # using the captured references, including .data storage replacement.
+        for (weight, _layout), _, _, _ in batch:
+            if weight is not None:
+                name, binding = self.by_owner[id(weight)]
+                current = model.get_parameter(name)
+                if current is not weight or self._binding(current) != binding:
+                    raise ValueError("Ordinary loader setup changed an admitted destination")
+
+    def current(self, receiver: Any, raw: torch.Tensor, status: torch.Tensor) -> bool:
+        return self.signature == self._bindings(receiver.model) and validate_shard_storage(
+            receiver.model, receiver.destinations, (raw, status), self.direct
+        )
+
+
 class ShardFrame:
     """One bounded tile directory and ordered runs sharing the original consume
     fence."""
@@ -384,12 +383,24 @@ class ShardFrame:
         return ((tiles * 48 + 511) // 512 * 512 + 3 * 512) if tiles else 0
 
     def __init__(
-        self, plan: ExpertTargets, ordinals: frozenset, entries: list, raw: torch.Tensor, ends: list[int] | None = None
+        self,
+        plan: ExpertTargets | BroadcastTargets,
+        ordinals: frozenset,
+        entries: list,
+        raw: torch.Tensor,
+        ends: list[int] | None = None,
+        *,
+        lane_ordinals: frozenset | None = None,
     ):
         self.plan = plan
         self.raw = raw
         self.runs = []
-        descriptors = np.empty((len(ordinals), 6), dtype=np.int64)
+        self.local_words = (
+            torch.zeros((), dtype=torch.int64, device=raw.device)
+            if (plan.broadcast or (lane_ordinals is not None and ordinals != lane_ordinals)) and raw.is_cuda
+            else 0
+        )
+        descriptors = np.empty((len(ordinals), 7), dtype=np.int64)
         tile_count = descriptor_count = 0
         self.local_checks = []
         selected = set(ordinals)
@@ -406,18 +417,28 @@ class ShardFrame:
                 self.runs.append((False, entries[start:stop]))
             else:
                 groups = {}
-                for entry, positions, values in entries[start:stop]:
-                    target = plan.targets.get(entry["name"])
-                    if target is None or positions is None or values.dtype != torch.bfloat16:
-                        raise ValueError("A partial shard must cover a seed-admitted sparse BF16 expert")
-                    weight, base, limit = target
-                    if plan.broadcast:
-                        limit *= plan.tp
-                    if weight.device != raw.device or entry["count"] > limit:
-                        raise ValueError("Target shard has an invalid physical device or coordinate count")
-                    groups.setdefault(weight, []).append((entry, positions, values, base, limit))
+                for index, (entry, positions, values) in enumerate(entries[start:stop], start):
+                    name = entry["name"]
+                    global_coords = plan.broadcast or (lane_ordinals is not None and index not in lane_ordinals)
+                    targets = plan.bindings.targets if global_coords and not plan.broadcast else plan.targets
+                    if name not in targets or positions is None:
+                        raise ValueError("A direct entry needs an acknowledged sparse input")
+                    if global_coords:
+                        region = targets[name]
+                        weight = region.weight if region is not None else None
+                        base = region.base if region is not None else 0
+                        layout = (region.offset, region.rows, region.stride, region.width) if region else None
+                        limit = math.prod(entry["shape"])
+                    else:
+                        weight, base, limit = plan.targets[name]
+                        layout = None
+                    if (weight is not None and (weight.device != raw.device or weight.dtype != values.dtype)) or entry[
+                        "count"
+                    ] > limit:
+                        raise ValueError("Target shard has an invalid physical device, dtype or coordinate count")
+                    groups.setdefault((weight, layout), []).append((entry, positions, values, base, limit))
                 batch = []
-                for weight, parts in groups.items():
+                for (weight, layout), parts in groups.items():
                     first = tile_count
                     for entry, positions, values, base, limit in parts:
                         count = entry["count"]
@@ -431,10 +452,18 @@ class ShardFrame:
                                 count,
                                 base,
                                 limit,
+                                values.element_size(),
                             )
                             descriptor_count += 1
                             tile_count += (count + self.BLOCK - 1) // self.BLOCK
-                    batch.append((weight, first, tile_count, parts if raw.device.type == "cpu" else None))
+                    batch.append(
+                        (
+                            (weight, layout),
+                            first,
+                            tile_count,
+                            parts if raw.device.type == "cpu" else None,
+                        )
+                    )
                 self.runs.append((True, batch))
             if stop == end:
                 self.group_runs.append(self.runs[group_start:])
@@ -447,7 +476,7 @@ class ShardFrame:
     def _tile_table(cls, descriptors: np.ndarray, tile_count: int, raw: torch.Tensor) -> torch.Tensor:
         host = torch.empty((tile_count, 6), dtype=torch.int64, device="cpu", pin_memory=raw.is_cuda)
         table = host.numpy()
-        first, position_offset, value_offset, count, base, limit = descriptors.T
+        first, position_offset, value_offset, count, base, limit, word_size = descriptors.T
         for start in range(0, tile_count, cls._HOST_BATCH_TILES):
             stop = min(start + cls._HOST_BATCH_TILES, tile_count)
             rows = table[start:stop]
@@ -455,7 +484,7 @@ class ShardFrame:
             owner = np.searchsorted(first, tiles, side="right") - 1
             offset = (tiles - first[owner]) * cls.BLOCK
             rows[:, 0] = position_offset[owner] + 4 * offset
-            rows[:, 1] = value_offset[owner] + 2 * offset
+            rows[:, 1] = value_offset[owner] + word_size[owner] * offset
             rows[:, 2] = np.minimum(count[owner] - offset, cls.BLOCK)
             rows[:, 3] = offset != 0
             rows[:, 4] = base[owner]
@@ -476,25 +505,21 @@ class ShardFrame:
         return self.invalid[0].bool()
 
     def scatter(self, batch: list) -> None:
-        for weight, first, end, parts in batch:
-            if end == first:
+        for (weight, layout), first, end, parts in batch:
+            if end == first or weight is None:
                 continue
-            target = weight.detach().view(torch.int16).view(-1)
-            _, hidden, local = self.plan.geometry
-            rank, tp = self.plan.rank, self.plan.tp
-            down = id(weight) in self.plan.down_weights
+            word_type = torch.int16 if weight.element_size() == 2 else torch.int32
+            target = weight.detach().view(word_type).view(-1)
             if self.raw.device.type == "cpu":
                 for _, pos, values, base, _ in parts:
-                    words = values.view(torch.int16)
-                    pos = pos.long()
-                    if self.plan.broadcast:
-                        axis = pos % (tp * local) if down else pos // hidden
-                        keep = (axis >= rank * local) & (axis < (rank + 1) * local)
-                        pos, words = pos[keep], words[keep]
-                        if down:
-                            pos = (pos // (tp * local)) * local + pos % (tp * local) - rank * local
-                        else:
-                            pos = pos - rank * local * hidden
+                    words, pos = values.view(word_type), pos.long()
+                    if layout is not None:
+                        offset, rows, stride, width = layout
+                        rel = pos - offset
+                        keep = (rel >= 0) & (rel < rows * stride) & (rel % stride < width)
+                        rel, words = rel[keep], words[keep]
+                        pos = (rel // stride) * width + rel % stride
+                        self.local_words += pos.numel()
                     target.index_copy_(0, pos + base, words)
             else:
                 from .delta_shard_kernel import shard_tiles
@@ -506,10 +531,11 @@ class ShardFrame:
                     self.invalid,
                     True,
                     self.BLOCK,
-                    self.plan.broadcast,
-                    down,
-                    hidden,
-                    local,
-                    tp,
-                    rank,
+                    REGION=layout is not None,
+                    OFFSET=layout[0] if layout else 0,
+                    ROWS=layout[1] if layout else 1,
+                    STRIDE=layout[2] if layout else 1,
+                    WIDTH=layout[3] if layout else 1,
+                    WORD_BYTES=weight.element_size(),
+                    written=self.local_words if layout else self.invalid,
                 )

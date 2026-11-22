@@ -5,11 +5,28 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 
 
 RETAINED_DIRECTORY_BYTES = 16 << 20
+
+
+def supports_delta_layout(layout: Mapping, gpu_count: int) -> bool:
+    """An ordinary single-node stream addresses one physical worker per TP/PP
+    coordinate."""
+    tp = layout.get("tp_size")
+    pp = layout.get("pp_size")
+    return (
+        layout.get("nnodes") == 1
+        and layout.get("dp_size") == 1
+        and type(tp) is int
+        and tp > 0
+        and type(pp) is int
+        and pp > 0
+        and tp * pp == gpu_count
+    )
 
 
 @dataclass(frozen=True)

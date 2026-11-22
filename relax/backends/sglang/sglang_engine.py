@@ -33,6 +33,7 @@ except ImportError:
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
+from relax.distributed.weight_sync.config import supports_delta_layout
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.async_utils import run
@@ -1792,12 +1793,7 @@ class SGLangEngine(RayActor):
 
     def _delta_layout_supported(self, gpu_count: int) -> bool:
         layout = getattr(self, "_weight_sync_server_args", {})
-        return (
-            layout.get("nnodes") == 1
-            and layout.get("pp_size") == 1
-            and layout.get("dp_size") == 1
-            and layout.get("tp_size") == gpu_count
-        )
+        return supports_delta_layout(layout, gpu_count)
 
     def end_weight_update(self):
         """Close the session opened by ``begin_weight_update``.
@@ -2298,9 +2294,11 @@ def _compute_server_args(
             loaders.append(EXPERT_SLICE_LOADER)
         if getattr(args, "memory_weight_sync_config", None):
             from relax.backends.sglang.delta_loader import LOADER
+            from relax.backends.sglang.delta_pipeline import PIPELINE_LOADER
 
-            if LOADER not in loaders:
-                loaders.append(LOADER)
+            for loader in (LOADER, PIPELINE_LOADER):
+                if loader not in loaders:
+                    loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders
 
     if (
