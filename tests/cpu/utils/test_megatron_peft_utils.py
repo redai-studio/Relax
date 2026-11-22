@@ -94,6 +94,7 @@ class TestConvertMegatronToHfTargetModules:
         assert convert_megatron_to_hf_target_modules(["linear_qkv"]) == ["q_proj", "k_proj", "v_proj"]
         assert convert_megatron_to_hf_target_modules(["linear_fc1"]) == ["gate_proj", "up_proj"]
         assert convert_megatron_to_hf_target_modules(["linear_proj"]) == ["o_proj"]
+        assert convert_megatron_to_hf_target_modules(["output_layer"]) == ["lm_head"]
 
     def test_convert_megatron_to_hf_dedups_preserving_order(self):
         """Overlapping expansions collapse to a stable, de-duplicated list."""

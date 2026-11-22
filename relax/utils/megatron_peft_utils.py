@@ -65,6 +65,7 @@ GDN_GATE_PARTS = ("in_proj_b", "in_proj_a")
 MEGATRON_TO_HF_MODULES = {
     "linear_qkv": ["q_proj", "k_proj", "v_proj"],
     "linear_proj": ["o_proj"],
+    "output_layer": ["lm_head"],
     "linear_fc1": ["gate_proj", "up_proj"],
     "linear_fc2": ["down_proj"],
     "router": ["gate"],
