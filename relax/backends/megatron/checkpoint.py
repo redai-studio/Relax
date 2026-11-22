@@ -409,26 +409,36 @@ _OPTIMIZER_BUCKET_LOAD_LOCK = RLock()
 
 
 @contextmanager
-def _check_optimizer_buckets_on_load(iteration_dir: Path, load_path: str):
+def _check_optimizer_buckets_on_load(load_path: str, ckpt_step: int | None):
     from megatron.core import dist_checkpointing
 
+    selected_dir = None
     with _OPTIMIZER_BUCKET_LOAD_LOCK:
         original_load = dist_checkpointing.load
 
         def load_with_bucket_validation(sharded_state_dict, checkpoint_dir, *args, **kwargs):
-            if Path(checkpoint_dir) == iteration_dir:
-                # Use the actual load template, before MCore assigns shards to
-                # ranks. A mismatch on any rank must fail all ranks together.
-                _collective_checkpoint_probe(
-                    lambda: _validate_dp_reshardable_optimizer_buckets(
-                        iteration_dir, sharded_state_dict.get("optimizer", {}), load_path
-                    )
-                )
+            nonlocal selected_dir
+            selected_dir = Path(checkpoint_dir)
+            optimizer_state = sharded_state_dict.get("optimizer", {})
+
+            def probe() -> str:
+                _validate_dp_reshardable_optimizer_buckets(selected_dir, optimizer_state, load_path, ckpt_step)
+                return str(selected_dir)
+
+            # Ranks without local optimizer shards must also enter the probe.
+            _collective_checkpoint_probe(probe)
             return original_load(sharded_state_dict, checkpoint_dir, *args, **kwargs)
 
         dist_checkpointing.load = load_with_bucket_validation
         try:
             yield
+        except AssertionError as error:
+            if str(error).startswith("Number of unpadded elements in each bucket need to be the same"):
+                raise RuntimeError(
+                    f"Cannot resume optimizer state from {selected_dir or load_path} because the bucket layout changed.\n"
+                    f"{_optimizer_bucket_restart_hint(load_path, ckpt_step, selected_dir)}"
+                ) from error
+            raise
         finally:
             dist_checkpointing.load = original_load
 
@@ -752,11 +762,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             return _metadata_value(common.get("args"), _LORA_CHECKPOINT_METADATA_ATTR)
 
         lora_metadata = _collective_checkpoint_probe(probe_metadata)
-        bucket_validation = (
-            _check_optimizer_buckets_on_load(Path(iter_dir), load_path)
-            if load_optimizer and (Path(iter_dir) / ".metadata").is_file()
-            else nullcontext()
-        )
+        bucket_validation = _check_optimizer_buckets_on_load(load_path, getattr(args, "ckpt_step", None))
         try:
             if lora_metadata is None:
                 step_context = (
@@ -803,11 +809,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             message = str(e)
             if "OptimizerParamScheduler" in message:
                 raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
-            if load_optimizer and message.startswith("Number of unpadded elements in each bucket need to be the same"):
-                raise RuntimeError(
-                    f"Cannot resume optimizer state from {iter_dir} because the optimizer bucket layout changed.\n"
-                    f"{_optimizer_bucket_restart_hint(load_path)}"
-                ) from e
             raise
     else:
         if not exist:

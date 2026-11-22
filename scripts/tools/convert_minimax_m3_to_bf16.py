@@ -55,12 +55,14 @@ def dequant_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def dequant_nvfp4(packed: torch.Tensor, scale: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
     """Low nibble is the even element."""
-    rows, cols = packed.shape[0], packed.shape[1] * 2
-    assert scale.shape == (rows, cols // NVFP4_BLOCK), f"{packed.shape=} {scale.shape=}"
+    rows, unpacked_cols = packed.shape[0], packed.shape[1] * 2
+    assert scale.shape == (rows, unpacked_cols // NVFP4_BLOCK), f"{packed.shape=} {scale.shape=}"
     table = E2M1_TABLE.to(packed.device)
-    values = torch.stack([table[(packed & 0x0F).long()], table[(packed >> 4).long()]], dim=-1).view(rows, cols)
-    blocks = values.view(rows, cols // NVFP4_BLOCK, NVFP4_BLOCK) * scale.float().unsqueeze(-1)
-    return (blocks / global_scale.float().reshape(())).view(rows, cols).to(torch.bfloat16)
+    values = torch.stack([table[(packed & 0x0F).long()], table[(packed >> 4).long()]], dim=-1).view(
+        rows, unpacked_cols
+    )
+    blocks = values.view(rows, unpacked_cols // NVFP4_BLOCK, NVFP4_BLOCK) * scale.float().unsqueeze(-1)
+    return (blocks / global_scale.float().reshape(())).view(rows, unpacked_cols).to(torch.bfloat16)
 
 
 def output_name(name: str, layer_map: dict[int, int] | None) -> str | None:

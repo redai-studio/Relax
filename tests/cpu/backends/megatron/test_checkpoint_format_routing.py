@@ -48,6 +48,7 @@ def checkpoint(request, monkeypatch):
                 "_metadata_value",
             ],
         )
+        module._check_optimizer_buckets_on_load = lambda *_: nullcontext()
     monkeypatch.setattr(module, "_collective_checkpoint_probe", lambda probe: probe(), raising=False)
     # These format-routing fixtures have placeholder metadata, not loadable
     # shards; actual storage validation is covered in test_checkpoint_preflight.

@@ -6,6 +6,7 @@ import re
 from argparse import Namespace
 from collections.abc import Callable
 from pathlib import Path
+from shlex import quote
 from typing import Any
 
 from relax.utils.distributed_utils import get_gloo_group
@@ -61,14 +62,21 @@ def _has_optimizer_keys(metadata: Any) -> bool:
     )
 
 
-def _optimizer_bucket_restart_hint(load_path: str) -> str:
+def _optimizer_bucket_restart_hint(load_path: str, ckpt_step: int | None, checkpoint_dir: Path | None = None) -> str:
+    # MCore can select a different root and step from the persistent tracker.
+    if checkpoint_dir is not None and (match := re.fullmatch(r"iter_(\d+)", checkpoint_dir.name)):
+        load_path = str(checkpoint_dir.parent)
+        ckpt_step = int(match[1])
+    step_flag = f" --ckpt-step {ckpt_step}" if ckpt_step is not None else ""
     return (
         "Resume with the original parameter precision and DDP bucket settings. To start from the saved "
-        f"model weights with a new optimizer, use --load {load_path} --finetune --save <new-directory>."
+        f"model weights with a new optimizer, use --load {quote(load_path)}{step_flag} --finetune --save <new-directory>."
     )
 
 
-def _validate_dp_reshardable_optimizer_buckets(checkpoint_dir: Path, optimizer_state: dict, load_path: str) -> None:
+def _validate_dp_reshardable_optimizer_buckets(
+    checkpoint_dir: Path, optimizer_state: dict, load_path: str, ckpt_step: int | None
+) -> None:
     """Validate the current optimizer template before a partial DCP load."""
     from megatron.core.dist_checkpointing.dict_utils import nested_values
     from megatron.core.dist_checkpointing.mapping import ShardedTensor
@@ -95,7 +103,7 @@ def _validate_dp_reshardable_optimizer_buckets(checkpoint_dir: Path, optimizer_s
             actual = tuple(stored.size) if isinstance(stored, TensorStorageMetadata) else "missing tensor"
             raise RuntimeError(
                 f"Incompatible optimizer bucket {key} in {checkpoint_dir}: saved {actual}, expected {expected}.\n"
-                f"{_optimizer_bucket_restart_hint(load_path)}"
+                f"{_optimizer_bucket_restart_hint(load_path, ckpt_step, checkpoint_dir)}"
             )
 
 
