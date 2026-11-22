@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from .adts.bitpack import PackedU16Plan, read_package_header
+from .adts.bitpack import PackedU16Plan, U16Transfer, read_package_header
 
 
 @dataclass
@@ -20,6 +20,7 @@ class _State:
     base: str
     current: str
     plans: dict[tuple[str, str], PackedU16Plan]
+    transfer: U16Transfer
     pointers: dict[str, int]
     recovery: dict[str, torch.Tensor]
 
@@ -79,11 +80,13 @@ def _prepare(model: torch.nn.Module, root: Path, rank: int) -> _State:
         recovery[name] = snapshot
         snapshot.copy_(tensor, non_blocking=True)
 
-    torch.cuda.synchronize(next(model.parameters()).device)
+    device = next(model.parameters()).device
+    torch.cuda.synchronize(device)
     if base_header is None:
         raise ValueError(f"No ADTS package for base {base!r} on TP rank {rank}")
     _verify_base(weights, recovery, base_header, base)
-    return _State(base, base, plans, pointers, recovery)
+    transfer = U16Transfer(device, set(plans.values()))
+    return _State(base, base, plans, transfer, pointers, recovery)
 
 
 def _apply_delta(model: torch.nn.Module, state: _State, source: str, target: str) -> None:
@@ -92,7 +95,7 @@ def _apply_delta(model: torch.nn.Module, state: _State, source: str, target: str
         tensor = attrgetter(name.removeprefix("buffer:"))(model)
         if tensor.data_ptr() != state.pointers[name]:
             raise RuntimeError(f"Teacher write target moved: {name}")
-    plan.apply(target)
+    state.transfer.apply(plan, target)
 
 
 def _restore_teacher(model: torch.nn.Module, state: _State, target: str) -> None:

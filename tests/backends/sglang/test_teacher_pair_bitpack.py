@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from examples.on_policy_distillation.mopd.pack_teacher_pair import _hash_tensor, _write_package
-from relax.backends.sglang.adts.bitpack import TILE, PackedU16Plan, encode_frame, read_package_header
+from relax.backends.sglang.adts.bitpack import TILE, PackedU16Plan, U16Transfer, encode_frame, read_package_header
 from relax.backends.sglang.adts_teacher_loader import adts_teacher_loader
 
 
@@ -43,13 +43,17 @@ def test_packed_pair_roundtrip_on_all_tile_modes(tmp_path):
     with path.open("rb") as stream:
         header = read_package_header(stream)
         plan = PackedU16Plan(stream, {"w": gpu}, header)
+    transfer = U16Transfer(gpu.device, [plan])
     for target, expected in (("B", right), ("A", left), ("B", right)):
-        plan.apply(target)
+        transfer.apply(plan, target)
         np.testing.assert_array_equal(gpu.cpu().numpy(), expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Teacher switching")
-def test_three_teachers_restore_weights_and_logits(tmp_path):
+def test_three_teachers_restore_weights_and_logits(tmp_path, monkeypatch):
+    # Two weight frames and one buffer frame exercise both slots, then reuse the first.
+    monkeypatch.setattr("examples.on_policy_distillation.mopd.pack_teacher_pair._FRAME_BYTES", 1024)
+    monkeypatch.setattr("relax.backends.sglang.adts.bitpack._BATCH_BYTES", 1)
     rng = torch.Generator().manual_seed(17)
     states = {
         name: {

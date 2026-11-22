@@ -7,6 +7,7 @@ Each 512-word tile uses zero, nibble, byte or full words.
 
 import json
 import struct
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -127,7 +128,7 @@ def read_package_header(stream):
 
 
 class PackedU16Plan:
-    """One pinned bank and reusable H2D buffers for both directions."""
+    """Pinned deltas and GPU decode descriptors for one Teacher pair."""
 
     def __init__(self, stream, tensors, header):
         self.source = header["provenance"]["source"]
@@ -161,15 +162,6 @@ class PackedU16Plan:
         if stream.readinto(self.bank.numpy()) != payload_bytes:
             raise ValueError("Truncated U16 package")
 
-        self.stream = torch.cuda.Stream(device=device)
-        self.copy_stream = torch.cuda.Stream(device=device)
-        capacity = max((end - start for start, end, _ in batch_layouts), default=1)
-        self.buffers = [
-            torch.empty(capacity, dtype=torch.uint8, device=device) for _ in range(min(2, len(batch_layouts)))
-        ]
-        self.copied = [torch.cuda.Event() for _ in self.buffers]
-        self.applied = [torch.cuda.Event() for _ in self.buffers]
-
         self.batches = []
         for start, end, frames in batch_layouts:
             frame_rows, tile_counts, first_tile = [], [], 0
@@ -186,27 +178,43 @@ class PackedU16Plan:
             )
             self.batches.append((start, end, descriptors, tile_to_frame))
 
-        self.stream.wait_stream(torch.cuda.current_stream(device))
 
-    def apply(self, target):
-        caller = torch.cuda.current_stream(self.stream.device)
-        self.stream.wait_stream(caller)
-        self.copy_stream.wait_stream(self.stream)
+class U16Transfer:
+    """Copy and apply one Teacher pair at a time on this TP rank."""
 
-        with torch.cuda.device(self.stream.device), torch.cuda.stream(self.stream):
-            for batch_index, (begin, end, descriptors, tile_to_frame) in enumerate(self.batches):
+    def __init__(self, device: torch.device, plans: Iterable[PackedU16Plan]) -> None:
+        # Each slot only needs to fit the largest batch that will use it.
+        capacities = [0, 0]
+        for plan in plans:
+            for index, (begin, end, _, _) in enumerate(plan.batches):
+                slot = index % 2
+                capacities[slot] = max(capacities[slot], end - begin)
+        self.buffers = [torch.empty(size, dtype=torch.uint8, device=device) for size in capacities if size]
+        self.decode_stream = torch.cuda.Stream(device=device)
+        self.copy_stream = torch.cuda.Stream(device=device)
+        self.copied = [torch.cuda.Event() for _ in self.buffers]
+        self.applied = [torch.cuda.Event() for _ in self.buffers]
+        self.decode_stream.wait_stream(torch.cuda.current_stream(device))
+
+    def apply(self, plan: PackedU16Plan, target: str) -> None:
+        caller = torch.cuda.current_stream(self.decode_stream.device)
+        self.decode_stream.wait_stream(caller)
+        self.copy_stream.wait_stream(self.decode_stream)
+
+        with torch.cuda.device(self.decode_stream.device), torch.cuda.stream(self.decode_stream):
+            for batch_index, (begin, end, descriptors, tile_to_frame) in enumerate(plan.batches):
                 slot = batch_index % len(self.buffers)
                 # Wait only when reusing this slot so a copy can overlap decoding in the other slot.
                 with torch.cuda.stream(self.copy_stream):
                     if batch_index >= len(self.buffers):
                         self.copy_stream.wait_event(self.applied[slot])
-                    self.buffers[slot][: end - begin].copy_(self.bank[begin:end], non_blocking=True)
+                    self.buffers[slot][: end - begin].copy_(plan.bank[begin:end], non_blocking=True)
                     self.copied[slot].record(self.copy_stream)
 
-                self.stream.wait_event(self.copied[slot])
+                self.decode_stream.wait_event(self.copied[slot])
                 _apply_tiles[(tile_to_frame.numel(),)](
-                    self.buffers[slot], descriptors, tile_to_frame, target == self.source, TILE
+                    self.buffers[slot], descriptors, tile_to_frame, target == plan.source, TILE
                 )
-                self.applied[slot].record(self.stream)
+                self.applied[slot].record(self.decode_stream)
 
-        self.stream.synchronize()
+        self.decode_stream.synchronize()
