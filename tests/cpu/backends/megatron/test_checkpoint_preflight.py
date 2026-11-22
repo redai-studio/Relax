@@ -15,7 +15,7 @@ from types import ModuleType
 import pytest
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint import CheckpointException, save
+from torch.distributed.checkpoint import save
 
 from relax.backends.megatron import checkpoint_metadata, compat
 from relax.engine.sft.runtime import is_rm_mode
@@ -50,7 +50,6 @@ def _load_checkpoint_module():
     module = ModuleType("checkpoint_routing_under_test")
     module.__dict__.update(
         Namespace=Namespace,
-        CheckpointException=CheckpointException,
         Path=Path,
         os=os,
         re=re,
@@ -60,6 +59,8 @@ def _load_checkpoint_module():
         is_rm_mode=is_rm_mode,
         _collective_checkpoint_probe=checkpoint_metadata._collective_checkpoint_probe,
         _checkpoint_has_optimizer_state=checkpoint_metadata._checkpoint_has_optimizer_state,
+        _check_optimizer_buckets_on_load=lambda *_: nullcontext(),
+        _optimizer_bucket_restart_hint=checkpoint_metadata._optimizer_bucket_restart_hint,
         validate_native_checkpoint=checkpoint_metadata.validate_native_checkpoint,
         patch_hybrid_optimizer_native_fp32_checkpoint_load=compat.patch_hybrid_optimizer_native_fp32_checkpoint_load,
         preserve_hdo_dp_reshardable_steps_on_load=compat.preserve_hdo_dp_reshardable_steps_on_load,

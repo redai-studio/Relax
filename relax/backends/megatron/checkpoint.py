@@ -9,15 +9,14 @@ from argparse import Namespace
 from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
+from threading import RLock
 
 import torch
-from megatron.core.dist_checkpointing.core import CheckpointingException
 
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
-from torch.distributed.checkpoint import CheckpointException
 
 from relax.engine.sft.runtime import is_rm_mode
 from relax.utils import megatron_bridge_utils
@@ -33,6 +32,8 @@ from relax.utils.training.ppo_utils import (
 from .checkpoint_metadata import (
     _checkpoint_has_optimizer_state,
     _collective_checkpoint_probe,
+    _optimizer_bucket_restart_hint,
+    _validate_dp_reshardable_optimizer_buckets,
     validate_native_checkpoint,
 )
 from .compat import (
@@ -404,6 +405,34 @@ def _strict_lora_checkpoint_dcp_load(args):
         args.dist_ckpt_strictness = previous
 
 
+_OPTIMIZER_BUCKET_LOAD_LOCK = RLock()
+
+
+@contextmanager
+def _check_optimizer_buckets_on_load(iteration_dir: Path, load_path: str):
+    from megatron.core import dist_checkpointing
+
+    with _OPTIMIZER_BUCKET_LOAD_LOCK:
+        original_load = dist_checkpointing.load
+
+        def load_with_bucket_validation(sharded_state_dict, checkpoint_dir, *args, **kwargs):
+            if Path(checkpoint_dir) == iteration_dir:
+                # Use the actual load template, before MCore assigns shards to
+                # ranks. A mismatch on any rank must fail all ranks together.
+                _collective_checkpoint_probe(
+                    lambda: _validate_dp_reshardable_optimizer_buckets(
+                        iteration_dir, sharded_state_dict.get("optimizer", {}), load_path
+                    )
+                )
+            return original_load(sharded_state_dict, checkpoint_dir, *args, **kwargs)
+
+        dist_checkpointing.load = load_with_bucket_validation
+        try:
+            yield
+        finally:
+            dist_checkpointing.load = original_load
+
+
 @contextmanager
 def _preserve_hybrid_optimizer_steps_on_load():
     """Keep Adam steps when MCore rebuilds CPU-offload sub-optimizers.
@@ -723,6 +752,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             return _metadata_value(common.get("args"), _LORA_CHECKPOINT_METADATA_ATTR)
 
         lora_metadata = _collective_checkpoint_probe(probe_metadata)
+        bucket_validation = (
+            _check_optimizer_buckets_on_load(Path(iter_dir), load_path)
+            if load_optimizer and (Path(iter_dir) / ".metadata").is_file()
+            else nullcontext()
+        )
         try:
             if lora_metadata is None:
                 step_context = (
@@ -733,7 +767,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     and not skip_load_to_model_and_opt
                     else nullcontext()
                 )
-                with step_context:
+                with step_context, bucket_validation:
                     return _load_checkpoint_megatron(
                         ddp_model=ddp_model,
                         optimizer=optimizer,
@@ -751,6 +785,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     load_path=args.hf_checkpoint,
                 )
             with (
+                bucket_validation,
                 _patch_lora_checkpoint_state_dict(),
                 _strict_lora_checkpoint_dcp_load(args),
                 _preserve_hybrid_optimizer_steps_on_load(),
@@ -764,19 +799,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     skip_load_to_model_and_opt=skip_load_to_model_and_opt,
                     strict=True,
                 )
-        except (AssertionError, CheckpointException) as e:
-            if isinstance(e, AssertionError):
-                message = str(e)
-                if "OptimizerParamScheduler" in message:
-                    raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
-                bucket_mismatch = message.startswith("Number of unpadded elements in each bucket need to be the same")
-            else:
-                bucket_mismatch = _is_dp_reshardable_bucket_load_error(e)
-            if load_optimizer and bucket_mismatch:
+        except AssertionError as e:
+            message = str(e)
+            if "OptimizerParamScheduler" in message:
+                raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
+            if load_optimizer and message.startswith("Number of unpadded elements in each bucket need to be the same"):
                 raise RuntimeError(
                     f"Cannot resume optimizer state from {iter_dir} because the optimizer bucket layout changed.\n"
-                    "Resume with the original parameter precision and DDP bucket settings. To start from the saved "
-                    f"model weights with a new optimizer, use --load {load_path} --finetune --save <new-directory>."
+                    f"{_optimizer_bucket_restart_hint(load_path)}"
                 ) from e
             raise
     else:
@@ -795,31 +825,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             args=args,
             load_path=load_path,
         )
-
-
-def _is_dp_reshardable_bucket_load_error(error: CheckpointException) -> bool:
-    """Recognize optimizer bucket mismatches reported by the DCP planner."""
-    if not error.failures:
-        return False
-    for cause, _ in error.failures.values():
-        message = cause.args[0] if cause.args else None
-        if not isinstance(message, str):
-            return False
-        if isinstance(cause, CheckpointingException) and message.startswith("Global shape mismatch for loaded ("):
-            key = message.rpartition(" for key ")[2]
-        elif isinstance(cause, KeyError):
-            key = message.partition(" from model not in state dict:")[0]
-        elif isinstance(cause, RuntimeError) and message.startswith("Missing key in checkpoint state_dict: "):
-            key = message.removeprefix("Missing key in checkpoint state_dict: ").removesuffix(".")
-        else:
-            return False
-        if not re.fullmatch(
-            r"(?:chained_\d+\.)*optimizer\.distributed\.dp_group_idx_\d+\.gbuf_idx_\d+\."
-            r"dtype_.+\.bucket_idx_\d+\.\w+",
-            key,
-        ):
-            return False
-    return True
 
 
 def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
