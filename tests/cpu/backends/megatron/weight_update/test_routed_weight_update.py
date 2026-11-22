@@ -122,7 +122,8 @@ def test_routed_update_publishes_version_only_after_all_loads(module, fail_load,
 
     updater._hf_weight_iterator = SimpleNamespace(get_hf_weight_chunks=chunks)
 
-    def send(tensors, *, dispatch_errors=None):
+    def send(tensors, *, dispatch_errors=None, defer_version=False):
+        assert not defer_version
         events.append(("send", {}))
         if fail_load == "dispatch":
             dispatch_errors.append("dispatch failed")
@@ -360,7 +361,8 @@ def test_weight_export_optimizes_only_retained_ordinary_ipc(module, monkeypatch,
 
     updater._wait_for_ipc = wait
 
-    def send(chunk, *, dispatch_errors):
+    def send(chunk, *, dispatch_errors, defer_version):
+        assert not defer_version
         events.append(("send", *(name for name, _ in chunk)))
         refs = [chunk[0][0]]
         inflight_before_send.append(len(inflight))

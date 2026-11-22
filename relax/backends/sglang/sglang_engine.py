@@ -910,6 +910,7 @@ class SGLangEngine(RayActor):
         layout["quantization_config"] = (
             quantization.to_dict() if quantization is not None and not isinstance(quantization, dict) else quantization
         )
+        layout["ordinary_tp_protocol"] = 1
         return layout
 
     def load_lora_adapter_from_tensors(

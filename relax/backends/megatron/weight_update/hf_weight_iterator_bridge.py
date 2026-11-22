@@ -557,6 +557,12 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
         # --- Non-expert weights: original path ---
         for bucket_infos in self._non_expert_buckets:
+            # Every Actor rank has the same cold-qualified PP-global selection.
+            # Filter before PP broadcast and TP gather, not after conversion.
+            skipped = getattr(self, "_shard_p2p_skip_names", frozenset())
+            bucket_infos = [info for info in bucket_infos if info.name not in skipped]
+            if not bucket_infos:
+                continue
             if trim_tp_size and backup_done is not None:
                 for info in bucket_infos:
                     if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):

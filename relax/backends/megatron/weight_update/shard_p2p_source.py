@@ -234,6 +234,9 @@ def local_expert_plan(
 class MegatronShardP2PSource:
     """Describe qualified training views and rebind each fresh snapshot."""
 
+    has_experts = True
+    has_ordinary = False
+
     def __init__(self, iterator, layout, *, process_group, num_layers: int, qualified: bool) -> None:
         self.iterator, self.layout = iterator, layout
         self.group = process_group
@@ -438,9 +441,21 @@ def create_shard_p2p_synchronizer(owner):
         and hasattr(owner._hf_weight_iterator, "get_non_expert_hf_weight_chunks")
         and getattr(owner, "_expert_ipc_receiver_support", False)
     )
-    source = MegatronShardP2PSource(
-        owner._hf_weight_iterator, layout, process_group=group, num_layers=owner.args.num_layers, qualified=qualified
-    )
+    source = None
+    if getattr(owner, "_colocate_expert_ipc_enabled", False):
+        source = MegatronShardP2PSource(
+            owner._hf_weight_iterator,
+            layout,
+            process_group=group,
+            num_layers=owner.args.num_layers,
+            qualified=qualified,
+        )
+    if getattr(owner, "_colocate_tp_ipc_enabled", False):
+        from .combined_shard_source import CombinedShardSource
+
+        source = CombinedShardSource(owner, process_group=group, expert=source)
+    if source is None:
+        raise ValueError("No qualified shard P2P source")
     return ShardP2PSynchronizer(
         source,
         process_group=group,
