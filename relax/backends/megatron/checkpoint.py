@@ -765,6 +765,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         except AssertionError as e:
             if "OptimizerParamScheduler" in str(e):
                 raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
+            if load_optimizer and str(e).startswith("Number of unpadded elements in each bucket need to be the same"):
+                raise RuntimeError(
+                    f"Cannot resume optimizer state from {iter_dir}: {e}\n"
+                    "Resume with the original parameter precision and DDP bucket settings. To start from the saved "
+                    f"model weights with a new optimizer, use --load {load_path} --finetune --save <new-directory>."
+                ) from e
             raise
     else:
         if not exist:

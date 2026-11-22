@@ -64,16 +64,19 @@ def test_minimax_forward_returns_tensor_when_labels_are_absent():
 
 
 @pytest.mark.parametrize(
-    "multimodal_keys,lora_rank,lora_scope,allowed",
+    "multimodal_keys,lora_rank,lora_scope,frozen_vision,allowed",
     [
-        ({"image": "images"}, 0, "all", False),
-        ({"image": "images"}, 16, "all", False),
-        ({"image": "images"}, 16, "language", True),
-        (None, 0, "all", True),
+        ({"image": "images"}, 0, "all", False, False),
+        ({"image": "images"}, 16, "all", False, False),
+        ({"image": "images"}, 16, "language", False, True),
+        (None, 0, "all", False, False),
+        (None, 0, "all", True, True),
     ],
 )
-def test_minimax_overlapped_grad_reduce_checks_trainable_vision(multimodal_keys, lora_rank, lora_scope, allowed):
-    provider = SimpleNamespace(freeze_vision_model=False, freeze_vision_projection=False)
+def test_minimax_overlapped_grad_reduce_checks_trainable_vision(
+    multimodal_keys, lora_rank, lora_scope, frozen_vision, allowed
+):
+    provider = SimpleNamespace(freeze_vision_model=frozen_vision, freeze_vision_projection=frozen_vision)
     args = SimpleNamespace(
         loss_type="sft",
         multimodal_keys=multimodal_keys,

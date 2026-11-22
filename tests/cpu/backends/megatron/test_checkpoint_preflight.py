@@ -176,6 +176,26 @@ def test_checkpoint_missing_optimizer_requires_explicit_reset(monkeypatch, tmp_p
     assert calls == []
 
 
+def test_checkpoint_optimizer_bucket_mismatch_explains_weights_only_restart(monkeypatch, tmp_path):
+    directory = tmp_path / "iter_0000007"
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
+    save({"optimizer.state.exp_avg.weight": torch.ones(2)}, checkpoint_id=directory)
+    args = Namespace(load=str(tmp_path), ckpt_format="torch_dist")
+    _stub_loaders(monkeypatch, args)
+    original = AssertionError(
+        "Number of unpadded elements in each bucket need to be the same in current run ([2, 1]) and checkpoint ([3])"
+    )
+
+    def load_megatron(**kwargs):
+        raise original
+
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", load_megatron)
+    with pytest.raises(RuntimeError, match="--finetune --save <new-directory>") as error:
+        checkpoint.load_checkpoint(None, object(), None, {}, False)
+    assert error.value.__cause__ is original
+    assert str(directory) in str(error.value)
+
+
 def test_checkpoint_release_remains_an_explicit_weights_only_source(monkeypatch, tmp_path):
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("release")
     save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "release")
