@@ -368,7 +368,9 @@ async def test_buffered_native_route_releases_only_for_returned_owner(published,
     args, sample, producer = native_write
     await producer.adopt_native_response(sample, args, {"routed_experts": ref.to_dict()})
     buffer = RolloutDataSourceWithBuffer(
-        SimpleNamespace(rollout_global_dataset=False, buffer_filter_path=None, n_samples_per_prompt=1)
+        SimpleNamespace(
+            rollout_global_dataset=False, use_streaming_dataset=False, buffer_filter_path=None, n_samples_per_prompt=1
+        )
     )
     groups = [[sample]]
     producer.manager.handoff_buffered_routes(groups)
