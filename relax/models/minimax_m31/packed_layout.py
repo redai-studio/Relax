@@ -1,5 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Adapted from Miles, commit 3a7659a4, under the Apache License, Version 2.0.
+# Copyright 2025-2026 RadixArk, Inc. (Miles).
+# Copyright 2025 Zhipu AI (Slime).
+# SPDX-License-Identifier: Apache-2.0
+# Adapted for Relax from Miles (https://github.com/radixark/miles), commit 3a7659a4.
+# Miles includes software developed from Slime (https://github.com/THUDM/slime).
 
 from collections.abc import Sequence
 
