@@ -242,13 +242,16 @@ class BroadcastTargets(TorchDispatchMode):
             if argument.alias_info is None or not argument.alias_info.is_write:
                 continue
             value = args[i] if i < len(args) else kwargs.get(argument.name)
-            if isinstance(value, torch.Tensor) and value.layout == torch.strided:
-                span = _byte_span(value)
-                if span is not None and value.device in self.starts:
-                    idx = bisect_right(self.ends[value.device], span[0])
-                    starts = self.starts[value.device]
+            # Batched ATen operators declare a writable Tensor[] argument.
+            for tensor in (value,) if isinstance(value, torch.Tensor) else tree_leaves(value):
+                if not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided:
+                    continue
+                span = _byte_span(tensor)
+                if span is not None and tensor.device in self.starts:
+                    idx = bisect_right(self.ends[tensor.device], span[0])
+                    starts = self.starts[tensor.device]
                     if idx < len(starts) and starts[idx] < span[1]:
-                        self.writes.setdefault(value.device, []).append((*span, self.name))
+                        self.writes.setdefault(tensor.device, []).append((*span, self.name))
         if self.source is not None and self.supported:
             if func == torch.ops.aten.copy_.default:
                 dest, source = args[:2]

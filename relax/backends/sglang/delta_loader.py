@@ -30,7 +30,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.sparse_tensor import FullTensorRequired, SparseTensor, storage_identity
 
 from .delta_capability import declared_copy_layout, full_loader_inputs, requires_full_input, sparse_loader_identity
-from .delta_model_loaders import stock_rank_skips_input
+from .delta_model_loaders import stock_observed_experts_only, stock_rank_skips_input
 from .delta_shard_layout import BroadcastTargets, ShardFrame, marked_ordinals, validate_transport_storage
 from .delta_target_lane import ExpertTargets
 
@@ -140,6 +140,7 @@ class DeltaReceiver:
         self._broadcast_plan: BroadcastTargets | None = None
         self._capture: BroadcastTargets | None = None
         self._declared: tuple | None = None
+        self._observed_only = False
         self._seed_directory: tuple = ()
         self.target_shard_metrics: dict | None = None
 
@@ -173,6 +174,7 @@ class DeltaReceiver:
             raise ValueError("Reallocated sparse model storage requires a new FULL seed")
         self.capability = capability
         self._declared = declared_copy_layout(self.model)
+        self._observed_only = self._declared is not None or stock_observed_experts_only(self.model)
         self._capture = BroadcastTargets(self.model) if control["seed"] and capability is not None else None
         if capability is not None:
             self.full_only.update(full_loader_inputs(self.model))
@@ -486,9 +488,9 @@ class DeltaReceiver:
             plan = self._target_plan
             lane_ordinals = frozenset(marked_ordinals(marker, plan.rank, len(metadata["tensors"])))
             local = lane_ordinals
-            # Declared loaders accept sparse data only through observed copies.
+            # Observation-only loaders require a bound region for each sparse input.
             # Unmarked slots in a mixed lane keep their original HF coordinates.
-            if self._declared is not None:
+            if self._observed_only:
                 local = local.union(
                     i
                     for i, entry in enumerate(metadata["tensors"])
@@ -501,8 +503,8 @@ class DeltaReceiver:
                 i for i, entry in enumerate(metadata["tensors"]) if not entry["full"] and entry["name"] in plan.targets
             )
             if local and (not plan.current(self, raw, status) or not status.is_contiguous()):
-                if self._declared is not None:
-                    raise FullTensorRequired("Declared copy layout changed before installation")
+                if self._observed_only:
+                    raise FullTensorRequired("Observed copy layout changed before installation")
                 self._broadcast_plan, plan, local = None, None, frozenset()
         if pending is None:
             self._admit(metadata, raw, local, ipc_directory_bytes)
@@ -567,7 +569,7 @@ class DeltaReceiver:
             raise FullTensorRequired("Receiver loader/layout capability changed before sparse installation")
         full_group = all(entry["full"] for entry, _, _ in entries)
         full_required = self.capability is None
-        if self._declared is not None and any(
+        if self._observed_only and any(
             not entry["full"] and i not in local for i, (entry, _, _) in enumerate(entries)
         ):
             raise FullTensorRequired("Sparse input has no acknowledged copy region")
@@ -606,10 +608,14 @@ class DeltaReceiver:
                 # turn an unobserved copy into an acknowledged local no-op.
                 if name in self.full_only or (
                     self._capture.targets.get(name) is None
-                    and (self._declared is not None or not stock_rank_skips_input(self.model, name))
+                    and (
+                        self._declared is not None
+                        or (self._observed_only and name not in self._capture.targets)
+                        or not stock_rank_skips_input(self.model, name)
+                    )
                 ):
                     self._capture.targets.pop(name, None)
-                    if self._declared is not None:
+                    if self._observed_only:
                         self.full_only.add(name)
         if full_required:
             self.full_only.update(entry["name"] for entry, _, _ in entries)
@@ -649,7 +655,7 @@ class DeltaReceiver:
                 if direct:
                     plan = shard.plan
                     plan.check_run(self.model, batch)
-                    if (recheck or self._declared is not None) and (
+                    if (recheck or self._observed_only) and (
                         not plan.current(self, raw, status) or sparse_loader_identity(self.model) != self.capability
                     ):
                         raise FullTensorRequired("Ordinary loader changed the admitted destination")
@@ -726,7 +732,7 @@ class DeltaReceiver:
                 and not self.force_full_seed
             ):
                 self._broadcast_plan = self._capture
-            elif self._declared is not None or (self._capture and self._capture.conflicts - self.full_only):
+            elif self._observed_only or (self._capture and self._capture.conflicts - self.full_only):
                 self.force_full_seed = True
                 self.full_only.update(schema)
             self._capture = None

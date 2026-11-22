@@ -248,6 +248,20 @@ class ShardDeltaExporter:
             if any(errors):
                 raise RuntimeError(f"Delta weight synchronization failed across source ranks: {errors}")
 
+        # Both production callers pass their Gloo metadata group. Keep control
+        # on the host there, even when the conversion itself runs on CUDA.
+        control_device = "cuda" if world > 1 and dist.get_backend(group) == "nccl" else "cpu"
+
+        def reduce_control(error: Exception | None, count: bool = False) -> int:
+            failed, total = int(error is not None), int(count)
+            if world > 1:
+                state = torch.tensor([failed, total], dtype=torch.int32, device=control_device)
+                dist.all_reduce(state, op=dist.ReduceOp.SUM, group=group)
+                failed, total = state.tolist()
+            if failed:
+                agree(error)
+            return total
+
         warm_pool = warm_spare = None
         try:
             status = [None, False]
@@ -277,18 +291,6 @@ class ShardDeltaExporter:
             seed = status[0]
             self._target_shards = status[1] is True and not seed
             constraints = set()
-
-            def drain_previous_frame() -> None:
-                # Called by every rank at the same point in the export. A TCP
-                # consumer error must reach the whole group before we admit
-                # another frame or publish the final version.
-                error = None
-                if rank == 0:
-                    try:
-                        constraints.update(self.transfer.drain_frame())
-                    except Exception as exc:
-                        error = exc
-                agree(error)
 
             error = None
             try:
@@ -358,11 +360,9 @@ class ShardDeltaExporter:
                         raise ValueError("Measured source conversion workspace exceeds its configured GPU budget")
                 except Exception as exc:
                     error = exc
-                agree(error)
-                finished = [None] * world
-                dist.all_gather_object(finished, chunk is None, group=group)
-                if any(finished):
-                    if not all(finished):
+                finished = reduce_control(error, chunk is None)
+                if finished:
+                    if finished != world:
                         raise ValueError("Source converters disagree on the complete HF group directory")
                     if not pack:
                         break
@@ -386,18 +386,14 @@ class ShardDeltaExporter:
                             metadata, raw = frame
                             if self.sender_pipeline_active:
                                 self.transfer.prepare_frame(raw)
+                                constraints.update(self.transfer.drain_frame())
                     except Exception as exc:
                         error = exc
-                agree(error)
-                if pack:
-                    available = [frame is not None]
-                    dist.broadcast_object_list(available, src=source_rank, group=group)
-                    if not available[0]:
-                        if chunk is None:
-                            break
-                        continue
-                if self.sender_pipeline_active:
-                    drain_previous_frame()
+                available = reduce_control(error, frame is not None)
+                if not available:
+                    if chunk is None:
+                        break
+                    continue
                 error = None
                 if rank == 0:
                     try:
@@ -407,7 +403,7 @@ class ShardDeltaExporter:
                             constraints.update(self.transfer.send(metadata, raw, defer_ordered=True))
                     except Exception as exc:
                         error = exc
-                agree(error)
+                reduce_control(error)
                 if defer_spare:
                     # The FULL bucket has fenced its broadcast and handed the
                     # ordinary receiver ACK to the install worker on rank zero.
@@ -422,7 +418,13 @@ class ShardDeltaExporter:
                 # A converter can finish without yielding any wire frame.
                 start_spare()
             if self.sender_pipeline_active:
-                drain_previous_frame()
+                error = None
+                if rank == 0:
+                    try:
+                        constraints.update(self.transfer.drain_frame())
+                    except Exception as exc:
+                        error = exc
+                agree(error)
             if first_live_seed:
                 try:
                     if warm_spare is not None:

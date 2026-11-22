@@ -29,13 +29,28 @@ def _routed_only(model: Any) -> bool:
     return type(model) is cls and getattr(model.load_weights, "__func__", None) is cls.load_weights
 
 
-def stock_requires_full_input(model: Any, name: str) -> bool:
-    """Only routed expert inputs of the Qwen3.5 conditional loader are
-    reviewed.
+def stock_observed_experts_only(model: Any) -> bool:
+    """The GLM dispatcher requires an observed direct copy for each sparse
+    expert."""
+    module = sys.modules.get("sglang.srt.models.glm4_moe_lite")
+    cls = getattr(module, "Glm4MoeLiteForCausalLM", None)
+    return type(model) is cls and getattr(model.load_weights, "__func__", None) is cls.load_weights
 
-    Gated DeltaNet, vision, shared experts and fused attention retain their
-    ordinary dense inputs, including the original invocation and ordering.
-    """
+
+def stock_requires_full_input(model: Any, name: str) -> bool:
+    """Keep every non-routed input on the model's original dense iterator."""
+    if stock_observed_experts_only(model):
+        match = _ROUTED_INPUT.fullmatch(name)
+        if match is None or not name.startswith("model.layers.") or match[2] is None:
+            return True
+        layer, expert = map(int, match.groups())
+        config = model.config
+        return not (
+            config.moe_layer_freq == 1
+            and config.first_k_dense_replace <= layer < config.num_hidden_layers
+            and type(config.n_routed_experts) is int
+            and expert < config.n_routed_experts
+        )
     if not _routed_only(model):
         return False
     match = _ROUTED_INPUT.fullmatch(name)
@@ -48,6 +63,10 @@ def stock_requires_full_input(model: Any, name: str) -> bool:
 
 
 def stock_loader_scope(model: Any, function: Any) -> str | None:
+    if getattr(model, "quant_config", None) is not None:
+        return None
+    if stock_observed_experts_only(model):
+        return "glm_experts"
     known = []
     for module_name, class_name in (
         ("sglang.srt.models.llama", "LlamaForCausalLM"),
@@ -59,7 +78,7 @@ def stock_loader_scope(model: Any, function: Any) -> str | None:
         if cls is not None:
             known.append(cls.load_weights)
     routed_only = _routed_only(model)
-    if (function not in known and not routed_only) or getattr(model, "quant_config", None) is not None:
+    if function not in known and not routed_only:
         return None
     return "experts" if routed_only else "ordinary"
 
@@ -72,7 +91,21 @@ def stock_rank_skips_input(model: Any, name: str) -> bool:
     if not isinstance(start, int) or not isinstance(end, int):
         return False
     match = re.fullmatch(r"(?:model\.)?(?:language_model\.)?layers\.(\d+)\..+", name)
-    return match is not None and not start <= int(match[1]) < end
+    if match is None or start <= int(match[1]) < end:
+        return False
+    if stock_observed_experts_only(model):
+        # GLM skips a missing expert destination in params_dict, without an
+        # explicit PP-range filter. Confirm that this exact off-stage slot is absent.
+        if stock_requires_full_input(model, name):
+            return False
+        parent = name[: name.index(".experts.") + len(".experts")]
+        param = "w2_weight" if name.endswith(".down_proj.weight") else "w13_weight"
+        try:
+            model.get_parameter(f"{parent}.{param}")
+        except AttributeError:
+            return True
+        return False
+    return True
 
 
 def stock_routed_module(name: str) -> bool:
@@ -217,9 +250,9 @@ def stock_loader_identity(model: Any, function: Any, aliased: frozenset[str]) ->
     scope = stock_loader_scope(model, function)
     if scope is None:
         return None
-    routed_only = scope == "experts"
+    routed_only = scope in {"experts", "glm_experts"}
     if routed_only:
-        # The conditional loader explicitly keeps duplicate parameter names.
+        # Check physical aliases across every name, including dense writers.
         # A separately loaded dense alias must never overwrite a sparse target.
         tensors = (*model.named_parameters(remove_duplicate=False), *model.named_buffers(remove_duplicate=False))
         seen = set()
@@ -258,7 +291,42 @@ def stock_loader_identity(model: Any, function: Any, aliased: frozenset[str]) ->
         return None  # AITER post-load shuffling is a different storage contract.
     methods = (UnquantizedEmbeddingMethod, UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
     identity = [function, getattr(getattr(model, "config", None), "tie_word_embeddings", None)]
-    if routed_only:
+    if scope == "glm_experts":
+        # The causal dispatcher unconditionally rebuilds local MLA K/V caches
+        # through this hook, even for an empty (direct-only) input iterator.
+        native = sys.modules.get("sglang.srt.models.deepseek_common.deepseek_weight_loader")
+        mixin = getattr(native, "DeepseekV2WeightLoaderMixin", None)
+        config = model.config
+        post = getattr(model, "post_load_weights", None)
+        if (
+            mixin is None
+            or getattr(post, "__func__", None) is not getattr(mixin, "post_load_weights", None)
+            or getattr(post, "__self__", None) is not model
+            or any(
+                getattr(bound, "__func__", None) is not expected or getattr(bound, "__self__", None) is not model
+                for bound, expected in (
+                    (model.named_parameters, torch.nn.Module.named_parameters),
+                    (model.get_parameter, torch.nn.Module.get_parameter),
+                )
+            )
+            or not 0 <= model.model.start_layer <= model.model.end_layer <= config.num_hidden_layers
+            or getattr(config, "architectures", None) != ["Glm4MoeLiteForCausalLM"]
+            or config.moe_layer_freq != 1
+            or model.num_fused_shared_experts != 0
+        ):
+            return None
+        identity.extend(
+            (
+                post.__func__,
+                config.n_routed_experts,
+                config.num_hidden_layers,
+                config.first_k_dense_replace,
+                config.moe_layer_freq,
+                model.num_fused_shared_experts,
+                getattr(config, "num_nextn_predict_layers", None),
+            )
+        )
+    if scope == "experts":
         if (
             model.enable_shared_expert_fusion
             or model.config.encoder_only
@@ -321,7 +389,7 @@ def stock_loader_identity(model: Any, function: Any, aliased: frozenset[str]) ->
 
             if not expert_layout_checked:
                 metadata = get_global_expert_location_metadata()
-                if metadata is not None:
+                if metadata is not None or scope == "glm_experts":
                     try:
                         from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -333,16 +401,27 @@ def stock_loader_identity(model: Any, function: Any, aliased: frozenset[str]) ->
                             and not policy.is_ep_scale_joiner
                             and get_parallel().max_ep_size is None
                             and policy.moe_a2a_backend == "none"
+                            and (scope != "glm_experts" or policy.ep_num_redundant_experts == 0)
                         )
                     except (ImportError, AttributeError):
                         return None
                     if not supported:
                         return None
+                if metadata is not None:
                     layout = _trivial_expert_layout(metadata)
                     if layout is None:
                         return None
                     identity.append(("static_expert_layout", layout))
                 expert_layout_checked = True
+            if scope == "glm_experts" and (
+                type(method) is not UnquantizedFusedMoEMethod
+                or module._num_global_routed != config.n_routed_experts
+                or module._num_local_routed * module.moe_ep_size != config.n_routed_experts
+                or module.num_fused_shared_experts != 0
+                or module._has_fused_shared
+                or module.num_local_experts != module._num_local_routed
+            ):
+                return None
             if metadata is not None and vars(metadata)["ep_size"] != module.moe_ep_size:
                 return None
         try:

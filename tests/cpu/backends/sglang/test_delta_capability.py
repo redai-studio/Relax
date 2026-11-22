@@ -429,6 +429,50 @@ def test_overlapping_seed_writes_require_full_even_for_transient_dlpack_destinat
     assert ack[0] == 1 and torch.equal(model.weight, torch.ones(4))
 
 
+def test_tensor_list_writer_preserves_unchanged_words_of_later_alias():
+    from relax.distributed.weight_sync.codec import schema_digest
+
+    class Batched(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+        def load_weights(self, items):
+            for name, value in items:
+                if name == "batched":
+                    torch._foreach_copy_([self.weight], [value])
+                else:
+                    self.weight.copy_(value)
+
+        load_weights.relax_copy_layout = lambda model: (1, frozenset({"last"}))
+
+    model, reference = Batched(), Batched()
+    schema = {name: ((4,), "float32") for name in ("batched", "last")}
+    required = [True, True]
+    for version in (0, 1):
+        seed = version == 0
+        begin(model, str(version), seed=seed, base=None if seed else "0")
+        inputs = [("batched", torch.full((4,), 1.0 + version)), ("last", torch.tensor([3.0 + version, 3, 3, 3]))]
+        reference.load_weights(inputs)
+        entries = []
+        for full, (name, value) in zip(required, inputs, strict=True):
+            positions = None if full else torch.tensor([0], dtype=torch.int32)
+            entries.append((name, (4,), value.dtype, positions, value if full else value[:1]))
+        meta, raw = encode(entries, max_bytes=128)
+        status = torch.empty(3, dtype=torch.uint8)
+        control = dict(op="consume", version=str(version), frame=0, metadata=meta)
+        load_delta_weights(model, [(json.dumps(control), raw), ("__delta_capability__", status[:2])])
+        final = dict(op="finalize", version=str(version), frames=1)
+        ack = []
+        if seed:
+            final.update(full_required_count=2, full_required_schema=schema_digest(schema))
+            ack.append(("__delta_capability__", status))
+        load_delta_weights(model, [(json.dumps(final), torch.empty(0)), *ack])
+        if seed:
+            required = status[1:].tolist()
+        assert torch.equal(model.weight.view(torch.int32), reference.weight.view(torch.int32))
+
+
 def test_declared_dispatcher_setup_cannot_redirect_a_seeded_write():
     class Rebinding(torch.nn.Module):
         def __init__(self):
