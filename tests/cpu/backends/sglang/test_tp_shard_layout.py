@@ -189,6 +189,98 @@ def test_alias_or_custom_loader_falls_back_as_complete_component():
     assert "model.language_model.layers.0.mlp.gate_proj.weight" in reply["selected_hf"]
 
 
+def test_native_full_copy_modules_match_row_sharded_sources():
+    native = pytest.importorskip("sglang.srt.models.gemma3_causal")
+    from sglang.srt.layers.linear import ReplicatedLinear
+    from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.embed_tokens_per_layer = native.Gemma3TextScaledWordEmbedding(8, 6, 0, embed_scale=16.0).to(
+        dtype=torch.bfloat16
+    )
+    model.model.embed_tokens = native.Gemma3TextScaledWordEmbedding(8, 6, 0, embed_scale=4.0).to(dtype=torch.bfloat16)
+    model.lm_head = model.model.embed_tokens
+    model.model.per_layer_model_projection = ReplicatedLinear(4, 6, bias=False, params_dtype=torch.bfloat16)
+    values = {
+        name.replace("model.", "model.language_model.", 1): torch.arange(value.numel(), dtype=torch.bfloat16).view(
+            value.shape
+        )
+        for name, value in model.named_parameters()
+    }
+    reply = describe_tp_targets(model, _description(values), 1)
+    assert reply["selected_hf"] == sorted(values)
+    actual = {name: torch.zeros_like(value) for name, value in model.named_parameters()}
+    for write in reply["writes"]:
+        source = values[write["hf"]].chunk(2)[write["source_rank"]].contiguous()
+        copy_rectangle(source, actual[write["param"]], write)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            address = param.untyped_storage().data_ptr()
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            loader(param, values[name.replace("model.", "model.language_model.", 1)])
+            assert torch.equal(param, actual[name])
+            assert param.untyped_storage().data_ptr() == address
+    conflicting = dict(values, **{"lm_head.weight": torch.ones_like(model.lm_head.weight)})
+    for description in (_description(conflicting), _description(values)):
+        # A second producer also conflicts when it has only a native fallback.
+        description["native_specs"]["lm_head.weight"] = dict(shape=[8, 6], dtype=str(torch.bfloat16))
+        conflict = describe_tp_targets(model, description, 1)
+        assert "model.language_model.embed_tokens.weight" not in conflict["selected_hf"]
+        assert "lm_head.weight" not in conflict["selected_hf"]
+    model.tied = torch.nn.Parameter(model.model.embed_tokens_per_layer.weight.detach())
+    model.model.per_layer_model_projection.weight.weight_loader = lambda *args: None
+    assert describe_tp_targets(model, _description(values), 1)["selected_hf"] == [
+        "model.language_model.embed_tokens.weight"
+    ]
+
+
+@pytest.mark.parametrize("vl_prefix", [False, True])
+def test_mixed_model_copies_bf16_fusions_and_keeps_scale_dependency_native(vl_prefix):
+    from relax.backends.sglang.tp_shard_adapters import target_parameter
+
+    model = torch.nn.Module()
+    for name in ("lm_head.weight", "language_model.lm_head.weight"):
+        assert target_parameter(model, name) == (name, None)
+    model.model = Qwen3_5ForConditionalGeneration().model
+    values = {
+        (name if vl_prefix else name.replace("model.language_model.", "model.")): value
+        for name, value in _values().items()
+        if not name.startswith("model.visual.")
+    }
+    description = _description(values)
+    reply = describe_tp_targets(model, description, 1)
+    assert reply["selected_hf"] == sorted(values)
+    # A source view whose receiver needs a custom loader closes the whole group.
+    values["weight_scale"] = torch.ones((4, 4), dtype=torch.bfloat16)
+    description = _description(values)
+    for record in description["records"]:
+        record["groups"]["quantized"] = [next(name for name in values if "down_proj" in name), "weight_scale"]
+    reply = describe_tp_targets(model, description, 1)
+    assert reply["selected_hf"] == sorted(
+        name for name in values if "down_proj" not in name and name != "weight_scale"
+    )
+
+
+def test_single_rank_replicated_bridge_view_is_a_full_storage_rectangle():
+    from relax.backends.megatron.weight_update.tp_shard_source import local_tp_regions
+
+    parameter = torch.arange(16, dtype=torch.bfloat16).view(4, 4)
+    view = SimpleNamespace(
+        weight=parameter, shard_dim=None, shard_group="replicated", global_weight_shape=(4, 4), name="embed.weight"
+    )
+    task = SimpleNamespace(
+        mapping=SimpleNamespace(tp_rank=0, tp_size=1, local_hf_params=lambda *args, **kwargs: [view]),
+        global_param_name="embed",
+        megatron_module=None,
+    )
+    (region,) = local_tp_regions("embed", parameter, task, 0, 1)
+    assert (region["global_shape"], region["offset"], region["shape"]) == ([4, 4], [0, 0], [4, 4])
+    task.mapping.tp_size = 2
+    with pytest.raises(NotImplementedError):
+        local_tp_regions("embed", parameter, task, 0, 2)
+
+
 def test_qwen3_5_moe_refresh_is_explicit():
     from relax.backends.sglang.tp_shard_adapters import needs_native_refresh
 
