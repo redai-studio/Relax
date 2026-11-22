@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+moe_layer_freq="$(jq -cn '[range(60) | if . < 3 then 0 else 1 end]')"
 MODEL_ARGS=(
-   --num-layers "${1:-4}"
+   --num-layers 60
    --hidden-size 6144
    --ffn-hidden-size 3072
    --num-attention-heads 64
@@ -19,7 +20,7 @@ MODEL_ARGS=(
    --untie-embeddings-and-output-weights
    --swiglu
    --num-experts 128
-   --moe-layer-freq "${2:-[0,0,1,1]}"
+   --moe-layer-freq "$moe_layer_freq"
    --moe-router-topk 4
    --moe-ffn-hidden-size 3072
    --moe-shared-expert-intermediate-size 3072
