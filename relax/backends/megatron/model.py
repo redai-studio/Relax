@@ -1762,8 +1762,13 @@ def train_one_step(
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
-    """Block forward pre-hook for certain configurations."""
-    return args.use_distributed_optimizer and args.overlap_param_gather
+    """Toggle DDP's optimizer gather hooks.
+
+    Megatron FSDP manages its own unshard hooks.
+    """
+    return (
+        args.use_distributed_optimizer and args.overlap_param_gather and not getattr(args, "use_megatron_fsdp", False)
+    )
 
 
 def train(
@@ -1808,7 +1813,8 @@ def train(
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.
-    if isinstance(model[0], DDP) and args.overlap_grad_reduce and config.no_sync_func is None:
+    handles_grad_sync = isinstance(model[0], DDP) or getattr(args, "use_megatron_fsdp", False)
+    if handles_grad_sync and args.overlap_grad_reduce and config.no_sync_func is None:
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]

@@ -1866,6 +1866,22 @@ diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_para
          tp_group = expert_tp_group
      # Prefer provided tp_group when available (new explicit path).
      if tp_group is not None:
+@@ -219,3 +222,6 @@
++    # Model-specific lookup kernels share the TP masking and collectives below.
++    _embedding_lookup = staticmethod(F.embedding)
++
+     def __init__(
+         self,
+         num_embeddings: int,
+@@ -306,7 +312,7 @@
+             output_parallel = self.weight[masked_input]
+         else:
+             # F.embedding currently has a non-deterministic backward function
+-            output_parallel = F.embedding(masked_input, self.weight)
++            output_parallel = self._embedding_lookup(masked_input, self.weight)
+         # Mask the output embedding.
+         if self.tp_group.size() > 1:
+             output_parallel[input_mask, :] = 0.0
 diff --git a/megatron/bridge/peft/recompute.py b/megatron/bridge/peft/recompute.py
 --- a/megatron/bridge/peft/recompute.py
 +++ b/megatron/bridge/peft/recompute.py
@@ -10519,4 +10535,61 @@ index a78479272..769dc7422 100644
 +        help='MCore common options (shared_expert_mode) and backend-specific MoE '
 +        'megakernel options as a JSON object.',
      )
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ import functools
+ import math
++import os
+ from dataclasses import dataclass
+ from typing import List, Optional, Sequence, Tuple, Union
+@@ -1611,6 +1612,15 @@
+     if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
+         return 256
+     if config.fp8:
++        # TE's cuBLASLt grouped MXFP8 quantizer requires 128-row scale tiles.
++        # HybridEP inserts the zero-probability padding as part of dispatch.
++        if (
++            config.fp8_recipe == "mxfp8"
++            and os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM") == "1"
++            and config.moe_token_dispatcher_type == "flex"
++            and config.moe_flex_dispatcher_backend == "hybridep"
++        ):
++            return 128
+         return get_fp8_align_size(config.fp8_recipe)
+     if config.fp4:
+         return get_fp4_align_size(config.fp4_recipe)
+diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+--- a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
++++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+@@ -649,7 +649,13 @@
+                     if param.grad is not None:
++                        grad = to_local_if_dtensor(param.grad)
+                         if self.report_nan_in_param_grad:
+-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
++                            _check_nan_in_grad(grad.coalesce().values() if grad.is_sparse else grad)
+                         # Copy the gradient into the allocated main gradient bucket.
+                         # It will be reduce-scattered and accumulated into gbuf.
+-                        param.main_grad.copy_(to_local_if_dtensor(param.grad))
++                        if grad.is_sparse:
++                            # The communication bucket is reused. Clear untouched rows
++                            # before inserting a sparse embedding gradient.
++                            param.main_grad.zero_().add_(grad)
++                        else:
++                            param.main_grad.copy_(grad)
+                         del param.grad
+@@ -661,4 +667,5 @@
+                     if param.grad is not None:
++                        grad = to_local_if_dtensor(param.grad)
+                         if self.report_nan_in_param_grad:
+-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
++                            _check_nan_in_grad(grad.coalesce().values() if grad.is_sparse else grad)
+                         # Accumulate the gradient into the main gradient buffer,
+@@ -666,3 +673,3 @@
+                         param.main_grad = param.get_main_grad()
+-                        param.main_grad.add_(to_local_if_dtensor(param.grad))
++                        param.main_grad.add_(grad)
+                         del param.grad
 # END blackwell

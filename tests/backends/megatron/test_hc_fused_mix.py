@@ -183,6 +183,14 @@ def test_hc_fusion_production_width_dynamic_tokens(runtime, combine):
     torch.manual_seed(42)
     model = make(combine, hidden_size=2560, rank=320)
     for rows in (11, 19):
+        if rows == 19:
+            # Reuse the compiled graph after FSDP republishes an existing
+            # Parameter at a one-element offset in a contiguous BF16 buffer.
+            norm = model.hc_norm.weight
+            flat = norm.new_empty(norm.numel() + 1)
+            with torch.no_grad():
+                norm.set_(flat[1:].copy_(norm))
+            assert norm.data_ptr() % 16 == norm.element_size()
         x = torch.randn(rows, 1, 10240, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         expected = tuple(t for t in original(model, x) if t is not None)
         actual = tuple(t for t in model._mix(x) if t is not None)
@@ -191,6 +199,28 @@ def test_hc_fusion_production_width_dynamic_tokens(runtime, combine):
         actual_grads = torch.autograd.grad(actual, [x, *model.parameters()], grad_outputs=upstream)
         for a, b in zip((*actual, *actual_grads), (*expected, *expected_grads)):
             _close(a, b)
+
+
+@gpu
+def test_hc_mixer_cache_limit_preserves_output_and_gradients(runtime):
+    from torch import _dynamo
+
+    make, original = runtime
+    # With one entry, the decoder and output-mixer signatures cannot both
+    # compile. The second must still complete a real forward and backward.
+    _dynamo.reset_code(patch._qwen38_mix.__code__)
+    with _dynamo.config.patch(recompile_limit=1):
+        for combine in (True, False):
+            model = make(combine, hidden_size=2560, rank=320)
+            x = torch.randn(13, 1, 10240, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            actual = tuple(t for t in patch.fused_mix(model, x) if t is not None)
+            expected = tuple(t for t in original(model, x) if t is not None)
+            upstream = tuple(torch.randn_like(t) * 0.01 for t in expected)
+            inputs = (x, *model.parameters())
+            actual_grad = torch.autograd.grad(actual, inputs, grad_outputs=upstream)
+            expected_grad = torch.autograd.grad(expected, inputs, grad_outputs=upstream)
+            for a, b in zip((*actual, *actual_grad), (*expected, *expected_grad)):
+                _close(a, b)
 
 
 @gpu

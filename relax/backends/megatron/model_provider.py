@@ -617,6 +617,10 @@ def get_model_provider_func(
                 from relax.models.qwen3_8.precision import configure_fp8
 
                 configure_fp8(model, args)
+                if Envs.RELAX_QWEN38_PLE_COMPACT_GRAD:
+                    from relax.models.qwen3_8.ops.ple_row_grad import configure as configure_ple_row_grad
+
+                    configure_ple_row_grad(model, args)
             configure_gdn_a_log_fp32(model)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
