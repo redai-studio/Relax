@@ -221,6 +221,7 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     args.calculate_per_token_loss = calculate_per_token_loss
     args.task_type = "causal_lm"
     args.loss_type = "rm" if reward_model else "policy_loss"
+    args.advantage_estimator = None
     calls = {"optimizer": 0, "scheduler": [], "capture_begin": 0, "capture_end": 0, "critic_update_successful": []}
     token_count = 0.0 if zero_tokens else 4.0
     numerator = 0.0 if zero_tokens else 12.0
