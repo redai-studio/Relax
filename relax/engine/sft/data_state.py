@@ -47,6 +47,8 @@ def _signature(config: Any, size: int) -> str:
     # Preserve legacy checkpoint signatures when the new opt-in is disabled.
     if getattr(config, "sft_mask_reasoning", False):
         value["sft_mask_reasoning"] = True
+    if getattr(config, "loss_type", None) == "lightning_opd":
+        value["loss_type"] = config.loss_type
     value["train_size"] = size
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 

@@ -18,7 +18,13 @@ orchestrator. Three responsibilities:
 from argparse import Namespace
 from uuid import uuid4
 
-from relax.engine.sft.runtime import is_i2i_sft, is_offline_mode, is_preference_mode, resolve_sft_eval_split
+from relax.engine.sft.runtime import (
+    is_i2i_sft,
+    is_lightning_opd_mode,
+    is_offline_mode,
+    is_preference_mode,
+    resolve_sft_eval_split,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -75,7 +81,13 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
     config._sft_dataset_names = ()
     # Lazy import: pulling streaming dataset at module load would drag heavy
     # multimodal deps into every controller import.
-    if is_preference_mode(config):
+    if is_lightning_opd_mode(config):
+        from relax.engine.sft.dataset.lightning_opd import LightningOPDDataset
+
+        sizing_dataset = LightningOPDDataset(
+            config.prompt_data, prompt_key=config.input_key, metadata_key=config.metadata_key
+        )
+    elif is_preference_mode(config):
         from relax.engine.sft.dataset.preference import PreferenceStreamingDataset
 
         sizing_dataset = PreferenceStreamingDataset(
