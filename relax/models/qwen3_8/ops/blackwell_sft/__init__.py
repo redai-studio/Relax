@@ -55,6 +55,8 @@ def initialize_mfsdp(args: Namespace) -> None:
         raise ValueError(
             "The Blackwell SM103 MFSDP recipe requires BF16, DeepEPv2, one MTP layer, and unfused dense gradients"
         )
+    if args.offload_train:
+        raise ValueError("Expanded DeepEP dispatch requires resident expert process groups (--no-offload-train)")
     enable_mfsdp_persistent_head()
     fsdp_gather_groups.initialize(args)
     decoder_checkpoint.install(args)
