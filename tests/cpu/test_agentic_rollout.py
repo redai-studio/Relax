@@ -2268,7 +2268,7 @@ async def test_pause_abort_keeps_wire_id_until_ambiguous_generation_is_cleaned_u
 
 
 @pytest.mark.parametrize("managed", [False, True])
-async def test_parameter_rejection_fails_only_current_ir(monkeypatch, managed):
+async def test_parameter_rejection_fails_only_current_ir(monkeypatch, managed, caplog):
     shard, group, session, ir, _host, _manager = _managed_shard_session()
     if not managed:
         session.lora_key = None
@@ -2289,8 +2289,11 @@ async def test_parameter_rejection_fails_only_current_ir(monkeypatch, managed):
     runner = asyncio.create_task(shard._run_ir(session, ir))
     ir.runner_task = runner
     await asyncio.wait_for(runner, 1)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(httpx.HTTPStatusError) as exc:
         await ir.waiter
+    (record,) = (r for r in caplog.records if r.exc_info and r.exc_info[1] is exc.value)
+    assert record.exc_info[2] is not None
+    assert session.session_id in record.getMessage() and ir.request_id in record.getMessage()
     assert session.live_irs == {sibling}
     assert session.phase is service_mod.SessionPhase.ACTIVE
     assert not session.result_cell.terminal and not group.drop_committed

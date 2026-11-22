@@ -432,6 +432,7 @@ async def test_final_backfill_replenishes_aborted_groups(monkeypatch):
         timeout=2,
     )
 
+    assert result.partition_complete is True
     assert len(result.samples) == 1 and transfers[0][:2] == (0, True)
     assert [sample.abort_count for group in carry for sample in group if sample.status == Sample.Status.ABORTED] == [
         1,
@@ -464,7 +465,7 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
         global_batch_size=8,
     )
 
-    await asyncio.wait_for(
+    output, _ = await asyncio.wait_for(
         sglang_rollout.generate_rollout_async(
             args,
             rollout_id=1,
@@ -477,6 +478,7 @@ async def test_old_partition_is_paid_before_current(monkeypatch, max_staleness, 
     assert len(requests) == expected_requests
     assert transfers == ([(0, True, 1)] if max_staleness == 2 else [(0, True, 1), (1, True, 8)])
     assert state.last_step_current_deficit == expected_deficit
+    assert output.partition_complete is (expected_deficit == 0)
 
 
 @pytest.mark.parametrize("group_rm", [False, True])

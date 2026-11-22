@@ -1459,7 +1459,14 @@ async def _generate_rollout_async(
 
     state.reset()
 
-    return RolloutFnTrainOutput(samples=data, metrics=filter_metrics), aborted_samples
+    output = RolloutFnTrainOutput(
+        samples=data,
+        metrics=filter_metrics,
+        partition_complete=(committed_prev >= prev_target and committed_curr >= curr_target)
+        if args.fully_async
+        else None,
+    )
+    return output, aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}

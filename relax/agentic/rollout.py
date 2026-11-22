@@ -736,7 +736,11 @@ class AgenticResidentPipeline:
             await self.prepare_domain.discard_step()
 
         await self.runtime_domain.trim_memory()
-        return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
+        return RolloutFnTrainOutput(
+            samples=context.output_groups,
+            metrics={},
+            partition_complete=(self.transfer_domain.total_debt == 0) if self.args.fully_async else None,
+        )
 
     async def _seal_dynamic_partition(self, context: _StepContext) -> None:
         """Seal with the DP-aligned FIFO prefix of completed Group tasks."""

@@ -2605,6 +2605,9 @@ class AgenticSessionShard:
     ) -> None:
         """Release one failed IR, wake its caller, and continue sibling IRs."""
 
+        logger.error(
+            "Agentic request failed session_id=%s request_id=%s", session.session_id, ir.request_id, exc_info=error
+        )
         self._observe_session(
             session,
             "request",
