@@ -402,7 +402,7 @@ index 2055912..e829d7d 100644
                  flatten_sharded_tensors=False,
              ),
 diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
-index c483f97..521ae91 100644
+index c483f97..685dbf1 100644
 --- a/megatron/core/extensions/transformer_engine.py
 +++ b/megatron/core/extensions/transformer_engine.py
 @@ -930,6 +930,7 @@ class TELinear(te.pytorch.Linear):
@@ -421,6 +421,42 @@ index c483f97..521ae91 100644
                              ).view(self.fp8_meta["recipe"].amax_history_len, -1),
                          }
                      )
+@@ -2454,6 +2456,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+             )
+             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+ 
++            # In BF16 a persistent FSDP gradient is zeroed by the optimizer.
++            # Forward and backward microbatch order can differ, so TE must
++            # add even when this was the first forward in a pipeline step.
++            weight = getattr(self, "weight0", None)
++            if (
++                self.fuse_wgrad_accumulation
++                and getattr(weight, "__fsdp_param__", False)
++                and not weight.overwrite_main_grad
++                and weight.dtype == torch.bfloat16
++                and not (self.config.fp8 or self.config.fp4)
++            ):
++                _is_first_microbatch = None
+             with quant_context:
+                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+             self.is_first_microbatch = False
+@@ -3571,6 +3585,7 @@ try:
+         out: Optional[torch.Tensor] = None,
+         bias: Optional[torch.Tensor] = None,
+         grad: bool = False,
++        accumulate: bool = False,
+     ) -> List[torch.Tensor]:
+         """
+         Wrapper for TE's general_gemm function.
+@@ -3584,7 +3599,7 @@ try:
+             quantization_params=None,
+             gelu=None,
+             gelu_in=None,
+-            accumulate=False,
++            accumulate=accumulate,
+             layout=layout,
+             out=out,
+             bias=bias,
 diff --git a/megatron/core/fp8_utils.py b/megatron/core/fp8_utils.py
 index ac36d40..490ebed 100644
 --- a/megatron/core/fp8_utils.py
@@ -1864,9 +1900,10 @@ diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/opti
          destination.shared = source.shared
      if hasattr(source, GRAD_NORM_GROUP_ATTR):
 diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+index 3318972..07ea934 100644
 --- a/megatron/core/tensor_parallel/layers.py
 +++ b/megatron/core/tensor_parallel/layers.py
-@@ -98,7 +98,10 @@
+@@ -98,7 +98,10 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
      if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
          return True
      # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
@@ -1878,6 +1915,35 @@ diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_para
          tp_group = expert_tp_group
      # Prefer provided tp_group when available (new explicit path).
      if tp_group is not None:
+@@ -590,6 +593,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+                 # In case of Megatron-FSDP, need to create main grad buffers in-place
+                 if hasattr(weight, "__fsdp_param__"):
+                     weight.main_grad = weight.get_main_grad()
++                    # Repeated projections (e.g. a chunked LM head) write to
++                    # the same full gradient before the bucket is reduced.
++                    accumulate = not weight._gbuf.is_data_distributed or getattr(
++                        weight, "_fsdp_fused_wgrad_written", False
++                    )
++                    weight._fsdp_fused_wgrad_written = True
+                     # Import here to avoid circular import
+                     from megatron.core.extensions.transformer_engine import te_general_gemm
+ 
+@@ -604,9 +613,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+                             layout="NT",
+                             out=weight.main_grad,
+                             grad=True,
++                            accumulate=accumulate,
+                         )
+                     else:
+-                        torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
++                        dst = weight.main_grad
++                        torch.addmm(
++                            dst, grad_output.t().to(dst.dtype), total_input.to(dst.dtype),
++                            beta=int(accumulate), out=dst,
++                        )
+                 else:
+                     if weight.main_grad.dtype == torch.float32:
+                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
 diff --git a/megatron/bridge/peft/recompute.py b/megatron/bridge/peft/recompute.py
 --- a/megatron/bridge/peft/recompute.py
 +++ b/megatron/bridge/peft/recompute.py
@@ -9448,10 +9514,26 @@ index 4e2bc02..07cf136 100644
          dp_cp=dp_cp_group.size(),
          tp=tp_size,
 diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
-index 9c6cbdf..95b40ad 100644
+index 9c6cbdf..d67d588 100644
 --- a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
 +++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
-@@ -1145,7 +1145,7 @@ class MegatronFSDP(torch.nn.Module):
+@@ -500,11 +500,10 @@ class MegatronFSDP(torch.nn.Module):
+             # This setting is needed to have this attribute present after every
+             # un-shard of the FSDP params.
+             param.__fsdp_param__ = True
+-            # Transformer Engine accumulates gradient on top of the `main_grad`
+-            # buffer when gradient accumulation fusion in enabled. But with FSDP,
+-            # we want to overwrite the `main_grad` which is enabled by this
+-            # attribute.
+-            param.overwrite_main_grad = True
++            # A sharded gradient bucket is scratch until reduce-scatter.
++            # An unsharded buffer holds the running sum across microbatches.
++            grad_buffer = getattr(param, "_gbuf", None)
++            param.overwrite_main_grad = grad_buffer is not None and grad_buffer.is_data_distributed
+ 
+     def _register_fsdp_hooks(self, root_module):
+         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
+@@ -1145,7 +1144,7 @@ class MegatronFSDP(torch.nn.Module):
                  module, _root_pre_backward
              )
          self._root_pre_backward_hook_handle = create_custom_backward_hook(
@@ -9461,7 +9543,7 @@ index 9c6cbdf..95b40ad 100644
  
          # Register post load state_dict hook to ensure that the module parameters
 diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
-index 7732941..75e4acd 100644
+index 7732941..fd47e25 100644
 --- a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
 +++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
 @@ -34,6 +34,7 @@ from .mixed_precision import (
@@ -9480,7 +9562,16 @@ index 7732941..75e4acd 100644
      from megatron.core.distributed.distributed_data_parallel_config import (
          DistributedDataParallelConfig,
      )
-@@ -3453,6 +3455,7 @@ class ParamAndGradBuffer:
+@@ -1529,6 +1531,8 @@ class DataParallelBuffer:
+         for param in self.params:
+             if hasattr(param, "main_grad"):
+                 param.main_grad = None
++            if hasattr(param, "_fsdp_fused_wgrad_written"):
++                param._fsdp_fused_wgrad_written = False
+ 
+     def _get_item_slice_in_shard(self, item_id: int) -> Tuple[int, int]:
+         """
+@@ -3453,6 +3457,7 @@ class ParamAndGradBuffer:
                              "requires_grad",
                              "sequence_parallel",
                              "shared",
@@ -9488,7 +9579,7 @@ index 7732941..75e4acd 100644
                              "tensor_model_parallel",
                              "partition_dim",
                              "partition_stride",
-@@ -5291,12 +5294,18 @@ def make_fsdp_dtensor(
+@@ -5291,12 +5296,18 @@ def make_fsdp_dtensor(
              placements = [Shard(tp_dim)]
              global_shape[tp_dim] *= tp_mesh.mesh.numel()
  
