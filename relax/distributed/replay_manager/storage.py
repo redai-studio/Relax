@@ -620,6 +620,7 @@ class TQReplayStorage:
         self._pid = os.getpid()
         self._backend = TQBodyBackend(self.run, client_factory or self._make_client)
         self._pending_releases = []
+        self._abandoned_attempts: set[str] = set()
         self._device_reads = None
 
     @property
@@ -749,6 +750,24 @@ class TQReplayStorage:
         if registry is None:
             registry = await asyncio.to_thread(self._registry)
         return await registry.invoke.remote(method, args, kwargs)
+
+    async def open_response_attempt(self, rid: str) -> None:
+        # Native requests allocate a fresh RID. Fence abandoned attempts in
+        # the same registry call before dispatching a new request.
+        pending = tuple(self._abandoned_attempts)
+        await self.invoke_async("open_response_attempt", rid, pending)
+        self._abandoned_attempts.difference_update(pending)
+
+    async def abandon_response_attempt(self, rid: str) -> None:
+        # Closing is idempotent even if only the ACK was lost.
+        for attempt in range(2):
+            try:
+                await self.invoke_async("finish_response_attempt", rid)
+                return
+            except Exception:
+                if attempt:
+                    self._abandoned_attempts.add(rid)
+                    raise
 
     async def discard_async(self, refs: list[ReplayRef], *, media: Sequence[dict] = ()) -> None:
         await self.invoke_async("discard", refs, media=media)
@@ -932,5 +951,6 @@ class TQReplayStorage:
             self.invoke("finish", self._driver)
             _ray().kill(self._registry(), no_restart=True)
             self._driver = None
+        self._abandoned_attempts.clear()
         self._backend.close()
         self._device_reads = None

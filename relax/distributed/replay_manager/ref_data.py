@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Binary reference manifests, token identity and fixed-width row handles."""
+"""Binary reference manifests and token identity."""
 
 import hashlib
 import json
@@ -291,68 +291,6 @@ def decode_refs(payload: bytes) -> dict[str, Any]:
     if offset != len(payload):
         raise ValueError("Trailing replay manifest bytes")
     return result
-
-
-class TokenHandle:
-    """Six int32 words: UUID[4], row[1], tag[1]; bit-preserving layout only."""
-
-    RECORD = 0
-    PAD = 1
-    GAP = 2
-    WIDTH = 6
-
-    @staticmethod
-    def expand(ref: ReplayRef):
-        import numpy as np
-
-        if len(ref.record) != 32 or ref.rows >= 2**31:
-            raise ValueError("Replay record cannot be represented by token handles")
-        result = np.zeros((ref.rows, 6), dtype=np.int32)
-        result[:, :4] = np.frombuffer(bytes.fromhex(ref.record), dtype="<i4")
-        result[:, 4] = np.arange(ref.rows, dtype=np.int32)
-        return result
-
-    @classmethod
-    def padding(cls, count: int, *, gap: bool = False):
-        import numpy as np
-
-        result = np.zeros((count, 6), dtype=np.int32)
-        result[:, 4] = np.arange(count, dtype=np.int32)
-        result[:, 5] = cls.GAP if gap else cls.PAD
-        return result
-
-    @classmethod
-    def coordinates(cls, handles, refs: list[ReplayRef]):
-        import numpy as np
-
-        if handles.dtype != np.int32 or handles.ndim != 2 or handles.shape[1] != 6:
-            raise ValueError("Replay handles must be int32 [rows, 6]")
-        if np.any((handles[:, 5] < cls.RECORD) | (handles[:, 5] > cls.GAP)):
-            raise ValueError("Unknown replay handle tag")
-        # A gap must be supplied with explicit per-kind semantics; never silently
-        # convert a missing real token to padding in the current Relax adapter.
-        if np.any(handles[:, 5] == cls.GAP):
-            raise ValueError("Replay gap requires explicit adapter handling")
-        result = np.stack((np.full(len(handles), -1), handles[:, 4].astype(np.int64)), axis=1)
-        found = handles[:, 5] == cls.PAD
-        if np.any(found & np.any(handles[:, :4] != 0, axis=1)) or np.any(handles[:, 4] < 0):
-            raise ValueError("Malformed replay handle")
-        seen = {}
-        for i, ref in enumerate(refs):
-            if ref.record in seen:
-                if seen[ref.record] != ref:
-                    raise ValueError("Conflicting manifests for one replay record")
-                continue  # Repeated identical samples can resolve to the same body.
-            seen[ref.record] = ref
-            words = np.frombuffer(bytes.fromhex(ref.record), dtype="<i4")
-            selected = np.all(handles[:, :4] == words, axis=1) & (handles[:, 5] == cls.RECORD)
-            if np.any(handles[selected, 4] >= ref.rows):
-                raise ValueError("Replay handle row outside manifest")
-            result[selected, 0] = i
-            found |= selected
-        if not np.all(found):
-            raise ValueError("Replay handle has no manifest")
-        return result
 
 
 def validate_sample(value: dict[str, Any], tokens: list[int]) -> None:

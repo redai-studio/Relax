@@ -344,10 +344,6 @@ class ReplayManager:
             self._store_instance = self._store_factory() if self._store_factory is not None else get_store(self.config)
         return self._store_instance
 
-    def register_transport(self, factory: Callable[[], "TQReplayStorage"]) -> None:
-        """Compatibility name for register_storage."""
-        self.register_storage(factory)
-
     def reader(
         self,
         refs: list["ReplayRef"],
@@ -392,6 +388,30 @@ class ReplayManager:
 
     def sample_refs(self, samples: Sequence[Any]) -> list["ReplayRef"]:
         return refs_from_samples(samples) if self.uses_references else []
+
+    def handoff_buffered_routes(self, groups: Sequence[Sequence[Any]]) -> None:
+        """Carry native publisher ownership across the Ray buffer's
+        serialization boundary."""
+        if not self.native_route_owners:
+            return
+        for group in groups:
+            for sample in group:
+                owned = {
+                    ref.record
+                    for ref in iter_refs(sample.rollout_replay_refs or {})
+                    if self.native_route_owners.get(ref.record) is sample
+                }
+                if owned:
+                    sample._buffered_route_records = owned
+                    for record in owned:
+                        del self.native_route_owners[record]
+
+    def receive_buffered_routes(self, groups: Sequence[Sequence[Any]]) -> None:
+        if self.uses_references:
+            for group in groups:
+                for sample in group:
+                    for record in vars(sample).pop("_buffered_route_records", ()):
+                        self.native_route_owners[record] = sample
 
     def discard(self, samples: Sequence[Any]) -> None:
         if self.uses_references:
@@ -831,6 +851,7 @@ class ReplayInventory:
             item.pop("output_holders", None)
             item["publisher"] = False
         self._collect(self.state)
+        self._response_attempts.clear()
         self.state["closed"] = True
 
     def snapshot(self) -> dict:
@@ -970,8 +991,12 @@ class ReplayInventory:
             item["media_producer_readers"].setdefault(lease, publisher if cache else None)
             return {"status": "ready", "ref": ref.to_dict(), "lease": lease}
 
-    def open_response_attempt(self, rid: str) -> None:
+    def open_response_attempt(self, rid: str, abandoned: Sequence[str] = ()) -> None:
         with self._state():
+            if rid in abandoned:
+                raise ValueError("Cannot reopen an abandoned replay request ID")
+            for previous in abandoned:
+                self.finish_response_attempt(previous)
             self._response_attempts.setdefault(rid, {})
 
     def finish_response_attempt(self, rid: str, accepted: Sequence[str] = ()) -> None:

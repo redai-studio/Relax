@@ -421,6 +421,7 @@ async def post_generation_request(
     *,
     headers: dict | None,
     fail_fast_no_workers: bool,
+    retry_after_no_workers: bool = False,
 ) -> dict:
     """Keep response leases with the attempt until the receiver has its
     manifest."""
@@ -435,10 +436,15 @@ async def post_generation_request(
     if not rid.startswith((ATTEMPT_PREFIX, ROUTE_ATTEMPT_PREFIX)):
         return await post(url, payload, headers=headers, fail_fast_no_workers=fail_fast_no_workers)
 
+    if retry_after_no_workers:
+        # The previous registry close may still be in flight after the router's 503.
+        prefix = ATTEMPT_PREFIX if rid.startswith(ATTEMPT_PREFIX) else ROUTE_ATTEMPT_PREFIX
+        rid = prefix + uuid4().hex
+        payload = {**payload, "rid": rid}
     store = manager.store()
     meta = {}
     try:
-        await finish_before_cancellation(store.invoke_async("open_response_attempt", rid), "open-replay-attempt")
+        await finish_before_cancellation(store.open_response_attempt(rid), "open-replay-attempt")
         attempts = MAX_RETRIES if rid.startswith(ROUTE_ATTEMPT_PREFIX) else 1
         for index in range(attempts):
             try:
@@ -458,15 +464,17 @@ async def post_generation_request(
             store.invoke_async("finish_response_attempt", rid, accepted), "accept-replay-response"
         )
         return output
-    except BaseException:
+    except BaseException as error:
         try:
-            await finish_before_cancellation(
-                store.invoke_async("finish_response_attempt", rid), "close-replay-attempt"
-            )
-        finally:
-            # Acceptance may have committed just before its waiter was cancelled.
-            if meta:
+            await finish_before_cancellation(store.abandon_response_attempt(rid), "close-replay-attempt")
+        except (Exception, asyncio.CancelledError) as cleanup:
+            error.add_note(f"Replay attempt {rid} cleanup failed: {cleanup!r}")
+        # Acceptance may have committed just before its waiter was cancelled.
+        if meta:
+            try:
                 manager.register_producer({"mm_embedding"}).discard_response(meta)
+            except Exception as cleanup:
+                error.add_note(f"Replay response cleanup failed: {cleanup!r}")
         raise
 
 

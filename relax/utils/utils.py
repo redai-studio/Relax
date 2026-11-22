@@ -329,6 +329,22 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     # than by a whitelist of estimator names maintained here.
     spec = get_algorithm(args.advantage_estimator)
     normalizer = REWARD_NORMALIZERS[spec.reward_normalizer]
+    if args.advantage_estimator == "grpo" and any(getattr(s, "_multirow_request", False) for s in samples):
+        # A native generator can export several training rows for one request.
+        first_rows = {}
+        row_slots = []
+        for i, sample in enumerate(samples):
+            key = (sample.group_index, sample.index) if getattr(sample, "_multirow_request", False) else i
+            slot, first = first_rows.setdefault(key, (len(first_rows), i))
+            if first != i and raw_rewards[i] != raw_rewards[first]:
+                raise ValueError(
+                    f"Reward group {sample.group_index}, request {sample.index} exported rows with different rewards. "
+                    "Use --custom-reward-post-process-path to define how per-row rewards should be normalized."
+                )
+            row_slots.append(slot)
+        representatives = [i for _, i in first_rows.values()]
+        normalized = normalizer(args, [samples[i] for i in representatives], [raw_rewards[i] for i in representatives])
+        return [normalized[slot] for slot in row_slots]
     return normalizer(args, samples, raw_rewards)
 
 

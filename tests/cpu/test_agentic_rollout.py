@@ -2025,8 +2025,8 @@ async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch, l
     assert not adapter._requests
 
 
-@pytest.mark.parametrize("failure", ["unclassified-503", "transport"])
-async def test_ambiguous_generation_failure_keeps_wire_id_until_abort(monkeypatch, failure):
+@pytest.mark.parametrize("failure", ["unclassified-503", "transport", "no-workers"])
+async def test_generation_failure_aborts_only_potentially_dispatched_requests(monkeypatch, failure):
     adapter = _backend_adapter(lifecycle_enabled=False)
     adapter._args.use_rollout_mm_embedding_replay = True
     adapter._worker_urls = AsyncMock(return_value=["http://worker"])
@@ -2039,6 +2039,8 @@ async def test_ambiguous_generation_failure_keeps_wire_id_until_abort(monkeypatc
         request = httpx.Request("POST", url)
         if failure == "transport":
             raise httpx.ConnectError("connection interrupted", request=request)
+        if failure == "no-workers":
+            raise _router_503()
         response = httpx.Response(503, request=request, text="Service unavailable")
         raise httpx.HTTPStatusError("unclassified failure", request=request, response=response)
 
@@ -2046,14 +2048,14 @@ async def test_ambiguous_generation_failure_keeps_wire_id_until_abort(monkeypatc
     error_type = httpx.ConnectError if failure == "transport" else httpx.HTTPStatusError
     with pytest.raises(error_type):
         await adapter.generate(input_ids=[1, 2], sampling_params={}, session_id=None, request_id="ambiguous")
-    assert adapter._requests["ambiguous"][0] == "relax-mm-ambiguous"
     adapter._args.use_rollout_mm_embedding_replay = False
     await adapter.abort_request("ambiguous")
-    assert aborted == ["relax-mm-ambiguous"]
+    assert aborted == ([] if failure == "no-workers" else ["relax-mm-ambiguous"])
     assert not adapter._requests
 
 
-async def test_shard_owned_retry_does_not_resend_ambiguous_generation(monkeypatch):
+@pytest.mark.parametrize("fail_fast", [False, True])
+async def test_routed_generation_does_not_resend_after_ambiguous_failure(monkeypatch, fail_fast):
     from relax.utils import http_utils
 
     adapter = _backend_adapter(lifecycle_enabled=False)
@@ -2080,10 +2082,10 @@ async def test_shard_owned_retry_does_not_resend_ambiguous_generation(monkeypatc
                 session_id=None,
                 request_id="ambiguous-eval",
                 evaluation=True,
-                fail_fast_no_workers=True,
+                fail_fast_no_workers=fail_fast,
             )
         assert len(sends) == 1
-        assert adapter._requests["ambiguous-eval"][0] == "ambiguous-eval"
+        assert adapter._requests["ambiguous-eval"].wire_id == "ambiguous-eval"
         await adapter.abort_request("ambiguous-eval")
     assert aborted == ["ambiguous-eval"]
     assert not adapter._requests
@@ -2130,7 +2132,7 @@ async def test_shard_response_loss_aborts_original_wire_id_and_retains_failed_cl
     if abort_failures:
         assert ir.backend_started
         assert list(shard._pending_backend_cleanups.values()) == [session]
-        assert [rid for rid, _ in adapter._requests.values()] == generated
+        assert [attempt.wire_id for attempt in adapter._requests.values()] == generated
         # The same Session cleanup owns retries and all later resource release.
         for _ in range(abort_failures):
             shard._schedule_agent_cleanup(session, session.result_cell.payload)
@@ -2229,6 +2231,52 @@ async def test_unresponsive_abort_does_not_block_group_after_agent_timeout(monke
     while shard._agent_cleanup_tasks:
         await asyncio.wait_for(asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True), 1)
     assert not adapter._requests and not shard._pending_backend_cleanups
+
+
+@pytest.mark.parametrize("timeout_before_registration", [False, True])
+async def test_terminal_cleanup_aborts_generation_registered_after_first_ack(monkeypatch, timeout_before_registration):
+    shard, _, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    shard._trajectory_recorder = service_mod.ShardTrajectoryRecorder(shard.args, shard_ordinal=0)
+    backend = _backend_adapter(lifecycle_enabled=False)
+    backend._worker_urls = AsyncMock(return_value=["http://worker"])
+    shard._generation_backend = backend
+    sent, first_abort, register, stopped = (asyncio.Event() for _ in range(4))
+    generated, aborted = [], []
+
+    async def post(url, payload, **_kwargs):
+        rid = payload["rid"]
+        if url.endswith("/generate"):
+            generated.append(rid)
+            sent.set()
+            await register.wait()
+            await stopped.wait()
+            return {"output_ids": [], "meta_info": {"finish_reason": {"type": "abort"}}}
+        assert url == "http://worker/abort_request"
+        aborted.append(rid)
+        if register.is_set() and rid == generated[0]:
+            stopped.set()
+        first_abort.set()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    if timeout_before_registration:
+        monkeypatch.setattr(service_mod, "_SESSION_CLOSE_TIMEOUT_S", 0.05)
+    ir.runner_task = asyncio.create_task(shard._run_ir(session, ir))
+    await asyncio.wait_for(sent.wait(), 2)
+    await shard._finish_session(session, None)
+    await asyncio.wait_for(first_abort.wait(), 2)
+    assert session.result_cell.terminal and ir.backend_started
+    if timeout_before_registration:
+        await asyncio.wait_for(session.cleanup_task, 2)
+        assert ir.runner_task is not None and not ir.runner_task.done()
+        assert session.session_id in shard._pending_backend_cleanups
+        shard._schedule_agent_cleanup(session, None)
+    register.set()
+    await asyncio.wait_for(session.cleanup_task, 2)
+    assert stopped.is_set() and aborted == generated * 2
+    assert not ir.backend_started and not shard._pending_backend_cleanups
 
 
 async def test_pause_abort_keeps_wire_id_until_ambiguous_generation_is_cleaned_up(monkeypatch):
@@ -2667,7 +2715,7 @@ async def test_managed_backend_direct_transport_never_resends_and_cleans_endpoin
             await adapter.abort_request("r")
         assert cleanup.call_args.args[0] == "http://managed/abort_request"
         assert not await adapter.close_session("s", timeout_s=1)
-        assert adapter._requests["r"][1] == {"http://managed"}
+        assert adapter._requests["r"].targets == {"http://managed"}
         assert not adapter._session_endpoints
     finally:
         await adapter._managed_http.aclose()
@@ -3110,6 +3158,7 @@ async def test_agentic_combined_media_routing_capture_keeps_eval_and_abort_ids(m
             started.set()
             await finish.wait()
             return {"output_ids": [4], "meta_info": {"finish_reason": {"type": "stop"}}}
+        finish.set()
         return {}
 
     monkeypatch.setattr(runtime_mod, "post", post)

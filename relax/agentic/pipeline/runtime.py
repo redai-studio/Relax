@@ -550,6 +550,13 @@ def _is_context_length_error(error: httpx.HTTPStatusError) -> bool:
     return "maximum context length" in response_text or "Requested token count exceeds" in response_text
 
 
+@dataclass
+class _BackendAttempt:
+    wire_id: str
+    targets: set[str]
+    send_done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class SGLangBackendAdapter:
     """Shard-owned SGLang compiler and HTTP capability."""
 
@@ -560,7 +567,7 @@ class SGLangBackendAdapter:
         if score_centering_enabled(args):
             resolve_score_centering_vocab_size(args)
         self._session_lifecycle = args.agentic_session_lifecycle
-        self._requests: dict[str, tuple[str, set[str]]] = {}
+        self._requests: dict[str, _BackendAttempt] = {}
         self._session_endpoints: dict[str, set[str]] = {}
         # The shared request permit already bounds concurrency.
         self._managed_http = httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None))
@@ -631,13 +638,11 @@ class SGLangBackendAdapter:
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
-        self._requests[request_id] = (payload["rid"], {engine_url} if engine_url else set())
+        attempt = _BackendAttempt(payload["rid"], {engine_url} if engine_url else set())
+        self._requests[request_id] = attempt
         try:
-            send = self._managed_post if engine_url else post
-            if not engine_url and fail_fast_no_workers:
-                # The shard owns recovery retries. One transport attempt keeps
-                # a router rejection distinct from an earlier ambiguous send.
-                send = partial(post, max_retries=1)
+            # A lost generate response may already have produced tokens on a worker.
+            send = self._managed_post if engine_url else partial(post, max_retries=1)
             output = await send(
                 f"{engine_url or self._router_url}/generate",
                 payload,
@@ -649,7 +654,7 @@ class SGLangBackendAdapter:
             if (
                 aborted
                 or error.response.status_code == 400
-                or (not engine_url and fail_fast_no_workers and is_router_no_available_workers(error))
+                or (not engine_url and is_router_no_available_workers(error))
             ):
                 self._requests.pop(request_id, None)
             if _is_context_length_error(error):
@@ -663,6 +668,8 @@ class SGLangBackendAdapter:
                     elapsed=time.monotonic() - started,
                 )
             raise
+        finally:
+            attempt.send_done.set()
         self._requests.pop(request_id, None)
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])
@@ -715,7 +722,7 @@ class SGLangBackendAdapter:
         attempt = self._requests.get(request_id)
         if attempt is None:
             return
-        wire_id, targets = attempt
+        targets = attempt.targets
         if not targets:
             targets.update(await self._worker_urls())
             if self._requests.get(request_id) is not attempt:
@@ -723,18 +730,32 @@ class SGLangBackendAdapter:
             if not targets:
                 raise RuntimeError("Cannot confirm backend abort without any worker targets")
 
-        async def abort(url: str) -> None:
-            await post(f"{url}/abort_request", {"rid": wire_id})
-            if not retain_request:
+        async def abort(url: str, *, final: bool) -> None:
+            await post(f"{url}/abort_request", {"rid": attempt.wire_id})
+            if final:
                 targets.discard(url)
 
-        # Keep failed targets even if they disappear from subsequent worker discovery.
-        outcomes = await asyncio.gather(*(abort(url) for url in sorted(targets)), return_exceptions=True)
-        for outcome in outcomes:
-            if isinstance(outcome, BaseException):
-                raise outcome
-        if not retain_request and self._requests.get(request_id) is attempt:
-            self._requests.pop(request_id)
+        while self._requests.get(request_id) is attempt:
+            # The worker also ACKs an unknown RID. An ACK sent before /generate settled
+            # cannot rule out later dispatch, even when every discovered worker replied.
+            final = attempt.send_done.is_set() and not retain_request
+            outcomes = await asyncio.gather(
+                *(abort(url, final=final) for url in sorted(targets)), return_exceptions=True
+            )
+            if self._requests.get(request_id) is not attempt:
+                return
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+            if retain_request:
+                return
+            if final:
+                self._requests.pop(request_id)
+                return
+            try:
+                await asyncio.wait_for(attempt.send_done.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""

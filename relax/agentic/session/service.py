@@ -3499,14 +3499,9 @@ class AgenticSessionShard:
         for ir in session.live_irs:
             if not ir.waiter.done():
                 ir.waiter.set_result(_error_from_exception(_session_discarded_error(session.session_id)))
-            # Let a live reference response finish so the retired runner can
-            # discard its manifest. Backend cleanup sends the abort first.
-            drain_replay_response = ir.backend_started and (
-                replay_manager.replay_data_manager.uses_references
-                and replay_manager.rollout_kinds(self.args)
-                and group.rollout_mode == "train"
-            )
-            if ir.runner_task is not None and not drain_replay_response:
+            # Keep the HTTP send observable until terminal cleanup aborts it.
+            # A worker can ACK an abort before it receives the generation request.
+            if ir.runner_task is not None and not ir.backend_started:
                 ir.runner_task.cancel()
         session.result_cell.publish(outcome)
         self._schedule_agent_cleanup(session, outcome)
@@ -3614,7 +3609,8 @@ class AgenticSessionShard:
             if resources is not None:
                 resources.process_wait.cancel()
             for ir in irs:
-                ir.runner_task = None
+                if not ir.backend_started:
+                    ir.runner_task = None
             session.live_irs.difference_update(ir for ir in irs if not ir.backend_started)
             session.queued_irs.clear()
             session.forest = None

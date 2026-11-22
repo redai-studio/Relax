@@ -89,6 +89,7 @@ logger = get_logger(__name__)
 # deadlocking on the same non-reentrant semaphore. A ContextVar is task-local
 # and propagates down the await chain (including create_task children).
 _holding_session_lock: contextvars.ContextVar[bool] = contextvars.ContextVar("holding_session_lock", default=False)
+_dispatch_evaluation = contextvars.ContextVar("dispatch_evaluation", default=False)
 
 
 def _ensure_not_holding_session_lock() -> None:
@@ -369,7 +370,13 @@ async def _post_generation(
             raise GenerationAborted
         try:
             return await post_generation_request(
-                replay_data_manager, post, url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled
+                replay_data_manager,
+                post,
+                url,
+                payload,
+                headers=headers,
+                fail_fast_no_workers=router_recovery_enabled,
+                retry_after_no_workers=bool(attempt),
             )
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):
@@ -395,7 +402,7 @@ async def generate(
 ) -> Sample:
     """Generate using traditional SGLang router with token-based workflow."""
     with ExitStack() as response_scope:
-        return await _generate(args, sample, sampling_params, evaluation, response_scope)
+        return await _generate(args, sample, sampling_params, evaluation or _dispatch_evaluation.get(), response_scope)
 
 
 async def _generate(
@@ -720,6 +727,8 @@ async def _dispatch_generate(
                 return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
             return await custom_generate_func(args, sample, sampling_params)
 
+    # Three-argument custom generators can delegate to generate() without passing evaluation.
+    mode_token = _dispatch_evaluation.set(evaluation)
     try:
         if manages_permit:
             return await _run()
@@ -732,6 +741,8 @@ async def _dispatch_generate(
     except GenerationAborted:
         sample.status = Sample.Status.ABORTED
         return sample
+    finally:
+        _dispatch_evaluation.reset(mode_token)
 
 
 @track_custom_replay_outputs
@@ -885,6 +896,8 @@ async def generate_and_rm_group(
                 raise ValueError("Multiple training rows per request require --use-dynamic-batch-size")
             for row in outputs:
                 row.index, row.group_index = source.index, source.group_index
+                if len(outputs) > 1 or getattr(source, "_multirow_request", False):
+                    row._multirow_request = True
             rows.extend(outputs)
         return await _score_generated_group(args, state, rows, evaluation, teacher_routing_enabled)
     except BaseException as error:
@@ -1134,6 +1147,7 @@ async def _generate_rollout_async(
                 ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
 
             samples = await loop.run_in_executor(None, ray.get, ref)
+            replay_data_manager.receive_buffered_routes(samples)
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
@@ -1664,6 +1678,7 @@ def generate_rollout(
 
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
     if aborted_samples:
+        replay_data_manager.handoff_buffered_routes(aborted_samples)
         ray.get(data_buffer.add_samples.remote(aborted_samples))
     # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
     # prefetched generation is almost always aborted by the next step's pause_generation and its

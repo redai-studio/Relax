@@ -18,7 +18,9 @@ def adapter(monkeypatch, client: httpx.AsyncClient, *, lifecycle: bool = False):
         sglang_router_policy="cache_aware",
         slime_router_sticky=False,
     )
-    backend._requests = {"request": ("relax-agentic-r3-mm-exact-wire-id", set())}
+    attempt = runtime._BackendAttempt("relax-agentic-r3-mm-exact-wire-id", set())
+    attempt.send_done.set()  # The generate response was lost before cleanup began.
+    backend._requests = {"request": attempt}
     backend._session_endpoints = {}
     backend._session_lifecycle = lifecycle
 
@@ -62,7 +64,7 @@ async def test_abort_includes_unhealthy_worker_and_preserves_failed_target_for_r
         backend = adapter(monkeypatch, client)
         with pytest.raises(httpx.HTTPStatusError):
             await backend.abort_request("request")
-        assert backend._requests["request"][0] == "relax-agentic-r3-mm-exact-wire-id"
+        assert backend._requests["request"].wire_id == "relax-agentic-r3-mm-exact-wire-id"
         await backend.abort_request("request")
         assert not backend._requests
     assert [host for host, _ in calls] == ["healthy", "unhealthy", "unhealthy"]
@@ -81,7 +83,7 @@ async def test_abort_empty_worker_discovery_keeps_request_owner(monkeypatch):
         backend = adapter(monkeypatch, client)
         with pytest.raises(RuntimeError, match="without any worker targets"):
             await backend.abort_request("request")
-        assert backend._requests["request"][0] == "relax-agentic-r3-mm-exact-wire-id"
+        assert backend._requests["request"].wire_id == "relax-agentic-r3-mm-exact-wire-id"
     assert calls == ["/workers"]
 
 
@@ -96,10 +98,10 @@ async def test_session_close_retains_managed_endpoint_until_abort_ack(monkeypatc
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         backend = adapter(monkeypatch, client, lifecycle=lifecycle)
-        backend._requests["request"][1].add("http://original-engine")
+        backend._requests["request"].targets.add("http://original-engine")
         backend._session_endpoints["session"] = {"http://original-engine"}
         assert await backend.close_session("session", timeout_s=1)
-        assert backend._requests["request"][1] == {"http://original-engine"}
+        assert backend._requests["request"].targets == {"http://original-engine"}
         await backend.abort_request("request")
         assert not backend._requests and not backend._session_endpoints
     assert ("original-engine", "/abort_request") in calls

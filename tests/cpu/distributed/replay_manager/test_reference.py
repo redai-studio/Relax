@@ -142,6 +142,17 @@ def test_cli_reference_enable_generates_storage_identity_before_initialization(m
     assert os.environ["RELAX_REPLAY_RUN_ID"] == identity
 
 
+def test_debug_dump_uses_full_routes_and_rejects_explicit_references(monkeypatch):
+    args = SimpleNamespace(
+        train_backend="megatron", colocate=True, use_rollout_routing_replay=True, load_debug_rollout_data="dump.pt"
+    )
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "0")
+    validate_reference_training(args)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    with pytest.raises(ValueError, match="--load-debug-rollout-data.*RELAX_REPLAY_REFERENCES=0"):
+        validate_reference_training(args)
+
+
 @pytest.mark.parametrize("mode", ["colocate", "hybrid", "fully_async", "separate", "fsdp"])
 def test_reference_training_rejects_unwired_consumers_before_startup(monkeypatch, mode):
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
@@ -344,6 +355,38 @@ async def test_native_queue_failure_keeps_only_possibly_delivered_bodies(publish
         assert not inventory.state["objects"] and not body.blocks
 
 
+async def test_buffered_native_route_releases_only_for_returned_owner(published, native_write):
+    from copy import copy
+    from unittest.mock import AsyncMock
+
+    from ray import cloudpickle
+
+    from relax.engine.rollout.data_source import RolloutDataSourceWithBuffer
+    from relax.utils.utils import transfer_batch_to_data_system
+
+    _, _, body, inventory, ref, _ = published
+    args, sample, producer = native_write
+    await producer.adopt_native_response(sample, args, {"routed_experts": ref.to_dict()})
+    buffer = RolloutDataSourceWithBuffer(
+        SimpleNamespace(rollout_global_dataset=False, buffer_filter_path=None, n_samples_per_prompt=1)
+    )
+    groups = [[sample]]
+    producer.manager.handoff_buffered_routes(groups)
+    buffer.add_samples(cloudpickle.loads(cloudpickle.dumps(groups)))
+    returned = cloudpickle.loads(cloudpickle.dumps(buffer.get_samples(1)))
+    producer.manager.receive_buffered_routes(returned)
+    (owner,) = returned[0]
+    owner.loss_mask = [1, 1]
+    client = SimpleNamespace(async_put=AsyncMock())
+    with pytest.raises(AssertionError, match="loss mask"):
+        await transfer_batch_to_data_system(args, [[copy(owner)]], 0, 0, client)
+    assert body.blocks
+    with pytest.raises(AssertionError, match="loss mask"):
+        await transfer_batch_to_data_system(args, [[owner]], 0, 0, client)
+    client.async_put.assert_not_awaited()
+    assert not inventory.state["objects"] and not body.blocks
+
+
 @pytest.mark.parametrize("custom", [False, True], ids=["borrowed-native-route", "custom-fanout"])
 async def test_invalid_sibling_preserves_route_for_later_write(published, native_write, custom):
     from dataclasses import replace
@@ -397,10 +440,8 @@ def run_custom(native_write, monkeypatch):
     return run
 
 
-@pytest.mark.parametrize("dynamic_batch", [True, False], ids=["queue-all-rows", "reject-fixed-batch"])
-async def test_custom_group_hands_off_or_releases_all_rows(
-    published, native_write, run_custom, monkeypatch, dynamic_batch
-):
+@pytest.mark.parametrize("case", ["raw", "normalized", "conflicting-rewards", "fixed-batch", "gspo"])
+async def test_custom_group_hands_off_or_releases_all_rows(published, native_write, run_custom, monkeypatch, case):
     from dataclasses import replace
     from unittest.mock import AsyncMock
 
@@ -409,8 +450,13 @@ async def test_custom_group_hands_off_or_releases_all_rows(
 
     _, store, body, inventory, ref, values = published
     args, source, producer = native_write
-    args.use_dynamic_batch_size = dynamic_batch
-    score = AsyncMock(return_value=[1.0, 2.0, 3.0])
+    args.use_dynamic_batch_size = case != "fixed-batch"
+    args.rewards_normalization = case in ("normalized", "conflicting-rewards", "gspo")
+    args.advantage_estimator = "gspo" if case == "gspo" else "grpo"
+    args.n_samples_per_prompt = 2
+    args.grpo_std_normalization = True
+    rewards = [1.0, 1.0 if case == "normalized" else 2.0, 3.0]
+    score = AsyncMock(return_value=rewards)
     monkeypatch.setattr(sglang_rollout, "batched_async_rm", score)
 
     async def generate(args, row, params):
@@ -423,7 +469,7 @@ async def test_custom_group_hands_off_or_releases_all_rows(
         return row
 
     second = replace(source, index=1, rollout_replay_refs=None)
-    if not dynamic_batch:
+    if not args.use_dynamic_batch_size:
         with pytest.raises(ValueError, match="use-dynamic-batch-size"):
             await run_custom(generate, [source, second])
         assert not inventory.state["objects"] and not body.blocks
@@ -431,11 +477,21 @@ async def test_custom_group_hands_off_or_releases_all_rows(
 
     rows = await run_custom(generate, [source, second])
     score.assert_awaited_once_with(args, rows, evaluation=False)
-    assert [row.reward for row in rows] == [1.0, 2.0, 3.0]
+    assert [row.reward for row in rows] == rewards
     put = AsyncMock()
-    await transfer_batch_to_data_system(args, [rows], 1, 0, SimpleNamespace(async_put=put), is_last=True)
+    transfer = transfer_batch_to_data_system(args, [rows], 1, 0, SimpleNamespace(async_put=put), is_last=True)
+    if case in ("gspo", "conflicting-rewards"):
+        message = "3 samples, expected 2" if case == "gspo" else "custom-reward-post-process-path"
+        with pytest.raises(ValueError, match=message):
+            await transfer
+        put.assert_not_awaited()
+        assert not inventory.state["objects"] and not body.blocks
+        return
+    await transfer
     put.assert_awaited_once()
     sent = put.await_args.kwargs
+    expected_rewards = [-1 / 2**0.5, -1 / 2**0.5, 1 / 2**0.5] if case == "normalized" else rewards
+    assert sent["data"]["rewards"].tolist() == pytest.approx(expected_rewards)
     assert [meta["sample_index"] for meta in sent["custom_meta"]] == [0, 0, 1]
     assert sent["data"]["sample_index_mask_sums"].tolist() == [2, 2, 1]
     assert sent["is_last"]

@@ -34,7 +34,7 @@ flowchart TB
 
 SGLang 按 token 和层采集专家编号，在视觉 merger 之后采集 embedding。生产端等数据块写完再发布引用。训练样本保留常规训练字段，replay 数据通过 `rollout_replay_refs` 中的描述符传递。Replay Manager 跟踪发布者、训练分区和活跃 reader 各自持有的引用。分区退役后，仍在读取的数据会保留到最后一个持有者释放。全局恢复会创建新的 replay run。
 
-**样本选择。** Native rollout 的自定义 R3 生成器可以为一次请求导出多行，各行沿用原请求的 sample index。丢弃一行只释放该行持有的路由。Agentic rollout 由 Session 决定接受哪些 token、哪些分支进入训练。多轮生成或中断续跑时，已接受的前缀沿用原来的路由区间。Replay Manager 据此把选中的路由记录和每次图像引用各自的 lease 移交给导出的 Group，回收被丢弃分支持有的数据。
+**样本选择。** Native rollout 的自定义 R3 生成器可以为一次请求导出多行，各行沿用原请求的 sample index。丢弃一行只释放该行持有的路由。默认 GRPO 对同一请求的奖励只计一次，并将归一化结果用于该请求的每一行。若各行奖励不同，用 `--custom-reward-post-process-path` 指定处理方式。Agentic rollout 由 Session 决定接受哪些 token、哪些分支进入训练。多轮生成或中断续跑时，已接受的前缀沿用原来的路由区间。Replay Manager 据此把选中的路由记录和每次图像引用各自的 lease 移交给导出的 Group，回收被丢弃分支持有的数据。
 
 **写入训练队列。** 两条 rollout 路径共用 `put_rollout_batch`。Replay Manager 先把选中的数据关联到训练分区，再发送样本。确定在发送前失败时，释放未发送样本持有的引用。一旦开始发送，即使收不到 ACK，也会保留数据，因为训练端可能已经看到了样本。收到 ACK 后完成向分区的移交。
 

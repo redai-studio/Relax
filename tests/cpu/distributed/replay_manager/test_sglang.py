@@ -83,8 +83,19 @@ def test_multimodal_r3_hashes_the_original_placeholder_tokens(monkeypatch):
         store.close_run()
 
 
-@pytest.mark.parametrize("delivery", ["success", "connection-refused", "response-lost", "late-publication"])
-async def test_builtin_r3_owns_routes_until_http_handoff(monkeypatch, delivery):
+@pytest.mark.parametrize(
+    "delivery,close_fault",
+    [
+        ("success", None),
+        ("connection-refused", None),
+        ("response-lost", None),
+        ("late-publication", None),
+        ("late-publication", "before-dispatch"),
+        ("late-publication", "lost-ack"),
+        ("late-publication", "outage"),
+    ],
+)
+async def test_builtin_r3_owns_routes_until_http_handoff(monkeypatch, delivery, close_fault):
     import httpx
     import torch
 
@@ -109,6 +120,22 @@ async def test_builtin_r3_owns_routes_until_http_handoff(monkeypatch, delivery):
 
     def publish():
         return sglang._advance_publication(processor, request, 1, {"moe": lambda: capturer}, final=True)["moe"]
+
+    if close_fault:
+        invoke = store.invoke_async
+        close_calls = 0
+
+        async def faulty_close(method, *args):
+            nonlocal close_calls
+            if method == "finish_response_attempt" and args == (request.rid,):
+                close_calls += 1
+                if close_fault == "outage" or close_calls == 1:
+                    if close_fault == "lost-ack":
+                        await invoke(method, *args)
+                    raise ConnectionError("lost registry connection")
+            return await invoke(method, *args)
+
+        monkeypatch.setattr(store, "invoke_async", faulty_close)
 
     attempts = []
 
@@ -138,6 +165,23 @@ async def test_builtin_r3_owns_routes_until_http_handoff(monkeypatch, delivery):
                 await post
             if delivery == "late-publication":
                 publish()
+                if close_fault == "outage":
+                    # The late publisher is held until a new request reaches the recovered registry.
+                    assert inventory.snapshot()["objects"] and body.blocks
+                    monkeypatch.setattr(store, "invoke_async", invoke)
+
+                    async def next_send(*args, **kwargs):
+                        assert not inventory.snapshot()["objects"] and not body.blocks
+                        return {"meta_info": {}}
+
+                    await sglang.post_generation_request(
+                        manager,
+                        next_send,
+                        "/generate",
+                        producer.request_options(),
+                        headers=None,
+                        fail_fast_no_workers=False,
+                    )
         assert attempts == [request.rid] * (2 if delivery == "connection-refused" else 1)
         assert not inventory.snapshot()["objects"] and not body.blocks
     finally:

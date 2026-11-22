@@ -178,22 +178,45 @@ async def test_standard_post_maps_strict_499_to_generation_abort(monkeypatch, fu
 
 
 @pytest.mark.asyncio
-async def test_standard_eval_keeps_sglang_499_visible(monkeypatch):
+async def test_eval_delegate_skips_reference_capture_and_keeps_sglang_499_visible(monkeypatch):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayManager
+
+    args = _router_args(
+        ci_test=False,
+        sglang_router_ip="localhost",
+        sglang_router_port=80,
+        use_rollout_routing_replay=True,
+        use_rollout_indexer_replay=False,
+        lora_rank=0,
+        sglang_router_policy="round_robin",
+        slime_router_sticky=False,
+        custom_generate_function_path="custom",
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda *_args, **_kwargs: [1, 2]),
+        processor=None,
+        aborted=False,
+        semaphore=asyncio.Semaphore(1),
+        dp_rank_context=nullcontext,
+    )
     error = _ABORT_499()
 
-    async def fake_post(*_args, **_kwargs):
-        raise error
+    async def delegate(args, sample, params):
+        return await sglang_rollout.generate(args, sample, params)
 
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    post = AsyncMock(side_effect=error)
+    monkeypatch.setattr(sglang_rollout, "post", post)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _: delegate)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _: state)
+    manager = ReplayManager(config=ReplayConfig(delivery="reference", run_id="eval"))
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
     with pytest.raises(httpx.HTTPStatusError) as exc_info:
-        await _post_generation(
-            _router_args(),
-            SimpleNamespace(aborted=False, abort_event=asyncio.Event()),
-            "http://test/generate",
-            {},
-            None,
-            evaluation=True,
+        await sglang_rollout._dispatch_generate(
+            state, args, Sample(prompt="x"), {"max_new_tokens": 1}, evaluation=True
         )
+    payload = post.await_args.args[1]
+    assert "rid" not in payload and "return_routed_experts" not in payload
     assert exc_info.value is error
 
 
@@ -227,15 +250,34 @@ _NO_WORKERS_503 = lambda: _status_error(503, body={"error": {"code": "no_availab
 
 
 @pytest.mark.asyncio
-async def test_router_no_workers_waits_once_then_retries(monkeypatch):
+@pytest.mark.parametrize("lost_replay_close", [False, True])
+async def test_router_no_workers_waits_once_then_retries(monkeypatch, lost_replay_close):
     calls = []
     payload = {}
+    if lost_replay_close:
+        from relax.distributed.replay_manager.config import ReplayConfig
+        from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+        from relax.distributed.replay_manager.storage import TQReplayStorage
+
+        config = ReplayConfig(delivery="reference", run_id="a")
+        store = TQReplayStorage(config, inventory=ReplayInventory(config, lambda _: None))
+        manager = ReplayManager(config=config, store_factory=lambda: store)
+        monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+        payload = manager.register_producer({"moe"}).request_options()
+        invoke = store.invoke_async
+
+        async def lose_close(method, *args):
+            if method == "finish_response_attempt" and args == (payload["rid"],):
+                raise ConnectionError("registry unreachable")
+            return await invoke(method, *args)
+
+        monkeypatch.setattr(store, "invoke_async", lose_close)
 
     async def fake_post(_url, request_payload, **_kwargs):
         calls.append(request_payload)
         if len(calls) == 1:
             raise _NO_WORKERS_503()
-        return {"ok": True}
+        return {"meta_info": {}}
 
     monkeypatch.setattr(sglang_rollout, "post", fake_post)
     result = await _post_generation(
@@ -247,8 +289,11 @@ async def test_router_no_workers_waits_once_then_retries(monkeypatch):
         evaluation=False,
     )
 
-    assert result == {"ok": True}
-    assert calls == [payload, payload]
+    assert result == {"meta_info": {}}
+    if lost_replay_close:
+        assert len(calls) == 2 and calls[0]["rid"] != calls[1]["rid"]
+    else:
+        assert calls == [payload, payload]
 
 
 @pytest.mark.asyncio

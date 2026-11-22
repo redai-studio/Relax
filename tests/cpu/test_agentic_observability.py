@@ -1564,6 +1564,7 @@ def test_cleanup_failure_preserves_published_export(tmp_path, rollout_module, mo
     shard._generation_backend = SimpleNamespace(abort_request=AsyncMock(side_effect=RuntimeError("abort failed")))
     shard._notify_state_change = lambda group=None: None
     shard._agent_cleanup_tasks = set()
+    shard._pending_backend_cleanups = {}
     cell = service._SessionResultCell()
     group = service.ResidentGroup("train", "g", {"s": cell}, [])
     session = service._SessionRecord(group=group, session_id="s", session_sampling_params={}, result_cell=cell)
@@ -1573,17 +1574,20 @@ def test_cleanup_failure_preserves_published_export(tmp_path, rollout_module, mo
 
     async def scenario():
         runner = asyncio.create_task(asyncio.sleep(0))
-        session.live_irs = [
-            SimpleNamespace(
-                runner_task=runner, backend_started=True, waiter=asyncio.get_running_loop().create_future()
-            )
-        ]
+        ir = service.InflightRequest(
+            "request", "hash", 7, service.RequestKind.FRESH, 0, asyncio.get_running_loop().create_future(), 0.0
+        )
+        ir.runner_task = runner
+        ir.backend_started = True
+        session.live_irs.add(ir)
         session.phase = service.SessionPhase.FINALIZING
         outcome = SessionExportTransport(exports=({"sample_payload": {"sample_export_id": 7}},))
         await shard._finish_session_once(session, outcome)
         assert cell.payload is outcome and not group.sessions and not shard._session_records
         if hasattr(shard, "_agent_cleanup_tasks") and shard._agent_cleanup_tasks:
             await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        shard._generation_backend.abort_request.assert_awaited_once_with("request")
+        assert session.live_irs == {ir} and ir.backend_started
         await shard._trajectory_recorder.aclose()
 
     asyncio.run(scenario())
@@ -1831,6 +1835,7 @@ def _session_observation_fixture(tmp_path):
     shard._train_generation_open = True
     shard._generation_gate_lock = asyncio.Lock()
     shard._agent_cleanup_tasks = set()
+    shard._pending_backend_cleanups = {}
     cell = service._SessionResultCell()
     group = service.ResidentGroup("train", "g", {"s": cell}, [], ownership=service.GroupOwnership.RUNTIME)
     session = service._SessionRecord(group, "s", {}, cell, observation=SessionObservation())
@@ -2174,11 +2179,12 @@ def test_shutdown_records_terminal_session_before_closing_writer(tmp_path, rollo
         shard.args.agentic_session_lifecycle = True
         shard._permit_cleanup_tasks = set()
         shard._lifecycle_close_count = shard._lifecycle_close_failure_count = 0
-        entered = asyncio.Event()
+        entered, acknowledge = asyncio.Event(), asyncio.Event()
 
         async def close(*_args, **_kwargs):
             entered.set()
-            await asyncio.Event().wait()
+            await acknowledge.wait()
+            return True
 
         shard._generation_backend.close_session = close
         shard._generation_backend.shutdown = AsyncMock()
@@ -2186,6 +2192,10 @@ def test_shutdown_records_terminal_session_before_closing_writer(tmp_path, rollo
         await shard._finish_session(session, outcome)
         await entered.wait()
         assert session.result_cell.payload is outcome
+        with pytest.raises(service.RuntimeGroupError, match="Backend cleanup is unconfirmed"):
+            await asyncio.wait_for(shard.shutdown(), 1)
+        shard._generation_backend.shutdown.assert_not_awaited()
+        acknowledge.set()
         await asyncio.wait_for(shard.shutdown(), 1)
 
     asyncio.run(scenario())

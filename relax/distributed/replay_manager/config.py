@@ -123,6 +123,12 @@ def validate_reference_training(args: Any) -> None:
         return
     if not kinds:
         return
+    if getattr(args, "load_debug_rollout_data", None) is not None:
+        raise ValueError(
+            "--load-debug-rollout-data cannot restore live replay references. "
+            "For a dump containing full routes, set RELAX_REPLAY_REFERENCES=0 "
+            "and disable --use-rollout-mm-embedding-replay."
+        )
     if not _supports_reference_training(args, kinds):
         raise ValueError(
             "Reference replay requires colocated Megatron training, or hybrid/fully-async Megatron for R3 and frozen visual embeddings"

@@ -249,7 +249,7 @@ def consumer_batch_layout(
     canonical = {}
     for index, ref in enumerate(refs):
         if len(ref.record) != 32 or ref.rows >= 2**31 or len(bytes.fromhex(ref.record)) != 16:
-            raise ValueError("Replay record cannot be represented by token handles")
+            raise ValueError("Replay record must have a 128-bit ID and fewer than 2**31 rows")
         if ref.record in canonical:
             previous, _ = canonical[ref.record]
             if previous != ref:

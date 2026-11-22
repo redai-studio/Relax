@@ -1,10 +1,9 @@
-"""Routing replay transfer regressions without importing Megatron or Ray.
+"""Routing replay transfer through the streaming dataloader.
 
 Run the NCCL cases explicitly on two otherwise available GPUs with
 ``RELAX_ROUTING_REPLAY_GPU_TEST=1 pytest -q tests/gpux4/utils/data/test_routing_replay_transfer.py``.
 """
 
-import ast
 import gc
 import os
 from argparse import Namespace
@@ -18,21 +17,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-_ROOT = Path(__file__).resolve().parents[4]
 _CHUNK_BYTES = 64 * 1024 * 1024
 _GPU_TESTS = os.environ.get("RELAX_ROUTING_REPLAY_GPU_TEST") == "1"
-
-
-def _load_functions(*names: str, **namespace):
-    """Execute the production functions, leaving optional runtime imports
-    out."""
-    source = _ROOT / "relax/utils/data/stream_dataloader.py"
-    tree = ast.parse(source.read_text())
-    selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert len(selected) == len(names)
-    namespace = {"torch": torch, **namespace}
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"), namespace)
-    return tuple(namespace[name] for name in names)
 
 
 class _ParallelGroups:
@@ -107,6 +93,8 @@ def _assert_pattern(values: torch.Tensor, rows: int, width: int) -> None:
 
 
 def _transfer_worker(rank: int, init_file: str, topology: tuple[int, int, int], backend: str) -> None:
+    from relax.utils.data import stream_dataloader
+
     torch.set_num_threads(1)
     cp_size, pp_size, tp_size = topology
     device = torch.device("cpu")
@@ -123,18 +111,18 @@ def _transfer_worker(rank: int, init_file: str, topology: tuple[int, int, int], 
     try:
         groups = _ParallelGroups(rank, *topology)
         calls = []
+        dist_broadcast = dist.broadcast
 
         def observed_broadcast(tensor, src, group):
             size = tensor.numel() * tensor.element_size()
             assert size <= _CHUNK_BYTES, f"full-batch transfer allocated {size} bytes"
             calls.append((groups.names[group], size))
-            return dist.broadcast(tensor, src=src, group=group)
+            return dist_broadcast(tensor, src=src, group=group)
 
-        (broadcast,) = _load_functions(
-            "_broadcast_routed_experts",
-            mpu=groups,
-            dist=SimpleNamespace(broadcast=observed_broadcast, get_global_rank=dist.get_global_rank),
-        )
+        # Each spawned worker owns its module and its test topology.
+        stream_dataloader.mpu = groups
+        stream_dataloader.dist.broadcast = observed_broadcast
+        broadcast = stream_dataloader._broadcast_routed_experts
         # The second payload is larger than two staging buffers. Both must have
         # the same bounded GPU peak; no complete payload may reside on GPU.
         widths = [17, 0, 17]
@@ -221,17 +209,21 @@ def test_routing_replay_nccl_staging_peak_is_independent_of_batch_size(tmp_path:
     mp.spawn(_transfer_worker, args=(str(tmp_path / "nccl_init"), (2, 1, 1), "nccl"), nprocs=2, join=True)
 
 
-def test_routing_replay_single_rank_preserves_ragged_offsets_without_collectives() -> None:
+def test_routing_replay_single_rank_preserves_ragged_offsets_without_collectives(monkeypatch) -> None:
+    from relax.utils.data import stream_dataloader
+
     groups = SimpleNamespace(
         get_context_parallel_world_size=lambda: 1,
         get_tensor_model_parallel_world_size=lambda: 1,
         get_pipeline_model_parallel_world_size=lambda: 1,
     )
-    (broadcast,) = _load_functions("_broadcast_routed_experts", mpu=groups)
+    monkeypatch.setattr(stream_dataloader, "mpu", groups)
     source = torch.tensor([[8, 2], [5, 7], [3, 1]], dtype=torch.int64).T
     offsets = torch.tensor([0, 0, 1, 2], dtype=torch.int32)
 
-    actual, actual_offsets = broadcast(source, offsets, True, torch.device("cpu"), True)
+    actual, actual_offsets = stream_dataloader._broadcast_routed_experts(
+        source, offsets, True, torch.device("cpu"), True
+    )
 
     assert torch.equal(actual, source.to(torch.int32))
     assert actual.dtype == torch.int32 and actual.device.type == "cpu" and actual.is_contiguous()

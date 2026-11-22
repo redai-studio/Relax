@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Cross-check direct coordinates against the real legacy UUID-handle path."""
+"""Check consumer coordinates against hand-packed token rows."""
 
 import importlib.util
 import sys
@@ -10,16 +10,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 
-from relax.distributed.replay_manager.backend.megatron import consumer_batch_layout, pack_token_rows
-from relax.distributed.replay_manager.consumer import ConsumerBatchLayout
-from relax.distributed.replay_manager.ref_data import ReplayRef, TokenHandle
+from relax.distributed.replay_manager.backend.megatron import consumer_batch_layout
+from relax.distributed.replay_manager.ref_data import ReplayRef
 
 
 @pytest.fixture
 def ranks(monkeypatch):
-    state = SimpleNamespace(tp=4, cp=1, tp_rank=0, cp_rank=0)
+    state = SimpleNamespace(tp=2, cp=1, tp_rank=0, cp_rank=0)
     mpu = SimpleNamespace(
         get_tensor_model_parallel_world_size=lambda: state.tp,
         get_context_parallel_world_size=lambda: state.cp,
@@ -39,62 +37,52 @@ def ranks(monkeypatch):
 def refs():
     return [
         ReplayRef(2, "a", "b", f"{i:032x}", "moe", length - 1, 1, 2, 1024, "c" * 64, "int32")
-        for i, length in [(1, 5), (2, 9)]
+        for i, length in [(1, 3), (2, 5)]
     ]
 
 
-def legacy(args, values, lengths, sequence_parallel):
-    rows = [torch.from_numpy(TokenHandle.expand(value)) for value in values]
-
-    def pad(value, count):
-        return torch.cat((value, torch.from_numpy(TokenHandle.padding(count))), dim=0)
-
-    handles = pack_token_rows(args, rows, lengths, pad, sequence_parallel=sequence_parallel).numpy()
-    return ConsumerBatchLayout.from_coordinates(TokenHandle.coordinates(handles, values))
-
-
 @pytest.mark.parametrize(
-    "cp,sp,vl,allgather",
+    "vl,allgather,expected_by_cp",
     [
-        (1, False, False, False),
-        (1, True, False, False),
-        (2, False, False, False),
-        (2, True, False, True),
-        (2, True, True, False),
-        (2, False, True, True),
+        (False, False, ["A0 A1 p0 B0 B1 B2 B3 p0 A0 A1 p0 p0"]),
+        # Zigzag CP takes outer chunks on rank 0 and inner chunks on rank 1.
+        (False, False, ["A0 p0 B0 B1 p1 p2 A0 p0", "A1 p0 B2 B3 p0 p0 A1 p0"]),
+        # All-gather CP splits the globally padded batch contiguously.
+        (False, True, ["A0 A1 p0 B0 B1 B2 B3 p0", "A0 A1 p0 p0 p1 p2 p3 p4"]),
+        # Unsplit VL forward pads each sample to 8 before zigzag splitting.
+        (True, False, ["A0 A1 p4 p5 B0 B1 p2 p3 A0 A1 p4 p5", "p0 p1 p2 p3 B2 B3 p0 p1 p0 p1 p2 p3"]),
     ],
 )
-def test_direct_layout_matches_legacy_cp_sp_vl_padding_and_duplicate_records(ranks, cp, sp, vl, allgather):
-    ranks.cp = cp
-    values = refs()
-    values.append(values[0])
-    lengths = [value.rows + 1 for value in values]
+def test_consumer_layout_maps_duplicate_records_and_rank_local_padding(ranks, vl, allgather, expected_by_cp):
+    a, b = refs()
+    ranks.cp = len(expected_by_cp)
     args = SimpleNamespace(qkv_format="thd", is_vl_model=vl, allgather_cp=allgather, data_pad_size_multiplier=2)
-    for cp_rank in range(cp):
-        ranks.cp_rank = cp_rank
-        for tp_rank in range(ranks.tp if sp else 1):
-            ranks.tp_rank = tp_rank
-            expected = legacy(args, values, lengths, sp)
-            actual = consumer_batch_layout(args, values, lengths, sequence_parallel=sp)
-            assert actual.size == expected.size
-            np.testing.assert_array_equal(actual.valid, expected.valid)
-            np.testing.assert_array_equal(actual.padding_offsets, expected.padding_offsets)
-            assert [sample.sample_index for sample in actual.samples] == [
-                sample.sample_index for sample in expected.samples
-            ]
-            assert all(sample.sample_index != 2 for sample in actual.samples)
-            for got, want in zip(actual.samples, expected.samples, strict=True):
-                np.testing.assert_array_equal(got.source_rows, want.source_rows)
-                np.testing.assert_array_equal(got.output_rows, want.output_rows)
+    for ranks.cp_rank, expected_text in enumerate(expected_by_cp):
+        full = expected_text.split()
+        for sp in (False, True):
+            for ranks.tp_rank in range(ranks.tp if sp else 1):
+                # With sequence parallelism, each TP rank takes its contiguous half.
+                half = len(full) // 2
+                expected = full[ranks.tp_rank * half : (ranks.tp_rank + 1) * half] if sp else full
+                layout = consumer_batch_layout(args, [a, b, a], [3, 5, 3], sequence_parallel=sp)
+                assert layout.size == len(expected)
+                np.testing.assert_array_equal(layout.valid, [row[0] != "p" for row in expected])
+                assert layout.padding_offsets.tolist() == [[int(row[1:])] for row in expected if row[0] == "p"]
+                maps = {entry.sample_index: entry for entry in layout.samples}
+                assert set(maps) == {i for i, label in enumerate("AB") if any(row[0] == label for row in expected)}
+                for i, entry in maps.items():
+                    positions = [pos for pos, row in enumerate(expected) if row[0] == "AB"[i]]
+                    assert entry.output_rows.tolist() == positions
+                    assert entry.source_rows.tolist() == [int(expected[pos][1:]) for pos in positions]
 
 
 @pytest.mark.parametrize("failure", ["conflict", "uuid", "rows", "length", "count"])
-def test_direct_layout_preserves_manifest_and_handle_constraints(ranks, failure):
+def test_consumer_layout_rejects_invalid_manifests_and_lengths(ranks, failure):
     values = refs()
-    lengths = [5, 9]
+    lengths = [3, 5]
     if failure == "conflict":
         values.append(replace(values[0], owner="d"))
-        lengths.append(5)
+        lengths.append(3)
     elif failure == "uuid":
         values[0] = replace(values[0], version=1, record="a")
     elif failure == "rows":
