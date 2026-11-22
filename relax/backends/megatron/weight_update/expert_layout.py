@@ -3,8 +3,8 @@
 """BF16 gated-expert layouts shared by Bridge export and SGLang FusedMoE.
 
 Names and tensor orientation come from Bridge's canonical per-expert output.
-This module only packs and shards that representation; it never converts raw
-Megatron weights or keeps process groups/GPU storage across updates.
+This module packs and shards that representation and describes qualified raw
+source views. It never retains process groups or GPU storage across updates.
 """
 
 import json
@@ -21,6 +21,41 @@ from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER, expert_slic
 NamedTensor = tuple[str, torch.Tensor]
 _PACKED = re.compile(r"^(.*\.layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)$")
 _SLICE = re.compile(r"^(.*\.layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)\[(\d+):(\d+)\]$")
+
+
+def local_expert_parameters(iterator, weights):
+    """Select physical local parameters; global PP/EP metadata may name a
+    relay."""
+    seen, intervals = set(), {}
+    defaults = dict(tensor_model_parallel=False, partition_dim=-1, partition_stride=1, parallel_mode=None)
+    for bucket in iterator._expert_buckets:
+        for info in bucket:
+            if info.name not in iterator._vanilla_key_map:
+                continue
+            if info.name in seen:
+                raise ValueError(f"Duplicate local expert metadata: {info.name}")
+            seen.add(info.name)
+            parameter = weights[iterator._vanilla_key_map[info.name]]
+            if (
+                not isinstance(parameter, torch.Tensor)
+                or parameter.dtype != info.dtype
+                or tuple(parameter.shape) != tuple(info.shape)
+                or parameter.numel() * parameter.element_size() != info.size
+                or any(getattr(parameter, key, defaults[key]) != value for key, value in info.attrs.items())
+            ):
+                raise ValueError(f"Local expert differs from declared source layout: {info.name}")
+            if not parameter.is_contiguous():
+                raise ValueError(f"Local expert storage must be contiguous: {info.name}")
+            identity = (str(parameter.device), parameter.untyped_storage().data_ptr())
+            start = parameter.storage_offset() * parameter.element_size()
+            intervals.setdefault(identity, []).append((start, start + info.size, info.name))
+            yield info.name, parameter
+    if not seen:
+        raise ValueError("Local expert source has no physical parameters")
+    for regions in intervals.values():
+        regions.sort()
+        if any(left[1] > right[0] for left, right in zip(regions, regions[1:])):
+            raise ValueError("Distinct local experts alias valid source bytes")
 
 
 @dataclass(frozen=True)
