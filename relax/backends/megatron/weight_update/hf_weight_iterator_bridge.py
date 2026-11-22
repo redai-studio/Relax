@@ -331,7 +331,11 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             (mpu.get_expert_tensor_parallel_world_size, mpu.get_expert_tensor_parallel_group),
             (mpu.get_expert_data_parallel_world_size, mpu.get_expert_data_parallel_group),
         )
-        return [group() for size, group in dimensions if size() > 1]
+        groups = [group() for size, group in dimensions if size() > 1]
+        # Ordinary shard ownership checks query this group on every bind.
+        if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:
+            groups.append(mpu.get_data_parallel_group(with_context_parallel=True))
+        return groups
 
     def _iter_routed_expert_chunks(
         self, megatron_local_weights: Mapping[str, torch.Tensor]
