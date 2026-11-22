@@ -20,6 +20,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from torch.nn import Module
 
+from relax.utils.megatron_peft_utils import is_lora_enabled
+
 from .vlm import MiniMaxM31VLModel
 
 
@@ -49,6 +51,13 @@ class MiniMaxM31ModelProvider(MiniMaxM3VLModelProvider):
             raise ValueError("MiniMax-M3.1-Flash requires SFT.")
         if set(args.multimodal_keys or ()) - {"image"}:
             raise ValueError("MiniMax-M3.1-Flash SFT supports text and image inputs.")
+        if (
+            args.multimodal_keys
+            and getattr(args, "overlap_grad_reduce", False)
+            and not (self.freeze_vision_model and self.freeze_vision_projection)
+            and not (is_lora_enabled(args) and getattr(args, "lora_scope", "all") == "language")
+        ):
+            raise ValueError("MiniMax image SFT with trainable vision parameters requires overlap-grad-reduce off.")
         args.multimodal_host_grid_keys = ("image_grid_thw",)
         if args.context_parallel_size != 1 or args.pipeline_model_parallel_size != 1 or args.dynamic_context_parallel:
             raise ValueError("MiniMax-M3.1-Flash requires PP=CP=1 and static context parallelism.")

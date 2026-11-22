@@ -85,6 +85,8 @@ def _install_fake_megatron(monkeypatch, provider=None):
         pass
 
     class _FakeAutoBridge:
+        hf_pretrained = SimpleNamespace(config=SimpleNamespace(model_type="test"))
+
         @classmethod
         def from_hf_pretrained(cls, *args, **kwargs):
             return cls()
@@ -197,6 +199,25 @@ def _bridge_args(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def test_selected_minimax_propagates_bridge_import_failure(monkeypatch):
+    from relax import models
+
+    module, provider = _load_model_provider(monkeypatch)
+    from megatron.bridge import AutoBridge
+
+    error = ImportError("missing MiniMax Bridge module")
+    monkeypatch.setattr(models, "_MINIMAX_IMPORT_ERROR", error)
+    AutoBridge.hf_pretrained.config.model_type = "minimax_m3_vl"
+
+    with pytest.raises(ImportError, match="Failed to register the Relax MiniMax Bridge") as caught:
+        module.get_model_provider_func(_bridge_args())
+    assert caught.value.__cause__ is error
+
+    AutoBridge.hf_pretrained.config.model_type = "test"
+    model_provider = module.get_model_provider_func(_bridge_args())
+    assert model_provider() is provider.model
 
 
 def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):

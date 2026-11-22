@@ -41,7 +41,7 @@ class MiniMaxM31VLModel(MiniMaxM3VLModel):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if pixel_values_videos is not None or video_grid_thw is not None:
             raise ValueError("MiniMax-M3.1-Flash SFT supports text and image inputs.")
-        if labels is None and kwargs.get("mtp_kwargs") is None:
+        if labels is None:
             # CP=1 SFT reads the supervision mask from the batch. Passing it
             # to Bridge would turn its logits into a (logits, mask) pair.
             loss_mask = None

@@ -341,7 +341,11 @@ def get_model_provider_func(
     if not getattr(args, "custom_model_provider_path", None) and args.megatron_to_hf_mode == "bridge":
         from megatron.bridge import AutoBridge
 
+        from relax.models import _MINIMAX_IMPORT_ERROR
+
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        if _MINIMAX_IMPORT_ERROR is not None and bridge.hf_pretrained.config.model_type == "minimax_m3_vl":
+            raise ImportError("Failed to register the Relax MiniMax Bridge.") from _MINIMAX_IMPORT_ERROR
         provider = bridge.to_megatron_provider(load_weights=False)
     # Resolve once, after provider selection and before model/data setup. A VL
     # checkpoint can produce a text-only provider despite its processor files.

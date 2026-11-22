@@ -76,15 +76,25 @@ def miles_sft_loss(_args: Any, batch: dict, logits: "torch.Tensor", _reduce: Any
     return loss, {"loss": loss.detach().clone()}
 
 
-def configure_miles_worker(_args: Any) -> None:
+def log_framework(args: Any, framework: str) -> None:
+    if getattr(args, "rank", 0) == 0:
+        print(f"MiniMax native parity: framework={framework}", flush=True)
+
+
+def configure_miles_worker(args: Any) -> None:
     from miles.backends.training_utils.loss.hub import losses
 
     losses.sft_loss_function = miles_sft_loss
+    log_framework(args, "miles")
 
 
-def _read_metrics(path: Path, steps: int) -> dict[int, tuple[float, float]]:
+def _read_metrics(path: Path, steps: int, framework: str) -> dict[int, tuple[float, float]]:
+    log = path.read_text()
+    frameworks = set(re.findall(r"MiniMax native parity: framework=(\w+)", log))
+    if frameworks != {framework}:
+        raise ValueError(f"{path}: expected {framework} framework, found {sorted(frameworks)}.")
     metrics = {}
-    for match in re.finditer(r"step (\d+): (\{[^\n]+\})", path.read_text()):
+    for match in re.finditer(r"step (\d+): (\{[^\n]+\})", log):
         if "'train/loss'" not in match[2] or "'train/grad_norm'" not in match[2]:
             continue
         values = ast.literal_eval(match[2])
@@ -101,7 +111,8 @@ def _read_metrics(path: Path, steps: int) -> dict[int, tuple[float, float]]:
 def compare_logs(relax: Path, miles: Path, steps: int) -> None:
     if relax.resolve() == miles.resolve():
         raise ValueError("Provide separate Relax and Miles logs.")
-    left, right = (_read_metrics(path, steps) for path in (relax, miles))
+    left = _read_metrics(relax, steps, "relax")
+    right = _read_metrics(miles, steps, "miles")
     different = [step + 1 for step in left if struct.pack("!dd", *left[step]) != struct.pack("!dd", *right[step])]
     if different:
         raise SystemExit(f"Loss or gradient norm differs at steps {different}.")

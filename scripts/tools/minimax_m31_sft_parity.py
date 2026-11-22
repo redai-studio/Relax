@@ -158,11 +158,12 @@ def configure_worker(args: argparse.Namespace) -> None:
     implementation = os.environ["MINIMAX_MSA_IMPL"]
     if os.environ.get("MINIMAX_TEXT_PARITY") == "1":
         if implementation != "relax" or args.loss_type != "sft" or not args.calculate_per_token_loss:
-            raise ValueError("Text parity requires Relax MSA and per-token SFT.")
+            raise ValueError("Native parity requires Relax MSA and per-token SFT.")
         from relax.backends.megatron import loss
-        from scripts.tools.minimax_m31_text_parity import relax_sft_loss
+        from scripts.tools.minimax_m31_text_parity import log_framework, relax_sft_loss
 
         loss.sft_loss_function = relax_sft_loss
+        log_framework(args, "relax")
 
     if implementation == "miles":
         from relax.models.minimax_m31 import bridge
@@ -249,11 +250,11 @@ def compare_runs(logs: list[Path], checkpoints: list[Path], steps: int, *, full:
     left_metrics = _read_metrics(logs[0], steps, "relax")
     right_metrics = _read_metrics(logs[1], steps, "miles")
     if full:
+        from relax.backends.megatron.checkpoint_metadata import validate_native_checkpoint
         from scripts.tools.minimax_m31_sft_parity_state import read_rank_digests
 
         for root in checkpoints:
-            if not (root / f"iter_{steps - 1:07d}" / ".metadata").is_file():
-                raise ValueError(f"{root}: missing final full checkpoint.")
+            validate_native_checkpoint(root / f"iter_{steps - 1:07d}")
     mismatches = []
     for index in range(steps):
         fields = [

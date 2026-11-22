@@ -68,11 +68,13 @@ except Exception as _e:
     get_logger(__name__).warning("Failed to import relax.models.kimi_k3: %s", _e)
 
 
+_MINIMAX_IMPORT_ERROR: ImportError | None = None
 try:
     from relax.models import minimax_m31  # noqa: F401
 except ImportError as _e:
     from relax.utils.logging_utils import get_logger
 
+    _MINIMAX_IMPORT_ERROR = _e
     get_logger(__name__).warning("Failed to import relax.models.minimax_m31: %s", _e)
 
 

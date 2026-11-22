@@ -48,41 +48,141 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m scripts.tools.minimax_m31_sft_pari
 
 The comparison checks loss, gradient norm, global batch size, mean packed token count, and every stored adapter and optimizer tensor at each of the ten steps.
 
-## Independent text-only SFT runs
+## Independent Relax and Miles SFT runs
 
-The text recipe uses each framework's own training entry point. Both loss callbacks use Megatron's vocabulary-parallel cross entropy in FP32 on the same supervised predictor rows, in chunks of 256. Use the same BF16 checkpoint, chat template, and ordered batches of four samples with binary supervision masks. Check token IDs and supervised positions before launching. The tested input was a 40-row text-only selection of OpenSearch-VL. Supply the dataset as `$DATA_DIR/minimax-m3.1-flash-sft.jsonl` and the matching `SFT_CHAT_TEMPLATE`.
+These runs use Relax's SFT entry point and Miles' `train_async.py` in train-only mode. They share the BF16 checkpoint,
+input rows, assistant-mask template, and seed 1234. The reference data was selected from OpenSearch-VL. Before
+launch, match token IDs and supervised positions for each ordered batch of four rows. For image inputs, also match
+`pixel_values` and `image_grid_thw`. Prepare the shared JSONL as `$DATA_DIR/minimax-m3.1-flash-sft.jsonl`, with
+`messages`, `tools`, and `images` fields as applicable, and set `SFT_CHAT_TEMPLATE` to the verified template.
+Use the identical physical row order in Miles and Relax by supplying Miles with the seed-1234 Relax index order
+in `MINIMAX_E2E_INDEX_ORDER`.
 
-Run Relax on two eight-GPU nodes with TP=4, EP=16 and PP=CP=1. Use `MINIMAX_TEXT_PARITY_LAYERS=4` for the checkpoint with source layers 0, 1, 3 and 4. For 60 layers, convert the complete checkpoint to `$MODEL_DIR/MiniMax-M3.1-Flash-BF16` by omitting `--layers` from the converter command above.
+| Mode | Layers | TP  | EP  | Learning rate |
+| ---- | ------ | --- | --- | ------------- |
+| LoRA | 4      | 4   | 16  | 1e-4          |
+| LoRA | 60     | 4   | 16  | 1e-4          |
+| Full | 4      | 4   | 8   | 1e-5          |
+
+Use two eight-GPU nodes and PP=CP=1 for each pair. The 60-layer case uses
+`$MODEL_DIR/MiniMax-M3.1-Flash-BF16`, produced by omitting `--layers` from the converter command above.
+Set `SFT_MODE` and `MINIMAX_PARITY_LAYERS` for the pair. Leave `MULTIMODAL_KEYS` unset for text-only runs,
+or export `MULTIMODAL_KEYS='{"image":"images"}'` for image runs.
+
+The Miles checkout in the recorded experiment is pinned to `fa13e2ec42622f6e77aabd8e0c295ab8b4347eac`
+with the experiment overlay from `reproduce/sources-v2.tar.gz`
+(SHA-256 `84761b687a8fae4f787242bb4b871da30446a35ed3b83eda4870bbe0c5db5bcf`). The source archive is
+an external prerequisite for this recipe. Set `MILES_PARITY_CHECKOUT` to its restored `Miles/` directory and
+`MILES_PARITY_PYTHONPATH` to the shared runtime module paths for the pinned Core, Bridge, and offline input
+processor. The overlay's `miles_plugins/megatron_bridge/__init__.py` imports `minimax_vlm`, whose registered
+`MilesMiniMaxVLMBridge` installs Miles' `miles_plugins.models.minimax_m3.minimax_m3.get_minimax_m3_spec`.
+Use that registration on Bridge `6862ee170a`. The default Bridge in the pinned Miles image uses dense
+attention. The overlay also forwards the deterministic provider options and includes the offline SFT callbacks.
+For the image callback, populate the experiment metadata's `e2e_images` with the same paths as `images`,
+`e2e_videos` with an empty array, and `tools` with the same tool definitions as the Relax row.
+Keep the archived input processor importable for that callback.
+
+Launch Relax first. Use a fresh `EXP_NAME` for each paired run.
 
 ```bash
-unset MULTIMODAL_KEYS
-export MINIMAX_TEXT_PARITY=1 MINIMAX_TEXT_PARITY_LAYERS=60
-export MINIMAX_MSA_IMPL=relax SFT_MODE=lora SEED=1234 TRAIN_STEPS=10
+export MINIMAX_NATIVE_PARITY=1 MINIMAX_MSA_IMPL=relax SEED=1234 TRAIN_STEPS=10
+export SFT_MODE="${SFT_MODE:-lora}" MINIMAX_PARITY_LAYERS="${MINIMAX_PARITY_LAYERS:-4}"
 export RELAX_SKIP_CLUSTER_CLEANUP=1 RAY_NO_WAIT=
-EXP_NAME=text-parity-relax SUBMISSION_ID=text-parity-relax \
+EXP_NAME=native-parity-relax SUBMISSION_ID=native-parity-relax \
     bash scripts/entrypoint/ray-job.sh scripts/training/sft/run-minimax-m3.1-flash-4l-lora-sft-16xgpu.sh
 ```
 
-With the pinned Miles checkout and its MiniMax VLM Bridge provider, launch the same checkpoint through `train_async.py` in train-only mode. Keep the Miles attention and optimizer. Add Relax's `scripts/tools` directory to the Miles workers' `PYTHONPATH` and set these Miles flags:
-
-```text
---loss-type sft_loss
---custom-megatron-init-path minimax_m31_text_parity.configure_miles_worker
---calculate-per-token-loss
---deterministic-mode
---seed 1234
-```
-
-Use text batches with one THD sample per DP rank, a 9,216-token limit, and seed-matched data order and length balancing. Match rank-16 language attention QKV and output LoRA, alpha 32, zero dropout and Adam with learning rate `1e-4`, betas `(0.9, 0.999)`, zero weight decay and gradient clipping at 1. Use the same Megatron and Transformer Engine builds, including NCCL Ring/Simple, disabled NVLS, `CUBLAS_WORKSPACE_CONFIG=:4096:8` and `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`. Set `MILES_FILL_UNINIT=1` in the Miles worker environment. Use full activation recomputation with one layer per group and disable MoE permutation fusion for both runs.
+Run the following from Relax in Bash with the same environment. Copy the loss callback into the restored
+experiment checkout to include the framework marker used by the comparison command.
 
 ```bash
-python -m scripts.tools.minimax_m31_text_parity --logs relax.log miles.log --steps 10
+cp scripts/tools/minimax_m31_text_parity.py "$MILES_PARITY_CHECKOUT/"
+model="$MODEL_DIR/MiniMax-M3.1-Flash-4L-BF16"
+model_spec=minimax-m3.1-flash-4layer.py
+if [[ "$MINIMAX_PARITY_LAYERS" == 60 ]]; then
+    model="$MODEL_DIR/MiniMax-M3.1-Flash-BF16"
+    model_spec=minimax-m3.1-flash.py
+fi
+args_path="$MILES_PARITY_CHECKOUT/miles/utils/external_utils:$MILES_PARITY_CHECKOUT/scripts/models"
+mapfile -t spec < <(PYTHONPATH="$args_path${PYTHONPATH:+:$PYTHONPATH}" \
+    python - "$MILES_PARITY_CHECKOUT/scripts/models/$model_spec" <<'PYTHON'
+import runpy
+import shlex
+import sys
+
+args = shlex.split(runpy.run_path(sys.argv[1])["model_args"]())
+args.remove("--moe-permute-fusion")
+print("\n".join(args))
+PYTHON
+)
+ep=8
+lr=1e-5
+lora=()
+if [[ "$SFT_MODE" == lora ]]; then
+    ep=16
+    lr=1e-4
+    prefix='model.language_model.layers.*.self_attn'
+    lora=(--lora-train-only --lora-rank 16 --lora-alpha 32 --lora-type lora --lora-dropout 0
+          --target-modules "$prefix.q_proj,$prefix.k_proj,$prefix.v_proj,$prefix.o_proj")
+fi
+text_only=1
+input_hook=minimax_miles_sft.generate_rollout
+if [[ -n "${MULTIMODAL_KEYS:-}" ]]; then
+    text_only=0
+    input_hook=minimax_miles_media.generate_rollout
+fi
+
+runtime_env=$(jq -cn \
+    --arg path "./miles/utils/external_utils:./scripts/models:$MILES_PARITY_PYTHONPATH" \
+    --arg order "$MINIMAX_E2E_INDEX_ORDER" --arg text "$text_only" \
+    '{env_vars: {PYTHONPATH: $path, MINIMAX_E2E_INDEX_ORDER: $order, MINIMAX_E2E_TEXT_ONLY: $text,
+      NCCL_ALGO: "Ring", NCCL_PROTO: "Simple", NCCL_NVLS_ENABLE: "0", CUDA_DEVICE_MAX_CONNECTIONS: "1",
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8", NVTE_ALLOW_NONDETERMINISTIC_ALGO: "0", NVTE_FRAMEWORK: "pytorch",
+      PYTHONHASHSEED: "0", MILES_FILL_UNINIT: "1", RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES: "1"}}')
+ray job submit --address="$RAY_ADDRESS" --submission-id=native-parity-miles \
+    --entrypoint-num-cpus=1 --working-dir="$MILES_PARITY_CHECKOUT" --runtime-env-json="$runtime_env" \
+    -- python -u train_async.py "${spec[@]}" "${lora[@]}" \
+    --hf-checkpoint "$model" --ref-load "$model" --load "$model" --megatron-to-hf-mode bridge \
+    --train-backend megatron --debug-train-only --debug-skip-weight-update --disable-compute-advantages-and-returns \
+    --rollout-function-path "$input_hook" --data-source-path minimax_miles_sft.PairedOpenSearchDataSource \
+    --prompt-data "$DATA_DIR/minimax-m3.1-flash-sft.jsonl" --chat-template-path "$SFT_CHAT_TEMPLATE" \
+    --input-key messages --tool-key tools --metadata-key metadata --no-rollout-shuffle --balance-data \
+    --num-rollout 10 --rollout-batch-size 4 --global-batch-size 4 --n-samples-per-prompt 1 \
+    --loss-type sft_loss --calculate-per-token-loss --use-dynamic-batch-size \
+    --custom-megatron-init-path minimax_m31_text_parity.configure_miles_worker \
+    --max-tokens-per-gpu 9216 --seq-length 9216 --max-position-embeddings 1048576 \
+    --qkv-format thd --data-pad-size-multiplier 128 \
+    --actor-num-nodes 2 --actor-num-gpus-per-node 8 --num-gpus-per-node 8 \
+    --tensor-model-parallel-size 4 --pipeline-model-parallel-size 1 --context-parallel-size 1 \
+    --expert-model-parallel-size "$ep" --expert-tensor-parallel-size 1 --sequence-parallel \
+    --moe-token-dispatcher-type alltoall --moe-router-load-balancing-type none --moe-aux-loss-coeff 0 \
+    --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 \
+    --optimizer adam --lr "$lr" --lr-decay-style constant --weight-decay 0 \
+    --adam-beta1 0.9 --adam-beta2 0.999 --clip-grad 1 \
+    --bf16 --no-bias-swiglu-fusion --attention-backend flash --attention-dropout 0 --hidden-dropout 0 \
+    --deterministic-mode --seed 1234 --log-probs-chunk-size 256
 ```
 
-The four-layer experiment compared the first-step logits gradients, reduced LoRA gradients, Adam master parameters, and updated model parameters bitwise. The 60-layer run compared the first-step logits and per-token loss, then the reported loss and gradient norm at each of ten steps.
+Compare the ten reported loss and gradient-norm values using the framework markers in the two logs.
+In native parity mode, Relax saves a checkpoint at the final step and omits the per-step rank digests.
 
-## Full-parameter SFT
+```bash
+ray job logs --address="$RAY_ADDRESS" native-parity-relax > "$DATA_DIR/native-relax.log"
+ray job logs --address="$RAY_ADDRESS" native-parity-miles > "$DATA_DIR/native-miles.log"
+python -m scripts.tools.minimax_m31_text_parity \
+    --logs "$DATA_DIR/native-relax.log" "$DATA_DIR/native-miles.log" --steps 10
+```
 
-Set `SFT_MODE=full` for both launches and use separate experiment and submission names. The four-layer checkpoint and inputs are the same. The recipe uses TP=4, EP=8, and a learning rate of `1e-5`. It trains the language model, vision tower, and projectors. The MSA block indexer stays frozen because it produces discrete block selections outside autograd.
+## Full-parameter SFT with both MSA implementations
+
+In [Run and compare](#run-and-compare), set `SFT_MODE=full` for both launches and use separate experiment and submission names. The four-layer checkpoint and inputs are the same. The recipe uses TP=4, EP=8, and a learning rate of `1e-5`. It trains the language model, vision tower, and projectors. The MSA block indexer stays frozen because it produces discrete block selections outside autograd.
 
 Add `--full` to the comparison command. Full-parameter parity records SHA-256 digests of the rank-local model parameters, Adam master parameters, and optimizer tensor state after each successful update. Both runs save a regular full-training checkpoint after the last step. For ordinary full-parameter training, set `SFT_MODE=full` and use the same `SAVE_DIR` and `EXP_NAME` to resume.
+
+### Resume after router precision changes
+
+For full-parameter MiniMax-M3.1-Flash and mixed-attention MiniMax-M3, Relax now puts trainable router weights in
+FP32 buckets. A checkpoint saved with BF16 router weights and the `dp_reshardable` optimizer layout has different
+bucket sizes. Start a new run from the old model weights by setting `--load` to the old checkpoint root,
+`--save` to a fresh root, and adding `--finetune` on the training command. This starts new optimizer, scheduler,
+and RNG state. Keep optimizer-state resume for checkpoints already saved with the FP32 router layout.
