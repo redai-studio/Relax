@@ -54,8 +54,16 @@ def _restore_tp_weight(name, partitions, partition_dim, split_sizes=None):
     return torch.cat(partitions, dim=partition_dim)
 
 
-def _gather_tp_weights(named_params, *, split_sizes, async_op):
+def _gather_tp_weights(
+    named_params,
+    *,
+    split_sizes,
+    async_op,
+    contiguous_output_min_bytes: int | None = None,
+    reuse_tp1_buffer: bool = False,
+):
     tasks, handles = [], []
+    gather_inputs = []
     for name, param in named_params:
         name = name.replace(".to_wrap.", ".")
         if "expert_bias" in name:
@@ -75,11 +83,40 @@ def _gather_tp_weights(named_params, *, split_sizes, async_op):
             size, group = mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()
         if "linear_fc1" not in name:
             assert getattr(param, "partition_stride", 1) == 1, f"Unsupported partition stride for {name}"
-        partitions = [torch.empty_like(param.data) for _ in range(size)]
-        handle = dist.all_gather(partitions, param.data, group=group, async_op=async_op)
+        partition_dim = param.partition_dim
+        if (
+            reuse_tp1_buffer
+            and size == 1
+            and name not in split_sizes
+            and "linear_fc1.weight" not in name
+            and "linear_fc2.weight" not in name
+        ):
+            tasks.append((name, param.data, None, None))
+            continue
+        if (
+            contiguous_output_min_bytes is not None
+            and size > 1
+            and partition_dim == 0
+            and getattr(param, "partition_stride", 1) == 1
+            and name not in split_sizes
+            and "linear_fc1.weight" not in name
+            and "linear_fc2.weight" not in name
+            and param.numel() * param.element_size() * size > contiguous_output_min_bytes
+            and dist.get_backend(group) == dist.Backend.NCCL
+        ):
+            # A row-concatenated result is also the native all-gather layout.
+            # Avoid keeping a second, full-sized list of partitions for torch.cat.
+            source = param.detach().contiguous()
+            output = source.new_empty((source.size(0) * size, *source.shape[1:]))
+            handle = dist.all_gather_into_tensor(output, source, group=group, async_op=async_op)
+            gather_inputs.append(source)
+            tasks.append((name, output, None, None))
+        else:
+            partitions = [torch.empty_like(param.data) for _ in range(size)]
+            handle = dist.all_gather(partitions, param.data, group=group, async_op=async_op)
+            tasks.append((name, None, partitions, partition_dim))
         if handle is not None:
             handles.append(handle)
-        tasks.append((name, None, partitions, param.partition_dim))
     # All async collectives launch before any wait. Results remain in input order.
     for handle in handles:
         handle.wait()
@@ -89,7 +126,7 @@ def _gather_tp_weights(named_params, *, split_sizes, async_op):
     ]
 
 
-def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
+def all_gather_param(args, name: str, param: torch.Tensor, *, reuse_tp1_buffer: bool = False) -> torch.Tensor:
     """Gather one parameter using the same layout rules as batched export."""
     name = name.replace(".to_wrap.", ".")
     split_sizes = {}
@@ -101,13 +138,16 @@ def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
         split_sizes[name] = gdn_component_sizes(
             get_hf_config(args.hf_checkpoint), mpu.get_tensor_model_parallel_world_size(), name
         )
-    return _gather_tp_weights([(name, param)], split_sizes=split_sizes, async_op=False)[0]
+    return _gather_tp_weights(
+        [(name, param)], split_sizes=split_sizes, async_op=False, reuse_tp1_buffer=reuse_tp1_buffer
+    )[0]
 
 
 def all_gather_params_async(
     param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
     *,
     gdn_split_sizes: Mapping[str, tuple[int, ...]] | None = None,
+    contiguous_output_min_bytes: int | None = None,
 ) -> list[torch.Tensor]:
     """Launch every parameter gather before waiting, then restore shared TP
     layouts."""
@@ -115,6 +155,7 @@ def all_gather_params_async(
         [(info.name, param) for info, param in param_infos_and_params],
         split_sizes=gdn_split_sizes or {},
         async_op=True,
+        contiguous_output_min_bytes=contiguous_output_min_bytes,
     )
 
 

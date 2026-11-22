@@ -846,7 +846,19 @@ class SGLangEngine(RayActor):
             and layout.get("device") == "cuda"
             and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
         )
-        config = get_hf_config(layout["model_path"])
+        model_overrides = json.loads(layout.get("json_model_override_args") or "{}")
+        revision = info.get("revision")
+        if model_overrides or revision:
+            from sglang.srt.utils.hf_transformers_utils import get_config as get_sglang_config
+
+            config = get_sglang_config(
+                layout["model_path"],
+                trust_remote_code=info.get("trust_remote_code", True),
+                revision=revision,
+                model_override_args=model_overrides,
+            )
+        else:
+            config = get_hf_config(layout["model_path"])
         text_config = (
             getattr(config, "text_config", None)
             or getattr(getattr(config, "thinker_config", None), "text_config", None)
@@ -874,8 +886,17 @@ class SGLangEngine(RayActor):
             or getattr(text_config, "num_shared_experts", None)
             or int(bool(getattr(text_config, "shared_expert_intermediate_size", 0)))
         )
-        for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
+        for key in ("hidden_size", "moe_intermediate_size"):
             layout[key] = getattr(text_config, key, None)
+        # Match SGLang's checkpoint metadata precedence, including multimodal wrappers.
+        quantization = getattr(config, "quantization_config", None)
+        if quantization is None:
+            quantization = getattr(text_config, "quantization_config", None)
+        if quantization is None:
+            quantization = getattr(config, "compression_config", None)
+        layout["quantization_config"] = (
+            quantization.to_dict() if quantization is not None and not isinstance(quantization, dict) else quantization
+        )
         return layout
 
     def load_lora_adapter_from_tensors(
@@ -2248,6 +2269,12 @@ def _compute_server_args(
         loaders = list(kwargs.get("custom_weight_loader") or [])
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
+        if getattr(args, "colocate", False) and Envs.RELAX_COLOCATE_OVERLAP_WEIGHT_BACKUP:
+            # Empty updates through this loader wait for CUDA reads before ACK.
+            from relax.backends.sglang.weight_loader import NATIVE_SYNC_FENCE_LOADER
+
+            if NATIVE_SYNC_FENCE_LOADER not in loaders:
+                loaders.append(NATIVE_SYNC_FENCE_LOADER)
         kwargs["custom_weight_loader"] = loaders
 
     if (
