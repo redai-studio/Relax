@@ -46,6 +46,7 @@ def checkpoint(request, monkeypatch):
                 "_checkpoint_load_state",
                 "_resolve_checkpoint_iteration_dir",
                 "_metadata_value",
+                "_record_lora_base",
             ],
         )
     monkeypatch.setattr(module, "_collective_checkpoint_probe", lambda probe: probe(), raising=False)
@@ -55,6 +56,10 @@ def checkpoint(request, monkeypatch):
     monkeypatch.setattr(module, "validate_native_checkpoint", lambda *args, **kwargs: {}, raising=False)
     monkeypatch.setattr(module, "is_rm_mode", lambda args: False, raising=False)
     monkeypatch.setattr(module, "_LORA_CHECKPOINT_METADATA_ATTR", "relax_lora_checkpoint_metadata", raising=False)
+    from relax.utils.lora_checkpoint_identity import verified_lora_base_identity
+
+    monkeypatch.setattr(module, "verified_lora_base_identity", verified_lora_base_identity, raising=False)
+    monkeypatch.setattr(module, "_LORA_FROZEN_BASE", "relax_lora_frozen_hf_base", raising=False)
     monkeypatch.setattr(module, "logger", Mock(), raising=False)
     monkeypatch.setattr(module, "_alias_renamed_transfer_queue_enum", lambda: None, raising=False)
     return module
@@ -161,11 +166,26 @@ def test_checkpoint_lora_iteration_resume_order(checkpoint, monkeypatch, tmp_pat
     monkeypatch.setattr(
         checkpoint,
         "_load_checkpoint_metadata",
-        lambda *_: {"args": {"relax_lora_checkpoint_metadata": {"format_version": 1}}},
+        lambda *_: {
+            "args": {
+                "relax_lora_checkpoint_metadata": {
+                    "format_version": 2,
+                    "base_hf_checkpoint": {
+                        "config_sha256": "c",
+                        "index_sha256": None,
+                        "shard_stat_sha256": "s",
+                        "shard_count": "1",
+                    },
+                }
+            }
+        },
         raising=False,
     )
     monkeypatch.setattr(
-        checkpoint, "_validate_lora_checkpoint_metadata", lambda *_: calls.append("validate"), raising=False
+        checkpoint,
+        "_validate_lora_checkpoint_metadata",
+        lambda *_: calls.append("validate") or "base-model",
+        raising=False,
     )
     monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", lambda **kw: calls.append(kw["load_path"]), raising=False)
     for name in (

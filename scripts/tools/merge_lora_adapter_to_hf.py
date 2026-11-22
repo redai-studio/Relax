@@ -150,38 +150,33 @@ def _validate_adapter_dir(adapter_dir: Path) -> None:
         raise FileNotFoundError(f"No adapter weights (adapter_model.safetensors/.bin) found in {adapter_dir}.")
 
 
-def _read_adapter_scaling(adapter_dir: Path) -> float:
-    """Return the LoRA scaling factor and log the adapter's config + Relax
-    sidecar."""
-    with open(adapter_dir / "adapter_config.json") as f:
-        cfg = json.load(f)
-
+def _read_adapter_config(adapter_dir: Path) -> tuple[dict[str, Any], bool]:
+    """Read the PEFT config and recognize the Relax expert-rank convention."""
+    cfg = json.loads((adapter_dir / "adapter_config.json").read_text())
     rank = cfg.get("r")
     alpha = cfg.get("lora_alpha")
     if not rank or alpha is None:
         raise ValueError(f"adapter_config.json in {adapter_dir} is missing 'r' / 'lora_alpha'; cannot merge.")
 
-    if cfg.get("use_rslora"):
-        scaling = alpha / (rank**0.5)
-        rule = "alpha/sqrt(r) [rslora]"
-    else:
-        scaling = alpha / rank
-        rule = "alpha/r"
+    scaling = alpha / (math.sqrt(rank) if cfg.get("use_rslora") else rank)
+    rule = "alpha/sqrt(r) [rslora]" if cfg.get("use_rslora") else "alpha/r"
     print(
         f"[merge-lora] adapter config: r={rank} alpha={alpha} dropout={cfg.get('lora_dropout')} "
         f"scaling={scaling:g} ({rule}) targets={cfg.get('target_modules', [])}"
     )
 
     meta_file = adapter_dir / "relax_lora_meta.json"
+    relax_export = False
     if meta_file.is_file():
         with open(meta_file) as f:
             meta = json.load(f)
+        relax_export = meta.get("lora_rank") == rank and meta.get("lora_alpha") == alpha
         mode = "adapter" if meta.get("lora_adapter_mode") else "merge" if meta.get("lora_merge_mode") else "standard"
         print(
             f"[merge-lora] relax sidecar: trained mode={mode}, "
             f"target_modules(megatron)={meta.get('lora_target_modules')}"
         )
-    return scaling
+    return cfg, relax_export
 
 
 def _strip_suffix(key: str, suffixes) -> str:
@@ -305,6 +300,14 @@ def _module_scaling(config: dict[str, Any], prefix: str, actual_rank: int, *, re
     return alpha / (math.sqrt(rank) if config.get("use_rslora") else rank)
 
 
+def _check_delta_shape(key: str, base: tuple[int, ...], delta: tuple[int, ...]) -> None:
+    if base == delta:
+        return
+    if len(base) == 3 and ".experts." in key and delta in (base[1:], (1, *base[1:])):
+        return
+    raise ValueError(f"LoRA delta shape {delta} does not match base tensor {key} {base}")
+
+
 def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
     """Fold the adapter into ``shard_tensors`` in place.
 
@@ -322,14 +325,7 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
         # (E,out,r)@(E,r,in) for grouped MoE experts stored as one 3-D parameter.
         factor = scaling[prefix] if isinstance(scaling, dict) else scaling
         delta = factor * (lora_b @ lora_a)
-        if base.ndim == 3 and ".experts." in base_key and delta.shape[-2:] == base.shape[-2:]:
-            if delta.ndim == 2 or (delta.ndim == 3 and delta.shape[0] == 1):
-                delta = delta.expand(base.shape)
-        if delta.shape != base.shape:
-            raise ValueError(
-                f"LoRA delta shape {tuple(delta.shape)} does not match base tensor {base_key} "
-                f"{tuple(base.shape)} (lora_A={tuple(lora_a.shape)}, lora_B={tuple(lora_b.shape)})."
-            )
+        _check_delta_shape(base_key, tuple(base.shape), tuple(delta.shape))
         shard_tensors[base_key] = (base.to(device=device, dtype=torch.float32) + delta).to(
             dtype=base.dtype, device="cpu"
         )
@@ -388,15 +384,7 @@ def main() -> None:
     if not args.dry_run and output_dir.exists() and any(output_dir.iterdir()) and not args.force:
         raise ValueError(f"Output directory {output_dir} already exists and is non-empty. Use --force to overwrite.")
 
-    _read_adapter_scaling(adapter_dir)
-    config = json.loads((adapter_dir / "adapter_config.json").read_text())
-    sidecar = adapter_dir / "relax_lora_meta.json"
-    relax_export = False
-    if sidecar.is_file():
-        metadata = json.loads(sidecar.read_text())
-        relax_export = metadata.get("lora_rank") == config.get("r") and metadata.get("lora_alpha") == config.get(
-            "lora_alpha"
-        )
+    config, relax_export = _read_adapter_config(adapter_dir)
     base_config = json.loads((base_dir / "config.json").read_text())
     if base_config.get("quantization_config") or base_config.get("text_config", {}).get("quantization_config"):
         raise ValueError("Merge requires an unquantized HF base model")
@@ -452,13 +440,9 @@ def main() -> None:
                 for prefix, key in targets.items():
                     base = handle.get_slice(key)
                     shape, delta = tuple(base.get_shape()), delta_shapes[prefix]
-                    if len(shape) == 3 and ".experts." in key and delta[-2:] == shape[-2:]:
-                        if len(delta) == 2 or (len(delta) == 3 and delta[0] == 1):
-                            delta = shape
-                    if delta != shape or base.get_dtype() not in ("BF16", "F16", "F32", "F64"):
-                        raise ValueError(
-                            f"LoRA delta does not match floating-point base tensor {key}: {delta} vs {shape}"
-                        )
+                    _check_delta_shape(key, shape, delta)
+                    if base.get_dtype() not in ("BF16", "F16", "F32", "F64"):
+                        raise ValueError(f"LoRA merge requires a floating-point base tensor: {key}")
 
         if args.dry_run:
             for shard in shard_names:

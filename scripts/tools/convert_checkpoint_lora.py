@@ -5,9 +5,7 @@ model."""
 
 from __future__ import annotations
 
-import hashlib
 import io
-import json
 import math
 from argparse import Namespace
 from collections import defaultdict
@@ -15,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity, verified_lora_base_identity
 from scripts.tools.convert_checkpoint_mapping import Conversion, TensorSlice, build_conversions, normalize_key
 
 
@@ -45,7 +44,7 @@ def _load_common(source: Any) -> Any:
         "signal": ("Signals",),
         "relax.core.registry": ("ROLES_SFT_ONLY",),
     }
-    allowed = [Namespace, io.BytesIO, dict, defaultdict, Any]
+    allowed = [Namespace, io.BytesIO, dict, list, int, defaultdict, Any]
     # Old streaming-data checkpoints retain connection metadata. Export only
     # needs training args; preserve this record as inert data, without Ray/ZMQ.
     allowed.append((Namespace, "transfer_queue.utils.zmq_utils.ZMQServerInfo"))
@@ -62,6 +61,9 @@ def _load_common(source: Any) -> Any:
             "omegaconf.base.Metadata",
             "omegaconf.base.ContainerMetadata",
             "omegaconf.dictconfig.DictConfig",
+            "omegaconf.listconfig.ListConfig",
+            "relax.utils.data.identity_window_sampler.IdentityWindowSampler",
+            "relax.utils.model_source.ModelSource",
             "transfer_queue.sampler.seqlen_balanced_sampler.SeqlenBalancedSampler",
         )
     )
@@ -106,29 +108,13 @@ def read_lora_args(checkpoint: Path, reader: Any) -> dict[str, Any]:
     return args
 
 
-def validate_lora_base(args: dict[str, Any], model: Path, weight_map: dict[str, str]) -> bool:
+def validate_lora_base(args: dict[str, Any], model: Path) -> bool:
     """Require the same base identity as native adapter-only resume."""
     marker = args.get("relax_lora_checkpoint_metadata")
     if marker is None:
         return False
-    if not isinstance(marker, dict) or marker.get("format_version") != 1:
-        raise ValueError("Unsupported LoRA-only checkpoint metadata version")
-    expected = marker.get("base_hf_checkpoint")
-    required = {"config_sha256", "index_sha256", "shard_stat_sha256", "shard_count"}
-    if not isinstance(expected, dict) or not required.issubset(expected) or not expected.get("shard_stat_sha256"):
-        raise ValueError("LoRA-only checkpoint is missing its base HF identity")
-    index = model / "model.safetensors.index.json"
-    stats = [
-        (name, (model / name).stat().st_size, (model / name).stat().st_mtime_ns)
-        for name in sorted(set(weight_map.values()))
-    ]
-    actual = {
-        "config_sha256": hashlib.sha256((model / "config.json").read_bytes()).hexdigest(),
-        "index_sha256": hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else None,
-        "shard_stat_sha256": hashlib.sha256(json.dumps(stats, separators=(",", ":")).encode()).hexdigest(),
-        "shard_count": str(len(stats)),
-    }
-    if any(actual.get(key) != value for key, value in expected.items()):
+    expected = verified_lora_base_identity(args, marker)
+    if hf_checkpoint_identity(model) != expected:
         raise ValueError("LoRA-only checkpoint base HF identity mismatch; use the exact training base")
     for key in ("lora_rank", "lora_alpha", "tensor_model_parallel_size"):
         if key in marker and marker[key] != args.get(key):

@@ -1,13 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import copy
-import hashlib
-import json
 import os
 import re
 from argparse import Namespace
 from contextlib import contextmanager, nullcontext
-from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -22,6 +19,7 @@ from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
+from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity, verified_lora_base_identity
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.training.ppo_utils import (
     use_critic_lm_head_for_hf_load,
@@ -230,7 +228,8 @@ def _load_checkpoint_metadata(args, ddp_model, checkpoint_dir: Path) -> dict:
 
 
 _LORA_CHECKPOINT_METADATA_ATTR = "relax_lora_checkpoint_metadata"
-_LORA_CHECKPOINT_FORMAT_VERSION = 1
+_LORA_CHECKPOINT_FORMAT_VERSION = 2
+_LORA_FROZEN_BASE = "relax_lora_frozen_hf_base"
 
 
 def _filter_lora_checkpoint_state_dict(state_dict: dict, *, metadata: dict | None = None) -> dict:
@@ -276,7 +275,7 @@ def _patch_lora_checkpoint_state_dict(*, metadata: dict | None = None):
         checkpointing.generate_state_dict = original_generate_state_dict
 
 
-def _global_trainable_lora_parameter_names(model) -> tuple[str, ...]:
+def _global_trainable_lora_parameter_names(model, *, required: bool = True) -> tuple[str, ...]:
     import torch.distributed as dist
     from megatron.core.utils import unwrap_model
 
@@ -304,6 +303,8 @@ def _global_trainable_lora_parameter_names(model) -> tuple[str, ...]:
 
     all_lora = sorted({name for names, _ in gathered for name in names})
     all_invalid = sorted({name for _, names in gathered for name in names})
+    if not required and (all_invalid or not all_lora):
+        return ()
     if all_invalid:
         preview = ", ".join(all_invalid[:8])
         raise RuntimeError(
@@ -315,10 +316,12 @@ def _global_trainable_lora_parameter_names(model) -> tuple[str, ...]:
     return tuple(all_lora)
 
 
-def _lora_checkpoint_metadata(args, trainable_names: tuple[str, ...]) -> dict:
+def _lora_checkpoint_metadata(args, trainable_names: tuple[str, ...], base: dict | None) -> dict:
+    if not base or not base.get("shard_stat_sha256"):
+        raise RuntimeError("Cannot save a LoRA-only checkpoint without a verified frozen HF base; save a full DCP")
     return {
         "format_version": _LORA_CHECKPOINT_FORMAT_VERSION,
-        "base_hf_checkpoint": _hf_checkpoint_identity(args.hf_checkpoint),
+        "base_hf_checkpoint": base,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
@@ -340,56 +343,6 @@ def _lora_checkpoint_metadata(args, trainable_names: tuple[str, ...]) -> dict:
         "data_parallel_size": getattr(args, "data_parallel_size", None),
         "trainable_parameter_names": trainable_names,
     }
-
-
-@lru_cache(maxsize=8)
-def _hf_checkpoint_identity(path: str) -> dict[str, str | None]:
-    root = Path(path)
-
-    def digest(filename: str) -> str | None:
-        candidate = root / filename
-        if not candidate.is_file():
-            return None
-        return hashlib.sha256(candidate.read_bytes()).hexdigest()
-
-    index_path = next(
-        (
-            candidate
-            for candidate in (
-                root / "model.safetensors.index.json",
-                root / "pytorch_model.bin.index.json",
-            )
-            if candidate.is_file()
-        ),
-        None,
-    )
-    identity = {
-        "config_sha256": digest("config.json"),
-        "index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest() if index_path else None,
-    }
-    shard_names: list[str] = []
-    if index_path is not None:
-        index = json.loads(index_path.read_text())
-        shard_names = sorted(set(index.get("weight_map", {}).values()))
-    elif root.is_dir():
-        shard_names = sorted(
-            candidate.name for pattern in ("*.safetensors", "pytorch_model*.bin") for candidate in root.glob(pattern)
-        )
-
-    shard_stats = []
-    for name in shard_names:
-        shard = root / name
-        if not shard.is_file():
-            raise FileNotFoundError(f"HF base checkpoint shard is missing: {shard}")
-        stat = shard.stat()
-        shard_stats.append((name, stat.st_size, stat.st_mtime_ns))
-    if shard_stats:
-        encoded = json.dumps(shard_stats, separators=(",", ":"), ensure_ascii=True).encode()
-        identity["shard_stat_sha256"] = hashlib.sha256(encoded).hexdigest()
-        identity["shard_count"] = str(len(shard_stats))
-    if not shard_stats:
-        identity["path"] = str(root.resolve())
-    return identity
 
 
 @contextmanager
@@ -586,31 +539,51 @@ def _resolve_checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | No
     return path / f"iter_{iteration:07d}"
 
 
-def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> None:
-    if metadata.get("format_version") != _LORA_CHECKPOINT_FORMAT_VERSION:
-        raise RuntimeError(
-            f"Unsupported lightweight LoRA checkpoint format version: {metadata.get('format_version')!r}."
-        )
-    expected = _lora_checkpoint_metadata(args, _global_trainable_lora_parameter_names(model))
+def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> str:
+    # On resume --load names the native checkpoint. Either HF argument may
+    # supply the original weights, including a relocated identical base.
+    names = _global_trainable_lora_parameter_names(model)
+    candidates = tuple(dict.fromkeys((args.hf_checkpoint, getattr(args, "ref_load", None))))
+
+    def select_base() -> int:
+        for index, requested in enumerate(candidates):
+            if not requested:
+                continue
+            path = _select_hf_load_source(args, requested)
+            try:
+                if _is_hf_checkpoint(path) and hf_checkpoint_identity(path) == metadata["base_hf_checkpoint"]:
+                    return index
+            except FileNotFoundError:
+                continue
+        raise ValueError("Lightweight LoRA checkpoint base HF identity mismatch; supply the exact training base")
+
+    source = candidates[_collective_checkpoint_probe(select_base)]
+    expected = _lora_checkpoint_metadata(args, names, metadata["base_hf_checkpoint"])
+    expected["format_version"] = metadata["format_version"]
     mismatches = {
         key: (metadata.get(key), expected.get(key)) for key in expected if metadata.get(key) != expected.get(key)
     }
     if mismatches:
         details = ", ".join(f"{key}: checkpoint={old!r}, current={new!r}" for key, (old, new) in mismatches.items())
         raise RuntimeError(f"Lightweight LoRA checkpoint is incompatible with the current run: {details}")
+    return source
 
 
 def save_checkpoint(*args, lora_only: bool = False, **kwargs):
     """Save either the regular full DCP or a resumable LoRA-only DCP."""
-    if not lora_only:
-        return _save_checkpoint_megatron(*args, **kwargs)
-
     runtime_args = get_args()
     model = args[1] if len(args) > 1 else kwargs["model"]
+    if not lora_only:
+        if getattr(runtime_args, _LORA_FROZEN_BASE, None) and not _global_trainable_lora_parameter_names(
+            model, required=False
+        ):
+            setattr(runtime_args, _LORA_FROZEN_BASE, None)
+        return _save_checkpoint_megatron(*args, **kwargs)
+
     optimizer = args[2] if len(args) > 2 else kwargs.get("optimizer")
     _sync_hybrid_optimizer_checkpoint_steps(optimizer)
     trainable_names = _global_trainable_lora_parameter_names(model)
-    metadata = _lora_checkpoint_metadata(runtime_args, trainable_names)
+    metadata = _lora_checkpoint_metadata(runtime_args, trainable_names, getattr(runtime_args, _LORA_FROZEN_BASE, None))
     with _patch_lora_checkpoint_state_dict(metadata=metadata):
         return _save_checkpoint_megatron(*args, **kwargs)
 
@@ -718,9 +691,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     ),
                     common_state=common or None,
                 )
-            return _metadata_value(common.get("args"), _LORA_CHECKPOINT_METADATA_ATTR)
+            saved = common.get("args")
+            marker = _metadata_value(saved, _LORA_CHECKPOINT_METADATA_ATTR)
+            if marker is not None:
+                verified_lora_base_identity(saved if isinstance(saved, dict) else vars(saved), marker)
+            return marker, _metadata_value(saved, _LORA_FROZEN_BASE)
 
-        lora_metadata = _collective_checkpoint_probe(probe_metadata)
+        lora_metadata, frozen_base = _collective_checkpoint_probe(probe_metadata)
         try:
             if lora_metadata is None:
                 step_context = (
@@ -732,7 +709,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     else nullcontext()
                 )
                 with step_context:
-                    return _load_checkpoint_megatron(
+                    result = _load_checkpoint_megatron(
                         ddp_model=ddp_model,
                         optimizer=optimizer,
                         opt_param_scheduler=opt_param_scheduler,
@@ -740,13 +717,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                         skip_load_to_model_and_opt=skip_load_to_model_and_opt,
                     )
 
-            _validate_lora_checkpoint_metadata(args, ddp_model, lora_metadata)
+                if not skip_load_to_model_and_opt:
+                    _record_lora_base(args, ddp_model, optimizer, frozen_base)
+                return result
+
+            source = _validate_lora_checkpoint_metadata(args, ddp_model, lora_metadata)
             if not skip_load_to_model_and_opt:
                 _load_checkpoint_hf(
                     ddp_model=ddp_model,
                     optimizer=optimizer,
                     args=args,
-                    load_path=args.hf_checkpoint,
+                    load_path=source,
                 )
             with (
                 _patch_lora_checkpoint_state_dict(),
@@ -876,6 +857,14 @@ def _select_hf_load_source(args: Namespace, load_path: str | None) -> str:
     return args.hf_checkpoint
 
 
+def _record_lora_base(args, model, optimizer, identity: dict | None) -> None:
+    # Reference and teacher loads temporarily reuse the actor with optimizer=None.
+    if optimizer is not None and getattr(args, "lora_rank", 0):
+        if identity and not _global_trainable_lora_parameter_names(model, required=False):
+            identity = None
+        setattr(args, _LORA_FROZEN_BASE, identity)
+
+
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
@@ -894,6 +883,9 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
                 bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
                 with _patch_scatter_dtype_cast():
                     bridge.load_hf_weights(ddp_model)
+
+    if optimizer is not None and getattr(args, "lora_rank", 0):
+        _record_lora_base(args, ddp_model, optimizer, hf_checkpoint_identity(source_path))
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
     if (args.fp16 or args.bf16) and optimizer is not None:

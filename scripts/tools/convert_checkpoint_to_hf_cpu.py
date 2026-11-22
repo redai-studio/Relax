@@ -560,7 +560,7 @@ def export_checkpoint(
     adapter_only = False
     if has_lora:
         lora_args = read_lora_args(checkpoint, reader)
-        adapter_only = validate_lora_base(lora_args, model, weight_map)
+        adapter_only = validate_lora_base(lora_args, model)
         jobs = build_lora_conversions(tensors, config, schema, lora_args, adapter_only=adapter_only)
     else:
         jobs = build_conversions(tensors, config, schema)

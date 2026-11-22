@@ -368,6 +368,7 @@ def _lora_fixture(
         tensor_model_parallel_size=2,
     )
     if adapter_only:
+        args.load = args.ref_load = args.hf_checkpoint = str(model)
         stat = (model / "model.safetensors").stat()
         shard_stats = [("model.safetensors", stat.st_size, stat.st_mtime_ns)]
         args.relax_lora_checkpoint_metadata = {
@@ -460,6 +461,68 @@ def test_cpu_export_lora_merges_tp_gdn_experts_hc_ple_and_vision(
     assert not any(name.startswith(("megatron", "transformer_engine")) for name in set(sys.modules) - imported)
 
 
+@pytest.mark.parametrize("embedded", [False, True])
+@_cpu_only
+def test_cpu_lora_reads_default_sampler_metadata(tmp_path: Path, embedded: bool) -> None:
+    from omegaconf import OmegaConf
+
+    from relax.utils.data.identity_window_sampler import IdentityWindowSampler
+    from scripts.tools.convert_checkpoint_lora import read_lora_args
+
+    config = OmegaConf.create(
+        {"controller": {"sampler": IdentityWindowSampler(dp_size=2, placement="sequential")}, "worker_ids": [0, 1]},
+        flags={"allow_objects": True},
+    )
+    common = {"args": Namespace(tq_config=config, lora_rank=8, lora_alpha=16)}
+    if embedded:
+        payload = io.BytesIO()
+        torch.save([common], payload)
+        payload.seek(0)
+        dcp.save({"common_state/shard_0_1": payload}, checkpoint_id=tmp_path, no_dist=True)
+    else:
+        torch.save(common, tmp_path / "common.pt")
+    args = read_lora_args(tmp_path, dcp.FileSystemReader(tmp_path))
+    assert (args["lora_rank"], args["lora_alpha"]) == (8, 16)
+
+
+@_cpu_only
+def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> None:
+    from safetensors.torch import load_file
+
+    from relax.utils.lora_checkpoint_identity import hf_checkpoint_identity
+
+    checkpoint, trained, expected = _lora_fixture(tmp_path, adapter_only=True)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "config.json").write_bytes((trained / "config.json").read_bytes())
+    save_file({k: v + 8 for k, v in load_file(trained / "model.safetensors").items()}, other / "model.safetensors")
+    # Without an index the native v1 identity includes other weight files too.
+    torch.save({}, trained / "pytorch_model-extra.bin")
+    with torch.serialization.safe_globals([Namespace]):
+        args = torch.load(checkpoint / "common.pt", weights_only=True)["args"]
+    args.hf_checkpoint, args.load, args.ref_load = str(other), str(trained), None
+    marker = args.relax_lora_checkpoint_metadata
+    marker.update(format_version=2, base_hf_checkpoint=hf_checkpoint_identity(trained))
+    torch.save({"args": args}, checkpoint / "common.pt")
+    out = tmp_path / "actual"
+    with pytest.raises(ValueError, match="identity mismatch"):
+        export_checkpoint(checkpoint, other, out, dry_run=True)
+    export_checkpoint(checkpoint, trained, out, shard_bytes=4096, memory_budget=2**20)
+    index = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
+    for key, value in expected.items():
+        with safe_open(out / index[key], framework="pt") as handle:
+            torch.testing.assert_close(handle.get_tensor(key), value, atol=0, rtol=0)
+
+    marker.update(format_version=1, base_hf_checkpoint=hf_checkpoint_identity(other))
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="legacy v1"):
+        export_checkpoint(checkpoint, other, tmp_path / "legacy", dry_run=True)
+    args.hf_checkpoint = str(trained)
+    marker["base_hf_checkpoint"] = hf_checkpoint_identity(trained)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    assert export_checkpoint(checkpoint, trained, tmp_path / "legacy", dry_run=True)["lora_only_checkpoint"]
+
+
 @pytest.mark.parametrize(
     "failure",
     ["missing_args", "missing_tp", "rank", "base_identity", "partial_identity", "unmarked", "incomplete_pair"],
@@ -494,21 +557,25 @@ def test_cpu_lora_rejects_invalid_metadata_before_writing(tmp_path: Path, failur
 
 @_cpu_only
 def test_cpu_lora_dry_run_accounts_for_merge_workspace(tmp_path: Path) -> None:
-    checkpoint, model, _ = _lora_fixture(tmp_path)
-    output = tmp_path / "export"
-    report = export_checkpoint(
-        checkpoint, model, output, shard_bytes=512, memory_budget=1024**2, dry_run=True, prefetch=False, batch_bytes=1
-    )
+    model, checkpoint, output = tmp_path / "model", tmp_path / "iter_0000001", tmp_path / "export"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp_text", "hidden_size": 512}))
+    base = torch.zeros((512, 512), dtype=torch.bfloat16)
+    save_file({"model.layers.0.self_attn.o_proj.weight": base}, model / "model.safetensors")
+    prefix = "decoder.layers.0.self_attention.linear_proj"
+    state = {
+        prefix + ".weight": base,
+        prefix + ".adapter.linear_in.weight": base[:4].clone(),
+        prefix + ".adapter.linear_out.weight": base[:, :4].clone(),
+    }
+    dcp.save(state, storage_writer=dcp.FileSystemWriter(checkpoint), no_dist=True)
+    torch.save({"args": Namespace(lora_rank=4, lora_alpha=4)}, checkpoint / "common.pt")
+    options = dict(shard_bytes=4096, read_workers=1, prefetch=False, dry_run=True)
+    # The BF16 inputs, shard buffers, output and single file reader fit in 4 MiB.
+    # Four 512x512 FP32 merge temporaries alone require another 4 MiB.
     with pytest.raises(ValueError, match="above budget"):
-        export_checkpoint(
-            checkpoint,
-            model,
-            output,
-            shard_bytes=512,
-            memory_budget=report["planned_buffer_bytes"] - 1,
-            prefetch=False,
-            batch_bytes=1,
-        )
+        export_checkpoint(checkpoint, model, output, memory_budget=4 * 1024**2, **options)
+    export_checkpoint(checkpoint, model, output, memory_budget=12 * 1024**2, **options)
     assert not output.exists()
 
 

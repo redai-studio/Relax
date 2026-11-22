@@ -20,6 +20,7 @@ from torch.distributed.checkpoint import save
 from relax.backends.megatron import checkpoint_metadata, compat
 from relax.engine.sft.runtime import is_rm_mode
 from relax.utils.logging_utils import get_logger
+from relax.utils.lora_checkpoint_identity import verified_lora_base_identity
 from relax.utils.model_source import is_model_source_alias
 
 
@@ -43,6 +44,7 @@ def _load_checkpoint_module():
         "_alias_renamed_transfer_queue_enum",
         "_format_opt_param_scheduler_error",
         "_select_hf_load_source",
+        "_record_lora_base",
     }
     definitions = [
         node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef) and node.name in names
@@ -64,6 +66,8 @@ def _load_checkpoint_module():
         preserve_hdo_dp_reshardable_steps_on_load=compat.preserve_hdo_dp_reshardable_steps_on_load,
         REWARD_MODEL_HEAD_TYPE="reward_model_terminal_v1",
         _LORA_CHECKPOINT_METADATA_ATTR="relax_lora_checkpoint_metadata",
+        _LORA_FROZEN_BASE="relax_lora_frozen_hf_base",
+        verified_lora_base_identity=verified_lora_base_identity,
         get_args=None,
         _load_checkpoint_hf=None,
         _load_checkpoint_megatron=None,

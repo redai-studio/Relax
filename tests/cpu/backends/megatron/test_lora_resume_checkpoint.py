@@ -95,6 +95,8 @@ def test_save_lora_only_filters_model_after_optimizer_state_is_built(monkeypatch
     import megatron.training.checkpointing as mcore_checkpointing
 
     seen = {}
+    args = _runtime_args()
+    args.relax_lora_frozen_hf_base = {"shard_stat_sha256": "frozen-base"}
 
     def fake_generate_state_dict(*_args, **_kwargs):
         seen["optimizer_saw_base"] = True
@@ -113,7 +115,7 @@ def test_save_lora_only_filters_model_after_optimizer_state_is_built(monkeypatch
 
     monkeypatch.setattr(mcore_checkpointing, "generate_state_dict", fake_generate_state_dict)
     monkeypatch.setattr(checkpoint, "_save_checkpoint_megatron", fake_save)
-    monkeypatch.setattr(checkpoint, "get_args", _runtime_args)
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(
         checkpoint,
         "_global_trainable_lora_parameter_names",
@@ -127,7 +129,8 @@ def test_save_lora_only_filters_model_after_optimizer_state_is_built(monkeypatch
     assert seen["state"]["optimizer"] == {"state": "kept"}
     assert seen["state"]["rng_state"] == "kept"
     metadata = getattr(seen["state"]["args"], checkpoint._LORA_CHECKPOINT_METADATA_ATTR)
-    assert metadata["base_hf_checkpoint"] == {"config_sha256": None, "index_sha256": None, "path": "/models/base"}
+    assert metadata["base_hf_checkpoint"] == args.relax_lora_frozen_hf_base
+    assert metadata["format_version"] == 2
 
 
 def test_lora_model_load_allows_missing_base_but_requires_adapter():
@@ -149,6 +152,7 @@ def test_lora_only_save_keeps_full_model_for_hf_export(monkeypatch, tmp_path):
     from relax.backends.megatron import model as model_mod
 
     args = _runtime_args()
+    args.relax_lora_frozen_hf_base = {"shard_stat_sha256": "frozen-base"}
     args.save_lora_only = True
     args.save_hf = str(tmp_path / "hf")
     args.save_hf_dtype = "bf16"
@@ -190,17 +194,79 @@ def test_lora_only_save_keeps_full_model_for_hf_export(monkeypatch, tmp_path):
     assert not hasattr(args, checkpoint._LORA_CHECKPOINT_METADATA_ATTR)
 
 
+@pytest.mark.parametrize("use_ref", [False, True])
+def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, tmp_path, use_ref):
+    from argparse import Namespace
+
+    from megatron.bridge import AutoBridge
+    from safetensors.torch import load_file, save_file
+
+    args = _runtime_args()
+    a, b = tmp_path / "a", tmp_path / "b"
+    for directory, value in ((a, 1.0), (b, 2.0)):
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps({"name": directory.name}))
+        save_file({"weight": torch.full((2, 2), value)}, directory / "model.safetensors")
+    args.hf_checkpoint, args.ref_load = str(a), str(b) if use_ref else None
+    args.megatron_to_hf_mode, args.fp16, args.bf16 = "bridge", False, False
+    model = [_AdapterModel()]
+
+    def from_hf(path, **kwargs):
+        weights = load_file(Path(path) / "model.safetensors")["weight"]
+        return SimpleNamespace(load_hf_weights=lambda chunks: chunks[0].base.weight.data.copy_(weights))
+
+    monkeypatch.setattr(AutoBridge, "from_hf_pretrained", from_hf)
+    monkeypatch.setattr(checkpoint.megatron_bridge_utils, "patch_megatron_model", lambda _: nullcontext())
+    for name in ("use_critic_lm_head_for_hf_load", "use_sequence_classification_lm_head_for_hf_load"):
+        monkeypatch.setattr(checkpoint, name, lambda _: nullcontext())
+    checkpoint._load_checkpoint_hf(model, object(), args, None if use_ref else str(b))
+    torch.testing.assert_close(model[0].base.weight, torch.full((2, 2), 2.0))
+    expected_identity = checkpoint.hf_checkpoint_identity(b)
+    assert args.relax_lora_frozen_hf_base == expected_identity
+    checkpoint._load_checkpoint_hf(model, None, args, str(a))
+    assert args.relax_lora_frozen_hf_base == expected_identity
+
+    # Save the native common arguments and exercise the full-DCP loader
+    # followed by a lightweight save, without bringing up distributed ranks.
+    saved = {}
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    monkeypatch.setattr(checkpoint, "_save_checkpoint_megatron", lambda *a, **kw: saved.update(vars(args)))
+    checkpoint.save_checkpoint(1, model, None, None)
+    root = tmp_path / "checkpoint"
+    (root / "iter_0000001").mkdir(parents=True)
+    (root / "latest_checkpointed_iteration.txt").write_text("1")
+    args.load, args.no_load_optim, args.loss_type = str(root), True, "sft"
+    args.relax_lora_frozen_hf_base = None
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *a: {"args": Namespace(**saved)})
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: (1, 0))
+    checkpoint.load_checkpoint(model, object(), None, {}, False)
+    assert args.relax_lora_frozen_hf_base == expected_identity
+    names = checkpoint._global_trainable_lora_parameter_names(model)
+    marker = checkpoint._lora_checkpoint_metadata(args, names, args.relax_lora_frozen_hf_base)
+    args.ref_load = str(b)
+    assert checkpoint._validate_lora_checkpoint_metadata(args, model, marker) == str(b)
+    args.ref_load = None
+    with pytest.raises(RuntimeError, match="base HF identity mismatch"):
+        checkpoint._validate_lora_checkpoint_metadata(args, model, marker)
+
+    # An old full DCP still loads and can be saved in full. Discarding its
+    # base would lose the only authoritative copy of those weights.
+    saved.pop("relax_lora_frozen_hf_base")
+    checkpoint.load_checkpoint(model, object(), None, {}, False)
+    checkpoint.save_checkpoint(2, model, None, None)
+    with pytest.raises(RuntimeError, match="verified frozen HF base"):
+        checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
+
+
 def test_hf_checkpoint_identity_detects_shard_replacement(tmp_path):
     shard = tmp_path / "model-00001-of-00001.safetensors"
     shard.write_bytes(b"first")
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"weight": shard.name}}))
-    checkpoint._hf_checkpoint_identity.cache_clear()
-    before = checkpoint._hf_checkpoint_identity(str(tmp_path))
+    before = checkpoint.hf_checkpoint_identity(str(tmp_path))
 
     shard.write_bytes(b"replacement")
-    checkpoint._hf_checkpoint_identity.cache_clear()
-    after = checkpoint._hf_checkpoint_identity(str(tmp_path))
+    after = checkpoint.hf_checkpoint_identity(str(tmp_path))
 
     assert before["shard_stat_sha256"] != after["shard_stat_sha256"]
 
@@ -209,9 +275,8 @@ def test_hf_checkpoint_identity_covers_pytorch_bin(tmp_path):
     weights = tmp_path / "pytorch_model.bin"
     weights.write_bytes(b"weights")
     (tmp_path / "config.json").write_text("{}")
-    checkpoint._hf_checkpoint_identity.cache_clear()
 
-    identity = checkpoint._hf_checkpoint_identity(str(tmp_path))
+    identity = checkpoint.hf_checkpoint_identity(str(tmp_path))
 
     assert identity["shard_count"] == "1"
     assert identity["shard_stat_sha256"]
@@ -247,7 +312,15 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
         loss_type=loss_type,
         hidden_size=1024,
     )
-    marker = {"format_version": 1}
+    marker = {
+        "format_version": 2,
+        "base_hf_checkpoint": {
+            "config_sha256": "c",
+            "index_sha256": None,
+            "shard_count": "1",
+            "shard_stat_sha256": "s",
+        },
+    }
     common = {
         "args": SimpleNamespace(
             loss_type=loss_type,
@@ -277,7 +350,9 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
     monkeypatch.setattr(
         checkpoint,
         "_validate_lora_checkpoint_metadata",
-        lambda current_args, model, metadata: calls.append(("validate", current_args, model, metadata)),
+        lambda current_args, model, metadata: (
+            calls.append(("validate", current_args, model, metadata)) or args.hf_checkpoint
+        ),
     )
     monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", lambda **_kwargs: calls.append(("hf",)))
     monkeypatch.setattr(

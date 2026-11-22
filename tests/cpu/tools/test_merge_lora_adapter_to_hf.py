@@ -160,12 +160,14 @@ class TestReadAdapterScaling:
     )
     def test_scaling_rule(self, tmp_path, config, expected):
         (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-        assert merge_lora._read_adapter_scaling(tmp_path) == pytest.approx(expected)
+        parsed, is_relax = merge_lora._read_adapter_config(tmp_path)
+        assert not is_relax
+        assert merge_lora._module_scaling(parsed, "proj", parsed["r"]) == pytest.approx(expected)
 
     def test_missing_rank_or_alpha_is_a_hard_error(self, tmp_path):
         (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
         with pytest.raises(ValueError, match="missing 'r' / 'lora_alpha'"):
-            merge_lora._read_adapter_scaling(tmp_path)
+            merge_lora._read_adapter_config(tmp_path)
 
 
 def test_hf_merge_qwen38_hc_ple_and_normalized_experts(
