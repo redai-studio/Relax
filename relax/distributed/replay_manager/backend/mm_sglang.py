@@ -308,6 +308,11 @@ class MMCapture:
         self._drain_releases()
 
 
+def accept_training_mm_response(sample: Any, meta: dict, args: Any) -> dict:
+    keep_pixels = getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False)
+    return accept_mm_response(sample, meta, keep_pixels=keep_pixels)
+
+
 def accept_mm_response(sample: Any, meta: dict, *, keep_pixels: bool = False) -> dict:
     """Validate CPU layout and retain pixels when a reference policy needs
     them."""

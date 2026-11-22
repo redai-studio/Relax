@@ -97,6 +97,19 @@ class SGLangProducer(Producer):
             options["cache_salt"] = "relax-mm-embedding-replay"
         return options
 
+    def capture_tokens_before_normalization(
+        self, prefix: list[int], generated: list[int], tokenizer: Any, processor: Any, *, evaluation: bool
+    ) -> list[int] | None:
+        """Keep original route row IDs when rollout can replace media
+        tokens."""
+        if not self.manager.uses_references or evaluation or not self.kinds:
+            return None
+        if processor is not None or any(
+            hasattr(tokenizer, key) for key in ("image_token_id", "audio_token_id", "video_token_id")
+        ):
+            return prefix + list(generated)
+        return None
+
     def accept_response(
         self, sample: Any, meta: dict, args: Any, *, evaluation: bool = False, captured_tokens: list[int] | None = None
     ) -> None:
@@ -106,13 +119,9 @@ class SGLangProducer(Producer):
                 return
             refs = self.accept_route_refs(meta, args, sample.tokens, captured_tokens)
             if "mm_embedding" in self.kinds:
-                from .mm_sglang import accept_mm_response
+                from .mm_sglang import accept_training_mm_response
 
-                refs["mm_embedding"] = accept_mm_response(
-                    sample,
-                    meta,
-                    keep_pixels=getattr(args, "kl_coef", 0.0) != 0 or getattr(args, "use_kl_loss", False),
-                )
+                refs["mm_embedding"] = accept_training_mm_response(sample, meta, args)
             sample.rollout_replay_refs = refs
         else:
             if "routed_experts" in meta:

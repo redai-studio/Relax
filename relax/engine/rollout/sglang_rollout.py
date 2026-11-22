@@ -7,7 +7,7 @@ import inspect
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager, contextmanager
+from contextlib import AbstractAsyncContextManager, ExitStack, contextmanager
 from itertools import groupby
 from time import monotonic
 from typing import Any
@@ -23,11 +23,7 @@ from tqdm import tqdm
 
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.distributed.replay_manager import references_enabled, replay_data_manager, rollout_kinds
-from relax.distributed.replay_manager.backend.sglang import (
-    SGLangProducer,
-    discard_failed_generation,
-    post_generation_request,
-)
+from relax.distributed.replay_manager.backend.sglang import discard_failed_generation, post_generation_request
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rewards.async_eval import is_eval_reward_pending
@@ -394,6 +390,13 @@ async def generate(
     args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False
 ) -> Sample:
     """Generate using traditional SGLang router with token-based workflow."""
+    with ExitStack() as response_scope:
+        return await _generate(args, sample, sampling_params, evaluation, response_scope)
+
+
+async def _generate(
+    args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool, response_scope: ExitStack
+) -> Sample:
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
@@ -527,41 +530,7 @@ async def generate(
         replay_producer.discard_response(meta_info)
         raise GenerationAborted
 
-    with replay_producer.response(meta_info, evaluation=evaluation):
-        sample, post_time = await _apply_generation_response(
-            args,
-            state,
-            sample,
-            output,
-            replay_producer,
-            evaluation=evaluation,
-            sc_sampling_mode=sc_sampling_mode,
-            opd_enabled=opd_enabled,
-            native_image_opd=native_image_opd,
-        )
-        timing = {"generate": _t_generate, "post_generate": post_time}
-        if _t_image_processor is not None:
-            timing["image_processor"] = _t_image_processor
-        if _t_mm_encode is not None:
-            timing["mm_encode"] = _t_mm_encode
-        sample.metadata["_timing"] = timing
-        if sample.rollout_replay_refs and not evaluation:
-            await replay_producer.adopt_response(replay_producer.response_refs(meta_info), uuid.uuid4().hex)
-        return sample
-
-
-async def _apply_generation_response(
-    args: Namespace,
-    state: GenerateState,
-    sample: Sample,
-    output: dict,
-    replay_producer: SGLangProducer,
-    *,
-    evaluation: bool,
-    sc_sampling_mode: str | None,
-    opd_enabled: bool,
-    native_image_opd: bool,
-) -> tuple[Sample, float]:
+    response_scope.enter_context(replay_producer.response(meta_info, evaluation=evaluation))
     sc_result = None
     if sc_sampling_mode is not None:
         sc_result = parse_score_centering_response(
@@ -618,20 +587,9 @@ async def _apply_generation_response(
             if any(token in media_token_ids for token in new_response_tokens):
                 raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
 
-        if (
-            replay_data_manager.uses_references
-            and not evaluation
-            and replay_producer.kinds
-            and (
-                state.processor is not None
-                or any(
-                    hasattr(state.tokenizer, name) for name in ("image_token_id", "audio_token_id", "video_token_id")
-                )
-            )
-        ):
-            # These are the captured IDs, before the existing one-for-one
-            # media-token replacements. Keep the original row identities.
-            captured_replay_tokens = sample.tokens + list(new_response_tokens)
+        captured_replay_tokens = replay_producer.capture_tokens_before_normalization(
+            sample.tokens, new_response_tokens, state.tokenizer, state.processor, evaluation=evaluation
+        )
 
         while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
             index = new_response_tokens.index(state.tokenizer.image_token_id)
@@ -715,7 +673,18 @@ async def _apply_generation_response(
         )
 
     sample.update_from_meta_info(args, output["meta_info"])
-    return sample, monotonic() - _t_post_generate_start
+    _t_post_generate = monotonic() - _t_post_generate_start
+
+    _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
+    if _t_image_processor is not None:
+        _timing["image_processor"] = _t_image_processor
+    if _t_mm_encode is not None:
+        _timing["mm_encode"] = _t_mm_encode
+    sample.metadata["_timing"] = _timing
+
+    if sample.rollout_replay_refs and not evaluation:
+        await replay_producer.adopt_response(replay_producer.response_refs(meta_info), uuid.uuid4().hex)
+    return sample
 
 
 async def _dispatch_generate(
