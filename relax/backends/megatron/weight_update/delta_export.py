@@ -252,6 +252,20 @@ class ShardDeltaExporter:
             if any(errors):
                 raise RuntimeError(f"Delta weight synchronization failed across source ranks: {errors}")
 
+        # Both production callers pass their Gloo metadata group. Keep control
+        # on the host there, even when the conversion itself runs on CUDA.
+        control_device = "cuda" if world > 1 and dist.get_backend(group) == "nccl" else "cpu"
+
+        def reduce_control(error: Exception | None, count: bool = False, pause: bool = False) -> tuple[int, bool]:
+            failed, total, needs_pause = int(error is not None), int(count), int(pause)
+            if world > 1:
+                state = torch.tensor([failed, total, needs_pause], dtype=torch.int32, device=control_device)
+                dist.all_reduce(state, op=dist.ReduceOp.SUM, group=group)
+                failed, total, needs_pause = state.tolist()
+            if failed:
+                agree(error)
+            return total, bool(needs_pause)
+
         warm_pool = warm_spare = None
         try:
             if before_first_apply is not None:
@@ -306,18 +320,6 @@ class ShardDeltaExporter:
             applying = before_first_apply is None
             overlap = bool(self.config.receive_overlap and not seed and not force_full and not applying)
             constraints = set()
-
-            def drain_previous_frame() -> None:
-                # Called by every rank at the same point in the export. A TCP
-                # consumer error must reach the whole group before we admit
-                # another frame, pause rollout, or publish the final version.
-                error = None
-                if rank == 0:
-                    try:
-                        constraints.update(self.transfer.drain_frame())
-                    except Exception as exc:
-                        error = exc
-                agree(error)
 
             def enter_apply() -> None:
                 nonlocal applying
@@ -407,15 +409,13 @@ class ShardDeltaExporter:
                         raise ValueError("Measured source conversion workspace exceeds its configured GPU budget")
                 except Exception as exc:
                     error = exc
-                agree(error)
-                finished = [None] * world
-                dist.all_gather_object(finished, chunk is None, group=group)
-                if any(finished):
-                    if not all(finished):
+                finished, _ = reduce_control(error, chunk is None)
+                if finished:
+                    if finished != world:
                         raise ValueError("Source converters disagree on the complete HF group directory")
                     if not pack:
                         break
-                error, frame = None, None
+                error, frame, needs_pause = None, None, False
                 if rank == 0:
                     try:
                         if chunk is None:
@@ -435,29 +435,20 @@ class ShardDeltaExporter:
                             metadata, raw = frame
                             if self.sender_pipeline_active:
                                 self.transfer.prepare_frame(raw)
+                                constraints.update(self.transfer.drain_frame())
+                            if not applying:
+                                needs_pause = not self.transfer.can_stage(metadata, raw)
                     except Exception as exc:
                         error = exc
-                agree(error)
-                if pack:
-                    available = [frame is not None]
-                    dist.broadcast_object_list(available, src=source_rank, group=group)
-                    if not available[0]:
-                        if chunk is None:
-                            break
-                        continue
-                if self.sender_pipeline_active:
-                    drain_previous_frame()
-                if not applying:
-                    admission, error = [None], None
-                    if rank == 0:
-                        try:
-                            admission[0] = self.transfer.can_stage(metadata, raw)
-                        except Exception as exc:
-                            error = exc
-                    agree(error)
-                    dist.broadcast_object_list(admission, src=source_rank, group=group)
-                    if not admission[0]:
-                        enter_apply()
+                # Only the publisher encodes, drains the previous ACK, and checks admission.
+                # Every rank learns the resulting frame/pause decision in the same collective.
+                available, needs_pause = reduce_control(error, frame is not None, needs_pause)
+                if not available:
+                    if chunk is None:
+                        break
+                    continue
+                if needs_pause:
+                    enter_apply()
                 error = None
                 if rank == 0:
                     try:
@@ -469,7 +460,7 @@ class ShardDeltaExporter:
                             self.transfer.stage(metadata, raw)
                     except Exception as exc:
                         error = exc
-                agree(error)
+                reduce_control(error)
                 if defer_spare:
                     # The FULL bucket has fenced its broadcast and handed the
                     # ordinary receiver ACK to the install worker on rank zero.
@@ -484,7 +475,14 @@ class ShardDeltaExporter:
                 # A converter can finish without yielding any wire frame.
                 start_spare()
             if self.sender_pipeline_active:
-                drain_previous_frame()
+                # The final submitted frame must acknowledge before we pause or finalize.
+                error = None
+                if rank == 0:
+                    try:
+                        constraints.update(self.transfer.drain_frame())
+                    except Exception as exc:
+                        error = exc
+                agree(error)
             enter_apply()
             if first_live_seed:
                 try:

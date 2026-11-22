@@ -512,19 +512,26 @@ def test_first_live_seed_prepares_one_spare_under_its_existing_budget(case, monk
         monkeypatch.setattr(source.current_iterator, "get_hf_weight_chunks", lambda _: iter(()))
     monkeypatch.setattr(source, "_can_read_live", lambda _: True)
     monkeypatch.setattr(delta_export.dist, "get_rank", lambda group: 0)
-    world = 2 if case == "peer_error" else 1
+    world = 2
     monkeypatch.setattr(delta_export.dist, "get_world_size", lambda group: world)
     monkeypatch.setattr(delta_export.dist, "get_process_group_ranks", lambda group: [0])
+    monkeypatch.setattr(delta_export.dist, "get_backend", lambda group: "gloo")
     submitted, agreed = Event(), Event()
 
-    def gather(out, obj, group):
-        out[:] = [obj] * world
-        if submitted.is_set() and obj is None:
+    def reduce(state, op, group):
+        state.mul_(world)
+        if submitted.is_set():
             if case == "peer_error":
-                out[1] = "peer rejected the frame"
+                state[0] = 1
             else:
                 agreed.set()
 
+    def gather(out, obj, group):
+        out[:] = [obj] * world
+        if case == "peer_error" and submitted.is_set():
+            out[1] = "peer rejected the frame"
+
+    monkeypatch.setattr(delta_export.dist, "all_reduce", reduce)
     monkeypatch.setattr(delta_export.dist, "all_gather_object", gather)
     monkeypatch.setattr(delta_export.dist, "broadcast_object_list", lambda *args, **kwargs: None)
 
@@ -693,6 +700,96 @@ def test_empty_pipeline_stage_participates_in_both_delta_conversions(tmp_path):
     mp.start_processes(
         _export_empty_pipeline_stage, args=((tmp_path / "pp-ranks").as_uri(),), nprocs=2, start_method="fork"
     )
+
+
+def _check_frame_control(rank, rendezvous):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    group = dist.group.WORLD
+    model = {"w": torch.zeros(8)}
+
+    class Groups:
+        def get_hf_weight_chunks(self, shards):
+            yield [("a", shards["w"])]
+            if rank == 1 and fault == "iterator":
+                raise LookupError("rank one failed during conversion")
+            if rank == 1 and fault == "short":
+                return
+            yield [("b", shards["w"])]
+
+    def can_stage(metadata, raw):
+        if fault == "admission":
+            raise ValueError("publisher admission failed")
+        return not events
+
+    try:
+        for transport, requested_fault in (
+            ("tcp", None),
+            ("nccl_socket", None),
+            ("tcp", "admission"),
+            ("nccl_socket", "short"),
+            ("tcp", "iterator"),
+        ):
+            events = []
+            config = DeltaSyncConfig(stream="pp", transport=transport, staging_budget_bytes=32, receive_overlap=True)
+            source = ShardDeltaExporter(Groups(), Groups(), snapshot_budget_bytes=256, config=config)
+            source.transfer = SimpleNamespace(
+                connect=lambda *args, **kwargs: False,
+                can_reuse=lambda *_: True,
+                begin=lambda **kwargs: None,
+                stage=lambda meta, raw: events.append(("stage", [t["name"] for t in meta["tensors"]])),
+                send=lambda meta, raw, **kwargs: (
+                    events.append(("send", [t["name"] for t in meta["tensors"]])) or set()
+                ),
+                activate=lambda: events.append("activate"),
+                apply=lambda: events.append("apply") or set(),
+                can_stage=can_stage,
+                ordered_target_consume=False,
+                finalize=lambda: events.append("finalize") or {"receivers": [], "final_full_names": []},
+            )
+            args = dict(engines=[], gpu_counts=[], group=group)
+            fault = None
+            source.synchronize(lambda: model, version="0", **args)
+            source.commit()
+            events.clear()
+            fault = requested_fault
+            if fault:
+                error, text = {
+                    "short": (ValueError, "disagree on the complete HF group directory"),
+                    "iterator": (RuntimeError, "LookupError: rank one failed during conversion"),
+                    "admission": (RuntimeError, "ValueError: publisher admission failed"),
+                }[fault]
+                with pytest.raises(error, match=text):
+                    source.synchronize(
+                        lambda: model, version="1", before_first_apply=lambda: events.append("pause"), **args
+                    )
+                assert "pause" not in events and "finalize" not in events
+                assert source.failed and source._version == "0" and source._pending is None
+                continue
+            source.synchronize(lambda: model, version="1", before_first_apply=lambda: events.append("pause"), **args)
+            if rank == 1:
+                assert events == ["pause"]
+            elif transport == "tcp":
+                assert events == [("stage", ["a"]), "pause", "activate", "apply", ("send", ["b"]), "finalize"]
+            else:
+                assert events == [("stage", ["a", "b"]), "pause", "activate", "apply", "finalize"]
+            assert source._version == "0"
+            source.commit()
+            assert source._version == "1"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_frame_control_propagates_publisher_and_peer_decisions_before_final_ack(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.start_processes(_check_frame_control, args=((tmp_path / "control").as_uri(),), nprocs=2, start_method="fork")
 
 
 def test_requested_delta_admits_single_node_tp_pp_mesh(tmp_path):
