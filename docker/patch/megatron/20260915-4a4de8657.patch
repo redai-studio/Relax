@@ -9447,6 +9447,19 @@ index 4e2bc02..07cf136 100644
          "(dp_cp ep tp) -> ep dp_cp tp",
          dp_cp=dp_cp_group.size(),
          tp=tp_size,
+diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+index 9c6cbdf..95b40ad 100644
+--- a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
++++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+@@ -1145,7 +1145,7 @@ class MegatronFSDP(torch.nn.Module):
+                 module, _root_pre_backward
+             )
+         self._root_pre_backward_hook_handle = create_custom_backward_hook(
+-            module, _root_pre_backward
++            root_module, _root_pre_backward
+         )
+ 
+         # Register post load state_dict hook to ensure that the module parameters
 diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
 index 7732941..75e4acd 100644
 --- a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
