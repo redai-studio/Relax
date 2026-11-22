@@ -1436,3 +1436,34 @@ def test_cpu_checkpoint_resolves_selected_iteration(tmp_path: Path) -> None:
     assert resolve_checkpoint(checkpoint) == checkpoint
     with pytest.raises(FileNotFoundError):
         resolve_checkpoint(checkpoint.parent)
+
+
+def test_gdn_bridge_and_offline_merge_round_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
+    from megatron.bridge.models.conversion import peft_bridge
+    from megatron.bridge.models.conversion.peft_bridge import AdapterWeight, MegatronPeftBridge
+
+    monkeypatch.setattr(peft_bridge.parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+    config = SimpleNamespace(
+        num_moe_experts=0,
+        hidden_size=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=1,
+        linear_value_head_dim=1,
+    )
+    generator = torch.Generator().manual_seed(14)
+    a = torch.randn(3, 4, generator=generator).bfloat16()
+    b = torch.randn(12, 3, generator=generator).bfloat16()
+    rows = {"qkv": [0, 6, 1, 7, 2, 8], "z": [3, 9], "b": [4, 10], "a": [5, 11]}
+    base, expected = {}, {}
+    for projection, indices in rows.items():
+        name = f"model.layers.0.linear_attn.in_proj_{projection}.weight"
+        base[name] = torch.randn(len(indices), 4, generator=generator).bfloat16()
+        expected[name] = (base[name].double() + b[indices].double() @ a.double()).bfloat16()
+    adapter = AdapterWeight(
+        "decoder.layers.0.self_attention.in_proj", None, 3, 3, SimpleNamespace(weight=a), SimpleNamespace(weight=b)
+    )
+    actual = MegatronPeftBridge()._merge_lora_adapter_weights([SimpleNamespace(config=config)], base, [adapter])
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
