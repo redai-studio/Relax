@@ -1,41 +1,6 @@
 {
   "schema_version": 1,
-  "scope": "MoK shipped by Dockerfile.cu13 Blackwell; Megatron adapter is part of the complete CUDA patch.",
-  "megatron": {
-    "baseline": "Existing image /root/Megatron-LM snapshot (no git history)",
-    "upstream_port_pr": 8497,
-    "upstream_port_commit": "c42e8216d2031ab3ca191e56c9d370b347c2cf02",
-    "changed_files": [
-      "megatron/core/transformer/moe/megakernel/__init__.py",
-      "megatron/core/transformer/moe/megakernel/factory.py",
-      "megatron/core/transformer/moe/megakernel/mok/backend.py",
-      "megatron/core/transformer/moe/megakernel/mok/runtime.py",
-      "megatron/core/transformer/moe/megakernel/mok/weights.py",
-      "megatron/core/transformer/moe/moe_layer.py",
-      "megatron/core/transformer/transformer_config.py",
-      "megatron/training/arguments.py"
-    ],
-    "before_sha256": {
-      "megatron/core/transformer/moe/megakernel/__init__.py": "58e10992bbd9be26e7f3405062edcb000a2d36f482777cb36be947e60a32ca32",
-      "megatron/core/transformer/moe/megakernel/factory.py": "b57ba0c2d1ef7a57a6e9972d3b19ce5401093f16d4e5647ba7197eb2fac4e3ee",
-      "megatron/core/transformer/moe/megakernel/mok/backend.py": "dbc1a31cf9b8f5f908d837ea51038ce925ec911a94d067dd7139cfe0bb950088",
-      "megatron/core/transformer/moe/megakernel/mok/runtime.py": "4b023e432d033c2195307a8e3aae17de3a588f2c67ddd526226bd07e5cff3571",
-      "megatron/core/transformer/moe/megakernel/mok/weights.py": "6ce1077843b27adda17352876cbb4ea0da89ac1af9c8004264e8032232be22a3",
-      "megatron/core/transformer/moe/moe_layer.py": "7905b52b1e8aa39d402cb65fb34d492ca5959466b506ac9a4b47b4fd47557acf",
-      "megatron/core/transformer/transformer_config.py": "769a7dee2ab9d7ea74ec348a5eb251d2036c5bb2def37b6699fe62e773b54c57",
-      "megatron/training/arguments.py": "163660a1b4becb7bec59f2e2ea6bef6c53d4d32ee5c3dbef9a3705120416f8fa"
-    },
-    "after_sha256": {
-      "megatron/core/transformer/moe/megakernel/__init__.py": "46975e755a50423dde60ed4e2ea4dcaf5f4810095b773a05e67b79d010e83bca",
-      "megatron/core/transformer/moe/megakernel/factory.py": "9f9e00df3f8498bbb3bd368506b674ae28153adb19aeeb9e020cea06b021eff2",
-      "megatron/core/transformer/moe/megakernel/mok/backend.py": "cac7fae895389450d0ffce3a7ecbcf09ca141d0f28e4c135c844b2a932f5fbb7",
-      "megatron/core/transformer/moe/megakernel/mok/runtime.py": "bfe82a05e6666fee644ce55e0ec98f7874ce296d33340a1de263671cd47eb98c",
-      "megatron/core/transformer/moe/megakernel/mok/weights.py": "802488aaf060e57793d33c4296ded6a7e33208a81da4c82260dcc64026f284cf",
-      "megatron/core/transformer/moe/moe_layer.py": "c110fc199a901d0d869afa07b3f03b2024395646d40299b6005e72f2a6e1a7ff",
-      "megatron/core/transformer/transformer_config.py": "e2b7dd8f27cd0228c5a46615cfd0bc1db2cacf5e1db5491cff76c0ec397871f1",
-      "megatron/training/arguments.py": "b8cce01fd0c3f0256ec2743ed41514a6294df1ade09719c044177a94da14d94d"
-    }
-  },
+  "scope": "Source and toolchain inputs for the Blackwell MoK wheel.",
   "mok": {
     "url": "https://github.com/QiZhangNV/mixture-of-kittens.git",
     "commit": "ee7bdaba515fd3d557105d71809ec74cd523d5a1",
@@ -82,12 +47,7 @@
     "torch": "2.13.0+cu130",
     "torch_cuda": "13.0",
     "nvcc_release": "13.0",
-    "arch": "SM103",
-    "device": "Blackwell SM103",
-    "ep": 8,
-    "tp": 2,
-    "etp": 1,
-    "sequence_parallel": true
+    "arch": "SM103"
   },
   "patch_order": {
     "mok": ["mok.patch"],
@@ -96,12 +56,5 @@
   "patch_sha256": {
     "thunderkittens-mn-major.patch": "e001b2d0b6e4088bcedb5cef49bf6811d1757b9e9e9835ae50744ee54b8f633d",
     "mok.patch": "6ccc61da96f39a37a92655e24ba713dbdc680680317cafdc8f8ea0a065ab59f6"
-  },
-  "transformer_engine": {
-    "distribution": "transformer-engine",
-    "version": "2.18.0",
-    "path": "transformer_engine/pytorch/optimizers/fused_adam.py",
-    "before_sha256": "e7d493f0bc05f4c64dd7dd192b3f5c9bc951588c7a3358017ee2fe8a6a04f3ce",
-    "after_sha256": "b4621f62840a9ce0d7c1360d2c63f45e90104729125841a3b8f7e8c94dca3fff"
   }
 }

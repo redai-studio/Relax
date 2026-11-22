@@ -428,6 +428,7 @@ def test_serial_art_failure_releases_only_unpublished_refs_and_owned_samples(mon
     monkeypatch.setattr(ng, "_CANDIDATE_IMAGE_ROLLOUT_IDS", {})
     args = SimpleNamespace(
         rollout_batch_size=2,
+        generation_seed=42,
         sampling_config={
             "algorithm": "art",
             "wave_groups": 1,

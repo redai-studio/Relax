@@ -102,10 +102,10 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     Returns:
         Dataset or StreamingDataset instance
     """
-    custom_prompt_path = getattr(args, "custom_prompt_path", None)
+    custom_prompt_path = args.custom_prompt_path
     custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
 
-    use_streaming = getattr(args, "use_streaming_dataset", False)
+    use_streaming = args.use_streaming_dataset
 
     # === OPSD: resolve teacher-side multimodal_keys ===
     # --opd-teacher-image-key / -video-key / -audio-key are convenience flags
@@ -120,10 +120,10 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     if use_streaming:
         from relax.utils.data.streaming_dataset import StreamingDataset
 
-        buffer_size = getattr(args, "streaming_buffer_size", 10000)
-        prefetch_chunk_size = getattr(args, "prefetch_chunk_size", 32)
-        prefetch_max_cached = getattr(args, "prefetch_max_cached", 256)
-        prefetch_num_workers = getattr(args, "prefetch_num_workers", 1)
+        buffer_size = args.streaming_buffer_size
+        prefetch_chunk_size = args.prefetch_chunk_size
+        prefetch_max_cached = args.prefetch_max_cached
+        prefetch_num_workers = args.prefetch_num_workers
 
         logger.info(
             f"Using StreamingDataset with buffer_size={buffer_size}, "
@@ -218,12 +218,12 @@ class RolloutDataSource(DataSource):
         self.metadata = {}
 
         # Check if using streaming dataset
-        self._use_streaming = getattr(args, "use_streaming_dataset", False)
+        self._use_streaming = args.use_streaming_dataset
         self.dataset = None
         self._dataset_resume_contract = None
 
         if args.rollout_global_dataset:
-            if getattr(args, "hf_checkpoint", None):
+            if args.hf_checkpoint:
                 prepare_model_maybe_update_args(args, completeness="metadata")
                 tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
                 processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
@@ -308,7 +308,7 @@ class RolloutDataSource(DataSource):
         }
         if getattr(self, "_dataset_resume_contract", None) is not None:
             state_dict["dataset_contract"] = self._dataset_resume_contract
-        if (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art":
+        if (self.args.sampling_config or {}).get("algorithm") == "art":
             state_dict["rollout_id"] = rollout_id
             from relax.backends.fsdp.checkpoint import COMMITTED_MARKER, iter_dir_name, load_art_dataset_state
 
@@ -350,7 +350,7 @@ class RolloutDataSource(DataSource):
             return
 
         path = os.path.join(self.args.load, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
-        is_art = (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
+        is_art = (self.args.sampling_config or {}).get("algorithm") == "art"
         if is_art:
             from relax.backends.fsdp.checkpoint import load_art_dataset_state
 

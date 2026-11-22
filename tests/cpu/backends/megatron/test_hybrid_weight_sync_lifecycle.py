@@ -28,6 +28,7 @@ def hybrid_actor(monkeypatch, request):
         tensor_model_parallel_size=2,
         pipeline_model_parallel_size=1,
         keep_old_actor=False,
+        rollout_external=False,
     )
     actor.role = "actor"
     actor._use_dcs_hybrid_weight_sync = True
