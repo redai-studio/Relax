@@ -51,13 +51,17 @@
 
 ### FSDPTurbo 配置与支持范围
 
-使用 `--train-backend fsdp_turbo --turbo-config <配置文件> --colocate` 选择该后端。当前支持离线 SFT 和同步 colocate GRPO；不支持 fully-async、hybrid、critic/reference 模型及独立 log-prob 服务入口，`--kl-coef` 必须为 `0`。
+使用 `--train-backend fsdp_turbo --turbo-config <配置文件> --colocate` 选择该后端。当前支持离线 SFT 和同步 colocate 文本 GRPO；不支持 fully-async、hybrid、critic/reference 模型及独立 log-prob 服务入口，`--kl-coef` 必须为 `0`。
 
-优化器和学习率调度以 Turbo YAML 的 `optimizer` 字段为准，包括 `lr`、`min_lr`、`warmup_ratio` / `warmup_steps`、betas 和 weight decay。`--lr`、`--lr-decay-style` 等 Megatron 参数不会覆盖这些值；`--turbo-config` 使用内联 JSON 时遵循相同规则。全局 batch size、数据路径等 Relax 参数仍通过 CLI 设置。
+GRPO 要求 SGLang DP=1、PP=1，每个 rollout 的全局样本数不能超过 `--global-batch-size`；暂不支持图像 GRPO。
+
+优化器和学习率调度以 Turbo YAML 的 `optimizer` 字段为准，包括 `lr`、`min_lr`、`warmup_ratio` / `warmup_steps`、betas 和 weight decay。`--lr`、`--lr-decay-style` 等 Megatron 参数不会覆盖这些值；`--turbo-config` 使用内联 JSON 时遵循相同规则。`warmup_steps` 显式设置时优先于 `warmup_ratio`，包括 `warmup_steps: 0`。全局 batch size、数据路径等 Relax 参数仍通过 CLI 设置。
 
 Ulysses CP 目前仅支持 SFT。Qwen4 Exp SFT 可以组合 CP 与 `memory.chunk_loss: true`，通过 `memory.chunk_loss_size` 指定分块行数；要求 TP=1、MTP 关闭，且保持 `memory.chunk_batch: false`。`chunk_batch` 与 `chunk_loss` 是不同配置，不能用前者替代后者。
 
 全层 128-NPU SFT 脚本为 `scripts/training/sft/run-qwen3.8-flash-next-tmp-fsdp-turbo-128xnpu.sh`，使用 `configs/turbo_config/qwen3_8_flash_next.yaml`。通过 `HF_CHECKPOINT` 指定模型目录、`DATA_DIR` 指定训练 parquet 所在目录；`LOAD_PATH` 用于续训，`SAVE_INTERVAL` 可覆盖默认的 5000 步保存间隔。始终开启 per-token loss。
+
+直接多机启动时，在八个节点分别设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。配方固定 `WORLD_SIZE=8`、`NUM_NPUS=16`。
 
 FSDPTurbo 的 DCP 和 legacy 检查点均需包含 `lr_scheduler.pt` 才能通过 `--load` 恢复 scheduler 进度。缺少该文件的旧检查点会明确报错，不会根据 rollout 编号猜测 optimizer 更新次数。若只复用权重，应先导出为当前模型可加载的 HF 目录，再通过 `--hf-checkpoint` 开始新训练；不要将 DCP 分片目录直接作为 HF 目录使用。
 

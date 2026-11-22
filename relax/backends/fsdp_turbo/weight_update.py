@@ -99,17 +99,15 @@ def _iter_ple_weight_chunks(
     num_shards: int,
     group_rank: int,
     sync_width: int,
-    initialized: bool,
 ):
-    """Stream complete HF shard sets independently to every rollout engine."""
+    """Stream each HF shard to the rollout TP ranks whose vocabulary ranges
+    overlap."""
     for raw_name, param in named_params_getter():
         name = _strip_turbo_param_prefix(raw_name)
         if not name.endswith(_PLE_TABLE_SUFFIX):
             continue
         if isinstance(param, DTensor) or param.device.type != "cpu":
             raise ValueError("PLE weight sync currently requires a replicated CPU table; VP tables are unsupported.")
-        if initialized and not param.requires_grad:
-            continue
         if num_shards < 1 or sync_width < 1:
             raise ValueError("PLE shard count and synchronization width must be positive")
         rows = param.size(0)
@@ -120,13 +118,22 @@ def _iter_ple_weight_chunks(
                 f"PLE HF shard requires {shard_bytes} bytes, exceeding update_weight_buffer_size={buffer_size_bytes}"
             )
         table = param.detach()
-        for first_shard in range(0, num_shards, sync_width):
-            shard = first_shard + group_rank
+        # SGLang 0.5.22 pads the original vocabulary to 64 rows, increasing
+        # the padding multiple by TP size when needed for an even partition.
+        padding = 64
+        padded_rows = ((rows + padding - 1) // padding) * padding
+        if padded_rows % sync_width:
+            padding *= sync_width
+            padded_rows = ((rows + padding - 1) // padding) * padding
+        partition_rows = padded_rows // sync_width
+        tp_start = min(group_rank * partition_rows, rows)
+        tp_end = min((group_rank + 1) * partition_rows, rows)
+        for shard in range(num_shards):
             start = shard * shard_rows
-            if group_rank < 0 or group_rank >= sync_width or shard >= num_shards or start >= rows:
+            end = min(start + shard_rows, rows)
+            if group_rank < 0 or group_rank >= sync_width or max(start, tp_start) >= min(end, tp_end):
                 yield []
                 continue
-            end = min(start + shard_rows, rows)
             shard_name = f"{name.removesuffix('.weight')}.shard_{shard}.weight"
             yield [(shard_name, table[start:end].to(device).contiguous())]
 
@@ -138,8 +145,6 @@ class FSDPTurboUpdateWeight:
         self.args = args
         self.model = model
         self.weight_version = 0
-        self._ple_tables_initialized = False
-        self._ple_sync_width = 1
         self._ipc_gather_group = None
         self._ipc_gather_src: int | None = None
         self._ipc_engine: ActorHandle | None = None
@@ -161,7 +166,6 @@ class FSDPTurboUpdateWeight:
         Every engine must share a Ray node with a training actor.
         """
         self.rollout_engines = list(rollout_engines)
-        self._ple_tables_initialized = False
 
         if engine_gpu_counts is None:
             engine_gpu_counts = [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
@@ -171,8 +175,6 @@ class FSDPTurboUpdateWeight:
             for count in engine_gpu_counts:
                 engine_gpu_offsets.append(offset)
                 offset += count
-
-        self._ple_sync_width = min(engine_gpu_counts, default=1)
 
         engine_node_ids = [
             info.get("node_id", "")
@@ -217,11 +219,11 @@ class FSDPTurboUpdateWeight:
         if failures:
             raise RuntimeError("FSDPTurbo weight sync failed: " + " | ".join(failures))
 
-    def _call_engines(self, method: str) -> None:
+    def _call_engines(self, method: str, **kwargs) -> None:
         error = None
         if dist.get_rank() == 0:
             try:
-                results = ray.get([getattr(engine, method).remote() for engine in self.rollout_engines])
+                results = ray.get([getattr(engine, method).remote(**kwargs) for engine in self.rollout_engines])
                 for result in results:
                     if isinstance(result, dict) and result.get("success") is False:
                         raise RuntimeError(str(result))
@@ -245,6 +247,7 @@ class FSDPTurboUpdateWeight:
         text_config = getattr(hf_config, "text_config", hf_config)
         num_ple_shards = int(getattr(text_config, "split_ngram_parts", getattr(hf_config, "split_ngram_parts", 512)))
         group_rank = dist.get_rank(self._ipc_gather_group) if self._ipc_gather_group is not None else -1
+        sync_width = dist.get_world_size(self._ipc_gather_group) if self._ipc_gather_group is not None else 1
         chunks = chain(
             _iter_weight_chunks(lambda: self.model.named_parameters(), buffer_size_bytes, device),
             _iter_ple_weight_chunks(
@@ -253,8 +256,7 @@ class FSDPTurboUpdateWeight:
                 device,
                 num_ple_shards,
                 group_rank,
-                self._ple_sync_width,
-                self._ple_tables_initialized,
+                sync_width,
             ),
         )
         num_chunks = 0
@@ -277,8 +279,8 @@ class FSDPTurboUpdateWeight:
 
         dist.barrier(group=get_gloo_group())
         self._call_engines("end_weight_update")
+        self._call_engines("update_weight_version", weight_version=str(self.weight_version))
         self._call_engines("continue_generation")
-        self._ple_tables_initialized = True
         dist.barrier(group=get_gloo_group())
         if rank == 0:
             logger.info(f"[fsdp_turbo] weight sync v{self.weight_version} done ({num_chunks} IPC chunks)")
@@ -354,7 +356,6 @@ class FSDPTurboUpdateWeight:
                     self._ipc_engine.update_weights_from_tensor.remote(
                         serialized_named_tensors=serialized_for_bucket,
                         load_format="flattened_bucket",
-                        weight_version=str(self.weight_version),
                     )
                 )
             ray.get(refs)

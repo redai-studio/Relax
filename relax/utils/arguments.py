@@ -4383,7 +4383,7 @@ def relax_validate_args(args):
                 # If is a HF checkpoint, set start_rollout_id to 0 here.
                 args.start_rollout_id = 0
         else:
-            if (
+            if args.train_backend != "fsdp_turbo" and (
                 args.load is None
                 or not os.path.exists(args.load)
                 or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))

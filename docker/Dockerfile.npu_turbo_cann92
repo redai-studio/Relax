@@ -87,7 +87,7 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
     git clone https://gitcode.com/ascend/MindSpeed-Bridge.git /root/MindSpeed-Bridge && \
     git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /root/Megatron-Bridge
 
-COPY docker/npu_patch /root/Relax/docker/npu_patch
+COPY docker/npu_patch/megatron-bridge.patch docker/npu_patch/megatron.patch docker/npu_patch/mindspeed-ops.patch docker/npu_patch/mindspeed.patch docker/npu_patch/mindspeed-bridge.patch /root/Relax/docker/npu_patch/
 
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
@@ -120,7 +120,9 @@ RUN cd /root/Megatron-Bridge && \
     git add . && git commit -m "base line" && \
     cd /root/MindSpeed && git add . && git commit -m "base line"
 
-# Patch base: 35ce313293052f8362e0829e7512bc9bc3d336c9.
+COPY docker/npu_patch/sglang-v0.5.22-npu.patch /root/Relax/docker/npu_patch/
+
+# Patch base: baa9befa381511cd4d56f83980951e5a45fffc6d.
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     git clone https://github.com/sgl-project/sglang.git /root/sglang && \
     cd /root/sglang && git checkout v0.5.22 && \
@@ -131,6 +133,8 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
     pip_install 'setuptools-scm>=8.0' wheel && \
     SGLANG_BUILD_RUST_EXTS=none pip install -e "python[srt_npu]" \
         --no-build-isolation --constraint <(echo "torch==2.10.0")
+
+COPY docker/npu_patch/sgl-kernel-npu-2026.9.0.post9.patch /root/Relax/docker/npu_patch/
 
 # Patch base: 0234a271453bb55eb395aa471ace1e815513e92a.
 RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
@@ -154,20 +158,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends gawk && \
     FLA_NPU_SOC=ascend910_93 python scripts/build_wheel.py && \
     python -m pip install --force-reinstall --no-cache-dir --no-deps dist/flash_linear_attention_npu*.whl
 
+COPY docker/npu_patch/hyper-multicore.patch /root/Relax/docker/npu_patch/
+
 ARG HYPER_MULTICORE_COMMIT=623627515705c07d443997012d0979bbbe6e49bb
 RUN git init /root/hyper-multicore && cd /root/hyper-multicore && \
     git remote add origin https://github.com/zongshuai1/hyper-multicore.git && \
     git -c http.version=HTTP/1.1 fetch --depth 1 origin ${HYPER_MULTICORE_COMMIT} && \
     git checkout --detach FETCH_HEAD && \
-    sed -i \
-        -e '/auto stream = GetAclStream();/a\  uint32_t level = c10_npu::GetDeterministicLevel();' \
-        -e 's/\[api, copied_params, stream, cache_params\]/[api, copied_params, stream, cache_params, level]/' \
-        -e 's/\&status, cache_params))/\&status, cache_params, level))/' \
-        -e '/if (hit_cache_v2_ext/i\      at_npu::native::ApplyDeterministicLevel(static_cast<int64_t>(level), at::globalContext().deterministicAlgorithms(), true);' \
-        -e '/if (hit_cache_ext/i\  at_npu::native::ApplyDeterministicLevel(static_cast<int64_t>(level), at::globalContext().deterministicAlgorithms(), true);' \
-        -e 's/api.execute, args...))/api.execute, level, args...))/' \
-        -e '/SetExecConfig.*;/d' \
-        hyper_multicore/torch/csrc/cached_moe_op_api.h && \
+    git apply --check /root/Relax/docker/npu_patch/hyper-multicore.patch && \
+    git apply /root/Relax/docker/npu_patch/hyper-multicore.patch && \
     pip install -r requirements.txt wheel 'packaging>=22' decorator attrs psutil && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     bash build.sh --soc-list ascend910_93 --jobs 24 && \
@@ -181,6 +180,8 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip_install ray==2.55.1 protobuf==6.33.6 fastokens==0.3.1
+
+COPY docker/npu_patch/fsdpturbo.patch /root/Relax/docker/npu_patch/
 
 # Patch base: 86c476bde97f657e0a0a70fd2a093ffbdb61e0cb.
 RUN git clone https://gitcode.com/Ascend/FSDPTurbo.git /root/FSDPTurbo && \
@@ -209,5 +210,5 @@ RUN python -m pip install --no-cache-dir --no-deps \
 RUN pip cache purge && \
     rm -rf /tmp/*
 
-ENTRYPOINT ["/bin/bash", "-c", "set -e; source /usr/local/Ascend/ascend-toolkit/set_env.sh; source /usr/local/Ascend/nnal/atb/set_env.sh; source \"$(command -v hyper_multicore_set_env.bash)\"; exec \"$@\"", "--"]
+ENTRYPOINT ["/bin/bash", "-c", "set -e; source /usr/local/Ascend/ascend-toolkit/set_env.sh; source /usr/local/Ascend/cann-9.2.0/share/info/ascendnpu-ir/bin/set_env.sh; source /usr/local/Ascend/nnal/atb/set_env.sh ${ATB_CXX_ABI}; source \"$(command -v hyper_multicore_set_env.bash)\"; exec \"$@\"", "--"]
 CMD ["/bin/bash"]

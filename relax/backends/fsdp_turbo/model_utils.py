@@ -55,6 +55,13 @@ def load_hf_model(model_path: str, torch_dtype: torch.dtype):
     return auto_cls.from_pretrained(model_path, dtype=torch_dtype, trust_remote_code=True)
 
 
+def _local_shard_size_and_offset(placement, *args):
+    method = getattr(placement, "local_shard_size_and_offset", None)
+    if method is None:
+        method = placement._local_shard_size_and_offset
+    return method(*args)
+
+
 def build_microbatches(
     total_lengths: Sequence[int],
     max_tokens_per_gpu: int | None,
@@ -1102,20 +1109,17 @@ def _compose_dtensor_local_indices(shape, device_mesh, placements) -> list:
             # A strided shard is a regular rank shard inside each of the
             # split_factor outer chunks.  Compose two regular shard offset
             # calculations instead of relying on the newer ALL-offset API.
-            local_size, _ = placement.local_shard_size_and_offset(len(current), num_chunks, rank)
             selected = []
             for split_index in range(placement.split_factor):
-                outer_size, outer_offset = Shard.local_shard_size_and_offset(
-                    len(current), placement.split_factor, split_index
+                outer_size, outer_offset = _local_shard_size_and_offset(
+                    Shard, len(current), placement.split_factor, split_index
                 )
-                inner_size, inner_offset = Shard.local_shard_size_and_offset(outer_size, num_chunks, rank)
+                inner_size, inner_offset = _local_shard_size_and_offset(Shard, outer_size, num_chunks, rank)
                 start = outer_offset + inner_offset
                 selected.extend(current[start : start + inner_size])
         else:
-            local_size, offset = placement.local_shard_size_and_offset(len(current), num_chunks, rank)
+            local_size, offset = _local_shard_size_and_offset(placement, len(current), num_chunks, rank)
             selected = [] if local_size == 0 else current[offset : offset + local_size]
-        if len(selected) != local_size:
-            raise RuntimeError(f"Invalid Qwen4Exp local offsets for placement {placement}")
         indices[dim] = selected
     return indices
 
@@ -1839,94 +1843,6 @@ def _build_qwen4_exp_turbo(args, turbo_config, torch_dtype):
 
     logger.info("[qwen4_exp] meta model materialized with local shards and wrapped by FSDPTurbo")
     return turbo
-
-
-def _install_fused_moe_dispatcher(model: torch.nn.Module, turbo_config, hf_config) -> int:
-    """Bind the lean fused NPU MoE compute path for ``expert_parallel_size=1``.
-
-    Avoid unnecessary ep>1 dispatch collectives and host syncs while keeping
-    expert parameters FSDP-sharded under their original HF names.
-    """
-    distributed = turbo_config.distributed
-    ep_plan = getattr(distributed, "ep_plan", None)
-    if ep_plan is None or int(getattr(distributed, "expert_parallel_size", 1) or 1) != 1:
-        return 0
-    if not ep_plan.apply_modules or ep_plan.dispatcher not in ("fused", "eager"):
-        return 0
-
-    try:
-        import torch_npu  # noqa: F401 — the fused kernels are NPU-only
-        from fsdp_turbo.ops.moe import permute, unpermute
-        from fsdp_turbo.ops.npu.grouped_matmul import GroupedMatmul
-        from fsdp_turbo.utils.str_match import module_name_match
-        from torch.distributed.tensor import DTensor
-    except ImportError as exc:
-        raise RuntimeError(
-            f"distributed.ep_plan.dispatcher={ep_plan.dispatcher!r} needs the fsdp_turbo fused MoE "
-            f"kernels (NPU), which are unavailable: {exc}. Remove distributed.ep_plan from the "
-            "turbo config to fall back to the transformers reference MoE path (very slow on NPU)."
-        ) from exc
-
-    num_experts = 0
-    for cfg in (hf_config, getattr(hf_config, "text_config", None)):
-        num_experts = int(getattr(cfg, "num_experts", 0) or 0)
-        if num_experts:
-            break
-
-    def _ep1_experts_forward(self, hidden_states, top_k_index, top_k_weights):
-        gate_up = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
-        down = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
-
-        shape = hidden_states.shape
-        x = hidden_states.reshape(-1, shape[-1])
-
-        # Derive on-device grouped-GEMM row counts from the expert weight stack.
-        num_experts = gate_up.shape[0]
-        counts = torch.histc(top_k_index, bins=num_experts, min=0, max=num_experts).long()
-
-        permuted, sort_indices = permute(x, top_k_index)
-        fc1 = GroupedMatmul.apply(permuted, gate_up, None, counts, 1)
-        gate, up = fc1.chunk(2, dim=-1)
-        act = torch.nn.functional.silu(gate) * up
-        y = GroupedMatmul.apply(act, down, None, counts, 1)
-        out = unpermute(y, sort_indices, top_k_weights)
-        return out.view(*shape)
-
-    installed = 0
-    matched_total = 0
-    for name, module in model.named_modules():
-        if not any(module_name_match(pattern, name) for pattern in ep_plan.apply_modules):
-            continue
-        total = int(getattr(module, "num_experts", 0) or 0)
-        if not total:
-            try:
-                total = len(module)
-            except TypeError:
-                total = 0
-        total = total or num_experts
-        if not total:
-            raise RuntimeError(
-                f"Cannot determine the expert count for module {name!r}; set num_experts on the "
-                "module/hf config or remove distributed.ep_plan from the turbo config."
-            )
-        if not hasattr(module, "num_experts"):
-            module.num_experts = total
-        module.forward = types.MethodType(_ep1_experts_forward, module)
-        installed += 1
-        matched_total = total
-
-    if installed:
-        logger.info(
-            f"[fsdp_turbo] lean ep=1 fused MoE bound on {installed} experts modules "
-            f"(experts/module={matched_total}): npu token permute -> packed npu_grouped_matmul "
-            f"-> silu*up -> npu_grouped_matmul -> npu token unpermute; no A2A dispatch machinery"
-        )
-    else:
-        logger.warning(
-            f"[fsdp_turbo] ep_plan.apply_modules matched no modules "
-            f"(patterns={ep_plan.apply_modules}); MoE stays on the transformers reference path."
-        )
-    return installed
 
 
 def build_turbo_model(args: Namespace, turbo_config, hf_config) -> torch.nn.Module:

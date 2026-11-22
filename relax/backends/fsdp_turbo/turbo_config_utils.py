@@ -57,6 +57,12 @@ def load_turbo_config(source: str | None) -> "FSDPTurboConfig":
         logger.info("Loaded FSDPTurbo config from inline JSON.")
 
     model_payload = payload.get("model") or {}
+    optimizer_payload = payload.get("optimizer") or {}
+    if "warmup_steps" in optimizer_payload:
+        warmup_steps = optimizer_payload["warmup_steps"]
+        if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, (int, float)) or warmup_steps < 0:
+            raise ValueError("optimizer.warmup_steps must be a nonnegative number")
+        config.optimizer.warmup_steps = warmup_steps
     from .performance_config import PerformanceConfig
 
     config.relax_performance = PerformanceConfig.from_dict(payload.get("relax_performance"))
@@ -225,6 +231,13 @@ def validate_fsdp_turbo_args(args) -> None:
     if not is_sft and algorithm_needs_critic(args):
         problems.append("critic-based advantage estimators are not supported; use a GRPO-family estimator")
     if not is_sft:
+        if int(getattr(args, "sglang_pp_size", 1) or 1) != 1:
+            problems.append("fsdp_turbo weight synchronization requires --sglang-pp-size 1")
+        if int(getattr(args, "sglang_dp_size", 1) or 1) != 1:
+            problems.append("fsdp_turbo weight synchronization requires --sglang-dp-size 1")
+        rows = int(getattr(args, "rollout_batch_size", 0) or 0) * int(getattr(args, "n_samples_per_prompt", 1) or 1)
+        if rows > int(getattr(args, "global_batch_size", rows) or rows):
+            problems.append("fsdp_turbo supports one optimizer batch per rollout")
         if getattr(args, "advantage_estimator", "grpo") != "grpo":
             problems.append("only --advantage-estimator grpo is implemented for fsdp_turbo RL")
         for name in ("normalize_advantages", "use_tis", "use_opd"):

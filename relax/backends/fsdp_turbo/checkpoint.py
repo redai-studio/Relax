@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -59,14 +60,33 @@ def _strip_turbo_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@contextmanager
+def _checkpoint_write_phase():
+    """Propagate file-write errors before any rank enters the next phase."""
+    error = None
+    try:
+        yield
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    errors = [None] * dist.get_world_size(get_gloo_group())
+    dist.all_gather_object(errors, error, group=get_gloo_group())
+    if any(item is not None for item in errors):
+        raise RuntimeError(f"Checkpoint write failed across ranks: {errors}")
+
+
 def _get_full_state_dicts(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None):
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 
     # Gather full tensors into rank-0 host RAM; saving local shards here would
     # produce an unresumable file. Other ranks do not hold a full copy.
-    model_state, optimizer_state = get_state_dict(
-        model, optimizer, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
-    )
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    if optimizer is not None and not optimizer.state:
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+        model_state = get_model_state_dict(model, options=options)
+        optimizer_state = optimizer.state_dict()
+    else:
+        model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
     return _strip_turbo_prefix(model_state), optimizer_state
 
 
@@ -236,12 +256,19 @@ if _HAS_DCP:
             self.model = model
             self.optimizer = optimizer
             self.rollout_id = int(rollout_id)
+            self.initialize_optimizer = False
 
         def state_dict(self) -> dict[str, Any]:
             from torch.distributed.checkpoint.state_dict import get_state_dict
 
             # Sharded defaults avoid materializing the ~95 GiB VP table in full.
-            model_sd, optim_sd = get_state_dict(self.model, self.optimizer)
+            if self.optimizer is not None and not self.optimizer.state and not self.initialize_optimizer:
+                from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+                model_sd = get_model_state_dict(self.model)
+                optim_sd = self.optimizer.state_dict()
+            else:
+                model_sd, optim_sd = get_state_dict(self.model, self.optimizer)
             # Frozen replicated tables are rebuilt from HF and need no checkpoint copy.
             dropped = _find_frozen_ngram_param_names(self.model) & model_sd.keys()
             for key in dropped:
@@ -258,6 +285,14 @@ if _HAS_DCP:
             from torch.distributed.checkpoint.state_dict import StateDictOptions, set_state_dict
 
             model_sd = state_dict.get("model", {})
+            if not state_dict.get("optim", {}).get("state"):
+                from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+                set_model_state_dict(self.model, model_sd, options=StateDictOptions(strict=False))
+                if self.optimizer is not None:
+                    self.optimizer.load_state_dict(state_dict["optim"])
+                self.rollout_id = int(state_dict.get("rollout_id", 0))
+                return
             # Re-inject skipped frozen tables so strict restore sees a complete mapping.
             missing_ngram = _find_frozen_ngram_param_names(self.model) - model_sd.keys()
             if missing_ngram:
@@ -331,7 +366,8 @@ if _HAS_DCP:
     ) -> None:
         """Save local shards; published ``.metadata`` certifies all ranks
         finished."""
-        os.makedirs(output_dir, exist_ok=True)
+        with _checkpoint_write_phase():
+            os.makedirs(output_dir, exist_ok=True)
         dcp.save(
             {"app": _AppState(model, optimizer, rollout_id)},
             checkpoint_id=output_dir,
@@ -344,6 +380,8 @@ if _HAS_DCP:
         Host memory stays at one local shard per rank.
         """
         app = _AppState(model, optimizer, 0)
+        metadata = dcp.FileSystemReader(load_dir).read_metadata()
+        app.initialize_optimizer = any(key.startswith("app.optim.state.") for key in metadata.state_dict_metadata)
         dcp.load(
             {"app": app},
             checkpoint_id=load_dir,
@@ -481,18 +519,24 @@ def _export_hf_weights(
     vp_params = _find_vp_table_params(model)
     detach_receipt = _detach_vp_tables_for_gather(model, optimizer, vp_params)
     try:
-        model_state, _optimizer_state = _get_full_state_dicts(model, optimizer)
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+        model_state = _strip_turbo_prefix(
+            get_model_state_dict(model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        )
     finally:
         _restore_vp_tables_after_gather(model, optimizer, detach_receipt)
     if vp_params:
-        _save_vp_shards(output_dir, vp_params, rollout_id)
-    if dist.get_rank() == 0:
-        os.makedirs(output_dir, exist_ok=True)
-        _write_hf_model_file(output_dir, model_state)
-        logger.info(
-            "[fsdp_turbo] save_checkpoint: HF weight export written beside the DCP checkpoint "
-            "(RELAX_FSDPTURBO_CKPT_EXPORT_HF); resume does NOT read it"
-        )
+        with _checkpoint_write_phase():
+            _save_vp_shards(output_dir, vp_params, rollout_id)
+    with _checkpoint_write_phase():
+        if dist.get_rank() == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            _write_hf_model_file(output_dir, model_state)
+            logger.info(
+                "[fsdp_turbo] save_checkpoint: HF weight export written beside the DCP checkpoint "
+                "(RELAX_FSDPTURBO_CKPT_EXPORT_HF); resume does NOT read it"
+            )
 
 
 def save_checkpoint(
@@ -511,12 +555,14 @@ def save_checkpoint(
     """
     if args.save is None:
         return
+    hf_config = getattr(getattr(model, "model", model), "config", hf_config)
     output_dir = os.path.join(args.save, str(rollout_id))
     rank = dist.get_rank()
 
-    if rank == 0 and lr_scheduler is not None:
-        os.makedirs(output_dir, exist_ok=True)
-        torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "lr_scheduler.pt"))
+    with _checkpoint_write_phase():
+        if rank == 0 and lr_scheduler is not None:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "lr_scheduler.pt"))
 
     use_dcp = Envs.RELAX_FSDPTURBO_CKPT_DCP and _HAS_DCP
     if Envs.RELAX_FSDPTURBO_CKPT_DCP and not _HAS_DCP and rank == 0:
@@ -531,19 +577,20 @@ def save_checkpoint(
             _export_hf_weights(output_dir, model, optimizer, rollout_id)
         # Publish the resume marker only after every rank finishes writing.
         dist.barrier(group=get_gloo_group())
-        if rank == 0:
-            # Config/tokenizer keep the step recognizable to HF tooling; resume reads DCP shards.
-            hf_config.save_pretrained(output_dir)
-            if tokenizer is not None:
-                tokenizer.save_pretrained(output_dir)
-            logger.info(
-                f"[fsdp_turbo] saved DCP sharded checkpoint for rollout_id={rollout_id} to {output_dir} "
-                f"({dist.get_world_size()} per-rank shard files; model+optimizer in sharded form, "
-                "VP tables included with their optimizer moments)"
-            )
-            # Step marker supports direct --load; root marker supports crash recovery.
-            for root in (output_dir, args.save):
-                _write_atomic_latest(root, rollout_id)
+        with _checkpoint_write_phase():
+            if rank == 0:
+                # Config/tokenizer keep the step recognizable to HF tooling; resume reads DCP shards.
+                hf_config.save_pretrained(output_dir)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(output_dir)
+                logger.info(
+                    f"[fsdp_turbo] saved DCP sharded checkpoint for rollout_id={rollout_id} to {output_dir} "
+                    f"({dist.get_world_size()} per-rank shard files; model+optimizer in sharded form, "
+                    "VP tables included with their optimizer moments)"
+                )
+                # Step marker supports direct --load; root marker supports crash recovery.
+                for root in (output_dir, args.save):
+                    _write_atomic_latest(root, rollout_id)
         dist.barrier(group=get_gloo_group())
         return
 
@@ -556,100 +603,34 @@ def save_checkpoint(
     finally:
         _restore_vp_tables_after_gather(model, optimizer, detach_receipt)
     if vp_params:
-        _save_vp_shards(output_dir, vp_params, rollout_id)
+        with _checkpoint_write_phase():
+            _save_vp_shards(output_dir, vp_params, rollout_id)
 
-    if rank == 0:
-        logger.info(
-            f"[fsdp_turbo] save_checkpoint: VP table param(s) found: {len(vp_params)} "
-            "(non-zero means the shard bypass is active; zero means the tables ride the full gather)"
-        )
-        os.makedirs(output_dir, exist_ok=True)
-        _write_hf_model_file(output_dir, model_state)
-        hf_config.save_pretrained(output_dir)
-        if tokenizer is not None:
-            tokenizer.save_pretrained(output_dir)
-        torch.save(
-            {"optimizer": optimizer_state, "rollout_id": rollout_id},
-            os.path.join(output_dir, "optimizer.pt"),
-        )
-        logger.info(f"[fsdp_turbo] saved checkpoint for rollout_id={rollout_id} to {output_dir}")
-        # Step marker supports direct --load; root marker supports crash recovery.
-        for root in (output_dir, args.save):
-            _write_atomic_latest(root, rollout_id)
+    with _checkpoint_write_phase():
+        if rank == 0:
+            logger.info(
+                f"[fsdp_turbo] save_checkpoint: VP table param(s) found: {len(vp_params)} "
+                "(non-zero means the shard bypass is active; zero means the tables ride the full gather)"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            _write_hf_model_file(output_dir, model_state)
+            hf_config.save_pretrained(output_dir)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(output_dir)
+            torch.save(
+                {"optimizer": optimizer_state, "rollout_id": rollout_id},
+                os.path.join(output_dir, "optimizer.pt"),
+            )
+            logger.info(f"[fsdp_turbo] saved checkpoint for rollout_id={rollout_id} to {output_dir}")
+            # Step marker supports direct --load; root marker supports crash recovery.
+            for root in (output_dir, args.save):
+                _write_atomic_latest(root, rollout_id)
     dist.barrier(group=get_gloo_group())
-
-
-def _shard_view(file_t: torch.Tensor, param: torch.Tensor) -> torch.Tensor | None:
-    """Return this rank's slice of a full tensor for a DTensor parameter.
-
-    Match FSDP2's uneven ``torch.chunk`` layout, including zero padding for
-    tail ranks. Return None when the exact layout cannot be derived so the
-    caller can fall back.
-    """
-    spec = getattr(param, "_spec", None)
-    if spec is None:
-        return None
-    try:
-        mesh = spec.mesh
-        coords = mesh.get_coordinate()
-        if coords is None:
-            return None
-        local_shape = tuple(getattr(param, "_local_tensor", param).shape)
-        view = file_t
-        plan: list[tuple[int, int, int]] = []  # (dim, start, data rows)
-        padded = False
-        for mesh_idx, placement in enumerate(spec.placements):
-            dim = getattr(placement, "dim", None)
-            if dim is None:
-                continue
-            size = mesh.size(mesh_idx)
-            if size <= 1:
-                continue
-            base, rem = divmod(view.shape[dim], size)
-            rank = coords[mesh_idx]
-            if rank < rem:
-                start, data_rows = rank * (base + 1), base + 1
-            else:
-                start, data_rows = rem * (base + 1) + (rank - rem) * base, base
-            if data_rows > local_shape[dim]:
-                return None
-            padded = padded or data_rows < local_shape[dim]
-            plan.append((dim, start, data_rows))
-            view = view.narrow(dim, start, data_rows)
-        if not padded:
-            return view
-        # Match the padded local shard; only unshard trims the zero rows.
-        out = file_t.new_zeros(local_shape)
-        dst = out
-        for dim, _, data_rows in plan:
-            if data_rows < local_shape[dim]:
-                dst = dst.narrow(dim, 0, data_rows)
-        if dst.shape != view.shape:
-            return None
-        dst.copy_(view)
-        return out
-    except Exception:
-        return None
 
 
 def _is_fork_set_failure(msg: str) -> bool:
     """Return whether ``msg`` is a recoverable fork set_state_dict failure."""
     return "Sharding propagation failed" in msg or "mixed torch.Tensor and DTensor" in msg
-
-
-def _describe_placement(param: torch.Tensor) -> str:
-    """Describe mesh placement for landing-refusal diagnostics."""
-    spec = getattr(param, "_spec", None)
-    if spec is None:
-        return "no _spec (not a standard DTensor)"
-    try:
-        mesh = spec.mesh
-        return (
-            f"placements={spec.placements} mesh={tuple(mesh.size(i) for i in range(mesh.ndim))} "
-            f"coords={mesh.get_coordinate()}"
-        )
-    except Exception:
-        return f"unusable spec ({spec!r})"
 
 
 def _load_vp_shards(load_dir: str, vp_params: dict[str, torch.nn.Parameter]) -> None:
@@ -723,8 +704,10 @@ def load_checkpoint(
     DCP is detected by ``.metadata``; other directories use the legacy reader.
     Return the next rollout id, or 0 when no optimizer state exists.
     """
-    if args.load is None or not os.path.isdir(args.load):
+    if args.load is None:
         return 0
+    if not os.path.isdir(args.load):
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {args.load}")
 
     # Accept either a step dir or a save root with a resume marker. Check step
     # signatures first so a DCP step's own marker does not append its id again.
@@ -739,8 +722,13 @@ def load_checkpoint(
             with open(marker_path, encoding="utf-8") as f:
                 load_dir = os.path.join(load_dir, f.read().strip())
     if not os.path.isdir(load_dir):
-        logger.warning(f"[fsdp_turbo] load_checkpoint: no checkpoint found under {args.load}, training from scratch")
-        return 0
+        raise FileNotFoundError(f"Checkpoint marker points to missing directory: {load_dir}")
+    if not any(
+        os.path.isfile(os.path.join(load_dir, name)) for name in (_DCP_METADATA, "model.safetensors", "model.bin")
+    ):
+        raise ValueError(f"No DCP metadata or legacy model weights found in checkpoint: {load_dir}")
+    if lr_scheduler is not None and not os.path.isfile(os.path.join(load_dir, "lr_scheduler.pt")):
+        raise ValueError(f"Checkpoint has no LR scheduler state: {load_dir}")
 
     # DCP directories use the sharded reader instead of the legacy full-file path.
     if os.path.isfile(os.path.join(load_dir, _DCP_METADATA)):
@@ -784,206 +772,46 @@ def load_checkpoint(
     if os.path.exists(optimizer_path):
         payload = torch.load(optimizer_path, map_location="cpu", weights_only=False)
         optimizer_state = payload.get("optimizer")
+        if optimizer is not None and optimizer_state is None:
+            raise ValueError(f"Checkpoint has no optimizer state: {optimizer_path}")
     else:
+        if optimizer is not None:
+            raise FileNotFoundError(f"Checkpoint has no optimizer state file: {optimizer_path}")
         resumed_rollout_id = 0  # no optimizer state: train a fresh step count
     if rank == 0:
         logger.info(f"[fsdp_turbo] resuming from {load_dir} (next rollout_id={resumed_rollout_id})")
 
-    from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_model_state_dict,
+        set_model_state_dict,
+        set_optimizer_state_dict,
+    )
 
-    # Build the exact key skeleton required by the current model and optimizer;
-    # checkpoint data fills it without missing-key failures.
-    model_skeleton, optim_skeleton = get_state_dict(model, optimizer)
-
-    # Map HF checkpoint names to FSDPTurbo keys; missing keys keep current
-    # values and surplus checkpoint keys are dropped.
-    missing_fill: list[str] = []
-    aligned_state: dict[str, Any] = {}
-    held_model: dict[str, Any] = {}
-    for name, tensor in model_skeleton.items():
+    skeleton = get_model_state_dict(model)
+    aligned = {}
+    for name, tensor in skeleton.items():
         stripped = name[len(_TURBO_PREFIX) :] if name.startswith(_TURBO_PREFIX) else name
         if stripped in model_state:
-            aligned_state[name] = model_state[stripped]
-            # Keep original file tensors for the force-land pass.
-            held_model[name] = model_state[stripped]
+            value = model_state[stripped]
+            if tuple(value.shape) != tuple(tensor.shape):
+                raise ValueError(f"Checkpoint shape mismatch for {name}: {value.shape} != {tensor.shape}")
+            aligned[name] = value
+        elif "ngram_embedding" not in name:
+            raise ValueError(f"Checkpoint is missing model parameter {name}")
+    # The state-dict APIs distribute full tensors using the actual DTensor placements,
+    # including repeated shards of the same dimension and uneven shards.
+    options = StateDictOptions(full_state_dict=True, strict=False)
+    set_model_state_dict(model, aligned, options=options)
+    if optimizer is not None and optimizer_state is not None:
+        if optimizer_state.get("state"):
+            set_optimizer_state_dict(model, optimizer, optimizer_state, options=options)
         else:
-            aligned_state[name] = tensor
-            missing_fill.append(name)
-    model_state = aligned_state
-    if missing_fill:
-        logger.warning(
-            f"[fsdp_turbo] load_checkpoint: {len(missing_fill)} model key(s) missing from the checkpoint; "
-            f"keeping resume-time values for them (e.g. {missing_fill[:3]})"
-        )
-
-    # Reject rank-local shards instead of loading a different wrong slice per rank.
-    rank_local = [
-        name
-        for name, value in held_model.items()
-        if hasattr(value, "_local_tensor") and tuple(value._local_tensor.shape) != tuple(value.shape)
-    ]
-    if rank_local:
-        raise RuntimeError(
-            f"[fsdp_turbo] load_checkpoint: refusing {load_dir}: {len(rank_local)}/{len(held_model)} values "
-            f"carry rank-local DTensor shards (e.g. '{rank_local[0]}') — only 1/N of each tensor was saved; "
-            f"re-save the checkpoint from a healthy run before resuming"
-        )
-
-    # Missing optimizer entries keep fresh zero moments; surplus saved keys are dropped.
-    if optimizer_state is not None:
-        skeleton_state = optim_skeleton.get("state", {})
-        saved_state = optimizer_state.get("state", {})
-        restored = sum(1 for k in skeleton_state if k in saved_state)
-        for fqn, entry in skeleton_state.items():
-            if fqn in saved_state:
-                skeleton_state[fqn] = saved_state[fqn]
-        optimizer_state["state"] = skeleton_state
-        logger.info(
-            f"[fsdp_turbo] load_checkpoint: restored {restored}/{len(skeleton_state)} optimizer "
-            f"state entries from checkpoint ({len(saved_state)} saved, {len(saved_state) - restored} unused)"
-        )
-
-    # This fork can reject EP sharding or plain-to-DTensor values after the
-    # optimizer restore. Pop named model offenders, retry non-strictly, then
-    # land them manually below.
-    manual: dict[str, Any] = {}
-    bad_keys: list[str] = []
-    params = dict(model.named_parameters())
-    try:
-        set_state_dict(model, optimizer, model_state_dict=model_state, optim_state_dict=optimizer_state)
-    except RuntimeError as e:
-        msg = str(e)
-        if not _is_fork_set_failure(msg):
-            raise
-        import re
-
-        bad_keys = sorted(set(re.findall(r'parameter named "([^"]+)"', msg)))
-        manual = {k: model_state.pop(k) for k in bad_keys if k in model_state}
-        from torch.distributed.checkpoint.state_dict import StateDictOptions
-
-        # Retries may surface more offenders. After two failures, force-land
-        # model weights from held file tensors; optimizer state already restored.
-        set_ok = False
-        for _attempt in range(2):
-            try:
-                set_state_dict(
-                    model,
-                    optimizer,
-                    model_state_dict=model_state,
-                    optim_state_dict=optimizer_state,
-                    options=StateDictOptions(strict=False),
-                )
-                set_ok = True
-                break
-            except RuntimeError as e2:
-                if not _is_fork_set_failure(str(e2)):
-                    raise
-                more = [k for k in re.findall(r'parameter named "([^"]+)"', str(e2)) if k in model_state]
-                bad_keys.extend(k for k in more if k not in bad_keys)
-                manual.update({k: model_state.pop(k) for k in more})
-        if not set_ok:
-            logger.warning(
-                "[fsdp_turbo] load_checkpoint: set_state_dict's model path keeps failing on fork "
-                "placements; the force-land pass below is the landing mechanism for model weights"
-            )
-        with torch.no_grad():
-            for k, v in manual.items():
-                p = params.get(k)
-                if p is None:
-                    continue
-                # Copy into raw local storage to avoid mixed Tensor/DTensor
-                # errors. Use an exact spec-driven slice when shapes differ;
-                # reject unsupported trainable layouts, while frozen parameters
-                # keep their identical current values.
-                local = getattr(p, "_local_tensor", p)
-                v_plain = getattr(v, "_local_tensor", v)
-                if local.shape == v_plain.shape:
-                    local.copy_(v_plain.to(local.dtype))
-                    continue
-                view = _shard_view(v_plain, p)
-                if view is not None and view.shape == local.shape:
-                    local.copy_(view.to(local.dtype))
-                    continue
-                if not p.requires_grad:
-                    continue
-                raise RuntimeError(
-                    f"[fsdp_turbo] load_checkpoint: param {k} local shard {tuple(local.shape)} cannot "
-                    f"accept checkpoint value {tuple(v_plain.shape)} — unsupported shard layout "
-                    f"({_describe_placement(p)}; shard_view={'None' if view is None else tuple(view.shape)}); "
-                    "report this layout so the slicer can cover it"
-                )
-        if manual:
-            logger.warning(
-                f"[fsdp_turbo] load_checkpoint: copied {len(manual)} set-refused param(s) into local "
-                f"shards manually (e.g. {bad_keys[:3]})"
-            )
-    # This fork's model restore may not stick. Copy every held file tensor into
-    # local storage; count unsupported layouts and leave those to set_state_dict.
-    landed = 0
-    unsupported = 0
-    with torch.no_grad():
-        for name, file_t in held_model.items():
-            p = params.get(name)
-            if p is None:
-                continue
-            # Unwrap file DTensors and require the global shape so rank-local
-            # shards cannot be tiled onto every rank.
-            file_plain = getattr(file_t, "_local_tensor", file_t)
-            expected = tuple(model_skeleton[name].shape) if name in model_skeleton else tuple(file_plain.shape)
-            if tuple(file_plain.shape) != expected:
-                unsupported += 1
-                continue
-            local = getattr(p, "_local_tensor", p)
-            if local.shape == file_plain.shape:
-                local.copy_(file_plain.to(local.dtype))
-                landed += 1
-                continue
-            view = _shard_view(file_plain, p)
-            if view is None or view.shape != local.shape:
-                unsupported += 1
-                continue
-            local.copy_(view.to(local.dtype))
-            landed += 1
-    logger.warning(
-        f"[fsdp_turbo] load_checkpoint: force-landed {landed} param(s) from the checkpoint file "
-        f"({unsupported} left to set_state_dict: unsupported shard layout)"
-    )
-    if unsupported > len(held_model) // 2:
-        logger.error(
-            "[fsdp_turbo] load_checkpoint: most checkpoint values carry rank-local shard shapes — "
-            "this file was saved without full gathering and cannot resume; re-save with a fixed save path"
-        )
+            optimizer.load_state_dict(optimizer_state)
     # VP tables bypassed the gather and must be restored from per-rank shards.
     vp_params = _find_vp_table_params(model)
     if vp_params:
         _load_vp_shards(load_dir, vp_params)
-    # Rebuild restored Adam moments with zeros_like(param), the layout this
-    # fork's optimizer accepts. Skip mismatched value copies; momentum
-    # re-converges while the restored step counter preserves bias correction.
-    if optimizer is not None:
-        rebuilt = 0
-        skipped = 0
-        with torch.no_grad():
-            for p, entry in optimizer.state.items():
-                if not isinstance(entry, dict):
-                    continue
-                for m in ("exp_avg", "exp_avg_sq"):
-                    if m not in entry:
-                        continue
-                    fresh = torch.zeros_like(p)
-                    fresh_local = getattr(fresh, "_local_tensor", fresh)
-                    src = getattr(entry[m], "_local_tensor", entry[m])
-                    if src.shape == fresh_local.shape:
-                        fresh_local.copy_(src.to(fresh_local.dtype))
-                    else:
-                        skipped += 1
-                    entry[m] = fresh
-                    rebuilt += 1
-        if rebuilt:
-            logger.warning(
-                f"[fsdp_turbo] load_checkpoint: rebuilt {rebuilt} Adam moment tensor(s) in the "
-                f"from-scratch zeros_like(param) form ({skipped} value copy skipped on shape mismatch)"
-            )
     if optimizer_state is not None:
         _restore_lr_scheduler(load_dir, lr_scheduler)
     return int(resumed_rollout_id)

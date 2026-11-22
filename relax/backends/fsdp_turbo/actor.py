@@ -24,8 +24,6 @@ from relax.algorithms.advantages import compute_advantages_and_returns
 from relax.backends.fsdp_turbo.checkpoint import load_checkpoint, save_checkpoint
 from relax.backends.fsdp_turbo.lr_scheduler import MegatronParityWarmupCosineScheduler
 from relax.backends.fsdp_turbo.model_utils import (
-    _install_fused_moe_dispatcher,
-    _is_deepseek_v4,
     _is_qwen4_exp,
     build_microbatches,
     build_turbo_model,
@@ -39,6 +37,7 @@ from relax.backends.fsdp_turbo.turbo_config_utils import load_turbo_config, vali
 from relax.backends.fsdp_turbo.weight_update import FSDPTurboUpdateWeight
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.runtime import (
+    evaluation_step_for_rollout,
     is_sft_mode,
     sft_partition_id,
     sft_partition_ids,
@@ -159,10 +158,6 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         if hasattr(self.turbo.model, "gradient_checkpointing_enable"):
             self.turbo.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         self.turbo.train()
-        if not _is_qwen4_exp(self.hf_config) and not _is_deepseek_v4(self.hf_config):
-            # Install after FSDP wrapping and before the first forward.
-            _install_fused_moe_dispatcher(self.turbo.model, turbo_config, self.hf_config)
-
         self._init_optimizer(args, turbo_config)
 
         from fsdp_turbo.distributed.parallel_state import get_parallel_state
@@ -239,7 +234,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         # The factory has no warmup, so match Megatron: linear warmup, then cosine over
         # total_steps - warmup_span. Keep warmup_span fractional and step after optimizer.step().
         warmup_span = float(getattr(optimizer_config, "warmup_steps", 0) or 0)
-        if warmup_span <= 0:
+        if not hasattr(optimizer_config, "warmup_steps"):
             warmup_ratio = float(getattr(optimizer_config, "warmup_ratio", 0.0) or 0.0)
             if warmup_ratio > 0:
                 warmup_span = warmup_ratio * total_steps
@@ -411,11 +406,6 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         return float(count.item()) / self._dp_size
 
     def _train_actor(self, rollout_id: int, rollout_data: dict) -> None:
-        if not is_sft_mode(self.args) and len(rollout_data["total_lengths"]) > self.args.global_batch_size:
-            raise ValueError(
-                "fsdp_turbo RL currently supports one optimizer batch per rollout; "
-                "set rollout_batch_size * n_samples_per_prompt <= global_batch_size."
-            )
         # Close stale half-open intervals before starting full-step train so a prior exception cannot
         # leave timer state that masks the next error.
         if "train" in Timer().start_time:
@@ -437,18 +427,34 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         Timer().seq_lens = [int(length) for length in rollout_data["total_lengths"]]
 
         mean_step_samples = self._mean_data_count(len(rollout_data["total_lengths"]), device)
+        if not is_sft_mode(self.args) and round(mean_step_samples * self._dp_size) > self.args.global_batch_size:
+            raise ValueError("fsdp_turbo RL supports only one global optimizer batch per rollout")
+        if not is_sft_mode(self.args):
+            has_images = self._mean_data_count(
+                any(item is not None and bool(item) for item in (rollout_data.get("multimodal_train_inputs") or [])),
+                device,
+            )
+            if has_images:
+                raise ValueError("fsdp_turbo image GRPO is not supported")
         skip_optimizer_step = False
         if is_sft_mode(self.args):
             metrics, skip_optimizer_step = self._train_sft(
                 rollout_id, rollout_data, microbatches, device, mean_step_samples
             )
         else:
-            metrics = self._train_rl(rollout_id, rollout_data, microbatches, device, mean_step_samples)
+            mean_tokens = self._mean_data_count(sum(float(mask.sum()) for mask in rollout_data["loss_masks"]), device)
+            skip_optimizer_step = mean_tokens <= 0
+            metrics = (
+                {}
+                if skip_optimizer_step
+                else self._train_rl(rollout_id, rollout_data, microbatches, device, mean_step_samples)
+            )
 
         if skip_optimizer_step:
             # Clear stale gradients and leave optimizer and LR state untouched.
             self.optimizer.zero_grad()
             metrics["grad_norm"] = 0.0
+            metrics["optimizer_step_skipped"] = 1.0
         else:
             from fsdp_turbo.training.clip_grads import clip_grad_norm
 
@@ -503,8 +509,9 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         if self.rollout_manager is not None and not self.args.debug_train_only:
             self.update_weights()
 
-        if is_sft_mode(self.args) and should_run_sft_eval(self.args, rollout_id):
-            self._run_sft_eval(rollout_id)
+        evaluation_step = evaluation_step_for_rollout(self.args, rollout_id)
+        if is_sft_mode(self.args) and should_run_sft_eval(self.args, evaluation_step):
+            self._run_sft_eval(evaluation_step)
 
         # Close full-step train before the perf logger resets timers, then reopen train_wait.
         Timer().end("train")
@@ -607,7 +614,7 @@ class FSDPTurboTrainRayActor(TrainRayActor):
 
         token_global = get_algorithm(self.args.advantage_estimator).advantage_normalization == "token_global"
         mean_step_tokens = None
-        if token_global:
+        if token_global or getattr(self.args, "calculate_per_token_loss", False):
             mean_step_tokens = self._mean_data_count(
                 sum(float(mask.sum()) for mask in rollout_data["loss_masks"]), device
             )

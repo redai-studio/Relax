@@ -1239,17 +1239,26 @@ def post_process_rollout_data(args, rollout_data):
         max_seq_len = max(rollout_data["total_lengths"])
 
         # pad to reduce memory fragmentation and maybe make the computation faster
-        pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+        pad_size = (
+            mpu.get_tensor_model_parallel_world_size()
+            if getattr(args, "train_backend", "megatron") == "megatron"
+            else 1
+        ) * args.data_pad_size_multiplier
         max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
 
         rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
 
-    padded_total_lengths = maybe_padded_total_lengths(
-        rollout_data["total_lengths"],
-        args.qkv_format,
-        getattr(args, "is_vl_model", False)
-        or "multimodal_train_inputs" in rollout_data
-        or getattr(args, "uses_unsplit_forward", False),
+    uses_megatron_cp = getattr(args, "train_backend", "megatron") == "megatron"
+    padded_total_lengths = (
+        maybe_padded_total_lengths(
+            rollout_data["total_lengths"],
+            args.qkv_format,
+            getattr(args, "is_vl_model", False)
+            or "multimodal_train_inputs" in rollout_data
+            or getattr(args, "uses_unsplit_forward", False),
+        )
+        if uses_megatron_cp
+        else None
     )
 
     response_float_fields = [
@@ -1304,6 +1313,7 @@ def post_process_rollout_data(args, rollout_data):
                     args.qkv_format,
                     rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
                     padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
+                    dynamic_cp_size=None if uses_megatron_cp else 1,
                 ),
                 device=cuda_dev,
                 dtype=dtype,

@@ -46,6 +46,9 @@ def log_perf_data_raw(
     if timer_instance.seq_lens:
         log_dict["perf/actor_train_tokens"] = sum(timer_instance.seq_lens)
 
+    if log_dict.get("perf/actor_train_time", 0) > 0 and timer_instance.seq_lens:
+        log_dict["perf/actor_train_tok_per_s"] = sum(timer_instance.seq_lens) / log_dict["perf/actor_train_time"]
+
     per_gpu_tflops: float | None = None
     if ("perf/actor_train_time" in log_dict) and (flops_counter is not None):
         # MFU is best-effort: unsupported model configs must skip tflops/mfu, not abort training.
@@ -95,7 +98,6 @@ def log_perf_data_raw(
             if log_dict["perf/actor_train_time"] > 0 and math.isfinite(per_gpu_tflops):
                 # Training includes fwd+bwd, use full 6N flops
                 log_dict["perf/actor_train_tflops"] = per_gpu_tflops / log_dict["perf/actor_train_time"]
-                log_dict["perf/actor_train_tok_per_s"] = sum(seq_lens) / log_dict["perf/actor_train_time"]
 
             # MFU = achieved_per_gpu_tflops / device_peak_tflops
             if math.isfinite(peak_tflops) and peak_tflops > 0:

@@ -1,0 +1,37 @@
+diff --git a/hyper_multicore/torch/csrc/cached_moe_op_api.h b/hyper_multicore/torch/csrc/cached_moe_op_api.h
+--- a/hyper_multicore/torch/csrc/cached_moe_op_api.h
++++ b/hyper_multicore/torch/csrc/cached_moe_op_api.h
+@@ -65,16 +65,17 @@
+   // Workspace, executor, converted parameters and contexts remain invocation/thread-local.
+   const auto task_queue_enable = OpApiGetTaskQueueEnable();
+   auto stream = GetAclStream();
++  uint32_t level = c10_npu::GetDeterministicLevel();
+   if (task_queue_enable == 2) {
+     auto copied_params = CopyTypesV2(args...);
+     auto cache_params = GetCacheParams();
+-    auto acl_call = [api, copied_params, stream, cache_params]() -> int {
++    auto acl_call = [api, copied_params, stream, cache_params, level]() -> int {
+       InitExecSubTheadCtx(stream);
+       int status = 0;
+-      if (hit_cache_v2_ext(stream, api.name, api.execute, copied_params, &status, cache_params)) {
++      at_npu::native::ApplyDeterministicLevel(static_cast<int64_t>(level), at::globalContext().deterministicAlgorithms(), true);
++      if (hit_cache_v2_ext(stream, api.name, api.execute, copied_params, &status, cache_params, level)) {
+         return status;
+       }
+-      SetExecConfigV2(cache_params);
+       api.init_context();
+       uint64_t workspace_size = 0;
+       aclOpExecutor *executor = nullptr;
+@@ -91,10 +92,10 @@
+     RunAclCall(api.name, acl_call);
+     return;
+   }
+-  if (hit_cache_ext(stream, api.name, api.execute, args...)) {
++  at_npu::native::ApplyDeterministicLevel(static_cast<int64_t>(level), at::globalContext().deterministicAlgorithms(), true);
++  if (hit_cache_ext(stream, api.name, api.execute, level, args...)) {
+     return;
+   }
+-  SetExecConfig();
+   api.init_context();
+   uint64_t workspace_size = 0;
+   aclOpExecutor *executor = nullptr;

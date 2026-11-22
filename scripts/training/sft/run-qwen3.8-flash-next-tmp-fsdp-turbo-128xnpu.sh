@@ -2,6 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Qwen3.8-Flash-Next SFT with the FSDPTurbo backend.
+# Set MASTER_ADDR, HOST_IP and POD_NAME on each of the eight nodes.
 # Override EXP_DIR, MODEL_DIR, DATA_DIR, SAVE_DIR and network interfaces as needed.
 
 set -ex
@@ -35,10 +36,27 @@ export RAY_memory_usage_threshold=0.97
 export RELAX_SFT_ROPE_FP32=1
 export RELAX_SFT_ROUTER_FP32=1
 
+export WORLD_SIZE=8 NUM_NPUS=16
+
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-npu-multinode.sh"
 fi
+
+RUNTIME_ENV_JSON=$(python3 - <<'PYENV'
+import json
+import os
+
+runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON", "{}"))
+env = runtime.setdefault("env_vars", {})
+for key in ("HCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "TP_SOCKET_IFNAME",
+            "HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE"):
+    if key in os.environ:
+        env[key] = os.environ[key]
+print(json.dumps(runtime))
+PYENV
+)
+export RUNTIME_ENV_JSON
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/sft/qwen3.8}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"

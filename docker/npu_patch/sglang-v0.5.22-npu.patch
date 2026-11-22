@@ -1069,22 +1069,6 @@ index 7dbf76c5141a6cc7f35c7895b7356749c989eb50..9da1c049feaab8f1e0091c7a1d28bcda
              from sglang.kernels.ops.mamba.qwen4_short_conv import (
                  can_fuse_qwen4_verify_conv,
                  fused_qwen4_verify_conv,
-diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index c97fd10787d2eefe515c16e8cf2f348ac648c1aa..6d5358efa01dae1d168af5d4ea3eb39c3ac5be41 100644
---- a/python/sglang/srt/utils/common.py
-+++ b/python/sglang/srt/utils/common.py
-@@ -328,6 +328,11 @@ is_sm90_supported = lru_cache(maxsize=1)(
-         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-     )
- )
-+is_sm100_supported = lru_cache(maxsize=1)(
-+    partial(
-+        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
-+    )
-+)
- 
- 
- # RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
 diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
 index cd5c96eda23a01100e6a5a9040283cb7ea8e1af3..a6854f1d5037a508adf2233744ec188e7ecfbd26 100644
 --- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
