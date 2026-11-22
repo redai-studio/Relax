@@ -44,3 +44,4 @@ def test_minimax_patch_marks_answer_and_eos_without_changing_render() -> None:
     )
     assert rendered == original
     assert [rendered[0][start:end] for start, end in spans[0]] == ["The answer<eos>\n"]
+    assert try_patch_minimax_chat_template(sample, patch.template, patch.kwargs) is None

@@ -2,11 +2,26 @@
 
 """Dispatch model-specific, per-call chat-template adaptations for SFT."""
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
 from relax.engine.sft.dataset.sample import CanonicalSample
+
+
+# `-?` accepts the dashed-whitespace-control variants `{%- generation -%}` and
+# `{%-generation-%}` that Jinja allows. The dashes only suppress surrounding
+# whitespace and are semantically identical to the plain `{% generation %}`
+# form for the purpose of marking assistant-token spans, so they should be
+# recognised as the same marker.
+_GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
+
+
+def HAS_GENERATION_MARKER(template_str: str | None) -> bool:  # noqa: N802
+    if not template_str:
+        return False
+    return bool(_GENERATION_MARKER_RE.search(template_str))
 
 
 @dataclass(frozen=True)

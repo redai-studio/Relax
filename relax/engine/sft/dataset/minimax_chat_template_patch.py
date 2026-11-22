@@ -2,21 +2,17 @@
 
 """Enable assistant-response masks for MiniMax-M3 chat templates."""
 
-import re
 from collections.abc import Mapping
 from typing import Any
 
-from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult
+from relax.engine.sft.dataset.chat_template_patch import HAS_GENERATION_MARKER, TemplatePatchResult
 from relax.engine.sft.dataset.sample import CanonicalSample
-
-
-_GENERATION = re.compile(r"{%-?\s*generation\s*-?%}")
 
 
 def try_patch_minimax_chat_template(
     _sample: CanonicalSample, template: str | None, kwargs: Mapping[str, Any]
 ) -> TemplatePatchResult | None:
-    if not template or "]<]minimax[>[" not in template or _GENERATION.search(template):
+    if not template or "]<]minimax[>[" not in template or HAS_GENERATION_MARKER(template):
         return None
     assistant = "{%- if message.role == 'assistant' -%}"
     tool = "{%- elif message.role == 'tool' -%}"
