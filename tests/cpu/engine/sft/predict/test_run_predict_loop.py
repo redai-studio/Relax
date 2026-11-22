@@ -498,7 +498,7 @@ async def test_predict_workload_uses_managed_admission_and_returns_permits(monke
         )
         remote_requests = []
 
-        async def remote_send(url, body, headers):
+        async def remote_send(url, body, headers, request_id):
             remote_requests.append(url)
             return await http_utils._request_once(client, url, body, headers)
 

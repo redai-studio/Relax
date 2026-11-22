@@ -372,19 +372,33 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
     from relax.utils import http_utils
 
     owner = manager()
+    completed = []
+
+    async def complete(permit):
+        completed.append(permit)
+        await owner.complete_request(permit)
+
     remote = SimpleNamespace(
         **{
             name: SimpleNamespace(remote=getattr(owner, name))
-            for name in ("snapshot", "admit_request", "complete_request", "fail_request_transport")
-        }
+            for name in ("snapshot", "admit_request", "fail_request_transport")
+        },
+        complete_request=SimpleNamespace(remote=complete),
     )
     started, disconnected, stopping, stopped = (asyncio.Event() for _ in range(4))
     paths = []
+    poster_calls = []
 
     async def do_request(*args):
+        poster_calls.append(args)
         started.set()
         await disconnected.wait()
+        if cancelled:
+            raise ray.exceptions.TaskCancelledError()
         raise ray.exceptions.ActorUnavailableError("connection lost", None)
+
+    async def no_cancel_receipt(request_id):
+        raise ray.exceptions.ActorDiedError()
 
     async def stop_requests():
         stopping.set()
@@ -399,10 +413,13 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
         return httpx.Response(200)
 
     poster = SimpleNamespace(
-        do_request=SimpleNamespace(remote=do_request), stop_requests=SimpleNamespace(remote=stop_requests)
+        do_request=SimpleNamespace(remote=do_request),
+        stop_requests=SimpleNamespace(remote=stop_requests),
+        cancel_request=SimpleNamespace(remote=no_cancel_receipt),
     )
     monkeypatch.setattr(http_utils, "_post_actors", [poster])
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        monkeypatch.setattr(http_utils, "_http_client", client)
         executor = InferenceRequestExecutor(
             Role.ROLLOUT, remote, client, send_request=http_utils.send_distributed_request
         )
@@ -413,8 +430,12 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
         disconnected.set()
         try:
             await asyncio.wait_for(stopping.wait(), 1)
-            assert owner.ledger.permits and not paths
-            assert not http_utils._post_actors
+            assert not completed and not paths
+            fallback = await http_utils.send_distributed_request(
+                client.build_request("POST", "http://engine/fallback")
+            )
+            await fallback.aclose()
+            assert paths == ["/fallback"] and len(poster_calls) == 1
         finally:
             stopped.set()
         expected = (
@@ -426,10 +447,10 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
             await asyncio.wait_for(generation, 2)
 
     if confirmed:
-        assert not owner.ledger.permits
-        assert paths == ["/workers", "/abort_request"]
+        assert len(completed) == 1
+        assert paths == ["/fallback", "/workers", "/abort_request"]
     else:
-        assert owner.ledger.permits and not paths
+        assert not completed and paths == ["/fallback"]
         assert not (await owner.snapshot()).models[0].admission
         with pytest.raises(RuntimeError, match="cannot confirm distributed POST"):
             await owner.wait_ready("rollout")

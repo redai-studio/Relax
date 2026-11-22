@@ -484,26 +484,41 @@ def test_unregister_waits_for_all_dp_rank_workers_to_leave(monkeypatch, sglang_e
     ]
 
 
-@pytest.mark.parametrize("terminal_job", [None, {"job_type": "AddWorker", "status": "failed"}])
-def test_rollback_waits_for_queued_router_add_before_removing_worker(monkeypatch, sglang_engine_module, terminal_job):
+@pytest.mark.parametrize(
+    ("add_outcome", "terminal"),
+    [
+        (None, True),
+        ("Workflow failed at step detect_connection: unavailable", True),
+        ("Workflow timeout after 30s for worker", False),
+        ("Failed to get workflow status: unavailable", False),
+    ],
+)
+def test_rollback_waits_for_queued_router_add_before_removing_worker(
+    monkeypatch, sglang_engine_module, add_outcome, terminal
+):
     router = _RouterRequests(worker_lists=[[]])
     engine = _make_engine(sglang_engine_module)
     engine._skip_router_registration = True
-    add_statuses = iter([{"job_status": {"status": "pending"}}, {"job_status": terminal_job}])
+    status = {"job_type": "AddWorker", "status": "failed", "message": add_outcome} if add_outcome else None
+    add_statuses = iter([{"job_status": {"status": "pending"}}, {"job_status": status}])
     router_get = router.get
 
     def get(url, timeout=None):
         if url.endswith("/physical-worker-id"):
             assert not router.deletes
-            return _Response(200, next(add_statuses))
+            return _Response(200, next(add_statuses, {"job_status": None}))
         return router_get(url, timeout)
 
     monkeypatch.setattr(router, "get", get)
     monkeypatch.setattr(sglang_engine_module, "requests", router)
     monkeypatch.setattr(sglang_engine_module, "time", _Clock())
     assert engine.register_to_router()
-    assert engine.unregister_from_router(wait_for_removal=True, timeout=5)
-    assert router.deletes == ["http://router:30000/workers/physical-worker-id"]
+    assert engine.unregister_from_router(wait_for_removal=True, timeout=5) is terminal
+    if terminal:
+        assert router.deletes == ["http://router:30000/workers/physical-worker-id"]
+    else:
+        assert not engine.unregister_from_router(wait_for_removal=True, timeout=1)
+        assert router.deletes == []
 
 
 def test_unregister_timeout_allows_a_later_retry(monkeypatch, sglang_engine_module):

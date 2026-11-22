@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-import ray
 
 from relax.utils.http_utils import (
     _post,
@@ -63,7 +62,7 @@ async def test_admitted_distributed_post_never_replays_unknown_outcome(monkeypat
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
 
-        async def remote(url, body, headers):
+        async def remote(url, body, headers, request_id):
             if outcome == "actor_error":
                 raise RuntimeError("poster actor died")
             return await http_utils._request_once(client, url, body, headers)
@@ -88,26 +87,24 @@ async def test_admitted_distributed_post_never_replays_unknown_outcome(monkeypat
 async def test_distributed_post_cancellation_waits_for_poster_completion(monkeypatch):
     from relax.utils import http_utils
 
-    completion = asyncio.get_running_loop().create_future()
-    submitted, cancellation_requested = asyncio.Event(), asyncio.Event()
+    submitted, cancellation_requested, acknowledge = (asyncio.Event() for _ in range(3))
+    ids = []
 
-    class PosterRef:
-        def __await__(self):
-            return completion.__await__()
+    async def remote(url, body, headers, request_id):
+        ids.append(request_id)
+        if len(ids) == 1:
+            submitted.set()
+            await asyncio.Future()
+        return 200, [], b"ok", None
 
-    ref = PosterRef()
-
-    def remote(*args):
-        submitted.set()
-        return ref
-
-    def cancel(target, *, recursive):
-        assert target is ref and not recursive
+    async def cancel(request_id):
+        assert ids == [request_id]
         cancellation_requested.set()
+        await acknowledge.wait()
+        return True
 
-    monkeypatch.setattr(ray, "ObjectRef", PosterRef)
-    monkeypatch.setattr(ray, "cancel", cancel)
-    monkeypatch.setattr(http_utils, "_post_actors", [SimpleNamespace(do_request=SimpleNamespace(remote=remote))])
+    actor = SimpleNamespace(do_request=SimpleNamespace(remote=remote), cancel_request=SimpleNamespace(remote=cancel))
+    monkeypatch.setattr(http_utils, "_post_actors", [actor])
     task = asyncio.create_task(http_utils.send_distributed_request(httpx.Request("POST", "http://engine/generate")))
     try:
         await asyncio.wait_for(submitted.wait(), 1)
@@ -115,12 +112,13 @@ async def test_distributed_post_cancellation_waits_for_poster_completion(monkeyp
         await asyncio.wait_for(cancellation_requested.wait(), 1)
         task.cancel()
         await asyncio.sleep(0)
-        assert not task.done() and not completion.done()
+        assert not task.done()
     finally:
-        if not completion.done():
-            completion.set_exception(ray.exceptions.TaskCancelledError())
+        acknowledge.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 1)
+    response = await http_utils.send_distributed_request(httpx.Request("POST", "http://engine/generate"))
+    assert response.content == b"ok" and len(ids) == 2
 
 
 @pytest.mark.parametrize(

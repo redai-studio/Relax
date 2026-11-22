@@ -8,10 +8,11 @@ import random
 import re
 import socket
 import threading
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -23,6 +24,7 @@ logger = get_logger(__name__)
 
 MAX_RETRIES = 6
 _POSTER_STOP_TIMEOUT_S = 20
+_MAX_PENDING_POSTER_CANCELLATIONS = 4096
 
 
 class DistributedPostUnconfirmed(RuntimeError):
@@ -369,32 +371,54 @@ def _init_ray_distributed_post(args):
             )
             self._requests_lock = threading.Lock()
             self._stopped = False
-            self._active_requests: set[asyncio.Task] = set()
+            self._active_requests: dict[str, asyncio.Task] = {}
+            self._cancelled_requests: set[str] = set()
 
         async def do_post(self, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
             return await _post_with_error_envelope(
                 self._client, url, payload, max_retries, headers, fail_fast_no_workers
             )
 
-        async def do_request(self, url, body, headers):
+        async def do_request(self, url, body, headers, request_id: str):
             task = asyncio.current_task()
             assert task is not None
             with self._requests_lock:
-                if self._stopped:
-                    return None, [], b"", ("PoolTimeout", "Distributed HTTP poster stopped")
-                self._active_requests.add(task)
+                if self._stopped or request_id in self._cancelled_requests:
+                    self._cancelled_requests.discard(request_id)
+                    return None, [], b"", ("PoolTimeout", "Distributed HTTP request did not dispatch")
+                self._active_requests[request_id] = task
             try:
                 return await _request_once(self._client, url, body, headers)
             finally:
                 with self._requests_lock:
-                    self._active_requests.discard(task)
+                    self._active_requests.pop(request_id)
+
+        @ray.method(concurrency_group="control")
+        async def cancel_request(self, request_id: str) -> bool:
+            with self._requests_lock:
+                if self._stopped:
+                    return False
+                active = self._active_requests.get(request_id)
+                if active is None:
+                    # The work RPC may still be queued or in transit. Retain
+                    # its marker until it arrives, or retire at the cap.
+                    if len(self._cancelled_requests) >= _MAX_PENDING_POSTER_CANCELLATIONS:
+                        return False
+                    self._cancelled_requests.add(request_id)
+                    return True
+            await self._cancel_active((active,))
+            return True
 
         @ray.method(concurrency_group="control")
         async def stop_requests(self) -> None:
             # A control RPC must run even when all request slots are occupied.
             with self._requests_lock:
                 self._stopped = True
-                active = tuple(self._active_requests)
+                active = tuple(self._active_requests.values())
+                self._cancelled_requests.clear()
+            await self._cancel_active(active)
+
+        async def _cancel_active(self, active: tuple[asyncio.Task, ...]) -> None:
             if active:
 
                 async def cancel_active() -> None:
@@ -454,14 +478,15 @@ async def send_distributed_request(request: httpx.Request) -> httpx.Response:
     import ray
 
     try:
-        ref = actor.do_request.remote(str(request.url), body, request.headers.multi_items())
+        request_id = uuid4().hex
+        ref = actor.do_request.remote(str(request.url), body, request.headers.multi_items(), request_id)
         pending = asyncio.ensure_future(ref)
         try:
             status, headers, body, error = await asyncio.shield(pending)
         except asyncio.CancelledError:
-            await _cancel_poster_request(actor, ref, pending)
+            await _cancel_poster_request(actor, request_id, pending)
             raise
-    except ray.exceptions.RayActorError:
+    except (ray.exceptions.RayActorError, ray.exceptions.TaskCancelledError):
         await _confirm_poster_stopped(actor)
         raise
     if error is not None:
@@ -471,63 +496,50 @@ async def send_distributed_request(request: httpx.Request) -> httpx.Response:
     return httpx.Response(status, headers=headers, content=body, request=request)
 
 
-async def _cancel_poster_request(actor: object, ref: object, pending: asyncio.Future) -> None:
-    import ray
-
-    if isinstance(ref, ray.ObjectRef) and not pending.done():
+async def _cancel_poster_request(actor: object, request_id: str, pending: asyncio.Future) -> None:
+    if pending.done() and not pending.cancelled() and pending.exception() is None:
+        return
+    try:
+        # Ray can rewrite a connection error to TaskCancelledError without
+        # the actor seeing the cancellation. Require an application ACK.
         try:
-            ray.cancel(ref, recursive=False)
-        except Exception:
-            logger.exception("Could not send cancellation to the distributed HTTP poster")
-            pending.cancel()
-            await _confirm_poster_stopped(actor)
-            return
-    deadline = asyncio.get_running_loop().time() + _POSTER_STOP_TIMEOUT_S
-    while not pending.done():
-        try:
-            await asyncio.wait_for(asyncio.shield(pending), deadline - asyncio.get_running_loop().time())
-        except asyncio.CancelledError:
-            continue
-        except TimeoutError:
-            pending.cancel()
-            await _confirm_poster_stopped(actor)
-            return
-        except Exception:
-            break
-    if not pending.cancelled() and isinstance(pending.exception(), ray.exceptions.RayActorError):
+            if await _poster_control_ack(lambda: actor.cancel_request.remote(request_id)) is True:
+                return
+        except DistributedPostUnconfirmed:
+            logger.warning("Could not confirm distributed POST cancellation; stopping the poster")
         await _confirm_poster_stopped(actor)
+    finally:
+        if not pending.cancel() and not pending.cancelled():
+            pending.exception()
 
 
 async def _confirm_poster_stopped(actor: object) -> None:
     """Retire a poster after an ambiguous actor error, holding the permit."""
-    import ray
-
     if actor in _post_actors:
         _post_actors.remove(actor)
+    await _poster_control_ack(actor.stop_requests.remote)
 
-    async def stop() -> None:
+
+async def _poster_control_ack(call: Callable[[], Awaitable]) -> object:
+    import ray
+
+    async def control():
         while True:
             try:
-                await actor.stop_requests.remote()
-                return
+                return await call()
             except ray.exceptions.ActorUnavailableError:
                 await asyncio.sleep(0.5)
 
-    stopped = asyncio.ensure_future(asyncio.wait_for(stop(), _POSTER_STOP_TIMEOUT_S))
-    cancelled = False
+    ack = asyncio.ensure_future(asyncio.wait_for(control(), _POSTER_STOP_TIMEOUT_S))
     while True:
         try:
-            await asyncio.shield(stopped)
-            break
+            return await asyncio.shield(ack)
         except asyncio.CancelledError:
-            if stopped.cancelled():
+            if ack.cancelled():
                 raise DistributedPostUnconfirmed("HTTP poster stop was cancelled") from None
-            cancelled = True
         except Exception as exc:
             # Ray can mark a partitioned node dead while its process still runs.
             raise DistributedPostUnconfirmed("Could not confirm that the distributed HTTP poster stopped") from exc
-    if cancelled:
-        raise asyncio.CancelledError
 
 
 async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):

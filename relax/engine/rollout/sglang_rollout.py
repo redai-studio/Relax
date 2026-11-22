@@ -40,6 +40,7 @@ from relax.utils.data.processing_utils import (
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
 from relax.utils.http_utils import (
+    DistributedPostUnconfirmed,
     get,
     is_expected_sglang_499,
     is_router_no_available_workers,
@@ -386,7 +387,7 @@ async def _post_generation(
                     if not generation.done():
                         generation.cancel()
                     outcome, _ = await asyncio.gather(generation, aborted, return_exceptions=True)
-                    if isinstance(outcome, http_utils.DistributedPostUnconfirmed):
+                    if isinstance(outcome, DistributedPostUnconfirmed):
                         raise outcome
             return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
         except httpx.HTTPStatusError as error:
@@ -855,7 +856,16 @@ async def generate_and_rm_group(
             asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
         )
 
-    group = await asyncio.gather(*tasks)
+    try:
+        group = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, DistributedPostUnconfirmed):
+                raise outcome
+        raise
 
     # Group rewards require complete trajectories, including during evaluation.
     group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
@@ -934,15 +944,24 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
 
     # make sure all the pending tasks are finished
     count = 0
+    dispatch_failure = None
+    partial_failure = None
     while state.pendings:
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
-        if not args.partial_rollout:
-            continue
-
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
-            group = task.result()
+            try:
+                group = task.result()
+            except DistributedPostUnconfirmed as exc:
+                dispatch_failure = exc
+                continue
+            except (Exception, asyncio.CancelledError) as exc:
+                if args.partial_rollout and partial_failure is None:
+                    partial_failure = exc
+                continue
+            if not args.partial_rollout:
+                continue
             for sample in group:
                 if sample.status == Sample.Status.ABORTED:
                     sample.abort_count += 1
@@ -951,6 +970,10 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             aborted_samples.append(group)
             count += len(group)
 
+    if dispatch_failure is not None:
+        raise dispatch_failure
+    if partial_failure is not None:
+        raise partial_failure
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
 

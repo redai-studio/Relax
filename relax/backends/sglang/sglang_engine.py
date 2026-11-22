@@ -1351,6 +1351,7 @@ class SGLangEngine(RayActor):
                     # The router may accept the worker before its HTTP response
                     # is lost. Reconcile that mutation instead of posting twice.
                     self._router_registration_pending = True
+                    self._router_registration_outcome_unknown = False
                     self._router_worker_id = None
                 try:
                     response = requests.post(
@@ -1479,10 +1480,25 @@ class SGLangEngine(RayActor):
                         status = requests.get(worker_endpoint, timeout=min(5.0, remaining))
                         status.raise_for_status()
                         job = status.json().get("job_status")
-                        if job is None or (
+                        failed_add = (
                             isinstance(job, dict)
                             and job.get("job_type") == "AddWorker"
                             and job.get("status") == "failed"
+                        )
+                        if failed_add:
+                            message = job.get("message")
+                            # The router also records errors from the waiter's
+                            # timeout or state lookup while AddWorker can run.
+                            if not isinstance(message, str) or not (
+                                message.startswith("Workflow failed at step ")
+                                or message.startswith("Failed to start local worker registration workflow:")
+                                or message.startswith("Failed to start external worker registration workflow:")
+                                or message in {"Workflow engines not initialized", "AppContext dropped"}
+                            ):
+                                self._router_registration_outcome_unknown = True
+                                return False
+                        if failed_add or (
+                            job is None and not getattr(self, "_router_registration_outcome_unknown", False)
                         ):
                             self._router_registration_pending = False
                             timeout = remaining

@@ -151,6 +151,32 @@ async def test_weight_sync_failure_never_registers_engine_to_dcs():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_scale_out_retains_execution_ownership_until_cleanup():
+    server = make_rollout_server()
+    manager = create_test_manager(servers={"default": server})
+    cleanup_started, finish_cleanup = asyncio.Event(), asyncio.Event()
+
+    async def bring_up(request):
+        request.update_status(ScaleOutStatus.CREATING)
+        cleanup_started.set()
+        await finish_cleanup.wait()
+
+    manager._scale_out_ray_native = bring_up
+    first = manager.create_scale_out_request(num_replicas=2)
+    running = asyncio.create_task(manager.execute_scale_out(first["request_id"]))
+    await asyncio.wait_for(cleanup_started.wait(), 1)
+    assert manager.cancel_scale_out(first["request_id"])["status"] == "CANCELLED"
+    try:
+        blocked = manager.create_scale_out_request(num_replicas=2)
+        assert blocked["status"] == "CONFLICT"
+        assert first["request_id"] in blocked["message"]
+    finally:
+        finish_cleanup.set()
+        await running
+    assert manager.create_scale_out_request(num_replicas=2)["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
 async def test_failed_native_scale_out_reports_cleanup_failure_and_keeps_placement_group(monkeypatch, patch_ray_get):
     from relax.distributed.ray import policy_engine_pool as policy
 

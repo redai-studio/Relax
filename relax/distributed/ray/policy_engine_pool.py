@@ -935,6 +935,7 @@ class PolicyEnginePool:
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
+        self._executing_scale_out: ScaleOutRequest | None = None
         self._port_cursors: dict[int, int] = {}
 
         # Elastic scale-in tracking
@@ -1563,6 +1564,9 @@ class PolicyEnginePool:
         with self._engine_lifecycle_lock:
             if getattr(self, "_unconfirmed_rollback_engines", ()):
                 return {"type": "scale_out rollback", "request_id": "cleanup", "status": "DRAINING"}
+            executing = getattr(self, "_executing_scale_out", None)
+            if executing is not None:
+                return {"type": "scale_out", "request_id": executing.request_id, "status": executing.status.value}
             # Explicit requests take precedence because an active scale-in may
             # itself have already moved a group into DRAINING.
             for r in self._scale_out_requests.values():
@@ -1759,13 +1763,15 @@ class PolicyEnginePool:
             request_id: The request ID returned by create_scale_out_request
         """
         self._require_unmanaged_engine_pool()
-        request = self._scale_out_requests.get(request_id)
-        if request is None:
-            logger.error(f"Scale-out request {request_id} not found")
-            return
-        if request.status != ScaleOutStatus.PENDING:
-            logger.warning(f"Scale-out request {request_id} is not in PENDING state: {request.status}")
-            return
+        with self._engine_lifecycle_lock:
+            request = self._scale_out_requests.get(request_id)
+            if request is None:
+                logger.error(f"Scale-out request {request_id} not found")
+                return
+            if request.status != ScaleOutStatus.PENDING or getattr(self, "_executing_scale_out", None) is not None:
+                logger.warning("Scale-out request %s cannot start in state %s", request_id, request.status)
+                return
+            self._executing_scale_out = request
 
         # Auto-detect mode: if num_replicas > 0, it's ray_native; if engine_urls is provided, it's external
         try:
@@ -1781,12 +1787,14 @@ class PolicyEnginePool:
                     f"[ScaleOut] Invalid request {request.request_id}: neither num_replicas nor engine_urls provided"
                 )
         finally:
-            if getattr(self, "_unconfirmed_rollback_engines", ()):
-                self._scale_out_cleanup_failed = True
-                failure = ScaleOutFailureCategory.ROLLBACK_UNCONFIRMED
-                request.failure_categories = [failure.name, *request.failure_categories]
-                request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {failure.value}")
-                raise _ScaleOutReleaseUnconfirmed("Scale-out rollback did not confirm resource release")
+            with self._engine_lifecycle_lock:
+                self._executing_scale_out = None
+                if getattr(self, "_unconfirmed_rollback_engines", ()):
+                    self._scale_out_cleanup_failed = True
+                    failure = ScaleOutFailureCategory.ROLLBACK_UNCONFIRMED
+                    request.failure_categories = [failure.name, *request.failure_categories]
+                    request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {failure.value}")
+                    raise _ScaleOutReleaseUnconfirmed("Scale-out rollback did not confirm resource release")
 
     async def _scale_out_ray_native(self, request: ScaleOutRequest) -> None:
         """Execute scale-out in ray_native mode with incremental resource
@@ -1833,7 +1841,10 @@ class PolicyEnginePool:
 
         try:
             # Step 1: Update status
-            request.update_status(ScaleOutStatus.CREATING)
+            with self._engine_lifecycle_lock:
+                if request.status == ScaleOutStatus.CANCELLED:
+                    return
+                request.update_status(ScaleOutStatus.CREATING)
             logger.info(
                 f"[ScaleOut] Status: PENDING → CREATING for request {request.request_id}, "
                 f"target: {request.num_replicas} replicas ({self.args.rollout_num_gpus_per_engine} GPUs each)"
@@ -1899,6 +1910,7 @@ class PolicyEnginePool:
                         except Exception:
                             pass
                     # Keep already-succeeded replicas (don't roll back)
+                    pending_indices.clear()
                     break
 
                 # Check readiness of all pending PGs concurrently
@@ -1912,6 +1924,8 @@ class PolicyEnginePool:
                     check_futures.values(),
                     timeout=min(poll_interval, remaining),
                 )
+                if request.status == ScaleOutStatus.CANCELLED:
+                    continue
 
                 for idx, fut in check_futures.items():
                     if fut in done_set and not fut.cancelled():
@@ -2403,7 +2417,10 @@ class PolicyEnginePool:
         # to DCS. A failed scale-out engine must never enter the actor's normal
         # DCS topology, otherwise the next full weight update can fail and
         # escalate an isolated scale-out failure into a global restart.
-        request.update_status(ScaleOutStatus.WEIGHT_SYNCING)
+        with self._engine_lifecycle_lock:
+            if request.status == ScaleOutStatus.CANCELLED:
+                return EngineFinalizeResult(False)
+            request.update_status(ScaleOutStatus.WEIGHT_SYNCING)
         logger.info(f"{log_prefix} {replica_str}: starting weight sync from seed engine...")
         sync_timeout = max(30.0, request.timeout_secs - (time.time() - request.created_at))
         sync_reasons: list[ScaleOutFailure] = []
@@ -2581,6 +2598,8 @@ class PolicyEnginePool:
 
         if getattr(self, "_unconfirmed_rollback_engines", ()):
             # execute_scale_out publishes the cleanup failure with these IDs.
+            return
+        if request.status == ScaleOutStatus.CANCELLED:
             return
         if not succeeded_engine_ids:
             if reason_str:
@@ -3480,13 +3499,14 @@ class PolicyEnginePool:
         Returns:
             Updated request status or None if not found/cancellable
         """
-        request = self._scale_out_requests.get(request_id)
-        if request is None:
-            return None
-        if not request.can_cancel():
-            return {"error": "Request cannot be cancelled in current state", "status": request.status.value}
-        previous_status = request.status.value
-        request.update_status(ScaleOutStatus.CANCELLED)
+        with self._engine_lifecycle_lock:
+            request = self._scale_out_requests.get(request_id)
+            if request is None:
+                return None
+            if not request.can_cancel():
+                return {"error": "Request cannot be cancelled in current state", "status": request.status.value}
+            previous_status = request.status.value
+            request.update_status(ScaleOutStatus.CANCELLED)
         logger.info(f"Scale-out request {request_id} cancelled (was in {previous_status} state)")
         return request.to_dict()
 

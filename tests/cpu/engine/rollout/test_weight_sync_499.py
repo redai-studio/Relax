@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from relax.utils.http_utils import DistributedPostUnconfirmed
 from relax.utils.types import Sample
 
 
@@ -85,6 +86,42 @@ async def test_standard_post_keeps_unrelated_499_visible(monkeypatch):
             evaluation=False,
         )
     assert exc_info.value is error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_rollout", [False, True])
+async def test_batch_abort_drains_other_tasks_before_reporting_unknown_dispatch(monkeypatch, partial_rollout):
+    state = SimpleNamespace(
+        aborted=False, evaluating=0, protected_pendings=set(), pendings=set(), abort_event=asyncio.Event()
+    )
+    finish = asyncio.Event()
+    failed = asyncio.Event()
+
+    async def cannot_confirm():
+        await state.abort_event.wait()
+        failed.set()
+        raise DistributedPostUnconfirmed("poster stop not confirmed")
+
+    async def finish_other_request():
+        await finish.wait()
+        return []
+
+    async def workers(url):
+        return {"urls": [], "workers": []}
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "get", workers)
+    state.pendings = {asyncio.create_task(cannot_confirm()), asyncio.create_task(finish_other_request())}
+    args = _router_args(partial_rollout=partial_rollout, sglang_router_ip="router", sglang_router_port=80)
+    abort = asyncio.create_task(sglang_rollout.abort(args, 1))
+    try:
+        await asyncio.wait_for(failed.wait(), 1)
+        assert not abort.done()
+    finally:
+        finish.set()
+        with pytest.raises(DistributedPostUnconfirmed, match="poster stop not confirmed"):
+            await asyncio.wait_for(abort, 1)
+    assert not state.pendings
 
 
 def _router_args(**overrides):
