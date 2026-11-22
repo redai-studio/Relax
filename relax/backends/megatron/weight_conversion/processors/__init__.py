@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from .padding_remover import remove_padding
 
 
@@ -12,7 +14,7 @@ except Exception:
 __all__ = ["remove_padding", "quantize_params", "quantize_params_fp8", "quantize_params_compressed_tensors"]
 
 
-def quantize_params(args, megatron_name, converted_named_params, quantization_config):
+def quantize_params(args, megatron_name, converted_named_params, quantization_config, *, fp8_weight_names=()):
     if quantization_config is None:
         return converted_named_params
     # Kimi K3-style mxfp4-pack-quantized releases: routed experts are already
@@ -25,7 +27,9 @@ def quantize_params(args, megatron_name, converted_named_params, quantization_co
     if quant_method == "fp8":
         if quantize_params_fp8 is None:
             raise NotImplementedError("fp8 quantization is not supported in this environment.")
-        return quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config)
+        return quantize_params_fp8(
+            args, megatron_name, converted_named_params, quantization_config, fp8_weight_names=fp8_weight_names
+        )
     elif quant_method == "compressed-tensors":
         if quantize_params_compressed_tensors is None:
             raise NotImplementedError("compressed-tensors quantization is not supported in this environment.")

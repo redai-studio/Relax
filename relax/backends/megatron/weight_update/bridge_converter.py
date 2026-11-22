@@ -170,6 +170,7 @@ class BridgeConverter:
         self._bridge_expert_transposes_down: bool = True
         self._configs_broadcast_done: bool = False
         self._hf_alias_checkpoint_keys: frozenset[str] | None = None
+        self._hf_fp8_weight_names: frozenset[str] = frozenset()
         # DeepSeek-V4 mHC alpha buffering, see _convert_hc_alpha.
         self._hc_alpha_buf: dict[str, dict[str, torch.Tensor]] = {}
         self._hc_alpha_hf_name: dict[str, str] = {}
@@ -209,6 +210,12 @@ class BridgeConverter:
         bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
         checkpoint_keys = _get_hf_checkpoint_keys(bridge)
         if checkpoint_keys is not None:
+            self._hf_fp8_weight_names = frozenset(
+                key.removesuffix(suffix) + ".weight"
+                for key in checkpoint_keys
+                for suffix in (".scale", ".weight_scale_inv", ".weight_scale")
+                if key.endswith(suffix) and key.removesuffix(suffix) + ".weight" in checkpoint_keys
+            )
             self._hf_alias_checkpoint_keys = frozenset(
                 key
                 for key in checkpoint_keys
@@ -791,4 +798,10 @@ class BridgeConverter:
                     postprocessed.append((hf_name, tensor))
             converted_named_tensors = postprocessed
 
-        return quantize_params(self._args, name, converted_named_tensors, self._quantization_config)
+        return quantize_params(
+            self._args,
+            name,
+            converted_named_tensors,
+            self._quantization_config,
+            fp8_weight_names=self._hf_fp8_weight_names,
+        )

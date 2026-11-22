@@ -472,3 +472,17 @@ class TestQuantizeParamScaleFormat:
 
         assert out[self._NAME] is qweight
         assert out[self._NAME.replace(".weight", ".weight_scale_inv")] is scale
+
+
+def test_checkpoint_scaled_projection_preserves_native_fp8_weight_scale_pair():
+    args = SimpleNamespace(fp8=None)
+    config = dict(quant_method="fp8", fmt="e4m3", activation_scheme="dynamic")
+    name = "layers.0.attn.wo_a.weight"
+    weight = torch.arange(16, dtype=torch.bfloat16).view(4, 4)
+    source = "module.module.decoder.layers.0.self_attention.linear_o_group_proj"
+    native = qf.quantize_params_fp8(args, source, [(name, weight)], config)
+    assert native[0][1] is weight
+    quantized = qf.quantize_params_fp8(args, source, [(name, weight)], config, fp8_weight_names={name})
+    assert [key for key, _ in quantized] == [name, "layers.0.attn.wo_a.weight_scale"]
+    assert quantized[0][1].dtype == torch.float8_e4m3fn
+    assert torch.isfinite(quantized[0][1].float()).all() and quantized[1][1].item() > 0

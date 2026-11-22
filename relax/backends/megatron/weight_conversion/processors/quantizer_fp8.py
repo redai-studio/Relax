@@ -60,7 +60,7 @@ def _resolve_online_weight_scale_fmt(
     return None
 
 
-def quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config):
+def quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config, *, fp8_weight_names=()):
     assert quantization_config["quant_method"] == "fp8"
     fmt = quantization_config.get("fmt", "e4m3")
     assert fmt == "e4m3", f"Unsupported FP8 format: {fmt}"
@@ -75,6 +75,19 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
         return _quantize_params_fp8_by_ignore_list(
             converted_named_params, set(modules_to_not_convert), weight_block_size, scale_fmt
         )
+
+    if any(name in fp8_weight_names for name, _ in converted_named_params):
+        # The real checkpoint schema also covers projections absent from the
+        # legacy Megatron-name list, including grouped output projections.
+        return [
+            item
+            for name, param in converted_named_params
+            for item in (
+                _quantize_param(name, param, weight_block_size, scale_fmt)
+                if name in fp8_weight_names
+                else [(name, param)]
+            )
+        ]
 
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, megatron_name)

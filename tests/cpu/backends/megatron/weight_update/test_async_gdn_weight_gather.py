@@ -170,3 +170,37 @@ def test_non_sharded_gdn_named_tensor_needs_no_gdn_config(monkeypatch, kind):
     monkeypatch.setattr(common, "get_hf_config", lambda *a: pytest.fail("unneeded config lookup"))
     actual = common.all_gather_param(SimpleNamespace(), "decoder.layers.0.self_attention.in_proj.weight", tensor)
     assert actual.data_ptr() == tensor.data_ptr()
+
+
+@pytest.mark.parametrize("projection,dim", [(1, 0), (2, 1)])
+def test_expert_partition_is_gathered_without_te_training_tp_flag(monkeypatch, projection, dim):
+    from relax.backends.megatron.weight_update import common
+
+    shards = [torch.arange(8, dtype=torch.bfloat16).view(4, 2) + 10 * rank for rank in range(2)]
+    param = shards[0].clone()
+    param.tensor_model_parallel, param.partition_dim, param.partition_stride = False, dim, 1
+    monkeypatch.setattr(
+        common,
+        "mpu",
+        SimpleNamespace(
+            get_expert_tensor_parallel_world_size=lambda: 2, get_expert_tensor_parallel_group=lambda: "etp"
+        ),
+    )
+
+    def gather(outputs, value, *, group, async_op):
+        assert group == "etp" and not async_op
+        for output, shard in zip(outputs, shards, strict=True):
+            output.copy_(shard)
+
+    monkeypatch.setattr(common.dist, "all_gather", gather)
+    name = f"decoder.layers.0.mlp.experts.linear_fc{projection}.weight0"
+    actual = common.all_gather_param(SimpleNamespace(), name, param)
+    expected = (
+        torch.cat([shards[0][:2], shards[1][:2], shards[0][2:], shards[1][2:]], 0)
+        if projection == 1
+        else torch.cat(shards, 1)
+    )
+    assert torch.equal(actual, expected) and not param.tensor_model_parallel
+    del param.partition_dim
+    with pytest.raises(NotImplementedError, match="partition layout"):
+        common.all_gather_param(SimpleNamespace(), name, param)
