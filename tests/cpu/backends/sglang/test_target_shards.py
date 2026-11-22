@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from relax.backends.sglang import delta_loader, delta_shard_layout
+from relax.backends.sglang import delta_loader
 from relax.distributed.weight_sync.codec import encode
 
 
@@ -50,17 +50,16 @@ def model_at(rank, tp=4):
 
 
 def fixture_admission(monkeypatch):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+    # The CPU fixture exercises the real stock loader and parameter copies.
+    def identity(model):
+        geometries = tuple(
+            module.use_padded_loading
+            for module in model.modules()
+            if hasattr(module, "moe_tp_rank") and hasattr(module, "use_padded_loading")
+        )
+        return type(model).load_weights, geometries
 
-    # Loader inputs, installed tensors, schema and actual ordinary target
-    # loads stay real. Substitute the native-version/CUDA admission for CPU.
-    monkeypatch.setattr(delta_loader, "sparse_loader_identity", lambda m: (type(m).load_weights,))
-    monkeypatch.setattr(
-        delta_shard_layout,
-        "_runtime",
-        lambda m, broadcast=False: (m.model.layers[0].mlp.experts.moe_tp_rank, FusedMoE, UnquantizedFusedMoEMethod),
-    )
+    monkeypatch.setattr(delta_loader, "sparse_loader_identity", identity)
 
 
 def source_words():
@@ -216,7 +215,10 @@ def test_unsupported_seed_declines_before_partial_delivery(fault, monkeypatch):
     if fault == "partial_schema":
         words.pop(next(iter(words)))
     if fault == "padding":
-        ex.use_padded_loading = True
+        # The physical projection is shorter than its wire quadrant.
+        for name, words_in in list(words.items()):
+            if name.endswith("gate_proj.weight"):
+                words[name] = torch.cat((words_in, words_in[:4]), dim=0)
     if fault == "alias":
         m.register_buffer("alias", torch.from_dlpack(ex.w2_weight.detach()))
     if fault == "parameter_subclass":
@@ -228,16 +230,13 @@ def test_unsupported_seed_declines_before_partial_delivery(fault, monkeypatch):
     # Ordinary FULL input still follows its loader; enable the safe original
     # CPU implementation before triggering the layout-only negative check.
     begin(m, 2, 1, True)
-    if fault == "padding":
-        ex.use_padded_loading = False
     assert not apply_frame(m, 1, *lane(words, None, 2, full=True)).any()
-    if fault == "padding":
-        ex.use_padded_loading = True
     assert finish(m, 1).tolist() == [0, 0]
 
 
 @pytest.mark.parametrize("status_alias", [False, True])
-def test_ordinary_full_with_parameter_subclass_acknowledges_only_safe_status(status_alias):
+@pytest.mark.parametrize("requested", [False, True])
+def test_ordinary_full_with_parameter_subclass_acknowledges_only_safe_status(status_alias, requested):
     class PackedParameter(torch.nn.Parameter):
         pass
 
@@ -253,12 +252,12 @@ def test_ordinary_full_with_parameter_subclass_acknowledges_only_safe_status(sta
     model = Ordinary()
     words = torch.tensor([0x7FC1, -32768, 42], dtype=torch.int16)
     raw_bf16 = words.view(torch.bfloat16)
-    begin(model, 0, 1, True)
+    begin(model, 0, 1, True, requested=requested)
     metadata, raw = encode([("weight", (3,), torch.bfloat16, None, raw_bf16)], max_bytes=128)
     assert apply_frame(model, 1, metadata, raw).tolist() == [1]
     receiver = model._relax_delta_receiver
     if status_alias:
-        status = torch.from_dlpack(model.weight.detach()).view(torch.uint8)[:2]
+        status = torch.from_dlpack(model.weight.detach()).view(torch.uint8)[: 2 if requested else 1]
         with pytest.raises(ValueError, match="overlap"):
             delta_loader.load_delta_weights(
                 model,
@@ -269,7 +268,7 @@ def test_ordinary_full_with_parameter_subclass_acknowledges_only_safe_status(sta
             )
         assert receiver.failed and receiver.version is None
     else:
-        assert finish(model, 1).tolist() == [1, 0]
+        assert finish(model, 1, requested=requested).tolist() == ([1, 0] if requested else [1])
         assert not receiver.failed and receiver.version == "1"
     assert torch.equal(model.weight.detach().view(torch.int16), words)
 
@@ -419,6 +418,15 @@ def test_ordered_target_consume_fences_each_frame_and_byte(fault, monkeypatch):
     models = [model_at(tp)[0] for tp in range(4)]
     refs = [model_at(tp)[0] for tp in range(4)]
     fixture_admission(monkeypatch)
+    original_load = type(models[0]).load_weights
+    calls = {id(model): 0 for model in models}
+
+    def load(model, weights):
+        if id(model) in calls:
+            calls[id(model)] += 1
+        return original_load(model, weights)
+
+    monkeypatch.setattr(type(models[0]), "load_weights", load)
     proxy = wire.WeightSyncProxy(None)
     proxy.children = [None] * 4
     proxy.identities = [dict(uuid=str(rank)) for rank in range(4)]
@@ -510,6 +518,7 @@ def test_ordered_target_consume_fences_each_frame_and_byte(fault, monkeypatch):
             arenas[0].reserve(777, 8)
         packed.append(stage(key, [lane(group, old, rank, full=False) for rank in range(4)]))
     before = [arena.storage.clone() for arena in arenas]
+    initial_calls = dict(calls)
     http.clear()
     releases.clear()
     if fault == "bad_last":
@@ -540,6 +549,7 @@ def test_ordered_target_consume_fences_each_frame_and_byte(fault, monkeypatch):
     assert all(torch.equal(a.storage, initial) for a, initial in zip(arenas, before, strict=True))
     assert all(s["status_acks"] == s["releases"] == 3 for s in proxy.metrics["target_shards"])
     assert proxy.finalize("2", timeout=30)["target_shard_capable"]
+    assert all(count == initial_calls[key] + 3 for key, count in calls.items())
     for model, ref in zip(models, refs, strict=True):
         ref.load_weights([(k, t.view(torch.bfloat16)) for k, t in words.items()])
         assert all(
@@ -692,7 +702,11 @@ def test_triton_maps_global_broadcast_words_to_each_tp_rank(down):
         bad = torch.zeros(1, dtype=torch.int32)
         kernel[(len(rows),)](raw, rows, target, bad, False, width)
         assert not bad.item()
-        kernel[(len(rows),)](raw, rows, target, bad, True, width, True, down, hidden, local, 2, rank)
+        installed = torch.zeros((), dtype=torch.int64)
+        offset = rank * local * (1 if down else hidden)
+        nrows, stride, cols = (hidden, 2 * local, local) if down else (1, local * hidden, local * hidden)
+        kernel[(len(rows),)](raw, rows, target, bad, True, width, True, offset, nrows, stride, cols, 2, installed)
+        assert int(installed) == hidden * local
         expected = words.view(shape).chunk(2, dim=int(down))[rank].reshape(-1)
         assert torch.equal(target[3:-3], expected) and not target[:3].any() and not target[-3:].any()
 
@@ -758,3 +772,63 @@ def test_tile_table_respects_entry_weight_and_loader_boundaries(empty, monkeypat
         assert frame.table is None and frame.invalid_positions() is None
     else:
         assert torch.equal(frame.table, torch.tensor(rows)) and not frame.invalid_positions()
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_four_lanes_follow_observed_nonstock_layout_and_loader_calls(rank):
+    # A separate dispatcher declares copy-only HF inputs. Its two gated halves
+    # are stored in the reverse order and no SGLang runtime/class is involved.
+    prefix = "model.language_model.layers.7.mlp.experts.0."
+    gate, up, down = [prefix + projection + "_proj.weight" for projection in ("gate", "up", "down")]
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vertical = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16), requires_grad=False)
+            self.horizontal = torch.nn.Parameter(torch.zeros(4, 2, dtype=torch.bfloat16), requires_grad=False)
+            self.calls = 0
+
+        def load_weights(self, weights):
+            self.calls += 1
+            for name, value in weights:
+                if name == down:
+                    self.horizontal.copy_(value.narrow(1, rank * 2, 2))
+                else:
+                    self.vertical.narrow(0, 2 if name == gate else 0, 2).copy_(value.narrow(0, rank * 2, 2))
+
+    Layer.load_weights.relax_copy_layout = lambda _: (rank, frozenset((gate, up, down)))
+    model, reference = Layer(), Layer()
+    old = {
+        gate: torch.arange(32, dtype=torch.int16).reshape(8, 4),
+        up: -torch.arange(32, dtype=torch.int16).reshape(8, 4),
+        down: torch.arange(32, dtype=torch.int16).reshape(4, 8),
+    }
+    for version in (1, 2):
+        full = version == 1
+        words = {name: value.clone() for name, value in old.items()}
+        if not full:
+            for value in words.values():
+                value.flatten()[::3] = -32768
+        begin(model, rank, version, full)
+        if full:
+            meta, raw = lane(words, old, rank, full=True)
+        else:
+            # gate/down are target-local; up stays sparse in global HF coordinates.
+            entries = []
+            for name, value in words.items():
+                new, before = value, old[name]
+                if name != up:
+                    axis = 1 if name == down else 0
+                    new, before = (t.chunk(4, dim=axis)[rank] for t in (new, before))
+                new, before = new.flatten(), before.flatten()
+                pos = (new != before).nonzero().flatten().to(torch.int32)
+                entries.append((name, value.shape, torch.bfloat16, pos, new[pos.long()].view(torch.bfloat16)))
+            meta, raw = encode(entries, max_bytes=1 << 20)
+            meta["target_shard"] = dict(format=1, tp_rank=rank, tp_size=4, entries=[0, 2])
+        assert not apply_frame(model, version, meta, raw).any()
+        assert finish(model, version).tolist() == [0, 1]
+        with torch.no_grad():
+            reference.load_weights([(name, w.view(torch.bfloat16)) for name, w in words.items()])
+        assert model.calls == reference.calls == version
+        for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

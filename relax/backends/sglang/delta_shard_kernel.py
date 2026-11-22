@@ -7,6 +7,11 @@ import triton.language as tl
 
 
 @triton.jit
+def _add(left, right):
+    return left + right
+
+
+@triton.jit
 def shard_tiles(
     raw,
     rows,
@@ -14,12 +19,13 @@ def shard_tiles(
     invalid,
     WRITE: tl.constexpr,
     BLOCK: tl.constexpr,
-    BROADCAST: tl.constexpr = False,
-    DOWN: tl.constexpr = False,
-    HIDDEN: tl.constexpr = 1,
-    LOCAL: tl.constexpr = 1,
-    TP: tl.constexpr = 1,
-    RANK: tl.constexpr = 0,
+    REGION: tl.constexpr = False,
+    OFFSET: tl.constexpr = 0,
+    ROWS: tl.constexpr = 1,
+    STRIDE: tl.constexpr = 1,
+    WIDTH: tl.constexpr = 1,
+    WORD_BYTES: tl.constexpr = 2,
+    written=None,
 ):
     row = rows + tl.program_id(0) * 6
     po, vo = tl.load(row), tl.load(row + 1)
@@ -30,15 +36,13 @@ def shard_tiles(
     ptr = (raw + po).to(tl.pointer_type(tl.int32)) + lane
     pos = tl.load(ptr, mask=present, other=0)
     if WRITE:
-        if BROADCAST:
-            if DOWN:
-                column = pos % (TP * LOCAL)
-                present = present & (column >= RANK * LOCAL) & (column < (RANK + 1) * LOCAL)
-                pos = (pos // (TP * LOCAL)) * LOCAL + column - RANK * LOCAL
-            else:
-                present = present & (pos >= RANK * LOCAL * HIDDEN) & (pos < (RANK + 1) * LOCAL * HIDDEN)
-                pos = pos - RANK * LOCAL * HIDDEN
-        word = tl.load((raw + vo).to(tl.pointer_type(tl.int16)) + lane, mask=present, other=0)
+        if REGION:
+            rel = pos.to(tl.int64) - OFFSET
+            present = present & (rel >= 0) & (rel < ROWS * STRIDE) & (rel % STRIDE < WIDTH)
+            pos = (rel // STRIDE) * WIDTH + rel % STRIDE
+            tl.atomic_add(written, tl.reduce(present.to(tl.int32), 0, _add).to(tl.int64), sem="relaxed")
+        word_type: tl.constexpr = tl.int16 if WORD_BYTES == 2 else tl.int32
+        word = tl.load((raw + vo).to(tl.pointer_type(word_type)) + lane, mask=present, other=0)
         tl.store(target + base + pos.to(tl.int64), word, mask=present)
     else:
         compare = present & ((lane > 0) | (has_prev != 0))

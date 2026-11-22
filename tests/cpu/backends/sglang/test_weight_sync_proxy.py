@@ -320,7 +320,7 @@ def test_missing_final_lane_capability_keeps_human_version_unpublished(monkeypat
         op = cmds[0]["op"]
         events.append(op)
         if op == "export":
-            assert all(c["sentinel"] and c["count"] == 2 for c in cmds)
+            assert all(c["count"] == 2 for c in cmds)
             return [dict(serialized="handle")] * 4
         if op == "status":
             return [dict(full_required=[0, 1])] * 3 + [dict(full_required=[0, 255])]
@@ -335,3 +335,76 @@ def test_missing_final_lane_capability_keeps_human_version_unpublished(monkeypat
     with pytest.raises(RuntimeError, match="ambiguous"):
         proxy.finalize("0", timeout=20)
     assert events == ["receive", "ready", "export", "update_weights_from_tensor", "status"]
+
+
+def test_pipeline_ipc_opens_exactly_the_local_stage_payload(monkeypatch, native_serializer):
+    from sglang.srt.distributed import parallel_state
+
+    from relax.backends.sglang.delta_pipeline import local_payload
+
+    tp = SimpleNamespace(world_size=3, rank_in_group=0)
+    pp = SimpleNamespace(world_size=2, rank_in_group=0)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp)
+    inner = [native_serializer.serialize((p, t), output_str=True) for p in range(2) for t in range(3)]
+    # An invalid pickle on the other stage must not even be opened.
+    inner[4] = "AAAA"
+    proxy = WeightSyncProxy(None)
+    proxy.tp_size, proxy.pp_size = tp.world_size, pp.world_size
+    routed = proxy._payload(inner)["serialized_named_tensors"]
+    for tp.rank_in_group in range(3):
+        assert local_payload(native_serializer.deserialize(routed[tp.rank_in_group])) == (0, tp.rank_in_group)
+    pp.rank_in_group, tp.rank_in_group = 1, 2
+    assert local_payload(native_serializer.deserialize(routed[2])) == (1, 2)
+    with pytest.raises(ValueError, match="topology"):
+        local_payload(native_serializer.deserialize(routed[0]))
+
+
+def test_pipeline_completion_observes_flush_and_rejects_aliases():
+    import json
+
+    import torch
+
+    from relax.backends.sglang.delta_pipeline import _install
+
+    model = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    before = model.weight.detach().view(torch.uint8).clone()
+    raw = torch.empty(0, dtype=torch.uint8)
+    status = torch.zeros(1, dtype=torch.uint8)
+    control = (json.dumps(dict(op="confirm_flush", version="2")), raw)
+    receiver = model._relax_delta_receiver = SimpleNamespace(version="1", failed=False, active=None)
+    with pytest.raises(ValueError, match="completed"):
+        _install(model, [control, ("__delta_capability__", status)])
+    assert status.item() == 0
+    receiver.version = "2"
+    with pytest.raises(ValueError):
+        _install(model, [control, ("__delta_capability__", model.weight.detach().view(torch.uint8)[0, :1])])
+    assert torch.equal(model.weight.detach().view(torch.uint8), before)
+    _install(model, [control, ("__delta_capability__", status)])
+    assert status.item() == 1
+
+
+def test_missing_ordinary_ack_keeps_ipc_storage_and_old_version(monkeypatch):
+    from relax.backends.sglang.weight_sync_proxy import _status_buffer
+
+    assert _status_buffer(2, bytes([17, 0]), "cpu").tolist() == [255, 255, 17, 0]
+    proxy = WeightSyncProxy(None)
+    proxy.children = [(None, None)]
+    proxy.version, proxy.batch, proxy.staging_budget = "2", 0, 1024
+    operations = []
+
+    def commands(cmds, *, deadline):
+        op = cmds[0]["op"]
+        operations.append(op)
+        return [dict(serialized="ipc")] if op == "export" else [dict(full_required=[255])]
+
+    monkeypatch.setattr(proxy, "_commands", commands)
+    monkeypatch.setattr(proxy, "_request", lambda action, *args, **kwargs: operations.append(action))
+    monkeypatch.setattr(proxy, "receive", lambda *args, **kwargs: None)
+    monkeypatch.setattr(proxy, "ready", lambda *args, **kwargs: None)
+    monkeypatch.setattr(proxy, "_shared_controls", lambda *args: ([{}], False, b""))
+    with pytest.raises(RuntimeError, match="install acknowledgement"):
+        proxy.consume(0, {"tensors": [{"name": "w"}]}, timeout=10)
+    with pytest.raises(RuntimeError, match="final acknowledgement"):
+        proxy.finalize("2", timeout=10)
+    assert operations == ["export", "update_weights_from_tensor", "status"] * 2

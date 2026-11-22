@@ -571,3 +571,34 @@ def test_ordered_ack_missing_after_send_does_not_replay_or_advance(monkeypatch):
         source.finalize()
     assert events == [(0, "consume"), (1, "consume")]
     assert len(source._staged) == 2
+
+
+@pytest.mark.parametrize(
+    "layout, expected", [({"pp_size": 1, "tp_size": 4}, True), ({"pp_size": 2, "tp_size": 2}, False), ({}, False)]
+)
+def test_target_lanes_only_negotiate_actual_four_way_tp(monkeypatch, layout, expected):
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync import transport
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
+    monkeypatch.setattr(ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="GPU-source"))
+    monkeypatch.setattr(transport, "GpuSyncGroup", lambda *args, **kwargs: SimpleNamespace(close=lambda: None))
+
+    def dispatch(op, **kwargs):
+        if op == "prepare":
+            return [dict(layout, uuid=f"GPU-child{rank}") for rank in kwargs["ranks"]]
+
+    engines = [
+        SimpleNamespace(_actor_id=bytes([i]), delta_weight_sync=SimpleNamespace(remote=dispatch)) for i in range(2)
+    ]
+    source = transport.DeltaTransfer(DeltaSyncConfig(stream="test", transport="nccl", target_shard_delta=True), "cpu")
+    try:
+        assert source.connect(engines, [4, 4])
+        assert source.connection.get("target_shard_p2p", False) is expected
+    finally:
+        source.close()

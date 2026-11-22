@@ -19,10 +19,12 @@ from multiprocessing.connection import Connection
 from typing import Any
 
 from relax.distributed.weight_sync.codec import WIRE_ALIGNMENT, validate_directory
+from relax.distributed.weight_sync.config import supports_delta_layout
 from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup, remaining
 
 from .delta_loader import LOADER as PROXY_MEMORY_LOADER
 from .delta_loader import MAX_DOCUMENT_BYTES, MAX_HTTP_BYTES, workspace_bytes
+from .delta_pipeline import PIPELINE_LOADER
 from .delta_shard_layout import ShardFrame, marked_ordinals
 
 
@@ -87,6 +89,7 @@ def _status_buffer(count: int, tail: bytes, device: Any) -> Any:
     import torch
 
     ack = torch.empty(count + len(tail), dtype=torch.uint8, device=device)
+    ack[:count].fill_(255)
     if tail:
         ack[count:].copy_(torch.frombuffer(bytearray(tail), dtype=torch.uint8))
     return ack
@@ -192,6 +195,7 @@ def _child(connection: Connection) -> None:
         device = torch.device("cuda", config["device"])
         properties = torch.cuda.get_device_properties(device)
         identity = dict(pid=os.getpid(), device=device.index, uuid=str(properties.uuid), rank=config["rank"])
+        identity.update({k: config[k] for k in ("tp_size", "pp_size", "tp_rank", "pp_rank")})
         identity["nccl_net"] = os.getenv("NCCL_NET")
         free, total = torch.cuda.mem_get_info(device)
         connection.send(
@@ -295,16 +299,21 @@ def _child(connection: Connection) -> None:
                         for key in range(command["round"], command["stop"]):
                             buffers[key]["exported"] = True
                     item["exported"] = True
-                    ack = _status_buffer(command["count"], command.get("directory_tail", b""), device)
+                    pipeline = config["pp_size"] > 1
+                    tail = command.get("directory_tail", b"")
+                    ack = _status_buffer(command["count"], tail + (b"\x00" if pipeline else b""), device)
+                    if pipeline:
+                        item["completion"] = ack[-1:]
                     # The prefix view also keeps the immutable directory allocation
                     # alive until the worker's original consume/release fence.
                     item["status"] = ack[: command["count"]]
-                    if command.get("sentinel"):
-                        item["status"].fill_(255)
                     result = dict(success=True, serialized=_serialize(command["control"], slab, ack))
                     del item, slab, ack
                 elif op == "status":
                     item = buffers[command["round"]]
+                    if "completion" in item:
+                        while not item["completion"].cpu().item():
+                            time.sleep(min(0.005, remaining(command["deadline"])))
                     result = dict(success=True, full_required=item["status"].cpu().tolist())
                     del item
                 elif op == "release":
@@ -376,6 +385,7 @@ class WeightSyncProxy:
         self._ordered_capable = self._record_seed = False
         self._seed_directory: dict[str, tuple] = {}
         self._target_requested = self._target_capable = self._target_failed = False
+        self.tp_size = self.pp_size = 1
         self.children: list[tuple[Any, Connection]] = []
         self.connection: dict | None = None
         self.identities: list[dict] = []
@@ -413,8 +423,9 @@ class WeightSyncProxy:
             type(args.get(key)) is not int for key in ("nnodes", "tp_size", "base_gpu_id", "gpu_id_step")
         ):
             raise ValueError("GPU proxy requires resolved integer GPU topology")
-        if args["nnodes"] != 1 or args["tp_size"] != len(ranks) or self.children:
-            raise ValueError("GPU proxy requires one fixed local process per actual TP GPU")
+        if not supports_delta_layout(args, len(ranks)):
+            raise ValueError("GPU proxy requires one local process per TP/PP coordinate")
+        self.tp_size, self.pp_size = args["tp_size"], args["pp_size"]
         if args["base_gpu_id"] < 0 or args["gpu_id_step"] <= 0:
             raise ValueError("GPU proxy requires a nonnegative base device and a positive device step")
         from multiprocessing import Pipe
@@ -426,7 +437,15 @@ class WeightSyncProxy:
         if len(workers) <= 1:
             raise ValueError("Cannot verify the existing SGLang worker process tree")
         deadline = time.monotonic() + timeout
-        for tp, rank in enumerate(ranks):
+        devices = [
+            args["base_gpu_id"] + pp * self.tp_size + tp * args["gpu_id_step"]
+            for pp in range(self.pp_size)
+            for tp in range(self.tp_size)
+        ]
+        if len(set(devices)) != len(devices):
+            raise ValueError("SGLang TP/PP coordinates overlap on a physical GPU")
+        for local, rank in enumerate(ranks):
+            pp, tp = divmod(local, self.tp_size)
             parent, child = Pipe(duplex=True)
             fd = child.fileno()
             process = subprocess.Popen(
@@ -441,7 +460,11 @@ class WeightSyncProxy:
                     rank=rank,
                     timeout_s=remaining(deadline),
                     workers=workers,
-                    device=args["base_gpu_id"] + tp * args["gpu_id_step"],
+                    device=devices[local],
+                    tp_size=self.tp_size,
+                    pp_size=self.pp_size,
+                    tp_rank=tp,
+                    pp_rank=pp,
                 )
             )
         self.identities = self._receive_replies(deadline=deadline)
@@ -485,9 +508,17 @@ class WeightSyncProxy:
         self.metrics["control_bytes"] += size
         self.metrics["http_s"] += time.monotonic() - started
 
-    @staticmethod
-    def _payload(serialized: list[str], *, flush: bool = False) -> dict:
-        return dict(serialized_named_tensors=serialized, load_format=PROXY_MEMORY_LOADER, flush_cache=flush)
+    def _payload(self, serialized: list[str], *, flush: bool = False) -> dict:
+        loader = PROXY_MEMORY_LOADER
+        if self.pp_size > 1:
+            if len(serialized) != self.pp_size * self.tp_size:
+                raise ValueError("Incomplete SGLang pipeline delivery")
+            serialized = [
+                _serialize(dict(tp=self.tp_size, rank=rank, stages=serialized[rank :: self.tp_size]))
+                for rank in range(self.tp_size)
+            ]
+            loader = PIPELINE_LOADER
+        return dict(serialized_named_tensors=serialized, load_format=loader, flush_cache=flush)
 
     def _controls(self, controls: list[dict], *, deadline: float, flush: bool = False) -> None:
         self._request(
@@ -779,7 +810,6 @@ class WeightSyncProxy:
                             stop=first + hi,
                             span=(start, length),
                             count=count,
-                            sentinel=True,
                             control=ctl,
                         )
                     )
@@ -840,7 +870,6 @@ class WeightSyncProxy:
                     round=round_id,
                     control=c,
                     count=len(directory["tensors"]),
-                    **({"sentinel": True} if lanes else {}),
                     **({"directory_tail": tail} if tail else {}),
                 )
                 for c in controls
@@ -855,15 +884,20 @@ class WeightSyncProxy:
             self.metrics.get("consume_http_s", 0.0) + self.metrics.get("http_s", 0.0) - before
         )
         ack_started = time.monotonic()
-        statuses = self._commands([dict(op="status", round=round_id)] * len(self.children), deadline=deadline)
-        if lanes:
-            marked = set(directory["target_shard"]["entries"])
-            if len(statuses) != 4 or any(
-                len(s["full_required"]) != len(directory["tensors"])
-                or any(v not in (0, 1) or (i in marked and v != 0) for i, v in enumerate(s["full_required"]))
-                for s in statuses
-            ):
-                raise RuntimeError("Missing or invalid target shard install acknowledgement")
+        statuses = self._commands(
+            [dict(op="status", round=round_id, deadline=deadline)] * len(self.children), deadline=deadline
+        )
+        marked = set(directory["target_shard"]["entries"]) if lanes else set()
+        if len(statuses) != len(self.children) or any(
+            len(s["full_required"]) != len(directory["tensors"])
+            or any(v not in (0, 1) or (i in marked and v != 0) for i, v in enumerate(s["full_required"]))
+            for s in statuses
+        ):
+            raise RuntimeError(
+                "Missing or invalid target shard install acknowledgement"
+                if lanes
+                else "Missing or invalid delta install acknowledgement"
+            )
         self._commands([dict(op="release", round=round_id, consumed=True)] * len(self.children), deadline=deadline)
         self.metrics["consume_ack_s"] = self.metrics.get("consume_ack_s", 0.0) + (time.monotonic() - ack_started)
         if lanes:
@@ -930,7 +964,6 @@ class WeightSyncProxy:
                     round=self.batch,
                     control=control,
                     count=2 if self._target_requested else 1,
-                    **({"sentinel": True} if self._target_requested else {}),
                 )
             ]
             * len(self.children),
@@ -941,7 +974,9 @@ class WeightSyncProxy:
             self._payload([reply["serialized"] for reply in replies], flush=True),
             deadline=deadline,
         )
-        statuses = self._commands([dict(op="status", round=self.batch)] * len(self.children), deadline=deadline)
+        statuses = self._commands(
+            [dict(op="status", round=self.batch, deadline=deadline)] * len(self.children), deadline=deadline
+        )
         if self._target_requested:
             if len(statuses) != 4 or any(
                 len(r["full_required"]) != 2
@@ -953,6 +988,22 @@ class WeightSyncProxy:
                 raise RuntimeError("Incomplete target shard final acknowledgement")
             capable = all(r["full_required"][0] == 0 and r["full_required"][1] in (1, 2) for r in statuses)
             self._ordered_capable = all(r["full_required"] == [0, 2] for r in statuses)
+        elif len(statuses) != len(self.children) or any(r["full_required"] not in ([0], [1]) for r in statuses):
+            raise RuntimeError("Incomplete delta final acknowledgement")
+        if self.pp_size > 1:
+            # FIFO at each scheduler makes this control run after its original
+            # finalize request (including SGLang's cache flush and TP barrier).
+            confirm = dict(op="confirm_flush", version=update)
+            replies = self._commands(
+                [dict(op="export", round=self.batch, control=confirm, count=0)] * len(self.children),
+                deadline=deadline,
+            )
+            self._request(
+                "update_weights_from_tensor", self._payload([r["serialized"] for r in replies]), deadline=deadline
+            )
+            self._commands(
+                [dict(op="status", round=self.batch, deadline=deadline)] * len(self.children), deadline=deadline
+            )
         self._commands([dict(op="release", round=self.batch, consumed=True)] * len(self.children), deadline=deadline)
         self._request("update_weight_version", dict(new_version=update, abort_all_requests=False), deadline=deadline)
         if self._target_requested:

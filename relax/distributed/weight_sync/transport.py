@@ -133,6 +133,7 @@ class DeltaTransfer:
         if (
             self.config.target_shard_delta
             and tuple(counts) == (4, 4)
+            and all(route.get("pp_size") == 1 and route.get("tp_size") == 4 for route in routes)
             and len(self.nccl_members) == 8
             and not self.tcp_members
         ):

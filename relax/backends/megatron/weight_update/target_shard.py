@@ -9,24 +9,7 @@ from collections import defaultdict
 import torch
 
 from relax.distributed.weight_sync.codec import encode
-
-
-TP_SIZE = 4
-
-
-def split_axis(name: str, shape: tuple[int, ...]) -> int | None:
-    # Names have already passed the Bridge/unique-owner proof. A FULL slot
-    # always retains ordinary HF coordinates, even among eligible neighbours.
-    if len(shape) == 2 and name.endswith(".down_proj.weight") and shape[1] > 0 and shape[1] % TP_SIZE == 0:
-        return 1
-    if (
-        len(shape) == 2
-        and name.endswith((".gate_proj.weight", ".up_proj.weight"))
-        and shape[0] > 0
-        and shape[0] % TP_SIZE == 0
-    ):
-        return 0
-    return None
+from relax.distributed.weight_sync.target_shard import TP_SIZE, split_axis
 
 
 def partition_owner_entries(slots, entries, qualified: set[int]):
