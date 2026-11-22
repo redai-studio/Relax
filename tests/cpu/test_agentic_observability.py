@@ -813,7 +813,7 @@ def test_step_close_records_groups_completed_during_barriers(tmp_path, rollout_m
         if completion_point == "pause":
             pipeline.runtime_domain.pause_generation = unblock
         elif completion_point == "tq":
-            pipeline._active_step.tq_put_tasks.append(asyncio.create_task(unblock()))
+            pipeline._active_step.tq_put_tasks[asyncio.create_task(unblock())] = []
         await pipeline._close_rollout_step(pipeline._active_step)
         assert not pipeline._active_group_tasks
         assert not pipeline._finalized_groups
@@ -823,6 +823,24 @@ def test_step_close_records_groups_completed_during_barriers(tmp_path, rollout_m
     rows = _read_stage_ends(resolve_agentic_obs_config(args).stage_path(7))
     assert [(row["sample_export_id"], row["stage"]) for row in rows] == [("42", "filter")]
     assert rows[0]["operation"] == "oversampling"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_releases_batch_cancelled_before_transfer(tmp_path, rollout_module, monkeypatch):
+    pipeline = _obs_pipeline(rollout_module, _obs_args(tmp_path))
+    pipeline._changed = asyncio.Event()
+    group = _group("cancelled", export_ids=[42])
+    discard = AsyncMock()
+    monkeypatch.setattr(rollout_module.replay_data_manager, "discard_async", discard)
+    pipeline._submit_tq_batch(pipeline._active_step, (7, (group,), True))
+    (task,) = pipeline._active_step.tq_put_tasks
+    task.cancel()
+    # Start shutdown immediately, before the cancelled task's callbacks have run.
+    await pipeline.shutdown()
+
+    assert task.cancelled()
+    discard.assert_awaited_once_with(group.samples)
+    assert not pipeline._finalized_groups
 
 
 def test_shutdown_records_all_completed_owners_before_propagating_error(tmp_path, rollout_module):

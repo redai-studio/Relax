@@ -76,7 +76,8 @@ class _StepContext:
     rollout_id: int
     final_backfill: bool
     output_groups: List[List[Sample]] = field(default_factory=list)
-    tq_put_tasks: List[asyncio.Task[None]] = field(default_factory=list)
+    # Each task owns its groups once it starts; until then the step owns them.
+    tq_put_tasks: dict[asyncio.Task[None], list[GroupExport]] = field(default_factory=dict)
     progress: Any = None
     scored: int = 0
     prepared: int = 0
@@ -506,8 +507,8 @@ class AgenticResidentPipeline:
 
         for task in tuple(context.tq_put_tasks):
             if task.done():
-                context.tq_put_tasks.remove(task)
                 task.result()
+                del context.tq_put_tasks[task]
         self.prepare_domain.collect()
 
         self._collect_finalized_groups()
@@ -556,21 +557,15 @@ class AgenticResidentPipeline:
         partition_id, groups, is_last = batch
         if self._stage_recorder.enabled:
             context.observed_group_ids.update(group.group_id for group in groups)
-        started = False
+        pending_groups = list(groups)
 
         async def transfer() -> None:
-            nonlocal started
-            started = True
+            pending_groups.clear()
             await self._transfer_and_record(context, partition_id, groups, is_last)
 
-        def transfer_done(task: asyncio.Task) -> None:
-            if task.cancelled() and not started:
-                self._finalized_groups.extend(groups)
-            self._changed.set()
-
         task = asyncio.create_task(transfer(), name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups")
-        task.add_done_callback(transfer_done)
-        context.tq_put_tasks.append(task)
+        context.tq_put_tasks[task] = pending_groups
+        task.add_done_callback(lambda _: self._changed.set())
 
     async def _transfer_and_record(
         self,
@@ -822,16 +817,16 @@ class AgenticResidentPipeline:
         # have stopped; the cancellation helper records all successful results.
         self._finalized_groups.extend(self.transfer_domain.pending_groups())
         first_error: Optional[BaseException] = None
-        context = self._active_step
-        tq_put_tasks: Tuple[asyncio.Task[None], ...] = ()
-        if context is not None:
-            tq_put_tasks = tuple(context.tq_put_tasks)
-        for task in tq_put_tasks:
+        tq_put_tasks = self._active_step.tq_put_tasks if self._active_step is not None else {}
+        tasks = tuple(tq_put_tasks)
+        for task in tasks:
             task.cancel()
-        for outcome in await asyncio.gather(*tq_put_tasks, return_exceptions=True):
+        for outcome in await asyncio.gather(*tasks, return_exceptions=True):
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 first_error = outcome
                 break
+        for task in tasks:
+            self._finalized_groups.extend(tq_put_tasks.pop(task, []))
 
         self.transfer_domain.clear()
         for cleanup in (
