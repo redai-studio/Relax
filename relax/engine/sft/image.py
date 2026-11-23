@@ -29,7 +29,7 @@ def image_tier_budget(config: dict[str, Any], index: int) -> int | None:
     return int(tiers[torch.randint(len(tiers), (1,), generator=stream).item()])
 
 
-def load_sft_image(path: Path, max_pixels: int, *, patch_size: int, fixed_pixels: int | None = None) -> Any:
+def load_sft_image(path: Path, max_pixels: int, *, patch_size: int, fixed_pixels: int | None) -> Any:
     """Load an RGB image, resize to the pixel budget and center-crop to
     ``patch_size`` multiples."""
     from PIL import Image
