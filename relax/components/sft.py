@@ -137,8 +137,11 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
         oversize_strategy == "keep"
         and oversize_custom_path == "relax.models.qwen3_5.recipe.keep_within_tp4_dispatch_limit"
     ):
-        # Keep the checkpoint signature on config; enforce the recipe's dispatch limit in the dataset.
-        oversize_strategy = "custom"
+        from relax.models.qwen3_5.recipe import enabled as qwen35_recipe_enabled
+
+        if qwen35_recipe_enabled(config):
+            # Keep the checkpoint signature on config; enforce the recipe's dispatch limit in the dataset.
+            oversize_strategy = "custom"
     if oversize_strategy == "custom":
         if not oversize_custom_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
