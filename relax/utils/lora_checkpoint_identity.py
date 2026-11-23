@@ -27,29 +27,43 @@ def hf_checkpoint_identity(path: str | Path, *, version: int = 1) -> dict[str, s
             return None
         return hashlib.sha256(candidate.read_bytes()).hexdigest()
 
-    index_path = next(
-        (
-            candidate
-            for candidate in (
-                root / "model.safetensors.index.json",
-                root / "pytorch_model.bin.index.json",
-            )
-            if candidate.is_file()
-        ),
-        None,
-    )
+    safe_index = root / "model.safetensors.index.json"
+    bin_index = root / "pytorch_model.bin.index.json"
+    index_path = safe_index if safe_index.is_file() else None
+    if version == 1 and index_path is None and bin_index.is_file():
+        index_path = bin_index
+    index_bytes = index_path.read_bytes() if index_path else None
     identity = {
         "config_sha256": digest("config.json"),
-        "index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest() if index_path else None,
+        "index_sha256": hashlib.sha256(index_bytes).hexdigest() if index_bytes is not None else None,
     }
     shard_names: list[str] = []
-    if index_path is not None:
-        index = json.loads(index_path.read_text())
-        shard_names = sorted(set(index.get("weight_map", {}).values()))
-    elif root.is_dir():
+    if index_bytes is not None:
+        index = json.loads(index_bytes)
+        if version == 1:
+            shard_names = sorted(set(index.get("weight_map", {}).values()))
+        else:
+            weights = index.get("weight_map") if isinstance(index, dict) else None
+            if (
+                not isinstance(weights, dict)
+                or not weights
+                or not all(
+                    isinstance(name, str) and Path(name).name == name and name.endswith(".safetensors")
+                    for name in weights.values()
+                )
+            ):
+                raise ValueError(f"Invalid Safetensors weight map in {index_path}")
+            shard_names = sorted(set(weights.values()))
+    elif version == 1 and root.is_dir():
         shard_names = sorted(
             candidate.name for pattern in ("*.safetensors", "pytorch_model*.bin") for candidate in root.glob(pattern)
         )
+    elif version == 2:
+        # Bridge scans every Safetensors file without an index; offline export
+        # reads model.safetensors. Only their common, unambiguous case is safe.
+        shard_names = sorted(candidate.name for candidate in root.glob("*.safetensors"))
+        if shard_names and shard_names != ["model.safetensors"]:
+            raise ValueError(f"An unindexed HF base must contain a single model.safetensors: {root}")
 
     if not shard_names:
         identity["path"] = str(root.resolve())
@@ -85,7 +99,11 @@ def has_mutable_router_bias(args: dict[str, Any]) -> bool:
 
 
 def verified_lora_base_identity(
-    saved: dict[str, Any], marker: dict[str, Any], reference: Path | None = None
+    saved: dict[str, Any],
+    marker: dict[str, Any],
+    reference: Path | None = None,
+    *,
+    confirmed_resume_base: str | None = None,
 ) -> dict[str, str | None]:
     """Read new provenance and accept v1 only when its saved source is
     unambiguous."""
@@ -116,16 +134,26 @@ def verified_lora_base_identity(
                 or any(directory.glob("mp_rank_*/model_optim_rng.pt"))
             )
 
+        # Old launchers used their future output directory as --load. That
+        # path alone cannot distinguish first-run HF fallback from a DCP.
+        confirmed_output_resume = bool(
+            confirmed_resume_base
+            and saved.get("save")
+            and saved.get("load")
+            and normalize_model_path(saved["load"]) == normalize_model_path(saved["save"])
+            and not native_evidence(Path(confirmed_resume_base))
+        )
         if (
             not hf
             or "load" not in saved
             or "ref_load" not in saved
             or saved.get("ckpt_step")
-            or not identifies_hf(saved.get("load"))
+            or (not identifies_hf(saved.get("load")) and not confirmed_output_resume)
             or not identifies_hf(saved.get("ref_load"))
             or (saved.get("save") and identifies_hf(saved["save"]))
             or (
                 saved.get("load")
+                and not confirmed_output_resume
                 and not is_model_source_alias(args, saved["load"])
                 and not (Path(hf) / "config.json").is_file()
             )

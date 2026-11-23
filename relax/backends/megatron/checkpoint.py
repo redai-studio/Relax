@@ -559,7 +559,8 @@ def _actor_hf_identity(path: str, version: int) -> dict | None:
             return None
         try:
             identity = hf_checkpoint_identity(path, version=version)
-        except (OSError, ValueError) as error:
+        except Exception as error:
+            # Every leader must reach the identity gather, including on malformed input.
             logger.warning("Cannot identify the HF base at %s: %s", path, error)
             return None
         return identity if identity.get("shard_count") else None
@@ -585,7 +586,11 @@ def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> str:
     # On resume --load names the native checkpoint. Either HF argument may
     # supply the original weights, including a relocated identical base.
     names = _global_trainable_lora_parameter_names(model)
-    for requested in (args.hf_checkpoint, getattr(args, "ref_load", None)):
+    confirmed = os.environ.get("RELAX_LORA_V1_RESUME_BASE") if metadata["format_version"] == 1 else None
+    if metadata["format_version"] == 1:
+        _collective_checkpoint_probe(lambda: bool(confirmed))
+    candidates = (confirmed,) if confirmed else (args.hf_checkpoint, getattr(args, "ref_load", None))
+    for requested in candidates:
         path = _select_hf_load_source(args, requested) if requested else ""
         if _actor_hf_identity(path, metadata["format_version"]) == metadata["base_hf_checkpoint"]:
             break
@@ -732,8 +737,19 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             saved = common.get("args")
             marker = _metadata_value(saved, _LORA_CHECKPOINT_METADATA_ATTR)
             if marker is not None:
-                verified_lora_base_identity(saved if isinstance(saved, dict) else vars(saved), marker)
-            return marker, _metadata_value(saved, _LORA_FROZEN_BASE)
+                if getattr(args, "non_persistent_ckpt_type", None):
+                    raise ValueError("Disable non-persistent checkpoint selection to resume a LoRA-only checkpoint")
+                verified_lora_base_identity(
+                    saved if isinstance(saved, dict) else vars(saved),
+                    marker,
+                    confirmed_resume_base=os.environ.get("RELAX_LORA_V1_RESUME_BASE"),
+                )
+            # Native load can prefer an equally recent local/global non-persistent
+            # checkpoint and returns only (iteration, FLOPs), not the selected source.
+            frozen_base = (
+                None if getattr(args, "non_persistent_ckpt_type", None) else _metadata_value(saved, _LORA_FROZEN_BASE)
+            )
+            return marker, frozen_base
 
         lora_metadata, frozen_base = _collective_checkpoint_probe(probe_metadata)
         try:
@@ -900,7 +916,7 @@ def _select_hf_load_source(args: Namespace, load_path: str | None) -> str:
 
 def _record_lora_base(args, model, optimizer, identity: dict | None, *, source_path: str | None = None) -> None:
     # Reference and teacher loads temporarily reuse the actor with optimizer=None.
-    if optimizer is None or not getattr(args, "lora_rank", 0):
+    if optimizer is None or not getattr(args, "lora_rank", 0) or not getattr(args, "save", None):
         return
     if (
         (identity or source_path)
@@ -978,7 +994,11 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
 
     import torch.distributed as dist
 
-    from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, write_hf_peft_adapter
+    from relax.utils.megatron_peft_utils import (
+        convert_megatron_to_hf_target_modules,
+        exported_visual_qkv_layout,
+        write_hf_peft_adapter,
+    )
 
     gloo = get_gloo_group()
     is_dst = dist.get_rank() == 0
@@ -1021,6 +1041,7 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
             # args.lora_target_modules holds canonical Megatron names; the on-disk HF-PEFT
             # adapter_config.json must carry HF-style names so standard PEFT loaders can match
             # them against the HF module tree.
+            vision_layout = exported_visual_qkv_layout(merged, bridge)
             write_hf_peft_adapter(
                 merged,
                 adapter_dir,
@@ -1042,12 +1063,8 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
                 "lora_merge_mode": args.lora_merge_mode,
                 "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
             }
-            if any(".attn.qkv.lora_B." in name and ".visual.blocks." in name for name in merged):
-                from megatron.bridge.models.conversion.param_mapping import ConcatenatedQKVMapping
-
-                metadata["vision_qkv_b_layout"] = (
-                    "hf" if hasattr(ConcatenatedQKVMapping, "for_lora_output") else "megatron"
-                )
+            if vision_layout is not None:
+                metadata["vision_qkv_b_layout"] = vision_layout
             with open(adapter_dir / "relax_lora_meta.json", "w") as f:
                 json.dump(metadata, f)
 

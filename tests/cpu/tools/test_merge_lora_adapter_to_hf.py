@@ -160,8 +160,8 @@ class TestReadAdapterScaling:
     )
     def test_scaling_rule(self, tmp_path, config, expected):
         (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-        parsed, is_relax, layout = merge_lora._read_adapter_config(tmp_path)
-        assert not is_relax and layout == "hf"
+        parsed, is_relax, _ = merge_lora._read_adapter_config(tmp_path)
+        assert not is_relax
         assert merge_lora._module_scaling(parsed, "proj", parsed["r"]) == pytest.approx(expected)
 
     def test_missing_rank_or_alpha_is_a_hard_error(self, tmp_path):
@@ -241,6 +241,7 @@ def test_hf_merge_rejects_rank_mismatch_and_duplicate_factors() -> None:
     ("sidecar", "explicit", "expected"),
     [
         (None, None, "hf"),
+        (None, "megatron", "megatron"),
         ({}, None, "unmarked"),
         ({}, "megatron", "megatron"),
         ({}, "hf", "hf"),

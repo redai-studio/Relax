@@ -212,6 +212,9 @@ def _check_local_hf_copies(rank: int, directory: str) -> None:
             (local / "model.safetensors").write_bytes(b"changed")
         assert checkpoint._actor_hf_identity(str(local), 2) is None
         assert checkpoint._actor_hf_identity(str(root / "0") if rank == 0 else "", 2) is None
+        if rank == 1:
+            (local / "model.safetensors.index.json").write_text("[]")
+        assert checkpoint._actor_hf_identity(str(local), 2) is None
     finally:
         torch.distributed.destroy_process_group()
 
@@ -227,10 +230,12 @@ def test_distributed_lora_identity_agrees_on_localized_weights(tmp_path):
 
 @pytest.mark.parametrize("use_ref", [False, True])
 def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, tmp_path, use_ref):
-    from argparse import Namespace
-
     from megatron.bridge import AutoBridge
+    from megatron.core import dist_checkpointing
+    from megatron.training.checkpointing import _load_base_checkpoint, generate_state_dict
     from safetensors.torch import load_file, save_file
+
+    from tests.cpu.backends.megatron.test_checkpoint_chained_optimizer import _CPUSaveStrategy
 
     args = _runtime_args()
     a, b = tmp_path / "a", tmp_path / "b"
@@ -250,6 +255,15 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     monkeypatch.setattr(checkpoint.megatron_bridge_utils, "patch_megatron_model", lambda _: nullcontext())
     for name in ("use_critic_lm_head_for_hf_load", "use_sequence_classification_lm_head_for_hf_load"):
         monkeypatch.setattr(checkpoint, name, lambda _: nullcontext())
+    with monkeypatch.context() as patch:
+
+        def unexpected_hash(*_args):
+            pytest.fail("A run without a native save directory hashed the HF weights")
+
+        patch.setattr(checkpoint, "_actor_hf_identity", unexpected_hash)
+        checkpoint._load_checkpoint_hf(model, object(), args, None if use_ref else str(b))
+    root = tmp_path / "checkpoint"
+    args.save = str(root)
     checkpoint._load_checkpoint_hf(model, object(), args, None if use_ref else str(b))
     torch.testing.assert_close(model[0].base.weight, torch.full((2, 2), 2.0))
     expected_identity = checkpoint.hf_checkpoint_identity(b, version=2)
@@ -259,18 +273,26 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     assert args.relax_lora_frozen_hf_base == expected_identity
     model[0].load_state_dict(actor_state)
 
-    # Save the native common arguments and exercise the full-DCP loader
-    # followed by a lightweight save, without bringing up distributed ranks.
-    saved = {}
-    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
-    monkeypatch.setattr(checkpoint, "_save_checkpoint_megatron", lambda *a, **kw: saved.update(vars(args)))
-    checkpoint.save_checkpoint(1, model, None, None)
-    root = tmp_path / "checkpoint"
-    (root / "iter_0000001").mkdir(parents=True)
-    (root / "latest_checkpointed_iteration.txt").write_text("1")
+    args.no_save_optim = args.no_save_rng = args.no_load_rng = True
     args.load, args.no_load_optim, args.loss_type = str(root), True, "sft"
+
+    def save_common(iteration, *_args, **_kwargs):
+        directory = Path(args.save) / f"iter_{iteration:07d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        # Exercise Megatron's training args serialization and torch_dist common
+        # object, replacing only the distributed model and CUDA save finalizer.
+        state = generate_state_dict(args, [], None, None, None, iteration=iteration)
+        torch.distributed.init_process_group("gloo", init_method=(directory / "store").as_uri(), rank=0, world_size=1)
+        try:
+            dist_checkpointing.save(state, str(directory), sharded_strategy=_CPUSaveStrategy())
+        finally:
+            torch.distributed.destroy_process_group()
+        (directory.parent / "latest_checkpointed_iteration.txt").write_text(str(iteration))
+
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    monkeypatch.setattr(checkpoint, "_save_checkpoint_megatron", save_common)
+    checkpoint.save_checkpoint(1, model, None, None)
     args.relax_lora_frozen_hf_base = None
-    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *a: {"args": Namespace(**saved)})
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: (1, 0))
     checkpoint.load_checkpoint(model, object(), None, {}, False)
     assert args.relax_lora_frozen_hf_base == expected_identity
@@ -282,21 +304,85 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     with pytest.raises(RuntimeError, match="base HF identity mismatch"):
         checkpoint._validate_lora_checkpoint_metadata(args, model, marker)
 
+    # A second DCP at the same iteration wins the native selection. The
+    # (iteration, FLOPs) returned to Relax cannot distinguish these sources.
+    alternate = tmp_path / "non_persistent"
+    args.save = str(alternate)
+    checkpoint._load_checkpoint_hf(model, object(), args, str(a))
+    checkpoint.save_checkpoint(1, model, None, None)
+    args.save = str(root)
+    args.non_persistent_ckpt_type, args.non_persistent_global_ckpt_dir = "global", str(alternate)
+
+    def load_native_common(**_kwargs):
+        state, path, _, _ = _load_base_checkpoint(str(root), args, rank0=True)
+        assert Path(path) == alternate / "iter_0000001"
+        assert state["args"].relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
+        return state["iteration"], 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint, "_load_checkpoint_megatron", load_native_common)
+        checkpoint.load_checkpoint(model, object(), None, {}, False)
+    with pytest.raises(RuntimeError, match="verified frozen HF base"):
+        checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
+    args.non_persistent_ckpt_type = None
+
     args.moe_router_enable_expert_bias = True
     args.moe_router_bias_update_rate = 1e-3
     checkpoint.save_checkpoint(2, model, None, None)
-    assert saved["relax_lora_frozen_hf_base"] is None
+    assert dist_checkpointing.load_common_state_dict(root / "iter_0000002")["args"].relax_lora_frozen_hf_base is None
     with pytest.raises(RuntimeError, match="MoE expert bias"):
         checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
     args.moe_router_bias_update_rate = 0
 
     # An old full DCP still loads and can be saved in full. Discarding its
     # base would lose the only authoritative copy of those weights.
-    saved.pop("relax_lora_frozen_hf_base")
+    del args.relax_lora_frozen_hf_base
+    checkpoint.save_checkpoint(3, model, None, None)
     checkpoint.load_checkpoint(model, object(), None, {}, False)
-    checkpoint.save_checkpoint(2, model, None, None)
+    checkpoint.save_checkpoint(4, model, None, None)
     with pytest.raises(RuntimeError, match="verified frozen HF base"):
         checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
+
+
+def test_v1_first_run_fallback_requires_confirmed_original_base(monkeypatch, tmp_path):
+    from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+    from safetensors.torch import save_file
+
+    from scripts.tools.convert_checkpoint_lora import validate_lora_base
+
+    base, other, native = (tmp_path / name for name in ("original", "other", "native"))
+    for directory, size in ((base, 2), (other, 4)):
+        directory.mkdir()
+        (directory / "config.json").write_text("{}")
+        save_file({"weight": torch.zeros(size)}, directory / "model.safetensors")
+    iteration = native / "iter_0000001"
+    iteration.mkdir(parents=True)
+    (native / "latest_checkpointed_iteration.txt").write_text("1")
+    save_config(CheckpointingConfig("torch_dist"), str(iteration))
+    args = _runtime_args()
+    args.hf_checkpoint = args.ref_load = str(base)
+    args.load = args.save = str(native)
+    args.no_load_optim, args.loss_type, args.dist_ckpt_strictness = True, "sft", "raise_all"
+    model = [_AdapterModel()]
+    names = checkpoint._global_trainable_lora_parameter_names(model)
+    marker = checkpoint._lora_checkpoint_metadata(args, names, checkpoint.hf_checkpoint_identity(base), version=1)
+    saved = dict(vars(args), relax_lora_checkpoint_metadata=marker)
+    torch.save({"args": saved}, iteration / "common.pt")
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    monkeypatch.delenv("RELAX_LORA_V1_RESUME_BASE", raising=False)
+    with pytest.raises(RuntimeError, match="legacy v1"):
+        checkpoint.load_checkpoint(model, object(), None, {}, False)
+    monkeypatch.setenv("RELAX_LORA_V1_RESUME_BASE", str(other))
+    with pytest.raises(RuntimeError, match="base HF identity mismatch"):
+        checkpoint.load_checkpoint(model, object(), None, {}, False)
+    monkeypatch.setenv("RELAX_LORA_V1_RESUME_BASE", str(base))
+    with pytest.raises(ValueError, match="legacy v1"):
+        validate_lora_base(saved, base)
+    loaded = []
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", lambda **kw: loaded.append(kw["load_path"]))
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: (1, 0))
+    assert checkpoint.load_checkpoint(model, object(), None, {}, False) == (1, 0)
+    assert loaded == [str(base)]
 
 
 def test_hf_checkpoint_identity_detects_shard_replacement(tmp_path):

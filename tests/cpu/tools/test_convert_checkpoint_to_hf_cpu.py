@@ -517,6 +517,11 @@ def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> N
     extra_stat = (trained / "pytorch_model-extra.bin").stat()
     os.utime(other / "pytorch_model-extra.bin", ns=(extra_stat.st_atime_ns, extra_stat.st_mtime_ns))
     assert hf_checkpoint_identity(other) == hf_checkpoint_identity(trained)
+    # The HF reader loads the standalone Safetensors even alongside an
+    # alternate BIN index with identical payloads in both candidate bases.
+    bin_index = json.dumps({"weight_map": {"alternate": "pytorch_model-extra.bin"}})
+    for directory in (other, trained):
+        (directory / "pytorch_model.bin.index.json").write_text(bin_index)
     marker.update(format_version=2, base_hf_checkpoint=hf_checkpoint_identity(trained, version=2))
     os.utime(trained / "model.safetensors", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 10**9))
     torch.save({"args": args}, checkpoint / "common.pt")

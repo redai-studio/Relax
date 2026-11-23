@@ -230,7 +230,7 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 当前格式在初始化和校验基座时使用 SHA-256 核对权重分片内容，允许重新下载的文件具有不同时间戳。每次校验时，每台训练节点读取一次本地基座。启用 MoE 路由器 expert bias 更新时请使用完整 DCP，因为训练会直接更新基座的缓冲区。
 
-旧版 v1 轻量 checkpoint 在保存的来源参数能唯一确定同一基座时可以续训或导出。来源不明确时，请使用完整 DCP 恢复。即使基座来源未知，完整 DCP 仍可继续完整保存，也可用其自带的权重转换。
+旧版 v1 轻量 checkpoint 在保存的来源参数能唯一确定同一基座时可以续训或导出。如果首次启动的 `--load` 和 `--save` 指向同一个空输出目录，且已确认训练从哪份 HF 权重初始化，可在每个训练 worker 上将 `RELAX_LORA_V1_RESUME_BASE` 设为该 HF 目录。续训会校验 v1 指纹，从该目录加载基座。续训后保存一份新的原生 checkpoint 即可离线导出。其他来源不明的 v1 产物需要完整 DCP。启用非持久 checkpoint 选择时，Megatron 可能在同一步选择另一份权重，此时从完整 DCP 续训仅支持完整保存。恢复轻量 DCP 时请关闭非持久选择，直接指定对应的持久 checkpoint。即使基座来源未知，完整 DCP 仍可继续完整保存，也可用其自带的权重转换。
 
 ::: tip
 轻量 checkpoint 是分片的 Megatron 续训产物，不是可移植的 HF-PEFT adapter。启用 LoRA 时，`--save-hf` 还会在 HF 导出目录内写入 `lora_adapter/`，其中包含 `adapter_config.json`、`adapter_model.safetensors` 和 `relax_lora_meta.json`。Megatron 训练加载器不能通过 `--load` 加载这个 adapter 目录；续训应使用原生 checkpoint。如果只保留了这个 adapter，可按下文先与原始底模合并，再用合并后的 HF 模型初始化新训练，但无法恢复原来的训练状态。

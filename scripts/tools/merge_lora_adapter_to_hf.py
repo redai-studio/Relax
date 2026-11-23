@@ -173,13 +173,12 @@ def _read_adapter_config(adapter_dir: Path) -> tuple[dict[str, Any], bool, str |
 
     meta_file = adapter_dir / "relax_lora_meta.json"
     relax_export = False
-    vision_layout = "hf"
+    vision_layout = None
     if meta_file.is_file():
         with open(meta_file) as f:
             meta = json.load(f)
         relax_export = meta.get("lora_rank") == rank and meta.get("lora_alpha") == alpha
-        if relax_export:
-            vision_layout = meta.get("vision_qkv_b_layout")
+        vision_layout = meta.get("vision_qkv_b_layout")
         mode = "adapter" if meta.get("lora_adapter_mode") else "merge" if meta.get("lora_merge_mode") else "standard"
         print(
             f"[merge-lora] relax sidecar: trained mode={mode}, "
@@ -318,25 +317,30 @@ def _check_delta_shape(key: str, base: tuple[int, ...], delta: tuple[int, ...]) 
 
 
 def _vision_qkv_reorders(
-    targets_by_key: dict[str, str], base_config: dict[str, Any], layout: str | None, legacy_layout: str | None
+    targets_by_key: dict[str, str],
+    base_config: dict[str, Any],
+    layout: str | None,
+    legacy_layout: str | None,
+    *,
+    relax_export: bool,
 ) -> dict[str, tuple[int, int]]:
     """Identify packed visual B factors that need conversion from Megatron head
     order."""
 
-    keys = [
-        key for key in targets_by_key.values() if re.search(r"(?:^|\.)visual\.blocks\.\d+\.attn\.qkv\.weight$", key)
-    ]
+    from relax.utils.megatron_peft_utils import is_visual_qkv_weight
+
+    keys = [key for key in targets_by_key.values() if is_visual_qkv_weight(key)]
     if not keys:
         return {}
-    if layout is None and legacy_layout is None:
+    if relax_export and layout is None and legacy_layout is None:
         raise ValueError(
             "Unmarked Relax vision QKV adapter: select --legacy-vision-qkv-layout megatron "
             "for the historical Relax export, or hf for a verified HF-ordered adapter."
         )
     if layout is not None and legacy_layout is not None and layout != legacy_layout:
         raise ValueError("Requested legacy vision QKV layout conflicts with the adapter metadata")
-    selected = layout or legacy_layout
-    if selected == "hf":
+    selected = legacy_layout if legacy_layout is not None else layout
+    if selected is None or selected == "hf":
         return {}
     if selected != "megatron":
         raise ValueError(f"Unsupported vision QKV B layout: {selected!r}")
@@ -452,7 +456,7 @@ def main() -> None:
         pairs = _pair_adapter_keys(adapter.keys())
         targets_by_key = _resolve_base_keys(pairs, set(weight_map))
         vision_reorders = _vision_qkv_reorders(
-            targets_by_key, base_config, vision_layout, args.legacy_vision_qkv_layout
+            targets_by_key, base_config, vision_layout, args.legacy_vision_qkv_layout, relax_export=relax_export
         )
         scaling = {}
         delta_shapes = {}
