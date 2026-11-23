@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -96,6 +98,22 @@ def test_delta_receiver_matches_independent_full_loader_with_true_nan_bits(dtype
     frame(receiver, torch.empty(0, dtype=dtype), positions=torch.empty(0, dtype=torch.int32))
     control(receiver, op="finalize", frames=1)
     assert torch.equal(receiver.weight.view(words), reference.weight.view(words))
+
+
+def test_publication_finishes_before_sglang_publishes_rank_context(monkeypatch):
+    class UninitializedParallel:
+        @property
+        def tp_rank(self):
+            raise RuntimeError("parallel name 'tp_rank' has not been written in this process")
+
+    model = TinyModel(torch.bfloat16)
+    weights = torch.arange(4, dtype=torch.bfloat16)
+    begin(model, "0", seed=True)
+    frame(model, weights)
+    monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", SimpleNamespace(get_parallel=UninitializedParallel))
+    control(model, op="finalize", frames=1)
+    assert model._relax_delta_receiver.version == "0"
+    assert torch.equal(model.weight, weights.view(2, 2).T)
 
 
 def test_full_seed_marks_post_copy_numeric_conversion_for_full_fallback():
