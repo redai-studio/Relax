@@ -117,17 +117,8 @@ distributed:
     sequence_parallel: []
 
   # --- Context Parallel Plan (Ulysses CP) ---
-  # Patches full-attention and GDN (linear-attention) forwards with Ulysses
-  # all-to-all wrappers, and the causal-LM loss with CP-aware cross-entropy.
-  # Full-attention target: the GENERIC sdpa_attention_forward (upstream review
-  # fix; the old modeling_qwen4_exp.eager_attention_forward target was inert
-  # under _attn_implementation="sdpa" — text attn dispatches via
-  # ALL_ATTENTION_FUNCTIONS["sdpa"], which holds the generic function). The CP
-  # patch also rewrites the registry mapping, so every module using "sdpa" gets
-  # the Ulysses wrapper. The vision tower is isolated from this wrapper by the
-  # actor's "sdpa_vision" registration (a passthrough bound to the ORIGINAL
-  # sdpa_attention_forward before patching) — vision must NOT be Ulysses-sharded
-  # (CP happens post-fusion, inside qwen4_exp_model_forward).
+  # QSA context parallelism wraps Qwen4ExpTextAttention.forward.
+  # The vision tower uses the separate sdpa_vision entry backed by stock SDPA.
   cp_plan:
     ulysses_function_patches:
       - target_functions:

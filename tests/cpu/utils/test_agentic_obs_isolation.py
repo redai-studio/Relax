@@ -55,6 +55,7 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
         "_merge_export_metadata": lambda target, patch: target.update(patch),
         "_messages_tools_template_state_hash": lambda *args: next(hashes),
         "normalize_template_kwargs": lambda value: value,
+        "replay_manager": NS(replay_data_manager=NS(uses_references=False)),
     }
     exec("from __future__ import annotations\n" + ast.unparse(cls), scope)
     shard = scope["AgenticSessionShard"]()

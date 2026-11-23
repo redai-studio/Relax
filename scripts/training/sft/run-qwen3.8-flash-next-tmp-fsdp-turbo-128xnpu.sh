@@ -117,7 +117,6 @@ SFT_ARGS=(
    --global-batch-size 32
    --sft-invalid-multimodal-strategy skip
    --rollout-max-context-len 32768
-   --micro-batch-size 1
    --calculate-per-token-loss
    --seq-length 32768
    --use-dynamic-batch-size

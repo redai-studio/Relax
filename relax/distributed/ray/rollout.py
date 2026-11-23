@@ -475,6 +475,10 @@ class EngineGroup:
                 name, sep, value = spec.strip().partition("=")
                 if name:
                     env_vars[name] = value
+            from relax.distributed.replay_manager import reference_environment
+
+            env_vars.update(reference_environment())
+
             effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
             effective_load_format = self.sglang_overrides.get(
                 "load_format", getattr(self.args, "sglang_load_format", "auto")
@@ -1435,6 +1439,7 @@ class RolloutManager(ReloadableMixin):
             self._dynamic_global_batch_size = len(
                 {sample.index for sample_group in output.samples for sample in sample_group}
             )
+        return output.partition_complete
 
     async def eval(self, rollout_id):
         self._begin_generation()
@@ -1801,8 +1806,7 @@ class RolloutManager(ReloadableMixin):
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
-    # ===================== Elastic Rollout Scale-Out Methods =====================
-
+    # ===================== Elastic Rollout Scale-Out Methods ==============
     def _gc_terminal_requests(self) -> None:
         """Garbage-collect terminal scale-out/in requests to prevent unbounded
         memory growth.
@@ -2699,8 +2703,7 @@ class RolloutManager(ReloadableMixin):
             if all_actors:
                 await self._rollback_engines(all_actors)
 
-    # ===================== Scale-Out Helper Methods =====================
-
+    # ===================== Scale-Out Helper Methods ==============
     async def _finalize_engine_group_registration(
         self,
         request: ScaleOutRequest,
@@ -4644,8 +4647,7 @@ class RolloutManager(ReloadableMixin):
 
         return [r.to_dict() for r in requests]
 
-    # ===================== Eviction Monitoring =====================
-
+    # ===================== Eviction Monitoring ==============
     def _start_eviction_monitor(self):
         """Start a background thread that periodically polls engines for
         SIGTERM eviction."""
