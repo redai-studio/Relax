@@ -442,7 +442,7 @@ def test_trainer_init_closes_prefetch_when_tracker_setup_fails(tmp_path, monkeyp
     assert len(closed) == 1
 
 
-def test_online_only_custom_adapter_starts_without_tracker_hooks_and_cleans_stale_stats(
+def test_online_only_custom_adapter_starts_without_tracker_hooks_and_preserves_existing_stats(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     metadata = tmp_path / "train.json"
@@ -512,10 +512,11 @@ def test_online_only_custom_adapter_starts_without_tracker_hooks_and_cleans_stal
     with pytest.raises(ValueError, match="baseline condition tracking"):
         FSDPSFTTrainer(make_actor(OnlineOnlyAdapter(), {"baseline_stats_dir": str(stats_dir)}))
 
-    # 复用已有统计目录时，启动新训练会清理旧 rank 残留日志并分配新的 run_id。
+    # 复用包含基准产物的目录时，拒绝启动并保留原有文件。
     stats_dir.mkdir(parents=True, exist_ok=True)
     stale_rank = stats_dir / "rank_2_steps.jsonl"
-    stale_rank.write_text('{"rank": 2, "world_size": 4, "step": 0}\n', encoding="utf-8")
+    stale_content = '{"rank": 2, "world_size": 4, "step": 0}\n'
+    stale_rank.write_text(stale_content, encoding="utf-8")
 
     class TrackableAdapter(OnlineOnlyAdapter):
         def bind_tracker(self, model, tracker) -> None:
@@ -527,7 +528,110 @@ def test_online_only_custom_adapter_starts_without_tracker_hooks_and_cleans_stal
 
             return SENSENOVA_TRACKER_SCHEMA
 
-    tracked_trainer = FSDPSFTTrainer(make_actor(TrackableAdapter(), {"baseline_stats_dir": str(stats_dir)}))
-    assert not stale_rank.exists()
+    with pytest.raises(FileExistsError, match="fresh baseline_stats_dir"):
+        FSDPSFTTrainer(make_actor(TrackableAdapter(), {"baseline_stats_dir": str(stats_dir)}))
+    assert stale_rank.exists()
+    assert stale_rank.read_text(encoding="utf-8") == stale_content
+
+    # 使用全新统计目录时正常启动，并记录 run_id 与 expected_step_range。
+    fresh_stats_dir = tmp_path / "fresh_stats"
+    tracked_trainer = FSDPSFTTrainer(make_actor(TrackableAdapter(), {"baseline_stats_dir": str(fresh_stats_dir)}))
     assert tracked_trainer.tracker is not None and tracked_trainer.tracker.run_id
+    assert tracked_trainer.tracker.expected_step_range == (0, 1)
     tracked_trainer.close()
+
+
+def test_aborted_training_writes_incomplete_tracker_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = tmp_path / "train.json"
+    metadata.write_text(json.dumps([{"prompt": "edit", "image": "t.png", "edit_image": ["r.png"]}]))
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr("relax.backends.fsdp.actor._collect_weight_sync_errors", lambda err: [err] if err else [])
+    monkeypatch.setattr("relax.backends.fsdp.actor._collect_rank_objects", lambda value: [value])
+
+    class TrackableAdapter:
+        family = "custom_online"
+        supported_tasks = ("i2i",)
+        lora_target_modules = ("linear",)
+
+        def on_device_ready(self, model, device) -> None:
+            return None
+
+        def prepare_sample(self, row, root, config, index=0):
+            return row
+
+        def bind_tracker(self, model, tracker) -> None:
+            model.tracker = tracker
+
+        @staticmethod
+        def tracker_schema():
+            from relax.engine.sft.condition_tracker import SENSENOVA_TRACKER_SCHEMA
+
+            return SENSENOVA_TRACKER_SCHEMA
+
+    stats_dir = tmp_path / "aborted_stats"
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    optimizer.defaults.update({"betas": (0.9, 0.999), "eps": 1e-8, "foreach": False})
+    args = Namespace(
+        global_batch_size=1,
+        num_rollout=2,
+        save_interval=0,
+        seed=42,
+        lr_warmup_iters=0,
+        clip_grad=1.0,
+        model_adapter_path="test.TrackableAdapter",
+        model_path=str(tmp_path),
+        prompt_data=str(metadata),
+        load=None,
+        save=None,
+        fsdp_param_dtype="bf16",
+        fsdp_reduce_dtype="fp32",
+        fsdp_master_dtype="fp32",
+        use_pytorch_profiler=False,
+        record_memory_history=False,
+        i2i_sft_config={
+            "data_root": str(tmp_path),
+            "dataset_size": 1,
+            "conditioning_images": 1,
+            "max_pixels": 1024 * 1024,
+            "condition_cache_enabled": False,
+            "baseline_stats_dir": str(stats_dir),
+        },
+    )
+    actor = SimpleNamespace(
+        args=args,
+        adapter=TrackableAdapter(),
+        model=model,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        _trainable_mode="lora",
+        _device_group=lambda: None,
+        _lora_contract=lambda: {},
+    )
+    trainer = FSDPSFTTrainer(actor)
+    assert trainer.tracker is not None
+    trainer.tracker.begin_step(0, torch.device("cpu"))
+    trainer.tracker.begin_micro(
+        0,
+        0,
+        trainer.dataset.rows[0],
+        trainer.dataset.config,
+        "lora",
+        64,
+        64,
+        is_padding=False,
+    )
+    trainer.tracker.end_step(0, 0.001, 0.01)
+
+    def fail_step(step: int) -> None:
+        raise RuntimeError("step 1 read failure")
+
+    monkeypatch.setattr(trainer, "_train_step", fail_step)
+    with pytest.raises(RuntimeError, match="step 1 read failure"):
+        trainer.train(1)
+
+    summary = json.loads((stats_dir / "rank_0_summary.json").read_text(encoding="utf-8"))
+    assert summary["complete"] is False
+    assert summary["terminated_early"] is True
+    assert summary["expected_step_range"] == [0, 2]

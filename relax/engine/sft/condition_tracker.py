@@ -5,9 +5,11 @@ import hashlib
 import json
 import math
 import os
+import re
 import resource
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -232,6 +234,33 @@ def _sha256_key(payload: Any) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    # 先写入同目录临时文件并 fsync，再原子替换目标 JSON 文件，避免半写入损坏已有内容。
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _normalize_expected_step_range(value: Any, *, source: str | None = None) -> tuple[int, int]:
+    prefix = f"Invalid expected_step_range in {source}" if source else "Invalid expected_step_range"
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise ValueError(f"{prefix}: expected a 2-element sequence, got {value!r}")
+    start, end = value
+    if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, int) or not isinstance(end, int):
+        raise ValueError(f"{prefix}: start and end must be integers, got {value!r}")
+    if start < 0 or end < start:
+        raise ValueError(f"{prefix}: require 0 <= start <= end, got {value!r}")
+    return (int(start), int(end))
+
+
 def _read_cpu_memory_bytes() -> tuple[int, int]:
     statm_fields = Path("/proc/self/statm").read_text(encoding="utf-8").split()
     rss_pages = int(statm_fields[1])
@@ -340,12 +369,16 @@ class ConditionTracker:
         seed: int | None = None,
         schema: TrackerSchema = SENSENOVA_TRACKER_SCHEMA,
         run_id: str | None = None,
+        expected_step_range: tuple[int, int] | None = None,
     ) -> None:
         if rank < 0 or world_size <= 0 or micro_batches <= 0 or dataset_size <= 0 or warmup_steps < 0:
             raise ValueError("Invalid ConditionTracker configuration")
         self.rank = int(rank)
         self.schema = schema
         self.run_id = str(run_id) if run_id is not None else None
+        self.expected_step_range: tuple[int, int] | None = (
+            _normalize_expected_step_range(expected_step_range) if expected_step_range is not None else None
+        )
         self.io_failed = False
         self.io_error: str | None = None
         self.transfer_specs = {spec.kind: spec for spec in schema.transfers}
@@ -358,10 +391,15 @@ class ConditionTracker:
         self.output_dir = Path(output_dir)
         self.warmup_steps = int(warmup_steps)
         self.seed = int(seed) if seed is not None else None
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.steps_jsonl_path = self.output_dir / f"rank_{self.rank}_steps.jsonl"
         self.summary_json_path = self.output_dir / f"rank_{self.rank}_summary.json"
-        self.steps_jsonl_path.write_text("", encoding="utf-8")
+        if self.steps_jsonl_path.exists() or self.summary_json_path.exists():
+            raise FileExistsError(
+                f"Baseline stats files already exist for rank {self.rank} under {self.output_dir}; use a fresh directory"
+            )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with self.steps_jsonl_path.open("x", encoding="utf-8"):
+            pass
 
         # Preallocate two CUDA event pairs per (micro, stage) for the positive and negative branches
         self._cuda_available = torch.cuda.is_available()
@@ -879,7 +917,7 @@ class ConditionTracker:
                     exc,
                 )
 
-    def build_summary(self) -> dict[str, Any]:
+    def build_summary(self, *, complete: bool | None = None) -> dict[str, Any]:
         """Aggregate the recorded steps of this rank into a summary."""
         perf_records = [r for r in self.step_records if r["step"] >= self.warmup_steps]
         window_records = perf_records if perf_records else self.step_records
@@ -957,12 +995,18 @@ class ConditionTracker:
         step_res_mean = float(np.mean(step_res_vals)) if step_res_vals else 0.0
         step_res_max = int(max(step_res_vals)) if step_res_vals else 0
         gib = float(1024**3)
+        recorded_steps = [int(r["step"]) for r in self.step_records]
+        range_satisfied = self.expected_step_range is None or recorded_steps == list(
+            range(self.expected_step_range[0], self.expected_step_range[1])
+        )
+        terminated_early = complete is False
+        is_complete = (not self.io_failed) and (not terminated_early) and range_satisfied
 
         summary = {
             "tracker_schema": self.schema.name,
             "rank": self.rank,
             "world_size": self.world_size,
-            "complete": not self.io_failed,
+            "complete": is_complete,
             "micro_batches": self.micro_batches,
             "global_batch_size": self.global_batch_size,
             "dataset_size": self.dataset_size,
@@ -1002,21 +1046,23 @@ class ConditionTracker:
         }
         if self.run_id is not None:
             summary["run_id"] = self.run_id
+        if self.expected_step_range is not None:
+            summary["expected_step_range"] = [self.expected_step_range[0], self.expected_step_range[1]]
+        if terminated_early:
+            summary["terminated_early"] = True
         if self.io_error is not None:
             summary["io_error"] = self.io_error
         return summary
 
-    def save_summary(self) -> dict[str, Any]:
+    def save_summary(self, *, complete: bool | None = None) -> dict[str, Any]:
         """Write and return the summary of this rank."""
-        summary = self.build_summary()
+        summary = self.build_summary(complete=complete)
         if hasattr(self, "condition_cache_stats"):
             summary["condition_cache"] = self.condition_cache_stats
         if self.io_failed:
             return summary
         try:
-            self.summary_json_path.write_text(
-                json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
+            _atomic_write_json(self.summary_json_path, summary)
         except OSError as exc:
             self.io_failed = True
             self.io_error = f"{type(exc).__name__}: {exc}"
@@ -1039,8 +1085,36 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
         raise FileNotFoundError(f"No rank_*_steps.jsonl files found under {out_path}")
 
     rank_step_records: dict[int, list[dict[str, Any]]] = {}
+    truncated_step_logs: dict[str, dict[str, Any]] = {}
     for file_path in step_files:
-        records = [json.loads(line) for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        non_empty_lines = [
+            (line_no, raw_line)
+            for line_no, raw_line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), start=1)
+            if raw_line.strip()
+        ]
+        if not non_empty_lines:
+            continue
+        match = re.fullmatch(r"rank_(\d+)_steps\.jsonl", file_path.name)
+        records: list[dict[str, Any]] = []
+        for idx, (line_no, raw_line) in enumerate(non_empty_lines):
+            try:
+                parsed = json.loads(raw_line)
+            except json.JSONDecodeError as exc:
+                if idx == len(non_empty_lines) - 1:
+                    if not allow_incomplete:
+                        raise ValueError(
+                            f"Truncated trailing record in {file_path.name} at line {line_no}: {exc}"
+                        ) from exc
+                    rank_key = str(records[0]["rank"]) if records else (match.group(1) if match else file_path.name)
+                    truncated_step_logs[rank_key] = {"file": file_path.name, "line": line_no}
+                    break
+                raise ValueError(f"Corrupted record in {file_path.name} at line {line_no}: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"Corrupted record in {file_path.name} at line {line_no}: "
+                    f"expected JSON object, got {type(parsed).__name__}"
+                )
+            records.append(parsed)
         if not records:
             continue
         rank = int(records[0]["rank"])
@@ -1056,9 +1130,23 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
         raise ValueError(f"Step log files under {out_path} are empty")
 
     rank_summaries: dict[int, dict[str, Any]] = {}
+    corrupted_summaries: dict[str, str] = {}
     for file_path in sorted(out_path.glob("rank_*_summary.json")):
-        data = json.loads(file_path.read_text(encoding="utf-8"))
-        rank = int(data["rank"])
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"expected JSON object, got {type(data).__name__}")
+            raw_rank = data["rank"]
+            if isinstance(raw_rank, bool):
+                raise ValueError("rank must be an integer, not bool")
+            rank = int(raw_rank)
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+            if not allow_incomplete:
+                raise ValueError(f"Corrupted rank summary {file_path.name}: {exc}") from exc
+            match = re.fullmatch(r"rank_(\d+)_summary\.json", file_path.name)
+            rank_key = match.group(1) if match else file_path.name
+            corrupted_summaries[rank_key] = file_path.name
+            continue
         if file_path.name != f"rank_{rank}_summary.json":
             raise ValueError(f"Summary filename {file_path.name} does not match recorded rank {rank}")
         rank_summaries[rank] = data
@@ -1124,12 +1212,28 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
         if rank in rank_summaries and int(rank_summaries[rank].get("total_steps", -1)) != len(steps_by_rank[rank])
     ]
     incomplete_summaries = sorted(rank for rank, data in rank_summaries.items() if data.get("complete") is False)
+    declared_expected_ranges: set[tuple[int, int]] = set()
+    for rank, data in sorted(rank_summaries.items()):
+        raw_range = data.get("expected_step_range")
+        if raw_range is not None:
+            declared_expected_ranges.add(_normalize_expected_step_range(raw_range, source=f"rank_{rank}_summary.json"))
+    if len(declared_expected_ranges) > 1:
+        raise ValueError(f"Baseline files disagree on expected_step_range: {sorted(declared_expected_ranges)}")
+    expected_step_range = next(iter(declared_expected_ranges)) if declared_expected_ranges else None
+    expected_range_mismatches = (
+        [rank for rank in ranks if steps_by_rank[rank] != list(range(expected_step_range[0], expected_step_range[1]))]
+        if expected_step_range is not None
+        else []
+    )
     is_complete = (
         not missing_ranks
         and not missing_summaries
         and not mismatched_steps
         and not summary_step_mismatches
         and not incomplete_summaries
+        and not expected_range_mismatches
+        and not truncated_step_logs
+        and not corrupted_summaries
     )
     if not is_complete and not allow_incomplete:
         problems = []
@@ -1143,6 +1247,14 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
             problems.append(f"summary total_steps mismatch for ranks {summary_step_mismatches}")
         if incomplete_summaries:
             problems.append(f"incomplete rank summaries {incomplete_summaries}")
+        if expected_step_range is not None and expected_range_mismatches:
+            problems.append(
+                f"expected_step_range {list(expected_step_range)} mismatch for ranks {expected_range_mismatches}"
+            )
+        if truncated_step_logs:
+            problems.append(f"truncated trailing step logs {truncated_step_logs}")
+        if corrupted_summaries:
+            problems.append(f"corrupted rank summaries {corrupted_summaries}")
         raise ValueError("Incomplete baseline records: " + "; ".join(problems))
 
     warmup_steps = int(
@@ -1536,12 +1648,22 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
     }
     if run_id is not None:
         summary["run_id"] = run_id
+    if expected_step_range is not None:
+        summary["expected_step_range"] = [expected_step_range[0], expected_step_range[1]]
     if not is_complete:
         summary["missing_ranks"] = missing_ranks
         summary["missing_summaries"] = missing_summaries
         summary["recorded_steps_by_rank"] = {str(rank): steps_by_rank[rank] for rank in ranks}
         if summary_step_mismatches:
             summary["summary_step_mismatches"] = summary_step_mismatches
+        if incomplete_summaries:
+            summary["incomplete_summaries"] = incomplete_summaries
+        if expected_range_mismatches:
+            summary["expected_range_mismatches"] = expected_range_mismatches
+        if truncated_step_logs:
+            summary["truncated_step_logs"] = truncated_step_logs
+        if corrupted_summaries:
+            summary["corrupted_summaries"] = corrupted_summaries
     if "tracker_schema" in first_rank_steps[0]:
         summary["tracker_schema"] = schema.name
     if cache_stats:
@@ -1562,7 +1684,7 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
             "effective_reuse_rate": float(total_effective_reuses / total_requests) if total_requests > 0 else 0.0,
         }
     baseline_summary_path = out_path / "baseline_summary.json"
-    baseline_summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _atomic_write_json(baseline_summary_path, summary)
     return summary
 
 

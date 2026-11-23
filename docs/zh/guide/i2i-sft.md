@@ -85,7 +85,7 @@ bash scripts/entrypoint/ray-job.sh scripts/training/diffusion/run-sensenova-i2i-
 | `CONDITION_CACHE_ENABLED` | `condition_cache_enabled` | `0`（`false`） | 设为 `1` 开启缓存 |
 | `CONDITION_CACHE_MAX_ENTRIES` | `condition_cache_max_entries` | `256` | 每个 rank 最多缓存的条件数量 |
 | `CONDITION_CACHE_MAX_BYTES` | `condition_cache_max_bytes` | `1073741824`（1 GiB） | 每个 rank 缓存 Tensor 存储的字节上限 |
-| `BASELINE_STATS_DIR` | `baseline_stats_dir` | 未设置 | 保存各 rank 编码统计的目录 |
+| `BASELINE_STATS_DIR` | `baseline_stats_dir` | 未设置 | 保存各 rank 编码统计的新目录 |
 | `BASELINE_WARMUP_STEPS` | `baseline_warmup_steps` | `5` | 计时汇总时排除的开头步数 |
 
 两个上限分别作用于每个 rank，缓存的 Tensor 与训练共用 GPU 显存，每个条目按其持有的独立 Tensor
@@ -106,15 +106,18 @@ processor 配置及实际输入摘要、dtype 和 attention 实现，因此只�
 `group_forced_online` 是本 rank 命中、但因其他 rank 未命中而在线编码的次数。
 `evictions` 较多且 `peak_charged_bytes` 接近上限时，可以增大 `CONDITION_CACHE_MAX_BYTES`。
 
-估算预算时，关闭缓存运行一个短任务，并将 `BASELINE_STATS_DIR` 设为所有 worker 共享的目录。
-每个 rank 在其中写入 `rank_<rank>_steps.jsonl` 和 `rank_<rank>_summary.json`，任务结束后合并：
+估算预算时，关闭缓存运行一个短任务，并将 `BASELINE_STATS_DIR` 设为所有 worker 共享且不包含既有
+`rank_*_steps.jsonl`、`rank_*_summary.json` 或 `baseline_summary.json` 的新目录（若目录中已存在
+基准产物，训练会拒绝启动以保留已有结果）。每个 rank 在其中写入 `rank_<rank>_steps.jsonl` 和
+`rank_<rank>_summary.json`，任务结束后合并：
 
 ```bash
 python -m relax.engine.sft.condition_tracker /shared/runs/i2i-baseline
 ```
 
 命令按文件记录的 `tracker_schema` 生成 `baseline_summary.json`，并校验各 rank 与步骤完整性以及
-同一运行标识（需要汇总中断任务的部分日志时可加 `--allow-incomplete`）。其中 `feature_tensor_bytes`
+同一运行标识。需要汇总中断任务的部分日志时可加 `--allow-incomplete`，在该显式部分模式下会保留步骤日志
+截断尾行之前的全部完整步骤记录。其中 `feature_tensor_bytes`
 给出单个样本缓存特征的大小（SenseNova 为 `past_key_values_bytes` 与 `indexes_image_bytes`；
 Qwen-Image-Edit 为 `prompt_embeds_bytes`、`edit_latents_bytes` 与 `target_latents_bytes`），
 `stage_timings_ms.<stage>.share_pct` 表示缓存可以跳过单步训练中多少比例的时间（SenseNova 为

@@ -170,6 +170,7 @@ class FSDPSFTTrainer:
             seed_training(self.args.seed + self.rank)
         self.prefetch = None
         self.tracker = None
+        self._tracker_summary_complete_saved = False
         self.condition_cache = None
         depth = config.get("image_prefetch_depth", 0)
         workers = config.get("image_prefetch_workers", 2)
@@ -202,23 +203,50 @@ class FSDPSFTTrainer:
                 if not isinstance(actor.adapter, ConditionTrackerAdapter):
                     raise ValueError("The SFT adapter does not support baseline condition tracking")
                 stats_path = Path(stats_dir)
+                artifact_patterns = (
+                    "rank_*_steps.jsonl",
+                    "rank_*_summary.json",
+                    "rank_*_summary.json.tmp*",
+                    "baseline_summary.json",
+                    "baseline_summary.json.tmp*",
+                )
 
-                def _prepare_stats_dir() -> None:
-                    stats_path.mkdir(parents=True, exist_ok=True)
-                    for pattern in ("rank_*_steps.jsonl", "rank_*_summary.json", "baseline_summary.json"):
-                        for stale in stats_path.glob(pattern):
-                            if stale.is_file():
-                                stale.unlink()
+                def _check_stats_dir_fresh() -> None:
+                    if not stats_path.exists():
+                        return
+                    if not stats_path.is_dir():
+                        raise NotADirectoryError(f"baseline_stats_dir is not a directory: {stats_path}")
+                    for pattern in artifact_patterns:
+                        if any(stats_path.glob(pattern)):
+                            raise FileExistsError(
+                                f"Baseline stats directory already contains baseline artifacts; "
+                                f"use a fresh baseline_stats_dir: {stats_path}"
+                            )
 
                 if self.world > 1:
-                    actor._rank0_then_agree(_prepare_stats_dir, what="prepare baseline stats directory")
+                    stats_error = None
+                    try:
+                        _check_stats_dir_fresh()
+                    except Exception as exc:
+                        stats_error = f"{type(exc).__name__}: {exc}"
+                    errors = _collect_weight_sync_errors(stats_error)
+                    if errors:
+                        error_messages = [item[1] if isinstance(item, tuple) else str(item) for item in errors]
+                        if any(msg.startswith("FileExistsError:") for msg in error_messages):
+                            raise FileExistsError(f"Baseline stats directory check failed: {errors}")
+                        raise ValueError(f"Baseline stats directory check failed: {errors}")
+                    actor._rank0_then_agree(
+                        lambda: stats_path.mkdir(parents=True, exist_ok=True),
+                        what="prepare baseline stats directory",
+                    )
                     from relax.utils.distributed_utils import get_gloo_group
 
                     run_id_holder = [uuid.uuid4().hex if self.rank == 0 else None]
                     dist.broadcast_object_list(run_id_holder, src=0, group=get_gloo_group())
                     run_id = str(run_id_holder[0])
                 else:
-                    _prepare_stats_dir()
+                    _check_stats_dir_fresh()
+                    stats_path.mkdir(parents=True, exist_ok=True)
                     run_id = uuid.uuid4().hex
                 warmup_steps = int(config.get("baseline_warmup_steps", 5))
                 self.tracker = ConditionTracker(
@@ -231,6 +259,7 @@ class FSDPSFTTrainer:
                     seed=int(self.args.seed),
                     schema=actor.adapter.tracker_schema(),
                     run_id=run_id,
+                    expected_step_range=(self.step, int(self.args.num_rollout)),
                 )
                 actor.adapter.bind_tracker(actor.model, self.tracker)
             else:
@@ -241,7 +270,7 @@ class FSDPSFTTrainer:
                 self._init_condition_cache()
             self.profiler.on_init_end()
         except BaseException:
-            self.close(suppress_errors=True)
+            self.close(suppress_errors=True, aborted=True)
             raise
 
     def _init_condition_cache(self) -> None:
@@ -340,10 +369,10 @@ class FSDPSFTTrainer:
         except BaseException as exc:
             if getattr(self, "condition_cache", None) is not None:
                 traceback.clear_frames(exc.__traceback__)
-            self.close(suppress_errors=True)
+            self.close(suppress_errors=True, aborted=True)
             raise
 
-    def close(self, *, suppress_errors: bool = False) -> None:
+    def close(self, *, suppress_errors: bool = False, aborted: bool = False) -> None:
         try:
             if self.prefetch:
                 try:
@@ -357,7 +386,10 @@ class FSDPSFTTrainer:
                 tracker = getattr(self, "tracker", None)
                 if tracker is not None:
                     try:
-                        tracker.save_summary()
+                        if aborted:
+                            tracker.save_summary(complete=False)
+                        elif not getattr(self, "_tracker_summary_complete_saved", False):
+                            tracker.save_summary()
                     except Exception as exc:
                         if not suppress_errors:
                             raise
@@ -375,6 +407,8 @@ class FSDPSFTTrainer:
 
         if step != self.step:
             raise ValueError(f"Expected SFT step {self.step}, received {step}")
+        tagged_batch = self.sampler.batch_with_padding(step)
+        expected_ids = [sample_id for sample_id, _ in tagged_batch]
         holder: list[Any] = [None]
 
         def read_batch() -> None:
@@ -382,7 +416,7 @@ class FSDPSFTTrainer:
             if rows is None:
                 raise TimeoutError(f"No image SFT batch for step {step}")
             holder[0] = rows["sample_id"].tolist()
-            if holder[0] != self.sampler.batch(step):
+            if holder[0] != expected_ids:
                 raise ValueError("TransferQueue sample order differs from the deterministic SFT sampler")
 
         self.actor._rank0_then_agree(read_batch, what=f"read image SFT step {step}")
@@ -390,7 +424,6 @@ class FSDPSFTTrainer:
 
         dist.broadcast_object_list(holder, src=0, group=get_gloo_group())
         global_ids = holder[0]
-        tagged_batch = self.sampler.batch_with_padding(step)
         positions = assign_image_batch_positions(global_ids, self.args.i2i_sft_config, step=step, world=self.world)
         rank_positions = positions[self.rank :: self.world]
         ids = [global_ids[pos] for pos in rank_positions]
@@ -485,7 +518,8 @@ class FSDPSFTTrainer:
                 tracker.condition_cache_stats = self.condition_cache.stats()
             tracker.end_step(step, data_wait, train_seconds)
             if self.step == self.args.num_rollout:
-                tracker.save_summary()
+                tracker.save_summary(complete=True)
+                self._tracker_summary_complete_saved = True
         if self.rank == 0:
             values = {
                 "train/loss": metrics[0],
@@ -518,7 +552,7 @@ class FSDPSFTTrainer:
         except BaseException as exc:
             if getattr(self, "condition_cache", None) is not None:
                 traceback.clear_frames(exc.__traceback__)
-            self.close(suppress_errors=True)
+            self.close(suppress_errors=True, aborted=True)
             raise
 
     def _save_checkpoint(self) -> None:

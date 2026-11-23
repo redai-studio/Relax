@@ -115,7 +115,7 @@ directly in `--i2i-sft-config`:
 | `CONDITION_CACHE_ENABLED` | `condition_cache_enabled` | `0` (`false`) | Set to `1` to enable the cache |
 | `CONDITION_CACHE_MAX_ENTRIES` | `condition_cache_max_entries` | `256` | Maximum cached conditions on each rank |
 | `CONDITION_CACHE_MAX_BYTES` | `condition_cache_max_bytes` | `1073741824` (1 GiB) | Maximum tensor storage bytes on each rank |
-| `BASELINE_STATS_DIR` | `baseline_stats_dir` | unset | Directory for per-rank encoding statistics |
+| `BASELINE_STATS_DIR` | `baseline_stats_dir` | unset | Fresh directory for per-rank encoding statistics |
 | `BASELINE_WARMUP_STEPS` | `baseline_warmup_steps` | `5` | Steps excluded from the timing summary |
 
 Both limits apply to each rank separately, and cached tensors use the same GPU
@@ -149,7 +149,10 @@ missed. A large `evictions` count together with a `peak_charged_bytes` near the
 limit suggests a larger `CONDITION_CACHE_MAX_BYTES`.
 
 To estimate the budget, run a short job with the cache disabled and
-`BASELINE_STATS_DIR` set to a directory shared by all workers. Each rank writes
+`BASELINE_STATS_DIR` set to a fresh directory shared by all workers that does
+not contain existing `rank_*_steps.jsonl`, `rank_*_summary.json`, or
+`baseline_summary.json` files (startup is rejected if baseline artifacts are
+already present so prior results are preserved). Each rank writes
 `rank_<rank>_steps.jsonl` and `rank_<rank>_summary.json` there. Combine them
 after the job:
 
@@ -158,8 +161,10 @@ python -m relax.engine.sft.condition_tracker /shared/runs/i2i-baseline
 ```
 
 The command reads the recorded `tracker_schema`, validates rank coverage, step
-consistency, and run identity (pass `--allow-incomplete` to inspect partial
-logs from an interrupted run), and writes `baseline_summary.json`. In it,
+consistency, and run identity, and writes `baseline_summary.json`. Pass
+`--allow-incomplete` to summarize partial logs from an interrupted run; in this
+explicit partial mode, all complete step records before any truncated trailing
+line in a step log are retained. In `baseline_summary.json`,
 `feature_tensor_bytes` reports the per-sample size of cached features
 (`past_key_values_bytes` and `indexes_image_bytes` for SenseNova;
 `prompt_embeds_bytes`, `edit_latents_bytes`, and `target_latents_bytes` for

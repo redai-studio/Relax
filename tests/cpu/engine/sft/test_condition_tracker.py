@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 from __future__ import annotations
 
+import json
+import os
 import weakref
 from argparse import Namespace
 from pathlib import Path
@@ -179,6 +181,7 @@ def test_dp_tier_micro_balance_padding_flags(tmp_path: Path) -> None:
         for r in range(world_size)
     ]
 
+    expected_micro_records: dict[int, list[tuple[int, list[int], list[bool]]]] = {r: [] for r in range(world_size)}
     for step in range(4):
         tagged = sampler.batch_with_padding(step)
         raw_ids = [sid for sid, _ in tagged]
@@ -188,11 +191,28 @@ def test_dp_tier_micro_balance_padding_flags(tmp_path: Path) -> None:
         for r in range(world_size):
             trackers[r].begin_step(step, torch.device("cpu"))
             rank_positions = positions[r::world_size]
+            step_sample_ids: list[int] = []
+            step_padding_flags: list[bool] = []
             for micro, pos in enumerate(rank_positions):
                 sid, is_pad = tagged[pos]
+                step_sample_ids.append(int(sid))
+                step_padding_flags.append(bool(is_pad))
                 trackers[r].begin_micro(micro, sid, rows[sid], config, "lora", 64, 64, is_padding=is_pad)
                 assert trackers[r]._current_micro_records[micro]["is_padding"] is is_pad
+            expected_micro_records[r].append((step, step_sample_ids, step_padding_flags))
             trackers[r].end_step(step, 0.001, 0.01)
+
+    for r in range(world_size):
+        step_lines = [
+            json.loads(line)
+            for line in (tmp_path / f"rank_{r}_steps.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(step_lines) == len(expected_micro_records[r])
+        for rec, (expected_step, expected_sids, expected_pads) in zip(step_lines, expected_micro_records[r]):
+            assert rec["step"] == expected_step
+            assert [m["is_padding"] for m in rec["micros"]] == expected_pads
+            assert [m["sample_id"] for m in rec["micros"]] == expected_sids
 
     for t in trackers:
         t.save_summary()
@@ -830,3 +850,271 @@ def test_summarize_baseline_dir_reports_authoritative_condition_cache_rates(tmp_
     }
     for enc_stats in agg["encoding_stats"].values():
         assert "cache_hit_rate" not in enc_stats
+
+
+def test_expected_step_range_detects_early_exit(tmp_path: Path) -> None:
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+
+    # 场景 1：显式传入 complete=False 标记提前结束。
+    explicit_dir = tmp_path / "explicit_early"
+    explicit_summaries = []
+    for rank in range(2):
+        tr = ConditionTracker(
+            rank=rank,
+            world_size=2,
+            micro_batches=1,
+            dataset_size=2,
+            output_dir=explicit_dir,
+            warmup_steps=0,
+            run_id="run-explicit",
+            expected_step_range=(0, 2),
+        )
+        tr.begin_step(0, torch.device("cpu"))
+        tr.begin_micro(0, rank, row, config, "lora", 64, 64, is_padding=False)
+        tr.end_step(0, 0.001, 0.01)
+        explicit_summaries.append(tr.save_summary(complete=False))
+
+    for summary in explicit_summaries:
+        assert summary["complete"] is False
+        assert summary["expected_step_range"] == [0, 2]
+        assert summary["terminated_early"] is True
+
+    with pytest.raises(ValueError, match="Incomplete baseline records"):
+        summarize_baseline_dir(explicit_dir)
+    partial_explicit = summarize_baseline_dir(explicit_dir, allow_incomplete=True)
+    assert partial_explicit["complete"] is False
+    assert partial_explicit["expected_step_range"] == [0, 2]
+    assert partial_explicit["incomplete_summaries"] == [0, 1]
+    assert partial_explicit["expected_range_mismatches"] == [0, 1]
+
+    # 场景 2：未显式传入 complete 时，仅靠 expected_step_range 未走完触发不完整。
+    implicit_dir = tmp_path / "implicit_early"
+    implicit_summaries = []
+    for rank in range(2):
+        tr = ConditionTracker(
+            rank=rank,
+            world_size=2,
+            micro_batches=1,
+            dataset_size=2,
+            output_dir=implicit_dir,
+            warmup_steps=0,
+            run_id="run-implicit",
+            expected_step_range=(0, 2),
+        )
+        tr.begin_step(0, torch.device("cpu"))
+        tr.begin_micro(0, rank, row, config, "lora", 64, 64, is_padding=False)
+        tr.end_step(0, 0.001, 0.01)
+        implicit_summaries.append(tr.save_summary())
+
+    for summary in implicit_summaries:
+        assert summary["complete"] is False
+        assert summary["expected_step_range"] == [0, 2]
+        assert "terminated_early" not in summary
+
+    with pytest.raises(ValueError, match="expected_step_range"):
+        summarize_baseline_dir(implicit_dir)
+    partial_implicit = summarize_baseline_dir(implicit_dir, allow_incomplete=True)
+    assert partial_implicit["complete"] is False
+    assert partial_implicit["expected_step_range"] == [0, 2]
+    assert partial_implicit["expected_range_mismatches"] == [0, 1]
+
+    # 非法 expected_step_range 初始化应抛出 ValueError。
+    for bad_range in ((2, 1), (-1, 2), (True, 2)):
+        with pytest.raises(ValueError, match="expected_step_range"):
+            ConditionTracker(
+                rank=0,
+                world_size=1,
+                micro_batches=1,
+                dataset_size=1,
+                output_dir=tmp_path / f"bad_range_{bad_range[0]}_{bad_range[1]}",
+                expected_step_range=bad_range,  # type: ignore[arg-type]
+            )
+
+    # 多个 rank 声明不一致的 expected_step_range 时必须报错。
+    disagree_dir = tmp_path / "disagree_range"
+    for rank, step_range in ((0, (0, 1)), (1, (0, 2))):
+        tr = ConditionTracker(
+            rank=rank,
+            world_size=2,
+            micro_batches=1,
+            dataset_size=2,
+            output_dir=disagree_dir,
+            warmup_steps=0,
+            run_id="run-disagree",
+            expected_step_range=step_range,
+        )
+        tr.begin_step(0, torch.device("cpu"))
+        tr.begin_micro(0, rank, row, config, "lora", 64, 64, is_padding=False)
+        tr.end_step(0, 0.001, 0.01)
+        tr.save_summary()
+    with pytest.raises(ValueError, match="disagree on expected_step_range"):
+        summarize_baseline_dir(disagree_dir, allow_incomplete=True)
+
+
+def test_expected_step_range_supports_resume_window(tmp_path: Path) -> None:
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+    resume_dir = tmp_path / "resume"
+
+    for rank in range(2):
+        tr = ConditionTracker(
+            rank=rank,
+            world_size=2,
+            micro_batches=1,
+            dataset_size=2,
+            output_dir=resume_dir,
+            warmup_steps=0,
+            run_id="run-resume",
+            expected_step_range=(2, 4),
+        )
+        for step in (2, 3):
+            tr.begin_step(step, torch.device("cpu"))
+            tr.begin_micro(0, rank, row, config, "lora", 64, 64, is_padding=False)
+            tr.end_step(step, 0.001, 0.01)
+        summary = tr.save_summary()
+        assert summary["complete"] is True
+        assert summary["expected_step_range"] == [2, 4]
+        assert summary["total_steps"] == 2
+
+    agg = summarize_baseline_dir(resume_dir)
+    assert agg["complete"] is True
+    assert agg["expected_step_range"] == [2, 4]
+    assert agg["total_steps"] == 2
+
+
+def test_tracker_refuses_to_overwrite_existing_rank_files(tmp_path: Path) -> None:
+    steps_dir = tmp_path / "existing_steps"
+    steps_dir.mkdir(parents=True, exist_ok=True)
+    steps_path = steps_dir / "rank_0_steps.jsonl"
+    existing_steps_content = '{"rank": 0, "step": 99}\n'
+    steps_path.write_text(existing_steps_content, encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="already exist"):
+        ConditionTracker(rank=0, world_size=1, micro_batches=1, dataset_size=1, output_dir=steps_dir)
+    assert steps_path.read_text(encoding="utf-8") == existing_steps_content
+    assert [p.name for p in steps_dir.iterdir()] == ["rank_0_steps.jsonl"]
+
+    summary_dir = tmp_path / "existing_summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / "rank_0_summary.json"
+    existing_summary_content = '{"rank": 0, "complete": true}\n'
+    summary_path.write_text(existing_summary_content, encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="already exist"):
+        ConditionTracker(rank=0, world_size=1, micro_batches=1, dataset_size=1, output_dir=summary_dir)
+    assert summary_path.read_text(encoding="utf-8") == existing_summary_content
+    assert [p.name for p in summary_dir.iterdir()] == ["rank_0_summary.json"]
+
+
+def test_summarize_baseline_dir_handles_truncated_and_corrupted_files(tmp_path: Path) -> None:
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+
+    # 1. 步骤日志末尾存在截断 JSON 行。
+    trunc_dir = tmp_path / "truncated_tail"
+    tr_trunc = ConditionTracker(
+        rank=0, world_size=1, micro_batches=1, dataset_size=1, output_dir=trunc_dir, warmup_steps=0, run_id="run-trunc"
+    )
+    tr_trunc.begin_step(0, torch.device("cpu"))
+    tr_trunc.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+    tr_trunc.end_step(0, 0.001, 0.01)
+    tr_trunc.save_summary()
+    steps_file = trunc_dir / "rank_0_steps.jsonl"
+    steps_file.write_text(steps_file.read_text(encoding="utf-8") + '{"rank": 0, "step": 1', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Truncated trailing record"):
+        summarize_baseline_dir(trunc_dir)
+    partial_trunc = summarize_baseline_dir(trunc_dir, allow_incomplete=True)
+    assert partial_trunc["complete"] is False
+    assert partial_trunc["total_steps"] == 1
+    assert partial_trunc["truncated_step_logs"] == {"0": {"file": "rank_0_steps.jsonl", "line": 2}}
+
+    # 2. 步骤日志中间行损坏时，allow_incomplete=True 仍必须抛出 ValueError。
+    mid_dir = tmp_path / "corrupted_middle"
+    tr_mid = ConditionTracker(
+        rank=0, world_size=1, micro_batches=1, dataset_size=1, output_dir=mid_dir, warmup_steps=0, run_id="run-mid"
+    )
+    for step in (0, 1):
+        tr_mid.begin_step(step, torch.device("cpu"))
+        tr_mid.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+        tr_mid.end_step(step, 0.001, 0.01)
+    tr_mid.save_summary()
+    mid_lines = (mid_dir / "rank_0_steps.jsonl").read_text(encoding="utf-8").splitlines()
+    (mid_dir / "rank_0_steps.jsonl").write_text(
+        "\n".join([mid_lines[0], '{"rank": 0, "broken": ', mid_lines[1]]) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="Corrupted record"):
+        summarize_baseline_dir(mid_dir)
+    with pytest.raises(ValueError, match="Corrupted record"):
+        summarize_baseline_dir(mid_dir, allow_incomplete=True)
+
+    # 3. rank_0_summary.json 损坏为半截 JSON。
+    bad_sum_dir = tmp_path / "corrupted_summary"
+    tr_bad_sum = ConditionTracker(
+        rank=0, world_size=1, micro_batches=1, dataset_size=1, output_dir=bad_sum_dir, warmup_steps=0, run_id="run-sum"
+    )
+    tr_bad_sum.begin_step(0, torch.device("cpu"))
+    tr_bad_sum.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+    tr_bad_sum.end_step(0, 0.001, 0.01)
+    tr_bad_sum.save_summary()
+    (bad_sum_dir / "rank_0_summary.json").write_text('{"rank": 0, "complete": ', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Corrupted rank summary"):
+        summarize_baseline_dir(bad_sum_dir)
+    partial_sum = summarize_baseline_dir(bad_sum_dir, allow_incomplete=True)
+    assert partial_sum["complete"] is False
+    assert partial_sum["total_steps"] == 1
+    assert partial_sum["sample_stats"]["total_samples"] == 1
+    assert partial_sum["corrupted_summaries"] == {"0": "rank_0_summary.json"}
+    assert partial_sum["missing_summaries"] == [0]
+
+
+def test_atomic_summary_writes_leave_no_tmp_files_and_preserve_existing_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+
+    # 正常写入后目录中无临时文件残留。
+    clean_dir = tmp_path / "atomic_clean"
+    tr = ConditionTracker(
+        rank=0,
+        world_size=1,
+        micro_batches=1,
+        dataset_size=1,
+        output_dir=clean_dir,
+        warmup_steps=0,
+        run_id="run-atomic",
+    )
+    tr.begin_step(0, torch.device("cpu"))
+    tr.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+    tr.end_step(0, 0.001, 0.01)
+    tr.save_summary()
+    summarize_baseline_dir(clean_dir)
+    assert list(clean_dir.glob("*.tmp*")) == []
+
+    # 写入失败时应清理临时文件并保留原有文件内容。
+    sentinel_baseline = '{"sentinel": "baseline"}\n'
+    baseline_path = clean_dir / "baseline_summary.json"
+    baseline_path.write_text(sentinel_baseline, encoding="utf-8")
+    orig_rank_summary = (clean_dir / "rank_0_summary.json").read_text(encoding="utf-8")
+
+    def fail_replace(_src: object, _dst: object) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        summarize_baseline_dir(clean_dir)
+    assert baseline_path.read_text(encoding="utf-8") == sentinel_baseline
+    assert list(clean_dir.glob("*.tmp*")) == []
+
+    tr.condition_cache_stats = {"requests": 1}
+    failed_summary = tr.save_summary()
+    assert failed_summary["complete"] is False
+    assert tr.io_failed is True
+    assert "simulated replace failure" in (tr.io_error or "")
+    assert (clean_dir / "rank_0_summary.json").read_text(encoding="utf-8") == orig_rank_summary
+    assert list(clean_dir.glob("*.tmp*")) == []
