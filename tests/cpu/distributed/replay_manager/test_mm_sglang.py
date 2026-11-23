@@ -25,20 +25,20 @@ from relax.distributed.replay_manager.storage import TQReplayStorage
 
 @pytest.fixture
 def capture():
-    bodies = {}
-
     class Backend:
+        blocks = {}
+
         def write_many(self, keys, values):
-            bodies.update((key, value.copy()) for key, value in zip(keys, values, strict=True))
+            self.blocks.update((key, value.copy()) for key, value in zip(keys, values, strict=True))
 
         def read(self, keys):
-            return [bodies[key] for key in keys]
+            return [self.blocks[key] for key in keys]
 
         read_encoded = read
 
         def delete(self, keys):
             for key in keys:
-                bodies.pop(key, None)
+                self.blocks.pop(key, None)
 
     backend = Backend()
     config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2, publication_bytes=1 << 20)
@@ -256,6 +256,7 @@ async def test_agentic_mm_response_lease_follows_wire_request(capture, monkeypat
     calls = []
 
     def publish(payload):
+        assert payload["image_data"] == ["image"]
         rid = payload["rid"]
         image = item()
         media.bind(rid, SimpleNamespace(mm_items=[image]))
@@ -314,7 +315,7 @@ async def test_agentic_mm_response_lease_follows_wire_request(capture, monkeypat
                 assert publish(payload)[META_FIELD] == []
             media.flush()
     inventory.retire_partition("train_0")
-    assert not inventory.snapshot()["objects"]
+    assert not inventory.snapshot()["objects"] and not store._backend.blocks
 
 
 def test_mm_request_marker_is_absent_in_evaluation():
@@ -612,20 +613,88 @@ def test_mm_video_frame_spans_and_repeated_images_keep_media_occurrences(capture
     release_media_entries(store, entries)
 
 
-@pytest.mark.parametrize("resumable", [True, False])
-def test_scheduler_pause_preserves_mm_until_response_but_hard_abort_releases(capture, resumable):
-    from relax.distributed.replay_manager.backend.sglang import _abort_request_publication
+@pytest.mark.parametrize(
+    "kinds,disposition",
+    [
+        ({"mm_embedding"}, "stop"),
+        ({"mm_embedding", "moe"}, "stop"),
+        ({"mm_embedding"}, "error"),
+        ({"mm_embedding"}, "waiting"),
+        ({"mm_embedding"}, "native"),
+    ],
+)
+def test_scheduler_pause_preserves_mm_until_response_but_hard_abort_releases(capture, monkeypatch, kinds, disposition):
+    import sys
+    from types import ModuleType
 
+    from relax.agentic.session.service import _last_token_is_stop_token
+    from relax.distributed.replay_manager.backend import sglang
+    from relax.distributed.replay_manager.producer import prepare_replay_export
+
+    class FINISH_ABORT:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    class Scheduler:
+        max_running_requests = 1
+
+        def abort_request(self, notice):
+            if self.waiting_queue:
+                self.waiting_queue.clear()
+            else:
+                request.to_finish = FINISH_ABORT(503 if disposition == "error" else None)
+
+        def stream_output(self, reqs, return_logprob, skip_req=None):
+            assert reqs == [request]
+            self.entries = getattr(request, "_relax_mm_output", [])
+            self.tokens = list(request.output_ids)
+
+        def process_input_requests(self):
+            pass
+
+        def maybe_sleep_on_idle(self):
+            pass
+
+    module = ModuleType("sglang.srt.managers.scheduler")
+    module.Scheduler = Scheduler
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    sglang._install_abort_patch()
+    sglang._install_response_patch(lambda _: True)
     runtime, store, inventory = capture
-    rid, image = "relax-agentic-r3-mm-pause", item()
+    producer = ReplayManager(config=store.config, store_factory=lambda: store).register_producer(kinds)
+    payload = producer.request_options(request_id=None if disposition == "native" else "pause")
+    rid, image = payload["rid"], item()
     inventory.open_response_attempt(rid)
     runtime.bind(rid, SimpleNamespace(mm_items=[image]))
     expected = torch.arange(4 * 2560, dtype=torch.float32).reshape(4, 2560).bfloat16()
     runtime.capture(image, expected)
-    request = SimpleNamespace(rid=rid, _relax_replay_media=runtime)
-    _abort_request_publication(request, keep_moe=resumable)
-    if resumable:
-        entries = finish(runtime, rid)
+    request = SimpleNamespace(
+        **payload, _relax_replay_media=runtime, to_finish=None, finished_reason=None, output_ids=[]
+    )
+    request.finished = lambda: request.finished_reason is not None
+    scheduler = Scheduler()
+    waiting = disposition == "waiting"
+    scheduler.waiting_queue = [request] if waiting else []
+    scheduler.running_batch = SimpleNamespace(reqs=[] if waiting else [request])
+    scheduler.abort_request(SimpleNamespace(rid=rid, abort_all=False))
+    if disposition == "stop":
+        # SGLang emits the pending abort even when its last decoded token is EOS.
+        request.output_ids.append(2)
+        request.finished_reason, request.to_finish = request.to_finish, None
+        runtime._worker.submit(lambda: None).result(timeout=10)
+        scheduler.stream_output([request], True)
+        scheduler.process_input_requests()
+        entries = scheduler.entries
+        assert _last_token_is_stop_token(
+            token_ids=scheduler.tokens, tokenizer=SimpleNamespace(eos_token_id=2), sampling_params={}
+        )
+        sample = SimpleNamespace(
+            tokens=[1, *scheduler.tokens],
+            multimodal_train_inputs={"image_grid_thw": image.image_grid_thw},
+            rollout_replay_refs={"mm_embedding": producer.response_media({META_FIELD: entries}, required=True)},
+        )
+        prepare_replay_export(sample, SimpleNamespace())
         inventory.finish_response_attempt(rid, [entry["lease"] for entry in entries])
         runtime.flush()
         runtime._worker.submit(lambda: None).result(timeout=10)
@@ -646,4 +715,4 @@ def test_scheduler_pause_preserves_mm_until_response_but_hard_abort_releases(cap
         assert rid not in runtime.requests
     runtime.flush()
     runtime._worker.submit(lambda: None).result(timeout=10)
-    assert not inventory.state["objects"]
+    assert not inventory.state["objects"] and not store._backend.blocks

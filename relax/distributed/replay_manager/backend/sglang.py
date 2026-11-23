@@ -183,7 +183,7 @@ class SGLangProducer(Producer):
 
     def request_options(self, *, evaluation: bool = False, request_id: str | None = None) -> dict[str, Any]:
         from ..config import references_enabled
-        from .mm_sglang import ATTEMPT_PREFIX, REQUEST_PREFIX
+        from .mm_sglang import AGENTIC_MM_ATTEMPT_PREFIX, ATTEMPT_PREFIX, REQUEST_PREFIX
 
         self.manager._ensure_open()
         options = {}
@@ -198,7 +198,7 @@ class SGLangProducer(Producer):
                     request_id = f"{request_id}-{uuid4().hex}"
                 request_id = (AGENTIC_R3_MM_PREFIX if media else AGENTIC_R3_REQUEST_PREFIX) + request_id
             elif media:
-                request_id = ATTEMPT_PREFIX + uuid4().hex if reference else REQUEST_PREFIX + request_id
+                request_id = AGENTIC_MM_ATTEMPT_PREFIX + uuid4().hex if reference else REQUEST_PREFIX + request_id
             options["rid"] = request_id
         elif media:
             options["rid"] = ATTEMPT_PREFIX + uuid4().hex
@@ -532,13 +532,13 @@ def _validate_capture_api(kinds: frozenset[str]) -> None:
             raise RuntimeError(f"Installed SGLang lacks the {kind} replay capture/publication API")
 
 
-def _abort_request_publication(req: Any, *, keep_moe: bool = False) -> None:
+def _abort_request_publication(req: Any, *, keep_response: bool = False) -> None:
     """Drop only this request's unpublished bodies, after all writes drain."""
     error = None
     media = getattr(req, "_relax_replay_media", None)
     # A resumable pause still returns accepted tokens and both replay kinds.
     # Keep its independent media response leases until terminal output drains.
-    if media is not None and not keep_moe:
+    if media is not None and not keep_response:
         try:
             media.abort(req.rid)
             req._relax_replay_media = None
@@ -546,7 +546,7 @@ def _abort_request_publication(req: Any, *, keep_moe: bool = False) -> None:
             error = exc
     streams = getattr(req, "_relax_replay_streams", {})
     for kind, publication in streams.items():
-        if keep_moe and kind == "moe":
+        if keep_response and kind == "moe":
             continue
         try:
             publication.abort()
@@ -554,7 +554,7 @@ def _abort_request_publication(req: Any, *, keep_moe: bool = False) -> None:
             error = error or exc
     if error is not None:
         raise error
-    req._relax_replay_streams = {"moe": streams["moe"]} if keep_moe and "moe" in streams else {}
+    req._relax_replay_streams = {"moe": streams["moe"]} if keep_response and "moe" in streams else {}
     req._relax_replay_finish = None
 
 
@@ -562,13 +562,15 @@ def _request_aborted(req: Any) -> bool:
     return any(type(getattr(req, name, None)).__name__ == "FINISH_ABORT" for name in ("finished_reason", "to_finish"))
 
 
-def _keep_aborted_moe(req: Any) -> bool:
-    return getattr(req, "_relax_replay_keep_aborted_moe", False)
+def _keep_aborted_response(req: Any) -> bool:
+    return getattr(req, "_relax_replay_keep_aborted_response", False)
 
 
 def _install_abort_patch() -> None:
     """Waiting/chunked requests can disappear without a finished collector."""
     from sglang.srt.managers.scheduler import Scheduler
+
+    from .mm_sglang import AGENTIC_MM_ATTEMPT_PREFIX
 
     original = Scheduler.abort_request
     if getattr(original, "_relax_replay_cleanup", False):
@@ -603,18 +605,23 @@ def _install_abort_patch() -> None:
                     finish = getattr(req, "to_finish", None)
                     # Keep only scheduler pauses that can still return tokens
                     # over HTTP. Error-status aborts never deliver a manifest.
-                    keep_moe = (
+                    keep_response = (
                         resumable
                         and id(req) not in inactive
                         and not getattr(req, "finished_output", False)
                         and not getattr(req, "is_retracted", False)
-                        and req.rid.startswith(AGENTIC_R3_REQUEST_PREFIX)
-                        and getattr(req, "return_routed_experts", False)
+                        and (
+                            req.rid.startswith(AGENTIC_MM_ATTEMPT_PREFIX)
+                            or (
+                                req.rid.startswith(AGENTIC_R3_REQUEST_PREFIX)
+                                and getattr(req, "return_routed_experts", False)
+                            )
+                        )
                         and type(finish).__name__ == "FINISH_ABORT"
                         and getattr(finish, "status_code", None) is None
                     )
-                    req._relax_replay_keep_aborted_moe = keep_moe
-                    _abort_request_publication(req, keep_moe=keep_moe)
+                    req._relax_replay_keep_aborted_response = keep_response
+                    _abort_request_publication(req, keep_response=keep_response)
                 except Exception as exc:
                     error = error or exc
             if error is not None:
@@ -840,10 +847,10 @@ def install_scheduler_patch(
             raise RuntimeError("SGLang lacks a requested replay capturer")
         output_ids = req.output_ids_through_stop if hasattr(req, "output_ids_through_stop") else req.output_ids
         if _request_aborted(req):
-            if not (_keep_aborted_moe(req) and output_ids and "moe" in kinds):
+            if not (_keep_aborted_response(req) and output_ids and "moe" in kinds):
                 _abort_request_publication(req)
                 return
-            _abort_request_publication(req, keep_moe=True)
+            _abort_request_publication(req, keep_response=True)
             kinds = {"moe"}
         if not owner(self):
             for kind in kinds:
@@ -890,7 +897,7 @@ def install_scheduler_patch(
                         setattr(result, field, None)
                 for i, req in enumerate(batch.reqs):
                     if _request_aborted(req):
-                        if not _keep_aborted_moe(req):
+                        if not _keep_aborted_response(req):
                             _abort_request_publication(req)
                     elif not req.finished() and not req.is_retracted and not native_request(req):
                         # Only the already accepted prefix is stable. A verify
@@ -923,7 +930,7 @@ def install_scheduler_patch(
         original = getattr(Req, method)
 
         def reset(req, *args, _original=original, **kwargs):
-            req._relax_replay_keep_aborted_moe = False
+            req._relax_replay_keep_aborted_response = False
             _abort_request_publication(req)
             result = _original(req, *args, **kwargs)
             req._relax_replay_generation = getattr(req, "retraction_count", 0)
@@ -1007,7 +1014,7 @@ def _install_response_patch(owner: Callable) -> bool:
             ordinary = getattr(req, "_relax_replay_finish", None) or {}
             media = getattr(req, "_relax_replay_media", None)
             try:
-                if _request_aborted(req) and not _keep_aborted_moe(req):
+                if _request_aborted(req) and not _keep_aborted_response(req):
                     _abort_request_publication(req)
                     ordinary, media = {}, None
                 else:
@@ -1062,7 +1069,7 @@ def _install_response_patch(owner: Callable) -> bool:
                 continue
             if req is skip_req:
                 immediate.append(req)
-            elif _request_aborted(req) and not _keep_aborted_moe(req):
+            elif _request_aborted(req) and not _keep_aborted_response(req):
                 pending.pop(key, None)
                 _abort_request_publication(req)
                 immediate.append(req)

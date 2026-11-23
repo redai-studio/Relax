@@ -23,6 +23,7 @@ from .sglang import AGENTIC_R3_MM_PREFIX
 
 REQUEST_PREFIX = "relax-mm-"
 ATTEMPT_PREFIX = REQUEST_PREFIX + "attempt-"
+AGENTIC_MM_ATTEMPT_PREFIX = ATTEMPT_PREFIX + "agentic-"
 META_FIELD = "mm_embedding_refs"
 
 
