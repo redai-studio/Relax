@@ -424,6 +424,8 @@ class Controller:
             "polling_mode": self.config.polling_mode,
             "required_node_resource": required_node_resource,
         }
+        if (owner_timeout := getattr(self.config, "tq_owner_metadata_timeout", None)) is not None:
+            controller_config["owner_metadata_timeout"] = owner_timeout
         backend_config = self._resolve_tq_backend()
         if "SimpleStorage" in backend_config:
             backend_config["SimpleStorage"]["required_node_resource"] = required_node_resource

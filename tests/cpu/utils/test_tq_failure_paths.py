@@ -446,10 +446,10 @@ class _FakeOwner:
 
 @pytest.mark.parametrize("outcome", ["success", "timeout"])
 @pytest.mark.parametrize(
-    ("required_node_resource", "metadata_timeout"), [(None, 1), ("stable_cpu", 1), ("stable_cpu", -1)]
+    ("required_node_resource", "metadata_timeout"), [(None, None), ("stable_cpu", None), ("stable_cpu", -1)]
 )
 def test_owner_start_boundary(
-    monkeypatch: pytest.MonkeyPatch, outcome: str, required_node_resource: str | None, metadata_timeout: int
+    monkeypatch: pytest.MonkeyPatch, outcome: str, required_node_resource: str | None, metadata_timeout: int | None
 ) -> None:
     owner = _FakeOwner()
     stopped: list[Any] = []
@@ -457,9 +457,12 @@ def test_owner_start_boundary(
     actor_class.remote.return_value = owner
     options = MagicMock(return_value=actor_class)
     monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "options", options)
-    monkeypatch.setattr(tq_lifecycle.tq.controller, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", metadata_timeout)
+    # An ambient driver override must not take precedence over the Ray job.
+    monkeypatch.setattr(tq_lifecycle.tq.controller, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", -1)
     conf = _conf("MooncakeStore")
     conf["controller"]["required_node_resource"] = required_node_resource
+    if metadata_timeout is not None:
+        conf["controller"]["owner_metadata_timeout"] = metadata_timeout
     if outcome == "timeout":
         monkeypatch.setattr(
             tq_lifecycle.ray,
