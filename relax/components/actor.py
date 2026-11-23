@@ -21,7 +21,8 @@ from relax.engine.sft.runtime import (
 )
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
-from relax.utils.tq.lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client, clear_training_partition
+from relax.utils.training.intervals import should_save_checkpoint
 
 
 app = FastAPI()
@@ -200,7 +201,7 @@ class Actor(Base):
 
                 if did_train:
                     for partition_id in sft_partition_ids(self.config, local_step):
-                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                        run(clear_training_partition(self.data_system_client, partition_id))
                     self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -313,14 +314,8 @@ class Actor(Base):
 
     def _maybe_save_model(self) -> None:
         """Save model checkpoint if save interval is reached."""
-        if self.config.save is None or self.config.save_interval is None:
-            return
-
-        is_save_step = (self.step + 1) % self.config.save_interval == 0
-        is_final_step = (self.step + 1) == self.config.num_rollout
-
-        if self.config.rotate_ckpt or is_save_step or is_final_step:
-            self.actor_model.save_model(self.step, force_sync=is_final_step)
+        if should_save_checkpoint(self.config, self.step + 1):
+            self.actor_model.save_model(self.step, force_sync=self.step + 1 == self.config.num_rollout)
 
     def train(self, step: int, clear_data: bool = True) -> Dict[str, Any]:
         """Execute a single training step (for external control).
@@ -357,7 +352,7 @@ class Actor(Base):
                 # Only clear partition data if clear_data is True
                 if clear_data and did_train:
                     for partition_id in partition_ids:
-                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                        run(clear_training_partition(self.data_system_client, partition_id))
                     self._logger.info(f"Cleared data partitions: {partition_ids}")
                 elif clear_data:
                     self._logger.info(f"Skipped clearing partitions after skipped actor step: {partition_ids}")

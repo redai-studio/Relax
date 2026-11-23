@@ -36,6 +36,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_rm_mode, resident_sft_param_overlap_enabled, should_bypass_main_output_layer
+from relax.models.common.lora import finalize_lora_models
 from relax.utils import tracking_utils
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
@@ -84,14 +85,16 @@ from .model_provider import (
 logger = get_logger(__name__)
 
 
-def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
+def _finalize_model_grads_with_memory_release(
+    *args: Any, finalize_grads_func: Callable | None = None, **kwargs: Any
+) -> None:
     # Finalization itself can lazily initialize NCCL communicators (e.g. MoE
     # router bias reduction), before forward_backward_func returns to the
     # optimizer. Make unused activation cache available at that boundary too.
     memory_before = available_memory()
     device_module.empty_cache()
     logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
-    finalize_model_grads(*args, **kwargs)
+    (finalize_grads_func or finalize_model_grads)(*args, **kwargs)
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -504,7 +507,7 @@ def _configure_chunked_head_grad_sync(args: Namespace, model: Sequence[DDP]) -> 
     buckets."""
     if not (
         getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_chunked_logits", False)
+        and args.sft_chunked_logits
         and getattr(args, "recompute_loss_function", False)
         and getattr(args, "overlap_grad_reduce", False)
     ):
@@ -565,6 +568,7 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+    finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
@@ -574,15 +578,14 @@ def setup_model_and_optimizer(
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
     # the actual model modules to remove stale (orphaned) entries.
     if Envs.ENABLE_ROUTING_REPLAY:
-        from relax.utils.training.routing_replay import RoutingReplay
+        from relax.distributed.replay_manager.backend.megatron import RoutingReplay
 
         active_replays = []
         for model_chunk in model:
             for module in model_chunk.modules():
                 if hasattr(module, "routing_replay") and module.routing_replay is not None:
                     active_replays.append(module.routing_replay)
-        if active_replays:
-            RoutingReplay.all_routing_replays = active_replays
+        RoutingReplay.all_routing_replays = active_replays
 
     _patch_gdn_cu_seqlens_validation()
     if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
@@ -624,6 +627,9 @@ def setup_model_and_optimizer(
         config_overrides=_build_optimizer_config_overrides(args, config),
         use_gloo_process_groups=args.use_gloo_process_groups,
     )
+    from relax.utils.training.lora_grad_sync import exclude_replicated_expert_adapter_grads_from_norm
+
+    exclude_replicated_expert_adapter_grads_from_norm(optimizer, ep_rank=mpu.get_expert_model_parallel_rank())
     if skip_nonfinite:
         install_nonfinite_guard(optimizer, model, process_group=torch.distributed.group.WORLD)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -1004,6 +1010,7 @@ def forward_only(
             args.qkv_format,
             args.allgather_cp,
             is_vl_model,
+            model_chunk=model,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -1296,6 +1303,19 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
+    from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+    from relax.distributed.replay_manager.backend.megatron import RoutingReplay
+
+    bind_routing_replay = None
+    if (
+        (kinds := rollout_kinds(args))
+        and args.fully_async
+        and not args.hybrid
+        and getattr(model[0], "role", None) == "actor"
+    ):
+        consumer = replay_data_manager.register_consumer(kinds)
+        bind_routing_replay = consumer.streaming_binding(args, model, f"train_{rollout_id}")
+
     use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
     if use_indexer_replay:
         from relax.utils.training.indexer_replay import IndexerReplay
@@ -1394,14 +1414,14 @@ def train_one_step(
                 args.qkv_format,
                 args.allgather_cp,
                 is_vl_model,
+                model_chunk=model,
             )
+        if bind_routing_replay is not None:
+            bind_routing_replay(model, batch)
         note_microbatch_tokens(batch.get("total_lengths"))
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
-        if Envs.ENABLE_ROUTING_REPLAY:
-            old_stage = os.environ["ROUTING_REPLAY_STAGE"]
-            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
         # set in the SFT branch below; left as None for return_schedule_plan or
         # the non-SFT path so the original loss_function is used.
         lm_head_forward = None
@@ -1500,13 +1520,13 @@ def train_one_step(
                 fused_linear = (
                     head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
                 )
-                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False) and not fused_linear
+                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
                 mtp_output_layer_calls = (
                     0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
-                if getattr(args, "sft_chunked_logits", False) and (args.fp16 or args.bf16):
+                if args.sft_chunked_logits and (args.fp16 or args.bf16):
                     forward_kwargs["fp32_output"] = False
                 with _bypass_output_layer(
                     model,
@@ -1526,9 +1546,6 @@ def train_one_step(
                         output_tensor = model(**forward_kwargs)
                 else:
                     output_tensor = model(**forward_kwargs)
-
-        if Envs.ENABLE_ROUTING_REPLAY:
-            os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
         output_tensor = _unwrap_single_sequence_cp_output(output_tensor, batch)
 
@@ -1559,7 +1576,7 @@ def train_one_step(
     # Forward pass.
     use_streaming = (
         getattr(args, "use_dynamic_batch_size", False)
-        and getattr(args, "fully_async", False)
+        and args.fully_async
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
         and isinstance(data_iterator[0], StreamingTQIterator)
     )
@@ -1582,6 +1599,8 @@ def train_one_step(
     timers = straggler_timers("train", model, num_microbatches)
     if timers is not None:
         get_model_config(model[0]).timers = timers
+    if Envs.ENABLE_ROUTING_REPLAY:
+        forward_step = RoutingReplay.forward_stage()(forward_step)
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
@@ -1592,6 +1611,8 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    if bind_routing_replay is not None:
+        RoutingReplay.clear_all()
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
@@ -1785,11 +1806,18 @@ def train(
     if is_data_iterator:
         for iterator in data_iterator:
             iterator.reset()
+    elif len(data_iterator) > 1 and all(loader is data_iterator[0] for loader in data_iterator):
+        from itertools import tee
+
+        # The fixed TQ loader has one consuming cursor. VPP chunks must see the
+        # same physical rows, and get_batch rewrites each chunk's batch dict.
+        def chunk_batches(iterator):
+            for batch, meta in iterator:
+                yield batch.copy(), meta
+
+        data_iterator = [chunk_batches(it) for it in tee(iter(data_iterator[0]), len(data_iterator))]
     else:
-        data_iter = []
-        for iterator in data_iterator:
-            data_iter.append(iter(iterator))  # type: ignore
-        data_iterator = data_iter
+        data_iterator = [iter(loader) for loader in data_iterator]
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
@@ -1813,10 +1841,20 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
+    finalize_grads_func = finalize_model_grads
+    if any(getattr(param, "expert_parallel_replicated", False) for chunk in model for param in chunk.parameters()):
+        from megatron.bridge.peft.utils import (
+            enable_expert_parallel_grad_sync_in_finalize,
+            finalize_model_grads_with_expert_adapter_sync,
+        )
+
+        # Fused accumulation writes main_grad; remove the eager grad hooks before backward.
+        enable_expert_parallel_grad_sync_in_finalize(model)
+        finalize_grads_func = finalize_model_grads_with_expert_adapter_sync
     config.finalize_model_grads_func = (
-        _finalize_model_grads_with_memory_release
+        partial(_finalize_model_grads_with_memory_release, finalize_grads_func=finalize_grads_func)
         if getattr(args, "empty_unused_memory_level", 0) >= 1
-        else finalize_model_grads
+        else finalize_grads_func
     )
 
     pre_hook_enabled = False
@@ -2139,6 +2177,8 @@ def save(
         args.head_type = "critic_value_terminal_v1"
     elif getattr(args, "task_type", "causal_lm") == "seq_cls":
         args.head_type = "sequence_classification_v1"
+    elif args.task_type == "embedding":
+        args.head_type = "embedding_v1"
     else:
         args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):

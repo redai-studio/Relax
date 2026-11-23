@@ -100,7 +100,10 @@ def test_prune_stale_artifacts_releases_cached_candidate_images():
     recent_uri, *_ = ng.cache_candidate_image(torch.rand(3, 8, 12), "t2i", 4, 0, 0)
 
     ng.prune_stale_artifacts(
-        SimpleNamespace(artifact_root=None, generation_task="t2i", artifact_retention_rollouts=2), rollout_id=5
+        SimpleNamespace(
+            artifact_root=None, generation_task="t2i", artifact_retention_rollouts=2, sampling_config=None
+        ),
+        rollout_id=5,
     )
 
     assert ng.get_cached_candidate_image(old_uri) is None
@@ -138,6 +141,7 @@ def test_convert_samples_to_train_data_numeric_row_only():
         rewards_normalization=False,
         n_samples_per_prompt=2,
         grpo_std_normalization=False,
+        sampling_config=None,
     )
     samples = [
         _sample(0, 0, 7, 1.0),
@@ -175,6 +179,7 @@ def test_convert_samples_to_train_data_uses_normalized_advantages():
         rewards_normalization=True,
         n_samples_per_prompt=2,
         grpo_std_normalization=False,
+        sampling_config=None,
     )
     samples = [_sample(0, 0, 7, 1.0), _sample(0, 1, 7, 3.0)]
 
@@ -187,7 +192,7 @@ def test_convert_samples_to_train_data_accepts_processed_rewards(monkeypatch):
     from relax.utils import utils
 
     monkeypatch.setattr(utils, "post_process_rewards", lambda _args, _samples: [-1.0, 1.0])
-    args = SimpleNamespace(debug_train_only=True)
+    args = SimpleNamespace(debug_train_only=True, sampling_config=None)
     samples = [_sample(0, 0, 7, 1.0), _sample(0, 1, 7, 3.0)]
 
     row = ng.convert_samples_to_train_data(args, samples)
@@ -297,6 +302,126 @@ def test_read_eval_prompts_uses_record_metadata_without_extra_nesting(tmp_path):
     assert ng._native_generation_sample_id(samples[0], group_index=0, slot=0) == "prompt:pickapic_000001:sample:0"
 
 
+def test_art_evaluation_requests_only_images_and_scores_saved_candidates(monkeypatch, tmp_path):
+    import json
+
+    from PIL import Image
+
+    from relax.backends.sglang.diffusion_engine import SGLangNativeGenerationEngine
+    from relax.engine.rewards import generative
+
+    prompts = tmp_path / "eval.jsonl"
+    prompts.write_text(json.dumps({"prompt": "edit", "metadata": {"images": ["a.png"]}}) + "\n")
+    sampling = dict(algorithm="art", height=8, width=8, num_inference_steps=4, art={"train_step_indices": [0, 2]})
+    args = SimpleNamespace(
+        artifact_root=str(tmp_path),
+        generation_task="i2i",
+        generation_seed=42,
+        sampling_config=sampling,
+        model_adapter_path="relax.models.sensenova.adapter.SenseNovaU1ImageEditAdapter",
+        eval_datasets=[SimpleNamespace(name="heldout", path=str(prompts))],
+        n_samples_per_eval_prompt=2,
+        reward_component_weights={"ocr": 1.0},
+        input_key=None,
+    )
+    engine = SGLangNativeGenerationEngine(args, rank=0)
+    monkeypatch.setattr(ng, "_get_engines", lambda *_: [engine])
+    monkeypatch.setattr(ng, "_log_eval_perf", lambda *_: None)
+    seeds = []
+
+    def dispatch(_engines, groups):
+        mapped = []
+        for group in groups:
+            results = []
+            for request in group:
+                assert request["rollout"] and request["rollout_sde_type"] == "ode"
+                assert request["extra_sampling_params"]["rollout_options"]["capture"] == "terminal"
+                assert not request["rollout_return_step_indices"]
+                assert request["rollout_return_dit_trajectory"] is request["rollout_return_denoising_env"] is False
+                seeds.append(request["seed"])
+                results.append(
+                    engine._map_responses(
+                        [
+                            {
+                                "seed": request["seed"],
+                                "generated_output": torch.full((1, 8, 8, 3), 255, dtype=torch.uint8),
+                            }
+                        ],
+                        request,
+                    )
+                )
+            mapped.append(results)
+        return mapped
+
+    def score(_args, samples):
+        assert len(samples) == 2
+        for sample in samples:
+            output = sample.train_metadata["manifest"]["outputs"][0]
+            with Image.open(output["uri"]) as image:
+                assert image.size == (8, 8) and image.getpixel((0, 0)) == (255, 255, 255)
+        return {"ocr": [0.75, 0.5]}
+
+    monkeypatch.setattr(ng, "_dispatch_groups", dispatch)
+    monkeypatch.setattr(generative, "score_samples", score)
+    result = ng.evaluate_rollout(args, 3)
+    assert result.data == {"heldout": {"rewards": [0.75, 0.5]}}
+    assert ng.evaluate_rollout(args, 9).data == result.data
+    assert seeds[:2] == seeds[2:]
+    assert len(set(seeds)) == 2
+    for rollout_id in (3, 9):
+        assert len(list((tmp_path / "eval" / "i2i" / f"rollout_{rollout_id:07d}").glob("*.png"))) == 2
+    assert sampling["art"]["train_step_indices"] == [0, 2]
+
+
+@pytest.mark.parametrize("driver_xt", [True, False])
+def test_qwen_eval_noise_is_fixed_across_rounds_and_distinct_across_datasets(monkeypatch, tmp_path, driver_xt):
+    from relax.engine.rewards import generative
+    from relax.models.qwen_image.adapter import QwenImageAdapter
+
+    prompts = tmp_path / "eval.jsonl"
+    prompts.write_text('{"prompt":"draw", "metadata":{"prompt_id":"p"}}\n')
+    sampling = dict(height=64, width=64, num_inference_steps=4, sde_indices=[1, 2], eta=0.8, driver_xt=driver_xt)
+    args = SimpleNamespace(
+        artifact_root=str(tmp_path),
+        generation_task="t2i",
+        generation_seed=42,
+        sampling_config=sampling,
+        model_adapter_path="relax.models.qwen_image.adapter.QwenImageAdapter",
+        eval_datasets=[SimpleNamespace(name=name, path=str(prompts)) for name in ("a", "b")],
+        n_samples_per_eval_prompt=2,
+        reward_component_weights={"ocr": 1.0},
+        input_key=None,
+    )
+    captured = []
+    monkeypatch.setattr(ng, "_get_engines", lambda *_: [object()])
+    monkeypatch.setattr(ng, "_log_eval_perf", lambda *_: None)
+    monkeypatch.setattr(generative, "score_samples", lambda _args, rows: {"ocr": [1.0] * len(rows)})
+
+    def dispatch(_engines, groups):
+        captured.extend(request for group in groups for request in group)
+        return [[{"generated_output": torch.zeros(3, 64, 64)} for request in group] for group in groups]
+
+    monkeypatch.setattr(ng, "_dispatch_groups", dispatch)
+    assert ng.evaluate_rollout(args, 3).data == ng.evaluate_rollout(args, 9).data
+    first, second = captured[:4], captured[4:]
+    for left, right in zip(first, second):
+        assert left["seed"] == right["seed"]
+        assert left["extra_sampling_params"] == right["extra_sampling_params"]
+    assert len({request["seed"] for request in first}) == 4
+    if driver_xt:
+        assert len({request["extra_sampling_params"]["initial_noise_group_ids"][0] for request in first}) == 4
+    # Training retains round-dependent initial noise identities.
+    sample = Sample(prompt="draw", index=0)
+    requests = [
+        QwenImageAdapter().build_rollout_request(sample, {**sampling, "driver_xt": True, "_rollout_id": r}, 42)
+        for r in (3, 9)
+    ]
+    assert (
+        requests[0]["extra_sampling_params"]["initial_noise_group_ids"]
+        != requests[1]["extra_sampling_params"]["initial_noise_group_ids"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # DP work sharding (design doc 3.1)
 # ---------------------------------------------------------------------------
@@ -327,7 +452,7 @@ def _write_two_groups(tmp_path, group_size=4, shared_conditions=False):
         "advantages": torch.tensor([g * 100 + s for g in (0, 1) for s in range(group_size)]).float(),
         "skip_optimizer_step": torch.zeros(2 * group_size, dtype=torch.long),
     }
-    args = SimpleNamespace(artifact_root=str(tmp_path), generation_task="t2i")
+    args = SimpleNamespace(artifact_root=str(tmp_path), generation_task="t2i", sampling_config=None)
     return args, rows
 
 
@@ -627,7 +752,9 @@ def test_prune_stale_artifacts_keeps_the_retention_window(tmp_path):
     shared volume and the run dies on an unrelated write error.
     """
     root = str(tmp_path)
-    args = SimpleNamespace(artifact_root=root, generation_task="t2i", artifact_retention_rollouts=2)
+    args = SimpleNamespace(
+        artifact_root=root, generation_task="t2i", artifact_retention_rollouts=2, sampling_config=None
+    )
     dirs = {r: _touch_rollout_dir(root, "t2i", r) for r in range(6)}
     eval_dir = _touch_rollout_dir(os.path.join(root, "eval"), "t2i", 1)
 
@@ -642,13 +769,19 @@ def test_prune_stale_artifacts_can_be_disabled_and_tolerates_a_missing_root(tmp_
     root = str(tmp_path)
     dirs = {r: _touch_rollout_dir(root, "t2i", r) for r in range(3)}
     ng.prune_stale_artifacts(
-        SimpleNamespace(artifact_root=root, generation_task="t2i", artifact_retention_rollouts=0), rollout_id=99
+        SimpleNamespace(
+            artifact_root=root, generation_task="t2i", artifact_retention_rollouts=0, sampling_config=None
+        ),
+        rollout_id=99,
     )
     assert all(os.path.exists(p) for p in dirs.values())
     # A root that was never written to must not raise on the first rollout.
     ng.prune_stale_artifacts(
         SimpleNamespace(
-            artifact_root=os.path.join(root, "nope"), generation_task="t2i", artifact_retention_rollouts=1
+            artifact_root=os.path.join(root, "nope"),
+            generation_task="t2i",
+            artifact_retention_rollouts=1,
+            sampling_config=None,
         ),
         rollout_id=7,
     )

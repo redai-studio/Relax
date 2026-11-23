@@ -45,12 +45,15 @@ from relax.agentic.stage_recorder import (
     StageRecorder,
 )
 from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
+from relax.distributed.replay_manager import replay_data_manager
+from relax.distributed.replay_manager.producer import PendingSampleWrite
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.tq.lifecycle import clear_training_partition
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -74,7 +77,8 @@ class _StepContext:
     rollout_id: int
     final_backfill: bool
     output_groups: List[List[Sample]] = field(default_factory=list)
-    tq_put_tasks: List[asyncio.Task[None]] = field(default_factory=list)
+    # Each task owns its groups once it starts; until then the step owns them.
+    tq_put_tasks: dict[asyncio.Task[None], list[GroupExport]] = field(default_factory=dict)
     progress: Any = None
     scored: int = 0
     prepared: int = 0
@@ -139,12 +143,14 @@ async def _run_group(
             operation=operation,
         )
 
+    collect = asyncio.create_task(runtime_domain.collect_group(stream))
+    handed_off = False
     try:
         if requires_complete_group:
-            group = await runtime_domain.collect_group(stream)
+            group = await collect
         else:
             tasks = (
-                asyncio.create_task(runtime_domain.collect_group(stream)),
+                collect,
                 asyncio.create_task(
                     reward_domain.score_sessions(stream, observe_reward=observe_reward)
                     if stage_recorder is not None
@@ -223,11 +229,11 @@ async def _run_group(
             if observation is not None:
                 observation.terminal_drop_recorded = True
             return None
-        if opd_manager is None:
-            return scored_group
-        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+        if opd_manager is not None:
+            from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
-        await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
+            await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
+        handed_off = True
         return scored_group
     except BaseException as error:
         reward_domain.discard_group_progress(stream)
@@ -244,6 +250,10 @@ async def _run_group(
                 category="infra" if isinstance(error, RuntimeGroupError) else "execution",
             )
         raise
+    finally:
+        if not handed_off and collect.done() and not collect.cancelled() and collect.exception() is None:
+            if (group := collect.result()) is not None:
+                await replay_data_manager.discard_async(group.samples)
 
 
 class AgenticResidentPipeline:
@@ -347,6 +357,8 @@ class AgenticResidentPipeline:
             await stop_sglang_profile(self.args, rollout_id)
             profile_stopped = True
             rollout_time = time.monotonic() - started_at
+            metrics["perf/rollout_time"] = rollout_time
+            metrics["perf/rollout_accepted_samples"] = len(samples)
             if samples:
                 last_sample = samples[-1]
                 logger.info(
@@ -367,7 +379,7 @@ class AgenticResidentPipeline:
                 if self._data_system_client is None:
                     raise RuntimeError("Agentic debug rollout cleanup requires a data system client.")
                 partition_rollout_id = rollout_id - 1 if final_backfill else rollout_id
-                await self._data_system_client.async_clear_partition(partition_id=f"train_{partition_rollout_id}")
+                await clear_training_partition(self._data_system_client, f"train_{partition_rollout_id}")
             output.metrics = metrics
             logger.info(
                 format_agentic_event(
@@ -496,8 +508,8 @@ class AgenticResidentPipeline:
 
         for task in tuple(context.tq_put_tasks):
             if task.done():
-                context.tq_put_tasks.remove(task)
                 task.result()
+                del context.tq_put_tasks[task]
         self.prepare_domain.collect()
 
         self._collect_finalized_groups()
@@ -546,12 +558,15 @@ class AgenticResidentPipeline:
         partition_id, groups, is_last = batch
         if self._stage_recorder.enabled:
             context.observed_group_ids.update(group.group_id for group in groups)
-        task = asyncio.create_task(
-            self._transfer_and_record(context, partition_id, groups, is_last),
-            name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups",
-        )
-        task.add_done_callback(lambda _task: self._changed.set())
-        context.tq_put_tasks.append(task)
+        pending_groups = list(groups)
+
+        async def transfer() -> None:
+            pending_groups.clear()
+            await self._transfer_and_record(context, partition_id, groups, is_last)
+
+        task = asyncio.create_task(transfer(), name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups")
+        context.tq_put_tasks[task] = pending_groups
+        task.add_done_callback(lambda _: self._changed.set())
 
     async def _transfer_and_record(
         self,
@@ -570,15 +585,12 @@ class AgenticResidentPipeline:
         of them.
         """
 
-        put_started = False
-
-        def on_put_started() -> None:
-            nonlocal put_started
-            put_started = True
+        samples = [sample for group in groups for sample in group.samples]
+        handoff = PendingSampleWrite(replay_data_manager, samples)
 
         try:
             await self._stage_recorder.begin_samples(
-                [sample for group in groups for sample in group.samples],
+                samples,
                 rollout_id=context.rollout_id,
                 partition_id=partition_id,
                 stage="transfer",
@@ -593,10 +605,11 @@ class AgenticResidentPipeline:
                 partition_id=partition_id,
                 data_system_client=self._data_system_client,
                 is_last=is_last,
-                on_put_started=on_put_started,
+                on_put_started=handoff.mark_started,
             )
         except BaseException as error:
-            if put_started:
+            await handoff.discard_if_unsent(error)
+            if handoff.started:
                 event = self._stage_recorder.record_transfer_unknown(
                     groups,
                     rollout_id=context.rollout_id,
@@ -688,7 +701,14 @@ class AgenticResidentPipeline:
             "agentic-generation-pause",
         )
         retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
+        retain_prepared = (
+            self.args.agentic_prelaunch
+            and not context.final_backfill
+            and context.rollout_id + 1 < self.args.num_rollout
+        )
         if not retain_resident_tail:
+            if not retain_prepared:
+                await self.prepare_domain.discard_step()
             await finish_before_cancellation(
                 self._cancel_active_group_tasks(
                     rollout_id=context.rollout_id,
@@ -703,8 +723,17 @@ class AgenticResidentPipeline:
             # its remaining TQ batches. Reward-inflight Groups stay resident.
             await self._seal_dynamic_partition(context)
 
+        if retain_resident_tail and not self.args.fully_async and context.rollout_id + 1 >= self.args.num_rollout:
+            # The final partial step has no next lease for prepared work. Its
+            # Runtime tail is still owned until the normal pipeline shutdown.
+            await self.prepare_domain.discard_step()
+
         await self.runtime_domain.trim_memory()
-        return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
+        return RolloutFnTrainOutput(
+            samples=context.output_groups,
+            metrics={},
+            partition_complete=(self.transfer_domain.total_debt == 0) if self.args.fully_async else None,
+        )
 
     async def _seal_dynamic_partition(self, context: _StepContext) -> None:
         """Seal with the DP-aligned FIFO prefix of completed Group tasks."""
@@ -730,9 +759,8 @@ class AgenticResidentPipeline:
     async def _lease_prepared_groups(self, context: _StepContext) -> None:
         """Open generation for the ready FIFO prefix visible at this check.
 
-        Each ready task already owns a Shard-resident Group whose Sessions have
-        crossed the first-IR barrier. Leasing changes ownership to Runtime and
-        opens its generation gate.
+        Each ready task owns a fully registered Group. Leasing opens ready
+        members' generation gates; siblings may reach their first IR later.
         """
 
         for stream, teacher_id, response_keys in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
@@ -787,16 +815,16 @@ class AgenticResidentPipeline:
         # have stopped; the cancellation helper records all successful results.
         self._finalized_groups.extend(self.transfer_domain.pending_groups())
         first_error: Optional[BaseException] = None
-        context = self._active_step
-        tq_put_tasks: Tuple[asyncio.Task[None], ...] = ()
-        if context is not None:
-            tq_put_tasks = tuple(context.tq_put_tasks)
-        for task in tq_put_tasks:
+        tq_put_tasks = self._active_step.tq_put_tasks if self._active_step is not None else {}
+        tasks = tuple(tq_put_tasks)
+        for task in tasks:
             task.cancel()
-        for outcome in await asyncio.gather(*tq_put_tasks, return_exceptions=True):
+        for outcome in await asyncio.gather(*tasks, return_exceptions=True):
             if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
                 first_error = outcome
                 break
+        for task in tasks:
+            self._finalized_groups.extend(tq_put_tasks.pop(task, []))
 
         self.transfer_domain.clear()
         for cleanup in (
@@ -837,6 +865,7 @@ class AgenticResidentPipeline:
         self._finalized_groups.extend(outcome for outcome in outcomes if isinstance(outcome, GroupExport))
         groups = tuple(self._finalized_groups)
         self._finalized_groups.clear()
+        await replay_data_manager.discard_async([sample for group in groups for sample in group.samples])
         if rollout_id is None:
             rollout_id = self._active_step.rollout_id if self._active_step is not None else -1
         if self._stage_recorder.enabled:

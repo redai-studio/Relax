@@ -332,14 +332,8 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs | dict, parent_pid: int):
-    """Top-level picklable ``multiprocessing.Process`` target that applies the
-    SGLang patches, each gated by its own env flag so any combination is valid:
-
-    - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
-    """
+def _launch_server_with_patches(server_args: ServerArgs | dict, parent_pid: int, reference_publication: bool = False):
+    """Launch the server with the capture hooks configured by its engine."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.utils import kill_itself_when_parent_died
 
@@ -351,7 +345,15 @@ def _launch_server_with_patches(server_args: ServerArgs | dict, parent_pid: int)
 
     if isinstance(server_args, dict):
         server_args = ServerArgs(**server_args)
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+    if reference_publication:
+        from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
+
+        launch_server(
+            server_args,
+            run_scheduler_process_func=run_reference_scheduler,
+            run_detokenizer_process_func=run_reference_detokenizer,
+        )
+    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -391,7 +393,7 @@ class _BoundServerProcess(subprocess.Popen):
         return self.poll() is None
 
 
-def _start_bound_teacher(server_args: dict, gpu_ids: list[int]) -> _BoundServerProcess:
+def _start_bound_teacher(server_args: dict, gpu_ids: list[int], *, reference_publication: bool) -> _BoundServerProcess:
     devices = [str(device) for device in gpu_ids]
     inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
     if (
@@ -406,18 +408,19 @@ def _start_bound_teacher(server_args: dict, gpu_ids: list[int]) -> _BoundServerP
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(devices))
     entry = (
         "import multiprocessing, pickle, sys; "
-        "sys.path[:], args, parent = pickle.load(sys.stdin.buffer); "
+        "sys.path[:], launch_args = pickle.load(sys.stdin.buffer); "
         "multiprocessing.set_start_method('spawn', force=True); "
         "from relax.backends.sglang.sglang_engine import _launch_server_with_patches; "
-        "_launch_server_with_patches(args, parent)"
+        "_launch_server_with_patches(*launch_args)"
     )
     with tempfile.TemporaryFile() as payload:
-        pickle.dump((sys.path, {**server_args, "base_gpu_id": 0, "gpu_id_step": 1}, os.getpid()), payload)
+        launch_args = ({**server_args, "base_gpu_id": 0, "gpu_id_step": 1}, os.getpid(), reference_publication)
+        pickle.dump((sys.path, launch_args), payload)
         payload.seek(0)
         return _BoundServerProcess([sys.executable, "-c", entry], env=env, stdin=payload)
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -432,7 +435,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
+    p = multiprocessing.Process(
+        target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
+    )
     p.start()
 
     if server_args.node_rank != 0:
@@ -607,6 +612,17 @@ class SGLangEngine(RayActor):
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
+        reference_publication = False
+        if Envs.RELAX_REPLAY_REFERENCES:
+            from relax.distributed.replay_manager.backend.sglang import configure_engine_publication
+
+            reference_publication = configure_engine_publication(
+                self.args,
+                server_args_dict,
+                self.rank,
+                external=bool(init_external_kwargs or self.args.rollout_external),
+            )
+
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
@@ -625,7 +641,7 @@ class SGLangEngine(RayActor):
             self._sync_nextn_draft = server_args_dict.get(
                 "speculative_algorithm"
             ) == "NEXTN" and _uses_target_checkpoint_for_draft(server_args_dict)
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, reference_publication=reference_publication)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
@@ -690,7 +706,9 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router()
 
-    def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
+    def _init_normal(
+        self, server_args_dict, *, apply_policy_load_plan: bool = True, reference_publication: bool = False
+    ):
         if apply_policy_load_plan:
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
@@ -740,7 +758,9 @@ class SGLangEngine(RayActor):
         ):
             self._router_bootstrap_port = None
             self._router_dp_size = 1
-            self.process = _start_bound_teacher(server_args_dict, self.server_gpu_ids)
+            self.process = _start_bound_teacher(
+                server_args_dict, self.server_gpu_ids, reference_publication=reference_publication
+            )
             host = {"0.0.0.0": "127.0.0.1", "[::]": "[::1]", "": "127.0.0.1"}.get(self.server_host, self.server_host)
             scheme = "https" if server_args_dict.get("ssl_certfile") else "http"
             url = f"{scheme}://{host}:{self.server_port}"
@@ -751,7 +771,7 @@ class SGLangEngine(RayActor):
                 server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
             )
             self._router_dp_size = server_args.dp_size
-            self.process = launch_server_process(server_args)
+            self.process = launch_server_process(server_args, reference_publication=reference_publication)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False

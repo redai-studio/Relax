@@ -2,6 +2,7 @@
 
 """Unit tests for SFT producer component (loop-only, no Ray runtime)."""
 
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -402,12 +403,16 @@ def test_sft_remote_batch_producer_resolves_model_on_its_node(monkeypatch):
     monkeypatch.setattr(sft_module, "attach_tq_client", MagicMock(return_value=fake_client))
     monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", _prepare_model)
     monkeypatch.setattr(sft_module.AutoTokenizer, "from_pretrained", _load_tokenizer)
-    monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
+    processor_pool = MagicMock()
+    monkeypatch.setattr(sft_module, "ProcessorPool", processor_pool)
     monkeypatch.setattr(sft_module, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
     create_dataset = MagicMock(return_value=fake_dataset)
     monkeypatch.setattr(sft_module, "_create_sft_train_dataset", create_dataset)
 
     args = _make_args(global_batch_size=2)
+    args.video_fps = 1.25
+    args.video_fps_max_frames = 6
+    args.video_max_token_num = 20
     producer_cls = sft_module._SFTBatchProducerActor.__ray_metadata__.modified_class
     producer = producer_cls(args, shard_id=0, num_shards=2, prefetch_num_workers=1)
 
@@ -417,6 +422,12 @@ def test_sft_remote_batch_producer_resolves_model_on_its_node(monkeypatch):
     assert args.hf_checkpoint == "/dev/shm/resolved-sft-model"
     assert state["train_size"] == 4
     assert create_dataset.call_args.kwargs["task_type"] == "causal_lm"
+    media_config = processor_pool.call_args.kwargs["multimodal_config"]
+    assert (media_config.video_fps, media_config.video_fps_max_frames, media_config.video_max_token_num) == (
+        1.25,
+        6,
+        20,
+    )
 
 
 def test_sft_remote_batch_producer_restricts_train_pool_for_eval_size(monkeypatch):
@@ -576,9 +587,11 @@ async def test_sft_remote_batch_producer_reprimes_before_second_step(monkeypatch
 
 
 def test_sft_remote_eval_size_initializes_eval_dataset_without_train_overlap(monkeypatch):
+    from relax.components import sft as sft_module
     from relax.components.sft import SFT
 
     fake_ds, _ = _patch_pipeline_dependencies(monkeypatch, n_samples=10)
+    processor_pool = sft_module.ProcessorPool
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
     monkeypatch.setattr("relax.components.sft.ray.is_initialized", lambda: True)
     monkeypatch.setattr("relax.components.sft.attach_tq_client", MagicMock())
@@ -586,6 +599,9 @@ def test_sft_remote_eval_size_initializes_eval_dataset_without_train_overlap(mon
     args = _make_args(global_batch_size=2)
     args.sft_async_prepack = True
     args.eval_size = 0.2
+    args.video_fps = 1.25
+    args.video_fps_max_frames = 6
+    args.video_max_token_num = 20
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -609,6 +625,12 @@ def test_sft_remote_eval_size_initializes_eval_dataset_without_train_overlap(mon
     assert sft._eval_indices == eval_indices
     fake_ds.restrict_training_indices.assert_not_called()
     assert [sample.source_idx for sample in sft._build_eval_batches()] == list(eval_indices)
+    media_config = processor_pool.call_args.kwargs["multimodal_config"]
+    assert (media_config.video_fps, media_config.video_fps_max_frames, media_config.video_max_token_num) == (
+        1.25,
+        6,
+        20,
+    )
 
 
 @pytest.mark.parametrize("remote_pipeline", [False, True])
@@ -627,6 +649,9 @@ def test_sft_independent_eval_propagates_rank_image_preprocessing(monkeypatch, r
     args.eval_prompt_data = "/fake/eval.jsonl"
     args.multimodal_keys = {"image": "images"}
     args.sft_image_preprocess_on_rank = True
+    args.sft_mask_reasoning = True
+    args.sft_loss_last_turn_only = True
+    args.sft_ignore_empty_think = True
 
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
@@ -652,6 +677,9 @@ def test_sft_independent_eval_propagates_rank_image_preprocessing(monkeypatch, r
     eval_kwargs = dataset_calls[-1]
     assert eval_kwargs["path"] == ["/fake/eval.jsonl"]
     assert eval_kwargs["image_preprocess_on_rank"] is True
+    assert all(call["loss_mask_reasoning"] is True for call in dataset_calls)
+    assert all(call["loss_last_turn_only"] is True for call in dataset_calls)
+    assert all(call["loss_ignore_empty_think"] is True for call in dataset_calls)
 
 
 @pytest.mark.asyncio
@@ -965,3 +993,96 @@ async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
     await sft._async_run()
 
     sft._produce_one_step.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "config_values",
+    [
+        {"model_type": "llama"},
+        {"model_type": "custom_unregistered", "auto_map": {"AutoConfig": "custom.Config"}},
+        {},
+    ],
+)
+def test_pad_token_resolution_propagates_invalid_config_errors(monkeypatch, config_values):
+    from relax.components import sft
+
+    error = ValueError("invalid model configuration")
+
+    def invalid_config(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(sft.AutoConfig, "from_pretrained", invalid_config)
+    monkeypatch.setattr(sft.PretrainedConfig, "get_config_dict", lambda *a, **kw: (config_values, {}))
+    with pytest.raises(ValueError) as actual:
+        sft._resolve_pad_token_ids_from_config("unused")
+    assert actual.value is error
+
+
+def test_pad_token_resolution_supports_unregistered_model_type(tmp_path):
+    from relax.components.sft import _resolve_pad_token_ids_from_config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "custom_model_not_registered_with_transformers",
+                "image_token_id": 101,
+                "video_token_id": 102,
+                "audio_token_id": 103,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _resolve_pad_token_ids_from_config(str(tmp_path)) == frozenset({101, 102, 103})
+
+
+def test_pad_token_resolution_keeps_registered_config_aliases(monkeypatch):
+    from transformers.models.gemma3.configuration_gemma3 import Gemma3Config
+
+    from relax.components import sft
+
+    config = Gemma3Config()
+    assert "image_token_id" not in config.to_dict()
+    monkeypatch.setattr(sft.AutoConfig, "from_pretrained", lambda *args, **kwargs: config)
+
+    assert sft._resolve_pad_token_ids_from_config("unused") == frozenset({262144})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n_real,pre_shifted", [(3, False), (5, True)])
+async def test_causal_eval_keeps_every_real_sample_and_zero_masks_padding(n_real, pre_shifted):
+    from relax.components.sft import SFT
+
+    samples = [_make_processed(i) for i in range(n_real)]
+    for sample in samples:
+        sample.tokens = sample.tokens + sample.source_idx * 10
+        if pre_shifted:
+            sample.pre_shifted_labels = torch.where(sample.loss_mask.bool(), sample.tokens, -100)
+    original_masks = [sample.loss_mask.clone() for sample in samples]
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = SimpleNamespace(
+        loss_type="sft",
+        eval_size=n_real,
+        eval_interval=1,
+        global_batch_size=4,
+        task_type="causal_lm",
+        multimodal_keys=None,
+    )
+    sft.step = 0
+    sft._logger_instance = MagicMock()
+    sft.data_system_client = MagicMock(async_put=AsyncMock())
+    sft._build_eval_batches = MagicMock(return_value=samples)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+    await sft._maybe_produce_eval(1)
+    chunks = [call.kwargs["data"] for call in sft.data_system_client.async_put.call_args_list]
+    masks = [mask for chunk in chunks for mask in chunk["loss_masks"]]
+    tokens = [row for chunk in chunks for row in chunk["tokens"]]
+    assert all(len(chunk["tokens"]) == 4 for chunk in chunks)
+    assert len(chunks) == (n_real + 3) // 4
+    assert all(torch.equal(tokens[i], samples[i].tokens) for i in range(n_real))
+    assert sum(int(mask.sum()) for mask in masks) == sum(int(mask.sum()) for mask in original_masks)
+    assert all(not mask.any() for mask in masks[n_real:])
+    assert all(torch.equal(sample.loss_mask, mask) for sample, mask in zip(samples, original_masks, strict=True))
+    if pre_shifted:
+        labels = [row for chunk in chunks for row in chunk["pre_shifted_labels"]]
+        assert all(torch.all(row == -100) for row in labels[n_real:])

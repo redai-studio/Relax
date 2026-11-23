@@ -593,6 +593,7 @@ class SFTStreamingDataset:
         classification_sentinel_token_id: int | None = None,
         loss_last_turn_only: bool = False,
         loss_ignore_empty_think: bool = False,
+        loss_mask_reasoning: bool = False,
         training_mode: str = "sft",
         cpt_template: str = "raw",
         line_offsets_cache: dict | None = None,
@@ -619,6 +620,7 @@ class SFTStreamingDataset:
                     apply_chat_template_kwargs if cpt_template != "multimodal" else None,
                     loss_last_turn_only,
                     loss_ignore_empty_think,
+                    loss_mask_reasoning,
                 )
             ):
                 raise ValueError("CPT does not support chat, label, multimodal, or selective-loss options")
@@ -649,6 +651,8 @@ class SFTStreamingDataset:
         self.task_type = task_type
         self.num_labels = num_labels
         self.problem_type = problem_type
+        if loss_mask_reasoning and task_type != "causal_lm":
+            raise ValueError("Reasoning masking requires task_type=causal_lm")
         self.classification_sentinel_token_id = classification_sentinel_token_id
         if self.task_type == "seq_cls":
             valid_problem_types = {"single_label_classification", "multi_label_classification"}
@@ -667,6 +671,7 @@ class SFTStreamingDataset:
                 raise ValueError("SFTStreamingDataset seq_cls capacity must be >= 2")
         self.loss_last_turn_only = loss_last_turn_only
         self.loss_ignore_empty_think = loss_ignore_empty_think
+        self.loss_mask_reasoning = loss_mask_reasoning
         self._image_transport = ImageReferenceTransport(image_preprocess_on_rank)
 
         valid_strategies = {"skip", "keep", "truncate_left", "truncate_right", "custom"}
@@ -1103,6 +1108,7 @@ class SFTStreamingDataset:
                 apply_chat_template_kwargs=self.apply_chat_template_kwargs,
                 last_turn_only=self.loss_last_turn_only,
                 ignore_empty_think=self.loss_ignore_empty_think,
+                mask_reasoning=self.loss_mask_reasoning,
             )
         n = int(short_ids.shape[0])
         effective_n = n + 1 if self.task_type == "seq_cls" else n

@@ -2,12 +2,32 @@
 """Install the Qwen TP4 optimization recipe."""
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from relax.utils.data import wholepack_policy
 
 
+if TYPE_CHECKING:
+    from torch import Tensor
+
+
 ENTRY = "relax.models.qwen3_5.recipe.before_step"
+
+
+def keep_within_tp4_dispatch_limit(
+    *, tokens: "Tensor", loss_mask: "Tensor", capacity: int, idx: int
+) -> tuple["Tensor", "Tensor"]:
+    """Keep oversize singletons that fit the TP4 ExpandedManager after image
+    expansion."""
+    # The SFT callback receives the packing budget as capacity. DeepEP's hard
+    # limit is independently fixed at 131072 rows per rank in deepep_expanded.py.
+    limit = 4 * 131072
+    if tokens.shape[0] > limit:
+        raise ValueError(
+            f"SFT sample idx={idx}: expanded length {tokens.shape[0]} exceeds the TP4 DeepEP limit of "
+            f"{limit} tokens (packing budget {capacity})"
+        )
+    return tokens, loss_mask
 
 
 def enabled(args: Any) -> bool:
@@ -30,10 +50,15 @@ def _check_args(args: Any) -> None:
     assert padding > 0 and args.max_tokens_per_gpu > 0 and args.max_tokens_per_gpu % padding == 0
     assert args.tensor_model_parallel_size == 4
     assert args.hidden_size == 2048 and args.num_experts == 256
-    assert args.bf16 and args.use_distributed_optimizer and args.sequence_parallel
+    assert args.bf16 and args.sequence_parallel
     assert not getattr(args, "use_megatron_fsdp", False)
-    assert getattr(args, "use_precision_aware_optimizer", False)
-    assert getattr(args, "optimizer_cpu_offload", False)
+    if getattr(args, "optimizer", None) == "muon":
+        assert args.use_distributed_optimizer or getattr(args, "use_layer_wise_distributed_optimizer", False)
+        assert not args.use_precision_aware_optimizer and not args.optimizer_cpu_offload
+    else:
+        assert args.use_distributed_optimizer
+        assert getattr(args, "use_precision_aware_optimizer", False)
+        assert getattr(args, "optimizer_cpu_offload", False)
     assert args.optimizer_offload_fraction == 0.0
 
 
@@ -97,7 +122,12 @@ def before_step(args: Any, rollout_id: int, step_id: int, model: list, optimizer
     assert not any(chunk.ddp_config.check_for_nan_in_grad for chunk in model)
     args._selective_loss_head = args._qwen_fused_head = True
     prime_expert_communicators(args, model)
-    install_norm_guard(args, optimizer)
+    if getattr(args, "optimizer", None) == "muon":
+        # Megatron clips Muon gradients; Relax checks for nonfinite values before updating any parameters.
+        if not getattr(optimizer, "_relax_nonfinite_guard_installed", False):
+            raise RuntimeError("The optimized Muon recipe requires RELAX_SKIP_NONFINITE_GRAD=1")
+    else:
+        install_norm_guard(args, optimizer)
     _ACTIVE = True
     install_ce_launches()
     import importlib.util

@@ -53,6 +53,43 @@ logger = get_logger(__name__)
 EPHEMERAL_FLOOR = 32768  # Linux default ephemeral range starts here.
 
 
+@pytest.mark.parametrize("gpus_per_engine", [4, 16], ids=["independent-tp4", "two-node-tp16"])
+def test_adjacent_engine_ranks_allocate_ports_on_their_own_nodes(patch_ray_get, gpus_per_engine):
+    from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
+
+    def engine_on(host, first_free_port):
+        engine = make_mock_engine()
+        engine._get_current_node_ip_and_free_port.remote.side_effect = lambda start_port=10000, consecutive=1: (
+            AwaitableValue((host, max(first_free_port, start_port)))
+        )
+        return engine
+
+    host_a, host_b = "192.0.2.1", "192.0.2.2"
+    args = SimpleNamespace(num_gpus_per_node=8, rollout_num_gpus_per_engine=gpus_per_engine, sglang_dp_size=1)
+    ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
+        args=args,
+        rollout_engines=[
+            (3, engine_on(host_a, 18000)),
+            (4, engine_on(host_b, 19000)),
+            (5, engine_on(host_a, 18000)),
+            (6, engine_on(host_b, 19000)),
+        ],
+        rank_offset=3,
+        worker_type="prefill",
+    )
+
+    assert [ports[rank]["host"] for rank in (3, 4)] == [host_a, host_b]
+    for rank, first_port in [(3, 18000), (4, 19000)]:
+        assert ports[rank]["port"] == first_port
+        assert ports[rank]["nccl_port"] == first_port + 1
+        assert ports[rank]["disaggregation_bootstrap_port"] == first_port + 2
+    assert ports[3]["dist_init_addr"] == f"{host_a}:18003"
+    assert ports[4]["dist_init_addr"] == (f"{host_b}:19003" if gpus_per_engine == 4 else ports[3]["dist_init_addr"])
+    # The next engine on each host must skip the first engine's reserved ports.
+    assert ports[5]["port"] == 18003 + 31
+    assert ports[6]["port"] == (19003 + 31 if gpus_per_engine == 4 else 19003)
+
+
 @pytest.mark.parametrize(
     ("genrm_config", "base_port", "busy_below", "expected_port", "expected_dist_port"),
     [
@@ -96,7 +133,7 @@ def test_rollout_ports_exclude_configured_genrm_windows(
     assert ports[0]["port"] == expected_port
     assert ports[0]["nccl_port"] == expected_port + 1
     assert ports[0]["dist_init_addr"] == f"10.0.0.1:{expected_dist_port}"
-    assert cursors == {0: expected_dist_port + 31}
+    assert cursors == {"10.0.0.1": expected_dist_port + 31}
 
 
 # ---------------------------------------------------------------------------
