@@ -103,7 +103,7 @@ distributed:
     # sync requires training weights resident on NPU.
     cpu_offload: true
     pin_memory: false
-    num_to_forward_prefetch: 2
+    num_to_forward_prefetch: 1
     num_to_backward_prefetch: 1
     hook_modules:
       - model.language_model.layers.{*}

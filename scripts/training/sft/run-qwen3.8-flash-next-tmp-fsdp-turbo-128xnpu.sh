@@ -116,7 +116,8 @@ SFT_ARGS=(
    --image-max-token-num "${IMAGE_MAX_TOKEN_NUM:-256}"
    --global-batch-size 32
    --sft-invalid-multimodal-strategy skip
-   --rollout-max-context-len 16384
+   --rollout-max-context-len 32768
+   --micro-batch-size 1
    --calculate-per-token-loss
    --seq-length 32768
    --use-dynamic-batch-size
