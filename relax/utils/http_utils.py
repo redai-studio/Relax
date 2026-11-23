@@ -254,6 +254,17 @@ _post_actors: list[object] = []
 _post_actor_idx: int = 0
 
 
+@dataclass
+class _PosterRequests:
+    active: int = 0
+    stop: asyncio.Task | None = None
+
+
+# The RolloutWorker dispatches on one event loop. Keep receipts until the
+# last request dispatched to this actor has observed its outcome.
+_poster_requests: dict[int, _PosterRequests] = {}
+
+
 def _next_actor():
     global _post_actor_idx
     if not _post_actors:
@@ -477,6 +488,8 @@ async def send_distributed_request(request: httpx.Request) -> httpx.Response:
         return await _http_client.send(request, stream=True)
     import ray
 
+    requests = _poster_requests.setdefault(id(actor), _PosterRequests())
+    requests.active += 1
     try:
         request_id = uuid4().hex
         ref = actor.do_request.remote(str(request.url), body, request.headers.multi_items(), request_id)
@@ -484,11 +497,15 @@ async def send_distributed_request(request: httpx.Request) -> httpx.Response:
         try:
             status, headers, body, error = await asyncio.shield(pending)
         except asyncio.CancelledError:
-            await _cancel_poster_request(actor, request_id, pending)
+            await _cancel_poster_request(actor, requests, request_id, pending)
             raise
     except (ray.exceptions.RayActorError, ray.exceptions.TaskCancelledError):
-        await _confirm_poster_stopped(actor)
+        await _confirm_poster_stopped(actor, requests)
         raise
+    finally:
+        requests.active -= 1
+        if not requests.active:
+            del _poster_requests[id(actor)]
     if error is not None:
         safe_errors = {name: getattr(httpx, name) for name in ("ConnectError", "ConnectTimeout", "PoolTimeout")}
         error_type = safe_errors.get(error[0], httpx.ReadError)
@@ -496,28 +513,40 @@ async def send_distributed_request(request: httpx.Request) -> httpx.Response:
     return httpx.Response(status, headers=headers, content=body, request=request)
 
 
-async def _cancel_poster_request(actor: object, request_id: str, pending: asyncio.Future) -> None:
+async def _cancel_poster_request(
+    actor: object, requests: _PosterRequests, request_id: str, pending: asyncio.Future
+) -> None:
     if pending.done() and not pending.cancelled() and pending.exception() is None:
         return
     try:
         # Ray can rewrite a connection error to TaskCancelledError without
         # the actor seeing the cancellation. Require an application ACK.
-        try:
-            if await _poster_control_ack(lambda: actor.cancel_request.remote(request_id)) is True:
-                return
-        except DistributedPostUnconfirmed:
-            logger.warning("Could not confirm distributed POST cancellation; stopping the poster")
-        await _confirm_poster_stopped(actor)
+        if requests.stop is None:
+            try:
+                if await _poster_control_ack(lambda: actor.cancel_request.remote(request_id)) is True:
+                    return
+            except DistributedPostUnconfirmed:
+                logger.warning("Could not confirm distributed POST cancellation; stopping the poster")
+        await _confirm_poster_stopped(actor, requests)
     finally:
         if not pending.cancel() and not pending.cancelled():
             pending.exception()
 
 
-async def _confirm_poster_stopped(actor: object) -> None:
+async def _confirm_poster_stopped(actor: object, requests: _PosterRequests) -> None:
     """Retire a poster after an ambiguous actor error, holding the permit."""
-    if actor in _post_actors:
-        _post_actors.remove(actor)
-    await _poster_control_ack(actor.stop_requests.remote)
+    if requests.stop is None:
+        if actor in _post_actors:
+            _post_actors.remove(actor)
+        requests.stop = asyncio.create_task(_poster_control_ack(actor.stop_requests.remote))
+    while not requests.stop.done():
+        try:
+            await asyncio.shield(requests.stop)
+        except asyncio.CancelledError:
+            continue
+    if requests.stop.cancelled():
+        raise DistributedPostUnconfirmed("HTTP poster stop was cancelled")
+    requests.stop.result()
 
 
 async def _poster_control_ack(call: Callable[[], Awaitable]) -> object:

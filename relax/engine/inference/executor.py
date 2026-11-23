@@ -327,7 +327,7 @@ class InferenceRequestExecutor:
                     if cleanup.cancelled():
                         raise
                     cancelled = True
-            if cancelled:
+            if cancelled and not request.transport_unconfirmed:
                 raise asyncio.CancelledError
 
     async def release(self, request: AdmittedRequest) -> None:

@@ -209,12 +209,54 @@ async def test_failed_native_scale_out_reports_cleanup_failure_and_keeps_placeme
     assert status["failure_categories"][0] == "ROLLBACK_UNCONFIRMED"
     assert "rollback resource release is unconfirmed" in status["error_message"]
     remove.assert_not_called()
+    engine.shutdown.remote.reset_mock()
+    engine.shutdown.remote.side_effect = None
+    engine.unregister_from_router.remote.return_value = AwaitableValue(False)
     with pytest.raises(RuntimeError, match="resource release is unconfirmed"):
         manager._shutdown_all_engines()
+    engine.shutdown.remote.assert_not_called()
     remove.assert_not_called()
-    engine.shutdown.remote.side_effect = None
+    engine.unregister_from_router.remote.return_value = AwaitableValue(True)
     manager._shutdown_all_engines()
+    engine.shutdown.remote.assert_called_once()
     remove.assert_called_once_with(pg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_wait", [False, True])
+async def test_unused_scale_out_pg_is_retained_when_removal_fails(monkeypatch, patch_ray_get, cancel_during_wait):
+    from relax.distributed.ray import policy_engine_pool as policy
+
+    waiting, resume = asyncio.Event(), asyncio.Event()
+
+    async def ready():
+        waiting.set()
+        await resume.wait()
+
+    pg = SimpleNamespace(ready=ready)
+    manager = create_test_manager(servers={"default": make_rollout_server()})
+    create = MagicMock(side_effect=[pg] if cancel_during_wait else [pg, RuntimeError("PG allocation failed")])
+    remove = MagicMock(side_effect=RuntimeError("PG removal failed"))
+    monkeypatch.setattr(policy.ray.util, "placement_group", create)
+    monkeypatch.setattr(policy.ray.util, "remove_placement_group", remove)
+    request = manager.create_scale_out_request(num_replicas=2 if cancel_during_wait else 3)
+    request_id = request["request_id"]
+    running = asyncio.create_task(manager.execute_scale_out(request_id))
+    if cancel_during_wait:
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert manager.cancel_scale_out(request_id)["status"] == "CANCELLED"
+        resume.set()
+    with pytest.raises(RuntimeError, match="did not confirm resource release"):
+        await asyncio.wait_for(running, 1)
+    status = manager.get_scale_out_status(request_id)
+    assert status["status"] == "FAILED"
+    assert "ROLLBACK_UNCONFIRMED" in status["failure_categories"]
+    assert manager.create_scale_out_request(num_replicas=3)["status"] == "CONFLICT"
+    remove.assert_called_once_with(pg)
+    remove.side_effect = None
+    manager._shutdown_all_engines()
+    assert remove.call_count == 2
+    remove.assert_called_with(pg)
 
 
 @pytest.mark.asyncio

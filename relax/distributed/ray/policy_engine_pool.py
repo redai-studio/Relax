@@ -892,6 +892,7 @@ class PolicyEnginePool:
         self._engine_actor_states = _get_engine_actor_states()
         self._seed_sync_receipts: dict[str, tuple[tuple[str, ...], str]] = {}
         self._unconfirmed_rollback_engines: list[Any] = []
+        self._strict_rollback_engines: list[Any] = []
         self._unconfirmed_rollback_placement_groups: list[Any] = []
         self._dynamic_global_batch_size = None
         # Disposal must remain usable if startup fails before creating locks or monitors.
@@ -1021,8 +1022,9 @@ class PolicyEnginePool:
                 self._lora_runtime = None
             self._shutdown_all_engines()
         finally:
-            # Routers are children of the task Manager process.
-            stop_launched_routers()
+            # Keep the registry available for a retry of strict rollback.
+            if not getattr(self, "_strict_rollback_engines", ()):
+                stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
@@ -1039,26 +1041,41 @@ class PolicyEnginePool:
                         all_engines.append(engine)
 
         retained = getattr(self, "_unconfirmed_rollback_engines", [])
+        strict = getattr(self, "_strict_rollback_engines", [])
         all_engines.extend(retained)
         logger.info(f"[Shutdown] Shutting down {len(all_engines)} SGLang engine(s)...")
 
-        # Step 1: Call shutdown() on each engine to kill child processes
-        # (sglang::scheduler, sglang::detokenizer, etc.)
+        # Retained engines can still have an AddWorker job in flight.
+        removals = []
         shutdown_refs = []
         failures = []
+        deadline = time.monotonic() + timeout
         for engine in all_engines:
             try:
-                ref = engine.shutdown.remote()
-                shutdown_refs.append((engine, ref))
+                if engine in strict:
+                    ref = engine.unregister_from_router.remote(wait_for_removal=True, timeout=timeout)
+                    removals.append((engine, ref))
+                else:
+                    shutdown_refs.append((engine, engine.shutdown.remote()))
+            except Exception as e:
+                failures.append(e)
+        for engine, ref in removals:
+            try:
+                if ray.get(ref, timeout=max(0.0, deadline - time.monotonic())) is not True:
+                    raise RuntimeError("Scale-out rollback Router removal is unconfirmed")
+                shutdown_refs.append((engine, engine.shutdown.remote()))
             except Exception as e:
                 failures.append(e)
 
         # Bound the whole batch so router cleanup can finish before the driver's
         # signal-exit watchdog, even when every engine is unresponsive.
-        deadline = time.monotonic() + timeout
         for engine, ref in shutdown_refs:
             try:
                 ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
+                if engine in strict:
+                    strict.remove(engine)
+                if engine in retained:
+                    retained.remove(engine)
             except Exception as e:
                 failures.append(e)
         if failures:
@@ -1068,7 +1085,6 @@ class PolicyEnginePool:
         while groups:
             ray.util.remove_placement_group(groups[-1])
             groups.pop()
-        retained.clear()
         logger.info(f"[Shutdown] All {len(all_engines)} SGLang engine(s) shut down.")
 
     @property
@@ -1562,7 +1578,9 @@ class PolicyEnginePool:
         ``type``, ``request_id``, and ``status`` of the blocking request.
         """
         with self._engine_lifecycle_lock:
-            if getattr(self, "_unconfirmed_rollback_engines", ()):
+            if getattr(self, "_unconfirmed_rollback_engines", ()) or getattr(
+                self, "_unconfirmed_rollback_placement_groups", ()
+            ):
                 return {"type": "scale_out rollback", "request_id": "cleanup", "status": "DRAINING"}
             executing = getattr(self, "_executing_scale_out", None)
             if executing is not None:
@@ -1789,7 +1807,9 @@ class PolicyEnginePool:
         finally:
             with self._engine_lifecycle_lock:
                 self._executing_scale_out = None
-                if getattr(self, "_unconfirmed_rollback_engines", ()):
+                if getattr(self, "_unconfirmed_rollback_engines", ()) or getattr(
+                    self, "_unconfirmed_rollback_placement_groups", ()
+                ):
                     self._scale_out_cleanup_failed = True
                     failure = ScaleOutFailureCategory.ROLLBACK_UNCONFIRMED
                     request.failure_categories = [failure.name, *request.failure_categories]
@@ -1839,6 +1859,8 @@ class PolicyEnginePool:
             logger.error(f"[ScaleOut] Model '{request.model_name}' not found")
             return
 
+        per_replica_pgs = []
+        pending_indices: set[int] = set()
         try:
             # Step 1: Update status
             with self._engine_lifecycle_lock:
@@ -1860,13 +1882,13 @@ class PolicyEnginePool:
 
             # Step 2: Create one PG per replica so that replicas with available
             # resources can proceed immediately without waiting for the others.
-            per_replica_pgs = []
             for i in range(request.num_replicas):
                 num_gpus = gpus_per_engine
                 accel_resource = device_utils.get_ray_accelerator_name()
                 bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
                 pg = ray.util.placement_group(bundles, strategy="PACK")
                 per_replica_pgs.append(pg)
+                pending_indices.add(i)
 
             logger.info(
                 f"[ScaleOut] Created {len(per_replica_pgs)} per-replica placement groups "
@@ -1881,8 +1903,6 @@ class PolicyEnginePool:
 
             start_time = time.time()
             poll_interval = 5.0
-            # Track which replicas are still pending PG readiness
-            pending_indices = set(range(request.num_replicas))
             succeeded_engine_ids: list[str] = []
             failed_replica_ids: list[str] = []
             # Aggregated per-replica root-cause reasons for failed replicas so the
@@ -1904,13 +1924,6 @@ class PolicyEnginePool:
                 # Check for cancellation
                 if request.status == ScaleOutStatus.CANCELLED:
                     logger.info(f"[ScaleOut] Request {request.request_id} cancelled during PG wait")
-                    for idx in pending_indices:
-                        try:
-                            ray.util.remove_placement_group(per_replica_pgs[idx])
-                        except Exception:
-                            pass
-                    # Keep already-succeeded replicas (don't roll back)
-                    pending_indices.clear()
                     break
 
                 # Check readiness of all pending PGs concurrently
@@ -1937,10 +1950,7 @@ class PolicyEnginePool:
                             pending_indices.discard(idx)
                             failed_replica_ids.append(f"replica_{idx}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_FAILED))
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[idx])
-                            except Exception:
-                                pass
+                            self._remove_scale_out_pg(per_replica_pgs[idx])
 
                 if newly_ready:
                     logger.info(f"[ScaleOut] {len(newly_ready)} PGs became ready: indices={newly_ready}")
@@ -1971,6 +1981,9 @@ class PolicyEnginePool:
                         )
                         return (idx, r.success, r.reason, replica_offsets[idx])
 
+                    # From here, the bring-up result determines whether a PG
+                    # was published, can be removed, or still needs rollback.
+                    pending_indices.difference_update(newly_ready)
                     results = await asyncio.gather(
                         *[_bring_up_one(idx) for idx in newly_ready],
                         return_exceptions=True,
@@ -1978,7 +1991,6 @@ class PolicyEnginePool:
 
                     for i, result in enumerate(results):
                         replica_idx_for_result = newly_ready[i]
-                        pending_indices.discard(replica_idx_for_result)
                         if isinstance(result, BaseException):
                             # Should not normally happen since _bring_up_single_replica
                             # catches exceptions internally, but handle defensively.
@@ -1999,10 +2011,7 @@ class PolicyEnginePool:
                             if reason:
                                 failure_reasons.append(reason)
                             logger.warning(f"[ScaleOut] ❌ Replica {idx} failed during bring-up: {reason}")
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[idx])
-                            except Exception:
-                                pass
+                            self._remove_scale_out_pg(per_replica_pgs[idx])
 
                 if not newly_ready and pending_indices:
                     elapsed_now = time.time() - start_time
@@ -2014,19 +2023,11 @@ class PolicyEnginePool:
                         )
 
             # Phase B: Handle remaining pending PGs (timed out)
-            for idx in list(pending_indices):
-                logger.warning(f"[ScaleOut] Replica {idx} timed out waiting for resources")
-                failed_replica_ids.append(f"replica_{idx}")
-                failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
-                try:
-                    ray.util.remove_placement_group(per_replica_pgs[idx])
-                except Exception:
-                    pass
-
-            # Phase C: Determine final status
-            self._update_scale_out_final_status(
-                request, srv, succeeded_engine_ids, failed_replica_ids, failure_reasons
-            )
+            if request.status != ScaleOutStatus.CANCELLED:
+                for idx in pending_indices:
+                    logger.warning(f"[ScaleOut] Replica {idx} timed out waiting for resources")
+                    failed_replica_ids.append(f"replica_{idx}")
+                    failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
 
         except Exception as e:
             # Surface only the exception type, never its args (may leak); full exc logged below.
@@ -2034,6 +2035,19 @@ class PolicyEnginePool:
             request.failure_categories = scale_utils._scale_out_failure_categories([failure])
             request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {failure.message()}")
             logger.exception(f"Scale-out failed for request {request.request_id}")
+            return
+        finally:
+            for idx in pending_indices:
+                self._remove_scale_out_pg(per_replica_pgs[idx])
+
+        self._update_scale_out_final_status(request, srv, succeeded_engine_ids, failed_replica_ids, failure_reasons)
+
+    def _remove_scale_out_pg(self, pg: Any) -> None:
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception:
+            logger.exception("Could not remove scale-out placement group")
+            self._unconfirmed_rollback_placement_groups.append(pg)
 
     async def _bring_up_single_replica(
         self,
@@ -2596,7 +2610,9 @@ class PolicyEnginePool:
         reason_str = scale_utils._aggregate_scale_out_reasons(failure_reasons)
         request.failure_categories = scale_utils._scale_out_failure_categories(failure_reasons)
 
-        if getattr(self, "_unconfirmed_rollback_engines", ()):
+        if getattr(self, "_unconfirmed_rollback_engines", ()) or getattr(
+            self, "_unconfirmed_rollback_placement_groups", ()
+        ):
             # execute_scale_out publishes the cleanup failure with these IDs.
             return
         if request.status == ScaleOutStatus.CANCELLED:
@@ -3424,11 +3440,16 @@ class PolicyEnginePool:
         retained = getattr(self, "_unconfirmed_rollback_engines", None)
         if retained is None:
             retained = self._unconfirmed_rollback_engines = []
+        strict = getattr(self, "_strict_rollback_engines", None)
+        if strict is None:
+            strict = self._strict_rollback_engines = []
         # Register the entire batch before any await, including cancellation.
         engines = [engine for engine in engines if engine is not None]
         for engine in engines:
             if engine not in retained:
                 retained.append(engine)
+            if confirm_router_removal and engine not in strict:
+                strict.append(engine)
 
         async def release(engine: Any) -> None:
             for attempt in range(attempts):
@@ -3443,14 +3464,15 @@ class PolicyEnginePool:
                     return
 
         async def release_once(engine: Any) -> None:
-            if confirm_router_removal:
+            require_confirmation = engine in strict
+            if require_confirmation:
                 await asyncio.wait_for(engine.unregister_dcs.remote(strict=True), timeout=10)
             else:
                 try:
                     await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
                 except Exception:
                     logger.warning("Failed to unregister DCS for engine during rollback", exc_info=True)
-            if confirm_router_removal:
+            if require_confirmation:
                 removed = await asyncio.wait_for(
                     engine.unregister_from_router.remote(wait_for_removal=True, timeout=30), timeout=35
                 )
@@ -3463,6 +3485,8 @@ class PolicyEnginePool:
         for engine, result in zip(engines, results):
             if result is None:
                 retained.remove(engine)
+                if engine in strict:
+                    strict.remove(engine)
         if failures:
             if attempts > 1 or confirm_router_removal:
                 self._scale_out_cleanup_failed = True

@@ -350,6 +350,24 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
     return values.reshape(num_rows, values.size // num_rows)
 
 
+async def _cancel_rollout_tasks(tasks: list[asyncio.Task]) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    outcomes = asyncio.gather(*tasks, return_exceptions=True)
+    cancelled = False
+    while not outcomes.done():
+        try:
+            await asyncio.shield(outcomes)
+        except asyncio.CancelledError:
+            cancelled = True
+    for outcome in outcomes.result():
+        if isinstance(outcome, DistributedPostUnconfirmed):
+            raise outcome
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def _post_generation(
     args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
 ) -> Any:
@@ -383,12 +401,7 @@ async def _post_generation(
                         raise GenerationAborted
                     return await generation
                 finally:
-                    aborted.cancel()
-                    if not generation.done():
-                        generation.cancel()
-                    outcome, _ = await asyncio.gather(generation, aborted, return_exceptions=True)
-                    if isinstance(outcome, DistributedPostUnconfirmed):
-                        raise outcome
+                    await _cancel_rollout_tasks([generation, aborted])
             return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):
@@ -859,12 +872,7 @@ async def generate_and_rm_group(
     try:
         group = await asyncio.gather(*tasks)
     except BaseException:
-        for task in tasks:
-            task.cancel()
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-        for outcome in outcomes:
-            if isinstance(outcome, DistributedPostUnconfirmed):
-                raise outcome
+        await _cancel_rollout_tasks(tasks)
         raise
 
     # Group rewards require complete trajectories, including during evaluation.
@@ -942,20 +950,27 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
         if isinstance(result, BaseException):
             logger.warning(f"Failed to abort worker at {url}: {result}")
 
-    # make sure all the pending tasks are finished
+    # Collect the groups that finish after the abort.
     count = 0
-    dispatch_failure = None
     partial_failure = None
     while state.pendings:
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+
+        for task in done:
+            if not task.cancelled() and isinstance(failure := task.exception(), DistributedPostUnconfirmed):
+                # A custom reward may never return. Report the dispatch fault
+                # while the other groups unwind. Their permits still fence
+                # any outstanding inference.
+                for pending in state.pendings:
+                    pending.cancel()
+                asyncio.gather(*done, *state.pendings, return_exceptions=True)
+                state.pendings.clear()
+                raise failure
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
             try:
                 group = task.result()
-            except DistributedPostUnconfirmed as exc:
-                dispatch_failure = exc
-                continue
             except (Exception, asyncio.CancelledError) as exc:
                 if args.partial_rollout and partial_failure is None:
                     partial_failure = exc
@@ -970,8 +985,6 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             aborted_samples.append(group)
             count += len(group)
 
-    if dispatch_failure is not None:
-        raise dispatch_failure
     if partial_failure is not None:
         raise partial_failure
     if args.partial_rollout:

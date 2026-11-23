@@ -89,10 +89,13 @@ async def test_distributed_post_cancellation_waits_for_poster_completion(monkeyp
 
     submitted, cancellation_requested, acknowledge = (asyncio.Event() for _ in range(3))
     ids = []
+    active = None
 
     async def remote(url, body, headers, request_id):
+        nonlocal active
         ids.append(request_id)
         if len(ids) == 1:
+            active = asyncio.current_task()
             submitted.set()
             await asyncio.Future()
         return 200, [], b"ok", None
@@ -101,6 +104,8 @@ async def test_distributed_post_cancellation_waits_for_poster_completion(monkeyp
         assert ids == [request_id]
         cancellation_requested.set()
         await acknowledge.wait()
+        active.cancel()
+        await asyncio.gather(active, return_exceptions=True)
         return True
 
     actor = SimpleNamespace(do_request=SimpleNamespace(remote=remote), cancel_request=SimpleNamespace(remote=cancel))
@@ -119,6 +124,60 @@ async def test_distributed_post_cancellation_waits_for_poster_completion(monkeyp
             await asyncio.wait_for(task, 1)
     response = await http_utils.send_distributed_request(httpx.Request("POST", "http://engine/generate"))
     assert response.content == b"ok" and len(ids) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("join_before_ack", [True, False])
+async def test_distributed_post_shares_poster_stop_receipt(monkeypatch, join_before_ack):
+    import ray
+
+    from relax.utils import http_utils
+
+    both_sent, lose_second, stopping, confirmed = (asyncio.Event() for _ in range(4))
+    sent = 0
+    stop_calls = 0
+
+    async def remote(*args):
+        nonlocal sent
+        sent += 1
+        if sent == 1:
+            await both_sent.wait()
+            raise ray.exceptions.ActorUnavailableError("connection lost", None)
+        both_sent.set()
+        await lose_second.wait()
+        raise ray.exceptions.TaskCancelledError()
+
+    async def stop():
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls > 1:
+            raise ray.exceptions.ActorDiedError()
+        stopping.set()
+        await confirmed.wait()
+
+    actor = SimpleNamespace(do_request=SimpleNamespace(remote=remote), stop_requests=SimpleNamespace(remote=stop))
+    monkeypatch.setattr(http_utils, "_post_actors", [actor])
+    request = lambda: httpx.Request("POST", "http://engine/generate")  # noqa: E731
+    first, second = [asyncio.create_task(http_utils.send_distributed_request(request())) for _ in range(2)]
+    try:
+        await asyncio.wait_for(stopping.wait(), 1)
+        if join_before_ack:
+            lose_second.set()
+            # If the second request starts a second stop, it can fail even
+            # while the original stop call is waiting for acknowledgement.
+            done, _ = await asyncio.wait({second}, timeout=0.05)
+            assert not done
+        confirmed.set()
+        with pytest.raises(ray.exceptions.ActorUnavailableError):
+            await asyncio.wait_for(first, 1)
+        lose_second.set()
+        with pytest.raises(ray.exceptions.TaskCancelledError):
+            await asyncio.wait_for(second, 1)
+        assert stop_calls == 1
+    finally:
+        confirmed.set()
+        lose_second.set()
+        await asyncio.gather(first, second, return_exceptions=True)
 
 
 @pytest.mark.parametrize(

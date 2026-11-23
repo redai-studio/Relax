@@ -90,20 +90,24 @@ async def test_standard_post_keeps_unrelated_499_visible(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("partial_rollout", [False, True])
-async def test_batch_abort_drains_other_tasks_before_reporting_unknown_dispatch(monkeypatch, partial_rollout):
+async def test_batch_abort_reports_unknown_dispatch_before_other_groups_finish(monkeypatch, partial_rollout):
     state = SimpleNamespace(
         aborted=False, evaluating=0, protected_pendings=set(), pendings=set(), abort_event=asyncio.Event()
     )
     finish = asyncio.Event()
-    failed = asyncio.Event()
+    other_started = asyncio.Event()
 
     async def cannot_confirm():
         await state.abort_event.wait()
-        failed.set()
         raise DistributedPostUnconfirmed("poster stop not confirmed")
 
     async def finish_other_request():
-        await finish.wait()
+        other_started.set()
+        try:
+            await finish.wait()
+        except asyncio.CancelledError:
+            # A custom reward can take arbitrarily long to unwind.
+            await finish.wait()
         return []
 
     async def workers(url):
@@ -111,17 +115,66 @@ async def test_batch_abort_drains_other_tasks_before_reporting_unknown_dispatch(
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
     monkeypatch.setattr(sglang_rollout, "get", workers)
-    state.pendings = {asyncio.create_task(cannot_confirm()), asyncio.create_task(finish_other_request())}
+    other = asyncio.create_task(finish_other_request())
+    await asyncio.wait_for(other_started.wait(), 1)
+    state.pendings = {asyncio.create_task(cannot_confirm()), other}
     args = _router_args(partial_rollout=partial_rollout, sglang_router_ip="router", sglang_router_port=80)
     abort = asyncio.create_task(sglang_rollout.abort(args, 1))
     try:
-        await asyncio.wait_for(failed.wait(), 1)
-        assert not abort.done()
-    finally:
-        finish.set()
         with pytest.raises(DistributedPostUnconfirmed, match="poster stop not confirmed"):
             await asyncio.wait_for(abort, 1)
+        assert not other.done()
+    finally:
+        finish.set()
+        await asyncio.wait_for(other, 1)
     assert not state.pendings
+
+
+@pytest.mark.asyncio
+async def test_group_reward_failure_preserves_dispatch_fault_during_abort(monkeypatch):
+    from relax.engine.inference import executor
+
+    state = SimpleNamespace(aborted=False, abort_event=asyncio.Event())
+    sent, stopping, reward_failed, confirm_failed = (asyncio.Event() for _ in range(4))
+
+    class PosterExecutor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def generate_json(self, payload, headers):
+            sent.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                stopping.set()
+                await confirm_failed.wait()
+                raise DistributedPostUnconfirmed("poster stop not confirmed") from None
+
+    async def generate_and_reward(args, sample, params, evaluation=False):
+        if sample.prompt == "generate":
+            return await _post_generation(args, state, "http://engine/generate", {}, None, evaluation)
+        await stopping.wait()
+        reward_failed.set()
+        raise ValueError("custom reward failed")
+
+    monkeypatch.setattr(executor, "InferenceRequestExecutor", PosterExecutor)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", generate_and_reward)
+    monkeypatch.setattr(sglang_rollout.opd, "is_teacher_routing_enabled", lambda *args, **kwargs: False)
+    args = _router_args(group_rm=False, _inference_manager_handle=object())
+    group = asyncio.create_task(
+        sglang_rollout.generate_and_rm_group(args, [Sample(prompt="generate"), Sample(prompt="reward")], {})
+    )
+    try:
+        await asyncio.wait_for(sent.wait(), 1)
+        state.abort_event.set()
+        await asyncio.wait_for(reward_failed.wait(), 1)
+        confirm_failed.set()
+        with pytest.raises(DistributedPostUnconfirmed, match="poster stop not confirmed"):
+            await asyncio.wait_for(group, 1)
+    finally:
+        confirm_failed.set()
+        await asyncio.gather(group, return_exceptions=True)
 
 
 def _router_args(**overrides):
