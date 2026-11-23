@@ -42,6 +42,8 @@ def hf_checkpoint_identity(path: str | Path, *, version: int = 1) -> dict[str, s
         index = json.loads(index_bytes)
         if version == 1:
             shard_names = sorted(set(index.get("weight_map", {}).values()))
+            if index_path == bin_index and any(shard.name not in shard_names for shard in root.glob("*.safetensors")):
+                raise ValueError("Legacy v1 BIN index does not cover the Safetensors read from the HF base")
         else:
             weights = index.get("weight_map") if isinstance(index, dict) else None
             if (

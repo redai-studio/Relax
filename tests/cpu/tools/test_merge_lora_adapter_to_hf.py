@@ -160,8 +160,7 @@ class TestReadAdapterScaling:
     )
     def test_scaling_rule(self, tmp_path, config, expected):
         (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-        parsed, is_relax, _ = merge_lora._read_adapter_config(tmp_path)
-        assert not is_relax
+        parsed, _ = merge_lora._read_adapter_config(tmp_path)
         assert merge_lora._module_scaling(parsed, "proj", parsed["r"]) == pytest.approx(expected)
 
     def test_missing_rank_or_alpha_is_a_hard_error(self, tmp_path):
@@ -259,7 +258,9 @@ def test_visual_qkv_peft_layout(tmp_path, monkeypatch, sidecar, explicit, expect
     prefix = "model.visual.blocks.0.attn.qkv"
     key = prefix + ".weight"
     (base / "config.json").write_text(json.dumps({"vision_config": {"hidden_size": 4, "num_heads": 2}}))
-    (adapter / "adapter_config.json").write_text(json.dumps({"r": 1, "lora_alpha": 1}))
+    # PEFT supports tuning alpha after training. An old Relax sidecar still
+    # describes the producer even when its saved scaling no longer matches.
+    (adapter / "adapter_config.json").write_text(json.dumps({"r": 1, "lora_alpha": 2}))
     if sidecar is not None:
         (adapter / "relax_lora_meta.json").write_text(json.dumps({"lora_rank": 1, "lora_alpha": 1, **sidecar}))
     # Distinct rows in two heads make a head-interleaving bug directly visible.
@@ -282,4 +283,4 @@ def test_visual_qkv_peft_layout(tmp_path, monkeypatch, sidecar, explicit, expect
     finally:
         torch.set_num_threads(threads)
     rows = [0, 1, 6, 7, 2, 3, 8, 9, 4, 5, 10, 11] if expected == "megatron" else list(range(12))
-    torch.testing.assert_close(load_file(out / "model.safetensors")[key], b[rows] @ a, atol=0, rtol=0)
+    torch.testing.assert_close(load_file(out / "model.safetensors")[key], 2 * (b[rows] @ a), atol=0, rtol=0)

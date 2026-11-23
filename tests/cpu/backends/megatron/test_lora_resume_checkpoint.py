@@ -326,6 +326,52 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
         checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
     args.non_persistent_ckpt_type = None
 
+    # The pretrained fallback happens before Megatron applies ckpt_step.
+    # Both roots have iteration 1, but only the alternate has a tracker.
+    (root / "latest_checkpointed_iteration.txt").unlink()
+    args.pretrained_checkpoint, args.ckpt_step = str(alternate), 1
+    args.no_load_optim = args.no_load_rng = use_ref
+    args.finetune = False
+    with monkeypatch.context() as patch:
+        from megatron.training import checkpointing as native
+
+        # Simulate the original tracker appearing after preflight. The loader
+        # must use the same root as the common state it already validated.
+        read_metadata = checkpoint._load_checkpoint_metadata
+
+        def read_selected_metadata(*positional):
+            common = read_metadata(*positional)
+            (root / "latest_checkpointed_iteration.txt").write_text("1")
+            return common
+
+        patch.setattr(checkpoint, "_load_checkpoint_metadata", read_selected_metadata)
+        patch.setattr(native, "get_args", lambda: args)
+        args.ckpt_format, args.auto_detect_ckpt_format = "torch_dist", False
+        read_base = native._load_base_checkpoint
+
+        class ReadCommon(Exception):
+            pass
+
+        def read_common(*positional, **kwargs):
+            state, path, _, _ = read_base(*positional, **kwargs)
+            assert Path(path) == alternate / "iter_0000001"
+            assert state["args"].relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
+            raise ReadCommon
+
+        def load_through_native_selector(**kwargs):
+            with pytest.raises(ReadCommon):
+                native.load_checkpoint(**kwargs)
+            return 0, 0
+
+        patch.setattr(native, "_load_base_checkpoint", read_common)
+        patch.setattr(checkpoint, "_load_checkpoint_megatron", load_through_native_selector)
+        checkpoint.load_checkpoint(model, object(), None, {}, False)
+    assert args.finetune and args.load == str(root)
+    assert args.relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
+    args.pretrained_checkpoint = args.ckpt_step = None
+    args.no_load_optim = args.no_load_rng = True
+    args.finetune = False
+
     args.moe_router_enable_expert_bias = True
     args.moe_router_bias_update_rate = 1e-3
     checkpoint.save_checkpoint(2, model, None, None)
@@ -382,6 +428,18 @@ def test_v1_first_run_fallback_requires_confirmed_original_base(monkeypatch, tmp
     monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", lambda **kw: loaded.append(kw["load_path"]))
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: (1, 0))
     assert checkpoint.load_checkpoint(model, object(), None, {}, False) == (1, 0)
+    assert loaded == [str(base)]
+
+    # A v1 BIN-only manifest still matches its BIN shard after a different
+    # model.safetensors is placed beside it. Even explicit confirmation must
+    # refuse weights that the historical fingerprint never covered.
+    (base / "model.safetensors").rename(base / "pytorch_model.bin")
+    (base / "pytorch_model.bin.index.json").write_text(json.dumps({"weight_map": {"weight": "pytorch_model.bin"}}))
+    marker["base_hf_checkpoint"] = checkpoint.hf_checkpoint_identity(base)
+    torch.save({"args": saved}, iteration / "common.pt")
+    save_file({"weight": torch.ones(2)}, base / "model.safetensors")
+    with pytest.raises(RuntimeError, match="base HF identity mismatch"):
+        checkpoint.load_checkpoint(model, object(), None, {}, False)
     assert loaded == [str(base)]
 
 

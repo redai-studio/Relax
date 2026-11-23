@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def visual_qkv_to_hf(tensor: Any, heads: int, head_dim: int) -> Any:
+    """Group head-interleaved Q/K/V rows in HF projection order."""
+    return tensor.reshape(heads, 3, head_dim, *tensor.shape[1:]).transpose(0, 1).reshape_as(tensor)
+
+
 @dataclass(frozen=True)
 class TensorSlice:
     key: str
@@ -39,23 +44,20 @@ class Conversion:
             values = [values[0] + 1]
         elif self.operation == "split_mlp":
             values = values[0].chunk(2, dim=0)
-        elif self.operation in ("qkv", "vision_qkv"):
-            vision = self.operation == "vision_qkv"
-            cfg = config["vision_config"] if vision else text
-            heads = cfg["num_heads"] if vision else cfg["num_attention_heads"]
-            groups = heads if vision else cfg["num_key_value_heads"]
-            dim = cfg.get("head_dim", cfg["hidden_size"] // heads)
+        elif self.operation == "vision_qkv":
+            vision = config["vision_config"]
+            heads = vision["num_heads"]
+            values = [visual_qkv_to_hf(values[0], heads, vision.get("head_dim", vision["hidden_size"] // heads))]
+        elif self.operation == "qkv":
+            heads, groups = text["num_attention_heads"], text["num_key_value_heads"]
+            dim = text.get("head_dim", text["hidden_size"] // heads)
             per_group = heads // groups
             tensor = values[0]
             tail = tensor.shape[1:]
-            fused = tensor.reshape(groups, (per_group if vision else 2 * per_group) + 2, dim, *tail)
-            q, k, v = fused[:, :per_group], fused[:, -2], fused[:, -1]
-            if not vision:
-                # HF interleaves Q and output gate per head; MCore groups them.
-                q = torch.cat((q, fused[:, per_group : 2 * per_group]), dim=2)
-            values = [part.reshape(-1, *tail) for part in (q, k, v)]
-            if vision:
-                values = [torch.cat(values, dim=0)]
+            fused = tensor.reshape(groups, 2 * per_group + 2, dim, *tail)
+            # HF interleaves Q and output gate per head; MCore groups them.
+            q = torch.cat((fused[:, :per_group], fused[:, per_group : 2 * per_group]), dim=2)
+            values = [part.reshape(-1, *tail) for part in (q, fused[:, -2], fused[:, -1])]
         if len(values) != len(self.outputs):
             raise ValueError(f"Invalid conversion: {self}")
         return dict(zip(self.outputs, values))

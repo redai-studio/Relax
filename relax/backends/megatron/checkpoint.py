@@ -655,21 +655,37 @@ def _alias_renamed_transfer_queue_enum() -> None:
 def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool) -> dict:
     """Probe only host metadata before deciding which collective loader to
     use."""
-    exists = Path(load_path).exists() and _is_dir_nonempty(load_path)
+    exists = bool(load_path and Path(load_path).exists() and _is_dir_nonempty(load_path))
     megatron = exists and (is_megatron_checkpoint(load_path) or bool(getattr(args, "ckpt_step", None)))
+    hf = exists and not megatron and _is_hf_checkpoint(load_path)
+    pretrained_fallback = False
+    pretrained = getattr(args, "pretrained_checkpoint", None)
+    if pretrained is not None and not hf:
+        from megatron.training.checkpointing import checkpoint_exists
+
+        # MCore checks trackers before applying an explicit ckpt_step.
+        if not checkpoint_exists(load_path):
+            if not checkpoint_exists(pretrained):
+                raise FileNotFoundError(f"No checkpoint tracker in {load_path} or pretrained directory {pretrained}")
+            load_path = pretrained
+            exists = True
+            megatron = True
+            pretrained_fallback = True
+            load_optimizer = False
     iteration_dir = (
         _resolve_checkpoint_iteration_dir(load_path, ckpt_step=getattr(args, "ckpt_step", None)) if megatron else None
     )
     valid_iteration = iteration_dir is not None and iteration_dir.is_dir()
     return {
         "load_path": str(load_path),
+        "pretrained_fallback": pretrained_fallback,
         "load_optimizer": load_optimizer,
         "exists": exists,
         "megatron": megatron,
         "iteration_dir": str(iteration_dir) if iteration_dir is not None else None,
         "valid_iteration": valid_iteration,
         "has_optimizer": (_checkpoint_has_optimizer_state(iteration_dir, args) if valid_iteration else True),
-        "hf": exists and not megatron and _is_hf_checkpoint(load_path),
+        "hf": hf,
     }
 
 
@@ -685,6 +701,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     exist = state["exists"]
 
     if state["megatron"]:
+        if state.get("pretrained_fallback"):
+            args.finetune = True
+            load_optimizer = False
+            load_path = state["load_path"]
         current_is_rm = is_rm_mode(args) and getattr(ddp_model[0], "role", "actor") == "actor"
         iter_dir = state["iteration_dir"]
         # A Megatron release checkpoint is explicitly a weights-only source.
@@ -751,6 +771,22 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             )
             return marker, frozen_base
 
+        def load_native(**kwargs):
+            pretrained = getattr(args, "pretrained_checkpoint", None)
+            if pretrained is None:
+                return _load_checkpoint_megatron(**kwargs)
+            # Both metadata and tensor reads use the agreed source, even if
+            # a tracker appears in the originally requested directory meanwhile.
+            directory = Path(iter_dir)
+            original_load, original_step = args.load, getattr(args, "ckpt_step", None)
+            args.load = str(directory.parent)
+            args.ckpt_step = None if release else int(directory.name.removeprefix("iter_"))
+            args.pretrained_checkpoint = None
+            try:
+                return _load_checkpoint_megatron(**kwargs)
+            finally:
+                args.load, args.ckpt_step, args.pretrained_checkpoint = original_load, original_step, pretrained
+
         lora_metadata, frozen_base = _collective_checkpoint_probe(probe_metadata)
         try:
             if lora_metadata is None:
@@ -763,7 +799,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     else nullcontext()
                 )
                 with step_context:
-                    result = _load_checkpoint_megatron(
+                    result = load_native(
                         ddp_model=ddp_model,
                         optimizer=optimizer,
                         opt_param_scheduler=opt_param_scheduler,
@@ -792,7 +828,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                 _preserve_hybrid_optimizer_steps_on_load(),
                 _validate_lora_model_state_load(ddp_model),
             ):
-                return _load_checkpoint_megatron(
+                return load_native(
                     ddp_model=ddp_model,
                     optimizer=optimizer,
                     opt_param_scheduler=opt_param_scheduler,

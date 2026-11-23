@@ -156,8 +156,8 @@ def _validate_adapter_dir(adapter_dir: Path) -> None:
         raise FileNotFoundError(f"No adapter weights (adapter_model.safetensors/.bin) found in {adapter_dir}.")
 
 
-def _read_adapter_config(adapter_dir: Path) -> tuple[dict[str, Any], bool, str | None]:
-    """Read the PEFT config and recognize the Relax expert-rank convention."""
+def _read_adapter_config(adapter_dir: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Read PEFT scaling and optional Relax producer metadata."""
     cfg = json.loads((adapter_dir / "adapter_config.json").read_text())
     rank = cfg.get("r")
     alpha = cfg.get("lora_alpha")
@@ -172,19 +172,16 @@ def _read_adapter_config(adapter_dir: Path) -> tuple[dict[str, Any], bool, str |
     )
 
     meta_file = adapter_dir / "relax_lora_meta.json"
-    relax_export = False
-    vision_layout = None
+    meta = None
     if meta_file.is_file():
         with open(meta_file) as f:
             meta = json.load(f)
-        relax_export = meta.get("lora_rank") == rank and meta.get("lora_alpha") == alpha
-        vision_layout = meta.get("vision_qkv_b_layout")
         mode = "adapter" if meta.get("lora_adapter_mode") else "merge" if meta.get("lora_merge_mode") else "standard"
         print(
             f"[merge-lora] relax sidecar: trained mode={mode}, "
             f"target_modules(megatron)={meta.get('lora_target_modules')}"
         )
-    return cfg, relax_export, vision_layout
+    return cfg, meta
 
 
 def _strip_suffix(key: str, suffixes) -> str:
@@ -322,7 +319,7 @@ def _vision_qkv_reorders(
     layout: str | None,
     legacy_layout: str | None,
     *,
-    relax_export: bool,
+    has_relax_sidecar: bool,
 ) -> dict[str, tuple[int, int]]:
     """Identify packed visual B factors that need conversion from Megatron head
     order."""
@@ -332,7 +329,7 @@ def _vision_qkv_reorders(
     keys = [key for key in targets_by_key.values() if is_visual_qkv_weight(key)]
     if not keys:
         return {}
-    if relax_export and layout is None and legacy_layout is None:
+    if has_relax_sidecar and layout is None and legacy_layout is None:
         raise ValueError(
             "Unmarked Relax vision QKV adapter: select --legacy-vision-qkv-layout megatron "
             "for the historical Relax export, or hf for a verified HF-ordered adapter."
@@ -358,6 +355,8 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device, *, vis
     """
     import torch
 
+    from scripts.tools.convert_checkpoint_mapping import visual_qkv_to_hf
+
     merged = []
     for prefix, base_key in targets.items():
         base = shard_tensors[base_key]
@@ -365,8 +364,7 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device, *, vis
         lora_b = adapter.get_tensor(pairs[prefix]["B"]).to(device=device, dtype=torch.float32)
 
         if vision_reorders and base_key in vision_reorders:
-            heads, head_dim = vision_reorders[base_key]
-            lora_b = lora_b.reshape(heads, 3, head_dim, -1).transpose(0, 1).reshape_as(lora_b)
+            lora_b = visual_qkv_to_hf(lora_b, *vision_reorders[base_key])
 
         # `@` covers both cases: 2-D (out,r)@(r,in) for nn.Linear weights, and batched
         # (E,out,r)@(E,r,in) for grouped MoE experts stored as one 3-D parameter.
@@ -431,7 +429,11 @@ def main() -> None:
     if not args.dry_run and output_dir.exists() and any(output_dir.iterdir()) and not args.force:
         raise ValueError(f"Output directory {output_dir} already exists and is non-empty. Use --force to overwrite.")
 
-    config, relax_export, vision_layout = _read_adapter_config(adapter_dir)
+    config, meta = _read_adapter_config(adapter_dir)
+    matching_scaling = meta is not None and (meta.get("lora_rank"), meta.get("lora_alpha")) == (
+        config["r"],
+        config["lora_alpha"],
+    )
     base_config = json.loads((base_dir / "config.json").read_text())
     if base_config.get("quantization_config") or base_config.get("text_config", {}).get("quantization_config"):
         raise ValueError("Merge requires an unquantized HF base model")
@@ -456,7 +458,11 @@ def main() -> None:
         pairs = _pair_adapter_keys(adapter.keys())
         targets_by_key = _resolve_base_keys(pairs, set(weight_map))
         vision_reorders = _vision_qkv_reorders(
-            targets_by_key, base_config, vision_layout, args.legacy_vision_qkv_layout, relax_export=relax_export
+            targets_by_key,
+            base_config,
+            meta.get("vision_qkv_b_layout") if meta is not None else None,
+            args.legacy_vision_qkv_layout,
+            has_relax_sidecar=meta is not None,
         )
         scaling = {}
         delta_shapes = {}
@@ -468,7 +474,7 @@ def main() -> None:
                 heads, dim = vision_reorders[targets_by_key[prefix]]
                 if len(b) != 2 or b[0] != 3 * heads * dim:
                     raise ValueError(f"Invalid legacy vision QKV B shape for {prefix}: {b}")
-            scaling[prefix] = _module_scaling(config, prefix, a[-2], relax_export=relax_export)
+            scaling[prefix] = _module_scaling(config, prefix, a[-2], relax_export=matching_scaling)
             delta_shapes[prefix] = (*torch.broadcast_shapes(a[:-2], b[:-2]), b[-2], a[-1])
             if any(adapter.get_slice(key).get_dtype() not in ("BF16", "F16", "F32", "F64") for key in pair.values()):
                 raise ValueError(f"LoRA factors must be floating point: {prefix}")

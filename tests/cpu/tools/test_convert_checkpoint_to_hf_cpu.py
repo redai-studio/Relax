@@ -534,11 +534,21 @@ def test_cpu_lora_uses_loaded_base_and_checks_legacy_origin(tmp_path: Path) -> N
         with safe_open(out / index[key], framework="pt") as handle:
             torch.testing.assert_close(handle.get_tensor(key), value, atol=0, rtol=0)
 
-    marker.update(format_version=1, base_hf_checkpoint=hf_checkpoint_identity(other))
+    # Reconstruct what v1 actually signed: the config, BIN index and BIN
+    # shard. A hard link preserves the stat-based timestamp of the old shard.
+    bin_only = tmp_path / "legacy-bin"
+    bin_only.mkdir()
+    for name in ("config.json", "pytorch_model.bin.index.json", "pytorch_model-extra.bin"):
+        (bin_only / name).hardlink_to(trained / name)
+    marker.update(format_version=1, base_hf_checkpoint=hf_checkpoint_identity(bin_only))
     torch.save({"args": args}, checkpoint / "common.pt")
     with pytest.raises(ValueError, match="legacy v1"):
         export_checkpoint(checkpoint, other, tmp_path / "legacy", dry_run=True)
     args.hf_checkpoint = str(trained)
+    torch.save({"args": args}, checkpoint / "common.pt")
+    with pytest.raises(ValueError, match="v1.*Safetensors"):
+        export_checkpoint(checkpoint, trained, tmp_path / "unsigned-base", dry_run=True)
+    (trained / "pytorch_model.bin.index.json").unlink()
     marker["base_hf_checkpoint"] = hf_checkpoint_identity(trained)
     torch.save({"args": args}, checkpoint / "common.pt")
     assert export_checkpoint(checkpoint, trained, tmp_path / "legacy", dry_run=True)["lora_only_checkpoint"]
