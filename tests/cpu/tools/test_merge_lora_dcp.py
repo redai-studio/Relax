@@ -165,7 +165,8 @@ def test_base_identity_mismatch_refuses_to_publish(checkpoint):
     assert not output.exists()
 
 
-def test_flash_dcp_preserves_fp8_and_deinterleaves_kda_projections(tmp_path):
+@pytest.mark.parametrize("case", ["kda", "zero_delta", "nonfinite_fp8", "invalid_grid", "vision_adapter"])
+def test_flash_dcp_validates_and_merges_fp8_shards(tmp_path, case):
     from scripts.tools.convert_checkpoint_to_hf_cpu import read_hf_schema
 
     base = tmp_path / "base"
@@ -177,7 +178,15 @@ def test_flash_dcp_preserves_fp8_and_deinterleaves_kda_projections(tmp_path):
     frozen = "model.language_model.layers.1.mlp.gate.weight"
     weights = {key: torch.zeros((4, 3), dtype=dtype) for key, dtype in zip(keys, (fp8, torch.bfloat16, fp8))}
     weights[frozen] = torch.tensor([3, 5, 7], dtype=torch.float32)
+    visual_key = "model.visual.blocks.0.mlp.gate_proj.weight"
+    if case == "vision_adapter":
+        weights[visual_key] = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
     scales = {key + "_scale_inv": torch.ones((1, 1)) for key in (keys[0], keys[2])}
+    if case in {"zero_delta", "nonfinite_fp8", "invalid_grid"}:
+        value = float("nan") if case == "nonfinite_fp8" else 0.5
+        weights[keys[0]] = torch.full((4, 3), value).to(fp8)
+        scale_shape = (2, 1) if case == "invalid_grid" else (1, 1)
+        scales[keys[0] + "_scale_inv"] = torch.full(scale_shape, 0.25)
     save_file(weights, base / "model-weights.safetensors")
     save_file(scales, base / "model-scales.safetensors")
     weight_map = dict.fromkeys(weights, "model-weights.safetensors") | dict.fromkeys(
@@ -190,15 +199,18 @@ def test_flash_dcp_preserves_fp8_and_deinterleaves_kda_projections(tmp_path):
     }
     (base / "config.json").write_text(json.dumps(config))
     module = "language_model.decoder.layers.2.inner_layer.self_attention.in_proj.adapter"
-    dcp.save(
-        {
-            f"{module}.linear_in.weight": torch.tensor([[1, 0, 0]], dtype=torch.bfloat16),
-            f"{module}.linear_out.weight": torch.tensor([2**i for i in range(12)], dtype=torch.bfloat16).reshape(
-                12, 1
-            ),
-        },
-        checkpoint_id=checkpoint,
-    )
+    b_rows = [2**i for i in range(12)] if case in {"kda", "vision_adapter"} else [0] * 12
+    adapters = {
+        f"{module}.linear_in.weight": torch.tensor([[1, 0, 0]], dtype=torch.bfloat16),
+        f"{module}.linear_out.weight": torch.tensor(b_rows, dtype=torch.bfloat16).reshape(12, 1),
+    }
+    if case == "vision_adapter":
+        visual = "visual.blocks.0.mlp.gate_proj.adapter"
+        vision_a = torch.tensor([[1, -2, 0.5]], dtype=torch.bfloat16)
+        vision_b = torch.tensor([[2], [-1], [0.5], [0]], dtype=torch.bfloat16)
+        adapters[f"{visual}.linear_in.weight"] = vision_a
+        adapters[f"{visual}.linear_out.weight"] = vision_b
+    dcp.save(adapters, checkpoint_id=checkpoint)
     spec = {
         "format_version": 1,
         "lora_rank": 1,
@@ -209,12 +221,28 @@ def test_flash_dcp_preserves_fp8_and_deinterleaves_kda_projections(tmp_path):
     args = Namespace(relax_lora_checkpoint_metadata=spec, tensor_model_parallel_size=2)
     torch.save({"args": args}, checkpoint / "common.pt")
 
+    expected_errors = {
+        "nonfinite_fp8": "Nonfinite output",
+        "invalid_grid": "Invalid FP8 scale grid",
+    }
+    if case in expected_errors:
+        with pytest.raises(ValueError, match=expected_errors[case]):
+            merge(base, output, checkpoint=checkpoint, preserve_base_dtypes=True)
+        assert not output.exists()
+        return
+
     report = merge(base, output, checkpoint=checkpoint, preserve_base_dtypes=True)
 
-    assert report["merged_matrices"] == 3
+    assert report["merged_finite"]
+    assert report["merged_matrices"] == (4 if case == "vision_adapter" else 3)
     output_map, output_schema = read_hf_schema(output)
     assert output_schema == read_hf_schema(base)[1]
     assert (output / "config.json").read_bytes() == (base / "config.json").read_bytes()
+    if case == "zero_delta":
+        for key, original in (weights | scales).items():
+            with safe_open(output / output_map[key], framework="pt") as handle:
+                torch.testing.assert_close(handle.get_tensor(key).view(torch.uint8), original.view(torch.uint8))
+        return
     for key, values in zip(keys, ([1, 2, 64, 128], [4, 8, 256, 512], [16, 32, 1024, 2048])):
         with safe_open(output / output_map[key], framework="pt") as handle:
             weight = handle.get_tensor(key).float()
@@ -222,6 +250,10 @@ def test_flash_dcp_preserves_fp8_and_deinterleaves_kda_projections(tmp_path):
                 weight *= handle.get_tensor(key + "_scale_inv")
         torch.testing.assert_close(weight[:, 0], torch.tensor(values, dtype=torch.float32))
         assert weight[:, 1:].count_nonzero().item() == 0
+    if case == "vision_adapter":
+        expected = (weights[visual_key].float() + vision_b.float() @ vision_a.float()).bfloat16()
+        with safe_open(output / output_map[visual_key], framework="pt") as handle:
+            torch.testing.assert_close(handle.get_tensor(visual_key), expected, rtol=0, atol=0)
     with safe_open(output / output_map[frozen], framework="pt") as handle:
         torch.testing.assert_close(handle.get_tensor(frozen), weights[frozen], rtol=0, atol=0)
 

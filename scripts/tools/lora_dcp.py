@@ -80,17 +80,23 @@ def adapter_targets(
     pattern = r"decoder\.layers\.(\d+)\.inner_layer\.(.+)" if flash else r"decoder\.layers\.(\d+)\.(.+)"
     targets = {}
     for prefix in sorted(prefixes):
-        match = re.fullmatch(pattern, normalize_key(prefix))
-        if match is None:
-            raise ValueError(f"Unsupported adapter module: {prefix}")
-        layer, module = match.groups()
-        if flash:
-            layer_index, sublayer = divmod(int(layer), 2)
-            if sublayer != int(module.startswith("mlp.")):
-                raise ValueError(f"Unexpected Flash hybrid sublayer: {prefix}")
-            head = f"model.language_model.layers.{layer_index}."
+        normalized = normalize_key(prefix)
+        is_visual = flash and normalized.startswith("visual.")
+        if is_visual:
+            # Flash Bridge replicates visual.* into model.visual.* without splitting rows.
+            head, module = "model.", normalized
         else:
-            head = f"model.layers.{layer}."
+            match = re.fullmatch(pattern, normalized)
+            if match is None:
+                raise ValueError(f"Unsupported adapter module: {prefix}")
+            layer, module = match.groups()
+            if flash:
+                layer_index, sublayer = divmod(int(layer), 2)
+                if sublayer != int(module.startswith("mlp.")):
+                    raise ValueError(f"Unexpected Flash hybrid sublayer: {prefix}")
+                head = f"model.language_model.layers.{layer_index}."
+            else:
+                head = f"model.layers.{layer}."
         a, b = shapes[prefix + _A], shapes[prefix + _B]
         if len(a) not in (2, 3) or len(a) != len(b) or a[-2] != rank or b[-1] != rank:
             raise ValueError(f"Invalid adapter shape: {prefix}: {a}, {b}")
@@ -98,7 +104,9 @@ def adapter_targets(
             raise ValueError(f"Mismatched expert axes: {prefix}")
         expert_indices: list[int | None] = [None]
         projection = module.removeprefix("self_attention.")
-        if flash and module == _KDA_QKV:
+        if is_visual:
+            names = [module]
+        elif flash and module == _KDA_QKV:
             names = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
             if b[-2] % (len(names) * tensor_parallel_size):
                 raise ValueError(f"Invalid Flash KDA QKV tensor-parallel layout: {prefix}")
@@ -180,7 +188,8 @@ class DcpAdapter:
         tensor_metadata = {
             k: v
             for k, v in metadata.state_dict_metadata.items()
-            if model_key(k) and isinstance(v, TensorStorageMetadata)
+            if isinstance(v, TensorStorageMetadata)
+            and (model_key(k) or (model_type == "glm5_next" and normalize_key(k).startswith("visual.")))
         }
         shapes = {k: tuple(v.size) for k, v in tensor_metadata.items() if ".adapter." in k}
         if any(k not in shapes for k in tensor_metadata):

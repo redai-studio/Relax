@@ -311,6 +311,16 @@ def _copy_aux_files(base_dir: Path, output_dir: Path) -> None:
         logger.info(f"[merge-lora]   copied {item.name}")
 
 
+def _fp8_grid(weight_shape: tuple[int, ...], scale_shape: tuple[int, ...]) -> tuple[int, int]:
+    if len(weight_shape) != 2:
+        raise ValueError(f"FP8 block quantization expects a matrix, got {tuple(weight_shape)}")
+    rows, cols = weight_shape
+    grid = ((rows + 127) // 128, (cols + 127) // 128)
+    if tuple(scale_shape) != grid:
+        raise ValueError(f"Invalid FP8 scale grid: {tuple(scale_shape)}, expected {grid}")
+    return grid
+
+
 def dequantize_base(weight: Any, scale: Any | None) -> Any:
     import torch
 
@@ -318,12 +328,10 @@ def dequantize_base(weight: Any, scale: Any | None) -> Any:
         if scale is not None:
             raise ValueError("Scale companion attached to a non-FP8 weight")
         return weight
-    if weight.ndim != 2 or scale is None:
+    if scale is None:
         raise ValueError("FP8 matrix requires its block scale companion")
+    nr, nc = _fp8_grid(weight.shape, scale.shape)
     rows, cols = weight.shape
-    nr, nc = (rows + 127) // 128, (cols + 127) // 128
-    if tuple(scale.shape) != (nr, nc):
-        raise ValueError(f"Invalid FP8 scale grid: {tuple(scale.shape)}, expected {(nr, nc)}")
     values = torch.nn.functional.pad(weight.float(), (0, nc * 128 - cols, 0, nr * 128 - rows))
     values = values.view(nr, 128, nc, 128)
     values.mul_(scale.float()[:, None, :, None])
@@ -384,8 +392,10 @@ def merge(
                 raise ValueError("FP8 weights require explicit block quantization metadata")
             if preserve_base_dtypes and entry["dtype"] != "F8_E4M3":
                 raise ValueError("Preserving FP8 dtypes requires E4M3 block quantization")
-            if key + "_scale_inv" not in scales:
+            scale_key = key + "_scale_inv"
+            if scale_key not in scales:
                 raise ValueError(f"Missing FP8 scale: {key}")
+            _fp8_grid(entry["shape"], schema[scale_key]["shape"])
         if key in scales:
             base_key = key.removesuffix("_scale_inv")
             if base_key not in schema or not schema[base_key]["dtype"].startswith("F8"):
@@ -462,7 +472,13 @@ def merge(
                 merged = _merge_shard(tensors, targets, adapter, pairs, scaling, device, fp8_scales=fp8_scales)
                 for key, value in tensors.items():
                     is_fp8 = schema[key]["dtype"].startswith("F8") and preserve_base_dtypes
-                    if not is_fp8 and not bool(torch.isfinite(value).all()):
+                    # Preserved FP8 is E4M3FN, which has NaNs but no infinities.
+                    # Check it in its native dtype to avoid expanding a weight shard.
+                    if is_fp8:
+                        nonfinite = torch.isnan(value).any()
+                    else:
+                        nonfinite = not torch.isfinite(value).all()
+                    if nonfinite:
                         raise ValueError(f"Nonfinite output: {key}")
                     tensors[key] = value.contiguous()
                     output_map[key] = shard

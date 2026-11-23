@@ -2,18 +2,20 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # Geometry3K visual geometry, BF16 GLM-5.3-Flash LoRA GRPO, 32 colocated GPUs.
-# On the Ray head, set RAY_JOB_ADDRESS to its Jobs HTTP URL, then run:
-#   RELAX_SKIP_CLUSTER_CLEANUP=1 bash scripts/entrypoint/ray-job.sh \
-#     examples/geometry3k_rl/scripts/run-glm5.3-flash-lora-32xgpu.sh
+# Use absolute model, data (including image paths), and checkpoint directories
+# visible on every Ray node. Set RAY_JOB_ADDRESS to the cluster's Jobs HTTP URL.
+#   MODEL_DIR=/shared/models DATA_DIR=/shared/data/geometry3k \
+#     SAVE_DIR=/shared/checkpoints RELAX_SKIP_CLUSTER_CLEANUP=1 \
+#     bash examples/geometry3k_rl/scripts/run-glm5.3-flash-lora-32xgpu.sh
 
 set -eo pipefail
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
-MODEL_DIR="${MODEL_DIR:-${RELAX_ROOT}/../../ckpt}"
-DATA_DIR="${DATA_DIR:-${RELAX_ROOT}/../../dataset/glm53-flash-geometry3k}"
-SAVE_DIR="${SAVE_DIR:-${MODEL_DIR}/relax-rl}"
+: "${MODEL_DIR:?Set MODEL_DIR to a model directory shared by all Ray nodes}"
+: "${DATA_DIR:?Set DATA_DIR to a data directory shared by all Ray nodes}"
+: "${SAVE_DIR:?Set SAVE_DIR to a persistent checkpoint directory shared by all Ray nodes}"
 MODEL_NAME="${MODEL_NAME:-relax-sft/glm5.3-flash-opensearch-vl-32xgpu/bf16/model-base}"
 HF_CHECKPOINT="${MODEL_DIR}/${MODEL_NAME}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/rl/geometry3k}"
