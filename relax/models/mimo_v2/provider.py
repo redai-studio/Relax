@@ -57,6 +57,7 @@ class MiMoV2ModelProvider(GPTModelProvider):
                 raise ValueError(
                     "MiMo image SFT requires a trusted HF checkpoint with its vision config and model code."
                 )
+            args.multimodal_input_key_map = {"image_grid_thw": "grid_thws"}
             # Insert image features before sequence parallelism partitions the embeddings.
             self.scatter_embedding_sequence_parallel = False
 

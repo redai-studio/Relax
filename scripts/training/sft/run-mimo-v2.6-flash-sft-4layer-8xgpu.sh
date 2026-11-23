@@ -28,6 +28,7 @@ CKPT_ARGS=(
     --hf-checkpoint "$HF_CHECKPOINT"
     --ref-load "$HF_CHECKPOINT"
     --megatron-to-hf-mode bridge
+    --load "$SAVE_DIR"
     --save "$SAVE_DIR"
     --save-interval "${SAVE_INTERVAL:-100}"
 )
@@ -70,7 +71,7 @@ OPTIMIZER_ARGS=(
 )
 TRAIN_CMD=(
     "${PYTHON:-python3}" -m relax.entrypoints.train
-    --resource "{\"sft\":[1,0],\"actor\":[$NODES,$NUM_GPUS]}"
+    --resource "{\"sft\":[1,0],\"actor\":[1,$((NODES * NUM_GPUS))]}"
     --num-gpus-per-node "$NUM_GPUS"
     "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${SFT_ARGS[@]}" "${PERF_ARGS[@]}" "${OPTIMIZER_ARGS[@]}" "$@"
 )

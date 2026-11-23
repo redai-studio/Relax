@@ -69,12 +69,14 @@ class MiMoV2ImageModel(GPTModel):
         *args,
         pixel_values: Tensor | None = None,
         image_grid_thw: Tensor | None = None,
+        grid_thws: Tensor | None = None,
         padding_mask: Tensor | None = None,
         fp32_output: bool | None = None,
         **kwargs,
     ) -> Tensor:
         if self.pre_process and decoder_input is None:
-            decoder_input = self.image_embeddings(input_ids, position_ids, pixel_values, image_grid_thw)
+            grid = grid_thws if grid_thws is not None else image_grid_thw
+            decoder_input = self.image_embeddings(input_ids, position_ids, pixel_values, grid)
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = scatter_to_sequence_parallel_region(
                     padding_mask.T.contiguous(), group=self.pg_collection.tp
