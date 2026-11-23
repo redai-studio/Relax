@@ -191,8 +191,10 @@ class SGLangProducer(Producer):
         if "moe" in self.kinds and not (evaluation and reference):
             options["return_routed_experts"] = True
         if request_id is not None:
-            # Agentic retries and aborts address this same wire request.
             if "moe" in self.kinds and reference:
+                # A retry of the same logical request can overlap an unacknowledged registry close.
+                if not evaluation:
+                    request_id = f"{request_id}-{uuid4().hex}"
                 request_id = AGENTIC_R3_REQUEST_PREFIX + ("mm-" if media else "") + request_id
             elif media:
                 request_id = REQUEST_PREFIX + request_id

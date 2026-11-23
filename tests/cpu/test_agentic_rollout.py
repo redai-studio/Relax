@@ -1121,7 +1121,10 @@ async def test_agentic_r3_handoff_by_wire_id(monkeypatch, agentic_replay_store, 
         route = seal(payload)
         if delivery == "response-lost":
             raise httpx.ReadError("lost after sealing")
-        return {"output_ids": [2], "meta_info": {"finish_reason": {"type": "stop"}, "routed_experts": route}}
+        return {
+            "output_ids": [2],
+            "meta_info": {"finish_reason": {"type": "stop"}, "routed_experts": sglang._wire_ref(route)},
+        }
 
     monkeypatch.setattr(adapter, "_managed_post", send)
     monkeypatch.setattr(runtime_mod, "post", send)
@@ -1147,6 +1150,74 @@ async def test_agentic_r3_handoff_by_wire_id(monkeypatch, agentic_replay_store, 
             seal(payload)
     inventory.retire_partition("train_0")
     assert not inventory.snapshot()["objects"] and not body.blocks
+
+
+async def test_agentic_r3_retries_after_no_workers_and_registry_close_failure(monkeypatch, agentic_replay_store):
+    store, _, _ = agentic_replay_store
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    adapter._args.use_rollout_mm_embedding_replay = True
+    rids = []
+
+    async def post(url, payload, **_kwargs):
+        rids.append(payload["rid"])
+        if len(rids) == 1:
+            raise _router_503()
+        return {"output_ids": [2], "meta_info": {"finish_reason": {"type": "stop"}}}
+
+    invoke = store.invoke_async
+
+    async def unavailable(method, *args):
+        if method == "finish_response_attempt" and len(args) == 1:
+            raise ConnectionError("registry unavailable during close")
+        return await invoke(method, *args)
+
+    monkeypatch.setattr(runtime_mod, "post", post)
+    kwargs = dict(input_ids=[1], sampling_params={}, session_id="s", request_id="r", fail_fast_no_workers=True)
+    with monkeypatch.context() as fault:
+        fault.setattr(store, "invoke_async", unavailable)
+        with pytest.raises(httpx.HTTPStatusError, match="router unavailable"):
+            await adapter.generate(**kwargs)
+    assert (await adapter.generate(**kwargs)).new_tokens == [2]
+    assert len(set(rids)) == 2 and all(rid.startswith("relax-agentic-r3-mm-") for rid in rids)
+
+
+async def test_agentic_r3_pause_during_rejected_request_cleanup(monkeypatch, agentic_replay_store):
+    store, _, _ = agentic_replay_store
+    shard, _, session, ir = _router_recovery_shard()
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    shard._generation_backend = adapter
+    adapter._worker_urls = AsyncMock(return_value=[])
+    monkeypatch.setattr(runtime_mod, "post", AsyncMock(side_effect=_router_503()))
+    closing, release = asyncio.Event(), asyncio.Event()
+    close = store.abandon_response_attempt
+
+    async def blocked_close(rid):
+        closing.set()
+        await release.wait()
+        await close(rid)
+
+    monkeypatch.setattr(store, "abandon_response_attempt", blocked_close)
+    runner = ir.runner_task = asyncio.create_task(shard._run_ir(session, ir))
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=3)
+
+        # Run the pause against the rejected request while the registry is still busy.
+        async def release_after_abort(*args, **kwargs):
+            try:
+                await abort(*args, **kwargs)
+            finally:
+                release.set()
+
+        abort = adapter.abort_request
+        monkeypatch.setattr(adapter, "abort_request", release_after_abort)
+        await asyncio.wait_for(shard.pause_generation(), timeout=3)
+        assert list(session.queued_irs) == [ir]
+        adapter._worker_urls.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.gather(runner, return_exceptions=True)
 
 
 @pytest.mark.parametrize("valid_score_centering", [False, True])

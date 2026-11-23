@@ -642,12 +642,22 @@ class SGLangBackendAdapter:
         started = time.monotonic()
         attempt = _BackendAttempt(payload["rid"], {engine_url} if engine_url else set())
         self._requests[request_id] = attempt
+
+        async def post_to_router(url: str, payload: dict, **kwargs: Any) -> dict:
+            # A lost response may already have produced tokens on a worker.
+            kwargs["max_retries"] = 1
+            try:
+                return await post(url, payload, **kwargs)
+            except httpx.HTTPStatusError as error:
+                if is_router_no_available_workers(error):
+                    # Pause can race replay cleanup. The router confirmed there is no worker to abort.
+                    self._requests.pop(request_id, None)
+                raise
+
         try:
-            # A lost generate response may already have produced tokens on a worker.
-            send = self._managed_post if engine_url else partial(post, max_retries=1)
             output = await post_generation_request(
                 replay_data_manager,
-                send,
+                self._managed_post if engine_url else post_to_router,
                 f"{engine_url or self._router_url}/generate",
                 payload,
                 headers=headers,
@@ -655,11 +665,7 @@ class SGLangBackendAdapter:
             )
         except httpx.HTTPStatusError as error:
             aborted = is_expected_sglang_499(error)
-            if (
-                aborted
-                or error.response.status_code == 400
-                or (not engine_url and is_router_no_available_workers(error))
-            ):
+            if aborted or error.response.status_code == 400:
                 self._requests.pop(request_id, None)
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
