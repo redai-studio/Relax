@@ -445,9 +445,11 @@ class _FakeOwner:
 
 
 @pytest.mark.parametrize("outcome", ["success", "timeout"])
-@pytest.mark.parametrize("required_node_resource", [None, "stable_cpu"])
+@pytest.mark.parametrize(
+    ("required_node_resource", "metadata_timeout"), [(None, 1), ("stable_cpu", 1), ("stable_cpu", -1)]
+)
 def test_owner_start_boundary(
-    monkeypatch: pytest.MonkeyPatch, outcome: str, required_node_resource: str | None
+    monkeypatch: pytest.MonkeyPatch, outcome: str, required_node_resource: str | None, metadata_timeout: int
 ) -> None:
     owner = _FakeOwner()
     stopped: list[Any] = []
@@ -455,6 +457,7 @@ def test_owner_start_boundary(
     actor_class.remote.return_value = owner
     options = MagicMock(return_value=actor_class)
     monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "options", options)
+    monkeypatch.setattr(tq_lifecycle.tq.controller, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", metadata_timeout)
     conf = _conf("MooncakeStore")
     conf["controller"]["required_node_resource"] = required_node_resource
     if outcome == "timeout":
@@ -470,7 +473,10 @@ def test_owner_start_boundary(
     else:
         monkeypatch.setattr(tq_lifecycle.ray, "get", lambda *_args, **_kwargs: None)
         assert tq_lifecycle._start_owner(conf, timeout=0.1) is owner
-    options.assert_called_once_with(resources={required_node_resource: 1} if required_node_resource else None)
+    expected: dict[str, Any] = {"resources": {required_node_resource: 1} if required_node_resource else None}
+    if metadata_timeout == -1:
+        expected["runtime_env"] = {"env_vars": {"TQ_CONTROLLER_GET_METADATA_TIMEOUT": "-1"}}
+    options.assert_called_once_with(**expected)
 
 
 def test_owner_initialize_success_timeout_and_exception_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:

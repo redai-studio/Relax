@@ -645,10 +645,13 @@ def _start_owner(conf: Any, *, timeout: float) -> Any:
     """Create and schedule the isolated owner before candidate fallback."""
     controller_conf = _get_config_value(conf, "controller", {})
     required_node_resource = _get_config_value(controller_conf, "required_node_resource", None)
+    options: dict[str, Any] = {"resources": {required_node_resource: 1} if required_node_resource else None}
+    # Ray may already be running when the driver selects nonblocking reads.
+    # The owner imports TQ in a separate process before it creates the controller.
+    if (metadata_timeout := tq.controller.TQ_CONTROLLER_GET_METADATA_TIMEOUT) < 0:
+        options["runtime_env"] = {"env_vars": {"TQ_CONTROLLER_GET_METADATA_TIMEOUT": str(metadata_timeout)}}
     try:
-        owner = _TransferQueueOwner.options(
-            resources={required_node_resource: 1} if required_node_resource else None
-        ).remote()
+        owner = _TransferQueueOwner.options(**options).remote()
         ray.get(owner.ready.remote(), timeout=timeout)
     except Exception as error:
         if "owner" in locals():
