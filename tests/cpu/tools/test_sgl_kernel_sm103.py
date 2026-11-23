@@ -19,7 +19,7 @@ SPEC.loader.exec_module(kernel)
 def make_source(root, layout, version="0.4.7"):
     source = root / layout
     source.mkdir(parents=True)
-    (source / "CMakeLists.txt").write_text('set(FLAGS "-gencode=arch=compute_120a,code=sm_120a")\n')
+    (source / "CMakeLists.txt").write_text('set(FLAGS "-gencode=arch=compute_103a,code=sm_103a")\n')
     (source / "pyproject.toml").write_text(f'[project]\nname = "sglang-kernel"\nversion = "{version}"\n')
     return source
 
@@ -96,7 +96,7 @@ def test_kernel_rebuild_uses_matching_source_and_keeps_dependencies(build, monke
     assert install.kwargs["env"]["CUDA_HOME"] == "/usr/local/cuda"
     assert '"-gencode=arch=compute_103a,code=sm_103a"' in (source / "CMakeLists.txt").read_text()
     contents = (source / "CMakeLists.txt").read_text()
-    kernel.add_sm103_target(source / "CMakeLists.txt")
+    kernel.require_sm103_target(source / "CMakeLists.txt")
     assert (source / "CMakeLists.txt").read_text() == contents
 
 
@@ -149,8 +149,8 @@ def test_kernel_hopper_skips_build_and_metadata(build, monkeypatch):
 def test_kernel_unknown_cmake_flags_fail_closed(tmp_path):
     cmake = tmp_path / "CMakeLists.txt"
     cmake.write_text("# upstream no longer has our build anchor\n")
-    with pytest.raises(RuntimeError, match="build flags changed"):
-        kernel.add_sm103_target(cmake)
+    with pytest.raises(RuntimeError, match="missing the SM103 build target"):
+        kernel.require_sm103_target(cmake)
 
 
 def test_kernel_missing_blackwell_library_is_not_hopper_success(build):

@@ -1,34 +1,16 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Keep CPU int32 rollout replay identical to the previous int64 layout.
+"""Exercise the actor’s dense MoE row packing on CPU."""
 
-Execute the real actor method and CP helpers without importing Megatron, Ray,
-or a model. CUDA transfer and pinned-memory behavior have separate tests.
-"""
-
-import ast
-import sys
-from collections.abc import Callable
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 
-_ROOT = Path(__file__).resolve().parents[4]
 _NUM_LAYERS = 8
 _TOPK = 2
 _TOKEN_LENGTHS = [1, 6, 11, 17]
 _MICROBATCHES = [[2, 0], [3, 1]]
-
-
-def _load_function(relative_path: str, name: str, namespace: dict) -> Callable:
-    source = _ROOT / relative_path
-    tree = ast.parse(source.read_text())
-    functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name]
-    assert len(functions) == 1
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
-    return namespace[name]
 
 
 class _ReplayIterator:
@@ -60,24 +42,23 @@ class _RecordedLayer:
 
 @pytest.fixture
 def replay_method(monkeypatch):
-    registry = SimpleNamespace(all_routing_replays=[])
-    block_module = ModuleType("megatron.core.transformer.transformer_block")
-    block_module.get_num_layers_to_build = lambda config, vp_stage: (
-        config.layer_spans[vp_stage][1] - config.layer_spans[vp_stage][0]
-    )
-    layer_module = ModuleType("megatron.core.transformer.transformer_layer")
-    layer_module.get_transformer_layer_offset = lambda config, vp_stage: config.layer_spans[vp_stage][0]
-    replay_module = ModuleType("relax.utils.training.routing_replay")
-    replay_module.RoutingReplay = registry
-    for module in (block_module, layer_module, replay_module):
-        monkeypatch.setitem(sys.modules, module.__name__, module)
+    from megatron.core import mpu
 
     parallel = SimpleNamespace()
-    namespace = {"torch": torch, "mpu": parallel, "Callable": Callable, "F": torch.nn.functional}
-    for name in ("slice_with_cp", "maybe_padded_total_lengths"):
-        _load_function("relax/backends/megatron/cp_utils.py", name, namespace)
-    fill = _load_function("relax/backends/megatron/actor.py", "fill_routing_replay", namespace)
-    return fill, parallel, registry
+    for name in (
+        "get_context_parallel_world_size",
+        "get_context_parallel_rank",
+        "get_tensor_model_parallel_world_size",
+        "get_tensor_model_parallel_rank",
+    ):
+        monkeypatch.setattr(mpu, name, lambda name=name: getattr(parallel, name)())
+
+    from relax.backends.megatron.actor import MegatronTrainRayActor
+    from relax.distributed.replay_manager.backend.megatron import RoutingReplay
+
+    monkeypatch.setattr(RoutingReplay, "all_routing_replays", [])
+    fill = MegatronTrainRayActor.fill_routing_replay
+    return fill, parallel, RoutingReplay
 
 
 def _run_fill(
@@ -113,7 +94,14 @@ def _run_fill(
         if (layer_id % moe_layer_freq == 0 if isinstance(moe_layer_freq, int) else bool(moe_layer_freq[layer_id]))
     ]
     records = [_RecordedLayer(layer_id) for layer_id in local_moe_layers]
-    registry.all_routing_replays = records
+    for model, (start, end) in zip(models, spans, strict=True):
+        modules = [
+            SimpleNamespace(layer_number=r.layer_id + 1, routing_replay=r)
+            for r in records
+            if start <= r.layer_id < end
+        ]
+        model.modules = lambda modules=modules: iter(modules)
+    registry.all_routing_replays = list(reversed(records))
     data = {
         "tokens": [torch.arange(length) for length in _TOKEN_LENGTHS],
         "rollout_routed_experts": [

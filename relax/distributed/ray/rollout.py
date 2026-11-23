@@ -470,6 +470,10 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            from relax.distributed.replay_manager import reference_environment
+
+            env_vars.update(reference_environment())
+
             effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
             effective_load_format = self.sglang_overrides.get(
                 "load_format", getattr(self.args, "sglang_load_format", "auto")
@@ -734,7 +738,7 @@ class RolloutServer:
         # is retried. Do not return None slots to the synchronous weight updater.
         for group, dead_indices in zip(groups, dead_per_group, strict=True):
             if not (
-                getattr(group.args, "fully_async", False)
+                group.args.fully_async
                 and group.is_scaled_out
                 and group.pg is not None
                 and group.skip_router_registration
@@ -1430,6 +1434,7 @@ class RolloutManager(ReloadableMixin):
             self._dynamic_global_batch_size = len(
                 {sample.index for sample_group in output.samples for sample in sample_group}
             )
+        return output.partition_complete
 
     async def eval(self, rollout_id):
         self._begin_generation()

@@ -9,6 +9,15 @@ from relax.distributed.weight_sync.codec import encode, tensors, validate_direct
 from relax.distributed.weight_sync.tcp_transport import TcpFrameSource, receive
 
 
+def test_config_rejects_staging_larger_than_receiver_budget(tmp_path):
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    path = tmp_path / "delta.json"
+    path.write_text('{"stream":"test","receiver_gpu_budget_bytes":16,"staging_budget_bytes":17}')
+    with pytest.raises(ValueError, match="staging_budget_bytes exceeds receiver_gpu_budget_bytes"):
+        DeltaSyncConfig.load(path)
+
+
 @pytest.mark.parametrize("empty", [False, True])
 def test_tcp_delivers_same_immutable_wire_to_all_fixed_recipients(empty):
     positions = torch.empty(0, dtype=torch.int32) if empty else torch.tensor([0, 3], dtype=torch.int32)
@@ -102,6 +111,8 @@ def test_staged_tcp_prefix_is_immutable_bounded_and_never_applies_before_owner_b
         assert consumed == [] and actions == ["receive", "ready", "receive", "ready"]
         with pytest.raises(RuntimeError, match="generating model"):
             transfer.apply()
+        with pytest.raises(RuntimeError, match="Cannot finalize"):
+            transfer.finalize()
         transfer.activate()
         assert transfer.apply() == {"weight"}
         assert consumed == [(0, expected), (1, bytes(8))]
@@ -687,8 +698,8 @@ def test_source_rejects_incomplete_final_mask_from_one_engine(monkeypatch, bad):
     transfer = DeltaTransfer(DeltaSyncConfig(stream="mask"), "cpu")
     transfer.connection = {}
     transfer.engines = [SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=lambda *a, **k: None))] * 2
-    transfer.begin(version="2", base="1", seed=True, defer_apply=True)
-    transfer._applying = True
+    monkeypatch.setattr(ray, "get", lambda *args, **kwargs: [{"success": True}] * 2)
+    transfer.begin(version="2", base="1", seed=True)
     transfer._final_schema = {"a": ((2,), "float32"), "b": ((2,), "float32")}
     good = dict(success=True, force_full_seed=False, full_required_mask=[1, 0])
     damaged = dict(good)

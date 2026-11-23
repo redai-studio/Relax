@@ -67,6 +67,7 @@ def test_ordinary_pp_iterator_preserves_selection_plans(monkeypatch, allgather_c
     monkeypatch.setenv("RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS", "1" if case == "vl_with_images" else "0")
     args = Namespace(
         loss_type="sft",
+        task_type="causal_lm",
         qkv_format="thd",
         sft_chunked_logits=True,
         enable_mtp_training=True,

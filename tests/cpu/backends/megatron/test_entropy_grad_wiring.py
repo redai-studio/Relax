@@ -3,6 +3,7 @@
 """Regression tests for fused log-probability and entropy wiring."""
 
 from argparse import Namespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -63,6 +64,66 @@ def test_get_log_probs_and_entropy_wires_entropy_grad(
         objective = objective + entropy_coef * entropy.sum()
     objective.backward()
     assert logits.grad is not None
+
+
+@pytest.mark.parametrize(
+    ("coef", "reentrant", "replay_entropy"), [(0.0, True, False), (0.1, True, True), (0.0, False, True)]
+)
+def test_policy_checkpoint_entropy_matches_eager(monkeypatch, coef, reentrant, replay_entropy):
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
+    kernel = Mock(wraps=loss_module.calculate_log_probs_and_entropy)
+    monkeypatch.setattr(loss_module, "calculate_log_probs_and_entropy", kernel)
+    args = Namespace(
+        loss_type="policy_loss",
+        advantage_estimator="grpo",
+        true_on_policy_mode=True,
+        use_opsm=False,
+        use_tis=False,
+        get_mismatch_metrics=False,
+        use_kl_loss=False,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        entropy_coef=coef,
+        calculate_per_token_loss=True,
+        global_batch_size=1,
+        qkv_format="thd",
+        allgather_cp=False,
+        rollout_temperature=1.0,
+        log_probs_chunk_size=-1,
+        opd_token_selection="student_sampled",
+        recompute_loss_function_use_reentrant=reentrant,
+    )
+    batch = {
+        "advantages": torch.tensor([1.0, -0.5]),
+        "unconcat_tokens": [torch.tensor([2, 1, 0])],
+        "total_lengths": [3],
+        "response_lengths": [2],
+        "loss_masks": [torch.tensor([1.0, 0.0])],
+    }
+    inputs = torch.tensor([[[1.0, -2.0, 0.5], [2.0, 0.0, -1.0], [0.0, 1.0, 2.0]]])
+
+    def run(recompute):
+        args.recompute_loss_function = recompute
+        logits = inputs.clone().requires_grad_()
+        loss, _, metrics = loss_module.loss_function(args, batch, 1, logits)
+        loss.backward()
+        entropy = metrics["values"][1 + metrics["keys"].index("entropy_loss")]
+        return loss.detach(), entropy, logits.grad
+
+    ref_logits = inputs.clone().requires_grad_()
+    # Only the first response token (target 1) contributes, with unit advantage and on-policy ratio 1.
+    log_probs = ref_logits[0, 0].log_softmax(dim=-1)
+    ref_entropy = -(log_probs.exp() * log_probs).sum()
+    ratio = (log_probs[1] - log_probs[1].detach()).exp()
+    ref_loss = -ratio - coef * ref_entropy
+    (ref_grad,) = torch.autograd.grad(ref_loss, ref_logits)
+
+    for loss, entropy, grad in (run(False), run(True)):
+        torch.testing.assert_close(grad, ref_grad)
+        torch.testing.assert_close(loss, ref_loss.detach())
+        torch.testing.assert_close(entropy, ref_entropy.detach())
+    assert [call.kwargs["with_entropy"] for call in kernel.call_args_list] == [True, True, replay_entropy]
 
 
 def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.MonkeyPatch) -> None:

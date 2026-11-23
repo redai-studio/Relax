@@ -130,6 +130,37 @@ def test_rank_zero_control_failure_does_not_strand_other_ranks(backends, phase):
     assert all(worker._managed_lora_publisher.publish.call_count == 0 for worker in workers)
 
 
+@pytest.mark.parametrize(("overlap", "phase"), [(False, "pause"), (False, "flush"), (True, "pause"), (True, "flush")])
+def test_delta_pause_failure_reaches_both_ranks_before_payload(backends, monkeypatch, overlap, phase):
+    from relax.backends.megatron.weight_update.delta_export import ShardDeltaExporter
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    ranks, workers = backends
+    monkeypatch.setattr(device_direct.dist, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for worker in workers:
+        worker._managed_lora_publisher = None
+        worker._lora_adapter_mode = False
+        worker.args.offload_rollout = False
+        worker.delta_exporter = ShardDeltaExporter(
+            object(),
+            object(),
+            snapshot_budget_bytes=64,
+            config=DeltaSyncConfig(stream="test", receive_overlap=overlap),
+        )
+        worker._delta_rollout_recipients = lambda: (True, [], [])
+    first = workers[0]
+    if phase == "flush":
+        first.rollout_engines[0].flush_cache.remote.side_effect = RuntimeError("control failed")
+    else:
+        first._batch_request.side_effect = RuntimeError("control failed")
+    results = ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True))
+    assert_rank_errors(results, "DCS delta pause/flush failed: RuntimeError: control failed")
+    for worker in workers:
+        assert worker.delta_exporter.transfer is None
+        assert worker.delta_exporter._sequence == 0
+
+
 def test_failed_first_publication_does_not_cause_base_resynchronization(backends):
     ranks, workers = backends
     for worker in workers:

@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from relax.utils.training.intervals import should_save_checkpoint
+
 
 def _load_functions(path, names, namespace):
     tree = ast.parse(Path(path).read_text())
@@ -59,6 +61,7 @@ def runtime():
         evaluation_step_for_rollout=lambda args, rollout_id: rollout_id + 1,
         should_run_sft_eval=lambda args, rollout_id: getattr(args, "eval_at", None) == rollout_id,
         should_run_sft_predict=lambda args, rollout_id: False,
+        should_save_checkpoint=should_save_checkpoint,
         device_utils=SimpleNamespace(make_current_torch_device=main_only(torch.device("cpu"))),
         mpu=SimpleNamespace(
             get_data_parallel_rank=main_only(3),

@@ -69,6 +69,22 @@ def test_data_state_rejects_configuration_change_but_allows_longer_run(tmp_path)
         restore_data_state(args, dataset(), 1, 13)
 
 
+def test_reasoning_mask_preserves_legacy_resume_but_rejects_policy_changes(tmp_path):
+    args, original = config(tmp_path), dataset()
+    samples, _ = original.get_batch(4)
+    save_data_state(args, original, 1, 13, samples)
+    args.sft_mask_reasoning = False
+    restore_data_state(args, dataset(), 1, 13)
+    args.sft_mask_reasoning = True
+    with pytest.raises(ValueError, match="configuration"):
+        restore_data_state(args, dataset(), 1, 13)
+    save_data_state(args, original, 1, 13, samples)
+    restore_data_state(args, dataset(), 1, 13)
+    args.sft_mask_reasoning = False
+    with pytest.raises(ValueError, match="configuration"):
+        restore_data_state(args, dataset(), 1, 13)
+
+
 @pytest.mark.parametrize("key,value", [("position", 14), ("epoch", -1), ("next_step", 9), ("version", 0)])
 def test_corrupt_cursor_is_not_silently_replayed(tmp_path, key, value):
     args, original = config(tmp_path), dataset()

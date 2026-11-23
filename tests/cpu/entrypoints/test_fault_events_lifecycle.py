@@ -147,6 +147,51 @@ def train_loader(monkeypatch):
             assert not server._thread.is_alive()
 
 
+def test_reference_startup_failure_cleans_once_under_watchdog(train_loader, monkeypatch):
+    from relax.core import controller
+    from relax.distributed import replay_manager as replay
+
+    module, events, timers = train_loader()
+    monkeypatch.setattr(module, "Controller", controller.Controller)
+    store = Mock()
+    manager = replay.ReplayManager(
+        config=replay.ReplayConfig(delivery="reference", run_id="a"), store_factory=lambda: store
+    )
+    monkeypatch.setattr(replay, "replay_data_manager", manager)
+    monkeypatch.setattr(controller, "HealthManager", Mock())
+    monkeypatch.setattr(
+        controller.Controller, "_initialize_data_system", Mock(side_effect=RuntimeError("init failed"))
+    )
+    monkeypatch.setattr(
+        controller.Controller, "_shutdown_services", lambda self: events.append(("cleanup", bool(timers)))
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        module.main(SimpleNamespace())
+
+    assert exc.value.code == 1
+    assert [event for event in events if isinstance(event, tuple) and event[0] == "cleanup"] == [("cleanup", True)]
+    store.start_run.assert_called_once_with()
+    store.close_run.assert_called_once_with()
+
+
+def test_failed_training_joins_driver_loop_before_ray_shutdown(train_loader, monkeypatch):
+    from relax.utils import async_utils
+
+    module, _, _ = train_loader(fail_at="training")
+    monkeypatch.setattr(async_utils, "async_loop", None)
+    shared = async_utils.get_async_loop()
+    alive_at_disconnect = []
+    monkeypatch.setattr(module.ray, "shutdown", lambda: alive_at_disconnect.append(shared._thread.is_alive()))
+    try:
+        with pytest.raises(SystemExit) as exc:
+            module.main(SimpleNamespace())
+        assert exc.value.code == 1
+        assert alive_at_disconnect == [False]
+    finally:
+        async_utils.shutdown_async_loop()
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("fail_at", [None, "tracking", "startup", "training"])
 def test_train_runtime_preserves_success_and_failure_cleanup(train_loader, monkeypatch, enabled, fail_at):
