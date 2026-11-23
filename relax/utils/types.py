@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from relax.utils.agentic_obs.records import UNASSIGNED_SAMPLE_EXPORT_ID
+from relax.utils.sampling_mask import RolloutSamplingMask
 
 
 _SPEC_TOKEN_COUNT_KEYS = (
@@ -105,6 +106,7 @@ class Sample:
     agentic_prompt_source: dict[str, Any] | None = None
 
     non_generation_time: float = 0.0  # time spent in non-generation steps
+    rollout_sampling_mask: RolloutSamplingMask | None = None
 
     @property
     def response_key(self) -> int | str | None:
@@ -182,6 +184,9 @@ class Sample:
 
     def to_dict(self):
         value = self.__dict__.copy()
+        mask = value.pop("rollout_sampling_mask", None)
+        if mask is not None:
+            value["rollout_sampling_mask"] = {"ids": mask.ids.tolist(), "offsets": mask.offsets.tolist()}
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
         value["prefix_cache_info"] = self.prefix_cache_info.to_dict()
@@ -190,6 +195,8 @@ class Sample:
     @staticmethod
     def from_dict(data: dict):
         data = dict(data)
+        if isinstance(data.get("rollout_sampling_mask"), dict):
+            data["rollout_sampling_mask"] = RolloutSamplingMask(**data["rollout_sampling_mask"])
         data["status"] = Sample.Status(data["status"])
         data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
         data["prefix_cache_info"] = Sample.PrefixCacheInfo.from_dict(data.get("prefix_cache_info", {}))
