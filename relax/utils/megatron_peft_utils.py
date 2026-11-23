@@ -3,11 +3,8 @@
 """Utilities for PEFT (Parameter-Efficient Fine-Tuning) of Megatron in
 Relax."""
 
-import json
 import re
-from argparse import Namespace
 from fnmatch import fnmatchcase
-from pathlib import Path
 from typing import Iterable, Tuple
 
 import torch
@@ -68,7 +65,6 @@ GDN_GATE_PARTS = ("in_proj_b", "in_proj_a")
 MEGATRON_TO_HF_MODULES = {
     "linear_qkv": ["q_proj", "k_proj", "v_proj"],
     "linear_proj": ["o_proj"],
-    "output_layer": ["lm_head"],
     "linear_fc1": ["gate_proj", "up_proj"],
     "linear_fc2": ["down_proj"],
     "router": ["gate"],
@@ -505,6 +501,14 @@ def write_hf_peft_adapter(
     Returns:
         The adapter directory path as a string.
     """
+    import json
+    from pathlib import Path
+
+    from safetensors.torch import save_file
+
+    adapter_dir = Path(adapter_dir)
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+
     # Qwen3.5 exports Megatron's MTP eh_proj as mtp.fc; DeepSeek/GLM keep
     # eh_proj. Resolve this model-specific name from the exported tensors,
     # rather than changing the shared mapping for every model family.
@@ -519,44 +523,12 @@ def write_hf_peft_adapter(
         lora_dropout=lora_dropout,
         task_type=task_type,
     )
-    return _write_peft_files(Path(adapter_dir), merged, config_dict)
-
-
-def write_megatron_peft_adapter(merged: dict[str, torch.Tensor], adapter_dir: Path, args: Namespace) -> str:
-    """Convert gathered Bridge weights to the state and config consumed by
-    PEFT."""
-    from megatron.bridge.models.conversion import peft_bridge
-    from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
-
-    if not hasattr(peft_bridge, "convert_adapter_weights_to_peft_state"):
-        # Bridge 0.3.1 exports LoRA on individual modules and predates the packed-parameter converter.
-        return write_hf_peft_adapter(
-            {f"base_model.model.{name}": weight for name, weight in merged.items()},
-            adapter_dir,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            target_modules=convert_megatron_to_hf_target_modules(args.lora_target_modules),
-            lora_dropout=args.lora_dropout,
-        )
-
-    weights = [HFWeightTuple(name, weight) for name, weight in merged.items()]
-    state, module_keys, parameters = peft_bridge.convert_adapter_weights_to_peft_state(weights)
-    config = peft_bridge.build_adapter_config_dict(
-        build_lora_peft(args),
-        target_modules=peft_bridge.infer_target_modules_from_adapter_weights(module_keys),
-        target_parameters=parameters,
-        rank_pattern=peft_bridge.infer_rank_pattern_from_adapter_weights(weights, default_rank=args.lora_rank),
-    )
-    return _write_peft_files(adapter_dir, state, config)
-
-
-def _write_peft_files(adapter_dir: Path, state: dict[str, torch.Tensor], config: dict) -> str:
-    from safetensors.torch import save_file
-
-    adapter_dir.mkdir(parents=True, exist_ok=True)
     with open(adapter_dir / "adapter_config.json", "w") as f:
-        json.dump(config, f)
-    save_file({name: t.contiguous() for name, t in state.items()}, str(adapter_dir / "adapter_model.safetensors"))
+        json.dump(config_dict, f)
+
+    # safetensors requires contiguous CPU tensors.
+    state = {name: t.contiguous() for name, t in merged.items()}
+    save_file(state, str(adapter_dir / "adapter_model.safetensors"))
     return str(adapter_dir)
 
 
@@ -693,7 +665,6 @@ __all__ = [
     "MEGATRON_TO_HF_MODULES",
     "MEGATRON_TO_SGLANG_MODULES",
     "write_hf_peft_adapter",
-    "write_megatron_peft_adapter",
     "extract_lora_delta",
     "inherit_lora_tp_grad_sync",
     "install_gdn_gate_mask_hooks",

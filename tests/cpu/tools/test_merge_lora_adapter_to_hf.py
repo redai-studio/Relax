@@ -17,8 +17,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
-import sys
-from argparse import Namespace
 
 import pytest
 
@@ -108,7 +106,7 @@ class TestMergeShard:
             {"w": "w.weight"},
             _FakeAdapterFile({"a": lora_a, "b": lora_b}),
             {"w": {"A": "a", "B": "b"}},
-            config={"r": 2, "lora_alpha": 4},
+            scaling=2.0,
             device="cpu",
         )
 
@@ -130,7 +128,7 @@ class TestMergeShard:
             {"experts.gate_up_proj": "experts.gate_up_proj"},
             _FakeAdapterFile({"a": lora_a, "b": lora_b}),
             {"experts.gate_up_proj": {"A": "a", "B": "b"}},
-            config={"r": 2, "lora_alpha": 1},
+            scaling=0.5,
             device="cpu",
         )
 
@@ -146,7 +144,7 @@ class TestMergeShard:
                 {"w": "w.weight"},
                 _FakeAdapterFile({"a": torch.zeros(2, 4), "b": torch.zeros(3, 2)}),
                 {"w": {"A": "a", "B": "b"}},
-                config={"r": 2, "lora_alpha": 2},
+                scaling=1.0,
                 device="cpu",
             )
 
@@ -161,49 +159,9 @@ class TestReadAdapterScaling:
     )
     def test_scaling_rule(self, tmp_path, config, expected):
         (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-        assert merge_lora._adapter_scaling(merge_lora._read_adapter_config(tmp_path)) == pytest.approx(expected)
+        assert merge_lora._read_adapter_scaling(tmp_path) == pytest.approx(expected)
 
     def test_missing_rank_or_alpha_is_a_hard_error(self, tmp_path):
         (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
         with pytest.raises(ValueError, match="missing 'r' / 'lora_alpha'"):
-            merge_lora._read_adapter_config(tmp_path)
-
-
-@pytest.mark.parametrize("packed", [False, True])
-def test_offline_merge_expert_adapter_export(tmp_path, monkeypatch, packed):
-    from safetensors.torch import load_file, save_file
-
-    base_dir = tmp_path / "base"
-    base_dir.mkdir()
-    adapter_dir, output_dir = tmp_path / "adapter", tmp_path / "merged"
-    base, weights, expected = {}, {}, {}
-    for name, inputs, outputs, rank in [
-        ("mlp.experts.gate_up_proj", 4, 6, 2),
-        ("mlp.experts.down_proj", 3, 4, 3 if packed else 2),
-    ]:
-        base[name] = torch.randn(3, outputs, inputs)
-        a = weights[f"{name}.lora_A.weight"] = torch.randn(3, rank, inputs)
-        b = weights[f"{name}.lora_B.weight"] = torch.randn(3, outputs, rank)
-        expected[name] = base[name] + (4 / rank) * (b @ a)
-    save_file(base, base_dir / "model.safetensors")
-    args = Namespace(lora_rank=2, lora_alpha=4, lora_dropout=0.0, lora_target_modules=["linear_fc1", "linear_fc2"])
-    if packed:
-        bridge = pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
-        if not hasattr(bridge, "convert_adapter_weights_to_peft_state"):
-            pytest.skip("Bridge version predates packed parameter export")
-        from relax.utils.megatron_peft_utils import write_megatron_peft_adapter
-
-        write_megatron_peft_adapter(weights, adapter_dir, args)
-    else:
-        adapter_dir.mkdir()
-        save_file(weights, adapter_dir / "adapter_model.safetensors")
-        (adapter_dir / "adapter_config.json").write_text(json.dumps({"r": 2, "lora_alpha": 4}))
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["merge", "--base-hf-dir", str(base_dir), "--adapter-dir", str(adapter_dir), "--output-dir", str(output_dir)],
-    )
-    merge_lora.main()
-    result = load_file(output_dir / "model.safetensors")
-    for name in base:
-        torch.testing.assert_close(result[name], expected[name])
+            merge_lora._read_adapter_scaling(tmp_path)

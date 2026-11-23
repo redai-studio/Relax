@@ -5,14 +5,12 @@
 
 from __future__ import annotations
 
-import torch
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping, ReplicatedMapping
 from megatron.bridge.models.mimo_v2_flash.mimo_v2_flash_bridge import MiMoV2FlashQKVMapping
 from megatron.core.models.gpt.gpt_model import GPTModel
 
-from .attention import _qkv_group_sizes, _split_qkv
 from .provider import MiMoV2ModelProvider
 
 
@@ -116,28 +114,3 @@ class MiMoV2Bridge(MegatronModelBridge):
             )
         )
         return MegatronMappingRegistry(*mappings)
-
-    def _split_qkv_linear_out_weight(self, megatron_model, linear_out_weight: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Split a TP-gathered ``linear_qkv`` LoRA B into the HF q/k/v rows for
-        adapter export and merge.
-
-        The generic split sizes V like K and takes the KV heads from the model
-        config; here each layer's KV heads are the global or SWA count whose
-        fused row count matches the tensor.
-        """
-        config = (megatron_model[0] if isinstance(megatron_model, list) else megatron_model).config
-        heads, qk_dim, v_dim = config.num_attention_heads, config.kv_channels, config.v_head_dim
-        rows = linear_out_weight.shape[0]
-        groups = next(
-            (
-                g
-                for g in (config.full_attn_num_query_groups, config.swa_num_query_groups)
-                if g * sum(_qkv_group_sizes(heads_per_group=heads // g, qk_dim=qk_dim, v_dim=v_dim)) == rows
-            ),
-            None,
-        )
-        assert groups is not None, f"linear_qkv LoRA B has {rows} rows, matching neither a global nor a SWA layer"
-        query, key, value = _split_qkv(
-            linear_out_weight, dim=0, groups=groups, heads_per_group=heads // groups, qk_dim=qk_dim, v_dim=v_dim
-        )
-        return {"q_proj": query.flatten(0, 1), "k_proj": key.flatten(0, 1), "v_proj": value.flatten(0, 1)}

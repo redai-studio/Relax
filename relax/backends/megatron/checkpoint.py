@@ -938,7 +938,7 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
 
     import torch.distributed as dist
 
-    from relax.utils.megatron_peft_utils import write_megatron_peft_adapter
+    from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, write_hf_peft_adapter
 
     gloo = get_gloo_group()
     is_dst = dist.get_rank() == 0
@@ -978,7 +978,17 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
                 raise RuntimeError("LoRA enabled but no adapter parameters were gathered.")
 
             adapter_dir = Path(checkpoint_dir) / "lora_adapter"
-            write_megatron_peft_adapter(merged, adapter_dir, args)
+            # args.lora_target_modules holds canonical Megatron names; the on-disk HF-PEFT
+            # adapter_config.json must carry HF-style names so standard PEFT loaders can match
+            # them against the HF module tree.
+            write_hf_peft_adapter(
+                merged,
+                adapter_dir,
+                lora_rank=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=convert_megatron_to_hf_target_modules(args.lora_target_modules),
+                lora_dropout=args.lora_dropout,
+            )
 
             # Sidecar metadata for resume-time mode-mismatch diagnostics. Kept separate from
             # adapter_config.json so it can never confuse load_peft_adapter.

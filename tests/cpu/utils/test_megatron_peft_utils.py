@@ -32,7 +32,6 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
     write_hf_peft_adapter,
-    write_megatron_peft_adapter,
 )
 
 
@@ -95,7 +94,6 @@ class TestConvertMegatronToHfTargetModules:
         assert convert_megatron_to_hf_target_modules(["linear_qkv"]) == ["q_proj", "k_proj", "v_proj"]
         assert convert_megatron_to_hf_target_modules(["linear_fc1"]) == ["gate_proj", "up_proj"]
         assert convert_megatron_to_hf_target_modules(["linear_proj"]) == ["o_proj"]
-        assert convert_megatron_to_hf_target_modules(["output_layer"]) == ["lm_head"]
 
     def test_convert_megatron_to_hf_dedups_preserving_order(self):
         """Overlapping expansions collapse to a stable, de-duplicated list."""
@@ -194,36 +192,6 @@ class TestWriteHfPeftAdapter:
             # when PEFT reloads the adapter using its saved configuration.
             module_name = k.rsplit(".lora_", 1)[0]
             assert any(module_name.endswith(f".{target}") for target in config["target_modules"])
-
-    @pytest.mark.parametrize("legacy_bridge", [False, True])
-    def test_bridge_export_loads_into_peft(self, tmp_path, monkeypatch, legacy_bridge):
-        peft_bridge = pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
-        peft = pytest.importorskip("peft")
-        from transformers import LlamaConfig, LlamaForCausalLM
-
-        config = LlamaConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            tie_word_embeddings=False,
-        )
-        base = LlamaForCausalLM(config)
-        args = Namespace(lora_rank=2, lora_alpha=4, lora_dropout=0.0, lora_target_modules=["linear_q", "output_layer"])
-        weights = {}
-        for name in ("lm_head", "model.layers.0.self_attn.q_proj"):
-            module = base.get_submodule(name)
-            weights[f"{name}.lora_A.weight"] = torch.randn(2, module.in_features)
-            weights[f"{name}.lora_B.weight"] = torch.randn(module.out_features, 2)
-
-        if legacy_bridge:
-            monkeypatch.delattr(peft_bridge, "convert_adapter_weights_to_peft_state", raising=False)
-        write_megatron_peft_adapter(weights, tmp_path, args)
-        loaded = peft.PeftModel.from_pretrained(base, tmp_path)
-        state = peft.get_peft_model_state_dict(loaded, save_embedding_layers=False)
-        for name, weight in weights.items():
-            torch.testing.assert_close(state[f"base_model.model.{name}"], weight, rtol=0, atol=0)
 
     def test_write_hf_peft_adapter_makes_missing_dirs(self, tmp_path):
         """Nested, non-existent target dirs are created."""
