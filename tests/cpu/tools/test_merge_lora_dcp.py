@@ -10,6 +10,9 @@ import hashlib
 import io
 import json
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier, get_ident
 
 import pytest
 import torch
@@ -297,6 +300,65 @@ def test_dcp_cli_dry_run_and_publish(checkpoint, monkeypatch):
     assert report["all_finite"]
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         main()
+
+
+def test_concurrent_dcp_exports_claim_one_staging_directory(checkpoint, monkeypatch):
+    from scripts.tools import merge_lora_adapter_to_hf as merger
+    from scripts.tools.convert_checkpoint_to_hf_cpu import read_hf_schema
+
+    first, base, output, adapters, _ = checkpoint
+    second = output.with_name("second-checkpoint")
+    weight_map, _ = read_hf_schema(base)
+    spec = dict(
+        format_version=1, lora_rank=2, lora_alpha=4, lora_dropout=0, base_hf_checkpoint=base_identity(base, weight_map)
+    )
+    alternate = {key: -value if key.endswith("linear_out.weight") else value for key, value in adapters.items()}
+    dcp.save(alternate, checkpoint_id=second)
+    torch.save({"args": Namespace(relax_lora_checkpoint_metadata=spec)}, second / "common.pt")
+    destination = output.with_name(output.name + ".partial")
+    ready = Barrier(2)
+    mkdir = Path.mkdir
+
+    def synchronized_mkdir(path, *args, **kwargs):
+        if path == destination:
+            ready.wait(timeout=10)
+        return mkdir(path, *args, **kwargs)
+
+    writers = set()
+    merge_shard = merger._merge_shard
+
+    def record_writer(*args, **kwargs):
+        writers.add(get_ident())
+        return merge_shard(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", synchronized_mkdir)
+    monkeypatch.setattr(merger, "_merge_shard", record_writer)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempts = [pool.submit(merge, base, output, checkpoint=path) for path in (first, second)]
+        reports = []
+        for attempt in attempts:
+            try:
+                reports.append(attempt.result(timeout=20))
+            except FileExistsError as exc:
+                assert "Refusing to overwrite" in str(exc)
+
+    [report] = reports
+    assert len(writers) == 1
+    assert not destination.exists()
+    assert json.loads((output / "relax_conversion_report.json").read_text())["checkpoint"] == report["checkpoint"]
+
+    reference = output.with_name("reference")
+    merge(base, reference, checkpoint=Path(report["checkpoint"]))
+    actual_map, _ = read_hf_schema(output)
+    reference_map, _ = read_hf_schema(reference)
+    assert actual_map == reference_map
+    for shard in set(actual_map.values()):
+        with (
+            safe_open(output / shard, framework="pt") as actual,
+            safe_open(reference / shard, framework="pt") as expected,
+        ):
+            for key in actual.keys():
+                torch.testing.assert_close(actual.get_tensor(key), expected.get_tensor(key), rtol=0, atol=0)
 
 
 def test_dcp_nonfinite_adapter_does_not_publish(checkpoint):

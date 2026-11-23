@@ -1364,3 +1364,30 @@ def test_glm_fallback_respects_explicit_system_and_reordered_tool_supervision():
 
     assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
     assert _learned_text(ids, mask) == "SYSTEM_TARGETreason</think><tool_call>x</tool_call>TOOL_TARGET</think>answer"
+
+
+def test_glm_boundary_probe_preserves_template_conditions():
+    class ConditionalGLMTokenizer(_FakeGLMTokenizer):
+        chat_template = """
+            {%- if messages[0].content.startswith('<|assistant|>') -%}
+                {{- '<|user|>' + messages[0].content -}}
+            {%- else -%}
+                {{- '<|user|>WRONG_PROMPT' -}}
+            {%- endif -%}
+            {{- '<|assistant|>' if messages[0].content.startswith('<|assistant|>') else '<|assistant|>WRONG_BRANCH' -}}
+            {{- messages[1].content -}}
+        """
+
+    tokenizer = ConditionalGLMTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "<|assistant|> PROMPT_ONLY", False),
+            CanonicalMessage("assistant", "TRUE_ANSWER", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=True)
+
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
+    assert _learned_text(ids, mask) == "TRUE_ANSWER"

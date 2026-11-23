@@ -137,11 +137,18 @@ def _native_mtp_output_calls(args: Namespace, model: torch.nn.Module) -> int:
     if not getattr(args, "enable_mtp_training", False):
         return 0
     owner = _find_lm_output_layer_owner(model)
-    if owner is None or not getattr(owner, "mtp_process", True):
+    if owner is None:
+        return 0
+    # GPT computes MTP loss at the output stage even when an earlier
+    # pipeline stage produced the draft hidden states.
+    owns_mtp_loss = owner.post_process if isinstance(owner, GPTModel) else getattr(owner, "mtp_process", True)
+    if not owns_mtp_loss:
         return 0
 
     config = get_model_config(owner)
     depth = int(getattr(config, "mtp_num_layers", getattr(args, "mtp_num_layers", 0)) or 0)
+    if not depth:
+        return 0
     if getattr(config, "mtp_loss_type", "ce") == "e2e_tv":
         return depth + 1  # The native TV loss also projects the teacher.
     if args.sft_chunked_logits:

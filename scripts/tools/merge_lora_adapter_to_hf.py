@@ -449,11 +449,21 @@ def merge(
 
         destination = output_dir.with_name(output_dir.name + ".partial") if checkpoint is not None else output_dir
         if checkpoint is not None:
-            if output_dir.exists() or destination.exists():
-                raise FileExistsError(f"Refusing to overwrite {output_dir} or {destination}")
-        elif output_dir.exists() and any(output_dir.iterdir()) and not force:
-            raise ValueError(f"Output directory {output_dir} already exists. Use --force to overwrite.")
-        destination.mkdir(parents=True, exist_ok=True)
+            refusal = f"Refusing to overwrite {output_dir} or {destination}"
+            if output_dir.exists():
+                raise FileExistsError(refusal)
+            try:
+                destination.mkdir(parents=True)
+            except FileExistsError as exc:
+                raise FileExistsError(refusal) from exc
+            # The previous owner may have published between the check and mkdir.
+            if output_dir.exists():
+                destination.rmdir()
+                raise FileExistsError(refusal)
+        else:
+            if output_dir.exists() and any(output_dir.iterdir()) and not force:
+                raise ValueError(f"Output directory {output_dir} already exists. Use --force to overwrite.")
+            destination.mkdir(parents=True, exist_ok=True)
         total_merged, total_bytes = 0, 0
         output_map = {}
         for i, shard in enumerate(shard_names, start=1):

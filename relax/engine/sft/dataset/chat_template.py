@@ -16,6 +16,7 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any, Protocol
 
 import torch
@@ -446,8 +447,64 @@ class _GLMDialect:
     _delimiter_pattern = "|".join(map(re.escape, _delimiters))
     _tagged_delimiters = re.compile(f"({re.escape(_boundary_marker)})?({_delimiter_pattern})")
 
+    def _mark_delimiters(self, text: str) -> str:
+        return re.sub(self._delimiter_pattern, lambda match: self._boundary_marker + match[0], text)
+
+    def _mark_output_expression(self, environment, tokens: list[tuple[str, str]]) -> str:
+        from jinja2 import nodes
+
+        # Tag candidate literals in an AST-only probe. Walk expressions that
+        # produce output, leaving predicate and function argument literals alone.
+        literals = {
+            index: f"\x00{index}\x00"
+            for index, (kind, value) in enumerate(tokens)
+            if kind == "string" and re.search(self._delimiter_pattern, value)
+        }
+        if not literals:
+            return "".join(value for _, value in tokens)
+        probe = "".join(
+            value[:1] + literals[index] + value[1:] if index in literals else value
+            for index, (_, value) in enumerate(tokens)
+        )
+        output = environment.parse("{{" + probe + "}}").body[0]
+        pending = list(output.nodes)
+        emitted = []
+        while pending:
+            node = pending.pop()
+            if isinstance(node, nodes.Const) and isinstance(node.value, str):
+                emitted.append(node.value)
+            elif isinstance(node, nodes.Concat):
+                pending.extend(node.nodes)
+            elif isinstance(node, nodes.Add):
+                pending.extend((node.left, node.right))
+            elif isinstance(node, nodes.CondExpr):
+                pending.extend((node.expr1, node.expr2))
+        return "".join(
+            self._mark_delimiters(value)
+            if index in literals and any(text.startswith(literals[index]) for text in emitted)
+            else value
+            for index, (_, value) in enumerate(tokens)
+        )
+
+    @lru_cache(maxsize=128)
     def marked_template(self, template: str) -> str:
-        return re.sub(self._delimiter_pattern, lambda match: self._boundary_marker + match[0], template)
+        from jinja2 import Environment
+
+        environment = Environment(keep_trailing_newline=True)
+        rendered = []
+        expression = None
+        for _, kind, value in environment.lex(template):
+            if kind == "variable_begin":
+                rendered.append(value)
+                expression = []
+            elif kind == "variable_end":
+                rendered.extend((self._mark_output_expression(environment, expression), value))
+                expression = None
+            elif expression is not None:
+                expression.append((kind, value))
+            else:
+                rendered.append(self._mark_delimiters(value) if kind == "data" else value)
+        return "".join(rendered)
 
     def mask_text(self, marked_text: str) -> str:
         # Keep only delimiters emitted by the template. Payload positions
@@ -747,6 +804,8 @@ def _render_per_message_fallback(
         normalize_qwen38_reasoning=qwen38_template,
         mask_reasoning=mask_reasoning,
     )
+    rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
+    boundary_text = rendered_text
     glm = deepseek_dialect if isinstance(deepseek_dialect, _GLMDialect) else None
     if glm is not None:
         assert effective_template is not None
@@ -756,11 +815,9 @@ def _render_per_message_fallback(
             return tokenizer.apply_chat_template(messages, tools=sample.tools, tokenize=False, **marked_kwargs)
 
         marked_text = render_marked(msgs)
-        rendered_text = marked_text.replace(glm._boundary_marker, "")
+        if marked_text.replace(glm._boundary_marker, "") != rendered_text:
+            raise ValueError("GLM template boundary probe changed the original rendering")
         boundary_text = glm.mask_text(marked_text)
-    else:
-        rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
-        boundary_text = rendered_text
 
     tokenized = tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
     token_ids = tokenized["input_ids"]
