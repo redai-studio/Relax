@@ -45,6 +45,7 @@ TRAIN_STEPS="${TRAIN_STEPS:-200}"
 ENV_JSON="$(python3 - <<'PYENV'
 import json
 import os
+import shlex
 from pathlib import Path
 
 def build_environment() -> dict[str, str]:
@@ -62,8 +63,9 @@ def build_environment() -> dict[str, str]:
     ]
     env = {key: os.environ[key] for key in ("PYTHONPATH", "PYTHONDONTWRITEBYTECODE") if key in os.environ}
     cache_dir = os.environ.get("EP_JIT_CACHE_DIR") or f"/tmp/relax-qwen35-{os.getuid()}/deepep"
-    if not Path(cache_dir).is_absolute():
-        raise ValueError("EP_JIT_CACHE_DIR must be an absolute path on the training nodes")
+    # DeepEP inserts the cache directory into unquoted shell commands during cold compilation.
+    if not Path(cache_dir).is_absolute() or shlex.quote(cache_dir) != cache_dir:
+        raise ValueError("EP_JIT_CACHE_DIR must be an absolute path that does not require shell quoting")
     env.update(
         {
             "LD_PRELOAD": ":".join(
