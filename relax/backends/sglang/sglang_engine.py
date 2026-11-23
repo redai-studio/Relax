@@ -387,10 +387,18 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def _spawn_server(target, *args) -> multiprocessing.Process:
+def _spawn_server(target, *args, health_url: str | None, api_key: str | None) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
     process = multiprocessing.Process(target=target, args=args)
     process.start()
+    if health_url is not None:
+        try:
+            _wait_server_healthy(base_url=health_url, api_key=api_key, is_process_alive=process.is_alive)
+        except BaseException:
+            # The engine only takes ownership once this function returns.
+            if process.is_alive():
+                kill_process_tree(process.pid)
+            raise
     return process
 
 
@@ -407,18 +415,14 @@ def launch_server_process(server_args: ServerArgs, *, reference_publication: boo
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = _spawn_server(_launch_server_with_patches, server_args, os.getpid(), reference_publication)
-
-    if server_args.node_rank != 0:
-        return p
-
-    _wait_server_healthy(
-        base_url=server_args.url(),
+    return _spawn_server(
+        _launch_server_with_patches,
+        server_args,
+        os.getpid(),
+        reference_publication,
+        health_url=server_args.url() if server_args.node_rank == 0 else None,
         api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
     )
-
-    return p
 
 
 def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
@@ -729,16 +733,15 @@ class SGLangEngine(RayActor):
 
             self._router_bootstrap_port = None
             self._router_dp_size = 1
-            multiprocessing.set_start_method("spawn", force=True)
-            self.process = multiprocessing.Process(
-                target=launch_bound_teacher,
-                args=(server_args_dict, self.server_gpu_ids, os.getpid(), reference_publication),
-            )
-            self.process.start()
             host = {"0.0.0.0": "127.0.0.1", "[::]": "[::1]", "": "127.0.0.1"}.get(self.server_host, self.server_host)
             scheme = "https" if server_args_dict.get("ssl_certfile") else "http"
-            _wait_server_healthy(
-                f"{scheme}://{host}:{self.server_port}", server_args_dict.get("api_key"), self.process.is_alive
+            self.process = _spawn_server(
+                launch_bound_teacher,
+                server_args_dict,
+                self.server_gpu_ids,
+                os.getpid(),
+                health_url=f"{scheme}://{host}:{self.server_port}",
+                api_key=server_args_dict.get("api_key"),
             )
         else:
             server_args = ServerArgs(**server_args_dict)
