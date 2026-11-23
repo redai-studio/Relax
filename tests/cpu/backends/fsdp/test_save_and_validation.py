@@ -282,6 +282,9 @@ def test_run_step_evaluation_does_not_wait_before_final_step(monkeypatch):
 def _valid_args(**over):
     base = dict(
         train_backend="fsdp",
+        loss_type=None,
+        task_type="causal_lm",
+        advantage_estimator="grpo",
         generation_task="t2i",
         model_adapter_path="relax.models.qwen_image.adapter.QwenImageAdapter",
         model_path="/models/Qwen-Image",

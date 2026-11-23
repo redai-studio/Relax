@@ -1125,7 +1125,7 @@ class RolloutManager(ReloadableMixin):
             if (
                 not self.args.fully_async
                 or getattr(self.args, "train_backend", "megatron") != "megatron"
-                or getattr(self.args, "hybrid", False)
+                or self.args.hybrid
                 or self.args.colocate
                 or self.args.offload_rollout
                 or not self.args.use_agentic_rollout
@@ -1475,7 +1475,7 @@ class RolloutManager(ReloadableMixin):
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         args = self.args
-        if getattr(args, "loss_type", None) == "sft":
+        if args.loss_type == "sft":
             # SFT already supplies completed training steps, not RL batch IDs.
             args = copy.copy(args)
             args.wandb_always_use_train_step = False
