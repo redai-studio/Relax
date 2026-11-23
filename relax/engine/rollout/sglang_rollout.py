@@ -897,6 +897,25 @@ async def generate_and_rm_group(
     return group
 
 
+def _raise_unconfirmed_dispatch(
+    state: GenerateState, done: set[asyncio.Task], transfers: list[asyncio.Task] | None = None
+) -> None:
+    for task in done:
+        if task.cancelled() or not isinstance(failure := task.exception(), DistributedPostUnconfirmed):
+            continue
+        pending = state.pendings | state.protected_pendings
+        for group in pending:
+            group.cancel()
+        # In-flight queue writes can finish while the groups unwind.
+        cleanup = asyncio.gather(*done, *pending, *(transfers or ()), return_exceptions=True)
+        track_cleanup = rollout_group_cleanup.get()
+        if track_cleanup is not None:
+            track_cleanup(cleanup)
+        state.pendings.clear()
+        state.protected_pendings.clear()
+        raise failure
+
+
 async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], list[list[Sample]]]:
     aborted_samples = []
     completed_protected_samples = []
@@ -925,6 +944,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             done, state.protected_pendings = await asyncio.wait(
                 state.protected_pendings, return_when=asyncio.FIRST_COMPLETED
             )
+            _raise_unconfirmed_dispatch(state, done)
             for task in done:
                 group = task.result()
                 completed_protected_samples.append(group)
@@ -956,19 +976,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     while state.pendings:
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
-        for task in done:
-            if not task.cancelled() and isinstance(failure := task.exception(), DistributedPostUnconfirmed):
-                # A custom reward may never return. Report the dispatch fault
-                # while the other groups unwind. Their permits still fence
-                # any outstanding inference.
-                for pending in state.pendings:
-                    pending.cancel()
-                cleanup = asyncio.gather(*done, *state.pendings, return_exceptions=True)
-                track_cleanup = rollout_group_cleanup.get()
-                if track_cleanup is not None:
-                    track_cleanup(cleanup)
-                state.pendings.clear()
-                raise failure
+        _raise_unconfirmed_dispatch(state, done)
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
@@ -1133,6 +1141,12 @@ async def generate_rollout_async(
         done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
         state.pendings = state.pendings & remaining
         state.protected_pendings = state.protected_pendings & remaining
+        try:
+            _raise_unconfirmed_dispatch(state, done, transfer_tasks)
+        except DistributedPostUnconfirmed:
+            pbar.close()
+            timer.end("rollout")
+            raise
         for task in done:
             group: list[Sample] = task.result()
 

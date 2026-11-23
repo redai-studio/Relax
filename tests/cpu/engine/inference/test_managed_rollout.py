@@ -369,6 +369,7 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
     import httpx
 
     from relax.engine.inference.executor import InferenceRequestExecutor
+    from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed
     from relax.utils import http_utils
 
     owner = manager()
@@ -388,6 +389,8 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
     started, disconnected, stopping, stopped = (asyncio.Event() for _ in range(4))
     paths = []
     poster_calls = []
+    stop_calls = []
+    poster_can_stop = confirmed
 
     async def do_request(*args):
         poster_calls.append(args)
@@ -401,9 +404,10 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
         raise ray.exceptions.ActorDiedError()
 
     async def stop_requests():
+        stop_calls.append("stop")
         stopping.set()
         await stopped.wait()
-        if not confirmed:
+        if not poster_can_stop:
             raise ray.exceptions.ActorDiedError()
 
     def upstream(request):
@@ -454,6 +458,32 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
         assert not (await owner.snapshot()).models[0].admission
         with pytest.raises(RuntimeError, match="cannot confirm distributed POST"):
             await owner.wait_ready("rollout")
+        pool = owner.pool
+        with pytest.raises(RolloutCleanupUnconfirmed, match="dispatch is still unconfirmed"):
+            await owner.dispose()
+        assert owner.pool is pool
+        assert pool.backend.status != "disposed"
+        assert len(owner.ledger.permits) == 1
+
+        poster_can_stop = True
+        if cancelled:
+            # Once the poster stops, retain its acknowledgement through
+            # engine cleanup failures. Drop the permit after pool disposal.
+            original_dispose = pool.dispose
+
+            def fail_dispose():
+                raise RuntimeError("engine resource release unconfirmed")
+
+            monkeypatch.setattr(pool, "dispose", fail_dispose)
+            with pytest.raises(RuntimeError, match="engine resource release unconfirmed"):
+                await owner.dispose()
+            assert len(owner.ledger.permits) == 1
+            monkeypatch.setattr(pool, "dispose", original_dispose)
+            poster_can_stop = False
+        await owner.dispose()
+        assert len(stop_calls) == 3
+        assert not owner.ledger.permits
+        assert owner.pool is None and pool.backend.status == "disposed"
 
 
 @pytest.mark.asyncio
@@ -584,7 +614,8 @@ async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("times_out", [False, True])
-async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, times_out):
+@pytest.mark.parametrize("phase", ["generation", "abort", "protected"])
+async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, times_out, phase):
     from unittest.mock import AsyncMock, Mock
 
     from relax.distributed.ray import rollout_worker
@@ -597,17 +628,27 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
     events = []
     finish_cleanup = worker_loop.create_future()
 
-    async def abort_rollout(args, rollout_id):
+    async def run_rollout(args, rollout_id):
         assert asyncio.get_running_loop() is not worker_loop
+        reward_started = asyncio.Event()
         state = SimpleNamespace(
-            aborted=False, evaluating=0, protected_pendings=set(), pendings=set(), abort_event=asyncio.Event()
+            aborted=False,
+            evaluating=0,
+            protected_pendings=set(),
+            pendings=set(),
+            abort_event=asyncio.Event(),
+            remaining_batch_size=1,
+            opd_manager=None,
         )
 
         async def dispatch_fault():
-            await state.abort_event.wait()
+            await reward_started.wait()
+            if phase == "abort":
+                await state.abort_event.wait()
             raise DistributedPostUnconfirmed("poster stop unconfirmed")
 
         async def custom_reward():
+            reward_started.set()
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
@@ -617,8 +658,16 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
                 events.append("reward cleaned")
 
         monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
-        state.pendings.update(asyncio.create_task(fn()) for fn in (dispatch_fault, custom_reward))
-        await sglang_rollout.abort(args, rollout_id)
+        fault = asyncio.create_task(dispatch_fault())
+        state.pendings.add(asyncio.create_task(custom_reward()))
+        if phase == "protected":
+            state.protected_pendings.add(fault)
+        else:
+            state.pendings.add(fault)
+        if phase == "generation":
+            await sglang_rollout.generate_rollout_async(args, rollout_id, None, None)
+        else:
+            await sglang_rollout.abort(args, rollout_id)
 
     async def wait_for_reward():
         await finish_cleanup
@@ -627,7 +676,7 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
         return {"urls": [], "workers": []}
 
     def generate(args, rollout_id, *unused, evaluation):
-        run(abort_rollout(args, rollout_id))
+        run(run_rollout(args, rollout_id))
 
     def load_function(path):
         return generate
@@ -645,6 +694,11 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
         sglang_router_port=80,
         tq_config={},
         use_slime_router=False,
+        rollout_global_dataset=True,
+        fully_async=False,
+        rollout_batch_size=1,
+        n_samples_per_prompt=1,
+        dynamic_sampling_filter_path=None,
     )
     manager_handle = SimpleNamespace(
         wait_ready=SimpleNamespace(remote=AsyncMock()),
@@ -657,6 +711,7 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
     monkeypatch.setattr(rollout_worker, "detach_tq_client", lambda: events.append("detached"))
     monkeypatch.setattr("relax.engine.rollout.workload.load_function", load_function)
     monkeypatch.setattr(sglang_rollout, "get", workers)
+    monkeypatch.setattr(sglang_rollout, "start_sglang_profile", AsyncMock())
     monkeypatch.setattr(ray, "kill", lambda worker: events.append("worker stopped"))
     worker = rollout_worker.RolloutWorker.__ray_metadata__.modified_class(args, object(), manager_handle)
 

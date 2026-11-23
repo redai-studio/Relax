@@ -65,6 +65,7 @@ class AdmittedRequest:
     finished: bool = False
     released: bool = False
     transport_unconfirmed: bool = False
+    unconfirmed_poster: Any = None
     replica_cursor: int | None = None
 
 
@@ -246,8 +247,9 @@ class InferenceRequestExecutor:
                 if self._send_request is not None:
                     return await self._send_request(upstream)
                 return await self.client.send(upstream, stream=True)
-            except DistributedPostUnconfirmed:
+            except DistributedPostUnconfirmed as exc:
                 request.transport_unconfirmed = True
+                request.unconfirmed_poster = exc.poster
                 raise
             except _NOT_SENT_ERRORS as exc:
                 request.dispatched = False
@@ -337,7 +339,7 @@ class InferenceRequestExecutor:
         request.released = True
         if request.transport_unconfirmed:
             try:
-                await self.manager_call("fail_request_transport", request.permit)
+                await self.manager_call("fail_request_transport", request.permit, request.unconfirmed_poster)
             except Exception:
                 logger.exception("Could not notify the Manager about unconfirmed dispatch for %s", request.rid)
             # A late POST can still reach the engine. Keep the permit in the

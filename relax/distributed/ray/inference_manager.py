@@ -16,6 +16,7 @@ from relax.engine.inference.lifecycle import AdmissionLedger, AdmissionScope
 from relax.engine.inference.placement import PlacementPlanner
 from relax.engine.inference.types import LifecycleState, Role, RoleSnapshot, RoutingSpec
 from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed
+from relax.utils.http_utils import DistributedPostUnconfirmed, stop_distributed_poster
 from relax.utils.logging_utils import get_logger
 
 
@@ -131,6 +132,8 @@ class _ModelRuntime:
         self._closing = False
         self._cleanup_task: asyncio.Task | None = None
         self._active_calls: set[asyncio.Future] = set()
+        self._unconfirmed_dispatches: dict[str, Any] = {}
+        self._stopped_dispatch_permits: set[str] = set()
         self._lora_publication = asyncio.Lock()
         self._recipients: set[str] = set()
 
@@ -358,9 +361,12 @@ class _ModelRuntime:
 
     async def complete_request(self, permit: str) -> None:
         await self.ledger.complete(permit)
+        self._unconfirmed_dispatches.pop(permit, None)
+        self._stopped_dispatch_permits.discard(permit)
 
-    async def fail_request_transport(self, permit: str) -> None:
+    async def fail_request_transport(self, permit: str, poster: Any = None) -> None:
         if permit in self.ledger.permits:
+            self._unconfirmed_dispatches[permit] = poster
             self.ledger.fences.add("unconfirmed_dispatch")
             self.state = LifecycleState.DEAD
 
@@ -644,6 +650,40 @@ class _ModelRuntime:
         if cancelled:
             raise asyncio.CancelledError
 
+    async def _abort_residual_requests(self) -> None:
+        if self.pool is None:
+            return
+        try:
+            handles = self.pool.backend.rollout_engines if self.role is Role.ROLLOUT else self.pool.backend.engines
+            refs = [engine.abort_requests.remote() for engine in handles if engine is not None]
+            if refs:
+                await _blocking(ray.get, refs, timeout=10)
+        except Exception:
+            logger.exception("Could not abort residual requests during shutdown")
+
+    async def _confirm_failed_dispatches(self) -> None:
+        if not self._unconfirmed_dispatches:
+            return
+        posters = []
+        for poster in self._unconfirmed_dispatches.values():
+            if poster is not None and poster not in posters:
+                posters.append(poster)
+        results = await asyncio.gather(
+            *(stop_distributed_poster(poster) for poster in posters), return_exceptions=True
+        )
+        confirmed = [poster for poster, result in zip(posters, results, strict=True) if result is None]
+        for permit, poster in tuple(self._unconfirmed_dispatches.items()):
+            if poster in confirmed:
+                self._unconfirmed_dispatches.pop(permit)
+                self._stopped_dispatch_permits.add(permit)
+        if self._unconfirmed_dispatches:
+            cause = next((result for result in results if isinstance(result, DistributedPostUnconfirmed)), None)
+            raise RolloutCleanupUnconfirmed(
+                "Distributed POST dispatch is still unconfirmed during shutdown"
+            ) from cause
+        # A request may have reached the engines after the first abort.
+        await self._abort_residual_requests()
+
     async def _dispose(self, worker: Any = None) -> None:
         self._closing = True
         self.ledger.fences.add("shutdown")
@@ -662,22 +702,9 @@ class _ModelRuntime:
             self._disposed = True
             self.ledger.fences.add("shutdown")
             worker_cleanup_unconfirmed = False
+            worker_error = None
             try:
-                try:
-                    if self.pool is not None:
-                        # Dead engines leave empty slots in the backend topology.
-                        handles = (
-                            self.pool.backend.rollout_engines
-                            if self.role is Role.ROLLOUT
-                            else self.pool.backend.engines
-                        )
-                        engines = [engine for engine in handles if engine is not None]
-                        if engines:
-                            await _blocking(
-                                ray.get, [engine.abort_requests.remote() for engine in engines], timeout=10
-                            )
-                except Exception:
-                    logger.exception("Could not abort residual requests during shutdown")
+                await self._abort_residual_requests()
                 if worker is not None:
                     try:
                         closing = asyncio.ensure_future(worker.close.remote())
@@ -689,14 +716,18 @@ class _ModelRuntime:
                     except ray.exceptions.ActorDiedError:
                         pass
                     except RolloutCleanupUnconfirmed:
-                        worker_cleanup_unconfirmed = True
                         raise
-                    except ray.exceptions.RayTaskError:
-                        raise
+                    except ray.exceptions.RayTaskError as exc:
+                        worker_error = exc
                     except ray.exceptions.ActorUnavailableError as exc:
-                        worker_cleanup_unconfirmed = True
                         raise RolloutCleanupUnconfirmed("Rollout worker cleanup is unconfirmed") from exc
-                await self.ledger.drain("shutdown", timeout=10)
+                await self._confirm_failed_dispatches()
+                if worker_error is not None:
+                    raise worker_error
+                await self.ledger.drain("shutdown", timeout=10, ignore_permits=self._stopped_dispatch_permits)
+            except RolloutCleanupUnconfirmed:
+                worker_cleanup_unconfirmed = True
+                raise
             finally:
                 if not worker_cleanup_unconfirmed:
                     try:
@@ -706,6 +737,8 @@ class _ModelRuntime:
                             self.state = LifecycleState.DEAD
                             self.memory_ready = False
                             self.resident = False
+                        for permit in tuple(self._stopped_dispatch_permits):
+                            await self.complete_request(permit)
                     finally:
                         if worker is not None:
                             ray.kill(worker)
@@ -851,7 +884,7 @@ class InferenceManager(_ModelRuntime):
         return await _ModelRuntime.admit_request(runtime, role, model_id, trace_id)
 
     async def complete_request(self, permit: str) -> None:
-        await self.requests.complete(permit)
+        await _ModelRuntime.complete_request(self, permit)
 
     async def wait_ready(self, role: Role | str, model_id: str | None = None) -> None:
         if Role(role) is self.role and self.pool is not None:

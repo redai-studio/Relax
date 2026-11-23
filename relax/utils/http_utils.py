@@ -30,6 +30,10 @@ _MAX_PENDING_POSTER_CANCELLATIONS = 4096
 class DistributedPostUnconfirmed(RuntimeError):
     """A distributed poster may still dispatch an admitted request."""
 
+    def __init__(self, message: str, poster: object | None = None) -> None:
+        super().__init__(message)
+        self.poster = poster
+
 
 @dataclass
 class PostObservation:
@@ -538,15 +542,24 @@ async def _confirm_poster_stopped(actor: object, requests: _PosterRequests) -> N
     if requests.stop is None:
         if actor in _post_actors:
             _post_actors.remove(actor)
-        requests.stop = asyncio.create_task(_poster_control_ack(actor.stop_requests.remote))
+        requests.stop = asyncio.create_task(stop_distributed_poster(actor))
     while not requests.stop.done():
         try:
             await asyncio.shield(requests.stop)
         except asyncio.CancelledError:
             continue
     if requests.stop.cancelled():
-        raise DistributedPostUnconfirmed("HTTP poster stop was cancelled")
+        raise DistributedPostUnconfirmed("HTTP poster stop was cancelled", actor)
     requests.stop.result()
+
+
+async def stop_distributed_poster(actor: object) -> None:
+    """Wait for the poster itself to acknowledge that dispatch has stopped."""
+    try:
+        await _poster_control_ack(actor.stop_requests.remote)
+    except DistributedPostUnconfirmed as exc:
+        exc.poster = actor
+        raise
 
 
 async def _poster_control_ack(call: Callable[[], Awaitable]) -> object:

@@ -4,7 +4,7 @@
 
 import asyncio
 from functools import wraps
-from typing import Any, Callable
+from typing import AbstractSet, Any, Callable
 from uuid import uuid4
 
 
@@ -30,11 +30,11 @@ class AdmissionLedger:
             self.permits.pop(token, None)
             self.changed.notify_all()
 
-    async def drain(self, fence: str, timeout: float) -> None:
+    async def drain(self, fence: str, timeout: float, *, ignore_permits: AbstractSet[str] = frozenset()) -> None:
         # A failure or cancellation deliberately leaves the fence closed.
         self.fences.add(fence)
         async with self.changed:
-            await asyncio.wait_for(self.changed.wait_for(lambda: not self.permits), timeout=timeout)
+            await asyncio.wait_for(self.changed.wait_for(lambda: not self.permits.keys() - ignore_permits), timeout)
 
 
 class AdmissionScope:
@@ -62,10 +62,12 @@ class AdmissionScope:
     async def complete(self, token: str) -> None:
         await self.root.complete(token)
 
-    async def drain(self, fence: str, timeout: float) -> None:
+    async def drain(self, fence: str, timeout: float, *, ignore_permits: AbstractSet[str] = frozenset()) -> None:
         self.fences.add(fence)
         async with self.root.changed:
-            await asyncio.wait_for(self.root.changed.wait_for(lambda: not self.permits), timeout=timeout)
+            await asyncio.wait_for(
+                self.root.changed.wait_for(lambda: not self.permits.keys() - ignore_permits), timeout
+            )
 
 
 def committed_policy_weight_version(actor: Any) -> str:
