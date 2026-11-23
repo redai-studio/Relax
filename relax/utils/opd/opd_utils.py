@@ -149,6 +149,10 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
 
 def build_teacher_engine_args(args: Any, overrides: dict[str, object]) -> Any:
     teacher_args = copy.copy(args)
+    # Only policy generations contribute replay data to the training batch.
+    teacher_args.use_rollout_routing_replay = False
+    teacher_args.use_rollout_indexer_replay = False
+    teacher_args.use_rollout_mm_embedding_replay = False
     for key, value in overrides.items():
         setattr(teacher_args, f"sglang_{key}", value)
     return teacher_args

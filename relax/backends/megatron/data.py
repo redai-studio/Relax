@@ -428,6 +428,7 @@ def get_batch(
     allgather_cp: bool = False,
     is_vl_model: bool = False,
     pack_device: torch.device | None = None,
+    model_chunk: Any = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -450,7 +451,14 @@ def get_batch(
     """
 
     assert "tokens" in keys
+    replay_mm = False
     if isinstance(data_iterator, DataIterator):
+        if getattr(get_args(), "use_rollout_mm_embedding_replay", False):
+            from relax.distributed.replay_manager.backend.mm_megatron import bind_mm_replay_batch, uses_native_vision
+
+            replay_mm = not uses_native_vision()
+            if replay_mm and "rollout_replay_refs" not in keys:
+                keys = (*keys, "rollout_replay_refs")
         extra_keys = []
         if Envs.RELAX_SFT_SELECTIVE_LOGITS:
             extra_keys.append("selective_loss_masks_cpu")
@@ -845,6 +853,8 @@ def get_batch(
             if mm_input_dict is None:
                 continue
             for key, mm_tensor in mm_input_dict.items():
+                if replay_mm and key in ("pixel_values", "pixel_values_videos"):
+                    continue
                 mapped_key = input_key_map.get(key, key)
                 if mapped_key != key and mapped_key in mm_input_dict:
                     raise ValueError(f"Multimodal inputs contain both {key!r} and its mapped key {mapped_key!r}.")
@@ -867,6 +877,9 @@ def get_batch(
 
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
+
+    if replay_mm:
+        bind_mm_replay_batch(batch, model_chunk)
 
     # Dynamic CP: forward_only merged its per-sample outputs back to full-length
     # responses (dynamic_cp_merge_output), so rollout_data stores full fields.
@@ -1579,6 +1592,7 @@ def log_rollout_data(
                 "sample_export_ids",
                 "agentic_group_ids",
                 "rollout_routed_experts",
+                "rollout_replay_refs",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
                 "rollout_topk_support_complete",

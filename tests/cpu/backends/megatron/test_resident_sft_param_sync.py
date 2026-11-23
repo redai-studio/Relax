@@ -12,11 +12,14 @@ from unittest.mock import Mock
 
 import pytest
 
+from relax.distributed.replay_manager import ReplayManager, rollout_kinds
+from relax.distributed.replay_manager.backend.megatron import reference_execution
 from relax.engine.sft.runtime import (
     is_dpo_mode,
     is_offline_mode,
     is_preference_mode,
     resident_sft_param_overlap_enabled,
+    sft_partition_id,
     should_skip_sft_weight_management,
 )
 from relax.utils.env import Envs
@@ -273,6 +276,10 @@ def test_resident_sft_live_initialization_reaches_train_without_snapshots(monkey
         TensorBackuper=Mock(),
         should_skip_sft_weight_management=should_skip_sft_weight_management,
         resident_sft_param_overlap_enabled=resident_sft_param_overlap_enabled,
+        reference_execution=reference_execution,
+        replay_data_manager=ReplayManager(),
+        rollout_kinds=rollout_kinds,
+        sft_partition_id=sft_partition_id,
         is_preference_mode=is_preference_mode,
         is_offline_mode=is_offline_mode,
         is_dpo_mode=is_dpo_mode,
