@@ -1087,36 +1087,35 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
     rank_step_records: dict[int, list[dict[str, Any]]] = {}
     truncated_step_logs: dict[str, dict[str, Any]] = {}
     for file_path in step_files:
-        with file_path.open("rb") as handle:
-            raw_lines = list(handle)
-        if not raw_lines:
-            continue
         match = re.fullmatch(r"rank_(\d+)_steps\.jsonl", file_path.name)
         records: list[dict[str, Any]] = []
-        for line_no, raw_bytes in enumerate(raw_lines, start=1):
-            if not raw_bytes.strip():
-                continue
-            # 仅最后一行缺少换行符时判定为写入中断产生的截断尾行；带换行符或中间行损坏均直接报错。
-            is_unterminated_trailing = line_no == len(raw_lines) and not raw_bytes.endswith(b"\n")
-            try:
-                raw_line = raw_bytes.decode("utf-8")
-                parsed = json.loads(raw_line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                if is_unterminated_trailing:
-                    if not allow_incomplete:
-                        raise ValueError(
-                            f"Truncated trailing record in {file_path.name} at line {line_no}: {exc}"
-                        ) from exc
-                    rank_key = str(records[0]["rank"]) if records else (match.group(1) if match else file_path.name)
-                    truncated_step_logs[rank_key] = {"file": file_path.name, "line": line_no}
-                    break
-                raise ValueError(f"Corrupted record in {file_path.name} at line {line_no}: {exc}") from exc
-            if not isinstance(parsed, dict):
-                raise ValueError(
-                    f"Corrupted record in {file_path.name} at line {line_no}: "
-                    f"expected JSON object, got {type(parsed).__name__}"
-                )
-            records.append(parsed)
+        with file_path.open("rb") as handle:
+            for line_no, raw_bytes in enumerate(handle, start=1):
+                if not raw_bytes.strip():
+                    continue
+                # 二进制逐行迭代中只有最后一行可能缺少换行符，据此判定写入中断产生的截断尾行。
+                is_unterminated_trailing = not raw_bytes.endswith(b"\n")
+                try:
+                    raw_line = raw_bytes.decode("utf-8")
+                    parsed = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    if is_unterminated_trailing:
+                        if not allow_incomplete:
+                            raise ValueError(
+                                f"Truncated trailing record in {file_path.name} at line {line_no}: {exc}"
+                            ) from exc
+                        rank_key = (
+                            str(records[0]["rank"]) if records else (match.group(1) if match else file_path.name)
+                        )
+                        truncated_step_logs[rank_key] = {"file": file_path.name, "line": line_no}
+                        break
+                    raise ValueError(f"Corrupted record in {file_path.name} at line {line_no}: {exc}") from exc
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"Corrupted record in {file_path.name} at line {line_no}: "
+                        f"expected JSON object, got {type(parsed).__name__}"
+                    )
+                records.append(parsed)
         if not records:
             continue
         rank = int(records[0]["rank"])
@@ -1135,7 +1134,7 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
     corrupted_summaries: dict[str, str] = {}
     for file_path in sorted(out_path.glob("rank_*_summary.json")):
         try:
-            data = json.loads(file_path.read_bytes().decode("utf-8"))
+            data = json.loads(file_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError(f"expected JSON object, got {type(data).__name__}")
             raw_rank = data["rank"]
