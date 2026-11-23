@@ -34,12 +34,13 @@ class GpuSyncGroup:
             # native DCS may use a different NCCL network in the same process.
             options = dist.ProcessGroupNCCL.Options()
             options.config.net_name = "Socket"
+        self._group_name = connection["group_name"]
         self.group = init_process_group(
             backend="nccl",
             init_method=connection["init_method"],
             world_size=connection["world_size"],
             rank=rank,
-            group_name=connection["group_name"],
+            group_name=self._group_name,
             timeout=timedelta(seconds=timeout_s),
             pg_options=options,
         )
@@ -109,3 +110,22 @@ class GpuSyncGroup:
         import torch.distributed as dist
 
         dist.destroy_process_group(self.group)
+
+    def abort(self) -> None:
+        """Retire this obsolete delta communicator when an original member is
+        gone."""
+        import torch.distributed.distributed_c10d as c10d
+
+        group = self.group
+        # None or WORLD in c10d aborts *every* process group, including training.
+        if (
+            group is None
+            or group == c10d.GroupMember.WORLD
+            or group == c10d.GroupMember.NON_GROUP_MEMBER
+            or not self._group_name.startswith("relax-delta-")
+            or group.group_name != self._group_name
+        ):
+            raise RuntimeError("Refusing to abort a group other than the owned delta communicator")
+        # The single-group helper also unregisters its store, name and rank
+        # mappings. An unavailable abort API must fail this reconnect.
+        c10d._abort_process_group(group)

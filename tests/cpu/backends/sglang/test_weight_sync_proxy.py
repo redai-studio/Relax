@@ -448,3 +448,117 @@ def test_pipeline_final_mask_requires_every_stage_and_flush_before_release(monke
         proxy.finalize("2", timeout=20, final_schema=dict(count=2, digest="0" * 64))
     assert "release" not in operations and "update_weight_version" not in operations
     assert len(confirmations) == (2 if fault.startswith("flush") else 1)
+
+
+@pytest.mark.parametrize("local_shutdown", [False, True])
+def test_proxy_retirement_fences_workers_and_reaps_each_child(local_shutdown):
+    import subprocess
+    import sys
+    from multiprocessing import Pipe
+
+    from relax.backends.sglang.weight_sync_proxy import _process_identity
+
+    # Drive the production child protocol. Only CUDA discovery and the PG are
+    # replaced. Hold both children after their ACK until the source joins.
+    code = """
+from multiprocessing.connection import Connection
+from types import SimpleNamespace
+import sys
+import torch
+from relax.backends.sglang import weight_sync_proxy
+
+torch.cuda.set_device = lambda _: None
+torch.cuda.get_device_properties = lambda _: SimpleNamespace(uuid="test")
+torch.cuda.mem_get_info = lambda _: (1024, 1024)
+torch.cuda.memory_allocated = torch.cuda.memory_reserved = lambda _: 0
+torch.cuda.max_memory_allocated = torch.cuda.max_memory_reserved = lambda _: 0
+arena = weight_sync_proxy._StagingArena
+weight_sync_proxy._StagingArena = lambda capacity, device: arena(capacity, "cpu")
+weight_sync_proxy._status_buffer = lambda count, tail, device: torch.zeros(count, dtype=torch.uint8)
+weight_sync_proxy._serialize = lambda *a: "local test IPC handle"
+calls = []
+def graceful():
+    calls.append("close")
+    sys.stdin.buffer.read(1)
+weight_sync_proxy.GpuSyncGroup = lambda *a, **kw: SimpleNamespace(
+    close=graceful, abort=lambda: calls.append("abort"), receive=lambda batch, slab: (slab, []),
+    fence=lambda works, **kw: None,
+)
+weight_sync_proxy._child(Connection(int(sys.argv[1])))
+assert calls == [sys.argv[2]], calls
+if calls == ["abort"]:
+    sys.stdin.buffer.read(1)
+"""
+    proxy = WeightSyncProxy(None)
+    children = []
+    model = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
+    try:
+        proxy._workers = [_process_identity(model.pid)]
+        for rank in range(2):
+            parent, child = Pipe()
+            process = subprocess.Popen(
+                [sys.executable, "-c", code, str(child.fileno()), "abort" if local_shutdown else "close"],
+                pass_fds=(child.fileno(),),
+                stdin=subprocess.PIPE,
+            )
+            child.close()
+            children.append((process, parent))
+            parent.send(
+                dict(
+                    workers=proxy._workers,
+                    device=rank,
+                    rank=rank,
+                    tp_size=2,
+                    pp_size=1,
+                    tp_rank=rank,
+                    pp_rank=0,
+                    timeout_s=5,
+                )
+            )
+        for rank, (_, channel) in enumerate(children):
+            assert channel.poll(30) and channel.recv()["success"]
+            channel.send(dict(op="join", connection={"transport": "nccl"}, rank=rank))
+            assert channel.poll(5) and channel.recv()["success"]
+        proxy.children = list(children)
+        if local_shutdown:
+            with pytest.raises(RuntimeError, match="original model workers"):
+                proxy.close(timeout=1, after_worker_exit=True)
+            assert all(not channel.closed and process.poll() is None for process, channel in children)
+            # One live model has an exported, unfenced IPC read. Its sibling
+            # may acknowledge abort; this child must retain its storage.
+            channel = children[0][1]
+            for command in (
+                dict(op="receive", round=0, batch={"bytes": 1}, budget=16),
+                dict(op="ready", round=0, deadline=monotonic() + 10),
+                dict(op="export", round=0, control={}, count=1),
+            ):
+                channel.send(command)
+                assert channel.poll(5) and channel.recv()["success"]
+            with pytest.raises(RuntimeError, match="Retaining unresolved IPC"):
+                proxy.close(timeout=1, abort_group=True)
+            assert not channel.closed and children[1][1].closed
+            model.kill()
+            model.wait(timeout=5)
+            proxy.close(timeout=5, after_worker_exit=True)
+        else:
+            with pytest.raises(subprocess.TimeoutExpired):
+                proxy.close(timeout=1)
+            model.kill()
+            model.wait(timeout=5)
+            with pytest.raises(subprocess.TimeoutExpired):
+                proxy.close(timeout=0.1, after_worker_exit=True)
+        assert all(channel.closed and process.poll() is None for process, channel in children)
+        for process, _ in children:
+            process.stdin.close()
+        proxy.close(timeout=5)
+        assert all(process.returncode == 0 for process, _ in children)
+        assert not proxy.children
+    finally:
+        model.kill()
+        model.wait(timeout=5)
+        model.stdin.close()
+        for process, channel in children:
+            process.kill()
+            process.wait(timeout=5)
+            process.stdin.close()
+            channel.close()

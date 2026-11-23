@@ -1094,7 +1094,7 @@ class SGLangEngine(RayActor):
             if proxy is not None:
                 # Unresolved IPC producers may retire only after their model
                 # consumers exited; killing the server above establishes that.
-                proxy.close(timeout=10)
+                proxy.close(timeout=10, after_worker_exit=True)
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-

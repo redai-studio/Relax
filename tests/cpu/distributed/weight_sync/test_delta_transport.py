@@ -196,6 +196,8 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
                 transfer.drain_frame()
             with pytest.raises(RuntimeError, match="Drain"):
                 transfer.finalize()
+            with pytest.raises(RuntimeError, match="Drain"):
+                transfer.connect([SimpleNamespace(_actor_id=b"replacement")], [1])
             assert actions[-1] == failure
         else:
             assert transfer.drain_frame() == {"ordinary0"}
@@ -647,3 +649,118 @@ def test_source_rejects_incomplete_final_mask_from_one_engine(monkeypatch, bad):
     monkeypatch.setattr(ray, "get", lambda *a, **k: replies)
     with pytest.raises(RuntimeError, match="Incomplete receiver final"):
         transfer.finalize()
+
+
+@pytest.mark.parametrize(
+    "failure", ["replaced_closed", "replaced_dead", "retained_dead", "nested_dead", "unavailable", "live_error"]
+)
+def test_membership_change_requires_retirement_of_every_surviving_receiver(monkeypatch, failure):
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync import transport
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    prepared = []
+    errors = {}
+    closed = []
+    source_shutdown = []
+
+    def engine(actor_id):
+        def operation(action, **kwargs):
+            if action == "close":
+                closed.append((actor_id, kwargs["abort_group"]))
+                return errors.get(actor_id)
+            if action == "prepare":
+                prepared.append(actor_id)
+                return [dict(uuid=f"GPU-{actor_id}", pp_size=1, tp_size=1)]
+            return {}
+
+        return SimpleNamespace(_actor_id=bytes([actor_id]), delta_weight_sync=SimpleNamespace(remote=operation))
+
+    def get(ref, **kwargs):
+        if isinstance(ref, Exception):
+            raise ref
+        return ref
+
+    monkeypatch.setattr(ray, "get", get)
+    monkeypatch.setattr(ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="GPU-source"))
+    monkeypatch.setattr(
+        transport,
+        "GpuSyncGroup",
+        lambda *args, **kwargs: SimpleNamespace(
+            close=lambda: source_shutdown.append("close"), abort=lambda: source_shutdown.append("abort")
+        ),
+    )
+    source = transport.DeltaTransfer(DeltaSyncConfig(stream="test", transport="nccl"), "cpu")
+    old, retained, replacement = [engine(i) for i in range(3)]
+    assert source.connect([old, retained], [1, 1])
+    prepared.clear()
+    error = {
+        "replaced_closed": None,
+        "replaced_dead": ray.exceptions.ActorDiedError(),
+        "nested_dead": ray.exceptions.RayTaskError(
+            "close", "nested failure", ray.exceptions.ActorDiedError()
+        ).as_instanceof_cause(),
+        "retained_dead": ray.exceptions.ActorDiedError(),
+        "unavailable": ray.exceptions.ActorUnavailableError("network partition", None),
+        "live_error": OSError("live proxy failed to close"),
+    }[failure]
+    errors[1 if failure == "retained_dead" else 0] = error
+    try:
+        if failure in {"replaced_closed", "replaced_dead"}:
+            assert source.connect([replacement, retained], [1, 1])
+            assert prepared == [2, 1]
+        else:
+            with pytest.raises(type(error)) as caught:
+                source.connect([replacement, retained], [1, 1])
+            assert caught.value is error and not prepared
+        assert closed == [(0, True), (1, True)] and source_shutdown == ["abort"]
+        if failure not in {"replaced_closed", "replaced_dead"}:
+            # A failed teardown may already have closed the source group. An
+            # identical old topology must not masquerade as a reusable group.
+            with pytest.raises(type(error)):
+                source.connect([old, retained], [1, 1])
+            assert not prepared
+    finally:
+        errors.clear()
+        source.close()
+
+
+def test_abort_unregisters_only_the_owned_group_and_preserves_world(monkeypatch, tmp_path):
+    import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
+
+    from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup
+    from relax.utils.distributed_utils import init_process_group
+
+    dist.init_process_group("gloo", init_method=(tmp_path / "world").as_uri(), world_size=1, rank=0)
+    try:
+        name = "relax-delta-cpu"
+        private = init_process_group(
+            backend="gloo", init_method=(tmp_path / "private").as_uri(), rank=0, world_size=1, group_name=name
+        )
+        other = dist.new_group([0], backend="gloo")
+        targets = []
+        # CPU substitute for the backend terminal call; exercise actual c10d
+        # dispatch, rank/name cleanup and the default group's continuing use.
+        monkeypatch.setattr(c10d.ProcessGroup, "abort", lambda pg: targets.append(pg))
+        owner = object.__new__(GpuSyncGroup)
+        owner._group_name = name
+        for invalid in (None, dist.group.WORLD, dist.GroupMember.NON_GROUP_MEMBER, other):
+            owner.group = invalid
+            with pytest.raises(RuntimeError, match="owned delta communicator"):
+                owner.abort()
+        assert not targets
+        owner.group = private
+        owner.abort()
+        assert targets == [private] and private not in c10d._world.pg_map
+        assert private not in c10d._world.pg_names and private not in c10d._world.pg_group_ranks
+        for group in (other, dist.group.WORLD):
+            value = torch.ones(1)
+            dist.all_reduce(value, group=group)
+            assert value.item() == 1
+    finally:
+        dist.destroy_process_group()

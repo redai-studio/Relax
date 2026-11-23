@@ -71,7 +71,10 @@ class DeltaTransfer:
         signature = self._signature(engines, counts)
         if signature == self.signature and not reconnect:
             return False
-        self.close()
+        self._require_drained()
+        previous_ids = {engine._actor_id.hex() for engine in self.engines}
+        current_ids = {actor_id for actor_id, _ in signature}
+        self.close(removed=previous_ids - current_ids)
         self.target_shard_capable = False
         self.target_shard_version = None
         self.engines = tuple(engines)
@@ -667,7 +670,7 @@ class DeltaTransfer:
             nccl_world_size=self.connection["world_size"] if self.group is not None else 0,
         )
 
-    def close(self) -> None:
+    def close(self, *, removed: set[str] | None = None) -> None:
         import ray
 
         # A caller that already observed a failed consume may still retire
@@ -676,6 +679,8 @@ class DeltaTransfer:
             self._require_drained()
         if self._active_raw is not None:
             raise RuntimeError("Cannot retire unresolved source transport storage")
+        # Even a partial retirement invalidates reuse of the old communicator.
+        self.signature = ()
         if self._sender is not None:
             self._sender.shutdown(wait=True)
             self._sender = None
@@ -683,15 +688,30 @@ class DeltaTransfer:
         self._host_slabs = [None, None]
         self._copy_stream = None
         closes = [
-            engine.delta_weight_sync.remote("close", timeout=self.config.sync_timeout_s) for engine in self.engines
+            engine.delta_weight_sync.remote("close", timeout=self.config.sync_timeout_s, abort_group=bool(removed))
+            for engine in self.engines
         ]
         if self.group is not None:
-            self.group.close()
+            if removed:
+                self.group.abort()
+            else:
+                self.group.close()
             self.group = None
         if self.tcp is not None:
             self.tcp.close()
             self.tcp = None
-        if closes:
-            ray.get(closes, timeout=self.config.sync_timeout_s)
+        deadline = monotonic() + self.config.sync_timeout_s
+        for engine, ref in zip(self.engines, closes, strict=True):
+            try:
+                ray.get(ref, timeout=max(0, deadline - monotonic()))
+            except ray.exceptions.ActorDiedError as exc:
+                # Only a permanently dead, replaced actor can no longer own
+                # a close RPC. A live old actor must still prove retirement.
+                if (
+                    isinstance(exc, ray.exceptions.RayTaskError)
+                    or not removed
+                    or engine._actor_id.hex() not in removed
+                ):
+                    raise
         self._pending_frame = None
         self.engines, self.signature, self.connection = (), (), None

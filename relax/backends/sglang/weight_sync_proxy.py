@@ -354,13 +354,16 @@ def _child(connection: Connection) -> None:
                         del item
                     if buffers and not _workers_exited(workers):
                         raise RuntimeError("Retaining unresolved IPC/NCCL buffers until model worker exit")
-                    connection.send(dict(success=True))
+                    if command.get("abort_group") and group is not None:
+                        group.abort()
+                        group = None
+                    connection.send(dict(success=True, op="close", abort_group=bool(command.get("abort_group"))))
                     break
                 else:
                     raise ValueError("Unknown proxy operation")
                 connection.send(result)
             except BaseException as exc:
-                connection.send(dict(success=False, error=f"{type(exc).__name__}: {exc}"))
+                connection.send(dict(success=False, op=op, error=f"{type(exc).__name__}: {exc}"))
     except (EOFError, BrokenPipeError, ConnectionResetError):
         pass
     except BaseException as exc:
@@ -389,6 +392,8 @@ class WeightSyncProxy:
         self._target_requested = self._target_capable = self._target_failed = False
         self.tp_size = self.pp_size = 1
         self.children: list[tuple[Any, Connection]] = []
+        self._closing: dict[Connection, tuple[bool, bool]] = {}
+        self._workers: list[tuple[int, int]] = []
         self.connection: dict | None = None
         self.identities: list[dict] = []
         self.version: str | None = None
@@ -409,6 +414,8 @@ class WeightSyncProxy:
         return results
 
     def _commands(self, commands: list[dict], *, deadline: float) -> list:
+        if self._closing:
+            raise RuntimeError("Cannot issue commands while retiring GPU proxies")
         if len(commands) != len(self.children):
             raise ValueError("Proxy commands must cover every TP process")
         for (_process, connection), command in zip(self.children, commands, strict=True):
@@ -438,6 +445,7 @@ class WeightSyncProxy:
         workers = [_process_identity(p.pid) for p in [root, *root.children(recursive=True)]]
         if len(workers) <= 1:
             raise ValueError("Cannot verify the existing SGLang worker process tree")
+        self._workers = workers
         deadline = time.monotonic() + timeout
         devices = [
             args["base_gpu_id"] + pp * self.tp_size + tp * args["gpu_id_step"]
@@ -1048,15 +1056,55 @@ class WeightSyncProxy:
             result["full_required_mask"] = [int(any(bits)) for bits in columns]
         return result
 
-    def close(self, *, timeout: float = 10) -> None:
+    def close(self, *, timeout: float = 10, after_worker_exit: bool = False, abort_group: bool = False) -> None:
         if not self.children:
             return
+        if after_worker_exit and (not self._workers or not _workers_exited(self._workers)):
+            raise RuntimeError("Cannot retire GPU proxy before its original model workers exit")
         deadline = time.monotonic() + timeout
-        self._commands([dict(op="close")] * len(self.children), deadline=deadline)
+        abort_group = abort_group or after_worker_exit
+        errors = []
+        # Post to all peers before waiting. A child acknowledges before its
+        # collective destructor runs, so a join timeout never permits replay.
+        for _, connection in self.children:
+            if connection not in self._closing:
+                self._closing[connection] = (abort_group, False)
+                try:
+                    connection.send(dict(op="close", abort_group=abort_group))
+                except Exception as exc:
+                    errors.append(exc)
+        all_exited = True
         for process, connection in self.children:
-            connection.close()
-            process.wait(timeout=remaining(deadline))
-        self.children.clear()
+            try:
+                sent_abort, acknowledged = self._closing[connection]
+                if not acknowledged:
+                    if not connection.poll(max(0, deadline - time.monotonic())):
+                        raise TimeoutError("GPU proxy did not acknowledge close")
+                    reply = connection.recv()
+                    if reply.get("op") != "close":
+                        raise RuntimeError(f"Unexpected reply while retiring GPU proxy: {reply}")
+                    if reply.get("success") is not True:
+                        del self._closing[connection]
+                        raise RuntimeError(f"GPU proxy refused close: {reply}")
+                    if reply.get("abort_group") is not sent_abort:
+                        raise RuntimeError("GPU proxy acknowledged a different retirement mode")
+                    self._closing[connection] = (sent_abort, True)
+                    connection.close()
+                # Only a completed abort permits the stopped engine to return
+                # before process exit. A prior graceful ACK still needs a join.
+                if after_worker_exit and sent_abort and process.poll() is None:
+                    all_exited = False
+                    continue
+                code = process.wait(timeout=max(0, deadline - time.monotonic()))
+                if code:
+                    raise RuntimeError(f"GPU proxy exited with status {code}")
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+        if all_exited:
+            self.children.clear()
+            self._closing.clear()
 
 
 if __name__ == "__main__":
