@@ -55,11 +55,6 @@ fi
 
 set -eo pipefail
 
-# Ray's state and Jobs clients both consult this before RAY_ADDRESS.
-if [[ -n "${RAY_JOBS_ADDRESS:-}" ]]; then
-    export RAY_API_SERVER_ADDRESS="${RAY_API_SERVER_ADDRESS:-$RAY_JOBS_ADDRESS}"
-fi
-
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # shellcheck source=./kernel-cache.sh
 source "${DIR}/kernel-cache.sh"
