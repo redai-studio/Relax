@@ -361,6 +361,21 @@ class _SFTPrepackedDeviceIterator:
         self._next_ready_event = None
 
 
+def _consumed_weight_version(updater: Any, engine_client: Any) -> str | None:
+    """Weight version the actor consumed, per weight-management mode.
+
+    Colocate/hybrid track it on weight_updater; pure fully-async on the DCS
+    backend counter (the same counter the rollout engine reports back in
+    meta_info, so lag joins one sequence); offline SFT publishes no weights.
+    """
+    if updater is not None:
+        return str(updater.weight_version)
+    if engine_client is not None:
+        version = getattr(engine_client.backend, "weight_version", None)
+        return str(version) if version is not None else None
+    return None
+
+
 class MegatronTrainRayActor(TrainRayActor):
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         super().set_rollout_manager(rollout_manager)
@@ -814,6 +829,12 @@ class MegatronTrainRayActor(TrainRayActor):
         ):
             return
         self.weights_backuper.backup("actor", on_device=getattr(self, "_weights_backup_on_device", False))
+
+    def _consumed_weight_version(self) -> str | None:
+        return _consumed_weight_version(
+            getattr(self, "weight_updater", None),
+            getattr(self, "checkpoint_engine_client", None),
+        )
 
     @timer
     def sleep(self) -> None:
@@ -2276,6 +2297,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         self.opt_param_scheduler,
                         data_iterator,
                         num_microbatches,
+                        consumed_weight_version=self._consumed_weight_version(),
                     )
                     self._resident_sft_params_pending = resident_overlap and rollout_id + 1 < self.args.num_rollout
                 finally:
@@ -2768,6 +2790,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     data_iterator,
                     num_microbatches,
+                    consumed_weight_version=self._consumed_weight_version(),
                 )
 
             self.prof.step(rollout_id=rollout_id)
@@ -2927,6 +2950,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     self.data_iterator,
                     self.num_microbatches,
+                    consumed_weight_version=self._consumed_weight_version(),
                 )
             self.prof.step(rollout_id=rollout_id)
             # [perf] Time actor spent waiting for TQ data (starvation).

@@ -77,7 +77,7 @@ from relax.utils.agentic_obs.records import utc_now
 from relax.utils.agentic_obs.writers import best_effort
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
-from relax.utils.types import get_spec_token_counts
+from relax.utils.types import WeightVersionSpan, get_spec_token_counts
 
 
 # Stable actor-name prefix embedded in opaque Session route tokens. Renaming it
@@ -3015,7 +3015,9 @@ class AgenticSessionShard:
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
+        token_start = len(ir.pending_token_delta)
         ir.pending_token_delta.extend(result.new_tokens)
+        token_end = len(ir.pending_token_delta)
         ir.pending_logprob_delta.extend(result.new_log_probs)
         if getattr(result, "new_topk_token_ids", None) is not None:
             ir.pending_topk_token_ids_delta.append(result.new_topk_token_ids)
@@ -3026,6 +3028,17 @@ class AgenticSessionShard:
             )
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
+        weight_version = result.meta_info.get("weight_version")
+        if token_end > token_start:
+            ir.pending_weight_version_spans.append(
+                WeightVersionSpan(
+                    version=str(weight_version) if weight_version is not None else None,
+                    token_start=token_start,
+                    token_end=token_end,
+                    attempt_seq=ir.weight_version_attempt_count,
+                )
+            )
+        ir.weight_version_attempt_count += 1
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
         routed_experts = _decode_routed_experts(
             args=self.args,
@@ -3114,6 +3127,7 @@ class AgenticSessionShard:
             if ir.pending_topk_support_complete_delta
             else None,
             weight_version_delta=ir.pending_weight_version_delta,
+            weight_version_spans=ir.pending_weight_version_spans,
             spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,
