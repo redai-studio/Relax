@@ -102,8 +102,64 @@ def test_dcs_quantized_rollout_restores_and_repacks_before_resume(rollout_backen
         assert awaited[-1] == ["/continue_generation"]
 
 
-def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_backend):
+@pytest.mark.parametrize("postprocess_fails", [False, True])
+def test_dcs_publication_requires_completed_quantization(rollout_backend, monkeypatch, postprocess_fails):
+    from relax.utils.agentic_obs import weight_publication
+    from relax.utils.agentic_obs.weight_audit import PublicationLedger
+
+    backend, _, _ = rollout_backend
+    backend.quantization_config = {"quant_method": "compressed-tensors"}
+    ledger = PublicationLedger()
+    monkeypatch.setattr(
+        weight_publication,
+        "begin_publication",
+        lambda owner: ledger.begin("policy", "epoch", str(owner.weight_version)),
+    )
+    monkeypatch.setattr(
+        weight_publication,
+        "commit_publication",
+        lambda owner: ledger.commit("policy", "epoch", str(owner.weight_version)),
+    )
+    resumed = []
+
+    def receiver(endpoint, payload=None):
+        if endpoint == "/post_process_weights" and payload["post_process_quantization"]:
+            assert ledger.snapshot()["ordinal"] is None
+            if postprocess_fails:
+                raise RuntimeError("quantization failed")
+        if endpoint == "/continue_generation":
+            resumed.append(ledger.snapshot())
+        return []
+
+    backend._batch_request = receiver
+    if postprocess_fails:
+        with pytest.raises(RuntimeError, match="quantization failed"):
+            backend.update_weights_for_rollout(rollout_only=True)
+        assert ledger.snapshot()["ordinal"] is None and not resumed
+    else:
+        backend.update_weights_for_rollout(rollout_only=True)
+        assert resumed == [{"policy": "policy", "epoch": "epoch", "ordinal": 1, "raw_version": "1"}]
+
+
+def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_backend, monkeypatch):
+    from relax.utils import distributed_utils
+    from relax.utils.agentic_obs import weight_publication
+    from relax.utils.agentic_obs.weight_audit import PublicationLedger
+
     backend, events, _ = rollout_backend
+    backend.args.dump_agentic_obs = "unused"
+    backend.args.use_agentic_rollout = True
+    backend.args.agentic_obs_run_id = "adapter"
+    ledger = PublicationLedger()
+    coordinator = SimpleNamespace(
+        begin_weight_publication=SimpleNamespace(remote=ledger.begin),
+        commit_weight_publication=SimpleNamespace(remote=ledger.commit),
+    )
+    monkeypatch.setattr(weight_publication, "_resolve_coordinator", lambda: coordinator)
+    monkeypatch.setattr(weight_publication, "_FRONTIERS", {})
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: object())
+    monkeypatch.setattr(device_direct.dist, "get_global_rank", lambda group, rank: rank)
+    monkeypatch.setattr(device_direct.ray, "get", lambda value, **kwargs: value)
     backend.quantization_config = {"quant_method": "compressed-tensors"}
     backend._lora_adapter_mode = True
     backend._lora_sync = SimpleNamespace(base_sync_done=False, adapter_loaded=False)
@@ -111,9 +167,13 @@ def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_
     backend.update_weights_for_rollout(rollout_only=True)
     assert len([e for e in events if isinstance(e, tuple) and e[0] == "/post_process_weights"]) == 2
     assert backend._lora_sync.base_sync_done
+    assert ledger.snapshot() is None
+    assert weight_publication.publication_label(backend) == "1"
     events.clear()
     backend.update_weights_for_rollout(rollout_only=True)
     assert events == [("/pause_generation", None), "flush", "adapter", ("/continue_generation", None)]
+    assert ledger.snapshot() is None
+    assert weight_publication.publication_label(backend) == "2"
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -135,7 +195,8 @@ def test_receiver_control_failure_reaches_every_training_rank(rollout_backend, m
         backend._rollout_control_request(endpoint)
 
 
-def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch):
+@pytest.mark.parametrize("audit_rejection", [False, True])
+def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch, audit_rejection):
     backend = object.__new__(device_direct.DeviceDirectBackend)
     backend._group_name = "pp0"
     backend._model_update_groups = object()
@@ -148,6 +209,10 @@ def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch):
         "2": {},
     }
     backend.rollout_engines = {rank: Mock() for rank in range(3)}
+    if audit_rejection:
+        backend.args = SimpleNamespace(dump_agentic_obs=True, use_agentic_rollout=True)
+        backend._weight_audit_label = "epoch:1"
+        backend.rollout_engines[1].make_request.remote.return_value = {"success": False}
     monkeypatch.setattr(device_direct.ray, "get", lambda value: value)
     monkeypatch.setattr(device_direct.dist, "broadcast", Mock())
 
@@ -156,11 +221,13 @@ def test_dcs_weight_bucket_selects_only_registered_nextn_drafts(monkeypatch):
     for rank, engine in backend.rollout_engines.items():
         endpoint, payload = engine.make_request.remote.call_args.args
         assert endpoint == "/update_weights_from_distributed"
-        assert payload["weight_version"] == "1"
+        assert payload["weight_version"] == ("epoch:1" if audit_rejection else "1")
         if rank == 0:
             assert payload["selector"] == "all"
         else:
             assert "selector" not in payload
+    if audit_rejection:
+        assert backend._weight_audit_rejected
 
 
 @pytest.mark.parametrize("generate", [False, True])

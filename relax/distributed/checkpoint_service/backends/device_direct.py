@@ -37,6 +37,7 @@ from urllib3.exceptions import NewConnectionError
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
+from relax.utils.agentic_obs.weight_publication import observe_install_result, publication_label
 from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
@@ -761,6 +762,11 @@ class DeviceDirectBackend(CommBackend):
             self._publish_managed_lora()
             return
 
+        from relax.utils.agentic_obs.weight_publication import begin_publication, commit_publication
+
+        if not actor_fwd_only and not self._lora_adapter_mode:
+            begin_publication(self)
+
         if self._use_bridge:
             # Bridge task construction and config exchange contain PP
             # collectives, so every rank must enter them before filtering.
@@ -956,6 +962,8 @@ class DeviceDirectBackend(CommBackend):
                     "/post_process_weights",
                     {"restore_weights_before_load": False, "post_process_quantization": True},
                 )
+            if not self._lora_adapter_mode:
+                commit_publication(self)
             self._rollout_control_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
             # NOTE: rollout proxy actors are intentionally kept alive across weight
@@ -1279,7 +1287,7 @@ class DeviceDirectBackend(CommBackend):
                 "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
                 "shapes": [param.shape for _, param in converted_named_tensors],
                 "group_name": self._group_name,
-                "weight_version": str(self.weight_version),
+                "weight_version": publication_label(self),
                 "flush_cache": False,
             }
             weight_payloads = {
@@ -1296,7 +1304,7 @@ class DeviceDirectBackend(CommBackend):
                 handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
             for handle in handles:
                 handle.wait()
-            ray.get(futures)  # Ensure remote update completes
+            observe_install_result(self, ray.get(futures))
             completed = True
         finally:
             try:

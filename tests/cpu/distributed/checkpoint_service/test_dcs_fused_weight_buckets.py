@@ -26,7 +26,9 @@ def dcs_update_bucket():
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method],
         type_ignores=[],
     )
-    namespace = {}
+    from relax.utils.agentic_obs.weight_publication import observe_install_result, publication_label
+
+    namespace = {"observe_install_result": observe_install_result, "publication_label": publication_label}
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace
 
