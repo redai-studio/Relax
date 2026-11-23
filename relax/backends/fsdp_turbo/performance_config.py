@@ -24,7 +24,7 @@ class PerformanceConfig:
 
 
 def optimizer_options(config):
-    options = getattr(config, "relax_performance", PerformanceConfig())
+    options = config.relax_performance
     if not options.adamw_fused:
         return {}
     if config.optimizer.optimizer_type.lower() != "adamw":

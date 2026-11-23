@@ -11,6 +11,7 @@ import pytest
 def post_process_rewards(monkeypatch):
     tensordict = ModuleType("tensordict")
     tensordict.TensorDict = dict
+    tensordict.TensorDictBase = dict
     monkeypatch.setitem(sys.modules, "tensordict", tensordict)
     sys.modules.pop("relax.utils.utils", None)
     module = importlib.import_module("relax.utils.utils")
