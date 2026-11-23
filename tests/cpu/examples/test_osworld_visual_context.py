@@ -1,0 +1,717 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""CPU contract tests: actual HTTP adapter -> Forest -> explicit exports ->
+loss mask."""
+
+import ast
+import asyncio
+import base64
+import copy
+import importlib.util
+import json
+import logging
+import os
+import signal
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+
+from examples.osworld_agentic.app.reward_post_process import compute_advantages, compute_legacy_raw_reward
+from examples.osworld_agentic.app.visual_context import VisualContext, image_count
+from relax.agentic.pipeline import TrainingFieldArtifact
+from relax.agentic.session.service import AgenticSessionShard
+from relax.agentic.session.state import SessionForest, check_messages, normalize_tools
+from relax.utils.logging_utils import get_logger
+from relax.utils.utils import convert_samples_to_train_data
+
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def observation(turn):
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + base64.b64encode(bytes([turn])).decode()},
+            },
+            {"type": "text", "text": f"Tool result: {turn}; Instruction: task; Previous actions: {list(range(turn))}"},
+        ],
+    }
+
+
+class MockUpstream:
+    """Pinned upstream shape: rebuilt window, dynamic system tools, same-prompt
+    parse retries."""
+
+    def __init__(self, **kwargs):
+        self.max_steps = kwargs.get("max_steps", 30)
+        self.actions, self.responses = [], []
+        self._input_toks_per_step, self._output_toks_per_step = [], []
+
+    def reset(self, *args):
+        pass
+
+    def record_exec_result(self, *args):
+        pass
+
+    def predict(self, instruction, obs, step_idx):
+        messages = [{"role": "system", "content": obs.get("system", "rules and tool definitions")}]
+        # The old user message loses its original instruction in upstream's rebuild.
+        if step_idx and self.responses:
+            old = observation(step_idx - 1)
+            old["content"] = old["content"][:1]
+            messages.extend([old, {"role": "assistant", "content": self.responses[-1]}])
+        messages.append(observation(step_idx))
+        payload = {
+            "messages": messages,
+            "tools": obs.get("tools", []),
+            "chat_template_kwargs": obs.get("template", {}),
+        }
+        for _ in range(5):
+            response = self.call_llm(payload, "mock")
+            if response != "bad parse":
+                break
+        self.responses.append(response)
+        self.actions.append(response)
+        return response, ["DONE"] if step_idx + 1 == self.max_steps else ["click()"], {"action_type": "gui"}
+
+
+@pytest.fixture
+def hybrid(monkeypatch):
+    external = ModuleType("mm_agents.hybrid_agent_local")
+    external.HybridAgentLocal = MockUpstream
+    monkeypatch.setitem(sys.modules, "mm_agents", ModuleType("mm_agents"))
+    monkeypatch.setitem(sys.modules, "mm_agents.hybrid_agent_local", external)
+    name = "examples.osworld_agentic.app.hybrid_agent"
+    spec = importlib.util.spec_from_file_location(name, ROOT / "examples/osworld_agentic/app/hybrid_agent.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://mock-only/v1")
+    return module
+
+
+class MockBackend:
+    """Deterministic fake codec and generation, real Forest
+    matching/commit/export.
+
+    Each input byte is one token, each image 32 tokens. Generated token IDs are
+    deliberately different from re-encoding answer text, exposing
+    retokenization. No image processing, HTTP, VM, tokenizer download or GPU is
+    involved.
+    """
+
+    apply_chat_template_kwargs = {}
+
+    def __init__(self, monkeypatch, hybrid, replies=None):
+        self.requests, self.generated, self.parents = [], [], []
+        self.replies = iter(replies) if replies else None
+        self.forest = SessionForest.create_empty(session_id="session", group_index=7, index=42)
+        self.shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
+        self.shard.args = SimpleNamespace(use_rollout_routing_replay=False)
+        from relax.agentic.observability import ShardTrajectoryRecorder
+
+        self.shard._trajectory_recorder = ShardTrajectoryRecorder(self.shard.args, shard_ordinal=0)
+        self.shard._generation_backend = SimpleNamespace(compiler=self, tokenizer=self)
+        self.shard._raise_if_observation_exceeds_context = lambda **kwargs: None
+        monkeypatch.setattr(hybrid.httpx, "post", self.post)
+
+    def decode(self, token_ids, **kwargs):
+        return " ".join(map(str, token_ids))
+
+    async def encode_messages(self, messages, **kwargs):
+        ids = []
+        for message in messages:
+            ids.extend(message["role"].encode())
+            content = message["content"]
+            for block in content if isinstance(content, list) else [{"type": "text", "text": content}]:
+                ids.extend([999] * 32 if block["type"] == "image_url" else block["text"].encode())
+        return SimpleNamespace(
+            train_prompt_ids=ids,
+            backend_prompt_ids=ids,
+            multimodal_train_inputs=None,
+            backend_image_data=[],
+            backend_audio_data=[],
+            backend_video_data=[],
+            timing={},
+        )
+
+    encode_observation_delta = encode_messages
+
+    def post(self, *args, json, **kwargs):
+        self.requests.append(copy.deepcopy(json))
+        messages = check_messages(json["messages"])
+        tools, template = normalize_tools(json.get("tools")), json.get("chat_template_kwargs") or {}
+        parent, delta = self.shard._match_parent_state(
+            forest=self.forest,
+            messages=messages,
+            tools=tools,
+            chat_template_kwargs=template,
+        )
+        self.parents.append(parent)
+        obs, _ = asyncio.run(
+            self.shard._append_observation(
+                session=SimpleNamespace(rollout_id=0),
+                forest=self.forest,
+                parent=parent,
+                messages_delta=delta,
+                tools=tools,
+                chat_template_kwargs=template,
+            )
+        )
+        i = len(self.generated)
+        content = next(self.replies) if self.replies else f"answer-{i}"
+        ids, probs = [100_000 + 2 * i, 100_001 + 2 * i], [-0.1 * (i + 1), -0.1 * (i + 1) - 0.01]
+        self.generated.append((ids, probs))
+        self.forest.append_resp(
+            parent_state_hash=obs.state_hash,
+            rollout_id=0,
+            abort_count=0,
+            messages_delta=[{"role": "assistant", "content": content}],
+            token_delta=ids,
+            logprob_delta=probs,
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": self.forest.train_token_count(obs.state_hash),
+                    "completion_tokens": len(ids),
+                },
+            },
+        )
+
+    def export(self, rows):
+        from relax.agentic.runner.ipc import _normalize_session_output_record
+
+        transport = self.shard._build_session_export_transport(
+            session=SimpleNamespace(
+                forest=self.forest, group=SimpleNamespace(rollout_mode="train", group_id="group"), observation=None
+            ),
+            reward=None,
+            metadata={},
+            output_records=tuple(_normalize_session_output_record(row) for row in rows),
+            finalize_events={},
+        )
+        return [TrainingFieldArtifact(sample_payload=e["sample_payload"]).to_sample() for e in transport.exports]
+
+
+def adapter_functions(**extras):
+    path = ROOT / "examples/osworld_agentic/app/agent.py"
+    names = {"main", "run_session", "_predict_one_step", "write_session_output", "_extract_task_config"}
+    nodes = [
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names
+    ]
+    tree = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
+        type_ignores=[],
+    )
+    ns = dict(asyncio=asyncio, signal=signal, logging=logging, os=os, json=json, Path=Path, **extras)
+    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), ns)
+    return ns
+
+
+@pytest.mark.parametrize("mode", ["baseline", "vcs"])
+@pytest.mark.parametrize("evaluation_failed", [False, True], ids=["zero-score", "evaluation-timeout"])
+def test_evaluation_failure_preserves_exports_and_terminal_status(
+    monkeypatch, tmp_path, hybrid, mode, evaluation_failed
+):
+    from relax.agentic.pipeline import SessionExportTransport
+    from relax.agentic.runner.ipc import SessionOutput
+    from relax.agentic.session import service
+
+    # Only the external VM SDK import and VM I/O are replaced. Load the full adapters.
+    desktop = ModuleType("desktop_env.desktop_env")
+    desktop.DesktopEnv = object
+    monkeypatch.setitem(sys.modules, "desktop_env", ModuleType("desktop_env"))
+    monkeypatch.setitem(sys.modules, "desktop_env.desktop_env", desktop)
+    app = ModuleType("app")
+    app.__path__ = [str(ROOT / "examples/osworld_agentic/app")]
+    monkeypatch.setitem(sys.modules, "app", app)
+    monkeypatch.setitem(sys.modules, "app.hybrid_agent", hybrid)
+
+    def load(leaf):
+        spec = importlib.util.spec_from_file_location(f"app.{leaf}", Path(app.__path__[0]) / f"{leaf}.py")
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, f"app.{leaf}", module)
+        spec.loader.exec_module(module)
+        return module
+
+    load("task_setup_compat")
+    adapter = load("env_osworld")
+    driver = load("agent")
+    backend = MockBackend(monkeypatch, hybrid)
+    instances = []
+
+    def evaluate():
+        if evaluation_failed:
+            raise TimeoutError("guest evaluator timed out")
+        return 0.0
+
+    class Env(adapter.OSWorldEnv):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._env = SimpleNamespace(evaluate=evaluate)
+            instances.append(self)
+
+        async def reset(self):
+            return adapter.StepObs(screenshot_bytes=b"screen")
+
+        async def exec_pyautogui(self, action):
+            return adapter.StepObs(screenshot_bytes=b"screen")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(driver, "OSWorldEnv", Env)
+    monkeypatch.setattr(
+        driver,
+        "_load_config",
+        lambda: {
+            "max_turns": 2,
+            "context_mode": mode,
+            "vcs_keep_images": 2,
+            "vcs_prune_images": 1,
+        },
+    )
+    monkeypatch.setenv("RELAX_SESSION_ID", "session")
+    monkeypatch.setenv("RELAX_VCS", str(int(mode == "vcs")))
+    payload = asyncio.run(driver.run_session({"task_config": {"id": "task", "instruction": "task"}}, {}))
+    assert payload["reward"] == 0.0
+    status = payload["metadata"]["execution_status"]
+    assert status["status"] == ("failed" if evaluation_failed else "completed")
+    if evaluation_failed:
+        assert status["reason_code"] == "evaluation_failed" and "TimeoutError" in status["reason"]
+    path = tmp_path / "output.jsonl"
+    driver.write_session_output(path, payload)
+    output = SessionOutput.from_records([json.loads(line) for line in path.read_text().splitlines()])
+
+    async def finalize():
+        shard = backend.shard
+        shard.args.agentic_session_lifecycle = False
+        shard._notify_state_change = lambda *args: None
+        shard._agent_cleanup_tasks = set()
+        group = service.ResidentGroup("train", "g", {}, [], ownership=service.GroupOwnership.RUNTIME)
+        session = service._SessionRecord(group, "session", {}, service._SessionResultCell(), forest=backend.forest)
+        group.sessions.append(session)
+        shard._session_records = {session.session_id: session}
+        process_wait = asyncio.create_task(asyncio.sleep(0))
+        watcher = asyncio.create_task(asyncio.Event().wait())
+        session.resources = service.SessionResources(
+            SimpleNamespace(output=output, terminate_and_join=AsyncMock()),
+            process_wait,
+            watcher,
+        )
+        await shard._finalize_terminal_session(session)
+        transport = session.result_cell.payload
+        assert isinstance(transport, SessionExportTransport) and not group.drop_committed
+        samples = [
+            TrainingFieldArtifact(sample_payload=row["sample_payload"]).to_sample() for row in transport.exports
+        ]
+        assert len(samples) == (2 if mode == "baseline" else 1)
+        tokens = [
+            t for sample in samples for t, m in zip(sample.tokens[-sample.response_length :], sample.loss_mask) if m
+        ]
+        assert tokens == [token for ids, _ in backend.generated for token in ids]
+        probs = [p for sample in samples for p, m in zip(sample.rollout_log_probs, sample.loss_mask) if m]
+        assert probs == pytest.approx([prob for _, values in backend.generated for prob in values])
+        assert [s.reward for s in samples if s.reward is not None] == [{"score": 0.0}]
+        metrics = await shard.agentic_kv_metrics()
+        assert metrics["terminal/failed"] == int(evaluation_failed)
+        assert metrics["terminal/completed"] == int(not evaluation_failed)
+        if shard._agent_cleanup_tasks:
+            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
+        await asyncio.gather(watcher, return_exceptions=True)
+        await shard._trajectory_recorder.aclose()
+
+    asyncio.run(finalize())
+    # A later successful evaluation must clear an earlier timeout diagnostic.
+    instances[0]._env.evaluate = lambda: 0.0
+    assert asyncio.run(instances[0].evaluate()) == 0.0
+    assert getattr(instances[0], "evaluation_error", None) is None
+
+
+def export_agent(agent, backend, tmp_path):
+    vcs = agent.visual_context
+    payload = {"_turn_records": agent.turn_records, "reward": 1, "metadata": {"agent_turns": len(agent.actions)}}
+    if vcs:
+        vcs.finish("agent_done")
+        payload["_segment_records"] = vcs.records
+        payload["metadata"].update(context_mode="vcs", model_calls=len(agent.turn_records))
+    output = tmp_path / "records.jsonl"
+    adapter_functions()["write_session_output"](output, payload)
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    return rows, backend.export(rows)
+
+
+def trained_pairs(samples):
+    return [
+        (token, prob)
+        for sample in samples
+        for token, prob, mask in zip(
+            sample.tokens[-sample.response_length :],
+            sample.rollout_log_probs,
+            sample.loss_mask,
+            strict=True,
+        )
+        if mask
+    ]
+
+
+@pytest.mark.parametrize("mode", ["baseline", "vcs"])
+def test_long_trajectory_actual_export_tokens_masks_and_normalization(hybrid, monkeypatch, tmp_path, mode):
+    backend = MockBackend(monkeypatch, hybrid)
+    agent = hybrid.RelaxHybridAgent(context_mode=mode)
+    for turn in range(10):
+        agent.predict("task", {}, step_idx=turn)
+    rows, samples = export_agent(agent, backend, tmp_path)
+    expected = [(t, p) for ids, probs in backend.generated for t, p in zip(ids, probs, strict=True)]
+    actual = trained_pairs(samples)
+    assert [x[0] for x in actual] == [x[0] for x in expected]
+    assert [x[1] for x in actual] == pytest.approx([x[1] for x in expected])
+    assert len({token for token, _ in actual}) == 20
+    assert {s.index for s in samples} == {42}
+    assert {s.group_index for s in samples} == {7}
+    assert sum(s.reward is not None for s in samples) == 1
+    for sample in samples:
+        assert len(sample.loss_mask) == len(sample.rollout_log_probs) == sample.response_length
+        assert all(p == 0 for m, p in zip(sample.loss_mask, sample.rollout_log_probs, strict=True) if not m)
+        sample.custom_advantage = 1.0
+    data = convert_samples_to_train_data(
+        SimpleNamespace(
+            custom_reward_post_process_path=None,
+            agentic_custom_advantage_path="mock",
+            use_opd=False,
+            debug_train_only=True,
+        ),
+        samples,
+    )
+    assert data["sample_index_mask_sums"] == [20] * len(samples)
+    comparison = {
+        "mode": mode,
+        "model_calls": len(backend.generated),
+        "environment_steps": len(agent.actions),
+        "training_rows": len(samples),
+        "request_images": sum(image_count(r["messages"]) for r in backend.requests),
+        "training_images": sum(image_count(r["messages"]) for r in rows),
+        "trained_answer_tokens": sum(sum(s.loss_mask) for s in samples),
+        "rollout_input_tokens": sum(agent._input_toks_per_step),
+        "training_tokens": sum(len(s.tokens) for s in samples),
+    }
+    (tmp_path / f"comparison-{mode}.json").write_text(json.dumps(comparison, indent=2))
+    if mode == "baseline":
+        assert len(rows) == 10
+        assert [image_count(r["messages"]) for r in backend.requests] == [1] + [2] * 9
+        assert all(s.metadata["agentic_trace"]["turn_count"] == 1 for s in samples)
+    else:
+        assert len(rows) == 4
+        assert [r["metadata"]["vcs_segment"]["new_answers"] for r in rows] == [4, 2, 2, 2]
+        assert [image_count(r["messages"]) for r in backend.requests] == [1, 2, 3, 4, 3, 4, 3, 4, 3, 4]
+        for i, parent in enumerate(backend.parents):
+            if i in (0, 4, 6, 8):
+                assert parent.state_hash == backend.forest.root_state_hash
+            else:
+                assert backend.requests[i]["messages"][:-1] == agent.turn_records[i - 1]["messages"]
+        # Replayed answers are before the first generated node: prompt, not targets.
+        assert [s.metadata["agentic_trace"]["turn_count"] for s in samples] == [4, 2, 2, 2]
+        after_trim = backend.requests[4]["messages"]
+        assert [m["content"] for m in after_trim if m["role"] == "assistant"] == [f"answer-{i}" for i in range(4)]
+        for i in range(5):
+            assert observation(i)["content"][-1] in [
+                b for m in after_trim if isinstance(m["content"], list) for b in m["content"]
+            ]
+        assert rows[0]["metadata"]["vcs_segment"]["trigger_images"] == 5
+        assert rows[0]["metadata"]["vcs_segment"]["pruned_images"] == 2
+        assert rows[-1]["metadata"]["vcs_segment"]["reason"] == "agent_done"
+
+
+@pytest.mark.parametrize("keep,prune", [(2, 2), (4, 4), (1, 2)])
+def test_exact_window_threshold(hybrid, monkeypatch, keep, prune):
+    backend = MockBackend(monkeypatch, hybrid)
+    agent = hybrid.RelaxHybridAgent(context_mode="vcs", vcs_keep_images=keep, vcs_prune_images=prune)
+    threshold = keep + prune
+    for turn in range(threshold):
+        agent.predict("task", {}, step_idx=turn)
+        assert agent.visual_context.records == []
+    assert image_count(backend.requests[-1]["messages"]) == threshold
+    agent.predict("task", {}, step_idx=threshold)
+    assert len(agent.visual_context.records) == 1
+    assert image_count(backend.requests[-1]["messages"]) == keep + 1
+
+
+def test_identical_parse_retries_and_tools_reversion_have_unique_loss(hybrid, monkeypatch, tmp_path):
+    backend = MockBackend(monkeypatch, hybrid, replies=["bad parse", "bad parse", "ok", "ok", "ok", "ok"])
+    agent = hybrid.RelaxHybridAgent(context_mode="vcs")
+    agent.predict("task", {}, step_idx=0)
+    tool = {"type": "function", "function": {"name": "click", "parameters": {"type": "object"}}}
+    agent.predict("task", {"tools": [tool], "system": "new tool definitions"}, step_idx=1)
+    agent.predict("task", {}, step_idx=2)
+    agent.predict("task", {"template": {"enable_thinking": False}}, step_idx=3)
+    rows, samples = export_agent(agent, backend, tmp_path)
+    assert len(samples) == 6
+    assert len(trained_pairs(samples)) == 12
+    assert [r["metadata"]["vcs_segment"]["reason"] for r in rows[:2]] == ["parse_retry"] * 2
+    assert all(p.state_hash == backend.forest.root_state_hash for p in backend.parents)
+    assert "bad parse" not in str(backend.requests[2])
+    assert backend.requests[3]["tools"] == [tool]
+    assert backend.requests[-1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert [c["parse_attempt"] for c in agent.turn_records] == [0, 1, 2, 0, 0, 0]
+    agent.visual_context.finish("duplicate_finish")
+    assert len(agent.visual_context.records) == 6
+
+
+@pytest.mark.parametrize("norm", ["0", "1"])
+def test_segments_share_trajectory_advantage_and_legacy_metric(monkeypatch, norm):
+    monkeypatch.setenv("OSWORLD_PER_TRAJ_NORM", norm)
+    baseline, vcs = [], []
+    for outcome, calls in [(1, 10), (0, 6)]:
+        md = {"outcome": outcome, "agent_turns": calls}
+        baseline.append({f"turn_{i}": dict(md) for i in range(calls)})
+        vcs.append({f"segment_{i}": dict(md, context_mode="vcs", model_calls=calls) for i in range(2)})
+    old, new = compute_advantages(baseline), compute_advantages(vcs)
+    assert [set(s.values()) for s in old] == [set(s.values()) for s in new]
+
+    def metric_samples(sessions):
+        return [
+            SimpleNamespace(session_id=str(i), metadata=md)
+            for i, session in enumerate(sessions)
+            for md in session.values()
+        ]
+
+    assert compute_legacy_raw_reward(metric_samples(baseline)) == compute_legacy_raw_reward(metric_samples(vcs))
+
+
+@pytest.mark.parametrize(
+    "mode,fail_at,error_kind",
+    [
+        (None, None, None),
+        ("baseline", None, None),
+        ("vcs", None, None),
+        ("vcs", 5, "predict_error"),
+        ("vcs", 5, "context_length_exceeded"),
+    ],
+)
+def test_real_session_driver_mock_environment_tail_and_early_stop(
+    hybrid, monkeypatch, tmp_path, mode, fail_at, error_kind
+):
+    import yaml
+
+    monkeypatch.delenv("RELAX_VCS", raising=False)
+    config = (
+        yaml.safe_load((ROOT / "examples/osworld_agentic/app/osworld_config.yaml").read_text())
+        if mode is None
+        else {"max_turns": 10, "context_mode": mode}
+    )
+    backend = MockBackend(monkeypatch, hybrid)
+    actions = []
+    obs = SimpleNamespace(
+        screenshot_bytes=b"mock", cur_app=None, app_info=None, tool_list=[], done=False, exec_ok=True, exec_result={}
+    )
+
+    class Env:
+        def __init__(self, **kwargs):
+            pass
+
+        async def reset(self):
+            return obs
+
+        async def exec_pyautogui(self, code):
+            actions.append(code)
+            return obs
+
+        async def evaluate(self):
+            return 1.0
+
+        async def close(self):
+            actions.append("close")
+
+    post = backend.post
+
+    def maybe_fail(*args, **kwargs):
+        if fail_at is not None and len(backend.generated) == fail_at:
+            if error_kind == "context_length_exceeded":
+                return httpx.Response(400, json={"error": {"code": error_kind}})
+            raise RuntimeError("mock model unavailable")
+        return post(*args, **kwargs)
+
+    monkeypatch.setattr(hybrid.httpx, "post", maybe_fail)
+    ns = adapter_functions(
+        time=SimpleNamespace(monotonic=lambda: 1),
+        _load_config=lambda: config,
+        OSWorldEnv=Env,
+        RelaxHybridAgent=hybrid.RelaxHybridAgent,
+        parse_mcp_action=lambda a: None,
+        SessionDiscardedError=hybrid.SessionDiscardedError,
+        ContextLengthExceededError=hybrid.ContextLengthExceededError,
+        logger=get_logger(__name__),
+        emit=lambda *a, **k: None,
+    )
+    result = asyncio.run(ns["run_session"]({"task_config": {"id": "task", "instruction": "task"}}, {}))
+    count = fail_at or config["max_turns"]
+    assert result["reward"] == 1.0
+    assert result["metadata"]["execution_status"]["status"] == (
+        "failed" if error_kind == "predict_error" else "completed"
+    )
+    if fail_at:
+        assert result["metadata"]["stop_reason"] == error_kind
+        assert "FAIL" not in actions
+    assert result["metadata"]["agent_turns"] == count
+    assert result["metadata"]["_session_metrics"]["osworld/model_calls"] == count
+    assert len(actions) == count + 1 and actions[-1] == "close"
+    if mode == "vcs":
+        assert result["_segment_records"][-1]["vcs_segment"]["reason"] == (error_kind if fail_at else "agent_done")
+        assert result["metadata"]["_session_metrics"]["osworld/answer_tokens"] == count * 2
+    else:
+        assert "_segment_records" not in result
+        assert not any("vcs" in key for key in result["metadata"]["_session_metrics"])
+    path = tmp_path / "session.jsonl"
+    ns["write_session_output"](path, result)
+    samples = backend.export([json.loads(line) for line in path.read_text().splitlines()])
+    assert len(trained_pairs(samples)) == count * 2
+
+
+def test_vcs_configuration_is_explicit_and_validated(hybrid):
+    assert hybrid.RelaxHybridAgent().visual_context is None
+    with pytest.raises(ValueError, match="positive"):
+        VisualContext(0, 2)
+    with pytest.raises(ValueError, match="context_mode"):
+        hybrid.RelaxHybridAgent(context_mode="unknown")
+    with pytest.raises(ValueError, match="context_policy"):
+        hybrid.RelaxHybridAgent(context_mode="vcs", context_policy="skip_on_no_change")
+
+
+def test_changed_retry_prompt_is_not_silently_discarded(hybrid, monkeypatch):
+    MockBackend(monkeypatch, hybrid)
+    agent = hybrid.RelaxHybridAgent(context_mode="vcs")
+    agent.predict("task", {}, step_idx=0)
+    request = {"messages": [{"role": "system", "content": "rules"}, observation(1)]}
+    with pytest.raises(ValueError, match="retries must reuse"):
+        agent.call_llm(request, "mock")
+
+
+def test_tool_change_at_image_boundary_records_both_causes(hybrid, monkeypatch, tmp_path):
+    backend = MockBackend(monkeypatch, hybrid)
+    agent = hybrid.RelaxHybridAgent(context_mode="vcs")
+    for turn in range(5):
+        agent.predict("task", {"system": "changed"} if turn == 4 else {}, step_idx=turn)
+    rows, samples = export_agent(agent, backend, tmp_path)
+    boundary = rows[0]["metadata"]["vcs_segment"]
+    assert boundary["reason"] == "tools_or_system_or_template_changed+image_window"
+    assert boundary["pruned_images"] == 2
+    assert agent.visual_context.metrics()["osworld/vcs_pruned_images"] == 2
+    assert len(trained_pairs(samples)) == 10
+    assert image_count(backend.requests[-1]["messages"]) == 3
+
+
+def test_terminal_signals_cross_pinned_upstream_predict_and_preserve_parse_retry():
+    """Run the pinned fork's real predict/parser; only HTTP and unused tools
+    are isolated."""
+    import subprocess
+
+    repo = os.environ.get("OSWORLD_REPO")
+    if not repo or not (Path(repo) / "mm_agents/hybrid_agent_local.py").is_file():
+        pytest.skip("Set OSWORLD_REPO to the pinned external fork for native predict validation")
+    source = subprocess.check_output(
+        ["git", "-C", repo, "show", "50b4a85778cfc13ce00e3bf63a3cd08bd260fb96:mm_agents/hybrid_agent_local.py"],
+        text=True,
+    )
+    script = r"""
+import io
+import logging
+import sys
+import types
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+from PIL import Image
+
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+# predict does not use ComputerUse; do not require its separate qwen_agent SDK.
+tools = types.ModuleType("mm_agents.agent_function_call")
+tools.ComputerUse = object
+sys.modules[tools.__name__] = tools
+upstream = types.ModuleType("mm_agents.hybrid_agent_local")
+upstream.__file__ = str(Path(sys.argv[1]) / "mm_agents/hybrid_agent_local.py")
+sys.modules[upstream.__name__] = upstream
+exec(compile(sys.stdin.read(), upstream.__file__, "exec"), upstream.__dict__)
+from examples.osworld_agentic.app.hybrid_agent import (
+    RelaxHybridAgent, ContextLengthExceededError, SessionDiscardedError,
+)
+
+def make_agent():
+    agent = object.__new__(RelaxHybridAgent)
+    agent._hybrid = True
+    agent.model, agent.max_steps, agent.max_tokens = "qwen3-vl", 30, 4096
+    agent.top_p = agent.temperature = agent._repetition_penalty = 1.0
+    agent.visual_context, agent._stop_token_ids = None, []
+    agent._base_url, agent._api_key = "http://mock/v1", "session"
+    agent._max_llm_call_retries, agent._llm_call_timeout_s, agent._backoff_seconds = 3, 1.0, 0
+    agent.turn_records, agent.model_request_s, agent.transport_retries = [], 0.0, 0
+    agent.reset(logging.getLogger("native-predict"))
+    agent._build_messages_owl = lambda *a: ([{"role": "user", "content": "task"}], [])
+    agent._build_base_reward_context = lambda *a: ("reward", [])
+    agent._finalize_reward_messages = lambda *a: []
+    return agent
+
+buffer = io.BytesIO()
+Image.new("RGB", (64, 64)).save(buffer, format="PNG")
+obs = {"screenshot": buffer.getvalue(), "tool_list": [], "cur_app": "test"}
+for status, code, error_type in (
+    (400, "context_length_exceeded", ContextLengthExceededError),
+    (404, "session_discarded", SessionDiscardedError),
+):
+    agent = make_agent()
+    with patch("httpx.post", return_value=httpx.Response(status, json={"error": {"code": code}})) as post:
+        try:
+            agent.predict("task", obs, step_idx=0)
+        except error_type:
+            pass
+        else:
+            raise AssertionError("terminal signal was swallowed by upstream retry")
+        assert post.call_count == 1 and not agent.actions and not agent._prediction_active
+
+agent = make_agent()
+good = '<tool_call>{"name":"app.click","arguments":{"x":1}}</tool_call>'
+replies = [httpx.Response(200, json={"choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                                   "usage": {"prompt_tokens": 3, "completion_tokens": 2}})
+           for content in ("bad parse", good)]
+with patch("httpx.post", side_effect=replies) as post:
+    result = agent.predict("task", obs, step_idx=0)
+    assert post.call_count == 2 and len(agent.turn_records) == 2 and len(agent.actions) == 1
+    assert not result[2].get("parse_failed") and result[1] == ['MCP:app.click:{"x": 1}']
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, repo, str(ROOT)], input=source, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_driver_reports_execution_failure_independently_of_reward(tmp_path):
+    path = tmp_path / "failed.json"
+
+    async def execution_failure(*args):
+        raise OSError("Nex execute failed")
+
+    namespace = adapter_functions(
+        parse_args=lambda: SimpleNamespace(input_json="unused", output_json=str(path)),
+        read_session_input=lambda path: {"task_config": {"id": "task"}},
+        logger=get_logger(__name__),
+    )
+    namespace["run_session"] = execution_failure
+    namespace["main"]()
+    result = json.loads(path.read_text())
+    assert result["reward"] == {"score": 0.0}
+    assert result["metadata"]["execution_status"] == {
+        "status": "failed",
+        "reason_code": "agent_execution_failed",
+        "category": "execution",
+        "reason": "OSError: Nex execute failed",
+    }

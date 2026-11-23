@@ -30,7 +30,7 @@ from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.straggler import straggler_rollout_end
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
-from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
+from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS, has_multimodal_inputs
 from relax.utils.training.flops_counter import FlopsCounter
 from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
@@ -478,6 +478,11 @@ def get_batch(
     if isinstance(batch, PrepackedBatch):
         return batch
 
+    # Agentic rows always publish this nullable TQ column. An all-text
+    # microbatch must still use GPT's normal CP packing, not Bridge's layout.
+    if "multimodal_train_inputs" in batch and not has_multimodal_inputs(batch["multimodal_train_inputs"]):
+        batch["multimodal_train_inputs"] = None
+
     if pack_device is not None:
         for key, dtype in (
             ("tokens", torch.long),
@@ -566,7 +571,7 @@ def get_batch(
         # Routed by `is_vl_model` (set from hf_config) rather than presence of
         # multimodal_train_inputs, so VL models with text-only batches still
         # land here — bridge skips vision embedding when image_grid_thw is None.
-        has_mm_inputs = batch.get("multimodal_train_inputs") is not None
+        has_mm_inputs = has_multimodal_inputs(batch.get("multimodal_train_inputs"))
         needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -839,12 +844,20 @@ def get_batch(
         multimodal_data = {}  # key -> concatenated tensor
         multimodal_num_items = {}  # key -> list of item counts per sequence
         tensor_dict_list = {}
+        cache_infos = []
+        cache_complete = True
         input_key_map = getattr(get_args(), "multimodal_input_key_map", {})
 
         for mm_input_dict in multimodal_train_inputs:
             if mm_input_dict is None:
                 continue
+            if Envs.RELAX_TRAIN_VISION_CACHE:
+                cache_infos.extend(mm_input_dict.get("_relax_vision_cache") or [])
+                if mm_input_dict.get("pixel_values") is not None and not mm_input_dict.get("_relax_vision_cache"):
+                    cache_complete = False
             for key, mm_tensor in mm_input_dict.items():
+                if key == "_relax_vision_cache":
+                    continue
                 mapped_key = input_key_map.get(key, key)
                 if mapped_key != key and mapped_key in mm_input_dict:
                     raise ValueError(f"Multimodal inputs contain both {key!r} and its mapped key {mapped_key!r}.")
@@ -865,6 +878,8 @@ def get_batch(
                     multimodal_data[key] = torch.cat(tensor_list, dim=0)
                 multimodal_num_items[key] = [t.size(0) for t in tensor_list]
 
+        if Envs.RELAX_TRAIN_VISION_CACHE and cache_complete and cache_infos:
+            multimodal_data["_relax_vision_cache"] = cache_infos
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
@@ -1424,7 +1439,7 @@ def get_data_iterator(
         needs_unsplit_input = (
             getattr(args, "is_vl_model", False)
             or getattr(args, "uses_unsplit_forward", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
+            or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
         )
         if args.qkv_format == "thd" and cp_size > 1 and needs_unsplit_input:
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
@@ -1560,7 +1575,7 @@ def log_rollout_data(
             total_lengths,
             args.qkv_format,
             getattr(args, "is_vl_model", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
+            or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
             or getattr(args, "uses_unsplit_forward", False),
         )
 

@@ -10,14 +10,6 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 
-
-try:
-    # Megatron-Bridge >= 0.6.0 moved LoRAMerge out of peft.lora into its own module.
-    from megatron.bridge.peft.lora_merge import LoRAMerge
-except ImportError:  # bridge <= 0.5.x
-    from megatron.bridge.peft.lora import LoRAMerge
-
-
 from relax.utils import device as device_utils
 from relax.utils.device import device_module
 from relax.utils.logging_utils import get_logger
@@ -586,6 +578,12 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         slot = self._adapter_map.get(_base_param_prefix(info.name))
         if slot is None or "in" not in slot or "out" not in slot:
             return param
+
+        try:
+            # Megatron-Bridge >= 0.6.0 moved LoRAMerge into its own module.
+            from megatron.bridge.peft.lora_merge import LoRAMerge
+        except ImportError:  # bridge <= 0.5.x
+            from megatron.bridge.peft.lora import LoRAMerge
 
         linear_in = megatron_local_weights[slot["in"]]
         linear_out = megatron_local_weights[slot["out"]]

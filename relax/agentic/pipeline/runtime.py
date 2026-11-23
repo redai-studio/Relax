@@ -39,6 +39,7 @@ from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.utils.agentic_obs.records import utc_now
+from relax.utils.env import Envs
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -50,6 +51,40 @@ from relax.utils.score_centering import (
     score_centering_enabled,
 )
 from relax.utils.types import Sample
+
+
+# ---- pixel_values storage dtype (2026-09-08) -----------------------------------
+# HF processors emit float32 pixel_values. The source is uint8 (8 bits of real
+# information per channel) and the ViT computes in bf16, so float32 storage is
+# pure overhead: 2x RAM in the rollout buffers and 2x pickle on every transfer.
+# Mirrors the reference repo's cast_pixel_fp16 (train/osworld_vlm_preprocess_shards.py).
+_MM_PIXEL_DTYPE_NAME = Envs.RELAX_MM_PIXEL_DTYPE.strip().lower()
+_MM_PIXEL_DTYPES = {
+    "fp32": None,
+    "float32": None,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "half": torch.float16,
+}
+try:
+    _MM_PIXEL_DTYPE = _MM_PIXEL_DTYPES[_MM_PIXEL_DTYPE_NAME]
+except KeyError as exc:
+    valid_values = ", ".join(sorted(_MM_PIXEL_DTYPES))
+    raise ValueError(
+        f"Invalid RELAX_MM_PIXEL_DTYPE={_MM_PIXEL_DTYPE_NAME!r}; expected one of: {valid_values}"
+    ) from exc
+
+
+def _cast_pixel_values(mm: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if _MM_PIXEL_DTYPE is None or not mm:
+        return mm
+    for key in ("pixel_values", "pixel_values_videos"):
+        v = mm.get(key)
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != _MM_PIXEL_DTYPE:
+            mm[key] = v.to(_MM_PIXEL_DTYPE).contiguous()
+    return mm
 
 
 logger = get_logger(__name__)
@@ -350,6 +385,7 @@ class SGLangMessageCompiler:
 
         if trim_length:
             train_prompt_ids = train_prompt_ids[trim_length:]
+        multimodal_train_inputs = _cast_pixel_values(multimodal_train_inputs)
         return (
             train_prompt_ids,
             multimodal_train_inputs,
@@ -667,6 +703,7 @@ class SGLangBackendAdapter:
             raise
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])
+
         token_logprobs = list(meta_info.get("output_token_logprobs") or ())
         tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
         sampled_logprobs = [float(item[0]) for item in token_logprobs]
@@ -1389,12 +1426,11 @@ class RuntimeDomain:
         }
 
     async def collect_agentic_kv_metrics(self) -> dict[str, float]:
-        if not getattr(self.args, "agentic_program_admission", False) and not getattr(
-            self.args, "agentic_session_lifecycle", False
-        ):
-            return {}
         shard_metrics = await asyncio.gather(
-            *(shard.handle.agentic_kv_metrics.remote(reset=True) for shard in self._shards),
+            *(
+                shard.handle.agentic_kv_metrics.remote(reset=True, rollout_mode=self.rollout_mode)
+                for shard in self._shards
+            ),
             return_exceptions=True,
         )
         metrics: dict[str, float] = {}
@@ -1411,7 +1447,29 @@ class RuntimeDomain:
                 metrics.update(await self._admission_coordinator.metrics.remote(True))
             except Exception:
                 pass
-        return {f"agentic_kv/{key}": value for key, value in metrics.items()}
+        terminal = {status: metrics.pop(f"terminal/{status}", 0.0) for status in ("completed", "failed", "cancelled")}
+        result = {f"agentic_kv/{key}": value for key, value in metrics.items()}
+        result.update({f"agentic/sessions_{status}": value for status, value in terminal.items()})
+        reported_shards = sum(not isinstance(snapshot, BaseException) for snapshot in shard_metrics)
+        complete = reported_shards == len(self._shards)
+        # Eval reconnects its RuntimeDomain each time; the worker's args persist.
+        # A replacement manager may inherit Shards with unknown reset boundaries.
+        alignment = vars(self.args).setdefault("_agentic_session_metrics_alignment", {})
+        interval_aligned = complete and alignment.get(self.rollout_mode, False)
+        # After a missing RPC, the first complete reset only restores a baseline.
+        alignment[self.rollout_mode] = complete
+        result.update(
+            {
+                "agentic/session_metrics_shards_total": float(len(self._shards)),
+                "agentic/session_metrics_shards_reported": float(reported_shards),
+                "agentic/session_metrics_complete": float(complete),
+                "agentic/session_metrics_interval_aligned": float(interval_aligned),
+            }
+        )
+        denominator = terminal["completed"] + terminal["failed"]
+        if interval_aligned and denominator:
+            result["agentic/session_error_rate"] = terminal["failed"] / denominator
+        return result
 
     async def shutdown(self) -> None:
         """Release local ownership and give remote cleanup a bounded grace."""

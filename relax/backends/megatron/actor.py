@@ -82,6 +82,7 @@ from relax.utils.megatron_peft_utils import (
 from relax.utils.memory_utils import clear_memory, manual_gc_eval, manual_gc_training, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.model_source import is_model_source_alias
+from relax.utils.multimodal.vision_feature_cache import clear_train_vision_cache
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
@@ -97,7 +98,7 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.data_fields import build_data_fields, has_multimodal_inputs, needs_multimodal_fields
 from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 from relax.utils.training.intervals import should_save_checkpoint
 from relax.utils.training.routing_replay import RoutingReplay
@@ -567,6 +568,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
             self._active_model_tag: str | None = "actor"
+            # Checkpoint paths alone do not establish identical snapshots.
+            self._ref_actor_weights_synced = False
             # Only the DCS actor snapshot may stay on device; other roles stay on host.
             self._use_dcs_hybrid_weight_sync = self.args.hybrid
             self._weights_backup_on_device = (
@@ -819,6 +822,7 @@ class MegatronTrainRayActor(TrainRayActor):
     def sleep(self) -> None:
         assert self.args.offload_train
         self._flush_resident_sft_parameters()
+        clear_train_vision_cache(self.model, reason="offload")
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -898,11 +902,60 @@ class MegatronTrainRayActor(TrainRayActor):
             # _rebuild_dpo_reference), so skipping avoids a redundant
             # full-weight CPU->GPU copy per step after the ref forward.
             return
+        clear_train_vision_cache(self.model, reason=f"weight_switch:{self._active_model_tag}->{target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
 
     def _is_standard_dpo(self) -> bool:
         return is_dpo_mode(self.args) and not self.args.dpo_reference_free
+
+    def _can_reuse_actor_ref_log_probs(self) -> bool:
+        """Only share deterministic, equally batched forwards of known-
+        identical weights."""
+        args = self.args
+        return (
+            getattr(self, "_ref_actor_weights_synced", False)
+            and self._active_model_tag == "actor"
+            and "ref" in self.weights_backuper.backup_tags
+            and "teacher" not in self.weights_backuper.backup_tags
+            and args.colocate
+            and not args.fully_async
+            and not args.hybrid
+            and not is_offline_mode(args)
+            and not args.keep_old_actor
+            and not args.use_opd
+            and not args.num_experts
+            and not args.fp8
+            and not getattr(args, "fp4", None)
+            and not is_lora_enabled(args)
+            and not args.use_routing_replay
+            and not args.use_rollout_routing_replay
+            and not getattr(args, "use_rollout_indexer_replay", False)
+            and not args.custom_megatron_before_log_prob_hook_path
+            and args.pipeline_model_parallel_size == 1
+            and args.context_parallel_size == 1
+            and not getattr(args, "dynamic_context_parallel", False)
+            and (not args.use_rollout_logprobs or args.get_mismatch_metrics)
+            and (not args.use_dynamic_batch_size or args.log_probs_max_tokens_per_gpu == args.max_tokens_per_gpu)
+        )
+
+    def _update_actor_weight_backups(self, rollout_id: int) -> None:
+        """Record shared provenance only after both backups complete
+        successfully."""
+        self._ref_actor_weights_synced = False
+        if not hasattr(self, "weights_backuper"):
+            return
+        self._backup_actor_weights_after_train()
+        if (
+            self.args.ref_update_interval is not None
+            and (rollout_id + 1) % self.args.ref_update_interval == 0
+            and "ref" in self.weights_backuper.backup_tags
+        ):
+            with timer("ref_model_update"):
+                if is_megatron_main_rank():
+                    logger.info(f"Updating ref model at rollout_id {rollout_id}")
+                self.weights_backuper.backup("ref")
+            self._ref_actor_weights_synced = self._active_model_tag == "actor"
 
     def _assert_dp_reference_digest_equal(self, digest: str) -> None:
         digests = [None] * dist.get_world_size(group=get_gloo_group())
@@ -2182,7 +2235,10 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
             if should_compute_old_log_probs:
-                if "ref" in self.weights_backuper.backup_tags:
+                reuse_ref_log_probs = not inline_old_log_probs and self._can_reuse_actor_ref_log_probs()
+                # Any subsequent hook/optimizer failure must leave reuse disabled.
+                self._ref_actor_weights_synced = False
+                if "ref" in self.weights_backuper.backup_tags and not reuse_ref_log_probs:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     if use_indexer_replay:
@@ -2228,18 +2284,30 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
                     if use_indexer_replay:
                         IndexerReplay.set_stage("replay_forward")
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="",
-                            collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
-                        )
+                    actor_log_prob_output = self.compute_log_prob(
+                        data_iterator,
+                        num_microbatches,
+                        store_prefix="",
+                        collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
                     )
+                    rollout_data.update(actor_log_prob_output)
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
                     if use_indexer_replay:
                         IndexerReplay.reset_forward()
+
+                if reuse_ref_log_probs:
+                    # Match forward_only's ref-prefixed outputs without sharing mutable
+                    # tensors with actor log-probs (including custom advantage consumers).
+                    with timer("ref_log_probs_reuse"):
+                        rollout_data.update(
+                            {
+                                f"ref_{key}": [value.detach().clone() for value in values]
+                                for key, values in actor_log_prob_output.items()
+                            }
+                        )
+                    Timer().add("ref_log_probs", 0.0)
+                    logger.info("Reused actor forward for ref log-probs at rollout_id %s", rollout_id)
 
                 # Restore model tag before train (keep_old_actor may have switched to old_actor).
                 if self._active_model_tag != "actor":
@@ -2263,6 +2331,7 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # Train
+            self._ref_actor_weights_synced = False
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             if use_indexer_replay:
@@ -2295,20 +2364,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if use_indexer_replay:
             IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
-        # update the cpu actor weight to the latest model
-        self._backup_actor_weights_after_train()
-
-        # Update ref model if needed
-        if (
-            self.args.ref_update_interval is not None
-            and (rollout_id + 1) % self.args.ref_update_interval == 0
-            and hasattr(self, "weights_backuper")
-            and "ref" in self.weights_backuper.backup_tags
-        ):
-            with timer("ref_model_update"):
-                if is_megatron_main_rank():
-                    logger.info(f"Updating ref model at rollout_id {rollout_id}")
-                self.weights_backuper.backup("ref")
+        self._update_actor_weight_backups(rollout_id)
 
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
@@ -2383,7 +2439,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
-        if self.args.multimodal_keys is not None:
+        if needs_multimodal_fields(self.args):
             data_fields.append("multimodal_train_inputs")
 
         if self._use_streaming_fwd():
@@ -2427,7 +2483,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 os.environ["ROUTING_REPLAY_STAGE"] = "record"
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
-        if self.args.multimodal_keys is not None:
+        if needs_multimodal_fields(self.args):
             data_fields.append("multimodal_train_inputs")
 
         if self._use_streaming_fwd():
@@ -2691,7 +2747,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.advantage_estimator == "score_centering":
                     data_fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
-                if self.args.multimodal_keys is not None:
+                if needs_multimodal_fields(self.args):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
@@ -2895,7 +2951,7 @@ class MegatronTrainRayActor(TrainRayActor):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
             data_fields.append("ref_log_probs")
-        if self.args.multimodal_keys is not None:
+        if needs_multimodal_fields(self.args):
             data_fields.append("multimodal_train_inputs")
         if self.args.use_opd:
             consume_opd_train_data(data_fields, self.args)
@@ -3420,6 +3476,7 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def recv_weight_fully_async(self, rollout_id) -> None:
         """Receive weights from actor (called by actor_fwd side)."""
+        self._ref_actor_weights_synced = False
         dist.barrier(group=get_gloo_group())
         print_memory("before update_weights")
         run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
@@ -3427,6 +3484,7 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
+        self._ref_actor_weights_synced = False
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         old_ckpt_step = None
         try:
@@ -3952,7 +4010,7 @@ class MegatronTrainRayActor(TrainRayActor):
             total_lengths,
             self.args.qkv_format,
             getattr(self.args, "is_vl_model", False)
-            or "multimodal_train_inputs" in rollout_data
+            or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
             or getattr(self.args, "uses_unsplit_forward", False),
         )
         if padded_total_lengths is None:

@@ -23,6 +23,9 @@ from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client
 
 
+_EVAL_ON_EPOCH_BOUNDARY = Envs.RELAX_EVAL_ON_EPOCH_BOUNDARY
+
+
 app = FastAPI()
 
 
@@ -369,8 +372,13 @@ class Rollout(Base):
 
         step = local_step + 1
 
+        # With rollout_batch_size == len(train set) there is exactly one rollout per
+        # epoch, so the epoch-boundary clause fires on every step and eval_interval
+        # becomes a no-op. Gate it so the interval alone can control eval cadence.
         should_eval = (step % self.config.eval_interval == 0) or (
-            self.num_rollout_per_epoch is not None and step % self.num_rollout_per_epoch == 0
+            _EVAL_ON_EPOCH_BOUNDARY
+            and self.num_rollout_per_epoch is not None
+            and step % self.num_rollout_per_epoch == 0
         )
         self._logger.info(f"Checking whether to evaluate rollout {step}, should_eval: {should_eval}")
         return should_eval

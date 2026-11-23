@@ -22,6 +22,7 @@ from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import Timer, timer
+from relax.utils.training.data_fields import has_multimodal_inputs
 
 
 logger = logging.getLogger(__name__)
@@ -1090,7 +1091,9 @@ def get_data_from_transfer_queue(
 
                 new_rollout_data[k] = decode_group_ids(v)
             elif (
-                "lengths" in k or "reward" in k or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids"}
+                "lengths" in k
+                or "reward" in k
+                or k in {"sample_index_mask_sums", "sample_export_ids", "dataset_ids", "sample_indices"}
             ):
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k in MULTIMODAL_PAYLOAD_FIELDS:
@@ -1248,7 +1251,7 @@ def post_process_rollout_data(args, rollout_data):
         rollout_data["total_lengths"],
         args.qkv_format,
         getattr(args, "is_vl_model", False)
-        or "multimodal_train_inputs" in rollout_data
+        or has_multimodal_inputs(rollout_data.get("multimodal_train_inputs"))
         or getattr(args, "uses_unsplit_forward", False),
     )
 

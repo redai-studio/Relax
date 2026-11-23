@@ -8,14 +8,87 @@ batch state.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import time
 from argparse import Namespace
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Tuple, cast
 
+import torch
+
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
+from relax.utils.env import Envs
+from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
+
+
+# ---- release pixel tensors once a batch crossed the TQ boundary (2026-09-08) ----
+# The pipeline keeps every Sample of the rollout (context.output_groups) for the
+# end-of-rollout metrics / log. Full debug dumps need pixels and bypass release.
+# Each Sample carried its full image window (~1.7 GiB per session in bf16), so the
+# RolloutManager grew by that amount per finished session until the rollout ended.
+# After async_put() succeeded the trainer owns the only copy that matters; replace
+# pixel tensors with 0-row stand-ins that keep dtype and width. image_grid_thw is
+# tiny and stays (metrics derive per-image token counts from it).
+_MM_RELEASE_AFTER_TRANSFER = Envs.RELAX_MM_RELEASE_AFTER_TRANSFER
+# Replacing the tensor is not enough: glibc raises its dynamic mmap threshold after
+# the first large free, so later pixel blocks come from the arena and free() only
+# returns them to the process, never to the OS -- RSS climbed monotonically for the
+# whole 3h rollout even though every batch had been released. gc + malloc_trim(0)
+# hands the arena's free pages back. The log line tells us which of the two it was.
+_TRANSFER_BATCH_GROUPS = Envs.RELAX_TRANSFER_BATCH_GROUPS
+_MM_RELEASE_TRIM = Envs.RELAX_MM_RELEASE_TRIM
+_MM_RELEASE_LOG = Envs.RELAX_MM_RELEASE_LOG
+_MM_LOG = get_logger(__name__)
+try:
+    _MM_LIBC = ctypes.CDLL("libc.so.6")
+except Exception:
+    _MM_LIBC = None
+
+
+def _mm_rss_bytes() -> int:
+    try:
+        with open("/proc/self/statm", "rb") as _f:
+            return int(_f.read().split()[1]) * 4096
+    except Exception:
+        return 0
+
+
+def _release_transferred_pixels(samples: List[Sample]) -> int:
+    if not _MM_RELEASE_AFTER_TRANSFER:
+        return 0
+    freed = 0
+    for sample in samples:
+        mm = getattr(sample, "multimodal_train_inputs", None)
+        if not isinstance(mm, dict):
+            continue
+        for key in ("pixel_values", "pixel_values_videos"):
+            v = mm.get(key)
+            if isinstance(v, torch.Tensor) and v.numel() > 0:
+                freed += v.numel() * v.element_size()
+                mm[key] = v.new_empty((0,) + tuple(v.shape[1:]))
+            del v  # Drop the final tensor reference before collecting/trimming.
+    if freed > 0 and _MM_RELEASE_TRIM:
+        _rss0 = _mm_rss_bytes()
+        gc.collect()
+        if _MM_LIBC is not None:
+            try:
+                _MM_LIBC.malloc_trim(0)
+            except Exception:
+                pass
+        if _MM_RELEASE_LOG:
+            _rss1 = _mm_rss_bytes()
+            _MM_LOG.info(
+                "mm_release samples=%d freed=%.1fGiB rss=%.1f->%.1fGiB returned=%.1fGiB",
+                len(samples),
+                freed / 2**30,
+                _rss0 / 2**30,
+                _rss1 / 2**30,
+                (_rss0 - _rss1) / 2**30,
+            )
+    return freed
 
 
 TransferBatch = Tuple[int, Tuple[GroupExport, ...], bool]
@@ -55,6 +128,9 @@ async def _transfer_batch_to_data_system(
             custom_meta=custom_meta,
             is_last=is_last,
         )
+        del rollout_batch
+        if getattr(args, "save_debug_rollout_data", None) is None and getattr(args, "dump_details", None) is None:
+            _release_transferred_pixels(samples)
     finally:
         for sample in samples:
             mark_sample_agentic_event(sample, "transfer_release_end_at")
@@ -102,10 +178,16 @@ class TransferDomain:
                 "Agentic dynamic global batch size requires partial rollout and over-sampling "
                 "(over_sampling_batch_size > rollout_batch_size), and is incompatible with fully-async mode."
             )
+        # In colocate (non fully_async) mode the batch count defaults to the whole
+        # rollout, so no partition is ever "ready" mid-rollout: every transfer -- and
+        # therefore every pixel release -- is deferred to flush_batches() at the end.
+        # RolloutManager then carries all N sessions' pixel tensors (2.65 GiB/session
+        # measured) until then, which is what caps us at ~256 sessions. Overriding the
+        # count makes the partition flush every K groups so the peak is one batch.
         self._transfer_batch_group_count = (
             args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
             if args.fully_async
-            else args.rollout_batch_size
+            else (_TRANSFER_BATCH_GROUPS or args.rollout_batch_size)
         )
         self._fully_async = args.fully_async
         self._previous_partition: Optional[_Partition] = None

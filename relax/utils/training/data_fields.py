@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from collections.abc import Sequence
+from typing import Any
 
 from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
 from relax.utils.agentic_obs import agentic_obs_enabled
@@ -21,6 +23,22 @@ PREFERENCE_DATA_FIELDS = (
 )
 
 
+def has_multimodal_inputs(rows: Sequence[dict[str, Any] | None] | None) -> bool:
+    """Distinguish actual media rows from a nullable transport column."""
+    return rows is not None and any(row is not None for row in rows)
+
+
+def needs_multimodal_fields(args: Namespace) -> bool:
+    """Whether consumers must fetch multimodal tensors from the rollout.
+
+    All Agentic batches publish a nullable column: rollout processes do not
+    share the training backend's is_vl_model flag and may emit text-only rows.
+    """
+    if getattr(args, "multimodal_keys", None) is not None:
+        return True
+    return bool(getattr(args, "use_agentic_rollout", False))
+
+
 def _base_rollout_fields(args: Namespace) -> list[str]:
     fields = [
         "tokens",
@@ -35,7 +53,7 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
-    if getattr(args, "multimodal_keys", None) is not None:
+    if needs_multimodal_fields(args):
         fields.append("multimodal_train_inputs")
     if agentic_obs_enabled(args):
         # Produced by convert_samples_to_train_data under the same gate.
