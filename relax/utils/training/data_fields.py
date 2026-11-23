@@ -7,6 +7,7 @@ from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.image_refs import sft_multimodal_data_fields
 from relax.utils.env import Envs
+from relax.utils.sampling_mask import SAMPLING_MASK_FIELDS
 from relax.utils.score_centering import SCORE_CENTERING_TRAIN_FIELDS
 
 
@@ -46,8 +47,8 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
 def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
     """Decide which fields to pull from TransferQueue for training.
 
-    ``consumer`` is only meaningful for PPO (``critic``, ``advantages``,
-    ``actor``); other algorithms ignore it and receive the base rollout fields.
+    PPO uses ``consumer`` to select critic, advantages, or actor inputs.
+    Sampling support is requested only by the actor, for every algorithm.
     """
     if is_preference_mode(args):
         return list(PREFERENCE_DATA_FIELDS)
@@ -88,6 +89,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return fields
 
     fields = _base_rollout_fields(args)
+    if consumer == "actor" and getattr(args, "use_rollout_sampling_replay", False):
+        fields.extend(SAMPLING_MASK_FIELDS)
     if getattr(args, "advantage_estimator", None) == "score_centering":
         fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
     if getattr(args, "use_rollout_indexer_replay", False):

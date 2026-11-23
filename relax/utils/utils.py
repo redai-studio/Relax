@@ -110,7 +110,10 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     # Native generative RL emits a lightweight diffusion TQ row (numeric-only)
     # via a declared hook, so the default token converter below is bypassed
     # (design doc 8.3). When unset the standard token path runs unchanged.
+    replay_enabled = getattr(args, "use_rollout_sampling_replay", False)
     custom_convert_path = getattr(args, "custom_convert_samples_to_train_data_path", None)
+    if replay_enabled and custom_convert_path is not None:
+        raise ValueError("sampling replay requires the standard token sample converter")
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
@@ -189,6 +192,16 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": sample_indices,
     }
+
+    if replay_enabled:
+        for sample in samples:
+            mask = sample.rollout_sampling_mask
+            if mask is None:
+                raise ValueError(f"Sample {sample.index}: missing rollout_sampling_mask with sampling replay enabled")
+            if len(mask) != sample.response_length:
+                raise ValueError(f"Sample {sample.index}: sampling mask length must match response_length")
+        train_data["rollout_sampling_mask_ids"] = [sample.rollout_sampling_mask.ids for sample in samples]
+        train_data["rollout_sampling_mask_offsets"] = [sample.rollout_sampling_mask.offsets for sample in samples]
 
     # loss mask
     # TODO: compress the loss mask
@@ -369,8 +382,11 @@ def dict_to_tensordict(
         return torch.tensor(lst, dtype=dtype, device=device)
 
     def _to_tensor_2d(lst):
-        dtype = _scalar_dtype(lst[0][0])
-        tensors = [torch.tensor(seq, dtype=dtype, device=device) for seq in lst]
+        # Empty responses still need the same dtype as nonempty rows.
+        first_row = next((seq for seq in lst if seq), [])
+        dtype = _scalar_dtype(first_row[0]) if first_row else None
+        empty_dtype = torch.tensor(first_row, dtype=dtype).dtype
+        tensors = [torch.tensor(seq, dtype=dtype if seq else empty_dtype, device=device) for seq in lst]
         return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
 
     def _to_nested_tensor_from_tensor_list(lst):
