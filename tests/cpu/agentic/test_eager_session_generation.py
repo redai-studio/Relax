@@ -6,6 +6,7 @@ Only external process, generation HTTP and Ray transport are substituted.
 
 import asyncio
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -165,16 +166,19 @@ async def harness(*, mode="train", **overrides):
         prepare=prepare,
         chat=chat,
     )
-    try:
-        yield h
-    finally:
-        for process in processes.values():
-            process.cleanup.set()
-        generation_gate.set()
-        await runtime.shutdown()
-        while shard._agent_cleanup_tasks:
-            await asyncio.gather(*tuple(shard._agent_cleanup_tasks), return_exceptions=True)
-        await shard._trajectory_recorder.aclose()
+    shard._export_slots = asyncio.Semaphore(1)
+    shard._inflight_exports = set()
+    with ThreadPoolExecutor(max_workers=1) as shard._export_executor:
+        try:
+            yield h
+        finally:
+            for process in processes.values():
+                process.cleanup.set()
+            generation_gate.set()
+            await runtime.shutdown()
+            while tasks := shard._agent_cleanup_tasks | shard._inflight_exports:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await shard._trajectory_recorder.aclose()
 
 
 @pytest.mark.parametrize("mode", ["train", "eval"])

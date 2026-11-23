@@ -43,12 +43,14 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
     cls.body = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_build_session_export_transport"
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_prepare_session_exports", "_build_session_export_transport"}
     ]
     cls.bases, cls.decorator_list = [], []
     hashes = iter(["leaf", "missing" if failure == "validation" else "leaf", "leaf", "leaf"])
     scope = {
         "copy": copy,
+        "time": time,
         "cast": lambda typ, value: value,
         "SessionForest": object,
         "SessionExportTransport": NS,
@@ -80,7 +82,7 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
         payload = {
             "name": name,
             "sample_payload": {
-                "sample_export_id": sample.sample_export_id,
+                "sample_export_id": UNASSIGNED_SAMPLE_EXPORT_ID,
                 "metadata": copy.deepcopy(sample.metadata),
                 "tokens": [1, 2],
                 "rollout_routed_experts": None,
@@ -96,16 +98,22 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
             recorded.append(kwargs)
 
     shard._build_sample, shard._export_payload = build_sample, compact
-    shard._trajectory_recorder = NS(next_sample_export_id=lambda: len(payloads), record=record)
+    shard._trajectory_recorder = NS(next_sample_export_id=iter(range(4)).__next__, record=record)
     session = NS(
         forest=NS(nodes_by_hash={"leaf": None}), group=NS(group_id="g", rollout_mode="train"), observation=NS()
     )
     records = tuple({"name": str(i), "metadata": {"export": i}, "messages": []} for i in range(4))
 
     def export():
-        return shard._build_session_export_transport(
-            session=session, reward=None, metadata={}, output_records=records, finalize_events={}
+        prepared = shard._prepare_session_exports(
+            forest=session.forest,
+            rollout_mode="train",
+            reward=None,
+            metadata={},
+            output_records=records,
+            finalize_events={},
         )
+        return shard._build_session_export_transport(session=session, prepared=prepared)
 
     if failure is not None:
         with pytest.raises(ValueError):
@@ -113,7 +121,7 @@ def test_session_export_compacts_incrementally_before_publishing(observe, failur
         assert not recorded
     else:
         transport = export()
-        assert len(transport.exports) == 4
+        assert [item["sample_payload"]["sample_export_id"] for item in transport.exports] == list(range(4))
         assert session.observation.export_ids == list(range(4))
         assert [row["metadata"]["export"] for row in recorded] == (list(range(4)) if observe else [])
 

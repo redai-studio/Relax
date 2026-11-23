@@ -2194,6 +2194,8 @@ async def test_managed_transport_failure_and_concurrent_finish_do_not_wait_on_ea
 async def test_managed_shard_shutdown_is_idempotent_after_host_exits():
     shard, _group, session, _ir, _host, manager = _managed_shard_session()
     shard._permit_cleanup_tasks = set()
+    shard._inflight_exports = set()
+    shard._export_executor = service_mod.ThreadPoolExecutor(max_workers=1)
     shard._generation_backend = SimpleNamespace(
         abort_request=AsyncMock(),
         close_session=AsyncMock(),
