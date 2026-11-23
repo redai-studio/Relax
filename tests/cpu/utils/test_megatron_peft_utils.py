@@ -220,10 +220,10 @@ class TestWriteHfPeftAdapter:
         if legacy_bridge:
             monkeypatch.delattr(peft_bridge, "convert_adapter_weights_to_peft_state", raising=False)
         write_megatron_peft_adapter(weights, tmp_path, args)
-        loaded = peft.PeftModel.from_pretrained(base, tmp_path).get_base_model()
+        loaded = peft.PeftModel.from_pretrained(base, tmp_path)
+        state = peft.get_peft_model_state_dict(loaded, save_embedding_layers=False)
         for name, weight in weights.items():
-            loaded_name = name.removesuffix(".weight") + ".default.weight"
-            torch.testing.assert_close(loaded.get_parameter(loaded_name), weight, rtol=0, atol=0)
+            torch.testing.assert_close(state[f"base_model.model.{name}"], weight, rtol=0, atol=0)
 
     def test_write_hf_peft_adapter_makes_missing_dirs(self, tmp_path):
         """Nested, non-existent target dirs are created."""

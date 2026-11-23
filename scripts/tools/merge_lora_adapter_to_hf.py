@@ -34,9 +34,9 @@ Why this is a tensor-level merge and not ``peft.merge_and_unload()``:
       architecture, so the merged model cannot be loaded back for training.
     * Grouped MoE experts are stored as 3-D ``nn.Parameter`` tensors
       (``Qwen3_5MoeExperts.gate_up_proj`` / ``.down_proj``), not ``nn.Linear``
-      submodules. PEFT matches *modules* by name, so it cannot see them and would
-      silently ignore every routed-expert LoRA tensor -- the bulk of the trained
-      capacity on an A3B MoE.
+      submodules. Older Relax exports address these parameters directly. Bridge
+      exports can instead pack their adapters under nested PEFT ParamWrapper
+      keys and record the original names in ``target_parameters``.
 
     Merging at the tensor level avoids both: unrelated tensors (vision tower, MTP
     head) pass through byte-for-byte, ``config.json`` and every auxiliary file are
@@ -132,9 +132,15 @@ def _validate_adapter_dir(adapter_dir: Path) -> None:
         raise FileNotFoundError(f"No adapter weights (adapter_model.safetensors/.bin) found in {adapter_dir}.")
 
 
-def _read_adapter_scaling(adapter_dir: Path) -> float:
-    """Return the LoRA scaling factor and log the adapter's config + Relax
-    sidecar."""
+def _adapter_scaling(config: dict, target: str = "") -> float:
+    # Bridge records rank overrides under the original HF parameter names.
+    rank = config.get("rank_pattern", {}).get(target, config["r"])
+    alpha = config.get("alpha_pattern", {}).get(target, config["lora_alpha"])
+    return alpha / (rank**0.5 if config.get("use_rslora") else rank)
+
+
+def _read_adapter_config(adapter_dir: Path) -> dict:
+    """Read the PEFT config and log its default scaling and Relax sidecar."""
     with open(adapter_dir / "adapter_config.json") as f:
         cfg = json.load(f)
 
@@ -143,12 +149,8 @@ def _read_adapter_scaling(adapter_dir: Path) -> float:
     if not rank or alpha is None:
         raise ValueError(f"adapter_config.json in {adapter_dir} is missing 'r' / 'lora_alpha'; cannot merge.")
 
-    if cfg.get("use_rslora"):
-        scaling = alpha / (rank**0.5)
-        rule = "alpha/sqrt(r) [rslora]"
-    else:
-        scaling = alpha / rank
-        rule = "alpha/r"
+    scaling = _adapter_scaling(cfg)
+    rule = "alpha/sqrt(r) [rslora]" if cfg.get("use_rslora") else "alpha/r"
     print(
         f"[merge-lora] adapter config: r={rank} alpha={alpha} dropout={cfg.get('lora_dropout')} "
         f"scaling={scaling:g} ({rule}) targets={cfg.get('target_modules', [])}"
@@ -163,7 +165,7 @@ def _read_adapter_scaling(adapter_dir: Path) -> float:
             f"[merge-lora] relax sidecar: trained mode={mode}, "
             f"target_modules(megatron)={meta.get('lora_target_modules')}"
         )
-    return scaling
+    return cfg
 
 
 def _strip_suffix(key: str, suffixes) -> str:
@@ -176,7 +178,7 @@ def _strip_suffix(key: str, suffixes) -> str:
     return ""
 
 
-def _pair_adapter_keys(adapter_keys) -> dict:
+def _pair_adapter_keys(adapter_keys, target_parameters=()) -> dict:
     """Group ``lora_A`` / ``lora_B`` tensors by the base tensor prefix they
     adapt.
 
@@ -205,6 +207,15 @@ def _pair_adapter_keys(adapter_keys) -> dict:
     incomplete = sorted(p for p, slot in pairs.items() if "A" not in slot or "B" not in slot)
     if incomplete:
         raise ValueError(f"{len(incomplete)} LoRA pair(s) are missing their A or B half, e.g. {incomplete[:5]}.")
+    # PEFT nests one ParamWrapper per target on a parent module, in config order.
+    next_wrapper = {}
+    for target in target_parameters:
+        parent = target.rpartition(".")[0]
+        wrapper = next_wrapper.get(parent, parent)
+        if wrapper not in pairs:
+            raise ValueError(f"Missing PEFT adapter pair {wrapper!r} for target parameter {target!r}.")
+        pairs[wrapper]["parameter"] = target
+        next_wrapper[parent] = f"{wrapper}.base_layer"
     return pairs
 
 
@@ -238,13 +249,14 @@ def _resolve_base_keys(pairs: dict, base_keys: set) -> dict:
     must resolve.
     """
     resolved, unmatched = {}, []
-    for prefix in pairs:
-        if f"{prefix}.weight" in base_keys:
-            resolved[prefix] = f"{prefix}.weight"
-        elif prefix in base_keys:
-            resolved[prefix] = prefix
+    for prefix, pair in pairs.items():
+        name = pair.get("parameter", prefix)
+        if "parameter" not in pair and f"{name}.weight" in base_keys:
+            resolved[prefix] = f"{name}.weight"
+        elif name in base_keys:
+            resolved[prefix] = name
         else:
-            unmatched.append(prefix)
+            unmatched.append(name)
 
     if unmatched:
         raise ValueError(
@@ -254,7 +266,7 @@ def _resolve_base_keys(pairs: dict, base_keys: set) -> dict:
     return resolved
 
 
-def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
+def _merge_shard(shard_tensors, targets, adapter, pairs, config, device):
     """Fold the adapter into ``shard_tensors`` in place.
 
     Returns the merged key list.
@@ -267,8 +279,15 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
         lora_a = adapter.get_tensor(pairs[prefix]["A"]).to(device=device, dtype=torch.float32)
         lora_b = adapter.get_tensor(pairs[prefix]["B"]).to(device=device, dtype=torch.float32)
 
+        if "parameter" in pairs[prefix]:
+            # Bridge stacks transposed expert B matrices by rows in PEFT A, and
+            # transposed expert A matrices by columns in PEFT B.
+            num_experts = base.size(0)
+            lora_a, lora_b = lora_b.T.unflatten(0, (num_experts, -1)), lora_a.unflatten(0, (num_experts, -1)).mT
+
         # `@` covers both cases: 2-D (out,r)@(r,in) for nn.Linear weights, and batched
         # (E,out,r)@(E,r,in) for grouped MoE experts stored as one 3-D parameter.
+        scaling = _adapter_scaling(config, pairs[prefix].get("parameter", prefix))
         delta = scaling * (lora_b @ lora_a)
         if delta.shape != base.shape:
             raise ValueError(
@@ -310,7 +329,7 @@ def main() -> None:
     if not args.dry_run and output_dir.exists() and any(output_dir.iterdir()) and not args.force:
         raise ValueError(f"Output directory {output_dir} already exists and is non-empty. Use --force to overwrite.")
 
-    scaling = _read_adapter_scaling(adapter_dir)
+    config = _read_adapter_config(adapter_dir)
 
     # Heavy deps imported lazily so `--help` / arg validation work without a full ML stack.
     from safetensors import safe_open
@@ -326,7 +345,7 @@ def main() -> None:
         )
 
     with safe_open(str(adapter_file), framework="pt") as adapter:
-        pairs = _pair_adapter_keys(adapter.keys())
+        pairs = _pair_adapter_keys(adapter.keys(), config.get("target_parameters") or ())
         targets_by_key = _resolve_base_keys(pairs, set(weight_map))
         print(f"[merge-lora] adapter: {len(pairs)} LoRA pair(s), all resolved against the base model")
 
@@ -364,7 +383,7 @@ def main() -> None:
             with safe_open(str(src), framework="pt") as f:
                 metadata = f.metadata() or {"format": "pt"}
                 shard_tensors = {key: f.get_tensor(key) for key in f.keys()}
-            merged = _merge_shard(shard_tensors, targets, adapter, pairs, scaling, args.device)
+            merged = _merge_shard(shard_tensors, targets, adapter, pairs, config, args.device)
             save_file(shard_tensors, str(dst), metadata=metadata)
             total_merged += len(merged)
             print(f"[merge-lora] [{i}/{len(shard_names)}] {shard}: merged {len(merged)} tensor(s)")
