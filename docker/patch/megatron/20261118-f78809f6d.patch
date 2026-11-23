@@ -7497,6 +7497,66 @@ index 3d88d5d..6387d59 100644
  # ==================== Checkpoint utilities for mHC ====================
  
  
+diff --git a/megatron/core/models/hybrid/hybrid_model.py b/megatron/core/models/hybrid/hybrid_model.py
+index a2745de..586bdaa 100644
+--- a/megatron/core/models/hybrid/hybrid_model.py
++++ b/megatron/core/models/hybrid/hybrid_model.py
+@@ -39,6 +39,7 @@ from megatron.core.transformer.multi_token_prediction import (
+     mtp_on_this_rank,
+     prepare_mtp_sequence_roll_context,
+     process_mtp_loss,
++    roll_tensor,
+ )
+ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+ from megatron.core.utils import (
+@@ -739,6 +740,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
+         cp_batch: ContextParallelBatch | None = None,
+         output_processor: Optional[Callable[..., Any]] = None,
+         output_processor_context: Optional[Any] = None,
++        mtp_kwargs: Optional[dict] = None,
+     ) -> Any:
+         """Forward function of the Hybrid model. This function passes the input tensors
+         through the embedding layer, and then the decoder and finally into the post
+@@ -1007,15 +1009,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
+         mtp_hidden_states = hidden_states
+         mtp_inputs = None
+         if mtp_forward_ran:
++            # External SFT loss supplies MTP targets independently of the main labels.
++            mtp_options = mtp_kwargs if mtp_kwargs is not None else {}
++            mtp_labels = mtp_options.get("mtp_labels")
+             mtp_inputs = self.mtp.prepare_cp_layout(
+                 input_ids=input_ids,
+                 position_ids=position_ids,
+                 hidden_states=hidden_states,
+                 decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
+                 mhc_multistream=mhc_multistream,
+-                labels=labels,
++                labels=mtp_labels if mtp_labels is not None else labels,
+                 loss_mask=loss_mask,
+-                mtp_input_mask=mtp_input_mask,
++                mtp_input_mask=mtp_options.get("mtp_input_mask", mtp_input_mask),
+                 packed_seq_params=packed_seq_params,
+                 cp_batch=cp_batch,
+                 padding_mask=padding_mask,
+@@ -1028,6 +1033,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
+             # Prefetch only after converting to the MTP layout: cached rows belong
+             # to these token IDs and this packed metadata, not the decoder layout.
+             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, mtp_inputs.packed_seq_params)
++            if mtp_labels is not None and not mtp_options.get("labels_are_shifted", False):
++                # Shift raw labels in the MTP layout. The supervision mask is
++                # already in next-token coordinates, and the halo cache must
++                # capture the shifted labels.
++                [mtp_inputs.labels] = roll_tensor(
++                    [mtp_inputs.labels],
++                    shifts=-1,
++                    dims=-1,
++                    cp_group=mtp_cp_group,
++                    packed_seq_params=mtp_inputs.packed_seq_params,
++                    cp_layout=self.config.attention_cp_layout,
++                )
+             sequence_roll_tokens = (
+                 mtp_inputs.input_ids if mtp_inputs.input_ids is not None else mtp_inputs.labels
+             )
 diff --git a/megatron/core/transformer/hyper_connection_transformer_layer.py b/megatron/core/transformer/hyper_connection_transformer_layer.py
 index 03f7d33..f25cf68 100644
 --- a/megatron/core/transformer/hyper_connection_transformer_layer.py
@@ -7900,7 +7960,7 @@ index bdf9145..785f7ca 100644
                  num_local_experts=self.num_local_experts,
                  router_topk=self.tp_size * self.config.moe_router_topk,
 diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
-index 0be6203..4d8f562 100644
+index 0be6203..510cc09 100644
 --- a/megatron/core/transformer/multi_token_prediction.py
 +++ b/megatron/core/transformer/multi_token_prediction.py
 @@ -1778,7 +1778,10 @@ def _compute_mtp_acceptance_counts(
@@ -8149,6 +8209,15 @@ index 0be6203..4d8f562 100644
  class MultiTokenPredictionLayer(MegatronModule):
      """The implementation for Multi-Token Prediction (MTP) which extends
      the prediction scope to multiple future tokens at each position.
+@@ -2832,7 +2867,7 @@ class MultiTokenPredictionLayer(MegatronModule):
+             hidden_size=self.config.hidden_size,
+             eps=self.config.layernorm_epsilon,
+         )
+-        if self.mhc_enabled:
++        if self.mhc_enabled and not getattr(self.final_layernorm, 'contracts_mhc_streams', False):
+             hc_mult = self.config.mhc_num_residual_streams
+             hc_dim = self.config.hidden_size * hc_mult
+             if self.config.mhc_learned_output_contract:
 @@ -2907,8 +2942,11 @@ class MultiTokenPredictionLayer(MegatronModule):
              fill_values.append(True)
              sequence_fields.append("padding_mask")
@@ -8197,7 +8266,10 @@ index 0be6203..4d8f562 100644
          # checkpointing requires at least one differentiable tensor input, so keep
          # MTP parameter gradients enabled explicitly.
          if not hidden_states.requires_grad:
-@@ -3137,4 +3183,4 @@ class MultiTokenPredictionLayer(MegatronModule):
+@@ -3134,7 +3180,7 @@ class MultiTokenPredictionLayer(MegatronModule):
+         Postprocesses the output of the transformer layers.
+         """
+ 
 -        if self.mhc_enabled:
 +        if self.mhc_enabled and not getattr(self.final_layernorm, 'contracts_mhc_streams', False):
              if self.config.mhc_learned_output_contract:
@@ -9424,7 +9496,7 @@ index 6f16f80..725fec3 100644
              mtp_was_standalone = self.mtp_standalone
              self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
-index 6083044..1893e3f 100644
+index 6083044..958ab70 100644
 --- a/megatron/core/transformer/transformer_layer.py
 +++ b/megatron/core/transformer/transformer_layer.py
 @@ -297,10 +297,14 @@ class TransformerLayerSubmodules:
@@ -9482,9 +9554,9 @@ index 6083044..1893e3f 100644
          recompute_context = (
              residual_stream_recompute_context if residual_connection is not None else None
          )
-+        attention_output, attention_output_bias = attention_output_with_bias
-+        attention_output = self.post_self_attn_layernorm(attention_output)
-+        attention_output_with_bias = (attention_output, attention_output_bias)
++        if not isinstance(self.post_self_attn_layernorm, IdentityOp):
++            attention_output, attention_output_bias = attention_output_with_bias
++            attention_output_with_bias = (self.post_self_attn_layernorm(attention_output), attention_output_bias)
 +
          # TODO: could we move `bias_dropout_add_exec_handler` itself
          # inside the module provided in the `bias_dropout_add_spec` module?
@@ -9533,18 +9605,19 @@ index 6083044..1893e3f 100644
      ) -> Tensor | list[Tensor | None]:
          """
          Perform a forward pass through the feed-forward layer.
-@@ -1575,6 +1628,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
+@@ -1575,6 +1628,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                  pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
              )
  
-+        mlp_output, mlp_output_bias = mlp_output_with_bias
-+        mlp_output = self.post_mlp_layernorm(mlp_output)
-+        mlp_output_with_bias = (mlp_output, mlp_output_bias)
++        # Attention-only hybrid layers return a tensor from their identity MLP.
++        if not isinstance(self.post_mlp_layernorm, IdentityOp):
++            mlp_output, mlp_output_bias = mlp_output_with_bias
++            mlp_output_with_bias = (self.post_mlp_layernorm(mlp_output), mlp_output_bias)
 +
          nvtx_range_pop(suffix="mlp")
          return mlp_output_with_bias
  
-@@ -2818,6 +2875,20 @@ class MoETransformerLayer(TransformerLayer):
+@@ -2818,6 +2876,20 @@ class MoETransformerLayer(TransformerLayer):
          padding_mask=None,
          input_ids=None,
          packed_seq_params=None,

@@ -538,7 +538,7 @@ def get_batch(
             raise ValueError("pre-shifted labels and tokens must have identical per-sample shapes")
         batch["unconcat_pre_shifted_labels"] = pre_shifted_labels
 
-    glm53_packed_cp = qkv_format == "thd" and cp_size > 1 and getattr(get_args(), "glm53_packed_cp", False)
+    global_packed_thd_cp = qkv_format == "thd" and cp_size > 1 and getattr(get_args(), "global_packed_thd_cp", False)
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
@@ -556,7 +556,7 @@ def get_batch(
         tokens = torch.stack(tokens)
         packed_seq_params = None
 
-    elif glm53_packed_cp:
+    elif global_packed_thd_cp:
         # GLM Bridge consumes a single global THD row. Keep one physical
         # layout for the Bridge, rank-local tokens, and the external SFT loss.
         align_size = 2 * cp_size * mpu.get_tensor_model_parallel_world_size()
@@ -814,7 +814,7 @@ def get_batch(
         # Pre-CP, per-sample full-length mask used for the bridge-aligned MTP
         # labels/mask below (built after this loop closes).
         full_per_sample_loss_masks.append(loss_mask)
-        if glm53_packed_cp:
+        if global_packed_thd_cp:
             loss_mask = F.pad(loss_mask, (0, padded_lengths[sample_idx] - total_length), value=0)
         if not allgather_cp:
             loss_mask = slice_with_cp(
@@ -914,7 +914,7 @@ def get_batch(
                     multimodal_data[key] = torch.cat(tensor_list, dim=0)
                 multimodal_num_items[key] = [t.size(0) for t in tensor_list]
 
-        if getattr(get_args(), "glm53_vision_dp", False):
+        if getattr(get_args(), "needs_cpu_image_grid", False):
             grid = multimodal_data.get("image_grid_thw")
             if grid is not None and grid.device.type == "cpu":
                 multimodal_data["image_grid_thw_cpu"] = grid.tolist()
@@ -967,10 +967,10 @@ def get_batch(
         and getattr(get_args(), "loss_type", None) == "sft"
         and getattr(get_args(), "sft_chunked_logits", False)
     ):
-        if glm53_packed_cp:
-            from .selective_logits import prepare_glm53_cp_selective_logits
+        if global_packed_thd_cp:
+            from .selective_logits import prepare_zigzag_cp_selective_logits
 
-            prepare_glm53_cp_selective_logits(batch, cp_size, cp_rank)
+            prepare_zigzag_cp_selective_logits(batch, cp_size, cp_rank)
         elif (
             cp_size == 1
             and qkv_format == "thd"

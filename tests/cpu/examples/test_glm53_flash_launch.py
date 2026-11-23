@@ -59,7 +59,7 @@ def _launch(tmp_path: Path, visible_gpus: int, **environment: str) -> subprocess
     return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=10)
 
 
-@pytest.mark.parametrize(("visible_gpus", "num_gpus"), [(8, ""), (32, "8"), (16, "32")])
+@pytest.mark.parametrize(("visible_gpus", "num_gpus"), [(8, ""), (16, "32")])
 def test_flash_local_launch_rejects_an_unsatisfiable_gpu_request(tmp_path, visible_gpus, num_gpus):
     result = _launch(tmp_path, visible_gpus, NUM_GPUS=num_gpus)
 

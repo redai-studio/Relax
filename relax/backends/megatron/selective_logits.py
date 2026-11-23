@@ -7,7 +7,7 @@ from argparse import Namespace
 import torch
 
 
-def prepare_glm53_cp_selective_logits(batch: dict, cp_size: int, cp_rank: int) -> None:
+def prepare_zigzag_cp_selective_logits(batch: dict, cp_size: int, cp_rank: int) -> None:
     """Build selection indices in the same zigzag order as the loss."""
     from relax.utils.sft_utils import align_loss_mask_for_sft
 

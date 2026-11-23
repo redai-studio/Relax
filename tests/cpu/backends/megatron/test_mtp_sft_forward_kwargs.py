@@ -134,3 +134,83 @@ def test_forward_mask_controls_independent_mtp_gradient(layout, existing_mask, i
     assert forward_kwargs["mtp_kwargs"]["mtp_labels"] is batch["tokens"]
     torch.testing.assert_close(full_mask, torch.tensor([[1.0, 0.0, 1.0, 0.0]]))
     torch.testing.assert_close(local_mask, torch.tensor([[1.0, 0.0]]))
+
+
+@pytest.mark.parametrize("labels_are_shifted", [False, True])
+def test_hybrid_sft_keeps_mtp_supervision_separate_from_main_labels(monkeypatch, labels_are_shifted):
+    from megatron.core.models.hybrid import hybrid_model
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+
+    batch = SimpleNamespace(
+        tokens=torch.tensor([[1, 2, 3, 4]]),
+        shifted_labels=torch.tensor([[8, 7, 6, 0]]),
+        mask=torch.tensor([[True, True, False, False]]),
+        conditioning=torch.tensor([[True, False, True, True]]),
+        hidden=torch.ones(4, 1, 2),
+    )
+    config = SimpleNamespace(
+        fine_grained_activation_offloading=False,
+        moe_paged_stash=False,
+        moe_num_hash_layers=0,
+        sequence_parallel=False,
+        freeze_base_model_for_mtp=False,
+        mtp_num_layers=1,
+        use_mup=False,
+        linear_cp_layout="zigzag",
+        attention_cp_layout="zigzag",
+    )
+
+    class MTPBlock:
+        cp_group = SimpleNamespace(size=lambda: 1)
+        sequence_parallel = False
+        prepare_cp_layout = MultiTokenPredictionBlock.prepare_cp_layout
+
+        def __call__(self, *, input_ids, hidden_states, mtp_input_mask, **kwargs):
+            torch.testing.assert_close(input_ids, batch.tokens)
+            torch.testing.assert_close(mtp_input_mask, batch.conditioning)
+            return hidden_states
+
+    def process_mtp_loss(**kwargs):
+        torch.testing.assert_close(kwargs["labels"], batch.shifted_labels)
+        torch.testing.assert_close(kwargs["loss_mask"], batch.mask)
+        return kwargs["hidden_states"] + 2
+
+    def main_output(**kwargs):
+        assert kwargs["labels"] is None
+        return kwargs["hidden_states"]
+
+    monkeypatch.setattr(hybrid_model, "process_mtp_loss", process_mtp_loss)
+    mtp = MTPBlock()
+    mtp.config = config
+    model = SimpleNamespace(
+        config=config,
+        position_embedding_type="none",
+        hybrid_layer_config_list=None,
+        share_embeddings_and_output_weights=False,
+        mtp_process=True,
+        mtp=mtp,
+        post_process=True,
+        pg_collection=SimpleNamespace(cp=None, dp_cp=None),
+        tp_group=None,
+        decoder=lambda *, hidden_states, **kwargs: hidden_states,
+        embedding=None,
+        output_layer=None,
+        compute_language_model_loss=None,
+        _scale_logits=None,
+        training=True,
+    )
+    output = hybrid_model.HybridModel.forward(
+        model,
+        input_ids=batch.tokens,
+        position_ids=None,
+        attention_mask=None,
+        decoder_input=batch.hidden,
+        loss_mask=batch.mask,
+        output_processor=main_output,
+        mtp_kwargs={
+            "mtp_labels": batch.shifted_labels if labels_are_shifted else torch.tensor([[9, 8, 7, 6]]),
+            "labels_are_shifted": labels_are_shifted,
+            "mtp_input_mask": batch.conditioning,
+        },
+    )
+    torch.testing.assert_close(output, torch.full_like(batch.hidden, 3))

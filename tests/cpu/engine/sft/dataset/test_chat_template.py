@@ -1310,6 +1310,8 @@ class _FakeGLMTokenizer(_FakeDeepSeekTokenizer):
                 {{- '<|assistant|><think>' + message.content -}}
             {%- elif message.role == 'tool' -%}
                 {{- '<|observation|><tool_response>' + message.content + '</tool_response>' -}}
+            {%- elif message.role == 'system' -%}
+                {{- '<|system|>' + message.content -}}
             {%- elif message.role == 'user' -%}
                 {{- '<|user|>' + message.content -}}
             {%- endif -%}
@@ -1335,3 +1337,28 @@ def test_glm_fallback_masks_roles_tools_and_preserves_reasoning(last_turn_only):
     if not last_turn_only:
         expected = "reason</think><tool_call>f</tool_call></think>answer1" + expected
     assert _learned_text(ids, mask) == expected
+
+
+def test_glm_fallback_respects_explicit_system_and_reordered_tool_supervision():
+    class SortingGLMTokenizer(_FakeGLMTokenizer):
+        chat_template = _FakeGLMTokenizer.chat_template.replace(
+            "{%- for message in messages -%}",
+            "{%- for message in messages[:3] + (messages[3:5] | reverse | list) + messages[5:] -%}",
+        )
+
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("system", "SYSTEM_TARGET", True),
+            CanonicalMessage("user", "question", False),
+            CanonicalMessage("assistant", "reason</think><tool_call>x</tool_call>", True),
+            CanonicalMessage("tool", "TOOL_TARGET", True, tool_call_id="y"),
+            CanonicalMessage("tool", "TOOL_CONTEXT", False, tool_call_id="x"),
+            CanonicalMessage("assistant", "</think>answer", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokenizer = SortingGLMTokenizer()
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer)
+
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
+    assert _learned_text(ids, mask) == "SYSTEM_TARGETreason</think><tool_call>x</tool_call>TOOL_TARGET</think>answer"

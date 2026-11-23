@@ -14,7 +14,7 @@ import hashlib
 import os
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -439,6 +439,65 @@ class _GLMDialect:
     def matches(self, template: str | None) -> bool:
         return bool(template) and "<|assistant|>" in template and "<|user|>" in template
 
+    _probe_marker = re.compile(r"\x00relax-glm-mask:(\d+):\d+\x00")
+
+    def locate_nonassistant_spans(
+        self, text: str, messages: list[dict[str, Any]], render: Callable[[list[dict[str, Any]]], str]
+    ) -> dict[int, list[_MsgSpan]]:
+        """Trace system and tool payloads through the native template's
+        rendering order."""
+        tagged_messages = list(messages)
+        expected_markers = set()
+        if self._probe_marker.search(text):
+            raise ValueError("GLM message contains a reserved supervision marker")
+
+        for index, message in enumerate(messages):
+            role = message["role"]
+            if role not in ("system", "tool"):
+                continue
+            content = message["content"]
+            grouped = (
+                role == "tool"
+                and isinstance(content, list)
+                and content
+                and isinstance(content[0], dict)
+                and "output" in content[0]
+            )
+            markers = [f"\x00relax-glm-mask:{index}:{part}\x00" for part in range(len(content) if grouped else 1)]
+            expected_markers.update(markers)
+            tagged_content = (
+                [{**entry, "output": marker} for entry, marker in zip(content, markers, strict=True)]
+                if grouped
+                else markers[0]
+            )
+            tagged_messages[index] = {**message, "content": tagged_content}
+
+        probe = render(tagged_messages)
+        matches = list(self._probe_marker.finditer(probe))
+        if len(matches) != len(expected_markers) or {match[0] for match in matches} != expected_markers:
+            raise ValueError("GLM chat template did not render each system or tool payload exactly once")
+        delimiters = (*self._headers, "<tool_response>", "</tool_response>")
+        if any(text.count(tag) != probe.count(tag) for tag in delimiters):
+            raise ValueError("Ambiguous GLM message delimiters in system or tool payloads")
+
+        prefix = probe[: matches[0].start()]
+        if not text.startswith(prefix):
+            raise ValueError("Cannot align GLM system and tool payloads with rendered messages")
+        spans: dict[int, list[_MsgSpan]] = {}
+        start = len(prefix)
+        for position, match in enumerate(matches):
+            index = int(match[1])
+            last = position + 1 == len(matches)
+            boundary = probe[match.end() : len(probe) if last else matches[position + 1].start()]
+            end = len(text) - len(boundary) if last else text.find(boundary, start)
+            if end < start or not text.startswith(boundary, end):
+                raise ValueError("Cannot align GLM system and tool payloads with rendered messages")
+            closing_tag = "</tool_response>"
+            next_cursor = end + (len(closing_tag) if boundary.startswith(closing_tag) else 0)
+            spans.setdefault(index, []).append(_MsgSpan(start, end, next_cursor))
+            start = end + len(boundary)
+        return spans
+
     def locate(self, text: str, cursor: int, msg: CanonicalMessage) -> _MsgSpan:
         if msg.role == "tool":
             opener, closer = "<tool_response>", "</tool_response>"
@@ -726,8 +785,25 @@ def _render_per_message_fallback(
 
     last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
     char_mask = bytearray(len(rendered_text))  # zeros
+    glm_spans = {}
+    if isinstance(deepseek_dialect, _GLMDialect) and any(
+        msg.learn and msg.role in ("system", "tool") for msg in sample.messages
+    ):
+        glm_spans = deepseek_dialect.locate_nonassistant_spans(
+            rendered_text,
+            msgs,
+            lambda messages: tokenizer.apply_chat_template(
+                messages, tools=sample.tools, tokenize=False, **extra_kwargs
+            ),
+        )
     cursor = 0
     for msg_idx, msg in enumerate(sample.messages):
+        if msg_idx in glm_spans:
+            for span in glm_spans[msg_idx]:
+                if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
+                    char_mask[span.learn_start : span.span_end] = b"\x01" * (span.span_end - span.learn_start)
+                cursor = max(cursor, span.next_cursor)
+            continue
         if deepseek_dialect.name in ("deepseek_v4", "glm"):
             span = deepseek_dialect.locate(rendered_text, cursor, msg)
             if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):

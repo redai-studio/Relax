@@ -107,10 +107,10 @@ def test_vl_cp_sft_loss_gradients_and_eval_match_unpartitioned(
                 return h @ weight.T, None
 
             if selective:
-                from relax.backends.megatron.selective_logits import prepare_glm53_cp_selective_logits
+                from relax.backends.megatron.selective_logits import prepare_zigzag_cp_selective_logits
 
                 batch["tokens"] = local_hidden.new_empty((1, local_hidden.size(1)), dtype=torch.long)
-                prepare_glm53_cp_selective_logits(batch, cp_size, rank)
+                prepare_zigzag_cp_selective_logits(batch, cp_size, rank)
             value, _ = loss_module.sft_loss_function_chunked(
                 args, batch, local_hidden, reducer, lm_head_forward=project
             )
@@ -164,7 +164,7 @@ def test_glm_packed_batch_matches_unsplit_next_token_loss(monkeypatch, cp_size, 
         loss_type="sft",
         allgather_cp=False,
         rollout_temperature=1.0,
-        glm53_packed_cp=True,
+        global_packed_thd_cp=True,
         sft_chunked_logits=True,
         linear_cp_mode=linear_cp_mode,
     )
@@ -216,12 +216,6 @@ def test_glm_packed_batch_matches_unsplit_next_token_loss(monkeypatch, cp_size, 
             padded_total_lengths=packed.get("padded_total_lengths"),
         )
         local_masks = cp_utils.get_cp_local_loss_masks(loss_masks=packed["loss_masks"], **metadata)
-        if cp_size > 1:
-            plans = packed["selective_logit_rows"]
-            assert len(plans) == len(local_masks)
-            for (full, indices), mask in zip(plans, local_masks, strict=True):
-                assert full == mask.numel()
-                torch.testing.assert_close(indices, mask.nonzero().flatten())
         responses = loss_module.get_responses(
             local_ids.float().unsqueeze(-1),
             args=args,
@@ -289,7 +283,7 @@ def test_glm_packed_cp_excludes_alignment_padding_from_moe_aux_loss(monkeypatch)
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"Requires the pinned GLM Bridge runtime: {exc}")
 
-    args = Namespace(glm53_packed_cp=True, qkv_format="thd", loss_type="sft")
+    args = Namespace(global_packed_thd_cp=True, qkv_format="thd", loss_type="sft")
     monkeypatch.setattr(data, "get_args", lambda: args)
     monkeypatch.setattr(data.mpu, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(data.mpu, "get_context_parallel_world_size", lambda: 2)

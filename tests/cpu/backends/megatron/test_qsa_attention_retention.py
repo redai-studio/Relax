@@ -263,32 +263,75 @@ def test_hybrid_mtp_forward_preserves_checkpoint_policy_and_metadata(retention, 
     assert calls == expected_calls
 
 
-@pytest.mark.parametrize("gated_mixer", [True, False])
-def test_mtp_postprocess_contracts_residual_streams_once(gated_mixer):
-    from megatron.core.transformer.hyper_connection import GatedResidualOutputMixer
-    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+@pytest.mark.parametrize("gated_mixer, learned", [(True, True), (False, True), (False, False)])
+def test_mtp_postprocess_contracts_residual_streams_once(gated_mixer, learned):
+    from megatron.core.transformer.hyper_connection import GatedResidualOutputMixer, learned_output_contract
+    from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.multi_token_prediction import (
+        MultiTokenPredictionLayer,
+        MultiTokenPredictionLayerSubmodules,
+    )
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
-    config = SimpleNamespace(
+    config = TransformerConfig(
+        num_layers=1,
         hidden_size=4,
-        num_residual_streams=2,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
+        perform_initialization=False,
+        mtp_num_layers=1,
+        enable_mhc_connections=True,
         mhc_num_residual_streams=2,
         mhc_gated_residual_rank=2,
-        mhc_learned_output_contract=False,
-        params_dtype=torch.float32,
-        layernorm_epsilon=1e-5,
-        perform_initialization=False,
-        sequence_parallel=False,
+        mhc_learned_output_contract=learned,
     )
-    norm = GatedResidualOutputMixer(config) if gated_mixer else torch.nn.Identity()
-    layer = SimpleNamespace(config=config, mhc_enabled=True, final_layernorm=norm)
+    submodules = MultiTokenPredictionLayerSubmodules(
+        enorm=IdentityOp,
+        hnorm=IdentityOp,
+        e_proj=IdentityOp,
+        h_proj=IdentityOp,
+        mtp_model_layer=IdentityOp,
+        layer_norm=GatedResidualOutputMixer if gated_mixer else IdentityOp,
+    )
+    groups = SimpleNamespace(cp=None, tp=None, pp=SimpleNamespace(rank=lambda: 0))
+    layer = MultiTokenPredictionLayer(config, submodules, pg_collection=groups)
+    head_parameters = {name for name in layer.state_dict() if name.startswith("hc_head_")}
+    assert head_parameters == (
+        {"hc_head_fn", "hc_head_base", "hc_head_scale"} if learned and not gated_mixer else set()
+    )
+
     hidden = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8).requires_grad_()
+    output = layer._postprocess(hidden)
+    if gated_mixer:
+        expected = layer.final_layernorm(hidden)
+    elif learned:
+        expected = learned_output_contract(
+            hidden, layer.hc_head_fn, layer.hc_head_base, layer.hc_head_scale, 2, config.layernorm_epsilon
+        )
+    else:
+        expected = hidden.unflatten(-1, (2, 4)).mean(dim=-2)
 
-    output = MultiTokenPredictionLayer._postprocess(layer, hidden)
-    expected = norm(hidden) if gated_mixer else hidden.unflatten(-1, (2, 4)).mean(dim=-2)
-
-    assert output.shape == (2, 1, config.hidden_size)
     torch.testing.assert_close(output, expected)
     torch.testing.assert_close(torch.autograd.grad(output.sum(), hidden), torch.autograd.grad(expected.sum(), hidden))
+
+
+def test_attention_only_transformer_layer_keeps_the_identity_mlp_output():
+    from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    layer = TransformerLayer.__new__(TransformerLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = SimpleNamespace(
+        mlp_chunks_for_prefill=1, mlp_chunks_for_training=1, inference_fuse_tp_communication=False
+    )
+    layer.mlp = layer.post_mlp_layernorm = IdentityOp()
+    layer.recompute_mlp = layer.is_moe_layer = False
+    hidden = torch.ones(3, 1, 4, requires_grad=True)
+
+    output = layer._run_mlp(hidden, hidden, None, None)
+
+    assert output is hidden
+    torch.testing.assert_close(torch.autograd.grad(output.sum(), hidden)[0], torch.ones_like(hidden))
 
 
 def test_checkpoint_closures_keep_each_microbatch_metadata(retention, monkeypatch):
