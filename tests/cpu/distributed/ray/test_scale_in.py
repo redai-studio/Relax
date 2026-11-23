@@ -714,18 +714,39 @@ class TestRemoveEngine:
         assert g.all_engines[0] is None
 
     @pytest.mark.asyncio
-    async def test_fallback_to_ray_kill_on_shutdown_failure(self):
-        e1 = make_mock_engine()
-        e1.shutdown.remote.return_value = AwaitableValue(None)
-        # Make shutdown raise a timeout
-        e1.shutdown.remote.side_effect = Exception("timeout")
-        g = make_engine_group(engines=[e1], is_scaled_out=True)
+    async def test_shutdown_retry_keeps_multi_node_actor_and_placement_group(self):
+        first, second = make_mock_engine(), make_mock_engine()
+        args = type("A", (), {"num_gpus_per_node": 1})()
+        group = make_engine_group(args=args, engines=[first, second], num_gpus_per_engine=2, is_scaled_out=True)
+        group.pg = (MagicMock(), [], [])
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+        second.shutdown.remote.side_effect = [TimeoutError("child still exiting"), AwaitableValue(None)]
 
-        with patch("ray.kill") as mock_kill, patch("ray.get", side_effect=mock_ray_get):
-            manager = create_test_manager()
-            await manager._remove_engine(g, 0, shutdown_timeout=1)
-            mock_kill.assert_called_once_with(e1)
-        assert g.all_engines[0] is None
+        async def remove(request_id):
+            request = ScaleInRequest(
+                request_id=request_id, status=ScaleInStatus.PENDING, engine_urls=["http://node-0:8000"], force=True
+            )
+            await manager._scale_in(request)
+            return request
+
+        first.get_url.remote.side_effect = lambda: AwaitableValue("http://node-0:8000")
+        with patch("ray.kill") as kill, patch("ray.util.remove_placement_group") as remove_pg:
+            attempt = await remove("first")
+            assert attempt.status == ScaleInStatus.FAILED
+            assert attempt.failed_engines == ["group_0_engine_0"] and not attempt.removed_engines
+            assert group.all_engines == [first, second]
+            assert server.engine_groups == [group]
+            assert group.lifecycle_status == EngineGroupLifecycle.DRAINING
+            remove_pg.assert_not_called()
+            retry = await remove("retry")
+            assert retry.status == ScaleInStatus.COMPLETED
+            assert retry.removed_engines == ["group_0_engine_0"] and not retry.failed_engines
+            assert group.all_engines == [None, None]
+            assert not server.engine_groups
+            first.unregister_from_router.remote.assert_called_once()
+            remove_pg.assert_called_once_with(group.pg[0])
+            kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dcs_failure_still_shuts_down_engine(self):

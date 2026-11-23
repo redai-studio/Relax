@@ -95,6 +95,7 @@ for _name in ["torch", "numpy"]:
 for _name in [
     "relax.distributed.ray",
     "relax.distributed.ray.placement_group",
+    "relax.distributed.ray.utils",
     "relax.engine.sft.runtime",
     "relax.utils.async_utils",
     "relax.utils.data.processing_utils",

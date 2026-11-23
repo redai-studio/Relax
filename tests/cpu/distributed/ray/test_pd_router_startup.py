@@ -544,3 +544,37 @@ def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_mod
     assert events[:5] == [("eviction", 0.0)] + [(f"health-{i}", 0.0) for i in range(4)]
     assert rollout_module.time.now == 5.0
     assert events[-2:] == [("engines", None), ("routers", None)]
+
+
+def test_failed_replacement_retries_original_actor_before_recovery(monkeypatch, rollout_module):
+    from conftest import make_rollout_server
+
+    engine = make_mock_engine()
+    group = make_engine_group(engines=[engine])
+    server = make_rollout_server(engine_groups=[group])
+    pg = object()
+    wait_budgets = []
+
+    def get(ref, timeout):
+        wait_budgets.append(timeout)
+        if len(wait_budgets) < 3:
+            raise TimeoutError("child still exiting")
+
+    kill = Mock()
+    remove_pg = Mock()
+    monkeypatch.setattr(rollout_module.ray, "get", get)
+    monkeypatch.setattr(rollout_module.ray, "kill", kill)
+    monkeypatch.setattr(rollout_module.ray.util, "remove_placement_group", remove_pg)
+    group.shutdown_engines({0})
+    assert group.all_engines == [engine]
+    server.pending_rollbacks[pg] = group
+    server.retry_scale_out_cleanup()
+    assert group.pending_shutdown == {0}
+    remove_pg.assert_not_called()
+    kill.assert_not_called()
+    server.retry_scale_out_cleanup()
+    assert wait_budgets[:3] == [rollout_module.ENGINE_SHUTDOWN_TIMEOUT_S] * 3
+    assert group.all_engines == [None]
+    assert not group.pending_shutdown and not server.pending_rollbacks
+    kill.assert_called_once_with(engine)
+    remove_pg.assert_called_once_with(pg)

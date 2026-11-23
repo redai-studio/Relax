@@ -22,6 +22,7 @@ import ray
 import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.distributed.ray.rollout_scale_types import ENGINE_SHUTDOWN_TIMEOUT_S
 from relax.utils.logging_utils import get_logger
 
 
@@ -53,7 +54,6 @@ _ENGINE_DEAD_EXCEPTIONS = (
 # so a dead *node* -- whose placement-group bundle can never be filled -- degrades
 # to "run with N-1 engines" instead of hanging the training step forever.
 _ENGINE_REBUILD_TIMEOUT_S = 900.0
-_ENGINE_SHUTDOWN_TIMEOUT_S = 60.0
 
 
 def _is_engine_dead(exc: BaseException) -> bool:
@@ -343,7 +343,7 @@ class MultiEngineManager:
                 try:
                     # shutdown stops the SGLang child processes. Keep a live actor
                     # reachable if shutdown times out so the next release can retry.
-                    ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
+                    ray.get(engine.shutdown.remote(), timeout=ENGINE_SHUTDOWN_TIMEOUT_S)
                     ray.kill(engine)
                 except ray.exceptions.ActorDiedError:
                     pass
