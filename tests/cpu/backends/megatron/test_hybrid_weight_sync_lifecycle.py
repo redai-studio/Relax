@@ -258,3 +258,51 @@ def test_consecutive_hybrid_steps_sync_after_offload_and_checkpoint(
         assert cleanup.call_count == 2
         assert all(call.args == ("http://rollout/end_update_weight",) for call in cleanup.call_args_list)
         assert all(call.kwargs == {"timeout": 17} for call in cleanup.call_args_list)
+
+
+@pytest.mark.parametrize(
+    ("delivery", "mm_replay", "routing_replay", "required_field"),
+    [
+        ("reference", True, False, "rollout_replay_refs"),
+        ("full", False, True, "rollout_routed_experts"),
+        ("full", False, False, None),
+    ],
+)
+def test_hybrid_fetch_requests_enabled_replay_payload(
+    hybrid_actor, monkeypatch, delivery, mm_replay, routing_replay, required_field
+):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayManager
+
+    actor, _ = hybrid_actor
+    vars(actor.args).update(
+        offload_train=False,
+        use_rollout_routing_replay=routing_replay,
+        use_rollout_mm_embedding_replay=mm_replay,
+        multimodal_keys={"image": "images"},
+        use_opd=False,
+    )
+    monkeypatch.setattr(actor_module, "replay_data_manager", ReplayManager(config=ReplayConfig(delivery=delivery)))
+    monkeypatch.setattr(actor_module.mpu, "get_data_parallel_world_size", lambda **_kw: 2)
+    monkeypatch.setattr(
+        actor_module,
+        "build_rollout_minibatch_plan",
+        lambda *_a: SimpleNamespace(mini_local_sample_request=2, num_rollout_minis=1),
+    )
+    actor.all_consumed = lambda *_a, **_kw: False
+
+    class FetchObserved(Exception):
+        pass
+
+    def fetch(task, step, fields, batch_size, batch_index):
+        assert "multimodal_train_inputs" in fields
+        if required_field is not None:
+            assert required_field in fields
+        else:
+            assert "rollout_replay_refs" not in fields
+            assert "rollout_routed_experts" not in fields
+        raise FetchObserved
+
+    actor._get_data_from_transfer_queue = fetch
+    with pytest.raises(FetchObserved):
+        actor.train_hybrid(0)

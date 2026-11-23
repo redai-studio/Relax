@@ -44,6 +44,12 @@ def response(prompt, completion, routes, *, index=None, finish="length"):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def end_headers(self):
+        if getattr(self.server, "close_connections", False):
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        super().end_headers()
+
     def log_message(self, *_):
         pass
 
@@ -116,7 +122,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def router(tmp_path):
+def router(tmp_path, request):
+    regular = getattr(request, "param", None) == "regular"
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text(
@@ -136,9 +143,10 @@ def router(tmp_path):
     )
     workers = []
     threads = []
-    for role in ("prefill", "decode"):
+    for role in ("null", "null") if regular else ("prefill", "decode"):
         worker = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         worker.daemon_threads = True
+        worker.close_connections = regular
         worker.role, worker.model_path, worker.received = role, str(tokenizer), []
         worker.response_status, worker.response_gate, worker.disconnect = 200, None, False
         worker.stale_after_s, worker.wire_attempts, worker.stale_resets = None, [], []
@@ -155,6 +163,17 @@ def router(tmp_path):
     log_path = tmp_path / "router.log"
     for worker in workers:
         worker.router_log_path = log_path
+    worker_args = [
+        "--pd-disaggregation",
+        "--prefill",
+        workers[0].url,
+        "--decode",
+        workers[1].url,
+        "--disable-circuit-breaker",
+        "--disable-retries",
+    ]
+    if regular:
+        worker_args = ["--worker-urls", workers[0].url, workers[1].url, "--cb-failure-threshold", "1"]
     command = [
         sys.executable,
         "-m",
@@ -163,11 +182,7 @@ def router(tmp_path):
         "127.0.0.1",
         "--port",
         str(port),
-        "--pd-disaggregation",
-        "--prefill",
-        workers[0].url,
-        "--decode",
-        workers[1].url,
+        *worker_args,
         "--policy",
         "round_robin",
         "--worker-startup-timeout-secs",
@@ -177,8 +192,6 @@ def router(tmp_path):
         "--request-timeout-secs",
         "10",
         "--disable-health-check",
-        "--disable-circuit-breaker",
-        "--disable-retries",
     ]
     with log_path.open("wb") as log:
         process = subprocess.Popen(
@@ -232,6 +245,33 @@ def generate(router, *, start=0, stream=False, batch=False, rid=None):
         Request(url + "/generate", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}),
         timeout=12,
     )
+
+
+@pytest.mark.parametrize("router", ["regular"], indirect=True)
+@pytest.mark.parametrize("failure", ["connection-refused", "response-lost"])
+def test_regular_router_only_retries_before_dispatch(router, failure):
+    _, workers = router
+    with generate(router, rid="warmup") as response:
+        assert response.status == 200
+    # Round robin selects the other worker next. All its earlier HTTP
+    # connections are closed so shutting the listener gives a TCP refusal.
+    target, healthy = sorted(workers, key=lambda worker: len(worker.received))
+    assert len(target.received) == 0 and len(healthy.received) == 1
+    if failure == "connection-refused":
+        target.shutdown()
+        target.server_close()
+        with generate(router, rid="request") as response:
+            assert response.status == 200
+        assert [item["rid"] for item in healthy.received] == ["warmup", "request"]
+        assert f"Failed to send typed request worker_url={target.url}" in target.router_log_path.read_text()
+    else:
+        target.disconnect = True
+        with pytest.raises(HTTPError) as error:
+            generate(router, rid="request")
+        assert error.value.code in (500, 502, 503)
+        assert b"no_available_workers" not in error.value.read()
+        assert [item["rid"] for item in target.received] == ["request"]
+        assert [item["rid"] for item in healthy.received] == ["warmup"]
 
 
 def test_pd_retires_idle_connections_before_backend_close(router):
