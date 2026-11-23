@@ -53,29 +53,29 @@
 
 使用 `--train-backend fsdp_turbo --turbo-config <配置文件> --colocate` 选择该后端。当前支持离线 SFT 和同步 colocate 文本 GRPO；不支持 fully-async、hybrid、critic/reference 模型及独立 log-prob 服务入口，`--kl-coef` 必须为 `0`。
 
-Turbo 仅接受 `sft` 和 `policy_loss`。GRPO 要求 SGLang DP=1、attention-DP=1、PP=1，包括 engine group 的覆盖配置。每个 rollout 的全局样本数不能超过 `--global-batch-size`；不支持多模态 GRPO，包括自定义生成 hook 添加的多模态输入。
+Turbo 仅接受 `sft` 和 `policy_loss`。GRPO 要求 SGLang DP=1、attention-DP=1、PP=1，包括 engine group 的覆盖配置。每个 rollout 的全局样本数不能超过 `--global-batch-size`。
 
-SFT 使用可训练视觉塔时，各 rank 每个对齐后的 microbatch 必须进入相同的图像/视频分支。不支持的混合 rank 批次会在模型 forward 前报错；冻结视觉塔保留原有行为。
+SFT 使用可训练视觉塔时，各 rank 每个 microbatch 必须进入相同的图像/视频分支。
 
-优化器和学习率调度以 Turbo YAML 的 `optimizer` 字段为准，包括 `lr`、`min_lr`、`warmup_ratio` / `warmup_steps`、betas 和 weight decay。`--lr`、`--lr-decay-style` 等 Megatron 参数不会覆盖这些值；`--turbo-config` 使用内联 JSON 时遵循相同规则。`warmup_steps` 显式设置时优先于 `warmup_ratio`，包括 `warmup_steps: 0`。全局 batch size、数据路径等 Relax 参数仍通过 CLI 设置。
+优化器和学习率以 Turbo YAML/JSON 的 `optimizer` 为准，Megatron CLI 优化器参数不会覆盖它。显式 `warmup_steps`（包括 `0`）优先于 `warmup_ratio`。batch size 和数据路径仍通过 CLI 设置。
 
 Ulysses CP 目前仅支持 SFT。Qwen4 Exp SFT 可以组合 CP 与 `memory.chunk_loss: true`，通过 `memory.chunk_loss_size` 指定分块行数；要求 TP=1、MTP 关闭，且保持 `memory.chunk_batch: false`。`chunk_batch` 与 `chunk_loss` 是不同配置，不能用前者替代后者。
 
 全层 128-NPU SFT 脚本为 `scripts/training/sft/run-qwen3.8-flash-next-tmp-fsdp-turbo-128xnpu.sh`，使用 `configs/turbo_config/qwen3_8_flash_next.yaml`。通过 `HF_CHECKPOINT` 指定模型目录、`DATA_DIR` 指定训练 parquet 所在目录；`LOAD_PATH` 用于续训，`SAVE_INTERVAL` 可覆盖默认的 5000 步保存间隔。始终开启 per-token loss。
 
-直接多机启动时，在八个节点分别设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。配方固定 `WORLD_SIZE=8`、`NUM_NPUS=16`。
+八机配方需在各节点设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。
 
-通过 Makefile 构建 Turbo 时，应指定与默认 NPU 镜像不同的输出标签。标签已存在时，`make docker-ascend` 会跳过构建：
+Turbo 使用独立的镜像标签：
 
 ```bash
-make docker-ascend REGISTRY=<registry> \
-  ASCEND_DOCKERFILE=docker/Dockerfile.npu_turbo_cann92 \
-  ASCEND_DEV_IMAGE=<registry>/relax:ascend-turbo-cann92-<tag>
+docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
 ```
 
-FSDPTurbo 的 DCP 和 legacy 检查点均需包含 `lr_scheduler.pt` 才能通过 `--load` 恢复 scheduler 进度。缺少该文件的旧检查点会明确报错，不会根据 rollout 编号猜测 optimizer 更新次数。若只复用权重，应先导出为当前模型可加载的 HF 目录，再通过 `--hf-checkpoint` 开始新训练；不要将 DCP 分片目录直接作为 HF 目录使用。
+若通过 Makefile 选择此 Dockerfile，也需在命令行指定独立的 `ASCEND_DEV_IMAGE`，避免复用默认 NPU 镜像标签。
 
-checkpoint 先写入独立临时目录，完成后再重命名为正式步目录。失败的临时目录不影响同一步重试；已存在的正式步目录仍禁止覆盖。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，整表和 VP sidecar 导出不能用于这种初始化；恢复其训练 checkpoint 应使用 `--load`。
+通过 `--load` 恢复 DCP 或 legacy checkpoint 均需 `lr_scheduler.pt`，缺少该文件的旧 checkpoint 会报错。新训练使用兼容的 HF 模型目录作为 `--hf-checkpoint`，不能直接使用 DCP 目录。
+
+checkpoint 写入失败可重试，已完成的步目录禁止覆盖。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，不支持整表和 VP sidecar 导出。
 
 ---
 

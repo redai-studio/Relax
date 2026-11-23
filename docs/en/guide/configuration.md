@@ -53,29 +53,29 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 
 Select this backend with `--train-backend fsdp_turbo --turbo-config <config> --colocate`. It currently supports offline SFT and synchronous colocated text GRPO. Fully async and hybrid training, critic/reference models, and standalone log-probability services are unsupported; `--kl-coef` must be `0`.
 
-Turbo accepts only `sft` and `policy_loss`. GRPO requires SGLang DP=1, attention-DP=1 and PP=1, including engine-group overrides. The global sample count per rollout must not exceed `--global-batch-size`; multimodal GRPO is unsupported, including payloads added by custom generation hooks.
+Turbo accepts only `sft` and `policy_loss`. GRPO requires SGLang DP=1, attention-DP=1 and PP=1, including engine-group overrides. Samples per rollout must not exceed `--global-batch-size`.
 
-For SFT with a trainable visual tower, every rank must enter the same image/video branches in each aligned microbatch. Unsupported mixed-rank batches fail before model forward; frozen visual towers retain the existing behavior.
+Trainable visual towers require matching image/video branches across ranks in each SFT microbatch.
 
-The Turbo YAML `optimizer` section controls the optimizer and learning-rate schedule, including `lr`, `min_lr`, `warmup_ratio` / `warmup_steps`, betas, and weight decay. Megatron arguments such as `--lr` and `--lr-decay-style` do not override these values. Inline JSON passed through `--turbo-config` follows the same rules. An explicit `warmup_steps` takes priority over `warmup_ratio`, including `warmup_steps: 0`. Relax arguments such as global batch size and data paths remain CLI settings.
+The Turbo YAML/JSON `optimizer` section controls optimizer and LR settings; Megatron CLI optimizer flags do not override it. Explicit `warmup_steps`, including `0`, overrides `warmup_ratio`. Batch size and data paths remain CLI settings.
 
 Ulysses CP is currently SFT-only. Qwen4 Exp SFT supports CP with `memory.chunk_loss: true`; `memory.chunk_loss_size` sets the chunk row count. This requires TP=1, MTP disabled, and `memory.chunk_batch: false`. `chunk_batch` and `chunk_loss` are separate settings and are not interchangeable.
 
 The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-next-tmp-fsdp-turbo-128xnpu.sh`, using `configs/turbo_config/qwen3_8_flash_next.yaml`. Set `HF_CHECKPOINT` to the model directory and `DATA_DIR` to the directory containing training parquet files. Use `LOAD_PATH` to resume and `SAVE_INTERVAL` to override the default checkpoint interval of 5000. Per-token loss is always enabled.
 
-For direct multinode launch, set `MASTER_ADDR` to the head node name, `POD_NAME` to each node name, and `HOST_IP` to its communication IP on all eight nodes. The recipe fixes `WORLD_SIZE=8` and `NUM_NPUS=16`.
+For the eight-node recipe, set `MASTER_ADDR` to the head node name, `POD_NAME` to the local node name, and `HOST_IP` to the local communication IP on each node.
 
-When building Turbo through Makefile, specify a distinct output tag from the default NPU image. An existing tag causes `make docker-ascend` to skip the build:
+Use a distinct image tag for Turbo:
 
 ```bash
-make docker-ascend REGISTRY=<registry> \
-  ASCEND_DOCKERFILE=docker/Dockerfile.npu_turbo_cann92 \
-  ASCEND_DEV_IMAGE=<registry>/relax:ascend-turbo-cann92-<tag>
+docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
 ```
 
-Both DCP and legacy FSDPTurbo checkpoints need `lr_scheduler.pt` to restore scheduler progress with `--load`. Older checkpoints without it fail explicitly instead of inferring optimizer update counts from rollout IDs. To reuse only the weights, first export a compatible HF model directory and start a new run with `--hf-checkpoint`; a DCP shard directory is not an HF model directory.
+If selecting this Dockerfile through Makefile, also specify a distinct `ASCEND_DEV_IMAGE` on the command line to avoid reusing the default NPU image tag.
 
-Checkpoints are written into independent temporary directories and renamed to their step directories after completion. Failed temporary directories do not prevent retrying the same step; existing final step directories remain protected from overwrite. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are not compatible HF initialization sources. Resume their training checkpoint with `--load` instead.
+DCP and legacy resumes with `--load` require `lr_scheduler.pt`; older checkpoints without it fail explicitly. For fresh training, use a compatible HF model with `--hf-checkpoint`, not a DCP directory.
+
+Failed checkpoint writes can be retried; completed step directories cannot be overwritten. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are unsupported.
 
 ---
 
