@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from dataclasses import make_dataclass
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -20,11 +21,13 @@ def test_teacher_child_resolves_server_args_on_assigned_gpus(monkeypatch, tmp_pa
     package = tmp_path / "runtime/relax/backends/sglang"
     package.mkdir(parents=True)
     (tmp_path / "runtime/relax/__init__.py").touch()
+    (package / "teacher_process.py").symlink_to(Path(module.__file__).with_name("teacher_process.py"))
     (package / "sglang_engine.py").write_text(
         "import json, os\n"
         "from pathlib import Path\n"
+        "visible_at_import = os.environ['CUDA_VISIBLE_DEVICES']\n"
         "def _launch_server_with_patches(args, parent_pid, reference_publication):\n"
-        "    observed = [os.environ['CUDA_VISIBLE_DEVICES'], args['base_gpu_id'], args['gpu_id_step']]\n"
+        "    observed = [visible_at_import, args['base_gpu_id'], args['gpu_id_step']]\n"
         "    Path('observed.json').write_text(json.dumps([observed, parent_pid]))\n"
     )
     (tmp_path / "relax.py").write_text("raise AssertionError('Imported Relax from the wrong checkout')")
@@ -42,10 +45,11 @@ def test_teacher_child_resolves_server_args_on_assigned_gpus(monkeypatch, tmp_pa
     engine.server_gpu_ids = [4, 6]
     engine.server_host, engine.server_port, engine.node_rank = "localhost", 8000, 0
     engine._skip_router_registration = True
-    args = dict(host="localhost", base_gpu_id=1, gpu_id_step=1, tp_size=2, pp_size=1, dp_size=1)
+    args = dict(host="localhost", port=8000, base_gpu_id=1, gpu_id_step=1, tp_size=2, pp_size=1, dp_size=1)
     engine._init_normal(args, apply_policy_load_plan=False)
 
-    assert engine.process.wait(timeout=10) == 0
+    engine.process.join(timeout=10)
+    assert engine.process.exitcode == 0
     assert json.loads((tmp_path / "observed.json").read_text()) == [["4,6", 0, 1], os.getpid()]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "7,4,6,3"
 

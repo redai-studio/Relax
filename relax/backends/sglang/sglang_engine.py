@@ -6,7 +6,6 @@ import ipaddress
 import json
 import multiprocessing
 import os
-import pickle
 import signal
 import subprocess
 import sys
@@ -388,38 +387,6 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-class _BoundServerProcess(subprocess.Popen):
-    def is_alive(self) -> bool:
-        return self.poll() is None
-
-
-def _start_bound_teacher(server_args: dict, gpu_ids: list[int], *, reference_publication: bool) -> _BoundServerProcess:
-    devices = [str(device) for device in gpu_ids]
-    inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if (
-        len(devices) != len(set(devices))
-        or len(devices) != server_args["tp_size"]
-        or (inherited is not None and not set(devices).issubset(d.strip() for d in inherited.split(",")))
-    ):
-        raise ValueError(f"Invalid Teacher GPU assignment {devices} under CUDA_VISIBLE_DEVICES={inherited!r}")
-
-    # ServerArgs may probe CUDA during construction. Set the mask before the
-    # child imports SGLang, and keep the Ray worker's device namespace intact.
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(devices))
-    entry = (
-        "import multiprocessing, pickle, sys; "
-        "sys.path[:], launch_args = pickle.load(sys.stdin.buffer); "
-        "multiprocessing.set_start_method('spawn', force=True); "
-        "from relax.backends.sglang.sglang_engine import _launch_server_with_patches; "
-        "_launch_server_with_patches(*launch_args)"
-    )
-    with tempfile.TemporaryFile() as payload:
-        launch_args = ({**server_args, "base_gpu_id": 0, "gpu_id_step": 1}, os.getpid(), reference_publication)
-        pickle.dump((sys.path, launch_args), payload)
-        payload.seek(0)
-        return _BoundServerProcess([sys.executable, "-c", entry], env=env, stdin=payload)
-
-
 def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
@@ -756,15 +723,21 @@ class SGLangEngine(RayActor):
             and server_args_dict.get("device") in (None, "cuda")
             and device_utils.get_accelerator_type() == device_utils.AcceleratorType.CUDA
         ):
+            from relax.backends.sglang.teacher_process import launch_bound_teacher
+
             self._router_bootstrap_port = None
             self._router_dp_size = 1
-            self.process = _start_bound_teacher(
-                server_args_dict, self.server_gpu_ids, reference_publication=reference_publication
+            multiprocessing.set_start_method("spawn", force=True)
+            self.process = multiprocessing.Process(
+                target=launch_bound_teacher,
+                args=(server_args_dict, self.server_gpu_ids, os.getpid(), reference_publication),
             )
+            self.process.start()
             host = {"0.0.0.0": "127.0.0.1", "[::]": "[::1]", "": "127.0.0.1"}.get(self.server_host, self.server_host)
             scheme = "https" if server_args_dict.get("ssl_certfile") else "http"
-            url = f"{scheme}://{host}:{self.server_port}"
-            _wait_server_healthy(url, server_args_dict.get("api_key"), self.process.is_alive)
+            _wait_server_healthy(
+                f"{scheme}://{host}:{self.server_port}", server_args_dict.get("api_key"), self.process.is_alive
+            )
         else:
             server_args = ServerArgs(**server_args_dict)
             self._router_bootstrap_port = (
