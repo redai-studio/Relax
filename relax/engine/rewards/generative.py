@@ -252,7 +252,7 @@ def score_samples(args, samples) -> Dict[str, List[float]]:
 
 def post_process(args, samples) -> List[float]:
     """``custom_reward_post_process_path`` entry point (design doc 11.2)."""
-    if (getattr(args, "sampling_config", None) or {}).get("algorithm") != "art":
+    if (args.sampling_config or {}).get("algorithm") != "art":
         return _post_process_grpo(args, samples)
     flat: List[Sample] = _flatten(samples)
     manager = _get_manager(args)
@@ -276,7 +276,7 @@ def post_process(args, samples) -> List[float]:
     configured_required = getattr(args, "reward_required_components", None)
     required = list(component_weights.keys()) if configured_required is None else list(configured_required)
 
-    if (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art":
+    if (args.sampling_config or {}).get("algorithm") == "art":
         from relax.engine.rewards.art import scalarize_art_rewards
 
         skip_acquisition = not all(valid_mask)
@@ -377,7 +377,7 @@ def _log_reward_metrics(args, flat: List[Sample], metrics: Dict[str, float]) -> 
 
 
 def _advantage_std_mode(args) -> str:
-    mode = getattr(args, "generative_advantage_std_mode", None)
+    mode = args.generative_advantage_std_mode
     if mode is not None:
         return str(mode)
     return "group" if bool(getattr(args, "grpo_std_normalization", True)) else "none"
