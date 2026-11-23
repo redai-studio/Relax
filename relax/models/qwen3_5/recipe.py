@@ -2,12 +2,32 @@
 """Install the Qwen TP4 optimization recipe."""
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from relax.utils.data import wholepack_policy
 
 
+if TYPE_CHECKING:
+    from torch import Tensor
+
+
 ENTRY = "relax.models.qwen3_5.recipe.before_step"
+
+
+def keep_within_tp4_dispatch_limit(
+    *, tokens: "Tensor", loss_mask: "Tensor", capacity: int, idx: int
+) -> tuple["Tensor", "Tensor"]:
+    """Keep oversize singletons that fit the TP4 ExpandedManager after image
+    expansion."""
+    # The SFT callback receives the packing budget as capacity. DeepEP's hard
+    # limit is independently fixed at 131072 rows per rank in deepep_expanded.py.
+    limit = 4 * 131072
+    if tokens.shape[0] > limit:
+        raise ValueError(
+            f"SFT sample idx={idx}: expanded length {tokens.shape[0]} exceeds the TP4 DeepEP limit of "
+            f"{limit} tokens (packing budget {capacity})"
+        )
+    return tokens, loss_mask
 
 
 def enabled(args: Any) -> bool:
