@@ -393,6 +393,7 @@ class WeightSyncProxy:
         self.tp_size = self.pp_size = 1
         self.children: list[tuple[Any, Connection]] = []
         self._closing: dict[Connection, tuple[bool, bool]] = {}
+        self._stopping = False
         self._workers: list[tuple[int, int]] = []
         self.connection: dict | None = None
         self.identities: list[dict] = []
@@ -414,7 +415,7 @@ class WeightSyncProxy:
         return results
 
     def _commands(self, commands: list[dict], *, deadline: float) -> list:
-        if self._closing:
+        if self._closing or self._stopping:
             raise RuntimeError("Cannot issue commands while retiring GPU proxies")
         if len(commands) != len(self.children):
             raise ValueError("Proxy commands must cover every TP process")
@@ -1059,10 +1060,38 @@ class WeightSyncProxy:
     def close(self, *, timeout: float = 10, after_worker_exit: bool = False, abort_group: bool = False) -> None:
         if not self.children:
             return
-        if after_worker_exit and (not self._workers or not _workers_exited(self._workers)):
-            raise RuntimeError("Cannot retire GPU proxy before its original model workers exit")
         deadline = time.monotonic() + timeout
-        abort_group = abort_group or after_worker_exit
+        # A failed engine shutdown can leave its Ray actor alive. Only an
+        # already-started local retirement may be resumed by membership close.
+        if after_worker_exit or (self._stopping and abort_group):
+            if not self._workers or not _workers_exited(self._workers):
+                raise RuntimeError("Cannot retire GPU proxy before its original model workers exit")
+            # The source and other engines can still be using the old group.
+            # Once this engine's IPC readers are gone, process exit is the
+            # local release fence; a unilateral NCCL abort need not complete.
+            self._stopping = True
+            errors = []
+            for process, _ in self.children:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except OSError as exc:
+                    errors.append(exc)
+            for process, _ in self.children:
+                try:
+                    process.wait(timeout=max(0, deadline - time.monotonic()))
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    errors.append(exc)
+            if errors:
+                raise errors[0]
+            for _, connection in self.children:
+                connection.close()
+            self.children.clear()
+            self._closing.clear()
+            self._stopping = False
+            return
+        if self._stopping:
+            raise RuntimeError("Local GPU proxy retirement has not completed")
         errors = []
         # Post to all peers before waiting. A child acknowledges before its
         # collective destructor runs, so a join timeout never permits replay.
@@ -1073,7 +1102,6 @@ class WeightSyncProxy:
                     connection.send(dict(op="close", abort_group=abort_group))
                 except Exception as exc:
                     errors.append(exc)
-        all_exited = True
         for process, connection in self.children:
             try:
                 sent_abort, acknowledged = self._closing[connection]
@@ -1090,11 +1118,6 @@ class WeightSyncProxy:
                         raise RuntimeError("GPU proxy acknowledged a different retirement mode")
                     self._closing[connection] = (sent_abort, True)
                     connection.close()
-                # Only a completed abort permits the stopped engine to return
-                # before process exit. A prior graceful ACK still needs a join.
-                if after_worker_exit and sent_abort and process.poll() is None:
-                    all_exited = False
-                    continue
                 code = process.wait(timeout=max(0, deadline - time.monotonic()))
                 if code:
                     raise RuntimeError(f"GPU proxy exited with status {code}")
@@ -1102,9 +1125,8 @@ class WeightSyncProxy:
                 errors.append(exc)
         if errors:
             raise errors[0]
-        if all_exited:
-            self.children.clear()
-            self._closing.clear()
+        self.children.clear()
+        self._closing.clear()
 
 
 if __name__ == "__main__":
