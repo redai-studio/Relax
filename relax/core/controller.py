@@ -25,6 +25,7 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.algorithms import algorithm_needs_critic
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
@@ -193,7 +194,7 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
-        if getattr(config, "train_backend", None) == "fsdp_turbo" and config.save is not None:
+        if checkpoint_saving_enabled(config):
             from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_generation
 
             config._turbo_checkpoint_generation = checkpoint_generation(config.save)
@@ -1911,7 +1912,7 @@ class Controller:
 
         try:
             # A first checkpoint may finish while old services are shutting down.
-            if getattr(config, "train_backend", None) == "fsdp_turbo" and config.save is not None:
+            if checkpoint_saving_enabled(config):
                 from relax.backends.fsdp_turbo.checkpoint_publication import fence_checkpoint_publishers
 
                 fence_checkpoint_publishers(config.save)

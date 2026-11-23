@@ -21,7 +21,8 @@ import torch.distributed as dist
 import transfer_queue as tq
 
 from relax.algorithms.advantages import compute_advantages_and_returns
-from relax.backends.fsdp_turbo.checkpoint import load_checkpoint, save_checkpoint
+from relax.backends.fsdp_turbo.checkpoint import load_checkpoint, save_checkpoint, validate_checkpoint_publisher
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
 from relax.backends.fsdp_turbo.lr_scheduler import MegatronParityWarmupCosineScheduler
 from relax.backends.fsdp_turbo.model_utils import (
     _is_qwen4_exp,
@@ -122,6 +123,8 @@ class FSDPTurboTrainRayActor(TrainRayActor):
         with_opd_teacher: bool = False,
     ) -> int:
         super().init(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+        if checkpoint_saving_enabled(args):
+            validate_checkpoint_publisher(args)
         if role != "actor":
             raise ValueError(f"fsdp_turbo backend only supports the 'actor' role, got {role!r}")
         if with_ref or with_opd_teacher:

@@ -77,6 +77,8 @@ DCP and legacy resumes with `--load` require `lr_scheduler.pt`; older checkpoint
 
 Failed checkpoint writes can be retried; completed step directories cannot be overwritten. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are unsupported.
 
+Turbo model saving requires the driver and all training ranks to mount `--save` as the same writable shared directory, with cross-client atomic `mkdir`/`rename` and visibility after publication. Client-local copies and mounts with coherence disabled are unsupported. Startup verifies the publication generation; saving-disabled runs create no publication lock. Lock acquisition fails after 30 seconds. If a process exits while holding the lock, remove `.checkpoint-publication.lock.d` from the save root only after confirming all old training processes have stopped, then restart.
+
 ---
 
 ## Checkpoint Configuration

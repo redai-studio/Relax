@@ -19,7 +19,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_generation, checkpoint_publication
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_publication
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -74,6 +74,12 @@ def _checkpoint_write_phase():
     dist.all_gather_object(errors, error, group=get_gloo_group())
     if any(item is not None for item in errors):
         raise RuntimeError(f"Checkpoint write failed across ranks: {errors}")
+
+
+def validate_checkpoint_publisher(args) -> None:
+    with _checkpoint_write_phase():
+        with checkpoint_publication(args.save, args._turbo_checkpoint_generation):
+            pass
 
 
 def _get_full_state_dicts(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None):
@@ -581,7 +587,7 @@ def save_checkpoint(
     with _checkpoint_write_phase():
         if rank == 0:
             if not hasattr(args, "_turbo_checkpoint_generation"):
-                args._turbo_checkpoint_generation = checkpoint_generation(args.save)
+                raise ValueError("Checkpoint publisher has no startup generation")
             if os.path.lexists(final_dir):
                 raise FileExistsError(f"Refusing to overwrite checkpoint: {final_dir}")
             os.makedirs(args.save, exist_ok=True)
