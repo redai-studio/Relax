@@ -279,18 +279,24 @@ async def test_queued_scores_use_remaining_budget_of_switching_replica(pool, pen
 @pytest.mark.asyncio
 async def test_offload_drains_and_onload_restores_or_reprepares_by_actor_identity(pool):
     owner, physical, engines, identities, released, arrived = pool
+
+    def submit_offload():
+        # Ray submits the RPC when .remote() is called, before its result is awaited.
+        assert all(not engine.inflight for engine in engines.values()), "offload submitted with active scores"
+        return asyncio.sleep(0)
+
+    physical.offload.remote = MagicMock(side_effect=submit_offload)
     a = submit(owner, "A", 10)
     b = submit(owner, "B", 20)
     await asyncio.wait_for(asyncio.gather(arrived[10].wait(), arrived[20].wait()), 3)
     offload = asyncio.create_task(owner.offload())
     await asyncio.sleep(0)
-    physical.offload.remote.assert_not_awaited()
     with pytest.raises(RuntimeError, match="draining"):
         await owner.score("B", {"input_ids": [21]})
     released[10].set()
     released[20].set()
     await asyncio.gather(a, b, offload)
-    physical.offload.remote.assert_awaited_once()
+    physical.offload.remote.assert_called_once_with()
     first_url, second_url = engines
     identities[second_url] = "rebuilt-at-same-url"
     await owner.onload()

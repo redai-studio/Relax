@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
-import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from contextlib import nullcontext
@@ -9,6 +8,7 @@ from contextlib import nullcontext
 import aiohttp
 import numpy as np
 
+from relax.utils.http_utils import aiohttp_json_post_kwargs
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
 from relax.utils.opd.opd_multimodal import (
@@ -18,17 +18,6 @@ from relax.utils.opd.opd_multimodal import (
     validate_image_input_ids,
 )
 from relax.utils.types import Sample
-
-
-try:
-    import orjson
-
-    def _dumps_to_bytes(payload: dict) -> bytes:
-        return orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
-except ImportError:  # pragma: no cover - orjson is normally available via sglang
-
-    def _dumps_to_bytes(payload: dict) -> bytes:
-        return json.dumps(payload).encode("utf-8")
 
 
 logger = get_logger(__name__)
@@ -76,15 +65,6 @@ def _insert_teacher_response_prefix(
     insertion_index = min(max(int(prompt_length), 0), len(teacher_input_ids))
     teacher_input_ids[insertion_index:insertion_index] = prefix_token_ids
     return teacher_input_ids, insertion_index + len(prefix_token_ids)
-
-
-def _aiohttp_json_post_kwargs(payload: dict) -> dict:
-    """Bypass aiohttp's ``json=`` kwarg: serialize via orjson and ship as raw
-    ``data=``."""
-    return {
-        "data": _dumps_to_bytes(payload),
-        "headers": {"Content-Type": "application/json"},
-    }
 
 
 def is_opd_enabled(args, evaluation: bool = False) -> bool:
@@ -384,7 +364,7 @@ class OpdManager:
         expected_input_ids: list[int] | None = None,
     ) -> opd_main_worker.LogprobResponse | None:
         try:
-            async with session.post(url, **_aiohttp_json_post_kwargs(payload)) as resp:
+            async with session.post(url, **aiohttp_json_post_kwargs(payload)) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.error("OPD %s failed: status=%s, url=%s, body=%s", err_tag, resp.status, url, body[:2048])

@@ -18,6 +18,17 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
+try:
+    import orjson
+
+    def _dumps_to_bytes(payload: dict) -> bytes:
+        return orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
+except ImportError:  # pragma: no cover - orjson is normally available via sglang
+
+    def _dumps_to_bytes(payload: dict) -> bytes:
+        return json.dumps(payload).encode("utf-8")
+
+
 logger = get_logger(__name__)
 
 MAX_RETRIES = 6
@@ -31,6 +42,14 @@ class PostObservation:
 
 
 post_observation: ContextVar[PostObservation | None] = ContextVar("post_observation", default=None)
+
+
+def aiohttp_json_post_kwargs(payload: dict) -> dict:
+    """Send pre-encoded JSON bytes with aiohttp."""
+    return {
+        "data": _dumps_to_bytes(payload),
+        "headers": {"Content-Type": "application/json"},
+    }
 
 
 def is_expected_sglang_499(error: httpx.HTTPStatusError) -> bool:

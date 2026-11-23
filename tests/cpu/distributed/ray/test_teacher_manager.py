@@ -12,6 +12,7 @@ import pytest
 def _cleanup_teacher_manager_module():
     yield
     sys.modules.pop("relax.distributed.ray.teacher_manager", None)
+    vars(sys.modules["relax.distributed.ray"]).pop("teacher_manager", None)
 
 
 def _install_teacher_manager_stubs(monkeypatch):
@@ -28,13 +29,11 @@ def _install_teacher_manager_stubs(monkeypatch):
     ray_utils = ModuleType("relax.distributed.ray.utils")
     ray_utils.NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = []
 
-    http_utils = ModuleType("relax.utils.http_utils")
-    http_utils.find_available_port = MagicMock(return_value=15000)
+    monkeypatch.setattr("relax.utils.http_utils.find_available_port", MagicMock(return_value=15000))
 
     monkeypatch.setitem(sys.modules, "relax.backends.sglang.sglang_engine", sglang_engine)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.utils", ray_utils)
-    monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
 
 
 def _import_teacher_manager(monkeypatch):
@@ -234,6 +233,37 @@ def test_dedicated_multinode_replica_creates_one_pg_for_both_slots(monkeypatch):
     assert teacher_manager_module.create_placement_group.call_count == 2
     for call in teacher_manager_module.create_placement_group.call_args_list:
         assert call.kwargs["num_gpus"] == 16
+
+
+def test_shared_tp2_replicas_allocate_disjoint_ports_on_one_node(monkeypatch):
+    from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
+
+    module, manager = _make_teacher_manager(monkeypatch, num_replicas=4, gpus_per_replica=2)
+    manager._teacher_args.sglang_dp_size = 1
+    module.find_available_port.side_effect = range(15000, 15008, 2)
+    monkeypatch.setattr(
+        module, "_allocate_rollout_engine_addr_and_ports_normal", _allocate_rollout_engine_addr_and_ports_normal
+    )
+    monkeypatch.setattr(module.ray, "get", lambda ref: ref)
+    reservations = {}
+
+    def probe(start_port=10000, consecutive=1):
+        # Before engines bind, a free-port probe always accepts the same candidate.
+        if consecutive > 1:
+            reservations[start_port] = range(start_port, start_port + consecutive)
+        return "192.0.2.1", start_port
+
+    engines = [(rank, MagicMock()) for rank in range(4)]
+    for _, engine in engines:
+        engine._get_current_node_ip_and_free_port.remote.side_effect = probe
+    addresses = manager._allocate_engine_addr_and_ports(new_engines=engines)
+
+    assert set(addresses) == {0, 1, 2, 3}
+    ports = []
+    for addr in addresses.values():
+        rendezvous = int(addr["dist_init_addr"].rsplit(":", 1)[1])
+        ports.extend([addr["port"], addr["nccl_port"], *reservations[rendezvous]])
+    assert len(set(ports)) == len(ports)
 
 
 def test_multinode_teacher_allocates_each_replicas_node_addresses_together(monkeypatch):

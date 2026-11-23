@@ -16,7 +16,7 @@ from relax.distributed.ray.placement_group import create_placement_group
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.utils.env import Envs
-from relax.utils.http_utils import find_available_port
+from relax.utils.http_utils import aiohttp_json_post_kwargs, find_available_port
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_overrides
 
@@ -217,9 +217,11 @@ class TeacherManager(MultiEngineManager):
                 addr_and_ports[rank] = dict(self._engine_addr_and_ports[rank])
                 continue
             unallocated_replicas.setdefault(rank // self.nodes_per_engine, []).append((rank, engine))
+        port_cursors = {}
         for replica, engines in unallocated_replicas.items():
-            base_port = find_available_port(15000)
-            per_engine_addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
+            # All replicas get their ports before any engine starts listening.
+            base_port = max(port_cursors.values()) if port_cursors else find_available_port(15000)
+            per_engine_addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
                 args=self._teacher_args,
                 rollout_engines=engines,
                 worker_type="regular",
@@ -348,9 +350,7 @@ class SharedTeacherManager:
         self._prepared_engines = identities
 
     async def _generate(self, url: str, payload: dict) -> dict:
-        from relax.engine.rollout.on_policy_distillation import _aiohttp_json_post_kwargs
-
-        async with self._session.post(url, **_aiohttp_json_post_kwargs(payload)) as response:
+        async with self._session.post(url, **aiohttp_json_post_kwargs(payload)) as response:
             if 400 <= response.status < 500 and response.status != 408:
                 body = await response.text()
                 raise _ScoreRejectedError(
