@@ -541,6 +541,7 @@ RUN . /etc/relax_build.env && \
 # pip check above validates every other dependency before this explicit override.
 # SM90 can share DSA backward signatures after making the length clamp dynamic;
 # SM100 kernels retain width-dependent compile-time tuning.
+# The Blackwell Muon recipes use the delivery wheel with the image's existing Torch and Triton.
 RUN --mount=type=bind,source=docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.patch,target=/tmp/cudnn-dsa.patch \
     pip install --no-cache-dir --force-reinstall --no-deps nvidia-nccl-cu13==2.30.7 && \
     python -c "import importlib.metadata as m; assert m.version('nvidia-nccl-cu13') == '2.30.7'" && \
@@ -552,6 +553,10 @@ RUN --mount=type=bind,source=docker/patch/cudnn/1.30.0-dsa-sm90-signature-cache.
         patch --batch --forward --fuzz=0 -d "$CUDNN_SITE" -p1 < /tmp/cudnn-dsa.patch && \
         python -m py_compile "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/_interface_sm90.py" \
             "$CUDNN_SITE/cudnn/deepseek_sparse_attention/sparse_attention_backward/dsa_bwd_sm90.py"; \
+    elif [ "$RELAX_GPU_ARCH" = "blackwell" ]; then \
+        printf '%s\n' 'emerging-optimizers==0.3.0 --hash=sha256:e993682a8b93b6953b3056b0d4e2714e3a3182b0c85f456bcc78d76cd7b47429' | \
+            python -m pip install --no-cache-dir --only-binary=:all: --no-deps --require-hashes -r /dev/stdin && \
+        python -c "from emerging_optimizers.orthogonalized_optimizers import Muon; from emerging_optimizers.registry import get_optimizer_cls; assert get_optimizer_cls('muon') is Muon"; \
     fi && \
     python /opt/relax/validate_hybridep_install.py && \
     python /opt/relax/validate_final_runtime.py && \
