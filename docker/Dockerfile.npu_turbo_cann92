@@ -87,7 +87,7 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
     git clone https://gitcode.com/ascend/MindSpeed-Bridge.git /root/MindSpeed-Bridge && \
     git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /root/Megatron-Bridge
 
-COPY docker/npu_patch/megatron-bridge.patch docker/npu_patch/megatron.patch docker/npu_patch/mindspeed-ops.patch docker/npu_patch/mindspeed.patch docker/npu_patch/mindspeed-bridge.patch /root/Relax/docker/npu_patch/
+COPY docker/npu_patch/mindspeed.patch /root/Relax/docker/npu_patch/
 
 RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org/simple "$@"; }; \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
@@ -108,6 +108,8 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
         flash-linear-attention setuptools hydra-core coverage nvidia-modelopt \
         nvidia-resiliency-ext accelerate datasets && \
     pip install -e . --no-deps
+
+COPY docker/npu_patch/megatron-bridge.patch docker/npu_patch/megatron.patch docker/npu_patch/mindspeed-ops.patch /root/Relax/docker/npu_patch/
 
 RUN cd /root/Megatron-Bridge && \
     patch -p1 < /root/Relax/docker/npu_patch/megatron-bridge.patch && \

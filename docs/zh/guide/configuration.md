@@ -65,9 +65,17 @@ Ulysses CP 目前仅支持 SFT。Qwen4 Exp SFT 可以组合 CP 与 `memory.chunk
 
 直接多机启动时，在八个节点分别设置 `MASTER_ADDR` 为头节点名称、`POD_NAME` 为本节点名称、`HOST_IP` 为本节点通信 IP。配方固定 `WORLD_SIZE=8`、`NUM_NPUS=16`。
 
+通过 Makefile 构建 Turbo 时，应指定与默认 NPU 镜像不同的输出标签。标签已存在时，`make docker-ascend` 会跳过构建：
+
+```bash
+make docker-ascend REGISTRY=<registry> \
+  ASCEND_DOCKERFILE=docker/Dockerfile.npu_turbo_cann92 \
+  ASCEND_DEV_IMAGE=<registry>/relax:ascend-turbo-cann92-<tag>
+```
+
 FSDPTurbo 的 DCP 和 legacy 检查点均需包含 `lr_scheduler.pt` 才能通过 `--load` 恢复 scheduler 进度。缺少该文件的旧检查点会明确报错，不会根据 rollout 编号猜测 optimizer 更新次数。若只复用权重，应先导出为当前模型可加载的 HF 目录，再通过 `--hf-checkpoint` 开始新训练；不要将 DCP 分片目录直接作为 HF 目录使用。
 
-保存时会拒绝已存在的步目录，以保护已发布的 checkpoint。重启旧训练时应选择新的保存目录。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，整表和 VP sidecar 导出不能用于这种初始化；恢复其训练 checkpoint 应使用 `--load`。
+checkpoint 先写入独立临时目录，完成后再重命名为正式步目录。失败的临时目录不影响同一步重试；已存在的正式步目录仍禁止覆盖。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，整表和 VP sidecar 导出不能用于这种初始化；恢复其训练 checkpoint 应使用 `--load`。
 
 ---
 

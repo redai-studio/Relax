@@ -65,9 +65,17 @@ The full-layer 128-NPU SFT recipe is `scripts/training/sft/run-qwen3.8-flash-nex
 
 For direct multinode launch, set `MASTER_ADDR` to the head node name, `POD_NAME` to each node name, and `HOST_IP` to its communication IP on all eight nodes. The recipe fixes `WORLD_SIZE=8` and `NUM_NPUS=16`.
 
+When building Turbo through Makefile, specify a distinct output tag from the default NPU image. An existing tag causes `make docker-ascend` to skip the build:
+
+```bash
+make docker-ascend REGISTRY=<registry> \
+  ASCEND_DOCKERFILE=docker/Dockerfile.npu_turbo_cann92 \
+  ASCEND_DEV_IMAGE=<registry>/relax:ascend-turbo-cann92-<tag>
+```
+
 Both DCP and legacy FSDPTurbo checkpoints need `lr_scheduler.pt` to restore scheduler progress with `--load`. Older checkpoints without it fail explicitly instead of inferring optimizer update counts from rollout IDs. To reuse only the weights, first export a compatible HF model directory and start a new run with `--hf-checkpoint`; a DCP shard directory is not an HF model directory.
 
-Saving refuses an existing step directory to protect published checkpoints. Use a new save directory when restarting an earlier run. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are not compatible HF initialization sources. Resume their training checkpoint with `--load` instead.
+Checkpoints are written into independent temporary directories and renamed to their step directories after completion. Failed temporary directories do not prevent retrying the same step; existing final step directories remain protected from overwrite. PLE HF initialization requires indexed `ngram_embedding.shard_*` weights; whole-table and VP sidecar exports are not compatible HF initialization sources. Resume their training checkpoint with `--load` instead.
 
 ---
 

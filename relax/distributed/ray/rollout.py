@@ -5274,22 +5274,24 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
     """
     config = _resolve_sglang_config(args)
 
-    if getattr(args, "train_backend", None) == "fsdp_turbo":
-        for model in config.models[:1]:
-            for group in model.engine_groups:
-                if group.worker_type == "placeholder":
-                    continue
-                for field in ("dp_size", "pp_size", "attn_dp_size"):
-                    value = group.overrides.get(field, getattr(args, f"sglang_{field}", 1))
-                    if int(value or 1) != 1:
-                        raise ValueError(f"fsdp_turbo weight synchronization requires final SGLang {field}=1")
-
     servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
     engine_offset = 0
 
     for model_idx, model_cfg in enumerate(config.models):
         model_cfg.resolve(args)
+
+        if model_idx == 0 and getattr(args, "train_backend", None) == "fsdp_turbo":
+            for group in model_cfg.engine_groups:
+                if group.worker_type == "placeholder":
+                    continue
+                for field in ("dp_size", "pp_size", "attn_dp_size"):
+                    value = group.overrides.get(field, getattr(args, f"sglang_{field}", 1))
+                    if int(value or 1) != 1:
+                        raise ValueError(f"fsdp_turbo weight synchronization requires final SGLang {field}=1")
+                tp_size = int(group.overrides.get("tp_size", group.num_gpus_per_engine))
+                if tp_size != group.num_gpus_per_engine:
+                    raise ValueError("fsdp_turbo SGLang tp_size must match the allocated GPUs per engine")
 
         has_pd = model_cfg.has_pd_disaggregation
         endpoint = (args.sglang_router_ip, args.sglang_router_port)
