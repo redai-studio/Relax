@@ -1,0 +1,956 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""TQ body transport; a metadata-only coordinator protects publication and
+readers.
+
+Bodies use TQ's explicit-key API, never the training sampler. Each layer/chunk
+is a separate value. SimpleStorage returns a whole block; row selection happens
+here, not in the storage service. No files or mmap are used.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from collections import OrderedDict
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from threading import RLock, Thread, current_thread
+from typing import TYPE_CHECKING, Any, Callable, Iterator
+
+from .ref_data import ReplayRef
+
+
+if TYPE_CHECKING:
+    import numpy as np
+
+
+_NAMESPACE = "relax-replay"
+_BASE_READ_BATCH_BYTES = 64 << 20
+_SIMPLE_STORAGE_PUBLICATION_WORKERS = 4
+BODY_PARTITION_PREFIX = "__replay_body__:"
+
+
+@dataclass(frozen=True)
+class _ReadSelection:
+    """Validated source rows and their final output positions for one layer."""
+
+    ref: ReplayRef
+    layer: int
+    source_rows: np.ndarray
+    output_rows: np.ndarray
+    output: np.ndarray
+
+
+@dataclass(frozen=True)
+class _RowCopy:
+    output: np.ndarray
+    output_rows: np.ndarray
+    block_rows: np.ndarray
+
+
+@dataclass
+class _ReadBlock:
+    """One immutable body key, potentially serving several output
+    selections."""
+
+    rows: int
+    topk: int
+    copies: list[_RowCopy] = field(default_factory=list)
+
+
+def _validate_read_layers(
+    layers: list[tuple[list[tuple[ReplayRef, Any, Any, str | None]], int, Any]],
+) -> tuple[list[_ReadSelection], list[tuple[ReplayRef, str | None]]]:
+    """Normalize the complete window before authorization or body I/O."""
+    import numpy as np
+
+    normalized = []
+    authorized = {}
+    for requests, layer, output in layers:
+        for ref, rows, destinations, lease in requests:
+            rows = np.asarray(rows, dtype=np.int64)
+            destinations = np.asarray(destinations, dtype=np.int64)
+            if (
+                rows.ndim != 1
+                or destinations.shape != rows.shape
+                or not 0 <= layer < ref.layers
+                or np.any(rows < 0)
+                or np.any(rows >= ref.rows)
+                or output.ndim != 2
+                or output.shape[1] != ref.topk
+                or output.dtype not in (np.int32, np.int64)
+                or not output.flags.writeable
+                or np.any(destinations < 0)
+                or np.any(destinations >= len(output))
+            ):
+                raise ValueError("Invalid replay read layout")
+            normalized.append(_ReadSelection(ref, layer, rows, destinations, output))
+            authorized[(ref, lease)] = None
+    return normalized, list(authorized)
+
+
+def _ray() -> Any:
+    import ray
+
+    if not ray.is_initialized():
+        raise RuntimeError("Replay requires an explicitly connected existing Ray runtime")
+    return ray
+
+
+def _call(actor: Any, method: str, *args: Any, **kwargs: Any) -> Any:
+    return _ray().get(getattr(actor, method).remote(*args, **kwargs))
+
+
+async def _clear_empty_body_partition(client: Any, partition: str) -> None:
+    """Remove drained replay metadata, including TQ's falsey empty
+    BatchMeta."""
+    if not partition.startswith(BODY_PARTITION_PREFIX):
+        raise ValueError("Replay cleanup requires a private body partition")
+    # The owning registry fences writers and drains all holds BEFORE calling
+    # this adapter. Never use metadata deletion to discard remaining bodies.
+    metadata = await client._get_partition_meta(partition)
+    if metadata is not None:
+        if metadata.size:
+            raise RuntimeError("Replay body partition is not empty after inventory close")
+        # Pinned TQ's public clear_partition returns early for an empty BatchMeta.
+        # Reuse its existing acknowledged RPC, on the client's own event loop.
+        await client._clear_partition_in_controller(partition)
+    if partition in await client.async_get_partition_list():
+        raise RuntimeError("Replay body partition metadata remains after close")
+
+
+def _select_body_rows(field_data: Any, positions: list[int], fallback: Callable) -> Any:
+    """Select strided CPU layers without scheduling PyTorch's thread pool."""
+    import numpy as np
+    import torch
+
+    if (
+        isinstance(field_data, torch.Tensor)
+        and not field_data.is_nested
+        and field_data.device.type == "cpu"
+        and field_data.dtype == torch.int32
+        and field_data.ndim == 3
+        and len(positions) > 1
+        and min(positions) >= 0
+        and max(positions) < len(field_data)
+    ):
+        stride = positions[1] - positions[0]
+        if stride > 1 and all(positions[i] - positions[i - 1] == stride for i in range(2, len(positions))):
+            return torch.from_numpy(
+                np.ascontiguousarray(field_data.numpy()[positions[0] : positions[-1] + 1 : stride])
+            )
+    return fallback(field_data, positions)
+
+
+def tq_client_factory(connection: Any, *, body_partition: str) -> Any:
+    """Connect sockets to resolved endpoints, never bootstrap a TQ cluster."""
+    import psutil
+    import torch
+    from transfer_queue.client import TQ_NUM_THREADS, TransferQueueClient
+    from transfer_queue.storage.managers import simple_storage_manager
+    from transfer_queue.utils.common import DEFAULT_TORCH_NUM_THREADS
+
+    if connection is None or not connection.controller.zmq_info:
+        raise RuntimeError("Replay needs the resolved TQ connection from Relax initialization")
+
+    # The pinned TQ context queries physical cores on every get. Replay clients
+    # live within one worker/run, so resolve this CPU topology once per client.
+    physical_cores = psutil.cpu_count(logical=False)
+    body_threads = (
+        min(TQ_NUM_THREADS, physical_cores)
+        if isinstance(physical_cores, int) and physical_cores > 0 and TQ_NUM_THREADS > 0
+        else None
+    )
+
+    class ReplayTQClient(TransferQueueClient):
+        async def async_clear_samples(self, metadata: Any) -> None:
+            if connection.backend.storage_backend != "SimpleStorage":
+                return await super().async_clear_samples(metadata)
+            await _clear_simple_storage_samples(self, metadata)
+
+        async def async_get_data(self, metadata: Any) -> Any:
+            # Keep TQ's validation/empty-result behavior and unusual topology
+            # fallback. The override is bound by TQ's synchronous constructor.
+            if (
+                body_threads is None
+                or getattr(self, "storage_manager", None) is None
+                or not metadata
+                or metadata.size == 0
+                or len(metadata.field_names) == 0
+            ):
+                return await super().async_get_data(metadata)
+            try:
+                torch.set_num_threads(body_threads)
+                return await self.storage_manager.get_data(metadata)
+            finally:
+                # Match pinned TQ: it restores its configured default, not the
+                # entry thread count. Do not change the engine's thread policy.
+                torch.set_num_threads(DEFAULT_TORCH_NUM_THREADS)
+
+        async def async_clear_partition(self, partition_id: str) -> None:
+            if partition_id.startswith(BODY_PARTITION_PREFIX):
+                if partition_id != body_partition:
+                    raise ValueError("Replay client cannot finalize another run's body partition")
+                await _clear_empty_body_partition(self, partition_id)
+            else:
+                await super().async_clear_partition(partition_id)
+
+    client = ReplayTQClient(
+        client_id=f"replay-{os.getpid()}-{uuid.uuid4().hex}", controller_info=connection.controller.zmq_info
+    )
+    backend = connection.backend.storage_backend
+    try:
+        client.initialize_storage_manager(backend, connection.backend[backend])
+        if isinstance(client.storage_manager, simple_storage_manager.AsyncSimpleStorageManager):
+            select = client.storage_manager._select_by_positions
+            client.storage_manager._select_by_positions = lambda data, positions: _select_body_rows(
+                data, positions, select
+            )
+    except BaseException:
+        client.close()
+        raise
+    return client
+
+
+async def _clear_simple_storage_samples(client: Any, metadata: Any) -> None:
+    """Keep key metadata until every storage unit acknowledges body deletion.
+
+    The pinned TQ SimpleStorage clear_data logs unit errors without raising.
+    Drain every unit before propagating failure so a retry cannot race an
+    outstanding request on the same client sockets.
+    """
+    manager = client.storage_manager
+    routing = manager._group_by_hash(metadata.global_indexes)
+    results = await asyncio.gather(
+        *(
+            manager._clear_single_storage_unit(group.global_indexes, target_storage_unit=unit)
+            for unit, group in routing.items()
+        ),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    await client._clear_meta_in_controller(metadata)
+
+
+async def _read_simple_storage_bodies(manager: Any, metadata: Any) -> list[Any]:
+    """Receive encoded CPU bodies without repacking them into a nested
+    batch."""
+    import torch
+
+    routing = manager._group_by_hash(metadata.global_indexes)
+    results = await asyncio.gather(
+        *(
+            manager._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=unit)
+            for unit, group in routing.items()
+        ),
+        return_exceptions=True,
+    )
+    # Drain every storage-unit request before a failure returns the shared
+    # client to another caller. Do not reimplement TQ's wire protocol.
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    bodies = [None] * metadata.size
+    for group, (fields, data) in zip(routing.values(), results, strict=True):
+        if tuple(fields) != ("replay_body",) or "replay_body" not in data:
+            raise RuntimeError("Unexpected SimpleStorage replay fields")
+        values = data["replay_body"]
+        if len(values) != len(group.batch_positions):
+            raise RuntimeError("SimpleStorage is missing a sealed replay body")
+        for position, value in zip(group.batch_positions, values, strict=True):
+            if (
+                not 0 <= position < len(bodies)
+                or bodies[position] is not None
+                or not isinstance(value, torch.Tensor)
+                or value.device.type != "cpu"
+            ):
+                raise RuntimeError("Invalid SimpleStorage replay body response")
+            bodies[position] = value.numpy()
+    if any(value is None for value in bodies):
+        raise RuntimeError("SimpleStorage is missing a sealed replay body")
+    return bodies
+
+
+class TQBodyBackend:
+    """Process-local client with explicit keys and a dedicated synchronous
+    loop."""
+
+    def __init__(self, run: str, client_factory: Callable[[], Any]) -> None:
+        self.partition = BODY_PARTITION_PREFIX + run
+        self._factory = client_factory
+        self._client = None
+        self._write_clients: dict[Thread, Any] = {}
+        self._gdr_reader = None
+        self._pid = os.getpid()
+        self._lock = RLock()
+        self._encoded_metadata: OrderedDict[str, Any] = OrderedDict()
+
+    def client(self) -> Any:
+        if os.getpid() != self._pid:
+            raise RuntimeError("Create replay transport after spawn; do not inherit TQ sockets across fork")
+        with self._lock:
+            if self._client is None:
+                self._client = self._factory()
+            return self._client
+
+    def write_many(self, keys: list[str], values: tuple[Any, ...]) -> None:
+        import numpy as np
+        import torch
+        from tensordict import TensorDict
+
+        if os.getpid() != self._pid:
+            raise RuntimeError("Create replay transport after spawn; do not inherit TQ sockets across fork")
+        # Each worker owns its client's event loop and sockets. Foreground
+        # reads and concurrent writers must never share a synchronous client.
+        with self._lock:
+            thread = current_thread()
+            if thread not in self._write_clients:
+                self._write_clients[thread] = self._factory()
+            client = self._write_clients[thread]
+        # Deterministic key is reserved in the inventory BEFORE this call, so a
+        # lost allocation/write response cannot lose the only address of a body.
+        meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=True)
+        if meta.size != len(keys):
+            raise RuntimeError("TQ returned an unexpected replay allocation")
+        # TQ enforces one dtype per field across the complete run. Represent
+        # raw BF16 bytes as int32 words alongside typed replay bodies; this is
+        # a bit-preserving view, with no numerical conversion or added bytes.
+        values = tuple(value.view(np.int32) if value.dtype == np.uint8 else value for value in values)
+        if len(values) == 1:
+            body = torch.from_numpy(values[0]).unsqueeze(0)
+        elif all(value.dtype == np.int32 and value.shape == values[0].shape for value in values):
+            body = torch.from_numpy(np.stack(values))
+        else:
+            # Preserve existing handling for other equally shaped bodies.
+            body = torch.stack([torch.from_numpy(value) for value in values])
+        client.put(TensorDict({"replay_body": body}, batch_size=[len(keys)]), metadata=meta)
+
+    def read(self, keys: list[str]) -> list[Any]:
+        return self._read(keys, cache_metadata=False)
+
+    def read_encoded(self, keys: list[str]) -> list[Any]:
+        return self._read(keys, cache_metadata=True)
+
+    def _read(self, keys: list[str], *, cache_metadata: bool) -> list[Any]:
+        import torch
+
+        if not keys:
+            return []
+        # Serialize foreground and speculative reads on the same sync client.
+        # Client creation alone does not establish caller-thread safety.
+        with self._lock:
+            client = self.client()
+            if not cache_metadata:
+                meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=False)
+                if meta.size != len(keys):
+                    raise RuntimeError("TQ is missing a sealed replay block")
+                meta = meta.select_fields(["replay_body"])
+            else:
+                # Sealed bodies are immutable while the caller holds its lease.
+                # Keep only routing metadata, never body payloads or ownership.
+                missing = list(dict.fromkeys(key for key in keys if key not in self._encoded_metadata))
+                resolved = {}
+                if missing:
+                    fetched = client.kv_retrieve_meta(keys=missing, partition_id=self.partition, create=False)
+                    if fetched.size != len(missing):
+                        raise RuntimeError("TQ is missing a sealed replay block")
+                    fetched = fetched.select_fields(["replay_body"])
+                    resolved = {key: fetched.select_samples([i]) for i, key in enumerate(missing)}
+                ordered = []
+                for key in keys:
+                    item = resolved[key] if key in resolved else self._encoded_metadata[key]
+                    ordered.append(item)
+                    self._encoded_metadata[key] = item
+                    self._encoded_metadata.move_to_end(key)
+                while len(self._encoded_metadata) > 8192:
+                    self._encoded_metadata.popitem(last=False)
+                meta = type(ordered[0]).concat(ordered) if len(ordered) > 1 else ordered[0]
+            # Both raw and encoded bodies can bypass generic nested-tensor
+            # repacking. Keep encoded metadata caching and GDR selection intact.
+            manager = getattr(client, "storage_manager", None)
+            loop = getattr(client, "_loop", None)
+            if (
+                isinstance(loop, asyncio.AbstractEventLoop)
+                and loop.is_running()
+                and callable(getattr(manager, "_group_by_hash", None))
+                and callable(getattr(manager, "_get_from_single_storage_unit", None))
+            ):
+                from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+
+                if isinstance(manager, AsyncSimpleStorageManager):
+                    # Use this client's socket-owning loop, but bypass generic
+                    # get_data's process-global torch thread-count changes and
+                    # SimpleStorage's full nested-tensor repacking copy.
+                    return asyncio.run_coroutine_threadsafe(_read_simple_storage_bodies(manager, meta), loop).result()
+            values = client.get_data(meta)["replay_body"]
+            if isinstance(values, torch.Tensor):
+                blocks = values.unbind()
+            elif isinstance(values, Sequence) and all(
+                isinstance(value, torch.Tensor) and value.ndim == 2 and value.device.type == "cpu" for value in values
+            ):
+                blocks = values
+            else:
+                raise RuntimeError("TQ returned invalid replay body buffers")
+            if len(blocks) != len(keys):
+                raise RuntimeError("TQ returned an unexpected replay block count")
+            return [value.cpu().numpy() for value in blocks]
+
+    def delete(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        with self._lock:
+            for key in keys:
+                self._encoded_metadata.pop(key, None)
+            client = self.client()
+            meta = client.kv_retrieve_meta(keys=keys, partition_id=self.partition, create=False)
+            if meta.size:
+                client.clear_samples(meta)
+
+    def close(self) -> None:
+        with self._lock:
+            self._encoded_metadata.clear()
+            errors = []
+            for thread, client in tuple(self._write_clients.items()):
+                try:
+                    client.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    del self._write_clients[thread]
+            if self._gdr_reader is not None:
+                try:
+                    self._gdr_reader.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    self._gdr_reader = None
+            if self._client is not None:
+                try:
+                    self._client.close()  # Local sockets only. Never tq.close().
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    self._client = None
+            if errors:
+                for extra in errors[1:]:
+                    errors[0].add_note(f"Another replay client failed to close: {extra!r}")
+                raise errors[0]
+
+
+def _connection_identity(connection: Any) -> Any:
+    """Compare resolved endpoints by value after Ray serializes opaque ZMQ
+    info."""
+    from collections.abc import Mapping
+    from enum import Enum
+
+    from omegaconf import OmegaConf
+
+    if OmegaConf.is_config(connection):
+        connection = OmegaConf.to_container(connection, resolve=True)
+    if isinstance(connection, Enum):
+        return _connection_identity(connection.value)
+    if isinstance(connection, Mapping):
+        return {key: _connection_identity(value) for key, value in connection.items()}
+    if isinstance(connection, (list, tuple)):
+        return tuple(_connection_identity(value) for value in connection)
+    if hasattr(connection, "to_dict"):
+        return _connection_identity(connection.to_dict())
+    if connection is None or isinstance(connection, (str, bool, int, float)):
+        return connection
+    raise TypeError(f"Unsupported replay TQ connection value: {type(connection).__name__}")
+
+
+def _registry_type() -> type:
+    """Keep serialized metadata on the actor loop and body I/O on one
+    worker."""
+    from .core import ReplayInventory
+
+    class Registry(ReplayInventory):
+        def __init__(self, config: Any, driver: str, backend: Any = None) -> None:
+            self.connection = None
+            self.connection_identity = None
+            self.driver = driver
+            self.backend = (
+                backend
+                if backend is not None
+                else TQBodyBackend(
+                    config.run_id,
+                    lambda: tq_client_factory(self.connection, body_partition=BODY_PARTITION_PREFIX + config.run_id),
+                )
+            )
+            super().__init__(config, self.backend.delete)
+            self._reclaim_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-reclaim")
+            self._reclaims: set[asyncio.Task] = set()
+            self._retiring: dict[str, dict] = {}
+
+        def _delete_collected(self, state: dict, collected: dict[str, dict]) -> None:
+            # These records have no writers, publishers, queue holds or readers.
+            # Fence new readers while retaining their bytes until delete ACK.
+            for record, item in collected.items():
+                del state["objects"][record]
+                self._retiring[record] = item
+                digest = item.get("media_hash")
+                if digest is not None and self._media.get(digest, {}).get("record") == record:
+                    del self._media[digest]
+
+            async def reclaim() -> None:
+                keys = [key for item in collected.values() for key in item["blocks"]]
+                try:
+                    await asyncio.get_running_loop().run_in_executor(self._reclaim_executor, self._delete, keys)
+                except BaseException:
+                    # Partial/uncertain deletion is retried with the same keys.
+                    # A newer media claim must not be replaced by this old one.
+                    state["objects"].update(collected)
+                    raise
+                else:
+                    self._used_bytes -= sum(item["bytes"] for item in collected.values())
+                finally:
+                    for record in collected:
+                        del self._retiring[record]
+
+            task = asyncio.create_task(reclaim(), name="replay-reclaim")
+            self._reclaims.add(task)
+            task.add_done_callback(self._reclaims.discard)
+
+        async def invoke(self, method: str, args: tuple, kwargs: dict) -> Any:
+            # No await in a metadata transition: the async actor still serializes
+            # state, but can service publications while deletion waits on TQ.
+            before = set(self._reclaims)
+            if method == "begin" and (args[0] if args else kwargs.get("record")) in self._retiring:
+                raise RuntimeError("Replay record is being reclaimed; its keys cannot be reused")
+            finishing = method == "finish"
+            if finishing:
+                if args != (self.driver,) or kwargs:
+                    raise RuntimeError("Only the owning driver may close replay")
+                method = "close"
+            result = None
+            primary = None
+            try:
+                result = getattr(self, method)(*(() if finishing else args), **kwargs)
+            except BaseException as error:
+                primary = error
+            retry_capacity = method == "reserve_layers" and isinstance(primary, BufferError) and bool(self._reclaims)
+            if retry_capacity:
+                primary = None
+            tasks = tuple(
+                self._reclaims
+                if finishing or method == "retire_partition" or retry_capacity
+                else self._reclaims - before
+            )
+            if tasks:
+                # A cancelled caller cannot cancel acknowledged deletion work.
+                from relax.utils.async_utils import finish_before_cancellation
+
+                errors = await finish_before_cancellation(
+                    asyncio.gather(*tasks, return_exceptions=True), "replay-collection"
+                )
+                for error in errors:
+                    if isinstance(error, BaseException):
+                        primary = primary or error
+            if retry_capacity and primary is None:
+                try:
+                    result = self.reserve_layers(*args, **kwargs)
+                except BaseException as error:
+                    primary = error
+            if primary is not None:
+                if method == "close":
+                    self.state["closed"] = False
+                raise primary
+            if finishing:
+
+                def finish_backend() -> None:
+                    if self.connection is not None:
+                        self.backend.client().clear_partition(self.backend.partition)
+                    self.backend.close()
+
+                from relax.utils.async_utils import finish_before_cancellation
+
+                await finish_before_cancellation(
+                    asyncio.get_running_loop().run_in_executor(self._reclaim_executor, finish_backend),
+                    "replay-backend-close",
+                )
+                self._reclaim_executor.shutdown(wait=True)
+            return result
+
+        def configure(self, connection: Any) -> None:
+            identity = _connection_identity(connection)
+            if self.connection is not None and self.connection_identity != identity:
+                raise RuntimeError("Replay TQ endpoints changed within a run; restart recovery is not implemented")
+            self.connection = connection
+            self.connection_identity = identity
+
+        def get_connection(self) -> Any:
+            if self.connection is None:
+                raise RuntimeError("Replay TQ connection has not been registered")
+            return self.connection
+
+    return Registry
+
+
+def _new_registry(config: Any, driver: str) -> Any:
+    registry = _ray().remote(num_cpus=0)(_registry_type())
+    return registry.options(name=f"replay-{config.run_id}", namespace=_NAMESPACE).remote(config, driver)
+
+
+class TQReplayStorage:
+    """Publication/reader facade; payload bytes go directly through TQ clients.
+
+    A caller may inject an in-process coordinator and client factory for CPU
+    contract tests. Production always resolves the named run coordinator.
+    """
+
+    def __init__(self, config: Any, *, inventory: Any = None, client_factory: Callable | None = None) -> None:
+        if not config.run_id or any(c not in "0123456789abcdef" for c in config.run_id):
+            raise ValueError("Replay requires a shared hexadecimal run identity")
+        self.config = config
+        self.run = self.owner = config.run_id
+        self.chunk_rows = config.chunk_rows
+        self.publication_bytes = config.publication_bytes
+        self._inventory = inventory
+        self._registry_handle = None
+        self._driver = None
+        self._writer = None
+        self._writer_lock = RLock()
+        self._pid = os.getpid()
+        self._backend = TQBodyBackend(self.run, client_factory or self._make_client)
+        self._pending_releases = []
+        self._abandoned_attempts: set[str] = set()
+        self._device_reads = None
+
+    @property
+    def read_batch_bytes(self) -> int:
+        """Bound read scratch independently of larger publication batches."""
+        return min(self.publication_bytes, max(_BASE_READ_BATCH_BYTES, self.config.materialization_bytes // 4))
+
+    def _registry(self) -> Any:
+        if self._registry_handle is None:
+            self._registry_handle = _ray().get_actor(f"replay-{self.run}", namespace=_NAMESPACE)
+        return self._registry_handle
+
+    def invoke(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if os.getpid() != self._pid:
+            raise RuntimeError("Replay transport must be constructed in the current process")
+        if self._inventory is not None:
+            with self._inventory._lock:
+                return getattr(self._inventory, method)(*args, **kwargs)
+        return _call(self._registry(), "invoke", method, args, kwargs)
+
+    def _make_client(self) -> Any:
+        return tq_client_factory(self.invoke("get_connection"), body_partition=self._backend.partition)
+
+    def start_run(self) -> None:
+        if self._driver is not None:
+            raise RuntimeError("Replay run has previous state; only its owning driver may close it")
+        token = uuid.uuid4().hex
+        if self._inventory is not None:
+            self._inventory.state["driver"] = token
+        else:
+            self._registry_handle = _new_registry(self.config, token)
+        self._driver = token
+
+    def register_local_owner(self, connection: Any = None) -> str:
+        # Retained integration entry; TQ no longer needs node-local body owners.
+        if connection is not None:
+            from omegaconf import OmegaConf
+
+            backend = connection.backend.storage_backend
+            resolved = OmegaConf.create(
+                {
+                    "controller": {"zmq_info": connection.controller.zmq_info},
+                    "backend": {"storage_backend": backend, backend: connection.backend[backend]},
+                },
+                flags={"allow_objects": True},
+            )
+            self.invoke("configure", resolved)
+        else:
+            self.invoke("get_connection")
+        return self.owner
+
+    def begin_publication(self, **kwargs: Any) -> Any:
+        from .producer import ProducerChunkWriter, ProducerPublication
+
+        with self._writer_lock:
+            if self._writer is None:
+                # A Mooncake client registers a full host segment and buffer,
+                # so use one worker and one write client for that backend.
+                parallel = (
+                    self._inventory is not None
+                    or self.invoke("get_connection").backend.storage_backend == "SimpleStorage"
+                )
+                max_workers = _SIMPLE_STORAGE_PUBLICATION_WORKERS if parallel else 1
+                self._writer = ProducerChunkWriter(self.publication_bytes, max_workers=max_workers)
+            writer = self._writer
+        return ProducerPublication(self, writer, **kwargs)
+
+    def write_blocks(self, record: str, chunk: int, layers: tuple[int, ...], values: tuple[Any, ...]) -> None:
+        if not layers or len(layers) != len(values) or any(value.shape != values[0].shape for value in values):
+            raise ValueError("Replay batch requires equally shaped layer blocks")
+        self.invoke("reserve_layers", record, chunk, layers, len(values[0]), sum(value.nbytes for value in values))
+        self._backend.write_many([f"{record}:{chunk}:{layer}" for layer in layers], values)
+        try:
+            self.invoke("written_layers", record, chunk, layers)
+        except Exception:
+            # Only metadata acknowledgement is idempotent; never retry an
+            # ambiguous payload put. Unacknowledged blocks remain inventoried.
+            self.invoke("written_layers", record, chunk, layers)
+
+    def _prepare_device_reads(self, device: Any) -> bool:
+        import torch
+
+        if self._inventory is not None or torch.device(device).type != "cuda":
+            return False
+        if self._device_reads is None:
+            from ._gdr import GdrBodyReader, reader_connection
+
+            connection, self._device_reads = reader_connection(self.invoke("get_connection"))
+            if self._device_reads:
+                from transfer_queue.storage.managers import mooncake_manager  # noqa: F401
+
+                self._backend._gdr_reader = GdrBodyReader(
+                    lambda: tq_client_factory(connection, body_partition=self._backend.partition),
+                    partition=self._backend.partition,
+                )
+        return bool(self._device_reads)
+
+    def encoded_batch_limit(self, *, device: Any) -> int:
+        """Bound heterogeneous body reads on both supported transports."""
+        return 32 << 20
+
+    def read_encoded(self, keys: list[str], *, device: Any) -> list[Any]:
+        """Batch CPU bodies with cached routing; RDMA arrives directly on
+        GPU."""
+        if self._prepare_device_reads(device):
+            return self._backend._gdr_reader.read(keys)
+        read = getattr(self._backend, "read_encoded", self._backend.read)
+        return read(keys)
+
+    def attach(self, refs: list[ReplayRef], partition: str) -> None:
+        if partition.startswith(BODY_PARTITION_PREFIX):
+            raise ValueError("Replay sample partition cannot use the body namespace")
+        self.invoke("attach", refs, partition)
+
+    def commit(self, refs: list[ReplayRef]) -> None:
+        self.invoke("commit", refs)
+
+    def discard(self, refs: list[ReplayRef]) -> None:
+        self.invoke("discard", refs)
+
+    async def invoke_async(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if os.getpid() != self._pid:
+            raise RuntimeError("Replay transport must be constructed in the current process")
+        if self._inventory is not None:
+            return await asyncio.to_thread(self.invoke, method, *args, **kwargs)
+        registry = self._registry_handle
+        if registry is None:
+            registry = await asyncio.to_thread(self._registry)
+        return await registry.invoke.remote(method, args, kwargs)
+
+    async def open_response_attempt(self, rid: str) -> None:
+        # Native requests allocate a fresh RID. Fence abandoned attempts in
+        # the same registry call before dispatching a new request.
+        pending = tuple(self._abandoned_attempts)
+        await self.invoke_async("open_response_attempt", rid, pending)
+        self._abandoned_attempts.difference_update(pending)
+
+    async def abandon_response_attempt(self, rid: str) -> None:
+        # Closing is idempotent even if only the ACK was lost.
+        for attempt in range(2):
+            try:
+                await self.invoke_async("finish_response_attempt", rid)
+                return
+            except Exception:
+                if attempt:
+                    self._abandoned_attempts.add(rid)
+                    raise
+
+    async def discard_async(self, refs: list[ReplayRef], *, media: Sequence[dict] = ()) -> None:
+        await self.invoke_async("discard", refs, media=media)
+
+    def validate_partition(self, refs: list[ReplayRef], partition: str) -> None:
+        self.invoke("validate_partition", refs, partition)
+
+    def acquire_many(self, refs: list[ReplayRef], *, partition: str | None = None) -> list[str]:
+        leases = [uuid.uuid4().hex for _ in refs]
+        try:
+            self.invoke("acquire_many", refs, partition=partition, leases=leases)
+        except BaseException as primary:
+            try:
+                self.invoke("rollback_acquire", leases)
+            except Exception as cleanup:
+                self._pending_releases.append(leases)
+                primary.add_note(f"Replay lease rollback pending: {cleanup!r}")
+            raise
+        return leases
+
+    def release_many(self, refs: list[ReplayRef], leases: list[str]) -> None:
+        self.invoke("release_many", refs, leases)
+
+    @contextmanager
+    def reader(self, refs: list[ReplayRef], *, partition: str | None = None) -> Iterator[Any]:
+        from .consumer import ConsumerReadSession
+
+        session = ConsumerReadSession(self, refs, partition=partition)
+        try:
+            yield session
+        except BaseException as primary:
+            try:
+                session.release()
+            except Exception as cleanup:
+                raise primary from cleanup
+            raise
+        else:
+            session.release()
+
+    def _read_into(
+        self, ref: ReplayRef, layer: int, rows: Any, output: Any, destinations: Any, lease: str | None = None
+    ) -> None:
+        self._read_many_into([(ref, rows, destinations, lease)], layer, output)
+
+    def _read_many_into(self, requests: list[tuple[ReplayRef, Any, Any, str | None]], layer: int, output: Any) -> None:
+        self._read_layers_into([(requests, layer, output)])
+
+    def _read_layers_into(
+        self,
+        layers: list[tuple[list[tuple[ReplayRef, Any, Any, str | None]], int, Any]],
+        *,
+        on_layer: Callable[[int], None] | None = None,
+    ) -> None:
+        """Read local layers with bounded, explicit-key TQ batches.
+
+        Requests come from disjoint sample positions in ConsumerBatchLayout.
+        Validate the entire window before I/O. Each distinct reference/lease is
+        authorized once, including different leases for duplicate references.
+        on_layer receives an output's position after all its rows are written.
+        The caller must still observe completion/failure of the entire read.
+        """
+        import numpy as np
+
+        normalized, identities = _validate_read_layers(layers)
+        positions = {id(output): index for index, (_, _, output) in enumerate(layers)}
+        if on_layer is not None and (
+            len(positions) != len(layers)
+            or any(
+                np.shares_memory(output, other)
+                for index, (_, _, output) in enumerate(layers)
+                for _, _, other in layers[:index]
+            )
+        ):
+            raise ValueError("Progressive replay reads require non-overlapping layer outputs")
+        if not normalized:
+            if on_layer is not None:
+                for index in range(len(layers)):
+                    on_layer(index)
+            return
+        if len(identities) == 1:
+            self.invoke("authorize_read", *identities[0])
+        else:
+            self.invoke("authorize_reads", [ref for ref, _ in identities], [lease for _, lease in identities])
+
+        pending: dict[str, _ReadBlock] = {}
+        pending_bytes = 0
+        remaining = dict.fromkeys(positions, 0)
+        enumerated = {id(output) for requests, _, output in layers if not requests}
+        published: set[int] = set()
+
+        def publish_ready() -> None:
+            if on_layer is not None:
+                for identity in positions:
+                    if identity in enumerated and not remaining[identity] and identity not in published:
+                        on_layer(positions[identity])
+                        published.add(identity)
+
+        publish_ready()
+
+        def flush() -> None:
+            blocks = self._backend.read(list(pending))
+            for plan, block in zip(pending.values(), blocks, strict=True):
+                if block.dtype != np.int32 or block.shape != (plan.rows, plan.topk):
+                    raise RuntimeError("TQ replay body shape/dtype differs from manifest")
+                for copy in plan.copies:
+                    source, destination = copy.block_rows, copy.output_rows
+                    if len(source) and np.all(np.diff(source) == 1) and np.all(np.diff(destination) == 1):
+                        # Basic slices are views: avoid the full temporary
+                        # produced by advanced indexing for contiguous CP rows.
+                        np.copyto(
+                            copy.output[int(destination[0]) : int(destination[-1]) + 1],
+                            block[int(source[0]) : int(source[-1]) + 1],
+                        )
+                    else:
+                        copy.output[destination] = block[source]
+                    if on_layer is not None:
+                        remaining[id(copy.output)] -= 1
+            pending.clear()
+            publish_ready()
+
+        for index, selection in enumerate(normalized):
+            ref = selection.ref
+            chunks = selection.source_rows // ref.chunk_rows
+            offsets = selection.source_rows % ref.chunk_rows
+            for chunk in np.unique(chunks):
+                key = f"{ref.record}:{chunk}:{selection.layer}"
+                count = min(ref.chunk_rows, ref.rows - int(chunk) * ref.chunk_rows)
+                if key not in pending:
+                    size = count * ref.topk * 4
+                    if pending and pending_bytes + size > self.read_batch_bytes:
+                        flush()
+                        pending_bytes = 0
+                    # As in single-sample reads, one indivisible chunk may
+                    # exceed the budget; no additional chunk joins that call.
+                    pending[key] = _ReadBlock(count, ref.topk)
+                    pending_bytes += size
+                indexes = np.flatnonzero(chunks == chunk)
+                pending[key].copies.append(
+                    _RowCopy(selection.output, selection.output_rows[indexes], offsets[indexes])
+                )
+                if on_layer is not None:
+                    remaining[id(selection.output)] += 1
+            if on_layer is not None and (
+                index + 1 == len(normalized) or normalized[index + 1].output is not selection.output
+            ):
+                enumerated.add(id(selection.output))
+                publish_ready()
+        if pending:
+            flush()
+
+    def retire_partition(self, partition: str) -> None:
+        self.invoke("retire_partition", partition)
+
+    def abandon_run(self) -> None:
+        """Drop failed-job metadata before its owning TQ is destroyed."""
+        if self._writer is not None:
+            self._writer.close()
+        if self._registry_handle is not None:
+            _ray().kill(self._registry_handle, no_restart=True)
+        self._backend.close()
+        self._device_reads = None
+        self._registry_handle = None
+        self._driver = None
+
+    def close_run(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+        pending, self._pending_releases = self._pending_releases, []
+        for leases in pending:
+            try:
+                self.invoke("rollback_acquire", leases)
+            except Exception:
+                self._pending_releases.append(leases)
+        if self._pending_releases:
+            raise RuntimeError("Replay lease rollback remains incomplete")
+        if self._inventory is not None:
+            self.invoke("close")
+        else:
+            if self._driver is None:
+                raise RuntimeError("This process does not own replay run shutdown")
+            self.invoke("finish", self._driver)
+            _ray().kill(self._registry(), no_restart=True)
+            self._driver = None
+        self._abandoned_attempts.clear()
+        self._backend.close()
+        self._device_reads = None
