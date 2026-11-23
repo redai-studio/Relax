@@ -38,17 +38,15 @@ export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 # Use an exclusive Ray cluster; the operator must prevent concurrent training.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
     : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs HTTP endpoint}"
-    exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
+    exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${qwen38_launcher:-${BASH_SOURCE[0]}}" "$@"
 fi
 
-# Explicit driver/actor settings override entrypoint defaults (notably connections=1).
+# Shared settings for the training actors and Ray job.
 ENV_ARGS=(
     "RELAX_SKIP_NONFINITE_GRAD=${RELAX_SKIP_NONFINITE_GRAD:-1}"
     MCORE_QSA_SPARSE_BACKEND=id_sparse
     TORCHINDUCTOR_COMPILE_THREADS=1
     QWEN38_PLE_CPU_OFFLOAD=1
-    "QWEN38_PLE_INPUT_HALO_CP=${QWEN38_PLE_INPUT_HALO_CP:-0}"
-    "QWEN38_PLE_INPUT_HALO_TRANSPORT=${QWEN38_PLE_INPUT_HALO_TRANSPORT:-adaptive}"
     "RELAX_HYBRID_EP_COMMIT=${RELAX_HYBRID_EP_COMMIT}"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
     RELAX_PROPAGATE_ENV_VARS=QWEN38_WORKSPACE,SAVE_DIR,RELAX_PROFILE_DIR,TENSORBOARD_DIR,CLEARML_CACHE_DIR,CLEARML_OFFLINE_MODE,PYTHONDONTWRITEBYTECODE,RELAX_HYBRID_EP_COMMIT,LD_LIBRARY_PATH,NVLINK_DOMAIN_SIZE,USE_MNNVL,CUDA_DEVICE_MAX_CONNECTIONS,QWEN38_RUN_DIR,RELAX_SKIP_NONFINITE_GRAD
@@ -110,28 +108,48 @@ ENV_ARGS=(
     RELAX_SFT_MTP_ACCEPTANCE_METRICS=0
     RELAX_QWEN38_QSA_GROUPED_BACKWARD_BLOCK_K=32
     RELAX_QWEN38_QSA_SELECTOR_COMPILE=1
-    "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-torch}"
-    "RELAX_QWEN38_QSA_CP=${RELAX_QWEN38_QSA_CP:-0}"
-    "RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE=${RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE:-0}"
-    "RELAX_QWEN38_PLE_CP_FUSED_CONV=${RELAX_QWEN38_PLE_CP_FUSED_CONV:-0}"
-    "RELAX_QWEN38_QSA_CP_TP_SELECTOR=${RELAX_QWEN38_QSA_CP_TP_SELECTOR:-0}"
 )
+# The Muon entrypoint supplies its own optimizer and CP-specific environment.
+if [[ -z "${qwen38_launcher:-}" ]]; then
+    qwen38_optimizer_args=(--optimizer adam)
+    qwen38_precision_flag=--use-precision-aware-optimizer
+    qwen38_extra_env=(
+        "QWEN38_PLE_INPUT_HALO_CP=${QWEN38_PLE_INPUT_HALO_CP:-0}"
+        "QWEN38_PLE_INPUT_HALO_TRANSPORT=${QWEN38_PLE_INPUT_HALO_TRANSPORT:-adaptive}"
+        "RELAX_QWEN38_QSA_SELECTOR_BACKEND=${RELAX_QWEN38_QSA_SELECTOR_BACKEND:-torch}"
+        "RELAX_QWEN38_QSA_CP=${RELAX_QWEN38_QSA_CP:-0}"
+        "RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE=${RELAX_QWEN38_GDN_CP_PREBUILD_ROUTE:-0}"
+        "RELAX_QWEN38_PLE_CP_FUSED_CONV=${RELAX_QWEN38_PLE_CP_FUSED_CONV:-0}"
+        "RELAX_QWEN38_QSA_CP_TP_SELECTOR=${RELAX_QWEN38_QSA_CP_TP_SELECTOR:-0}"
+    )
+fi
+ENV_ARGS+=("${qwen38_extra_env[@]}")
 unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
 export "${ENV_ARGS[@]}"
-TRAIN_ENV_JSON=$(python3 - "${ENV_ARGS[@]}" <<'PYENV'
+TRAIN_ENV_JSON=$(python3 - "${RUNTIME_ENV_JSON:-}" "${ENV_ARGS[@]}" <<'PYENV'
 import json
 import sys
-print(json.dumps(dict(item.split("=", 1) for item in sys.argv[1:])))
+env = dict(item.split("=", 1) for item in sys.argv[2:])
+base_env = json.loads(sys.argv[1] or "{}").get("env_vars", {})
+if base_env.get("LD_LIBRARY_PATH"):
+    # ray-job.sh appends the NVSHMEM and torch library directories.
+    paths = [*env["LD_LIBRARY_PATH"].split(":"), *base_env["LD_LIBRARY_PATH"].split(":")]
+    env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(path for path in paths if path))
+print(json.dumps(env))
 PYENV
 )
+# Muon uses one connection on the GPU-less driver; actors use TRAIN_ENV_JSON.
+export CUDA_DEVICE_MAX_CONNECTIONS="${qwen38_driver_connections:-$CUDA_DEVICE_MAX_CONNECTIONS}"
 BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
 if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
 RUNTIME_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${TRAIN_ENV_JSON}" <<'PYRUNTIME'
 import json
+import os
 import sys
 runtime = json.loads(sys.argv[1])
 runtime.setdefault("env_vars", {}).pop("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", None)
 runtime["env_vars"].update(json.loads(sys.argv[2]))
+runtime["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] = os.environ["CUDA_DEVICE_MAX_CONNECTIONS"]
 print(json.dumps(runtime))
 PYRUNTIME
 )
@@ -209,7 +227,7 @@ if [[ "${QWEN38_SFT_MODALITY:-multimodal}" == multimodal ]]; then
 fi
 
 OPTIMIZER_ARGS=(
-    --optimizer adam
+    "${qwen38_optimizer_args[@]}"
     --lr 2e-5
     --lr-decay-style cosine
     --lr-decay-iters "${LR_DECAY_ITERS:-2023}"
@@ -221,7 +239,7 @@ OPTIMIZER_ARGS=(
     --adam-beta2 0.98
     --clip-grad 1.0
     --use-distributed-optimizer
-    --use-precision-aware-optimizer
+    "$qwen38_precision_flag"
     --no-store-param-remainders
     --moe-aux-loss-coeff 0
 )

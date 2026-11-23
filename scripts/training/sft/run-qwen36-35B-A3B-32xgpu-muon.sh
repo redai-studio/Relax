@@ -13,8 +13,8 @@ export RELAX="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
 : "${DATA_DIR:?Set DATA_DIR}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent shared checkpoint root}"
 export NUM_GPUS=32
-export RAY_ADDRESS="${RAY_ADDRESS:-http://127.0.0.1:8265}"
-export RAY_JOBS_ADDRESS="${RAY_JOBS_ADDRESS:-$RAY_ADDRESS}"
+export RAY_JOBS_ADDRESS="${RAY_API_SERVER_ADDRESS:-${RAY_JOBS_ADDRESS:-${RAY_ADDRESS:-http://127.0.0.1:8265}}}"
+export RAY_API_SERVER_ADDRESS="$RAY_JOBS_ADDRESS"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 export PYTHONDONTWRITEBYTECODE=1
@@ -25,14 +25,10 @@ if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
 fi
 source "${MODEL_CONFIG_DIR:-$RELAX/scripts/models}/qwen35-35B-A3B.sh"
 
-MULTIMODAL=1
+# Accept the legacy flag; this recipe always enables multimodal SFT.
 EXTRA_ARGS=()
 for arg in "$@"; do
-    if [[ "$arg" == --multimodal ]]; then
-        MULTIMODAL=1
-    else
-        EXTRA_ARGS+=("$arg")
-    fi
+    if [[ "$arg" != --multimodal ]]; then EXTRA_ARGS+=("$arg"); fi
 done
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen36}"
@@ -44,10 +40,9 @@ CHECKPOINT_DIR="${SAVE_DIR}/${EXP_NAME}"
 TRAIN_STEPS="${TRAIN_STEPS:-200}"
 
 # Share native libraries while keeping preprocessing and training thread limits separate.
-ENV_JSON="$(python3 - "$MULTIMODAL" <<'PYENV'
+ENV_JSON="$(python3 - <<'PYENV'
 import json
 import os
-import sys
 from pathlib import Path
 
 def build_environment() -> dict[str, str]:
@@ -64,6 +59,9 @@ def build_environment() -> dict[str, str]:
         if not Path(p).name.startswith(("libnccl.so", "libcublas.so", "libcublasLt.so"))
     ]
     env = {key: os.environ[key] for key in ("PYTHONPATH", "PYTHONDONTWRITEBYTECODE") if key in os.environ}
+    cache_dir = os.environ.get("EP_JIT_CACHE_DIR") or f"/tmp/relax-qwen35-{os.getuid()}/deepep"
+    if not Path(cache_dir).is_absolute():
+        raise ValueError("EP_JIT_CACHE_DIR must be an absolute path on the training nodes")
     env.update(
         {
             "LD_PRELOAD": ":".join(
@@ -84,7 +82,7 @@ def build_environment() -> dict[str, str]:
             ),
             "RELAX_FLA_CONV_NB_MODE": "none",
             "EP_NCCL_ROOT_DIR": str(nccl),
-            "EP_JIT_CACHE_DIR": f"/tmp/relax-qwen35-{os.getuid()}/deepep",
+            "EP_JIT_CACHE_DIR": cache_dir,
         }
     )
     env.update(
@@ -96,10 +94,10 @@ def build_environment() -> dict[str, str]:
             "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM": "0",
             "NVTE_CUTEDSL_FUSED_GROUPED_MLP": "0",
             "RELAX_SFT_SELECTIVE_LOGITS": "1",
-            "RELAX_DISABLE_VISION_BRANCH_SYNC": "1",
+            "RELAX_DISABLE_VISION_BRANCH_SYNC": "0",
             "RELAX_LOGPROB_CE_IMPL": "native",
             "RELAX_MTP_CE_IMPL": "native",
-            "RELAX_LOGPROB_FAST_PATH": "1",
+            "RELAX_LOGPROB_FAST_PATH": "0",
             "OMP_NUM_THREADS": "24",
             "MKL_NUM_THREADS": "24",
             "OPENBLAS_NUM_THREADS": "24",
@@ -148,24 +146,20 @@ if os.environ.get("DRY_RUN") != "1":
     mode = os.environ.get("RELAX_FLA_CONV_NB_MODE", "original")
     assert mode == "none" or (mode == "auto" and os.environ.get("RELAX_GPU_ARCH") in {"blackwell", "b300"})  # gitleaks:allow -- existing runtime environment compatibility key
 env = build_environment()
-multimodal = sys.argv[1] == "1"
-if multimodal:
-    env.update({"RELAX_DISABLE_VISION_BRANCH_SYNC": "0", "RELAX_LOGPROB_FAST_PATH": "0"})
 runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 runtime.setdefault("env_vars", {}).update(env)
-if multimodal:
-    preprocessing = {
-        "RELAX_PROCESSOR_POOL_SIZE": "96",
-        "OMP_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "TOKENIZERS_PARALLELISM": "false",
-    }
-    runtime["env_vars"].update(preprocessing)
-    propagate = runtime["env_vars"].get("RELAX_PROPAGATE_ENV_VARS", "").split(",")
-    runtime["env_vars"]["RELAX_PROPAGATE_ENV_VARS"] = ",".join(
-        dict.fromkeys([name for name in propagate if name] + list(preprocessing))
-    )
+preprocessing = {
+    "RELAX_PROCESSOR_POOL_SIZE": "96",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+}
+runtime["env_vars"].update(preprocessing)
+propagate = runtime["env_vars"].get("RELAX_PROPAGATE_ENV_VARS", "").split(",")
+runtime["env_vars"]["RELAX_PROPAGATE_ENV_VARS"] = ",".join(
+    dict.fromkeys([name for name in propagate if name] + list(preprocessing))
+)
 for key in ("NCCL_PROTO", "NCCL_ALGO"):
     runtime["env_vars"].pop(key, None)
 print(json.dumps(env))
@@ -196,10 +190,10 @@ SFT_ARGS=(
     --balance-data
     --sft-oversize-strategy keep
     --data-pad-size-multiplier 1024
-    --sft-max-in-flight-steps 2
-    --sft-prefetch-buffer-size 128
+    --sft-max-in-flight-steps 3
+    --sft-prefetch-buffer-size 2048
     --sft-prefetch-chunk-size 128
-    --sft-prefetch-num-workers 16
+    --sft-prefetch-num-workers 96
     --sft-tq-timeout-minutes 60
     --sft-chunked-logits
     --sft-logits-chunk-size 1024
@@ -212,20 +206,11 @@ SFT_ARGS=(
     --apply-chat-template-kwargs '{"enable_thinking":false,"preserve_thinking":true,"add_non_thinking_prefix":true}'
     --metadata-key meta
     --tool-key tools
-    --sft-invalid-multimodal-strategy skip
+    --multimodal-keys '{"image":"images"}'
+    --image-max-token-num 16384
+    --image-min-token-num 64
+    --sft-invalid-multimodal-strategy error
 )
-
-if [[ "$MULTIMODAL" == 1 ]]; then
-    SFT_ARGS+=(
-        --multimodal-keys '{"image":"images"}'
-        --image-max-token-num 16384
-        --image-min-token-num 64
-        --sft-invalid-multimodal-strategy error
-        --sft-max-in-flight-steps 3
-        --sft-prefetch-buffer-size 2048
-        --sft-prefetch-num-workers 96
-    )
-fi
 
 MTP_ARGS=(
     --mtp-num-layers 1
