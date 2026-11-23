@@ -562,7 +562,7 @@ def test_wrapper_derives_vp_stage_from_parallel_state(monkeypatch):
 
     wrapped_provider = module.wrap_model_provider_with_freeze(
         original_provider,
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None, task_type="causal_lm"),
+        _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None),
     )
     wrapped_provider(pre_process=True, post_process=False)
 
@@ -580,7 +580,7 @@ def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch
 
     wrapped_provider = module.wrap_model_provider_with_freeze(
         lambda **kwargs: SimpleNamespace(named_parameters=lambda: []),
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None, task_type="causal_lm"),
+        _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None),
     )
     wrapped_provider(post_process=False)
 
@@ -614,7 +614,7 @@ def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     bridge_provider = module.get_model_provider_func(_bridge_args(), role="actor")
     wrapped_provider = module.wrap_model_provider_with_freeze(
         bridge_provider,
-        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None, task_type="causal_lm"),
+        _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None),
     )
     wrapped_provider(pre_process=True, post_process=False)
 
@@ -676,9 +676,7 @@ def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrappe
 
     monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
     monkeypatch.setattr(module, "build_lora_peft", lambda args: _FakePEFT())
-    args = SimpleNamespace(
-        only_train_params_name_list=None, freeze_params_name_list=None, lora_scope="all", task_type="causal_lm"
-    )
+    args = _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None)
     provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
     if "lora" in wrapper:
         provider = module.wrap_model_provider_with_lora(provider, args)
