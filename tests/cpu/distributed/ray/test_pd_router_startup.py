@@ -469,7 +469,7 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     monkeypatch.setattr(rollout_module, "remove_dead_router_worker", cleanup)
     pending, failed = object(), object()
     replacements = [make_mock_engine() for _ in slots]
-    # A shutdown queued behind pending init can time out; every actor must still be killed.
+    # A shutdown queued behind pending init must finish before its slot is reused.
     shutdown_ref = object()
     replacements[0].shutdown.remote.return_value = shutdown_ref
     attempts = []
@@ -491,12 +491,16 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
 
     failure = RuntimeError("Required PD router registration failed")
 
+    shutdown_attempts = []
+
     def get(refs, timeout=None):
         if isinstance(refs, list) and failed in refs and len(attempts) == 1:
             raise failure
         if refs is shutdown_ref:
-            assert timeout == 10
-            raise rollout_module.ray.exceptions.GetTimeoutError("shutdown queued behind pending init")
+            shutdown_attempts.append(timeout)
+            if len(shutdown_attempts) == 1:
+                raise rollout_module.ray.exceptions.GetTimeoutError("shutdown queued behind pending init")
+            return None
         return mock_ray_get(refs, timeout)
 
     monkeypatch.setattr(group, "start_engines", start)
@@ -509,15 +513,19 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
         server.recover()
 
     assert caught.value is failure
-    assert group.all_engines == surviving + [None] * len(slots)
+    assert group.all_engines == surviving + replacements[:1] + [None] * (len(slots) - 1)
+    assert group.pending_shutdown == {slots[0]}
     assert server.num_new_engines == 0
     assert group.engine_init_records == records
-    assert [call.args[0] for call in kill.call_args_list] == replacements
+    assert {call.args[0] for call in kill.call_args_list} == set(replacements[1:])
     for engine in surviving:
         engine.shutdown.remote.assert_not_called()
 
     server.recover()
     assert group.all_engines == surviving + replacements
+    assert shutdown_attempts == [rollout_module.ENGINE_SHUTDOWN_TIMEOUT_S] * 2
+    assert not group.pending_shutdown
+    assert kill.call_args.args == (replacements[0],)
     assert server.num_new_engines == len(slots)
     assert [call.args[2].actor_id for call in cleanup.call_args_list] == [
         f"{generation}-{slot}" for generation in ("old", "new") for slot in slots[::nodes_per_engine]
