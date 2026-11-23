@@ -18,6 +18,8 @@ from threading import Condition
 from time import perf_counter
 from typing import Any
 
+from .sglang import AGENTIC_R3_MM_PREFIX
+
 
 REQUEST_PREFIX = "relax-mm-"
 ATTEMPT_PREFIX = REQUEST_PREFIX + "attempt-"
@@ -25,9 +27,7 @@ META_FIELD = "mm_embedding_refs"
 
 
 def captures_request(rid: str) -> bool:
-    from .sglang import AGENTIC_R3_REQUEST_PREFIX
-
-    return rid.startswith((REQUEST_PREFIX, AGENTIC_R3_REQUEST_PREFIX + "mm-"))
+    return rid.startswith((REQUEST_PREFIX, AGENTIC_R3_MM_PREFIX))
 
 
 _CAPTURE: ContextVar[MMCapture | None] = ContextVar("relax_mm_capture", default=None)
@@ -125,7 +125,7 @@ class MMCapture:
             if [(m.digest, m.grid, m.modality) for m in previous] != metadata:
                 raise ValueError("MM replay request changed its media layout")
             return
-        attempt = rid if rid.startswith(ATTEMPT_PREFIX) else None
+        attempt = rid if rid.startswith((ATTEMPT_PREFIX, AGENTIC_R3_MM_PREFIX)) else None
         self.requests[rid] = [_Media(*description, attempt=attempt) for description in metadata]
 
     def capture(self, item: Any, embedding: Any) -> None:

@@ -38,6 +38,7 @@ from ..ref_data import (
 _CAPTURE_FIELDS = {"moe": "routed_experts"}
 ROUTE_ATTEMPT_PREFIX = "relax-r3-attempt-"
 AGENTIC_R3_REQUEST_PREFIX = "relax-agentic-r3-"
+AGENTIC_R3_MM_PREFIX = AGENTIC_R3_REQUEST_PREFIX + "mm-"
 
 
 @dataclass
@@ -195,9 +196,9 @@ class SGLangProducer(Producer):
                 # A retry of the same logical request can overlap an unacknowledged registry close.
                 if not evaluation:
                     request_id = f"{request_id}-{uuid4().hex}"
-                request_id = AGENTIC_R3_REQUEST_PREFIX + ("mm-" if media else "") + request_id
+                request_id = (AGENTIC_R3_MM_PREFIX if media else AGENTIC_R3_REQUEST_PREFIX) + request_id
             elif media:
-                request_id = REQUEST_PREFIX + request_id
+                request_id = ATTEMPT_PREFIX + uuid4().hex if reference else REQUEST_PREFIX + request_id
             options["rid"] = request_id
         elif media:
             options["rid"] = ATTEMPT_PREFIX + uuid4().hex

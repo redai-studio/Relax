@@ -2,6 +2,7 @@
 
 """MM capture contracts without importing SGLang or initializing CUDA."""
 
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -234,6 +235,86 @@ async def test_builtin_mm_generation_transfers_only_delivered_response_leases(ca
             runtime.flush()
     assert calls == ["/generate"]
     assert not inventory.state["objects"]
+
+
+@pytest.mark.parametrize("r3", [False, True], ids=["mm-only", "r3-mm"])
+@pytest.mark.parametrize("delivery", ["success", "response-lost", "late-publication"])
+async def test_agentic_mm_response_lease_follows_wire_request(capture, monkeypatch, r3, delivery):
+    from relax.agentic.pipeline import runtime as agentic
+    from relax.distributed.replay_manager.backend import sglang
+    from tests.cpu.test_agentic_rollout import _backend_adapter
+
+    media, store, inventory = capture
+    manager = ReplayManager(config=store.config, store_factory=lambda: store)
+    monkeypatch.setattr(agentic, "replay_data_manager", manager)
+    monkeypatch.setattr(sglang, "replay_data_manager", manager)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_mm_embedding_replay = True
+    adapter._args.use_rollout_routing_replay = r3
+    expected = torch.ones(4, 2560, dtype=torch.bfloat16)
+    calls = []
+
+    def publish(payload):
+        rid = payload["rid"]
+        image = item()
+        media.bind(rid, SimpleNamespace(mm_items=[image]))
+        media.capture(image, expected)
+        meta = {META_FIELD: finish(media, rid), "finish_reason": {"type": "stop"}}
+        if payload.get("return_routed_experts"):
+            req = SimpleNamespace(origin_input_ids=payload["input_ids"], output_ids=[2], req_pool_idx=0, **payload)
+            processor = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[0]])))
+            capturer = SimpleNamespace(host_cache=SimpleNamespace(buffer=torch.tensor([[[3]]], dtype=torch.int32)))
+            route = sglang._advance_publication(processor, req, 1, {"moe": lambda: capturer}, final=True)["moe"]
+            meta["routed_experts"] = sglang._wire_ref(route)
+        return meta
+
+    def worker(request):
+        payload = json.loads(request.content)
+        calls.append((request.url.path, payload))
+        if request.url.path == "/abort_request":
+            return httpx.Response(200, json={})
+        if delivery == "late-publication":
+            raise httpx.ReadError("response lost before capture completes")
+        meta = publish(payload)
+        if delivery == "response-lost":
+            raise httpx.ReadError("response lost after capture completes")
+        return httpx.Response(200, json={"output_ids": [2], "meta_info": meta})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(worker)) as client:
+        adapter._managed_http = client
+        result = adapter.generate(
+            input_ids=[1],
+            image_data=["image"],
+            sampling_params={},
+            session_id="s",
+            request_id="r",
+            engine_url="http://worker",
+            lora_path="v",
+        )
+        if delivery == "success":
+            meta = (await result).meta_info
+            (entry,) = meta[META_FIELD]
+            media.flush()
+            torch.testing.assert_close(read_mm_embedding(store, entry), expected)
+            release_media_entries(store, [entry])
+            if r3:
+                producer = manager.register_producer({"moe", "mm_embedding"})
+                (route,) = producer.response_refs(meta)
+                await producer.adopt_response([route], "session")
+                store.discard([route])
+        else:
+            with pytest.raises(httpx.ReadError):
+                await result
+            await adapter.abort_request("r")
+            (generate_url, payload), (abort_url, abort) = calls
+            assert (generate_url, abort_url) == ("/generate", "/abort_request")
+            assert abort["rid"] == payload["rid"]
+            if delivery == "late-publication":
+                assert publish(payload)[META_FIELD] == []
+            media.flush()
+    inventory.retire_partition("train_0")
+    assert not inventory.snapshot()["objects"]
 
 
 def test_mm_request_marker_is_absent_in_evaluation():
@@ -537,6 +618,7 @@ def test_scheduler_pause_preserves_mm_until_response_but_hard_abort_releases(cap
 
     runtime, store, inventory = capture
     rid, image = "relax-agentic-r3-mm-pause", item()
+    inventory.open_response_attempt(rid)
     runtime.bind(rid, SimpleNamespace(mm_items=[image]))
     expected = torch.arange(4 * 2560, dtype=torch.float32).reshape(4, 2560).bfloat16()
     runtime.capture(image, expected)
@@ -544,18 +626,22 @@ def test_scheduler_pause_preserves_mm_until_response_but_hard_abort_releases(cap
     _abort_request_publication(request, keep_moe=resumable)
     if resumable:
         entries = finish(runtime, rid)
+        inventory.finish_response_attempt(rid, [entry["lease"] for entry in entries])
         runtime.flush()
         runtime._worker.submit(lambda: None).result(timeout=10)
         # The emitted response owns a lease independently of the flushed cache.
         torch.testing.assert_close(read_mm_embedding(store, entries[0]).view(torch.uint8), expected.view(torch.uint8))
         release_media_entries(store, entries)
         resumed = rid + "-resumed"
+        inventory.open_response_attempt(resumed)
         runtime.bind(resumed, SimpleNamespace(mm_items=[image]))
         runtime.capture(image, expected)
         resumed_entries = finish(runtime, resumed)
+        inventory.finish_response_attempt(resumed, [entry["lease"] for entry in resumed_entries])
         torch.testing.assert_close(read_mm_embedding(store, resumed_entries[0]), expected)
         release_media_entries(store, resumed_entries)
     else:
+        inventory.finish_response_attempt(rid)
         assert request._relax_replay_media is None
         assert rid not in runtime.requests
     runtime.flush()
