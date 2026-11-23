@@ -28,7 +28,7 @@ def operators(monkeypatch):
     monkeypatch.setitem(sys.modules, "relax.models", package)
     existing = set(sys.modules)
     selector = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.selector")
-    dosa = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.dosa_selector")
+    dosa = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.seed_bound_selector")
     # The selector may already have been imported by a different test module.
     selector._interval_config.cache_clear()
     yield selector.select_ids, dosa.dosa_select_ids
@@ -117,7 +117,7 @@ def test_qsa_dosa_random_cancellation_matches_radix(operators):
 def test_qsa_dosa_certificate_encloses_scores_and_unsafe_values(operators):
     import triton
 
-    from relax.models.qwen3_8.ops.qsa_cute import dosa_kernels as kernels
+    from relax.models.qwen3_8.ops.qsa_cute import score_bound_kernels as kernels
 
     torch.manual_seed(91)
     q = torch.randn(7, 4, 128, device="cuda", dtype=torch.bfloat16)
@@ -197,7 +197,7 @@ def test_qsa_dosa_512k_radix_accumulation_layout(operators):
 @pytest.mark.parametrize("capacity", [256, 768], ids=["smaller-than-topk", "non-power-of-two"])
 def test_qsa_dosa_small_topk_requires_compatible_capacity(operators, capacity):
     select, _ = operators
-    from relax.models.qwen3_8.ops.qsa_cute.dosa_interval import IntervalConfig, select_interval_ids
+    from relax.models.qwen3_8.ops.qsa_cute.score_interval_selector import IntervalConfig, select_interval_ids
 
     query = torch.zeros(1, 4, 128, dtype=torch.bfloat16, device="cuda")
     keys = torch.zeros(4097, 128, dtype=torch.bfloat16, device="cuda")
@@ -220,7 +220,7 @@ def test_qsa_dosa_interval_preserves_fp32_topk_membership(operators, monkeypatch
     if not _has_cudnn_topk():
         pytest.skip("DoSA interval and boundary selection require cuDNN DSA indexer TopK")
 
-    dosa_interval = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.dosa_interval")
+    score_interval_selector = importlib.import_module("relax.models.qwen3_8.ops.qsa_cute.score_interval_selector")
     query = torch.zeros(1, 4, 128, dtype=torch.bfloat16, device="cuda")
     keys = torch.zeros(8192, 128, dtype=torch.bfloat16, device="cuda")
     query[:, :, 0] = 1
@@ -240,14 +240,14 @@ def test_qsa_dosa_interval_preserves_fp32_topk_membership(operators, monkeypatch
     monkeypatch.setenv("QWEN38_DOSA_INTERVAL_CONFIG", json.dumps(config))
 
     stats = {}
-    select_interval_ids = dosa_interval.select_interval_ids
+    select_interval_ids = score_interval_selector.select_interval_ids
 
     def record_stats(*args, **kwargs):
-        assert kwargs["config"] == dosa_interval.IntervalConfig(**config)
+        assert kwargs["config"] == score_interval_selector.IntervalConfig(**config)
         assert kwargs["boundary_only"] is boundary_only
         return select_interval_ids(*args, **kwargs, stats=stats)
 
-    monkeypatch.setattr(dosa_interval, "select_interval_ids", record_stats)
+    monkeypatch.setattr(score_interval_selector, "select_interval_ids", record_stats)
     result = select(query, keys, positions, 512, impl="dosa-set" if boundary_only else "dosa")
     radix = select(query, keys, positions, 512, impl="triton")
     expected = torch.arange(512, dtype=torch.int32, device="cuda").unsqueeze(0)
@@ -262,7 +262,7 @@ def test_qsa_dosa_interval_preserves_fp32_topk_membership(operators, monkeypatch
 
 def test_qsa_dosa_fp16_boundary_keeps_radix_membership_and_fallback(operators):
     select, _ = operators
-    from relax.models.qwen3_8.ops.qsa_cute.dosa_interval import IntervalConfig, select_interval_ids
+    from relax.models.qwen3_8.ops.qsa_cute.score_interval_selector import IntervalConfig, select_interval_ids
     from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import _has_cudnn_topk
 
     if not _has_cudnn_topk():

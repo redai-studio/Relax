@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice as lib
 
-from relax.models.qwen3_8.ops.qsa_cute.dosa_kernels import _scores
+from relax.models.qwen3_8.ops.qsa_cute.score_bound_kernels import _scores
 
 
 @triton.jit

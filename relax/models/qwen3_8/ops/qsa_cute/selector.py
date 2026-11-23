@@ -14,7 +14,7 @@ from torch import Tensor
 
 @functools.lru_cache(maxsize=1)
 def _interval_config():
-    from relax.models.qwen3_8.ops.qsa_cute.dosa_interval import IntervalConfig
+    from relax.models.qwen3_8.ops.qsa_cute.score_interval_selector import IntervalConfig
 
     return IntervalConfig(**json.loads(os.environ.get("QWEN38_DOSA_INTERVAL_CONFIG", "{}")))
 
@@ -45,14 +45,14 @@ def select_ids(query: Tensor, keys: Tensor, positions: Tensor, budget: int, impl
         boundary_only = impl == "dosa-set"
         variant = os.environ.get("QWEN38_DOSA_VARIANT")
         if boundary_only or variant in ("interval", "boundary"):
-            from relax.models.qwen3_8.ops.qsa_cute.dosa_interval import select_interval_ids
+            from relax.models.qwen3_8.ops.qsa_cute.score_interval_selector import select_interval_ids
 
             config = _interval_config()
             if not boundary_only and (config.boundary_bins or config.boundary_reuse_topk):
                 config = config._replace(half_scores=False, boundary_bins=0, boundary_reuse_topk=False)
             selected = select_interval_ids(query, keys, visible, budget, config=config, boundary_only=boundary_only)
         else:
-            from relax.models.qwen3_8.ops.qsa_cute.dosa_selector import dosa_select_ids
+            from relax.models.qwen3_8.ops.qsa_cute.seed_bound_selector import dosa_select_ids
 
             selected = dosa_select_ids(query, keys, visible, budget)
         if selected is not None:

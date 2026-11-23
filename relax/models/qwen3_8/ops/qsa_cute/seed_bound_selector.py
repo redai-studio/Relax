@@ -58,7 +58,7 @@ def dosa_select_ids(
         return None
     import triton
 
-    from relax.models.qwen3_8.ops.qsa_cute import dosa_kernels as kernels
+    from relax.models.qwen3_8.ops.qsa_cute import score_bound_kernels as kernels
     from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import (
         _qsa_select_score_kernel,
         _qsa_select_topk_kernel,

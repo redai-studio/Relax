@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice as lib
 
-from relax.models.qwen3_8.ops.qsa_cute.dosa_kernels import _safe, _scores, _up, key_norm
+from relax.models.qwen3_8.ops.qsa_cute.score_bound_kernels import _safe, _scores, _up, key_norm
 from relax.models.qwen3_8.ops.qsa_cute.triton_qsa_select import (
     _MAX_ID_CODE,
     ID_BITS,
@@ -207,7 +207,7 @@ def select_interval_ids(
     if boundary_only and config.prefix_threshold:
         return None  # A truncated threshold cannot certify membership in both directions.
     if boundary_only:
-        from relax.models.qwen3_8.ops.qsa_cute.dosa_boundary import compact_boundary, finish_boundary
+        from relax.models.qwen3_8.ops.qsa_cute.topk_membership import compact_boundary, finish_boundary
     if reuse_topk:
         from cudnn import DSA
 
