@@ -105,11 +105,11 @@ def prune_stale_artifacts(args, rollout_id: int) -> None:
     ``--artifact-retention-rollouts <= 0`` disables pruning. Best-effort: a
     failed unlink must never abort a rollout.
     """
-    keep = int(getattr(args, "artifact_retention_rollouts", _DEFAULT_ARTIFACT_RETENTION_ROLLOUTS))
-    root = getattr(args, "artifact_root", None)
+    keep = int(args.artifact_retention_rollouts)
+    root = args.artifact_root
     if keep <= 0:
         return
-    is_art = (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art"
+    is_art = (args.sampling_config or {}).get("algorithm") == "art"
     memory_cutoff = int(rollout_id) - (keep if is_art else max(keep, _DEFAULT_ARTIFACT_RETENTION_ROLLOUTS))
     stale_keys = [key for key in _TRAJECTORY_REF_CACHE if key[0] <= memory_cutoff]
     if is_art and stale_keys:
@@ -136,7 +136,7 @@ def prune_stale_artifacts(args, rollout_id: int) -> None:
         return
     import shutil
 
-    task = str(getattr(args, "generation_task", "") or "")
+    task = str(args.generation_task or "")
     for base in (os.path.join(root, task), os.path.join(root, "eval", task)):
         try:
             names = os.listdir(base)
@@ -492,7 +492,7 @@ def _prepare_generated_group(
         args, sampling, rollout_id, group_index, common, conditions, tracks
     )
     for slot, (sample, response) in enumerate(zip(group, responses)):
-        if getattr(args, "reward_runtime", "cpu") == "remote":
+        if args.reward_runtime == "remote":
             uri, height, width, digest = save_candidate_image(
                 response.get("generated_output"),
                 args.artifact_root,
@@ -547,7 +547,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
     if evaluation:
         return evaluate_rollout(args, rollout_id)
 
-    sampling = getattr(args, "sampling_config", None) or {}
+    sampling = args.sampling_config or {}
     if sampling.get("overlap_group_processing") or sampling.get("generation_prefetch"):
         raise ValueError("Group overlap and generation prefetch require the separate ART performance branch.")
     adapter = _load_adapter(args)
@@ -586,7 +586,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
         if minimum_bytes > cache_limit:
             raise ValueError("ART dense trajectory lower bound exceeds max_cache_bytes before dispatch.")
     out_groups: List[List[Sample]] = []
-    base_seed = int(getattr(args, "generation_seed", 1234))
+    base_seed = int(args.generation_seed)
     request_sampling_base = {**sampling, "_rollout_id": int(rollout_id), "_base_seed": base_seed, "_evaluation": False}
     driver_xt = bool(sampling.get("driver_xt", True))
     # Constant for the whole rollout (see _sampling_fingerprint) — hoisted out of
@@ -738,8 +738,8 @@ def evaluate_rollout(args, rollout_id: int):
 
     adapter = _load_adapter(args)
     engines = _get_engines(args, None)
-    sampling = dict(getattr(args, "sampling_config", None) or {})
-    base_seed = int(getattr(args, "generation_seed", 1234))
+    sampling = dict(args.sampling_config or {})
+    base_seed = int(args.generation_seed)
     request_sampling_base = {
         **sampling,
         "_rollout_id": int(rollout_id),
@@ -754,7 +754,7 @@ def evaluate_rollout(args, rollout_id: int):
         if not prompts:
             logger.warning(f"native evaluate_rollout: dataset {cfg.name!r} at {cfg.path!r} yielded no prompts.")
             continue
-        n = int(getattr(cfg, "n_samples_per_eval_prompt", None) or getattr(args, "n_samples_per_eval_prompt", 1) or 1)
+        n = int(getattr(cfg, "n_samples_per_eval_prompt", None) or args.n_samples_per_eval_prompt or 1)
 
         scored: List[Sample] = []
         # n single-candidate requests per prompt, with every candidate of a wave
@@ -824,7 +824,7 @@ def evaluate_rollout(args, rollout_id: int):
         component_rewards = score_samples(args, scored)
         if not component_rewards:
             continue
-        weights = getattr(args, "reward_component_weights", None) or {}
+        weights = args.reward_component_weights or {}
         primary = max(weights, key=weights.get) if weights else next(iter(component_rewards))
         entry: Dict[str, Any] = {"rewards": [float(v) for v in component_rewards[primary]]}
         # Surface every component so a multi-component reward is fully visible.
@@ -926,7 +926,7 @@ def _read_eval_prompts(args, cfg) -> List[Sample]:
     if not path or not os.path.exists(path):
         logger.warning(f"native evaluate_rollout: eval dataset path {path!r} does not exist.")
         return []
-    prompt_key = getattr(cfg, "input_key", None) or getattr(args, "input_key", None) or "prompt"
+    prompt_key = getattr(cfg, "input_key", None) or args.input_key or "prompt"
     samples: List[Sample] = []
     with open(path, encoding="utf-8") as handle:
         for line in handle:
@@ -1122,7 +1122,7 @@ def convert_samples_to_train_data(args, samples):
         # zero-gradient round is an explicit skip, not a silent no-op.
         "skip_optimizer_step": [int((s.train_metadata or {}).get("skip_optimizer_step", 0)) for s in flat],
     }
-    if (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art":
+    if (args.sampling_config or {}).get("algorithm") == "art":
         if any("art_reward" not in (sample.train_metadata or {}) for sample in flat):
             raise ValueError("ART requires raw scalar rewards from the ART reward post-process hook.")
         train_data["valid_masks"] = [int(bool((s.train_metadata or {}).get("valid_mask", True))) for s in flat]
@@ -1204,7 +1204,7 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
             )
         group_slots[int(slot)] = i
 
-    if (getattr(args, "sampling_config", None) or {}).get("algorithm") == "art":
+    if (args.sampling_config or {}).get("algorithm") == "art":
         return _hydrate_art_micro_batches(args, adapter, rollout_id, rows, by_group, dp_rank, dp_world)
 
     micro_batches: List[Dict[str, Any]] = []

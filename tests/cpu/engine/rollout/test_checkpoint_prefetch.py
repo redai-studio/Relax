@@ -37,6 +37,8 @@ def test_resume_reads_next_unconsumed_group(monkeypatch, tmp_path, interval, rot
         rollout_shuffle=True,
         lora_rank=0,
         lora_adapter_mode=False,
+        use_streaming_dataset=False,
+        sampling_config=None,
     )
 
     def source():
