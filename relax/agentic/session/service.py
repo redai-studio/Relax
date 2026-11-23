@@ -2752,7 +2752,9 @@ class AgenticSessionShard:
                             endpoint = await self._lora_runtime.route.remote(session.lora_key, binding)
                             managed_kwargs = {"lora_path": binding.lora_name, "engine_url": endpoint}
                         before_version = (
-                            await generation_snapshot(audit_coordinator) if audit_enabled and not managed_kwargs else None
+                            await generation_snapshot(audit_coordinator)
+                            if audit_enabled and not managed_kwargs
+                            else None
                         )
                         async with session.lock:
                             if not is_current():

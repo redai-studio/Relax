@@ -764,7 +764,7 @@ class DeviceDirectBackend(CommBackend):
 
         from relax.utils.agentic_obs.weight_publication import begin_publication, commit_publication
 
-        if not actor_fwd_only:
+        if not actor_fwd_only and not self._lora_adapter_mode:
             begin_publication(self)
 
         if self._use_bridge:

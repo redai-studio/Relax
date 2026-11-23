@@ -141,8 +141,25 @@ def test_dcs_publication_requires_completed_quantization(rollout_backend, monkey
         assert resumed == [{"policy": "policy", "epoch": "epoch", "ordinal": 1, "raw_version": "1"}]
 
 
-def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_backend):
+def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_backend, monkeypatch):
+    from relax.utils import distributed_utils
+    from relax.utils.agentic_obs import weight_publication
+    from relax.utils.agentic_obs.weight_audit import PublicationLedger
+
     backend, events, _ = rollout_backend
+    backend.args.dump_agentic_obs = "unused"
+    backend.args.use_agentic_rollout = True
+    backend.args.agentic_obs_run_id = "adapter"
+    ledger = PublicationLedger()
+    coordinator = SimpleNamespace(
+        begin_weight_publication=SimpleNamespace(remote=ledger.begin),
+        commit_weight_publication=SimpleNamespace(remote=ledger.commit),
+    )
+    monkeypatch.setattr(weight_publication, "_resolve_coordinator", lambda: coordinator)
+    monkeypatch.setattr(weight_publication, "_FRONTIERS", {})
+    monkeypatch.setattr(distributed_utils, "get_gloo_group", lambda: object())
+    monkeypatch.setattr(device_direct.dist, "get_global_rank", lambda group, rank: rank)
+    monkeypatch.setattr(device_direct.ray, "get", lambda value, **kwargs: value)
     backend.quantization_config = {"quant_method": "compressed-tensors"}
     backend._lora_adapter_mode = True
     backend._lora_sync = SimpleNamespace(base_sync_done=False, adapter_loaded=False)
@@ -150,9 +167,13 @@ def test_quantized_adapter_delta_does_not_restore_or_repack_frozen_base(rollout_
     backend.update_weights_for_rollout(rollout_only=True)
     assert len([e for e in events if isinstance(e, tuple) and e[0] == "/post_process_weights"]) == 2
     assert backend._lora_sync.base_sync_done
+    assert ledger.snapshot() is None
+    assert weight_publication.publication_label(backend) == "1"
     events.clear()
     backend.update_weights_for_rollout(rollout_only=True)
     assert events == [("/pause_generation", None), "flush", "adapter", ("/continue_generation", None)]
+    assert ledger.snapshot() is None
+    assert weight_publication.publication_label(backend) == "2"
 
 
 @pytest.mark.parametrize("rank", [0, 1])

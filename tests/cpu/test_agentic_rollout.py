@@ -2138,7 +2138,9 @@ async def test_managed_session_keeps_version_across_abort_resume_and_tool_gap():
     ir.parent_state_hash = root.state_hash
     ir.pending_token_delta = []
     frontier = {"policy": "p", "epoch": "e", "ordinal": 1, "raw_version": "mutable"}
-    shard._sglang_request_limiter = SimpleNamespace(weight_publication_snapshot=remote(AsyncMock(return_value=frontier)))
+    shard._sglang_request_limiter = SimpleNamespace(
+        weight_publication_snapshot=remote(AsyncMock(return_value=frontier))
+    )
     calls = []
 
     async def generate(**kwargs):
