@@ -742,6 +742,36 @@ def _localize_full_tensor(value: torch.Tensor, target: torch.Tensor) -> torch.Te
     return result
 
 
+def find_latest_complete_checkpoint(save_root: str) -> str | None:
+    """Find a published step even if the root recovery pointer is stale."""
+    if not os.path.isdir(save_root):
+        return None
+    with os.scandir(save_root) as entries:
+        candidates = sorted(
+            (
+                (int(entry.name), entry.path)
+                for entry in entries
+                if entry.name.isdecimal() and entry.is_dir(follow_symlinks=False)
+            ),
+            reverse=True,
+        )
+    for step, path in candidates:
+        marker = os.path.join(path, _LATEST)
+        if not os.path.isfile(marker):
+            continue
+        with open(marker, encoding="utf-8") as file:
+            if file.read().strip() != str(step):
+                raise ValueError(f"Checkpoint completion marker does not match its step: {path}")
+        has_model = any(os.path.isfile(os.path.join(path, name)) for name in ("model.safetensors", "model.bin"))
+        has_state = os.path.isfile(os.path.join(path, _DCP_METADATA)) or (
+            has_model and os.path.isfile(os.path.join(path, "optimizer.pt"))
+        )
+        if not has_state or not os.path.isfile(os.path.join(path, "config.json")):
+            raise ValueError(f"Published checkpoint is incomplete: {path}")
+        return path
+    return None
+
+
 def load_checkpoint(
     args,
     model: torch.nn.Module,
@@ -768,10 +798,23 @@ def load_checkpoint(
         and not os.path.isfile(os.path.join(load_dir, "model.safetensors"))
         and not os.path.isfile(os.path.join(load_dir, "model.bin"))
     ):
-        marker_path = os.path.join(load_dir, _LATEST)
-        if os.path.isfile(marker_path):
-            with open(marker_path, encoding="utf-8") as f:
-                load_dir = os.path.join(load_dir, f.read().strip())
+        selection = [load_dir, None]
+        if dist.get_rank(group=get_gloo_group()) == 0:
+            try:
+                latest = find_latest_complete_checkpoint(load_dir)
+                if latest is not None:
+                    selection[0] = latest
+                else:
+                    marker_path = os.path.join(load_dir, _LATEST)
+                    if os.path.isfile(marker_path):
+                        with open(marker_path, encoding="utf-8") as file:
+                            selection[0] = os.path.join(load_dir, file.read().strip())
+            except (OSError, ValueError) as error:
+                selection[1] = f"{type(error).__name__}: {error}"
+        dist.broadcast_object_list(selection, src=0, group=get_gloo_group())
+        if selection[1] is not None:
+            raise ValueError(f"Checkpoint discovery failed: {selection[1]}")
+        load_dir = selection[0]
     if not os.path.isdir(load_dir):
         raise FileNotFoundError(f"Checkpoint marker points to missing directory: {load_dir}")
     if not any(
