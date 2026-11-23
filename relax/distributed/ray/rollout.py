@@ -1124,8 +1124,8 @@ class RolloutManager(ReloadableMixin):
                 raise RuntimeError("Cannot replace a training publication configuration")
             if (
                 not self.args.fully_async
-                or getattr(self.args, "train_backend", "megatron") != "megatron"
-                or getattr(self.args, "hybrid", False)
+                or self.args.train_backend != "megatron"
+                or self.args.hybrid
                 or self.args.colocate
                 or self.args.offload_rollout
                 or not self.args.use_agentic_rollout
@@ -1475,7 +1475,7 @@ class RolloutManager(ReloadableMixin):
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         args = self.args
-        if getattr(args, "loss_type", None) == "sft":
+        if args.loss_type == "sft":
             # SFT already supplies completed training steps, not RL batch IDs.
             args = copy.copy(args)
             args.wandb_always_use_train_step = False
@@ -1560,9 +1560,9 @@ class RolloutManager(ReloadableMixin):
         # Reuse the shared --eval-* sampling args (no SFT-predict-specific
         # flags). Defaults preserve the original SFT predict behaviour
         # (greedy, max_new_tokens=512) when --eval-* is not provided.
-        eval_temperature = getattr(self.args, "eval_temperature", None)
-        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
-        eval_top_p = getattr(self.args, "eval_top_p", None)
+        eval_temperature = self.args.eval_temperature
+        eval_max_response_len = self.args.eval_max_response_len
+        eval_top_p = self.args.eval_top_p
         sampling_params = {
             "temperature": 0.0 if eval_temperature is None else eval_temperature,
             "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
@@ -1629,10 +1629,7 @@ class RolloutManager(ReloadableMixin):
             await self.data_source.load.remote(rollout_id)
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
-            if (
-                isinstance(e, DatasetStateMismatchError)
-                or (getattr(self.args, "sampling_config", None) or {}).get("algorithm") == "art"
-            ):
+            if isinstance(e, DatasetStateMismatchError) or (self.args.sampling_config or {}).get("algorithm") == "art":
                 raise
 
     async def offload(self):
@@ -3451,7 +3448,7 @@ class RolloutManager(ReloadableMixin):
                     return False
 
             pp_size = max(getattr(self.args, "sglang_pp_size", 1), 1)
-            rollout_gpus_per_engine = max(getattr(self.args, "rollout_num_gpus_per_engine", 1), 1)
+            rollout_gpus_per_engine = max(self.args.rollout_num_gpus_per_engine, 1)
             tp_size = max(rollout_gpus_per_engine // pp_size, 1)
 
             if run_precheck:
@@ -4943,7 +4940,7 @@ def _start_router(
         and not force_new
         and has_pd_disaggregation
         and not args.use_slime_router
-        and not getattr(args, "debug_train_only", False)
+        and not args.debug_train_only
         and getattr(args, "router_decode_policy", None) == "power_of_two"
     ):
         # The owner chooses and binds the endpoint after engines are ready.

@@ -195,7 +195,7 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
-    if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
+    if not is_managed_opd_teacher_enabled(args) or args.debug_train_only:
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────

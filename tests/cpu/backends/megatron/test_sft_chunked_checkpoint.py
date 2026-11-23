@@ -39,6 +39,7 @@ def _setup(monkeypatch, labels, chunk_size, temperature):
         sft_logits_chunk_size=chunk_size,
         rollout_temperature=temperature,
         entropy_coef=0,
+        advantage_estimator=None,
         allgather_cp=False,
         recompute_loss_function=True,
     )

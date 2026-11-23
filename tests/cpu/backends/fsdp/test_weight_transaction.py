@@ -75,7 +75,7 @@ def _manifest():
 
 def _shell():
     shell = object.__new__(FSDPTrainRayActor)
-    shell.args = SimpleNamespace(fsdp_trainable_attr="transformer")
+    shell.args = SimpleNamespace(fsdp_trainable_attr="transformer", debug_train_only=False)
     return shell
 
 
