@@ -58,7 +58,7 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
     server = make_rollout_server()
     request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
     engine = make_mock_engine()
-    group = SimpleNamespace(engines=[engine])
+    group = SimpleNamespace(engines=[engine], pending_shutdown=set())
     group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
     manager._finalize_engine_group_registration = AsyncMock(
         return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
@@ -100,6 +100,7 @@ async def test_ray_native_multinode_replica_allocates_one_slot_per_actor():
     engines = [make_mock_engine(), make_mock_engine()]
     group = SimpleNamespace(
         engines=engines,
+        pending_shutdown=set(),
         start_engines=MagicMock(return_value=([AwaitableValue(None)] * 2, {})),
     )
     captured = {}
@@ -155,7 +156,7 @@ async def test_ray_native_scale_out_inherits_canonical_model_override():
     manager = create_test_manager(args=args, servers={"default": server})
     request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
     engine = make_mock_engine()
-    group = SimpleNamespace(engines=[engine])
+    group = SimpleNamespace(engines=[engine], pending_shutdown=set())
     group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
     manager._finalize_engine_group_registration = AsyncMock(
         return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
@@ -286,7 +287,7 @@ async def test_engine_init_timeout_propagates_as_provision_timeout():
     server = make_rollout_server()
     request = ScaleOutRequest(request_id="test", num_replicas=1, status=ScaleOutStatus.CREATING)
     engine = make_mock_engine()
-    group = SimpleNamespace(engines=[engine])
+    group = SimpleNamespace(engines=[engine], pending_shutdown=set())
     group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
     manager._rollback_engines = AsyncMock()
 
