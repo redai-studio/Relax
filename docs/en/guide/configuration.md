@@ -619,7 +619,7 @@ These environment variables are for tuning and troubleshooting; all are optional
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--scale-in-drain-timeout` | float | 30.0 | Timeout to wait for in-flight requests to drain before force-aborting (seconds) |
-| `--scale-in-shutdown-timeout` | float | 30.0 | Timeout for graceful SGLang engine shutdown; `ray.kill` is used if exceeded (seconds) |
+| `--scale-in-shutdown-timeout` | float | 60.0 | Seconds to wait for engine shutdown. A timed-out removal can be retried with the same actors. |
 
 ---
 

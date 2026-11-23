@@ -619,7 +619,7 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--scale-in-drain-timeout` | float | 30.0 | 等待进行中请求排空的超时时间（秒），超时后强制终止 |
-| `--scale-in-shutdown-timeout` | float | 30.0 | SGLang 引擎优雅关闭的超时时间（秒），超时后使用 `ray.kill` 强制终止 |
+| `--scale-in-shutdown-timeout` | float | 60.0 | 等待引擎退出的秒数。超时后保留原引擎，重试缩容时继续清理。 |
 
 ---
 
