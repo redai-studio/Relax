@@ -387,9 +387,14 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
+def _spawn_server(target, *args) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
+    process = multiprocessing.Process(target=target, args=args)
+    process.start()
+    return process
 
+
+def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
     # Each SGLang patch is controlled by its own env flag and applied
     # independently (see ``_launch_server_with_patches`` and
     # ``_patched_run_scheduler_process``); any combination is valid:
@@ -402,10 +407,7 @@ def launch_server_process(server_args: ServerArgs, *, reference_publication: boo
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(
-        target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
-    )
-    p.start()
+    p = _spawn_server(_launch_server_with_patches, server_args, os.getpid(), reference_publication)
 
     if server_args.node_rank != 0:
         return p
