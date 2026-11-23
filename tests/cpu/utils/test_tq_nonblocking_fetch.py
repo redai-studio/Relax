@@ -1,14 +1,47 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Token-budget polling must leave the shared controller available to
+"""Fully async replay polling must leave the TQ controller available to
 writers."""
 
+from types import SimpleNamespace
+
 import pytest
+
+from relax.distributed.replay_manager import core
+from relax.distributed.replay_manager.config import ReplayConfig
+
+
+def _configure_timeout(monkeypatch, *, references=True, replay=True, fully_async=True, hybrid=False, polling=True):
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1" if references else "0")
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "abcd")
+    manager = core.ReplayManager(config=ReplayConfig.from_env())
+    monkeypatch.setattr(core, "replay_data_manager", manager)
+    args = SimpleNamespace(
+        train_backend="megatron",
+        use_rollout_routing_replay=replay,
+        colocate=not fully_async,
+        fully_async=fully_async,
+        hybrid=hybrid,
+        polling_mode=polling,
+    )
+    runtime_env = {"env_vars": {"TQ_CONTROLLER_GET_METADATA_TIMEOUT": "3"}}
+    core.configure_training_replay(args, runtime_env)
+    return int(runtime_env["env_vars"]["TQ_CONTROLLER_GET_METADATA_TIMEOUT"])
+
+
+@pytest.mark.parametrize(
+    "mode", [{"fully_async": False}, {"hybrid": True}, {"replay": False}, {"references": False}, {"polling": False}]
+)
+def test_other_tq_consumers_keep_their_configured_timeout(monkeypatch, mode):
+    assert _configure_timeout(monkeypatch, **mode) == 3
 
 
 @pytest.mark.parametrize("state", ["missing", "pending", "dummy", "drained", "window_drained"])
 def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkeypatch, state):
     module = pytest.importorskip("transfer_queue.controller")
+    # Ray exports the already-imported driver's controller class to the worker.
+    monkeypatch.setattr(module, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", 3)
+    assert _configure_timeout(monkeypatch) == 0
     controller_type = module.TransferQueueController.__ray_metadata__.modified_class
     controller = object.__new__(controller_type)
     partition = module.DataPartitionStatus("train_0")

@@ -1261,7 +1261,16 @@ def configure_training_replay(args: Any, runtime_env: dict) -> None:
     if replay_data_manager.uses_references or default_reference_r3(args):
         enable_reference_replay()
     validate_reference_training(args)
-    replay_data_manager.initialize(kinds=rollout_kinds(args))
+    kinds = rollout_kinds(args)
+    replay_data_manager.initialize(kinds=kinds)
     if not isinstance(runtime_env.get("env_vars"), dict):
         runtime_env["env_vars"] = {}
     runtime_env["env_vars"]["RELAX_REPLAY_REGISTRATION"] = json.dumps(replay_data_manager.export_registration())
+    # The TQ controller also serves replay publishers. Only shorten empty reads
+    # in polling mode, since blocking fixed-size reads share this timeout.
+    if kinds and replay_data_manager.uses_references and args.fully_async and not args.hybrid and args.polling_mode:
+        from transfer_queue import controller as tq_controller
+
+        # Ray serializes get_metadata with the timeout imported on the driver.
+        tq_controller.TQ_CONTROLLER_GET_METADATA_TIMEOUT = 0
+        runtime_env["env_vars"]["TQ_CONTROLLER_GET_METADATA_TIMEOUT"] = "0"
