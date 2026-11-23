@@ -723,28 +723,33 @@ def _check_frame_control(rank, rendezvous):
                 return
             yield [("b", shards["w"])]
 
-    def send(metadata, raw, **kwargs):
-        if fault == "send":
-            raise ValueError("publisher send failed")
-        events.append([item["name"] for item in metadata["tensors"]])
-        return set()
+    def can_stage(metadata, raw):
+        if fault == "admission":
+            raise ValueError("publisher admission failed")
+        return not events
 
     try:
         for transport, requested_fault in (
             ("tcp", None),
             ("nccl_socket", None),
-            ("tcp", "send"),
+            ("tcp", "admission"),
             ("nccl_socket", "short"),
             ("tcp", "iterator"),
         ):
             events = []
-            config = DeltaSyncConfig(stream="pp", transport=transport, staging_budget_bytes=32)
+            config = DeltaSyncConfig(stream="pp", transport=transport, staging_budget_bytes=32, receive_overlap=True)
             source = ShardDeltaExporter(Groups(), Groups(), snapshot_budget_bytes=256, config=config)
             source.transfer = SimpleNamespace(
                 connect=lambda *args, **kwargs: False,
+                can_reuse=lambda *_: True,
                 begin=lambda **kwargs: None,
-                abort=lambda: None,
-                send=send,
+                stage=lambda meta, raw: events.append(("stage", [t["name"] for t in meta["tensors"]])),
+                send=lambda meta, raw, **kwargs: (
+                    events.append(("send", [t["name"] for t in meta["tensors"]])) or set()
+                ),
+                activate=lambda: events.append("activate"),
+                apply=lambda: events.append("apply") or set(),
+                can_stage=can_stage,
                 ordered_target_consume=False,
                 finalize=lambda: events.append("finalize") or {"receivers": [], "final_full_names": []},
             )
@@ -758,20 +763,22 @@ def _check_frame_control(rank, rendezvous):
                 error, text = {
                     "short": (ValueError, "disagree on the complete HF group directory"),
                     "iterator": (RuntimeError, "LookupError: rank one failed during conversion"),
-                    "send": (RuntimeError, "ValueError: publisher send failed"),
+                    "admission": (RuntimeError, "ValueError: publisher admission failed"),
                 }[fault]
                 with pytest.raises(error, match=text):
-                    source.synchronize(lambda: model, version="1", **args)
-                assert "finalize" not in events
+                    source.synchronize(
+                        lambda: model, version="1", before_first_apply=lambda: events.append("pause"), **args
+                    )
+                assert "pause" not in events and "finalize" not in events
                 assert source.failed and source._version == "0" and source._pending is None
                 continue
-            source.synchronize(lambda: model, version="1", **args)
+            source.synchronize(lambda: model, version="1", before_first_apply=lambda: events.append("pause"), **args)
             if rank == 1:
-                assert not events
+                assert events == ["pause"]
             elif transport == "tcp":
-                assert events == [["a"], ["b"], "finalize"]
+                assert events == [("stage", ["a"]), "pause", "activate", "apply", ("send", ["b"]), "finalize"]
             else:
-                assert events == [["a", "b"], "finalize"]
+                assert events == [("stage", ["a", "b"]), "pause", "activate", "apply", "finalize"]
             assert source._version == "0"
             source.commit()
             assert source._version == "1"

@@ -908,18 +908,18 @@ class DeviceDirectBackend(CommBackend):
         )
 
         pause_rollout = not actor_fwd_only and (not managed or not self._lora_sync.base_sync_done)
-        if pause_rollout:
+        delta_overlap = delta_active and self.delta_exporter.config.receive_overlap
 
-            def pause_and_flush() -> None:
-                # Pause generation on all rollout nodes
-                logger.info("Pausing generation on all rollout nodes...")
-                ray.get(self._batch_request("/pause_generation"))
+        def pause_and_flush() -> None:
+            # This remains the original DCS control owner. The exporter may
+            # defer this barrier, but cannot choose recipients or resume them.
+            logger.info("Pausing generation on all rollout nodes...")
+            ray.get(self._batch_request("/pause_generation"))
+            logger.info("Flushing cache on all rollout nodes...")
+            for rank, engine in self.rollout_engines.items():
+                ray.get(engine.flush_cache.remote())
 
-                # Flush cache on all rollout nodes
-                logger.info("Flushing cache on all rollout nodes...")
-                for rank, engine in self.rollout_engines.items():
-                    ray.get(engine.flush_cache.remote())
-
+        def pause_for_apply() -> None:
             if managed or delta_active:
                 phase = "initial LoRA base pause" if managed else "DCS delta pause/flush"
                 run_on_training_rank_zero(pause_and_flush, phase=phase)
@@ -936,6 +936,34 @@ class DeviceDirectBackend(CommBackend):
                     "/post_process_weights",
                     {"restore_weights_before_load": True, "post_process_quantization": False},
                 )
+
+        def synchronize_delta() -> None:
+            getter = self._weights_getter
+            if getter is None:
+                getter = lambda: dict(
+                    self._megatron.named_params_and_buffers(
+                        self.args,
+                        self.model,
+                        convert_to_global_name=not self._use_bridge,
+                        include_persistent_buffers=self._use_bridge,
+                    )
+                )
+            self.delta_exporter.synchronize(
+                getter,
+                engines=delta_engines,
+                gpu_counts=delta_counts,
+                version=str(self.weight_version),
+                group=get_gloo_group(),
+                force_full=self.args.offload_rollout,
+                before_first_apply=pause_for_apply if delta_overlap else None,
+            )
+
+        if delta_overlap:
+            # Finish the HF iterator before running the separate raw DCS
+            # iterator so they cannot interleave Bridge process-group scopes.
+            synchronize_delta()
+        elif pause_rollout:
+            pause_for_apply()
 
         if not (delta and rollout_only):
             buffer_size = 0
@@ -984,25 +1012,8 @@ class DeviceDirectBackend(CommBackend):
             else:
                 self._run_expert_pass(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only or delta, pbar=pbar)
             dist.barrier(group=get_gloo_group())
-        if delta_active:
-            getter = self._weights_getter
-            if getter is None:
-                getter = lambda: dict(
-                    self._megatron.named_params_and_buffers(
-                        self.args,
-                        self.model,
-                        convert_to_global_name=not self._use_bridge,
-                        include_persistent_buffers=self._use_bridge,
-                    )
-                )
-            self.delta_exporter.synchronize(
-                getter,
-                engines=delta_engines,
-                gpu_counts=delta_counts,
-                version=str(self.weight_version),
-                group=get_gloo_group(),
-                force_full=self.args.offload_rollout,
-            )
+        if delta_active and not delta_overlap:
+            synchronize_delta()
         if not rollout_only and not self._skip_empty_actor_fwd_ref_sync:
             self._finish_actor_fwd_ref_sync()
 

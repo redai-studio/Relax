@@ -66,6 +66,67 @@ def test_wire_retains_mixed_dtype_full_values_and_rejects_overlapping_ranges():
         validate_directory(metadata, max_bytes=1024)
 
 
+def test_staged_tcp_prefix_is_immutable_bounded_and_never_applies_before_owner_barrier(monkeypatch):
+    """Real TCP data with a CPU model-RPC boundary; no CUDA acceptance
+    credit."""
+    from types import SimpleNamespace
+
+    import ray
+
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+    from relax.distributed.weight_sync.transport import DeltaTransfer
+
+    actions, buffers, consumed = [], {}, []
+
+    def operation(action, **kwargs):
+        actions.append(action)
+        if action == "receive":
+            key = kwargs["round_id"]
+            buffers[key] = bytes(receive(kwargs["descriptor"], "1", timeout_s=3, max_bytes=16))
+        elif action == "begin":
+            assert not consumed
+        elif action == "consume":
+            assert "begin" in actions
+            consumed.append((kwargs["round_id"], buffers.pop(kwargs["round_id"])))
+            return dict(full_required=["weight"])
+        elif action == "ready":
+            return [dict(retained_payload_bytes=sum(map(len, buffers.values())))]
+
+    monkeypatch.setattr(ray, "get", lambda refs, **kwargs: refs)
+    transfer = DeltaTransfer(DeltaSyncConfig(stream="test", staging_budget_bytes=16), "cpu")
+    transfer.engines = (SimpleNamespace(delta_weight_sync=SimpleNamespace(remote=operation)),)
+    transfer.ranks, transfer.tcp_members = [[1]], {"1"}
+    transfer.tcp = TcpFrameSource("127.0.0.1", timeout_s=3, host_budget_bytes=16)
+    try:
+        transfer.begin(version="1", base="0", seed=False, defer_apply=True)
+        metadata, raw = encode([("weight", (2,), torch.float32, None, torch.ones(2))], max_bytes=16)
+        expected = raw.numpy().tobytes()
+        assert not transfer.submit_frame(metadata, raw, applying=False)
+        raw.zero_()
+        assert not transfer.drain_frame()
+        transfer.stage(metadata, raw)
+        assert not transfer.can_stage(metadata, raw)
+        with pytest.raises(ValueError, match="capacity"):
+            transfer.stage(metadata, raw)
+        assert consumed == [] and actions == ["receive", "ready", "receive", "ready"]
+        with pytest.raises(RuntimeError, match="generating model"):
+            transfer.apply()
+        with pytest.raises(RuntimeError, match="Cannot finalize"):
+            transfer.finalize()
+        transfer.activate()
+        assert transfer.apply() == {"weight"}
+        assert consumed == [(0, expected), (1, bytes(8))]
+        assert transfer.can_stage(metadata, raw)
+        assert transfer.send(metadata, raw) == {"weight"}
+        assert consumed[-1] == (2, bytes(8))  # activate did not reset received round IDs.
+        assert transfer.metrics["prestaged_frames"] == 2
+        assert transfer.metrics["prestaged_bytes"] == 16
+        with pytest.raises(RuntimeError, match="only once"):
+            transfer.activate()
+    finally:
+        transfer.tcp.close()
+
+
 @pytest.mark.parametrize("fail_consume", [False, True])
 def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch, fail_consume):
     from threading import Event
@@ -102,7 +163,7 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
         transfer.begin(version="2", base="1", seed=False)
         metadata, raw = encode([("w", (2,), torch.float32, None, torch.ones(2))], max_bytes=16)
         first = raw.numpy().tobytes()
-        assert not transfer.submit_frame(metadata, raw)
+        assert not transfer.submit_frame(metadata, raw, applying=True)
         assert receiving.wait(3)
         # Produce the next frame on the main thread while the socket is pending.
         raw.zero_()
@@ -111,7 +172,7 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
         with pytest.raises(RuntimeError, match="already waiting"):
             transfer.prepare_frame(raw)
         with pytest.raises(RuntimeError, match="Drain"):
-            transfer.submit_frame(metadata, raw)
+            transfer.submit_frame(metadata, raw, applying=True)
         with pytest.raises(RuntimeError, match="Drain"):
             transfer.finalize()
         release.set()
@@ -123,7 +184,7 @@ def test_tcp_pipeline_keeps_one_frame_and_drains_actual_receiver_ack(monkeypatch
             assert actions == ["begin", "receive", "ready", "consume"]
         else:
             assert transfer.drain_frame() == {"name0"}
-            assert not transfer.submit_frame(metadata, raw)
+            assert not transfer.submit_frame(metadata, raw, applying=True)
             assert transfer.drain_frame() == {"name1"}
             assert transfer.finalize()["frames"] == 2
             assert actions == ["begin", "receive", "ready", "consume", "receive", "ready", "consume", "finalize"]
@@ -179,7 +240,7 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
     transfer.begin(version="1", base=None, seed=True)
     directory, raw = encode([("w", (1,), torch.float32, None, torch.ones(1))], max_bytes=8)
     try:
-        assert not transfer.submit_frame(directory, raw)
+        assert not transfer.submit_frame(directory, raw, applying=True)
         assert entered.wait(5)
         previous = weakref.ref(raw)
         del raw
@@ -187,7 +248,7 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
         directory, raw = encode([("next", (1,), torch.float32, None, torch.zeros(1))], max_bytes=8)
         assert actions == ["begin", "receive", "broadcast", "ready"]
         with pytest.raises(RuntimeError, match="Drain"):
-            transfer.submit_frame(directory, raw)
+            transfer.submit_frame(directory, raw, applying=True)
         with pytest.raises(RuntimeError, match="Drain"):
             transfer.finalize()
         release.set()
@@ -201,7 +262,7 @@ def test_collective_install_ack_is_drained_before_next_publication(monkeypatch, 
             assert actions[-1] == failure
         else:
             assert transfer.drain_frame() == {"ordinary0"}
-            assert not transfer.submit_frame(directory, raw)
+            assert not transfer.submit_frame(directory, raw, applying=True)
             assert transfer.drain_frame() == {"ordinary1"}
             assert transfer.finalize()["frames"] == 2
             assert actions == ["begin"] + ["receive", "broadcast", "ready", "consume"] * 2 + ["finalize"]
@@ -328,7 +389,7 @@ def test_collective_selects_network_only_for_unique_gpu_members(
         if reject:
             with pytest.raises(ValueError, match="NCCL_NET"):
                 source.connect([engine], [2])
-            assert not groups and not source.signature
+            assert not groups and not source.can_reuse([engine], [2])
         else:
             assert source.connect([engine], [2]) and not source.connect([engine], [2])
             assert [route["actual_transport"] for route in source.routes] == [transport, "tcp"]
@@ -451,12 +512,13 @@ def test_source_requires_current_all_receiver_ack_and_paused_apply_for_lanes(mon
         md["target_shard"] = dict(format=1, tp_rank=tp, tp_size=4, entries=[0])
         dirs.append(md)
         raws.append(raw)
-    source.begin(version="2", base="1", seed=False)
+    source.begin(version="2", base="1", seed=False, defer_apply=True)
     with pytest.raises(ValueError, match="Mismatched"):
         source.stage(list(reversed(dirs)), raws)
     assert not any(ev == "receive" for _, ev in remote_events)
     source.stage(dirs, raws)
-    assert not delivered
+    assert not delivered and source.metrics["prestaged_frames"] == 1
+    source.activate()
     assert not source.apply()
     assert delivered == {0: dirs, 1: dirs}
     assert transfers == [[(i + 1, raws[i % 4].numpy().tobytes()) for i in range(8)]]
@@ -469,8 +531,10 @@ def test_source_requires_current_all_receiver_ack_and_paused_apply_for_lanes(mon
         source.stage(dirs, raws)
 
 
-@pytest.mark.parametrize("peer_agrees", [True, False])
-def test_ordered_lane_consumes_hold_independent_slices_and_drain_before_mixed_or_capacity(monkeypatch, peer_agrees):
+@pytest.mark.parametrize(("peer_agrees", "prestage"), [(True, False), (False, False), (True, True)])
+def test_ordered_lane_consumes_hold_independent_slices_and_drain_before_mixed_or_capacity(
+    monkeypatch, peer_agrees, prestage
+):
     from types import SimpleNamespace
 
     import ray
@@ -525,8 +589,8 @@ def test_ordered_lane_consumes_hold_independent_slices_and_drain_before_mixed_or
                 views[rank - 1][source.frame].copy_(slab)
 
     source.group = SimpleNamespace(device=torch.device("cpu"), send_lanes=send_lanes)
-    source.begin(version="2", base="1", seed=False)
-    assert source.ordered_target_consume is peer_agrees
+    source.begin(version="2", base="1", seed=False, defer_apply=prestage)
+    assert source.ordered_target_consume is (peer_agrees and not prestage)
     required = set()
     for key in range(6):
         frames, raws = [], []
@@ -541,7 +605,14 @@ def test_ordered_lane_consumes_hold_independent_slices_and_drain_before_mixed_or
                 )
             )
             raws.append(torch.full((size,), key + 4 * tp, dtype=torch.uint8))
-        required.update(source.send(frames, raws, defer_ordered=True))
+        if prestage and key < 2:
+            source.stage(frames, raws)
+            assert calls == [[], []]
+        else:
+            if prestage and key == 2:
+                source.activate()
+                required.update(source.apply())
+            required.update(source.send(frames, raws, defer_ordered=True))
         for raw in raws:
             raw.zero_()
     required.update(source.apply())

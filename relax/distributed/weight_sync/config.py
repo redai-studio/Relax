@@ -43,6 +43,7 @@ class DeltaSyncConfig:
     full_only: bool = False
     transport: str = "tcp"
     sender_pipeline: bool = False
+    receive_overlap: bool = False
     target_shard_delta: bool = False
 
     @classmethod
@@ -80,6 +81,7 @@ class DeltaSyncConfig:
         if (
             type(config.full_only) is not bool
             or type(config.sender_pipeline) is not bool
+            or type(config.receive_overlap) is not bool
             or type(config.target_shard_delta) is not bool
             or config.transport not in ("tcp", "nccl", "nccl_socket")
         ):
