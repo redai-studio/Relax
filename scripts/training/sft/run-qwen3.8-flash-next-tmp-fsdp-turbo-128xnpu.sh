@@ -4,6 +4,8 @@
 # Qwen3.8-Flash-Next SFT with the FSDPTurbo backend.
 # Set MASTER_ADDR, HOST_IP and POD_NAME on each of the eight nodes.
 # Override EXP_DIR, MODEL_DIR, DATA_DIR, SAVE_DIR and network interfaces as needed.
+# For legacy resume, set TURBO_CONFIG to match the saved MTP depth.
+# When starting fresh with MTP disabled, use a new SAVE_DIR.
 
 set -ex
 set -o pipefail

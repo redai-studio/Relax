@@ -9,7 +9,7 @@ model:
   tokenizer_name_or_path: "Qwen3.8-Flash-Next"
   torch_dtype: "fp32"
   num_hidden_layers: null          # null uses all checkpoint layers
-  mtp_num_layers: 0             # MTP head (patched in by the actor)
+  mtp_num_layers: 0             # 0 disables MTP. Match the saved MTP depth for legacy resume.
   ple_layer_ids: [2]
   mtp_loss_scaling_factor: 0.1
 
