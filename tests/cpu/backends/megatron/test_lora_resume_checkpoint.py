@@ -232,7 +232,8 @@ def test_distributed_lora_identity_agrees_on_localized_weights(tmp_path):
 def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, tmp_path, use_ref):
     from megatron.bridge import AutoBridge
     from megatron.core import dist_checkpointing
-    from megatron.training.checkpointing import _load_base_checkpoint, generate_state_dict
+    from megatron.training import checkpointing as native
+    from megatron.training.checkpointing import generate_state_dict
     from safetensors.torch import load_file, save_file
 
     from tests.cpu.backends.megatron.test_checkpoint_chained_optimizer import _CPUSaveStrategy
@@ -293,7 +294,8 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     monkeypatch.setattr(checkpoint, "_save_checkpoint_megatron", save_common)
     checkpoint.save_checkpoint(1, model, None, None)
     args.relax_lora_frozen_hf_base = None
-    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: (1, 0))
+    native_load = native.load_checkpoint
+    monkeypatch.setattr(native, "load_checkpoint", lambda **kw: (1, 0))
     checkpoint.load_checkpoint(model, object(), None, {}, False)
     assert args.relax_lora_frozen_hf_base == expected_identity
     names = checkpoint._global_trainable_lora_parameter_names(model)
@@ -314,13 +316,13 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     args.non_persistent_ckpt_type, args.non_persistent_global_ckpt_dir = "global", str(alternate)
 
     def load_native_common(**_kwargs):
-        state, path, _, _ = _load_base_checkpoint(str(root), args, rank0=True)
+        state, path, _, _ = native._load_base_checkpoint(args.load, args, rank0=True)
         assert Path(path) == alternate / "iter_0000001"
         assert state["args"].relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
         return state["iteration"], 0
 
     with monkeypatch.context() as patch:
-        patch.setattr(checkpoint, "_load_checkpoint_megatron", load_native_common)
+        patch.setattr(native, "load_checkpoint", load_native_common)
         checkpoint.load_checkpoint(model, object(), None, {}, False)
     with pytest.raises(RuntimeError, match="verified frozen HF base"):
         checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
@@ -333,8 +335,6 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     args.no_load_optim = args.no_load_rng = use_ref
     args.finetune = False
     with monkeypatch.context() as patch:
-        from megatron.training import checkpointing as native
-
         # Simulate the original tracker appearing after preflight. The loader
         # must use the same root as the common state it already validated.
         read_metadata = checkpoint._load_checkpoint_metadata
@@ -360,11 +360,11 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
 
         def load_through_native_selector(**kwargs):
             with pytest.raises(ReadCommon):
-                native.load_checkpoint(**kwargs)
+                native_load(**kwargs)
             return 0, 0
 
         patch.setattr(native, "_load_base_checkpoint", read_common)
-        patch.setattr(checkpoint, "_load_checkpoint_megatron", load_through_native_selector)
+        patch.setattr(native, "load_checkpoint", load_through_native_selector)
         checkpoint.load_checkpoint(model, object(), None, {}, False)
     assert args.finetune and args.load == str(root)
     assert args.relax_lora_frozen_hf_base == checkpoint.hf_checkpoint_identity(a, version=2)
@@ -388,6 +388,71 @@ def test_lora_marker_tracks_actor_hf_load_and_survives_full_resume(monkeypatch, 
     checkpoint.save_checkpoint(4, model, None, None)
     with pytest.raises(RuntimeError, match="verified frozen HF base"):
         checkpoint.save_checkpoint(2, model, None, None, lora_only=True)
+
+
+@pytest.mark.parametrize(
+    "load_direct,selected_dir,next_tracker,expected_weight",
+    [
+        (False, "iter_0000007", "release", 23.0),
+        (True, "iter_0000000", "7", 11.0),
+        (True, "release", "7", 47.0),
+    ],
+)
+def test_resume_loads_weights_from_preflight_iteration(
+    monkeypatch, tmp_path, load_direct, selected_dir, next_tracker, expected_weight
+):
+    from megatron.training import checkpointing as native
+
+    root = tmp_path / "run"
+    model = torch.nn.Linear(1, 1, bias=False)
+    for dirname, weight in [("iter_0000000", 11), ("iter_0000007", 23), ("release", 47)]:
+        rank = root / dirname / "mp_rank_00"
+        rank.mkdir(parents=True)
+        torch.save(
+            {
+                "checkpoint_version": 3.0,
+                "iteration": 7 if dirname == "iter_0000007" else 0,
+                "model": {"weight": torch.tensor([[float(weight)]])},
+            },
+            rank / "model_optim_rng.pt",
+        )
+    tracker = root / "latest_checkpointed_iteration.txt"
+    tracker.write_text("7")
+    load_path = str(root / selected_dir if load_direct else root)
+    args = SimpleNamespace(
+        load=load_path,
+        pretrained_checkpoint=str(root) if load_direct else None,
+        ckpt_step=None,
+        ckpt_format="torch",
+        auto_detect_ckpt_format=True,
+        non_persistent_global_ckpt_dir=None,
+        non_persistent_ckpt_type=None,
+        no_load_optim=True,
+        no_load_rng=True,
+        finetune=False,
+        bf16=False,
+        fp16=False,
+    )
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    monkeypatch.setattr(native, "get_args", lambda: args)
+    monkeypatch.setattr(native, "_CHECKPOINT_VERSION", None)
+    for axis in ("tensor", "pipeline", "expert"):
+        monkeypatch.setattr(native.mpu, f"get_{axis}_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(native.mpu, f"get_{axis}_model_parallel_rank", lambda: 0)
+    # Change the shared tracker after MCore has opened the first checkpoint,
+    # before it opens the rank's file again to restore model parameters.
+    read_base = native._load_base_checkpoint
+
+    def move_tracker(*positional, **kwargs):
+        result = read_base(*positional, **kwargs)
+        if kwargs["rank0"]:
+            tracker.write_text(next_tracker)
+        return result
+
+    monkeypatch.setattr(native, "_load_base_checkpoint", move_tracker)
+    checkpoint.load_checkpoint([model], None, None, {}, False)
+    torch.testing.assert_close(model.weight, torch.tensor([[expected_weight]]))
+    assert args.load == load_path and not args.finetune
 
 
 def test_v1_first_run_fallback_requires_confirmed_original_base(monkeypatch, tmp_path):

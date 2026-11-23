@@ -4,13 +4,12 @@ import copy
 import os
 import re
 from argparse import Namespace
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import RLock, get_ident
 
 import torch
-
-# TODO: may need to copy those 2 functions and do refactoring.
-from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
 
@@ -520,17 +519,16 @@ def _validate_lora_model_state_load(model):
 def _resolve_checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path | None:
     """Resolve the concrete iteration directory megatron will load from.
 
-    Accepts an iteration directory directly for internal metadata reads. For a
-    checkpoint root, a positive ``--ckpt-step`` overrides a numeric tracker,
-    while a ``release`` tracker always selects the release directory, matching
-    Megatron's load behavior. Zero does not override the tracker.
+    A concrete iteration or release directory selects itself. For a root, a
+    positive step overrides a numeric tracker and a release tracker wins.
     """
     path = Path(load_path)
-    if re.fullmatch(r"iter_\d{7}", path.name):
-        return path
     iteration = None
     tracker = path / "latest_checkpointed_iteration.txt"
-    if tracker.is_file():
+    if not tracker.is_file():
+        if path.name == "release" or re.fullmatch(r"iter_(?:\d{7}|[1-9]\d{7,})", path.name):
+            return path
+    else:
         value = tracker.read_text().strip()
         if value.isdigit():
             iteration = int(value)
@@ -652,15 +650,62 @@ def _alias_renamed_transfer_queue_enum() -> None:
         enum_utils.TransferQueueRole = enum_utils.Role
 
 
+_native_checkpoint_load_lock = RLock()
+
+
+def _load_checkpoint_megatron(*, args: Namespace, iteration_dir: str, **kwargs):
+    """Keep MCore's metadata, shard and optimizer reads on the agreed
+    persistent checkpoint."""
+    from megatron.training import checkpointing
+
+    directory = Path(iteration_dir)
+    root = str(directory.parent)
+    selection = directory.name.removeprefix("iter_")
+    # MCore reads the tracker more than once, including for release and step zero.
+    # Only the tracker is local to the rank. All checkpoint data stays at its real path.
+    with _native_checkpoint_load_lock, ExitStack() as files:
+        tracker_path = ""
+
+        def prepare_tracker() -> None:
+            nonlocal tracker_path
+            tracker = files.enter_context(NamedTemporaryFile(mode="w"))
+            tracker.write(selection)
+            tracker.flush()
+            tracker_path = tracker.name
+
+        # A rank-local I/O failure must reach peers before native collectives.
+        _collective_checkpoint_probe(prepare_tracker)
+        get_tracker = checkpointing.get_checkpoint_tracker_filename
+        owner = get_ident()
+
+        def selected_tracker(path: str) -> str:
+            # MCore passes the load root through to its readers. Other roots
+            # and background saves must keep using their own trackers.
+            if get_ident() == owner and path is root:
+                return tracker_path
+            return get_tracker(path)
+
+        original_load, original_step = args.load, getattr(args, "ckpt_step", None)
+        checkpointing.get_checkpoint_tracker_filename = selected_tracker
+        args.load, args.ckpt_step = root, None
+        try:
+            return checkpointing.load_checkpoint(**kwargs)
+        finally:
+            args.load, args.ckpt_step = original_load, original_step
+            checkpointing.get_checkpoint_tracker_filename = get_tracker
+
+
 def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool) -> dict:
     """Probe only host metadata before deciding which collective loader to
     use."""
     exists = bool(load_path and Path(load_path).exists() and _is_dir_nonempty(load_path))
-    megatron = exists and (is_megatron_checkpoint(load_path) or bool(getattr(args, "ckpt_step", None)))
+    step = getattr(args, "ckpt_step", None)
+    megatron = exists and (is_megatron_checkpoint(load_path) or bool(step))
     hf = exists and not megatron and _is_hf_checkpoint(load_path)
     pretrained_fallback = False
     pretrained = getattr(args, "pretrained_checkpoint", None)
-    if pretrained is not None and not hf:
+    iteration_dir = _resolve_checkpoint_iteration_dir(load_path, step) if megatron else None
+    if pretrained is not None and not hf and (iteration_dir is None or iteration_dir != Path(load_path)):
         from megatron.training.checkpointing import checkpoint_exists
 
         # MCore checks trackers before applying an explicit ckpt_step.
@@ -672,9 +717,7 @@ def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool
             megatron = True
             pretrained_fallback = True
             load_optimizer = False
-    iteration_dir = (
-        _resolve_checkpoint_iteration_dir(load_path, ckpt_step=getattr(args, "ckpt_step", None)) if megatron else None
-    )
+            iteration_dir = _resolve_checkpoint_iteration_dir(pretrained, step)
     valid_iteration = iteration_dir is not None and iteration_dir.is_dir()
     return {
         "load_path": str(load_path),
@@ -771,22 +814,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             )
             return marker, frozen_base
 
-        def load_native(**kwargs):
-            pretrained = getattr(args, "pretrained_checkpoint", None)
-            if pretrained is None:
-                return _load_checkpoint_megatron(**kwargs)
-            # Both metadata and tensor reads use the agreed source, even if
-            # a tracker appears in the originally requested directory meanwhile.
-            directory = Path(iter_dir)
-            original_load, original_step = args.load, getattr(args, "ckpt_step", None)
-            args.load = str(directory.parent)
-            args.ckpt_step = None if release else int(directory.name.removeprefix("iter_"))
-            args.pretrained_checkpoint = None
-            try:
-                return _load_checkpoint_megatron(**kwargs)
-            finally:
-                args.load, args.ckpt_step, args.pretrained_checkpoint = original_load, original_step, pretrained
-
         lora_metadata, frozen_base = _collective_checkpoint_probe(probe_metadata)
         try:
             if lora_metadata is None:
@@ -799,7 +826,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     else nullcontext()
                 )
                 with step_context:
-                    result = load_native(
+                    result = _load_checkpoint_megatron(
+                        args=args,
+                        iteration_dir=iter_dir,
                         ddp_model=ddp_model,
                         optimizer=optimizer,
                         opt_param_scheduler=opt_param_scheduler,
@@ -828,7 +857,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                 _preserve_hybrid_optimizer_steps_on_load(),
                 _validate_lora_model_state_load(ddp_model),
             ):
-                return load_native(
+                return _load_checkpoint_megatron(
+                    args=args,
+                    iteration_dir=iter_dir,
                     ddp_model=ddp_model,
                     optimizer=optimizer,
                     opt_param_scheduler=opt_param_scheduler,
@@ -890,7 +921,7 @@ def is_megatron_checkpoint(path: str | Path) -> bool:
     path = Path(path)
     if (path / "latest_checkpointed_iteration.txt").is_file():
         return True
-    if not re.fullmatch(r"iter_\d{7}", path.name):
+    if path.name != "release" and not re.fullmatch(r"iter_(?:\d{7}|[1-9]\d{7,})", path.name):
         return False
 
     # HF exports use the same iteration names. Native format evidence takes
@@ -901,7 +932,7 @@ def is_megatron_checkpoint(path: str | Path) -> bool:
     if any(candidate.is_file() for candidate in path.glob("mp_rank_*/model_optim_rng.pt")):
         return True
     # Preserve the legacy route/error behavior for unknown iteration contents.
-    return not _is_hf_checkpoint(path)
+    return path.name != "release" and not _is_hf_checkpoint(path)
 
 
 def _is_hf_checkpoint(path: str | Path) -> bool:
