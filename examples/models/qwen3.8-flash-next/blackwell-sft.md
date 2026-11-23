@@ -21,7 +21,12 @@ Set `NUM_STEPS` and `SAVE_INTERVAL` together for a shorter verification. Use a n
 
 ## Performance observations
 
-Over 50 updates, the text recipe processed 405,940,021 effective tokens at 4,813 tokens/s/GPU. The multimodal recipe processed 288,971,498 effective tokens at 4,521 tokens/s/GPU and averaged 4.6816 images per sample. Across zero-based updates 3–49, throughput was 5,046 tokens/s/GPU for text and 4,876 for multimodal, measured using actor training time.
+The 50-update text run processed 405,940,021 effective tokens. The multimodal run processed 288,971,498 effective tokens and averaged 4.6816 images per sample. Throughput is effective tokens per GPU per second of actor training time. Steady-state throughput and MFU use zero-based updates 3–49.
+
+| Dataset    | Full-run tokens/s/GPU | Steady-state tokens/s/GPU | Steady-state MFU | Mean loss, last 10 updates |
+| ---------- | --------------------: | ------------------------: | ---------------: | -------------------------: |
+| Text       |              4,776.38 |                  5,004.44 |           10.48% |                    0.53926 |
+| Multimodal |              4,548.28 |                  4,888.87 |           10.26% |                    0.43177 |
 
 - Paired QSA reads shared K/V blocks once and preserves the selected blocks and causal tail separately for each query. Specializing on the number of sparse queries produced hundreds of kernel variants and an observed 3,125 tokens/s/GPU. Runtime row counts reduced the observed variants to two attention kernels and one merge kernel per node.
 - MFSDP uses independent all-gather and reduce-scatter communicators. The recipe retains selected BF16 parameter buckets within each optimizer update with 8 GiB and 22 GiB budgets on the two pipeline stages. Unbounded retention ran out of device memory in the third update.
