@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import ray
 from ray import serve
 
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_saving_enabled
 from relax.utils.async_utils import run as training_run
 from relax.utils.async_utils import shutdown_async_loop
 from relax.utils.fault_events import recovery
@@ -160,6 +161,7 @@ def cpu_controller_class(ray_adapter, serve_adapter, *, native=False):
 
     namespace = dict(globals())
     namespace.update(
+        checkpoint_saving_enabled=checkpoint_saving_enabled,
         GlobalStartup=recovery.GlobalStartup,
         RecoveryEvidence=RecoveryEvidence,
         concurrent=concurrent,

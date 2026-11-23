@@ -28,28 +28,33 @@ def _validate_storage_mount(root: str) -> None:
         if root_path.is_relative_to(mountpoint):
             mounts.append((len(mountpoint.parts), fields[2], fields[3].split(",")))
     _, filesystem, options = max(reversed(mounts), key=lambda mount: mount[0])
-    if filesystem in {"nfs", "nfs4"} and "nocto" in options:
-        raise ValueError(f"Turbo checkpoint saving requires NFS close-to-open coherence; nocto is unsupported: {root}")
+    unsupported = {"nocto", "nolock", "local_lock=all", "local_lock=flock"}.intersection(options)
+    if filesystem in {"nfs", "nfs4"} and unsupported:
+        raise ValueError(
+            f"Turbo checkpoint saving requires coherent NFS storage with remote flock: {root}: {unsupported}"
+        )
 
 
 @contextmanager
 def _publication_lock(root: str, timeout: float):
+    import fcntl
+
     _validate_storage_mount(root)
     os.makedirs(root, exist_ok=True)
-    lock = Path(root) / ".checkpoint-publication.lock.d"
-    deadline = time.monotonic() + timeout
-    while True:
+    with open(os.path.join(root, ".checkpoint-publication.lock"), "a") as lock:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for checkpoint publication: {root}") from None
+                time.sleep(0.1)
         try:
-            lock.mkdir()
-            break
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Timed out waiting for checkpoint publication: {lock}") from None
-            time.sleep(0.1)
-    try:
-        yield
-    finally:
-        lock.rmdir()
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _generation(root: str) -> str:

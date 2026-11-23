@@ -77,7 +77,7 @@ docker build -f docker/Dockerfile.npu_turbo_cann92 -t relax-turbo:cann92 .
 
 checkpoint 写入失败可重试，已完成的步目录禁止覆盖。PLE 的 HF 初始化要求索引中包含 `ngram_embedding.shard_*` 权重，不支持整表和 VP sidecar 导出。
 
-启用 Turbo 模型保存时，driver 和全部训练 rank 必须将 `--save` 挂载为同一可读写共享目录，支持跨客户端原子 `mkdir`/`rename` 和发布后的可见性；不支持客户端本地副本或关闭一致性的挂载。启动时会核对发布代次，未启用保存时不创建发布锁。发布锁等待 30 秒后报错；若进程在持锁时退出，仅在确认旧训练进程全部停止后，手动移除保存根下的 `.checkpoint-publication.lock.d` 再重启。
+启用 Turbo 模型保存时，driver 和全部训练 rank 必须将 `--save` 挂载为同一可读写共享目录，支持跨客户端 `flock`、原子重命名和发布后的可见性；拒绝 NFS 的 `nocto`、`nolock` 和 `local_lock=all/flock`。启动时会核对发布代次，未启用保存时不创建发布锁。发布锁等待 30 秒后报错；进程退出时锁自动释放。
 
 ---
 
