@@ -216,6 +216,7 @@ def test_unsupported_seed_declines_before_partial_delivery(fault, monkeypatch):
         words.pop(next(iter(words)))
     if fault == "padding":
         # The physical projection is shorter than its wire quadrant.
+        ex.use_padded_loading = True
         for name, words_in in list(words.items()):
             if name.endswith("gate_proj.weight"):
                 words[name] = torch.cat((words_in, words_in[:4]), dim=0)

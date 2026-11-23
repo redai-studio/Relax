@@ -753,12 +753,18 @@ class DeltaReceiver:
                 self.target_shard_metrics["local_words"] = int(self.target_shard_metrics["local_words"].cpu())
             runtime = sys.modules.get("sglang.srt.runtime_context")
             parallel = runtime.get_parallel() if runtime is not None and hasattr(runtime, "get_parallel") else None
+            try:
+                tp_rank = getattr(parallel, "tp_rank", None)
+                pp_rank = getattr(parallel, "pp_rank", None)
+            except (AssertionError, RuntimeError):
+                # Standalone loaders can run before SGLang publishes its rank context.
+                tp_rank = pp_rank = None
             logger.info(
                 "Broadcast delta receiver version=%s seed=%s tp_rank=%s pp_rank=%s metrics=%s",
                 self.active["control"]["version"],
                 self.active["control"]["seed"],
-                getattr(parallel, "tp_rank", None),
-                getattr(parallel, "pp_rank", None),
+                tp_rank,
+                pp_rank,
                 self.target_shard_metrics,
             )
         if status is not None:
