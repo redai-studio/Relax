@@ -627,6 +627,12 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
     engine = _pd_engine(sglang_engine_module)
     engine.args.rollout_external = False
     engine.process = SimpleNamespace(pid=123)
+    import psutil
+
+    parent = Mock()
+    parent.children.return_value = []
+    monkeypatch.setattr(psutil, "Process", lambda pid: parent)
+    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: (processes, []))
     unregister = Mock(side_effect=RuntimeError("router is unavailable"))
     killed = Mock()
     monkeypatch.setattr(engine, "unregister_from_router", unregister)
@@ -634,7 +640,8 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
     with pytest.raises(RuntimeError, match="router is unavailable"):
         engine.shutdown()
     unregister.assert_called_once_with(timeout=5.0)
-    killed.assert_called_once_with(123)
+    parent.kill.assert_called_once()
+    killed.assert_not_called()
     engine.process = None  # Do not exercise the destructor with the fake pid.
 
 
@@ -757,3 +764,54 @@ def test_pd_id_cleanup_rejects_url_shared_with_another_generation(monkeypatch, s
     )
     assert not sglang_engine_module.remove_dead_router_worker("http://router:3000", old["url"], cleanup)
     assert requests.deletes == []
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_shutdown_requires_process_exit(monkeypatch, sglang_engine_module, alive):
+    from unittest.mock import Mock
+
+    import psutil
+
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = False
+    engine.process = SimpleNamespace(pid=123)
+    parent = Mock(pid=123)
+    child = Mock(pid=124)
+    parent.children.return_value = [child]
+    child.children.return_value = []
+    monkeypatch.setattr(psutil, "Process", lambda pid: parent)
+    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: ([], [child] if alive else []))
+    monkeypatch.setattr(engine, "unregister_from_router", lambda **kwargs: None)
+    monkeypatch.setattr(sglang_engine_module, "kill_process_tree", lambda pid: None)
+    try:
+        if alive:
+            with pytest.raises(RuntimeError, match="exit unconfirmed"):
+                engine.shutdown()
+            assert not getattr(engine, "_server_exit_confirmed", False)
+        else:
+            engine.shutdown()
+            assert engine._server_exit_confirmed
+    finally:
+        engine.process = None
+
+
+def test_shutdown_before_address_allocation_is_safe(sglang_engine_module):
+    engine = sglang_engine_module.SGLangEngine.__new__(sglang_engine_module.SGLangEngine)
+    engine.args = SimpleNamespace(rollout_external=False)
+    engine.shutdown()
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_external_shutdown_requires_router_removal(monkeypatch, sglang_engine_module, removed):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = True
+    unregister = Mock(return_value=removed)
+    monkeypatch.setattr(engine, "unregister_from_router", unregister)
+    if removed:
+        engine.shutdown()
+    else:
+        with pytest.raises(RuntimeError, match="removal is unconfirmed"):
+            engine.shutdown()
+    unregister.assert_called_once_with(wait_for_removal=True, timeout=5.0)

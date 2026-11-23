@@ -89,7 +89,7 @@ class GenRMManager(MultiEngineManager):
         results = []
         for rank in range(0, len(self.all_engines), self.nodes_per_engine):
             engine = self.all_engines[rank]
-            if engine is not None and rank in self._engine_addr_and_ports:
+            if engine is not None and rank not in self._unready_ranks and rank in self._engine_addr_and_ports:
                 info = self._engine_addr_and_ports[rank]
                 results.append((info["host"], info["port"]))
         return results

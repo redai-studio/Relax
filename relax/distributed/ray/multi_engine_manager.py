@@ -92,6 +92,8 @@ class MultiEngineManager:
         self._log_prefix = log_prefix
 
         self.all_engines: list[Any] = [None] * num_slots
+        # Ownership survives failed initialization/cleanup; availability does not.
+        self._unready_ranks: set[int] = set()
         # Per-slot (pg_tuple, owns_pg) so shutdown()/_retire_engines() only
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
@@ -106,7 +108,11 @@ class MultiEngineManager:
     @property
     def engines(self) -> list[Any]:
         """Return the head-node slot of each logical engine."""
-        return self.all_engines[:: self.nodes_per_engine]
+        return [
+            engine if rank not in self._unready_ranks else None
+            for rank, engine in enumerate(self.all_engines)
+            if rank % self.nodes_per_engine == 0
+        ]
 
     # ------------------------------------------------------------------
     # Hooks -- subclasses must implement these.
@@ -168,12 +174,12 @@ class MultiEngineManager:
         init.remote() for all of them, then await everything in one ray.get so
         a large engine doesn't pay N x cold-load latency.
 
-        On failure, kill any newly created engines and leave their slots None
-        so the caller sees them as still-dead rather than silently healthy.
+        Failed cleanup retains ownership, but never marks those slots ready.
         """
         if not ranks:
             return 0
 
+        self._unready_ranks.update(ranks)
         EngineActor = ray.remote(self.engine_actor_cls)
         new_engines: list[tuple[int, Any]] = []
         try:
@@ -216,9 +222,11 @@ class MultiEngineManager:
             # ray.get would block the training step forever.
             ray.get(init_handles, timeout=_ENGINE_REBUILD_TIMEOUT_S)
         except Exception:
+            self._onloaded = False
             self._retire_engines(ranks)
             raise
 
+        self._unready_ranks.difference_update(ranks)
         return len(new_engines)
 
     def _remove_owned_pg(self, rank: int) -> None:
@@ -285,6 +293,9 @@ class MultiEngineManager:
         while other ranks wait on a barrier, so keep it short and leave the
         rebuild to the next onload().
         """
+        pending = [rank for rank in self._unready_ranks if self.all_engines[rank] is not None]
+        if pending:
+            self._retire_engines(pending)
         if not self._onloaded:
             logger.info(f"{self._log_prefix} engines already offloaded; skipping")
             return
@@ -307,7 +318,7 @@ class MultiEngineManager:
         handles = {}
         for rank in range(0, len(self.all_engines), self.nodes_per_engine):
             engine = self.all_engines[rank]
-            if engine is None or rank in skip:
+            if engine is None or rank in skip or rank in self._unready_ranks:
                 continue
             handles[rank] = getattr(engine, method).remote(**kwargs)
 
@@ -325,7 +336,10 @@ class MultiEngineManager:
     def _retire_engines(self, ranks: list[int]) -> None:
         """Retire the whole logical engine containing each given slot."""
         heads = sorted({rank // self.nodes_per_engine * self.nodes_per_engine for rank in ranks})
+        self._unready_ranks.update(i for rank in heads for i in range(rank, rank + self.nodes_per_engine))
+        failures = []
         for rank in heads:
+            group_failed = False
             for i in range(rank, rank + self.nodes_per_engine):
                 engine = self.all_engines[i]
                 if engine is None:
@@ -336,7 +350,9 @@ class MultiEngineManager:
                     # and keep holding GPU memory, so the rebuild can't fit.
                     ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
                 except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={i} shutdown failed (killing anyway): {exc}")
+                    failures.append((i, exc))
+                    group_failed = True
+                    continue
                 try:
                     ray.kill(engine)
                 except Exception as exc:
@@ -345,8 +361,13 @@ class MultiEngineManager:
                 logger.info(f"{self._log_prefix} engine rank={i} retired")
             # Followers share the head's owned PG. Stop every local process
             # before releasing it, even if one actor was never created.
-            for i in range(rank, rank + self.nodes_per_engine):
-                self._remove_owned_pg(i)
+            if not group_failed:
+                for i in range(rank, rank + self.nodes_per_engine):
+                    self._remove_owned_pg(i)
+        if failures:
+            raise RuntimeError(f"{self._log_prefix} engine resource release is unconfirmed: {failures}") from failures[
+                0
+            ][1]
 
     def recover(self) -> set:
         """Rebuild engines with missing slots. Returns all slot ranks rebuilt.
@@ -354,6 +375,10 @@ class MultiEngineManager:
         Retirement clears every slot in a logical engine, so recovery rebuilds
         its whole TP group.
         """
+        pending = [i for i in self._unready_ranks if self.all_engines[i] is not None]
+        if pending:
+            # Retry cleanup before replacing an actor that may still own GPUs.
+            self._retire_engines(pending)
         dead = [i for i, engine in enumerate(self.all_engines) if engine is None]
         if not dead:
             return set()
@@ -363,6 +388,8 @@ class MultiEngineManager:
             self._init_engines(dead)
         except Exception as exc:
             logger.exception(f"{self._log_prefix} engine rebuild failed for ranks={dead}: {exc}")
+            if any(self.all_engines[i] is not None and i in self._unready_ranks for i in dead):
+                raise RuntimeError("Engine initialization failed and cleanup is unconfirmed") from exc
 
         rebuilt = {i for i in dead if self.all_engines[i] is not None}
         still_dead = [i for i in dead if i not in rebuilt]

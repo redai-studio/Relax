@@ -84,6 +84,19 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 
 ### 4. 引擎层 (Engine)
 
+标准 SGLang Rollout 任务由 `InferenceManager` 持有引擎和 Router 进程，独立的
+CPU `RolloutWorker` 执行生成、评估与数据传输。Worker 通过公共请求执行器发送
+生成请求，外部 HTTP 请求经过 Rollout 服务的 Gateway。Manager 在释放显存或
+更新权重前关闭请求准入，只加载权重时不会恢复
+准入，需要等 KV cache 恢复后才能继续生成。Actor 和 Controller 通过委托句柄
+继续使用原有的 rollout manager 接口。
+
+使用标准生成、评估函数和框架创建的 placement group 时，框架自动选择此路径。
+GenRM、OPD、Agentic、native/自定义引擎、外部引擎、自定义生成/数据集或后处理
+hook，以及 offline 训练任务仍完整保留原有编排，不需要新增启动参数。
+`/rollout/engines` 默认响应保持原格式；使用新路径的任务还可通过
+`?schema_version=2` 获取 Manager 的发现快照。
+
 引擎层提供 Rollout 数据生成和奖励计算能力：
 
 - [**Rollout 引擎**](../../../relax/engine/rollout/)：SGLang rollout 实现、on-policy distillation 等
