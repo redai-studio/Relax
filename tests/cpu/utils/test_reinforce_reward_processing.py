@@ -1,22 +1,29 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import importlib
+import importlib.util
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 
 @pytest.fixture()
-def post_process_rewards(monkeypatch):
+def reward_utils(monkeypatch):
     tensordict = ModuleType("tensordict")
     tensordict.TensorDict = dict
     tensordict.TensorDictBase = dict
     monkeypatch.setitem(sys.modules, "tensordict", tensordict)
-    sys.modules.pop("relax.utils.utils", None)
-    module = importlib.import_module("relax.utils.utils")
-    yield module.post_process_rewards
-    sys.modules.pop("relax.utils.utils", None)
+    path = Path(__file__).resolve().parents[3] / "relax/utils/utils.py"
+    spec = importlib.util.spec_from_file_location("_reinforce_reward_utils", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture()
+def post_process_rewards(reward_utils):
+    return reward_utils.post_process_rewards
 
 
 class _Sample:
@@ -75,10 +82,10 @@ def test_agentic_custom_advantage_does_not_require_raw_reward(post_process_rewar
     assert rewards == [0.5]
 
 
-def test_agentic_converter_does_not_transfer_raw_reward(post_process_rewards):
+def test_agentic_converter_does_not_transfer_raw_reward(reward_utils):
     from relax.utils.types import Sample
 
-    convert_samples_to_train_data = sys.modules["relax.utils.utils"].convert_samples_to_train_data
+    convert_samples_to_train_data = reward_utils.convert_samples_to_train_data
     sample = Sample(tokens=[1, 2], response_length=1, index=0, custom_advantage=0.5)
     args = _args(
         agentic_custom_advantage_path="custom.py:advantage",

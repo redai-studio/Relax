@@ -1751,7 +1751,6 @@ class Controller:
 
         # Save references needed after __init__ overwrites them
         config = self.config
-        recovery_load_path(config)  # Ensure config has the correct checkpoint paths after restart
         runtime_env = self.runtime_env
 
         # Save the old HealthChecker's stop event. Since _global_restart is
@@ -1907,6 +1906,8 @@ class Controller:
         saved_global_restart_count = self._global_restart_count
 
         try:
+            # A first checkpoint may finish while old services are shutting down.
+            recovery_load_path(config)
             self.__init__(config, runtime_env, fault_events=self._fault_events, fault_recovery=self._fault_recovery)
             self._fault_rebuild_ready = self._fault_recovery
             if self._fault_events is not None:
