@@ -433,7 +433,8 @@ async def post_generation_request(
     from .mm_sglang import ATTEMPT_PREFIX, META_FIELD
 
     rid = payload.get("rid", "")
-    if not rid.startswith((ATTEMPT_PREFIX, ROUTE_ATTEMPT_PREFIX)):
+    agentic_routes = rid.startswith(AGENTIC_R3_REQUEST_PREFIX) and payload.get("return_routed_experts")
+    if not agentic_routes and not rid.startswith((ATTEMPT_PREFIX, ROUTE_ATTEMPT_PREFIX)):
         return await post(url, payload, headers=headers, fail_fast_no_workers=fail_fast_no_workers)
 
     if retry_after_no_workers:
@@ -743,7 +744,7 @@ def _advance_publication(
         from .mm_sglang import ATTEMPT_PREFIX
 
         rid = getattr(req, "rid", "")
-        attempt = rid if rid.startswith((ATTEMPT_PREFIX, ROUTE_ATTEMPT_PREFIX)) else None
+        attempt = rid if agentic_r3 or rid.startswith((ATTEMPT_PREFIX, ROUTE_ATTEMPT_PREFIX)) else None
         pending = {
             kind: publication.finish_async(tokens[moe_start:] if kind == "moe" else tokens, attempt=attempt)
             for kind, publication in streams.items()

@@ -1071,9 +1071,9 @@ async def test_generate_score_centering_candidates_are_training_only(monkeypatch
         assert result.new_topk_token_ids is result.new_topk_log_probs is None
 
 
-@pytest.mark.parametrize("valid_score_centering", [False, True])
-async def test_generate_releases_reference_only_if_parsing_fails(monkeypatch, valid_score_centering) -> None:
-    from relax.distributed.replay_manager.backend.sglang import _wire_ref
+@pytest.fixture
+def agentic_replay_store(monkeypatch):
+    from relax.distributed.replay_manager.backend import sglang
     from relax.distributed.replay_manager.config import ReplayConfig
     from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
     from relax.distributed.replay_manager.storage import TQReplayStorage
@@ -1085,9 +1085,77 @@ async def test_generate_releases_reference_only_if_parsing_fails(monkeypatch, va
     store = TQReplayStorage(config, inventory=inventory)
     store._backend = body
     manager = ReplayManager(config=config, store_factory=lambda: store)
-    monkeypatch.setattr(runtime_mod, "replay_data_manager", manager, raising=False)
+    monkeypatch.setattr(runtime_mod, "replay_data_manager", manager)
+    monkeypatch.setattr(sglang, "replay_data_manager", manager)
     monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
 
+    try:
+        yield store, inventory, body
+    finally:
+        store.close_run()
+
+
+@pytest.mark.parametrize("delivery", ["success", "response-lost", "late-publication"])
+async def test_agentic_r3_handoff_by_wire_id(monkeypatch, agentic_replay_store, delivery):
+    import torch
+
+    from relax.distributed.replay_manager.backend import sglang
+
+    store, inventory, body = agentic_replay_store
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    calls = []
+
+    def seal(payload):
+        req = SimpleNamespace(origin_input_ids=[1], output_ids=[2], req_pool_idx=0, **payload)
+        processor = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[0]])))
+        capturer = SimpleNamespace(host_cache=SimpleNamespace(buffer=torch.tensor([[[3]]], dtype=torch.int32)))
+        return sglang._advance_publication(processor, req, 1, {"moe": lambda: capturer}, final=True)["moe"]
+
+    async def send(url, payload, **_kwargs):
+        calls.append((url, payload))
+        if url.endswith("/abort_request"):
+            return {}
+        if delivery == "late-publication":
+            raise httpx.ReadError("lost before sealing")
+        route = seal(payload)
+        if delivery == "response-lost":
+            raise httpx.ReadError("lost after sealing")
+        return {"output_ids": [2], "meta_info": {"finish_reason": {"type": "stop"}, "routed_experts": route}}
+
+    monkeypatch.setattr(adapter, "_managed_post", send)
+    monkeypatch.setattr(runtime_mod, "post", send)
+    result = adapter.generate(
+        input_ids=[1], sampling_params={}, session_id="s", request_id="r", lora_path="v", engine_url="http://worker"
+    )
+    if delivery == "success":
+        meta = (await result).meta_info
+        producer = runtime_mod.replay_data_manager.register_producer({"moe"})
+        refs = producer.response_refs(meta)
+        await producer.adopt_response(refs, "session")
+        assert refs and body.blocks
+        store.discard(refs)
+        assert len(calls) == 1
+    else:
+        with pytest.raises(httpx.ReadError):
+            await result
+        await adapter.abort_request("r")
+        (generate_url, payload), (abort_url, abort) = calls
+        assert generate_url.endswith("/generate") and abort_url.endswith("/abort_request")
+        assert abort["rid"] == payload["rid"]
+        if delivery == "late-publication":
+            seal(payload)
+    inventory.retire_partition("train_0")
+    assert not inventory.snapshot()["objects"] and not body.blocks
+
+
+@pytest.mark.parametrize("valid_score_centering", [False, True])
+async def test_generate_releases_reference_only_if_parsing_fails(
+    monkeypatch, agentic_replay_store, valid_score_centering
+) -> None:
+    from relax.distributed.replay_manager.backend.sglang import _wire_ref
+
+    store, _, body = agentic_replay_store
     adapter = _backend_adapter(lifecycle_enabled=False)
     adapter._args.use_rollout_routing_replay = True
     adapter._args.advantage_estimator = "score_centering"
@@ -1124,7 +1192,6 @@ async def test_generate_releases_reference_only_if_parsing_fails(monkeypatch, va
             assert not body.blocks
     finally:
         publication.abort()
-        store._writer.close()
 
 
 async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
@@ -3142,10 +3209,11 @@ async def test_agentic_media_holds_follow_selected_lineage_and_retired_responses
 
 @pytest.mark.parametrize("evaluation", [False, True])
 @pytest.mark.parametrize("cancel_first", [False, True])
-async def test_agentic_combined_media_routing_capture_keeps_eval_and_abort_ids(monkeypatch, evaluation, cancel_first):
+async def test_agentic_combined_media_routing_capture_keeps_eval_and_abort_ids(
+    monkeypatch, agentic_replay_store, evaluation, cancel_first
+):
     from relax.distributed.replay_manager.backend.mm_sglang import captures_request
 
-    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
     adapter = _backend_adapter(lifecycle_enabled=False)
     adapter._args.use_rollout_routing_replay = True
     adapter._args.use_rollout_mm_embedding_replay = True

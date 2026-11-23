@@ -326,6 +326,7 @@ def test_agentic_reference_abort_seals_only_active_moe_routes(monkeypatch, abort
     schedule_batch.Req = Req
     monkeypatch.setitem(sys.modules, schedule_batch.__name__, schedule_batch)
     req = Req()
+    inventory.open_response_attempt(req.rid)
     req.routed_experts_start_len = 1 if abort_mode == "suffix" else 0
     scheduler = Scheduler()
     scheduler.emitted = []
@@ -359,6 +360,7 @@ def test_agentic_reference_abort_seals_only_active_moe_routes(monkeypatch, abort
             scheduler.process_input_requests([])
         assert scheduler.emitted == [req]
         ref = ReplayRef.from_dict(req.routed_experts)
+        inventory.finish_response_attempt(req.rid, [ref.record])
         start = req.routed_experts_start_len
         assert ref.rows == 3 - start and ref.tokens == token_digest([10, 11, 12, 13][start:])
         with store.reader([ref]) as reader:

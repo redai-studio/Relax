@@ -38,6 +38,7 @@ from relax.agentic.pipeline import (
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
 from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+from relax.distributed.replay_manager.backend.sglang import post_generation_request
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.utils.agentic_obs.records import utc_now
 from relax.utils.async_utils import finish_before_cancellation
@@ -644,7 +645,9 @@ class SGLangBackendAdapter:
         try:
             # A lost generate response may already have produced tokens on a worker.
             send = self._managed_post if engine_url else partial(post, max_retries=1)
-            output = await send(
+            output = await post_generation_request(
+                replay_data_manager,
+                send,
                 f"{engine_url or self._router_url}/generate",
                 payload,
                 headers=headers,
