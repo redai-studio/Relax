@@ -6,7 +6,6 @@ import re
 from argparse import Namespace
 from collections.abc import Callable
 from pathlib import Path
-from shlex import quote
 from typing import Any
 
 from relax.utils.distributed_utils import get_gloo_group
@@ -60,51 +59,6 @@ def _has_optimizer_keys(metadata: Any) -> bool:
         re.match(r"^(?:chained_\d+\.)*optimizer(?:[./]|$)", str(key)) is not None
         for key in metadata.state_dict_metadata
     )
-
-
-def _optimizer_bucket_restart_hint(load_path: str, ckpt_step: int | None, checkpoint_dir: Path | None = None) -> str:
-    # MCore can select a different root and step from the persistent tracker.
-    if checkpoint_dir is not None and (match := re.fullmatch(r"iter_(\d+)", checkpoint_dir.name)):
-        load_path = str(checkpoint_dir.parent)
-        ckpt_step = int(match[1])
-    step_flag = f" --ckpt-step {ckpt_step}" if ckpt_step is not None else ""
-    return (
-        "Resume with the original parameter precision and DDP bucket settings. To start from the saved "
-        f"model weights with a new optimizer, use --load {quote(load_path)}{step_flag} --finetune --save <new-directory>."
-    )
-
-
-def _validate_dp_reshardable_optimizer_buckets(
-    checkpoint_dir: Path, optimizer_state: dict, load_path: str, ckpt_step: int | None
-) -> None:
-    """Validate the current optimizer template before a partial DCP load."""
-    from megatron.core.dist_checkpointing.dict_utils import nested_values
-    from megatron.core.dist_checkpointing.mapping import ShardedTensor
-    from torch.distributed.checkpoint import FileSystemReader
-    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
-
-    buckets = {
-        shard.key: shard.global_shape
-        for shard in nested_values(optimizer_state)
-        if isinstance(shard, ShardedTensor)
-        and re.fullmatch(
-            r"(?:chained_\d+\.)*optimizer\.distributed\.dp_group_idx_\d+\.gbuf_idx_\d+\."
-            r"dtype_.+\.bucket_idx_\d+\.\w+",
-            shard.key,
-        )
-    }
-    if not buckets:
-        return
-
-    saved = FileSystemReader(str(checkpoint_dir)).read_metadata().state_dict_metadata
-    for key, expected in sorted(buckets.items()):
-        stored = saved.get(key)
-        if not isinstance(stored, TensorStorageMetadata) or stored.size != expected:
-            actual = tuple(stored.size) if isinstance(stored, TensorStorageMetadata) else "missing tensor"
-            raise RuntimeError(
-                f"Incompatible optimizer bucket {key} in {checkpoint_dir}: saved {actual}, expected {expected}.\n"
-                f"{_optimizer_bucket_restart_hint(load_path, ckpt_step, checkpoint_dir)}"
-            )
 
 
 def _validate_dcp_storage(checkpoint_dir: Path) -> Any:

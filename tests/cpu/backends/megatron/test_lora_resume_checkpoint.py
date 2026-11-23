@@ -273,7 +273,6 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(
     )
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
-    monkeypatch.setattr(checkpoint, "_check_optimizer_buckets_on_load", lambda *_: nullcontext())
     monkeypatch.setattr(checkpoint, "_validate_lora_model_state_load", lambda _model: nullcontext())
     monkeypatch.setattr(
         checkpoint,

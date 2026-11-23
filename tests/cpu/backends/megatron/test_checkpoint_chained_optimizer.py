@@ -202,9 +202,8 @@ def checkpoint_cpu_group(tmp_path, monkeypatch):
     "mismatch,selection",
     [
         ("bucket_shape", "tracked"),
-        ("bucket_key", "tracked"),
         ("model_shape", "tracked"),
-        ("bucket_key", "non_persistent"),
+        ("bucket_shape", "non_persistent"),
         ("bucket_shape", "explicit_step"),
         ("bucket_assertion", "explicit_step"),
     ],
@@ -222,15 +221,16 @@ def test_checkpoint_optimizer_bucket_planning_errors(checkpoint_cpu_group, monke
     weight_key = "language_model.decoder.layers.mlp.router.weight"
     bucket_prefix = "chained_0.optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.float32)"
     saved_bucket = f"{bucket_prefix}.bucket_idx_0.exp_avg"
-    requested_bucket = f"{bucket_prefix}.bucket_idx_1.exp_avg" if mismatch == "bucket_key" else saved_bucket
     weight = torch.tensor([0.5, -1.0], dtype=torch.bfloat16)
     for root, step in dict.fromkeys(((tmp_path, tracked_step), (source_root, selected_step))):
         iteration_dir = root / f"iter_{step:07d}"
         iteration_dir.mkdir()
+        # Keep the other iteration compatible so loading it would not raise.
+        bucket_size = 3 if iteration_dir != path and mismatch == "bucket_shape" else 2
         dist_checkpointing.save(
             {
                 "model": {"weight": ShardedTensor.from_rank_offsets(weight_key, weight)},
-                "optimizer": {"exp_avg": ShardedTensor.from_rank_offsets(saved_bucket, torch.zeros(2))},
+                "optimizer": {"exp_avg": ShardedTensor.from_rank_offsets(saved_bucket, torch.zeros(bucket_size))},
                 "iteration": step,
                 "opt_param_scheduler": {"steps": step},
             },
@@ -264,10 +264,11 @@ def test_checkpoint_optimizer_bucket_planning_errors(checkpoint_cpu_group, monke
         bucket_size = 3 if mismatch == "bucket_shape" else 2
         load_template = {
             "model": {"weight": ShardedTensor.from_rank_offsets(weight_key, torch.empty(model_size))},
-            "optimizer": {"exp_avg": ShardedTensor.from_rank_offsets(requested_bucket, torch.empty(bucket_size))},
+            "optimizer": {"exp_avg": ShardedTensor.from_rank_offsets(saved_bucket, torch.empty(bucket_size))},
         }
         result = mcore_checkpointing._load_base_checkpoint(args.load, args, sharded_state_dict=load_template)
         if mismatch == "bucket_assertion":
+            assert result[0]["iteration"] == selected_step
             raise original
         return result
 
@@ -282,12 +283,14 @@ def test_checkpoint_optimizer_bucket_planning_errors(checkpoint_cpu_group, monke
     with pytest.raises(RuntimeError, match="--finetune --save <new-directory>") as error:
         checkpoint.load_checkpoint(model, optimizer, None, {}, False)
     message = str(error.value)
-    assert str(path) in message
-    assert f"--load {source_root} --ckpt-step {selected_step} --finetune" in message
+    assert f"--load {tmp_path}" in message
+    assert ("--ckpt-step 3" in message) == (selection == "explicit_step")
+    assert "original parameter precision and DDP bucket settings" in message
     if mismatch == "bucket_assertion":
         assert error.value.__cause__ is original
     else:
-        assert requested_bucket in message
+        assert isinstance(error.value.__cause__, dcp.CheckpointException)
+        assert saved_bucket in str(error.value.__cause__)
 
     model_state = dist_checkpointing.load(
         {"model": {"weight": ShardedTensor.from_rank_offsets(weight_key, torch.empty(2))}}, str(path)

@@ -17,6 +17,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from torch.distributed.checkpoint import CheckpointException
 
 
 def _load_functions(filename, names):
@@ -48,7 +49,7 @@ def checkpoint(request, monkeypatch):
                 "_metadata_value",
             ],
         )
-        module._check_optimizer_buckets_on_load = lambda *_: nullcontext()
+        module.CheckpointException = CheckpointException
     monkeypatch.setattr(module, "_collective_checkpoint_probe", lambda probe: probe(), raising=False)
     # These format-routing fixtures have placeholder metadata, not loadable
     # shards; actual storage validation is covered in test_checkpoint_preflight.
