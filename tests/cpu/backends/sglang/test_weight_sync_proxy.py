@@ -9,6 +9,9 @@ import pytest
 from relax.backends.sglang.weight_sync_proxy import WeightSyncProxy
 
 
+pytest_plugins = ["tests.cpu.backends.sglang.test_router_registration"]
+
+
 def test_proxy_consumes_entire_failed_reply_batch_before_reporting_error():
     class Channel:
         def __init__(self):
@@ -452,6 +455,8 @@ def test_pipeline_final_mask_requires_every_stage_and_flush_before_release(monke
 
 @pytest.mark.parametrize("local_shutdown", [False, True])
 def test_proxy_retirement_fences_workers_and_reaps_each_child(local_shutdown):
+    import select
+    import signal
     import subprocess
     import sys
     from multiprocessing import Pipe
@@ -459,7 +464,7 @@ def test_proxy_retirement_fences_workers_and_reaps_each_child(local_shutdown):
     from relax.backends.sglang.weight_sync_proxy import _process_identity
 
     # Drive the production child protocol. Only CUDA discovery and the PG are
-    # replaced. Hold both children after their ACK until the source joins.
+    # replaced. Hold graceful teardown after its ACK and group abort before its ACK.
     code = """
 from multiprocessing.connection import Connection
 from types import SimpleNamespace
@@ -480,14 +485,16 @@ calls = []
 def graceful():
     calls.append("close")
     sys.stdin.buffer.read(1)
+def abort():
+    calls.append("abort")
+    print("entered abort", flush=True)
+    sys.stdin.buffer.read(1)
 weight_sync_proxy.GpuSyncGroup = lambda *a, **kw: SimpleNamespace(
-    close=graceful, abort=lambda: calls.append("abort"), receive=lambda batch, slab: (slab, []),
+    close=graceful, abort=abort, receive=lambda batch, slab: (slab, []),
     fence=lambda works, **kw: None,
 )
 weight_sync_proxy._child(Connection(int(sys.argv[1])))
 assert calls == [sys.argv[2]], calls
-if calls == ["abort"]:
-    sys.stdin.buffer.read(1)
 """
     proxy = WeightSyncProxy(None)
     children = []
@@ -500,6 +507,7 @@ if calls == ["abort"]:
                 [sys.executable, "-c", code, str(child.fileno()), "abort" if local_shutdown else "close"],
                 pass_fds=(child.fileno(),),
                 stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
             )
             child.close()
             children.append((process, parent))
@@ -525,7 +533,7 @@ if calls == ["abort"]:
                 proxy.close(timeout=1, after_worker_exit=True)
             assert all(not channel.closed and process.poll() is None for process, channel in children)
             # One live model has an exported, unfenced IPC read. Its sibling
-            # may acknowledge abort; this child must retain its storage.
+            # is blocked inside group abort; this child must retain its storage.
             channel = children[0][1]
             for command in (
                 dict(op="receive", round=0, batch={"bytes": 1}, budget=16),
@@ -536,22 +544,25 @@ if calls == ["abort"]:
                 assert channel.poll(5) and channel.recv()["success"]
             with pytest.raises(RuntimeError, match="Retaining unresolved IPC"):
                 proxy.close(timeout=1, abort_group=True)
-            assert not channel.closed and children[1][1].closed
+            assert not channel.closed and not children[1][1].closed
+            blocked = children[1][0].stdout
+            assert select.select([blocked], [], [], 3)[0] and blocked.readline() == b"entered abort\n"
             model.kill()
             model.wait(timeout=5)
             proxy.close(timeout=5, after_worker_exit=True)
+            assert all(process.returncode == -signal.SIGKILL for process, _ in children)
+            proxy.close(timeout=0, after_worker_exit=True)
         else:
             with pytest.raises(subprocess.TimeoutExpired):
                 proxy.close(timeout=1)
-            model.kill()
-            model.wait(timeout=5)
+            assert all(channel.closed and process.poll() is None for process, channel in children)
             with pytest.raises(subprocess.TimeoutExpired):
-                proxy.close(timeout=0.1, after_worker_exit=True)
-        assert all(channel.closed and process.poll() is None for process, channel in children)
-        for process, _ in children:
-            process.stdin.close()
-        proxy.close(timeout=5)
-        assert all(process.returncode == 0 for process, _ in children)
+                proxy.close(timeout=0.05)
+            for process, _ in children:
+                process.stdin.close()
+            proxy.close(timeout=5)
+            assert all(process.returncode == 0 for process, _ in children)
+        assert all(channel.closed for _, channel in children)
         assert not proxy.children
     finally:
         model.kill()
@@ -560,5 +571,78 @@ if calls == ["abort"]:
         for process, channel in children:
             process.kill()
             process.wait(timeout=5)
+            process.stdin.close()
+            process.stdout.close()
+            channel.close()
+
+
+def test_stopped_engine_keeps_children_until_every_process_is_reaped(monkeypatch, sglang_engine_module):
+    import os
+    import signal
+    import subprocess
+    import sys
+    from multiprocessing import Pipe
+
+    from relax.backends.sglang.weight_sync_proxy import _process_identity
+
+    # A real model process provides a birth identity that can be proven dead.
+    with subprocess.Popen([sys.executable, "-c", "import sys;sys.stdin.read()"], stdin=subprocess.PIPE) as model:
+        owner = _process_identity(model.pid)
+        model.stdin.close()
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
+    proxy = engine._weight_sync_proxy = WeightSyncProxy(engine)
+    proxy._workers = [owner]
+    children = []
+    try:
+        for _ in range(2):
+            parent, child = Pipe()
+            code = (
+                "from multiprocessing.connection import Connection; import sys; "
+                "Connection(int(sys.argv[1])).send(dict(op='close', success=True)); sys.stdin.read()"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", code, str(child.fileno())], pass_fds=(child.fileno(),), stdin=subprocess.PIPE
+            )
+            child.close()
+            children.append((process, parent))
+        first, last = children
+        assert all(channel.poll(3) for _, channel in children)
+        # One normal close already received its ACK, the other has a late reply.
+        assert first[1].recv()["success"]
+        first[1].close()
+        proxy._closing.update({first[1]: (False, True), last[1]: (False, False)})
+        proxy.children = children.copy()
+        # An OS error must still let the owner terminate and reap its other child.
+        with monkeypatch.context() as patch:
+
+            def denied():
+                raise PermissionError("test signal failure")
+
+            patch.setattr(first[0], "kill", denied)
+            with pytest.raises(PermissionError, match="test signal failure"):
+                proxy.close(timeout=0.1, after_worker_exit=True)
+        assert last[0].returncode == -signal.SIGKILL and first[0].poll() is None
+        assert proxy.children == children and not last[1].closed
+        # Delay termination to exercise a real, bounded Popen.wait timeout.
+        with monkeypatch.context() as patch:
+            patch.setattr(first[0], "kill", lambda: first[0].send_signal(signal.SIGSTOP))
+            with pytest.raises(subprocess.TimeoutExpired):
+                proxy.close(timeout=0.05, after_worker_exit=True)
+        with pytest.raises(RuntimeError, match="Local GPU proxy retirement"):
+            engine.delta_weight_sync("close", timeout=0.05)
+        with monkeypatch.context() as patch:
+            patch.setattr(proxy, "_workers", [_process_identity(os.getpid())])
+            with pytest.raises(RuntimeError, match="original model workers exit"):
+                engine.delta_weight_sync("close", timeout=0.05, abort_group=True)
+        assert engine._weight_sync_proxy is proxy and first[0].poll() is None
+        engine.delta_weight_sync("close", timeout=3, abort_group=True)
+        engine.delta_weight_sync("close", timeout=0, abort_group=True)
+        assert engine._weight_sync_proxy is None
+        assert not proxy.children and not proxy._closing and last[1].closed
+        assert first[0].returncode == -signal.SIGKILL
+    finally:
+        for process, channel in children:
+            process.kill()
+            process.wait(timeout=3)
             process.stdin.close()
             channel.close()
