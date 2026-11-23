@@ -1087,20 +1087,22 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
     rank_step_records: dict[int, list[dict[str, Any]]] = {}
     truncated_step_logs: dict[str, dict[str, Any]] = {}
     for file_path in step_files:
-        non_empty_lines = [
-            (line_no, raw_line)
-            for line_no, raw_line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), start=1)
-            if raw_line.strip()
-        ]
-        if not non_empty_lines:
+        with file_path.open("rb") as handle:
+            raw_lines = list(handle)
+        if not raw_lines:
             continue
         match = re.fullmatch(r"rank_(\d+)_steps\.jsonl", file_path.name)
         records: list[dict[str, Any]] = []
-        for idx, (line_no, raw_line) in enumerate(non_empty_lines):
+        for line_no, raw_bytes in enumerate(raw_lines, start=1):
+            if not raw_bytes.strip():
+                continue
+            # 仅最后一行缺少换行符时判定为写入中断产生的截断尾行；带换行符或中间行损坏均直接报错。
+            is_unterminated_trailing = line_no == len(raw_lines) and not raw_bytes.endswith(b"\n")
             try:
+                raw_line = raw_bytes.decode("utf-8")
                 parsed = json.loads(raw_line)
-            except json.JSONDecodeError as exc:
-                if idx == len(non_empty_lines) - 1:
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if is_unterminated_trailing:
                     if not allow_incomplete:
                         raise ValueError(
                             f"Truncated trailing record in {file_path.name} at line {line_no}: {exc}"
@@ -1133,7 +1135,7 @@ def summarize_baseline_dir(output_dir: Path, *, allow_incomplete: bool = False) 
     corrupted_summaries: dict[str, str] = {}
     for file_path in sorted(out_path.glob("rank_*_summary.json")):
         try:
-            data = json.loads(file_path.read_text(encoding="utf-8"))
+            data = json.loads(file_path.read_bytes().decode("utf-8"))
             if not isinstance(data, dict):
                 raise ValueError(f"expected JSON object, got {type(data).__name__}")
             raw_rank = data["rank"]

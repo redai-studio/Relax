@@ -1118,3 +1118,113 @@ def test_atomic_summary_writes_leave_no_tmp_files_and_preserve_existing_on_failu
     assert "simulated replace failure" in (tr.io_error or "")
     assert (clean_dir / "rank_0_summary.json").read_text(encoding="utf-8") == orig_rank_summary
     assert list(clean_dir.glob("*.tmp*")) == []
+
+
+def test_summarize_baseline_dir_handles_utf8_truncation_and_terminated_corrupt_tail(tmp_path: Path) -> None:
+    row = {"prompt": "p", "image": "t.png", "edit_image": ["r.png"]}
+    config = {"max_pixels": 65536, "fixed_pixels_tiers": None, "seed": 42}
+
+    # 1. 实际 tracker 写入两步，第二步传输键截断在 UTF-8 多字节字符的第一个字节之后（无换行符）。
+    utf8_dir = tmp_path / "truncated_utf8"
+    tr_utf8 = ConditionTracker(
+        rank=0, world_size=1, micro_batches=1, dataset_size=1, output_dir=utf8_dir, warmup_steps=0, run_id="run-utf8"
+    )
+    transfer_key = "参考图/样本.png"
+    for step in (0, 1):
+        tr_utf8.begin_step(step, torch.device("cpu"))
+        tr_utf8.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+        tr_utf8.record_transfer("ref_pixel_values", torch.ones((1, 4)), key=transfer_key)
+        tr_utf8.end_step(step, 0.001, 0.01)
+    tr_utf8.save_summary()
+
+    steps_path = utf8_dir / "rank_0_steps.jsonl"
+    raw_lines = steps_path.read_bytes().splitlines(keepends=True)
+    assert len(raw_lines) == 2
+    key_bytes = transfer_key.encode("utf-8")
+    key_offset = raw_lines[1].index(key_bytes)
+    steps_path.write_bytes(raw_lines[0] + raw_lines[1][: key_offset + 1])
+
+    with pytest.raises(ValueError, match="Truncated trailing record"):
+        summarize_baseline_dir(utf8_dir)
+    partial_utf8 = summarize_baseline_dir(utf8_dir, allow_incomplete=True)
+    assert partial_utf8["complete"] is False
+    assert partial_utf8["total_steps"] == 1
+    assert partial_utf8["truncated_step_logs"] == {"0": {"file": "rank_0_steps.jsonl", "line": 2}}
+
+    # 2. 带有换行符的损坏末行（JSON 损坏或 UTF-8 损坏）在部分模式下仍须拒绝。
+    for suffix_name, corrupt_tail in (
+        ("json_newline", b'{"rank": 0, "step": 1\n'),
+        ("utf8_newline", b'{"rank": 0, "key": "\xe5\n'),
+    ):
+        tail_dir = tmp_path / f"corrupt_{suffix_name}"
+        tr_tail = ConditionTracker(
+            rank=0,
+            world_size=1,
+            micro_batches=1,
+            dataset_size=1,
+            output_dir=tail_dir,
+            warmup_steps=0,
+            run_id=f"run-{suffix_name}",
+        )
+        tr_tail.begin_step(0, torch.device("cpu"))
+        tr_tail.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+        tr_tail.end_step(0, 0.001, 0.01)
+        tr_tail.save_summary()
+        tail_file = tail_dir / "rank_0_steps.jsonl"
+        tail_file.write_bytes(tail_file.read_bytes() + corrupt_tail)
+
+        with pytest.raises(ValueError, match="Corrupted record"):
+            summarize_baseline_dir(tail_dir)
+        with pytest.raises(ValueError, match="Corrupted record"):
+            summarize_baseline_dir(tail_dir, allow_incomplete=True)
+
+    # 3. 中间行包含非法 UTF-8 字节时，严格与部分模式均须抛出 ValueError。
+    mid_utf8_dir = tmp_path / "corrupted_middle_utf8"
+    tr_mid_utf8 = ConditionTracker(
+        rank=0,
+        world_size=1,
+        micro_batches=1,
+        dataset_size=1,
+        output_dir=mid_utf8_dir,
+        warmup_steps=0,
+        run_id="run-mid-utf8",
+    )
+    for step in (0, 1):
+        tr_mid_utf8.begin_step(step, torch.device("cpu"))
+        tr_mid_utf8.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+        tr_mid_utf8.end_step(step, 0.001, 0.01)
+    tr_mid_utf8.save_summary()
+    mid_lines = (mid_utf8_dir / "rank_0_steps.jsonl").read_bytes().splitlines(keepends=True)
+    assert len(mid_lines) == 2
+    (mid_utf8_dir / "rank_0_steps.jsonl").write_bytes(mid_lines[0] + b'{"rank": 0, "key": "\xe5"}\n' + mid_lines[1])
+
+    with pytest.raises(ValueError, match="Corrupted record"):
+        summarize_baseline_dir(mid_utf8_dir)
+    with pytest.raises(ValueError, match="Corrupted record"):
+        summarize_baseline_dir(mid_utf8_dir, allow_incomplete=True)
+
+    # 4. rank_0_summary.json 截断在 UTF-8 多字节字符中间时，部分模式应跳过损坏摘要并返回部分汇总。
+    bad_sum_utf8_dir = tmp_path / "corrupted_summary_utf8"
+    tr_sum_utf8 = ConditionTracker(
+        rank=0,
+        world_size=1,
+        micro_batches=1,
+        dataset_size=1,
+        output_dir=bad_sum_utf8_dir,
+        warmup_steps=0,
+        run_id="run-sum-utf8",
+    )
+    tr_sum_utf8.begin_step(0, torch.device("cpu"))
+    tr_sum_utf8.begin_micro(0, 0, row, config, "lora", 64, 64, is_padding=False)
+    tr_sum_utf8.end_step(0, 0.001, 0.01)
+    tr_sum_utf8.save_summary()
+    (bad_sum_utf8_dir / "rank_0_summary.json").write_bytes(b'{"rank": 0, "io_error": "\xe5')
+
+    with pytest.raises(ValueError, match="Corrupted rank summary"):
+        summarize_baseline_dir(bad_sum_utf8_dir)
+    partial_sum_utf8 = summarize_baseline_dir(bad_sum_utf8_dir, allow_incomplete=True)
+    assert partial_sum_utf8["complete"] is False
+    assert partial_sum_utf8["total_steps"] == 1
+    assert partial_sum_utf8["sample_stats"]["total_samples"] == 1
+    assert partial_sum_utf8["corrupted_summaries"] == {"0": "rank_0_summary.json"}
+    assert partial_sum_utf8["missing_summaries"] == [0]
