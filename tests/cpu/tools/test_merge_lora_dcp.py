@@ -165,6 +165,67 @@ def test_base_identity_mismatch_refuses_to_publish(checkpoint):
     assert not output.exists()
 
 
+def test_flash_dcp_preserves_fp8_and_deinterleaves_kda_projections(tmp_path):
+    from scripts.tools.convert_checkpoint_to_hf_cpu import read_hf_schema
+
+    base = tmp_path / "base"
+    base.mkdir()
+    output = tmp_path / "output"
+    checkpoint = tmp_path / "checkpoint"
+    fp8 = torch.float8_e4m3fn
+    keys = [f"model.language_model.layers.1.self_attn.{name}_proj.weight" for name in "qkv"]
+    frozen = "model.language_model.layers.1.mlp.gate.weight"
+    weights = {key: torch.zeros((4, 3), dtype=dtype) for key, dtype in zip(keys, (fp8, torch.bfloat16, fp8))}
+    weights[frozen] = torch.tensor([3, 5, 7], dtype=torch.float32)
+    scales = {key + "_scale_inv": torch.ones((1, 1)) for key in (keys[0], keys[2])}
+    save_file(weights, base / "model-weights.safetensors")
+    save_file(scales, base / "model-scales.safetensors")
+    weight_map = dict.fromkeys(weights, "model-weights.safetensors") | dict.fromkeys(
+        scales, "model-scales.safetensors"
+    )
+    (base / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    config = {
+        "model_type": "glm5_next",
+        "quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]},
+    }
+    (base / "config.json").write_text(json.dumps(config))
+    module = "language_model.decoder.layers.2.inner_layer.self_attention.in_proj.adapter"
+    dcp.save(
+        {
+            f"{module}.linear_in.weight": torch.tensor([[1, 0, 0]], dtype=torch.bfloat16),
+            f"{module}.linear_out.weight": torch.tensor([2**i for i in range(12)], dtype=torch.bfloat16).reshape(
+                12, 1
+            ),
+        },
+        checkpoint_id=checkpoint,
+    )
+    spec = {
+        "format_version": 1,
+        "lora_rank": 1,
+        "lora_alpha": 1,
+        "lora_dropout": 0,
+        "base_hf_checkpoint": base_identity(base, weight_map),
+    }
+    args = Namespace(relax_lora_checkpoint_metadata=spec, tensor_model_parallel_size=2)
+    torch.save({"args": args}, checkpoint / "common.pt")
+
+    report = merge(base, output, checkpoint=checkpoint, preserve_base_dtypes=True)
+
+    assert report["merged_matrices"] == 3
+    output_map, output_schema = read_hf_schema(output)
+    assert output_schema == read_hf_schema(base)[1]
+    assert (output / "config.json").read_bytes() == (base / "config.json").read_bytes()
+    for key, values in zip(keys, ([1, 2, 64, 128], [4, 8, 256, 512], [16, 32, 1024, 2048])):
+        with safe_open(output / output_map[key], framework="pt") as handle:
+            weight = handle.get_tensor(key).float()
+            if key + "_scale_inv" in output_map:
+                weight *= handle.get_tensor(key + "_scale_inv")
+        torch.testing.assert_close(weight[:, 0], torch.tensor(values, dtype=torch.float32))
+        assert weight[:, 1:].count_nonzero().item() == 0
+    with safe_open(output / output_map[frozen], framework="pt") as handle:
+        torch.testing.assert_close(handle.get_tensor(frozen), weights[frozen], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("suffix", ["self_attention.unsupported", "mlp.linear_fc1"])
 def test_unknown_or_unmatched_adapter_is_rejected(suffix):
     prefix = "decoder.layers.0." + suffix

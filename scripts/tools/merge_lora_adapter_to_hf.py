@@ -34,7 +34,9 @@ layouts are mapped to HF keys by lora_dcp.DcpAdapter.
 
 Unquantized PEFT exports preserve the base dtypes and config. Block-128 FP8
 bases are dequantized and rounded to BF16 before applying LoRA, and the output
-config drops quantization metadata. Other quantization schemes are rejected.
+config drops quantization metadata by default. Use --preserve-base-dtypes to
+requantize changed FP8 weights and retain the base's per-tensor dtypes and its
+quantization configuration. Other quantization schemes are rejected.
 DCP input is currently restricted to GLM version-1 LoRA-only checkpoints with
 zero dropout and the identical training base. DCP outputs use a .partial
 directory and are published only after identity and shard validation; --force
@@ -115,6 +117,11 @@ def _parse_args():
         action="store_true",
         help="Resolve and validate every adapter/base tensor pairing, report what would be merged, and exit "
         "without writing anything.",
+    )
+    parser.add_argument(
+        "--preserve-base-dtypes",
+        action="store_true",
+        help="Keep base tensor dtypes and re-quantize updated block-128 E4M3 weights to FP8.",
     )
     parser.add_argument(
         "-f",
@@ -243,7 +250,7 @@ def _resolve_base_keys(pairs: dict, base_keys: set) -> dict:
     return resolved
 
 
-def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
+def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device, *, fp8_scales=None):
     """Fold the adapter into ``shard_tensors`` in place.
 
     Returns the merged key list.
@@ -253,11 +260,21 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
     merged = []
     for prefix, base_key in targets.items():
         base = shard_tensors[base_key]
+        scale_key = base_key + "_scale_inv"
+        scale = fp8_scales.get(scale_key) if fp8_scales is not None else None
         lora_a = adapter.get_tensor(pairs[prefix]["A"]).to(device=device, dtype=torch.float32)
         lora_b = adapter.get_tensor(pairs[prefix]["B"]).to(device=device, dtype=torch.float32)
 
         if not torch.isfinite(lora_a).all() or not torch.isfinite(lora_b).all():
             raise ValueError(f"Nonfinite adapter: {prefix}")
+        if scale is not None:
+            if not torch.isfinite(scale).all():
+                raise ValueError(f"Nonfinite FP8 scale: {base_key}")
+            if not torch.count_nonzero(lora_b):
+                shard_tensors[scale_key] = scale
+                merged.append(base_key)
+                continue
+            base = dequantize_base(base.to(device), scale.to(device))
 
         # `@` covers both cases: 2-D (out,r)@(r,in) for nn.Linear weights, and batched
         # (E,out,r)@(E,r,in) for grouped MoE experts stored as one 3-D parameter.
@@ -267,9 +284,15 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device):
                 f"LoRA delta shape {tuple(delta.shape)} does not match base tensor {base_key} "
                 f"{tuple(base.shape)} (lora_A={tuple(lora_a.shape)}, lora_B={tuple(lora_b.shape)})."
             )
-        shard_tensors[base_key] = (base.to(device=device, dtype=torch.float32) + delta).to(
-            dtype=base.dtype, device="cpu"
-        )
+        result = (base.to(device=device, dtype=torch.float32) + delta).to(dtype=base.dtype)
+        if scale is not None:
+            from relax.utils.quant_cast.fp8 import block_fp8
+
+            if not torch.isfinite(result).all():
+                raise ValueError(f"Nonfinite output: {base_key}")
+            result, new_scale = block_fp8(result, [128, 128])
+            shard_tensors[scale_key] = new_scale.to(dtype=scale.dtype, device="cpu")
+        shard_tensors[base_key] = result.cpu()
         merged.append(base_key)
     return merged
 
@@ -307,6 +330,16 @@ def dequantize_base(weight: Any, scale: Any | None) -> Any:
     return values.view(nr * 128, nc * 128)[:rows, :cols].to(torch.bfloat16).contiguous()
 
 
+def _read_scale(key: str, shard: str, source: Any, weight_map: dict[str, str], base_dir: Path) -> Any:
+    from safetensors import safe_open
+
+    name = weight_map[key]
+    if name == shard:
+        return source.get_tensor(key)
+    with safe_open(str(base_dir / name), framework="pt") as other:
+        return other.get_tensor(key)
+
+
 def merge(
     base_dir: Path,
     output_dir: Path,
@@ -316,12 +349,14 @@ def merge(
     device: str = "cpu",
     dry_run: bool = False,
     force: bool = False,
+    preserve_base_dtypes: bool = False,
 ) -> dict[str, Any]:
     """Merge either adapter format using the same tensor and shard pipeline.
 
     DCP exports are published atomically after base/checkpoint identity checks.
     PEFT exports retain the existing --force behavior and base tensor dtypes.
-    Block-128 FP8 bases are dequantized to BF16 before adding LoRA deltas.
+    Block-128 FP8 bases are dequantized to BF16 before adding LoRA deltas. With
+    preserve_base_dtypes, only adapted matrices are re-quantized.
     """
     import torch
     from safetensors import safe_open
@@ -347,6 +382,8 @@ def merge(
         if entry["dtype"].startswith("F8"):
             if not quant:
                 raise ValueError("FP8 weights require explicit block quantization metadata")
+            if preserve_base_dtypes and entry["dtype"] != "F8_E4M3":
+                raise ValueError("Preserving FP8 dtypes requires E4M3 block quantization")
             if key + "_scale_inv" not in scales:
                 raise ValueError(f"Missing FP8 scale: {key}")
         if key in scales:
@@ -379,10 +416,13 @@ def merge(
         per_shard: dict = {}
         for prefix, base_key in targets_by_key.items():
             per_shard.setdefault(weight_map[base_key], {})[prefix] = base_key
+        adapted_scales = (
+            {key + "_scale_inv" for key in targets_by_key.values()} & scales if preserve_base_dtypes else set()
+        )
         report = {"base": str(base_dir), "merged_matrices": len(pairs), "dry_run": dry_run}
         if checkpoint is not None:
             report.update(adapter.report)
-            report["output_dtype"] = "bfloat16"
+            report["output_dtype"] = "base" if preserve_base_dtypes else "bfloat16"
         if dry_run:
             return report
 
@@ -406,24 +446,23 @@ def merge(
             with safe_open(str(src), framework="pt") as source:
                 metadata = source.metadata() or {"format": "pt"}
                 tensors = {}
+                fp8_scales = {}
                 for key in source.keys():
-                    if key in scales:
+                    if key in scales and (not preserve_base_dtypes or key in adapted_scales):
                         continue
-                    scale = None
                     scale_key = key + "_scale_inv"
-                    if scale_key in scales:
-                        if weight_map[scale_key] == shard:
-                            scale = source.get_tensor(scale_key)
-                        else:
-                            with safe_open(str(base_dir / weight_map[scale_key]), framework="pt") as other:
-                                scale = other.get_tensor(scale_key)
-                    weight = dequantize_base(source.get_tensor(key), scale)
-                    if checkpoint is not None and key in target_keys:
+                    weight = source.get_tensor(key)
+                    if scale_key in adapted_scales:
+                        fp8_scales[scale_key] = _read_scale(scale_key, shard, source, weight_map, base_dir)
+                    elif not preserve_base_dtypes and scale_key in scales:
+                        weight = dequantize_base(weight, _read_scale(scale_key, shard, source, weight_map, base_dir))
+                    if checkpoint is not None and key in target_keys and not preserve_base_dtypes:
                         weight = weight.to(torch.bfloat16)
                     tensors[key] = weight
-                merged = _merge_shard(tensors, targets, adapter, pairs, scaling, device)
+                merged = _merge_shard(tensors, targets, adapter, pairs, scaling, device, fp8_scales=fp8_scales)
                 for key, value in tensors.items():
-                    if not bool(torch.isfinite(value).all()):
+                    is_fp8 = schema[key]["dtype"].startswith("F8") and preserve_base_dtypes
+                    if not is_fp8 and not bool(torch.isfinite(value).all()):
                         raise ValueError(f"Nonfinite output: {key}")
                     tensors[key] = value.contiguous()
                     output_map[key] = shard
@@ -438,21 +477,27 @@ def merge(
         if checkpoint is not None:
             adapter.validate_unchanged()
         _copy_aux_files(base_dir, destination)
-        if quant or checkpoint is not None:
+        if not preserve_base_dtypes and (quant or checkpoint is not None):
             config.pop("quantization_config", None)
             config["dtype"] = "bfloat16"
             if "torch_dtype" in config:
                 config["torch_dtype"] = "bfloat16"
             (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        if (not preserve_base_dtypes and (quant or checkpoint is not None)) or output_map != weight_map:
             (destination / _INDEX_FILE).write_text(
                 json.dumps({"metadata": {"total_size": total_bytes}, "weight_map": output_map}, indent=2) + "\n"
             )
         physical_map, physical_schema = read_hf_schema(destination)
-        if physical_map != output_map or any(v["dtype"].startswith("F8") for v in physical_schema.values()):
+        if physical_map != output_map:
             raise ValueError("Final HF shard/index validation failed")
+        if preserve_base_dtypes and physical_schema != schema:
+            raise ValueError("Final HF tensor names, shapes or dtypes differ from the base")
+        if not preserve_base_dtypes and any(value["dtype"].startswith("F8") for value in physical_schema.values()):
+            raise ValueError("Final HF export contains unexpected FP8 tensors")
         report.update(merged_matrices=total_merged, output_tensors=len(output_map))
         if checkpoint is not None:
-            report.update(total_bytes=total_bytes, shards=len(set(output_map.values())), all_finite=True)
+            report.update(total_bytes=total_bytes, shards=len(set(output_map.values())))
+            report["merged_finite" if preserve_base_dtypes else "all_finite"] = True
             (destination / "relax_conversion_report.json").write_text(json.dumps(report, indent=2) + "\n")
             destination.rename(output_dir)
         return report
@@ -471,6 +516,7 @@ def main() -> None:
         device=args.device,
         dry_run=args.dry_run,
         force=args.force,
+        preserve_base_dtypes=args.preserve_base_dtypes,
     )
     logger.info(f"[merge-lora] Done: {report}")
 

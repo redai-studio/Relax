@@ -103,3 +103,30 @@ def test_non_sharded_gdn_named_tensor_needs_no_gdn_config(monkeypatch, kind):
     monkeypatch.setattr(common, "get_hf_config", lambda *a: pytest.fail("unneeded config lookup"))
     actual = common.all_gather_param(SimpleNamespace(), "decoder.layers.0.self_attention.in_proj.weight", tensor)
     assert actual.data_ptr() == tensor.data_ptr()
+
+
+def test_gather_restores_flash_kda_components(monkeypatch):
+    from relax.backends.megatron.weight_update import common
+
+    components = [torch.arange(8).reshape(8, 1) + base for base in (0, 100, 200)]
+    shards = [torch.cat([tensor.chunk(2)[rank] for tensor in components]) for rank in range(2)]
+    param = shards[0]
+    param.tensor_model_parallel = True
+    param.partition_dim = 0
+    config = SimpleNamespace(
+        model_type="glm5_next_text",
+        linear_attn_config={"num_heads": 4, "head_dim": 2},
+    )
+    monkeypatch.setattr(common, "get_hf_config", lambda _path: SimpleNamespace(text_config=config))
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(common.mpu, "get_tensor_model_parallel_group", lambda: None)
+
+    def all_gather(outputs, _param, *, group, async_op):
+        for output, shard in zip(outputs, shards, strict=True):
+            output.copy_(shard)
+
+    monkeypatch.setattr(common.dist, "all_gather", all_gather)
+    full = common.all_gather_param(
+        SimpleNamespace(hf_checkpoint="unused"), "decoder.layers.0.inner_layer.self_attention.in_proj.weight", param
+    )
+    torch.testing.assert_close(full, torch.cat(components))

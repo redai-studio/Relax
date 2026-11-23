@@ -58,3 +58,34 @@ def test_mtp_non_expert_names_do_not_receive_ep_or_pp_offsets(common, monkeypatc
     result = list(common.named_params_and_buffers(Namespace(num_experts=512), [model]))
     assert [name for name, _ in result] == names
     assert all(actual is expected for (_, actual), (_, expected) in zip(result, params, strict=True))
+
+
+def test_hybrid_decoder_uses_constructed_layer_numbers_and_unique_expert_names(common, monkeypatch):
+    layer = torch.nn.Module()
+    layer.layer_number = 48
+    layer.inner_layer = torch.nn.Module()
+    layer.inner_layer.mlp = torch.nn.Module()
+    layer.inner_layer.mlp.experts = torch.nn.Module()
+    layer.inner_layer.mlp.experts.linear_fc1 = torch.nn.Module()
+    weight = torch.nn.Parameter(torch.zeros(1))
+    layer.inner_layer.mlp.experts.linear_fc1.register_parameter("weight0", weight)
+    layer.register_buffer("expert_bias", torch.ones(1))
+    model = torch.nn.Module()
+    model.config = Namespace(hybrid_layer_pattern="KE")
+    model.language_model = torch.nn.Module()
+    model.language_model.decoder = torch.nn.Module()
+    model.language_model.decoder.layers = torch.nn.ModuleList([layer])
+    wrapper = torch.nn.Module()
+    wrapper.module = model
+    wrapper.config = model.config
+
+    names = []
+    for ep_rank in (0, 1):
+        monkeypatch.setattr(common.mpu, "get_expert_model_parallel_rank", lambda rank=ep_rank: rank)
+        exported = dict(common.named_params_and_buffers(Namespace(num_experts=288), [wrapper]))
+        prefix = "module.module.language_model.decoder.layers.47"
+        expert = f"{prefix}.inner_layer.mlp.experts.linear_fc1.weight{ep_rank * 36}"
+        assert exported[expert] is weight
+        assert exported[f"{prefix}.expert_bias"] is layer.expert_bias
+        names.append(expert)
+    assert len(set(names)) == 2
