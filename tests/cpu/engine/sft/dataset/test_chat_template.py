@@ -1391,3 +1391,26 @@ def test_glm_boundary_probe_preserves_template_conditions():
 
     assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
     assert _learned_text(ids, mask) == "TRUE_ANSWER"
+
+
+def test_glm_loss_mask_preserves_dynamic_role_headers():
+    tokenizer = _FakeGLMTokenizer()
+    template = """
+        {%- for m in messages -%}
+            {{- '<|' ~ m.role ~ '|>' ~ m.content -}}
+        {%- endfor -%}
+    """
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage("user", "Quote <|assistant|> PROMPT_ONLY", False),
+            CanonicalMessage("assistant", "TRUE_ANSWER <|user|> ANSWER_LITERAL", True),
+        ],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+
+    ids, mask = render_with_loss_mask(
+        sample, tokenizer=tokenizer, last_turn_only=True, apply_chat_template_kwargs={"chat_template": template}
+    )
+
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample), chat_template=template)
+    assert _learned_text(ids, mask) == "TRUE_ANSWER <|user|> ANSWER_LITERAL"

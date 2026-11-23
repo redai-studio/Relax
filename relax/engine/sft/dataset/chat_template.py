@@ -437,8 +437,12 @@ class _GLMDialect:
     name = "glm"
     _headers = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
 
+    _dynamic_header = re.compile(r"""['"]<\|['"]\s*~[^~]*(?:\.role|\[\s*['"]role['"]\s*\])\s*~\s*['"]\|>""")
+
     def matches(self, template: str | None) -> bool:
-        return bool(template) and "<|assistant|>" in template and "<|user|>" in template
+        return bool(template) and (
+            "<|assistant|>" in template and "<|user|>" in template or bool(self._dynamic_header.search(template))
+        )
 
     _probe_marker = re.compile(r"\x00relax-glm-mask:(\d+):\d+\x00")
 
@@ -458,7 +462,7 @@ class _GLMDialect:
         literals = {
             index: f"\x00{index}\x00"
             for index, (kind, value) in enumerate(tokens)
-            if kind == "string" and re.search(self._delimiter_pattern, value)
+            if kind == "string" and (value[1:-1] == "<|" or re.search(self._delimiter_pattern, value))
         }
         if not literals:
             return "".join(value for _, value in tokens)
@@ -469,22 +473,45 @@ class _GLMDialect:
         output = environment.parse("{{" + probe + "}}").body[0]
         pending = list(output.nodes)
         emitted = []
+        dynamic_starts = set()
         while pending:
             node = pending.pop()
             if isinstance(node, nodes.Const) and isinstance(node.value, str):
                 emitted.append(node.value)
             elif isinstance(node, nodes.Concat):
+                # The opening literal can be emitted as part of a dynamically
+                # assembled role header, e.g. '<|' ~ message.role ~ '|>'.
+                for start, role, end in zip(node.nodes, node.nodes[1:], node.nodes[2:], strict=False):
+                    if (
+                        isinstance(start, nodes.Const)
+                        and isinstance(start.value, str)
+                        and start.value.endswith("<|")
+                        and isinstance(end, nodes.Const)
+                        and isinstance(end.value, str)
+                        and end.value.startswith("|>")
+                        and (
+                            isinstance(role, nodes.Getattr)
+                            and role.attr == "role"
+                            or isinstance(role, nodes.Getitem)
+                            and isinstance(role.arg, nodes.Const)
+                            and role.arg.value == "role"
+                        )
+                    ):
+                        dynamic_starts.add(start.value.removesuffix("<|"))
                 pending.extend(node.nodes)
             elif isinstance(node, nodes.Add):
                 pending.extend((node.left, node.right))
             elif isinstance(node, nodes.CondExpr):
                 pending.extend((node.expr1, node.expr2))
-        return "".join(
-            self._mark_delimiters(value)
-            if index in literals and any(text.startswith(literals[index]) for text in emitted)
-            else value
-            for index, (_, value) in enumerate(tokens)
-        )
+        marked = []
+        for index, (_, value) in enumerate(tokens):
+            literal = literals.get(index)
+            if literal in dynamic_starts:
+                value = value[:1] + self._boundary_marker + value[1:]
+            elif literal is not None and any(text.startswith(literal) for text in emitted):
+                value = self._mark_delimiters(value)
+            marked.append(value)
+        return "".join(marked)
 
     @lru_cache(maxsize=128)
     def marked_template(self, template: str) -> str:
@@ -509,7 +536,8 @@ class _GLMDialect:
     def mask_text(self, marked_text: str) -> str:
         # Keep only delimiters emitted by the template. Payload positions
         # still index the original rendering, including any literal delimiters.
-        return self._tagged_delimiters.sub(lambda match: match[2] if match[1] else " " * len(match[2]), marked_text)
+        shadow = self._tagged_delimiters.sub(lambda match: match[2] if match[1] else " " * len(match[2]), marked_text)
+        return shadow.replace(self._boundary_marker, "")
 
     def locate_nonassistant_spans(
         self, text: str, messages: list[dict[str, Any]], render: Callable[[list[dict[str, Any]]], str]
