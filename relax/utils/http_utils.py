@@ -389,7 +389,9 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
-async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
+async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False, *, client=None):
+    if client is not None:
+        return await _post(client, url, payload, max_retries, headers, fail_fast_no_workers)
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         observation = post_observation.get()
@@ -419,8 +421,9 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no
             # Ray-actor/transport fault. Do NOT fall back to a local re-send:
             # that would double the logical attempt and, for an SGLang
             # pre-dispatch 499, hide the real error the 499 mapping needs to
-            # see. Only transport/actor failures fall back to the local client.
-            if isinstance(e, httpx.HTTPStatusError):
+            # see. Only transport/actor failures fall back to the local client,
+            # and an explicitly single-attempt call must never be resent.
+            if isinstance(e, httpx.HTTPStatusError) or max_retries == 1:
                 raise
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
@@ -428,7 +431,9 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no
     return await _post(_http_client, url, payload, max_retries, headers, fail_fast_no_workers)
 
 
-async def get(url, max_retries=MAX_RETRIES):
+async def get(url, max_retries=MAX_RETRIES, *, client=None):
+    if client is None:
+        client = _http_client
     # Mirror `_post`'s retry policy: a bare GET without retries lets a transient
     # connection drop (e.g. httpx.RemoteProtocolError "Server disconnected") on a
     # control call such as the router's /list_workers propagate immediately. In the
@@ -438,7 +443,7 @@ async def get(url, max_retries=MAX_RETRIES):
     while retry_count < max_retries:
         response = None
         try:
-            response = await _http_client.get(url)
+            response = await client.get(url)
             response.raise_for_status()
             content = await response.aread()
             try:

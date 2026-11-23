@@ -1004,6 +1004,8 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    reentrant_checkpoint: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO/SAPO) and metrics.
 
@@ -1058,13 +1060,15 @@ def policy_loss_function(
     max_seq_lens = batch.get("max_seq_lens", None)
     padded_total_lengths = batch.get("padded_total_lengths", None)
 
+    # A reentrant checkpoint enables grad only on its backward replay.
+    with_entropy = args.entropy_coef != 0 or not (reentrant_checkpoint and torch.is_grad_enabled())
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=with_entropy,
         gather_topk_token_ids=(
             batch["rollout_topk_token_ids"] if is_score_centering else resolve_opd_gather_topk_token_ids(args, batch)
         ),
@@ -1226,18 +1230,14 @@ def policy_loss_function(
         pg_loss_reducer = sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
-    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
 
-    # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    if is_score_centering:
-        entropy = torch.where(sc_valid, entropy, 0)
-
-    entropy_loss = sum_of_sample_mean(entropy)
-
-    loss = pg_loss - args.entropy_coef * entropy_loss
+    loss = pg_loss
+    if with_entropy:
+        entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
+        if is_score_centering:
+            entropy = torch.where(sc_valid, entropy, 0)
+        entropy_loss = sum_of_sample_mean(entropy)
+        loss = pg_loss - args.entropy_coef * entropy_loss
 
     if args.use_kl_loss:
         ref_log_probs = torch.cat(batch["ref_log_probs"], dim=0)
@@ -1259,7 +1259,13 @@ def policy_loss_function(
         loss = loss + opd_loss
 
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum(dtype=torch.float32)
+        loss = loss + 0 * logits.sum(dtype=torch.float32)
+
+    if not with_entropy:
+        return loss, {}  # The checkpoint forward already returned the metrics.
+
+    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
+    ppo_kl = sum_of_sample_mean(ppo_kl)
 
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
@@ -1879,13 +1885,16 @@ def _compute_loss_and_metrics(
                 raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     if args.recompute_loss_function:
+        use_reentrant = getattr(args, "recompute_loss_function_use_reentrant", True)
+        if use_reentrant and func is policy_loss_function:
+            func = partial(func, reentrant_checkpoint=True)
         return checkpoint(
             func,
             args,
             batch,
             logits,
             sum_of_sample_mean,
-            use_reentrant=getattr(args, "recompute_loss_function_use_reentrant", True),
+            use_reentrant=use_reentrant,
         )
     return func(args, batch, logits, sum_of_sample_mean)
 
