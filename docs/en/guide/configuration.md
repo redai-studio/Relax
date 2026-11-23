@@ -79,6 +79,8 @@ Failed checkpoint writes can be retried; completed step directories cannot be ov
 
 Turbo model saving requires the driver and all training ranks to mount `--save` as the same writable shared directory, with cross-client `flock`, atomic rename and visibility after publication. NFS `nocto`, `nolock`, and `local_lock=all/flock` are rejected. Startup verifies the publication generation; saving-disabled runs create no publication lock. Lock acquisition fails after 30 seconds; process exit releases the lock automatically.
 
+If the driver and training ranks use different UIDs, provision `.checkpoint-publication.lock` with shared-group write permission (for example, `0660`) before startup, or configure a suitable default ACL. Group write permission on the save directory alone does not ensure the lock file can be opened for writing.
+
 ---
 
 ## Checkpoint Configuration

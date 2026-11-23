@@ -79,6 +79,8 @@ checkpoint 写入失败可重试，已完成的步目录禁止覆盖。PLE 的 H
 
 启用 Turbo 模型保存时，driver 和全部训练 rank 必须将 `--save` 挂载为同一可读写共享目录，支持跨客户端 `flock`、原子重命名和发布后的可见性；拒绝 NFS 的 `nocto`、`nolock` 和 `local_lock=all/flock`。启动时会核对发布代次，未启用保存时不创建发布锁。发布锁等待 30 秒后报错；进程退出时锁自动释放。
 
+driver 与训练 rank 使用不同 UID 时，应在启动前预置共享组可写（如 `0660`）的 `.checkpoint-publication.lock`，或配置相应的默认 ACL；仅保存目录可组写不足以保证锁文件可写打开。
+
 ---
 
 ## 检查点配置

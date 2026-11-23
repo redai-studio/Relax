@@ -2,7 +2,6 @@
 """Fence checkpoint publication from training groups retired by recovery."""
 
 import os
-import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -19,29 +18,34 @@ def checkpoint_saving_enabled(config) -> bool:
     )
 
 
-def _validate_storage_mount(root: str) -> None:
-    root_path = Path(root).resolve()
-    mounts = []
-    for line in Path("/proc/mounts").read_text(encoding="utf-8").splitlines():
+def _validate_storage_mount(fd: int, root: str) -> None:
+    fdinfo = dict(
+        line.split(":", 1) for line in Path(f"/proc/self/fdinfo/{fd}").read_text(encoding="utf-8").splitlines()
+    )
+    mount_id = fdinfo["mnt_id"].strip()
+    for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
         fields = line.split()
-        mountpoint = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[1]))
-        if root_path.is_relative_to(mountpoint):
-            mounts.append((len(mountpoint.parts), fields[2], fields[3].split(",")))
-    _, filesystem, options = max(reversed(mounts), key=lambda mount: mount[0])
-    unsupported = {"nocto", "nolock", "local_lock=all", "local_lock=flock"}.intersection(options)
-    if filesystem in {"nfs", "nfs4"} and unsupported:
-        raise ValueError(
-            f"Turbo checkpoint saving requires coherent NFS storage with remote flock: {root}: {unsupported}"
-        )
+        if fields[0] != mount_id:
+            continue
+        separator = fields.index("-")
+        filesystem = fields[separator + 1]
+        options = set(fields[5].split(",")) | set(fields[separator + 3].split(","))
+        unsupported = {"nocto", "nolock", "local_lock=all", "local_lock=flock"}.intersection(options)
+        if filesystem in {"nfs", "nfs4"} and unsupported:
+            raise ValueError(
+                f"Turbo checkpoint saving requires coherent NFS storage with remote flock: {root}: {unsupported}"
+            )
+        return
+    raise ValueError(f"Cannot identify the checkpoint publication mount: {root}")
 
 
 @contextmanager
 def _publication_lock(root: str, timeout: float):
     import fcntl
 
-    _validate_storage_mount(root)
     os.makedirs(root, exist_ok=True)
     with open(os.path.join(root, ".checkpoint-publication.lock"), "a") as lock:
+        _validate_storage_mount(lock.fileno(), root)
         deadline = time.monotonic() + timeout
         while True:
             try:
