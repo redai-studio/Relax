@@ -9349,7 +9349,32 @@ index 82f5640ec..c8eac8ade 100644
 diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge/models/conversion/model_bridge.py
 --- a/megatron/bridge/models/conversion/model_bridge.py
 +++ b/megatron/bridge/models/conversion/model_bridge.py
-@@ -1482,7 +1482,7 @@
+@@ -1251,16 +1251,14 @@
+         return result
+
+     @staticmethod
+-    def _cast_export_weight_dtype(
+-        weights: Dict[str, torch.Tensor], weight_dtype: Optional[torch.dtype]
+-    ) -> Dict[str, torch.Tensor]:
+-        """Cast float export weights to ``weight_dtype`` (no-op if None; ints untouched)."""
+-        if weight_dtype is None:
+-            return weights
+-        return {
+-            name: (weight.to(weight_dtype) if weight.is_floating_point() else weight)
+-            for name, weight in weights.items()
+-        }
++    def _iter_export_weights(
++        weights: Mapping[str, torch.Tensor], weight_dtype: Optional[torch.dtype]
++    ) -> Iterable[Tuple[str, torch.Tensor]]:
++        """Cast each floating tensor as it is emitted. Lazy mappings may gather a shard per lookup."""
++        for name, weight in weights.items():
++            if weight_dtype is not None and weight.is_floating_point():
++                weight = weight.to(weight_dtype)
++            yield name, weight
+
+     def _accumulate_grouped_export(
+         self,
+@@ -1482,7 +1480,7 @@
                  if capture_unquantized_state_dict:
                      vp_stage = task.vp_stage if task.vp_stage is not None else 0
                      chunk_key = f"model{vp_stage}"
@@ -9358,6 +9383,31 @@ diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge
                  # NOTE:
                  # For fp8_param (blockwise), `task.param_weight` can be a TransformerEngine
                  # Float8BlockwiseQTensor) that is a leaf with requires_grad=True.
+@@ -1748,8 +1746,7 @@
+                     task, converted_weights_dict, model_config, _grouped_buffers, hf_state_dict
+                 )
+                 if merged_result is not None:
+-                    merged_result = self._cast_export_weight_dtype(merged_result, task.weight_dtype)
+-                    for hf_name, tensor in merged_result.items():
++                    for hf_name, tensor in self._iter_export_weights(merged_result, task.weight_dtype):
+                         yield from HFWeightTuple(hf_name, tensor).iter_finalized(
+                             export_hook=task.export_hook,
+                             cpu=cpu,
+@@ -1784,13 +1781,12 @@
+             )  # dict will be none except for one expert;
+             # All ranks get the full tensor
+             converted_weights_dict = self._truncate_vocab_padding(task, converted_weights_dict)
+-            converted_weights_dict = self._cast_export_weight_dtype(converted_weights_dict, task.weight_dtype)
+
+             tied_output_hf_name = None
+             if tied_mapping_registry is not None:
+                 tied_output_hf_name = self._get_tied_output_hf_name(task, tied_mapping_registry)
+
+-            for hf_name, tensor in converted_weights_dict.items():
++            for hf_name, tensor in self._iter_export_weights(converted_weights_dict, task.weight_dtype):
+                 if not merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
+                     suffix_pos = hf_name.rfind(".")
+                     if suffix_pos == -1:
 diff --git a/megatron/bridge/models/conversion/param_mapping.py b/megatron/bridge/models/conversion/param_mapping.py
 --- a/megatron/bridge/models/conversion/param_mapping.py
 +++ b/megatron/bridge/models/conversion/param_mapping.py

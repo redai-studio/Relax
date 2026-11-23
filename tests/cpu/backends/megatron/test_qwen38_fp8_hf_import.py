@@ -391,6 +391,31 @@ def _ple_state():
     return shards, state, prefix + ".weight_scale"
 
 
+def test_online_bf16_export_gathers_each_ple_shard_on_demand(api, monkeypatch):
+    monkeypatch.delenv("QWEN38_PLE_CPU_OFFLOAD", raising=False)
+    bridge = _bridge(api)
+    mapping = api.qwen.PLENGramEmbeddingMapping("ple.weight", "model.ple.shard_{}.weight", num_shards=4)
+    gather = Mock(wraps=mapping.gather_shard)
+    monkeypatch.setattr(mapping, "gather_shard", gather)
+    rows = torch.arange(42, dtype=torch.float32).reshape(14, 3) / 7
+    task = api.bridge.WeightConversionTask(
+        "ple.weight", "ple.weight", mapping, param_weight=rows, weight_dtype=torch.bfloat16
+    )
+    stream = bridge.stream_weights_megatron_to_hf(
+        [SimpleNamespace(config=SimpleNamespace())],
+        bridge.hf_pretrained,
+        conversion_tasks=[task],
+        merge_adapter_weights=False,
+        show_progress=False,
+    )
+    for index, expected in enumerate(rows.split(4)):
+        name, weight = next(stream)
+        assert [call.args[1] for call in gather.call_args_list] == list(range(index + 1))
+        assert name == f"model.ple.shard_{index}.weight"
+        torch.testing.assert_close(weight, expected.bfloat16(), rtol=0, atol=0)
+    assert list(stream) == []
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 def test_ple_rank_local_import_preserves_fp32_and_final_partial_shard(api, monkeypatch, rank):
     shards, state, scale_name = _ple_state()

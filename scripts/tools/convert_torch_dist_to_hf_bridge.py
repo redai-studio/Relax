@@ -314,8 +314,9 @@ def _initialize_bridge_patches():
     _original_save_file = safetensors_torch.save_file
     model_load_save_module.load_model_config = _patched_load_model_config
     safetensors_torch.save_file = _save_file_ensure_contiguous
-    # A dict comprehension here would materialize every PLE shard at once.
-    MegatronModelBridge._cast_export_weight_dtype = staticmethod(_cast_export_weight_dtype)
+    # Older Bridge images cast the entire mapping before yielding its first shard.
+    if hasattr(MegatronModelBridge, "_cast_export_weight_dtype"):
+        MegatronModelBridge._cast_export_weight_dtype = staticmethod(_cast_export_weight_dtype)
     _original_transformer_config_from_args = mlm_compat_args_module._transformer_config_from_args
     mlm_compat_args_module._transformer_config_from_args = _patched_transformer_config_from_args
     # Some Bridge revisions import this helper by name.
@@ -414,11 +415,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bf16",
         action="store_true",
-        help="Export plain bf16 weights (no quantization). When the origin is a quantized model "
-        "(fp8/MXFP4), the default export RE-quantizes the trained weights back to that scheme; "
-        "pass --bf16 to instead write dequantized bf16 (no .scale companions, ~570GB for DSv4-Flash) "
-        "and preserve full SFT precision. Routes through save_hf_pretrained(weight_dtype=torch.bfloat16), "
-        "which export_ckpt does not expose. Mutually exclusive with --fp8.",
+        help="Export dequantized BF16 weights without scale tensors. Qwen3.8 FP8 origins require an "
+        "explicit choice of --bf16 or --fp8. Other models retain their Bridge default when both flags are omitted.",
     )
     parser.add_argument(
         "--copy-config",
@@ -478,16 +476,6 @@ if __name__ == "__main__":
     _initialize_bridge_patches()
     from megatron.bridge import AutoBridge
 
-    checkpoint_metadata = _read_checkpoint_metadata(args.input_dir)
-    _lora_checkpoint_spec = _build_lora_checkpoint_spec(checkpoint_metadata)
-    if _lora_checkpoint_spec is None:
-        print("[convert] No LoRA adapter weights detected; exporting the full checkpoint directly")
-    else:
-        print(
-            f"[convert] Detected {len(_lora_checkpoint_spec['adapter_keys']) // 2} LoRA module(s); "
-            "they will be reconstructed and merged into the exported HF weights"
-        )
-
     if args.fp8 or args.bf16:
         try:
             output_is_origin = os.path.samefile(args.output_dir, args.origin_hf_dir)
@@ -513,9 +501,22 @@ if __name__ == "__main__":
             raise ValueError("--fp8-device points to CUDA, but torch.cuda.is_available() is false")
 
     print(f"Loading config from {args.origin_hf_dir}")
-    from relax.models.qwen3_8.precision import get_bf16_reference_loader
+    from relax.models.qwen3_8.precision import get_bf16_reference_loader, is_qwen_fp8_source
 
     bridge = AutoBridge.from_hf_pretrained(args.origin_hf_dir, trust_remote_code=True)
+    if not (args.fp8 or args.bf16) and is_qwen_fp8_source(bridge):
+        parser.error("Qwen3.8 FP8 origins require --fp8 to requantize or --bf16 to export dequantized weights")
+
+    checkpoint_metadata = _read_checkpoint_metadata(args.input_dir)
+    _lora_checkpoint_spec = _build_lora_checkpoint_spec(checkpoint_metadata)
+    if _lora_checkpoint_spec is None:
+        print("[convert] No LoRA adapter weights detected; exporting the full checkpoint directly")
+    else:
+        print(
+            f"[convert] Detected {len(_lora_checkpoint_spec['adapter_keys']) // 2} LoRA module(s); "
+            "they will be reconstructed and merged into the exported HF weights"
+        )
+
     bf16_reference = get_bf16_reference_loader(bridge) if args.bf16 else None
 
     # Use Bridge's provider so the correct model class is created (e.g., Qwen3VLModel
