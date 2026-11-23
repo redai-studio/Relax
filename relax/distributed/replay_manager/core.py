@@ -1268,7 +1268,7 @@ def configure_training_replay(args: Any, runtime_env: dict) -> None:
     runtime_env["env_vars"]["RELAX_REPLAY_REGISTRATION"] = json.dumps(replay_data_manager.export_registration())
     # The TQ controller also serves replay publishers. Only shorten empty reads
     # in polling mode, since blocking fixed-size reads share this timeout.
-    args.tq_owner_metadata_timeout = None
+    vars(args).pop("tq_owner_metadata_timeout", None)
     if kinds and replay_data_manager.uses_references and args.fully_async and not args.hybrid and args.polling_mode:
         from transfer_queue import controller as tq_controller
 
