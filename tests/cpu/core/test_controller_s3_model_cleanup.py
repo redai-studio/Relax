@@ -652,14 +652,16 @@ def test_shared_task_constructs_sleeping_owners_after_prefetch_before_deploy(mon
 
 
 @pytest.mark.parametrize("release_fails", [False, True])
-def test_shared_task_cleanup_confirms_release_before_killing_coordinator(monkeypatch, release_fails):
+def test_shared_task_cleanup_uses_task_disposal_without_a_training_handoff(monkeypatch, release_fails):
     from relax.distributed.ray import inference_manager
 
     events = []
 
     def switch(phase):
-        assert phase == "startup"
-        events.append("release")
+        raise AssertionError(f"Unexpected phase handoff during disposal: {phase}")
+
+    def dispose(owner):
+        events.append(owner)
         if release_fails:
             raise TimeoutError("release unconfirmed")
 
@@ -674,15 +676,15 @@ def test_shared_task_cleanup_confirms_release_before_killing_coordinator(monkeyp
     instance.serve_dict = {}
     monkeypatch.setattr(controller.ray, "get", lambda ref, **kwargs: ref)
     monkeypatch.setattr(controller.ray, "kill", lambda owner: events.append("kill coordinator"))
-    monkeypatch.setattr(inference_manager, "rollback_static_inference_manager", events.append)
+    monkeypatch.setattr(inference_manager, "rollback_static_inference_manager", dispose)
     if release_fails:
         with pytest.raises(TimeoutError):
             instance._dispose_shared_inference_task()
-        assert events == ["release"]
+        assert events == ["rollout"]
         assert instance.config._inference_phase_coordinator is coordinator
     else:
         assert instance._dispose_shared_inference_task()
-        assert events == ["release", "rollout"]
+        assert events == ["rollout"]
         assert not hasattr(instance.config, "_inference_phase_coordinator")
 
 

@@ -429,4 +429,5 @@ def test_deferred_publication_confirms_real_tq_visibility_and_stream_end(tq_fact
     assert receipt.state is PublicationState.CONFIRMED
     assert client.check_production_completed("confirmed")
     _, received = _get(client, "confirmed", ["tokens"], 2)
-    torch.testing.assert_close(received["tokens"], payload["tokens"])
+    # TransferQueue can reconstruct the token column as a jagged tensor.
+    torch.testing.assert_close(payload_rows(received["tokens"]), payload_rows(payload["tokens"]), rtol=0, atol=0)

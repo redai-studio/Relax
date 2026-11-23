@@ -22,7 +22,11 @@ def test_managed_weight_sync_releases_topology_lease_on_all_exit_paths(monkeypat
     monkeypatch.setattr(actor_module, "print_memory", lambda *args, **kwargs: None)
     monkeypatch.setattr(actor_module, "run", asyncio.run)
     monkeypatch.setattr(actor_module.ray, "get", lambda value, **kwargs: value)
-    manager = SimpleNamespace(set_weight_updating=SimpleNamespace(remote=Mock(return_value=True)))
+    manager = SimpleNamespace(
+        set_weight_updating=SimpleNamespace(remote=Mock(return_value=True)),
+        register_recovered_engines=SimpleNamespace(remote=Mock()),
+        sync_weights_for_scaled_out_engines=SimpleNamespace(remote=Mock(return_value={"success": True})),
+    )
     lock = SimpleNamespace(
         acquire=SimpleNamespace(remote=Mock(return_value=True)),
         release=SimpleNamespace(remote=Mock()),
@@ -39,6 +43,7 @@ def test_managed_weight_sync_releases_topology_lease_on_all_exit_paths(monkeypat
         actor.rollout_manager = manager
         actor._weight_sync_lock = lock
         actor.checkpoint_engine_client = SimpleNamespace(
+            backend=SimpleNamespace(weight_version=1),
             update_weights_for_rollout=AsyncMock(return_value=[]),
             init_process_groups_for_actor_fwd_ref=AsyncMock(),
         )
@@ -52,8 +57,10 @@ def test_managed_weight_sync_releases_topology_lease_on_all_exit_paths(monkeypat
     )
     if failure == "none":
         assert results == [None, None]
+        manager.sync_weights_for_scaled_out_engines.remote.assert_called_once_with()
     else:
         assert_rank_errors(results, f"{failure} failed")
+        manager.sync_weights_for_scaled_out_engines.remote.assert_not_called()
     assert [call.args for call in manager.set_weight_updating.remote.call_args_list] == [(True,), (False,)]
     assert lock.release.remote.call_count == (0 if failure == "acquire" else 1)
 

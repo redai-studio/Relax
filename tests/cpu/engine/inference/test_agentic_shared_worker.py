@@ -71,7 +71,7 @@ async def test_shared_worker_failure_prevents_partition_replay(monkeypatch, canc
     worker.args = SimpleNamespace(
         colocate=True, _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=AsyncMock()))
     )
-    worker._closed = False
+    worker._close_task = None
     worker._generation_running = False
     worker._generation_failed = False
     worker._training_ready = False
@@ -193,7 +193,8 @@ async def test_eval_can_run_on_independent_gpus_and_waits_for_shared_training(sh
         colocate=shared,
         _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=switch)),
     )
-    worker._closed = worker._generation_running = worker._generation_failed = worker._training_ready = False
+    worker._close_task = None
+    worker._generation_running = worker._generation_failed = worker._training_ready = False
     worker._phase_lock = asyncio.Lock()
     worker._active = set()
     worker.workload = SimpleNamespace(generate=generate, eval=AsyncMock())

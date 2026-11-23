@@ -12,7 +12,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote, urlsplit
 
 import ray
@@ -485,6 +485,23 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
 
 class SGLangEngine(RayActor):
     route_mode = "sglang_router"
+    _POLICY_WEIGHT_ENDPOINTS = frozenset(
+        {
+            "begin_weight_update",
+            "destroy_weights_update_group",
+            "end_weight_update",
+            "init_weights_send_group_for_remote_instance",
+            "init_weights_update_group",
+            "load_lora_adapter_from_tensors",
+            "post_process_weights",
+            "send_weights_to_remote_instance",
+            "unload_lora_adapter",
+            "update_lora_from_distributed",
+            "update_weight_version",
+            "update_weights_from_distributed",
+            "update_weights_from_tensor",
+        }
+    )
 
     def __init__(
         self,
@@ -624,6 +641,7 @@ class SGLangEngine(RayActor):
         return {"url": self.get_url(), **self.get_pid_and_node_id()}
 
     def register_dcs(self):
+        self._require_policy_weight_updates()
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
             effective_num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
@@ -733,6 +751,10 @@ class SGLangEngine(RayActor):
             if getattr(self, "_require_router_registration", False) and self.node_rank == 0 and not registered:
                 raise RuntimeError("Required PD router registration failed")
 
+    def _require_policy_weight_updates(self) -> None:
+        if getattr(self, "role", "rollout") != "rollout":
+            raise RuntimeError(f"{self.role} engines do not support DCS or dynamic weight updates")
+
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
         payload.
@@ -747,6 +769,8 @@ class SGLangEngine(RayActor):
         Returns:
             The JSON response from the server
         """
+        if endpoint in self._POLICY_WEIGHT_ENDPOINTS:
+            self._require_policy_weight_updates()
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
@@ -1084,7 +1108,11 @@ class SGLangEngine(RayActor):
             if not process.is_alive() or time.monotonic() >= deadline:
                 raise RuntimeError("SGLang server session startup is unconfirmed")
             time.sleep(0.05)
-        return {"node_id": ray.get_runtime_context().get_node_id(), "session_id": process.pid}
+        return {
+            "node_id": ray.get_runtime_context().get_node_id(),
+            "session_id": process.pid,
+            "pid_namespace": os.stat("/proc/self/ns/pid").st_ino,
+        }
 
     def shutdown(self, *, stopped_router: tuple[str, int] | None = None) -> None:
         if stopped_router is not None:
@@ -1217,7 +1245,8 @@ class SGLangEngine(RayActor):
         last_error = None
         while time.monotonic() < deadline:
             try:
-                response = requests.get(
+                response = self._router_request(
+                    "get",
                     f"http://{self.router_ip}:{self.router_port}/workers",
                     timeout=min(5.0, max(0.1, deadline - time.monotonic())),
                 )
@@ -1277,6 +1306,17 @@ class SGLangEngine(RayActor):
             return False
         return True
 
+    def _router_request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        if getattr(self, "_direct_router_endpoint", None) != (self.router_ip, self.router_port):
+            return getattr(requests, method)(url, **kwargs)
+        # The owner verifies the listener at this address during shutdown.
+        with requests.Session() as session:
+            session.trust_env = False
+            response = getattr(session, method)(url, allow_redirects=False, **kwargs)
+            if response.is_redirect:
+                raise RuntimeError("Owned Router redirected a worker registry request")
+            return response
+
     def _wait_for_registered_worker(self) -> None:
         if self.worker_type != "regular":
             self._wait_for_registered_pd_worker()
@@ -1284,7 +1324,7 @@ class SGLangEngine(RayActor):
         expected = f"http://{self.server_host}:{self.server_port}".rstrip("/")
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            response = requests.get(f"http://{self.router_ip}:{self.router_port}/workers", timeout=5)
+            response = self._router_request("get", f"http://{self.router_ip}:{self.router_port}/workers", timeout=5)
             response.raise_for_status()
             matches = [
                 worker
@@ -1307,7 +1347,15 @@ class SGLangEngine(RayActor):
             time.sleep(0.25)
         raise TimeoutError("Static replica registration did not become healthy")
 
-    def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
+    def register_to_router(
+        self,
+        bootstrap_port: int | None = None,
+        strict: bool = True,
+        *,
+        owned_router_endpoint: tuple[str, int] | None = None,
+        router_node_id: str | None = None,
+        router_network_namespace: int | None = None,
+    ) -> bool:
         required = getattr(self, "_require_router_registration", False)
         track_registration = required or getattr(self, "_skip_router_registration", False)
         if self.node_rank != 0:
@@ -1316,6 +1364,17 @@ class SGLangEngine(RayActor):
             return not required
         if self.is_evicted():
             return False
+
+        if owned_router_endpoint is not None:
+            if (self.router_ip, self.router_port) != owned_router_endpoint:
+                raise RuntimeError("AddWorker target differs from the owned Router")
+            address = ipaddress.ip_address(self.router_ip.strip("[]"))
+            if address.is_loopback and (
+                ray.get_runtime_context().get_node_id() != router_node_id
+                or os.stat("/proc/self/ns/net").st_ino != router_network_namespace
+            ):
+                raise RuntimeError("AddWorker cannot reach the owned loopback Router from this worker")
+            self._direct_router_endpoint = owned_router_endpoint
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
         try:
@@ -1337,7 +1396,8 @@ class SGLangEngine(RayActor):
                         raise ValueError(msg)
                     logger.warning(msg)
                     return False
-                response = requests.post(
+                response = self._router_request(
+                    "post",
                     f"http://{self.router_ip}:{self.router_port}/add_worker?url={worker_url}",
                     timeout=30,
                 )
@@ -1359,7 +1419,8 @@ class SGLangEngine(RayActor):
                     self._router_registration_outcome_unknown = False
                     self._router_worker_id = None
                 try:
-                    response = requests.post(
+                    response = self._router_request(
+                        "post",
                         f"http://{self.router_ip}:{self.router_port}/workers",
                         json=payload,
                         timeout=30,
@@ -1428,7 +1489,8 @@ class SGLangEngine(RayActor):
         last_error = None
         while True:
             try:
-                response = requests.get(
+                response = self._router_request(
+                    "get",
                     f"http://{self.router_ip}:{self.router_port}/workers",
                     timeout=min(5.0, max(1.0, deadline - time.monotonic())),
                 )
@@ -1464,12 +1526,14 @@ class SGLangEngine(RayActor):
 
         try:
             if router_version <= parse("0.2.1") or self.args.use_slime_router:
-                response = requests.post(
+                response = self._router_request(
+                    "post",
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
                     timeout=timeout,
                 )
             elif router_version < parse("0.3.0"):
-                response = requests.delete(
+                response = self._router_request(
+                    "delete",
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(worker_url, safe='')}",
                     timeout=timeout,
                 )
@@ -1482,7 +1546,7 @@ class SGLangEngine(RayActor):
                     # listing alone cannot rule out a late add.
                     deadline = time.monotonic() + timeout
                     while (remaining := deadline - time.monotonic()) > 0:
-                        status = requests.get(worker_endpoint, timeout=min(5.0, remaining))
+                        status = self._router_request("get", worker_endpoint, timeout=min(5.0, remaining))
                         status.raise_for_status()
                         job = status.json().get("job_status")
                         failed_add = (
@@ -1511,12 +1575,14 @@ class SGLangEngine(RayActor):
                         time.sleep(min(0.5, remaining))
                     else:
                         return False
-                response = requests.delete(
+                response = self._router_request(
+                    "delete",
                     worker_endpoint,
                     timeout=timeout,
                 )
             else:
-                workers_response = requests.get(
+                workers_response = self._router_request(
+                    "get",
                     f"http://{self.router_ip}:{self.router_port}/workers",
                     timeout=timeout,
                 )
@@ -1552,7 +1618,8 @@ class SGLangEngine(RayActor):
                 if worker_id is None or str(worker_id) == "":
                     logger.warning(f"Router worker {worker_url} did not have a worker ID during unregister.")
                     return False
-                response = requests.delete(
+                response = self._router_request(
+                    "delete",
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(str(worker_id), safe='')}",
                     timeout=timeout,
                 )

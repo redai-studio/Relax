@@ -44,7 +44,7 @@ async def test_genrm_session_scores_before_publish_and_reuses_processed_reward(m
     from relax.engine.rollout import scoring_phase
     from relax.engine.rollout.deferred import PublicationReceipt, PublicationState
     from relax.utils import misc
-    from relax.utils.utils import post_process_rewards
+    from relax.utils.utils import convert_samples_to_train_data
 
     args = SimpleNamespace(
         _genrm_instances_resolved={"judge": {}},
@@ -53,6 +53,9 @@ async def test_genrm_session_scores_before_publish_and_reuses_processed_reward(m
         custom_reward_post_process_path="test.hook",
         reward_key=None,
         _inference_phase_coordinator=object(),
+        multimodal_keys=None,
+        use_opd=False,
+        debug_train_only=False,
     )
     events = []
 
@@ -74,23 +77,25 @@ async def test_genrm_session_scores_before_publish_and_reuses_processed_reward(m
         return [0.25] * len(samples)
 
     async def publish(args, payload, count, rollout_id, client, *, is_last, operation_id):
-        events.append("publish")
-        assert post_process_rewards(args, payload[0]) == [0.25]
-        assert is_last
+        events.append(("publish", count, is_last))
+        batch = convert_samples_to_train_data(args, payload[0])
+        assert batch["rewards"].tolist() == [0.25]
+        assert "metadata" not in batch.keys()
         return PublicationReceipt(operation_id, PublicationState.CONFIRMED)
 
     monkeypatch.setattr(scoring_phase, "async_scoring_phase", phase)
     monkeypatch.setattr(misc, "load_function", lambda path: hook)
     session = DeferredOpdSession.maybe_create(args, 0, None, None, publish=publish)
     assert session is not None
-    await session.transfer(args, [[Sample(index=1, response_length=1)]], 0, 0, None, is_last=True)
+    await session.transfer(args, [[Sample(index=1, tokens=[1, 2], response_length=1)]], 0, 0, None)
+    await session.transfer(args, [[Sample(index=2, tokens=[1, 3], response_length=1)]], 1, 0, None, is_last=True)
     if fail:
         with pytest.raises(RuntimeError, match="did not publish"):
             await session.flush()
         assert events == ["enter", "score", "leave"]
     else:
         await session.flush()
-        assert events == ["enter", "score", "leave", "publish"]
+        assert events == ["enter", "score", "score", "leave", ("publish", 0, False), ("publish", 1, True)]
 
 
 def test_managed_genrm_hook_uses_coordinator_lifecycle_without_legacy_swap(monkeypatch):
@@ -185,6 +190,63 @@ def test_deferred_topk_uses_model_vocabulary_without_mutating_training_args(monk
     )
     assert session.executor.args.vocab_size == 17
     assert args.vocab_size == 32
+
+
+@pytest.mark.asyncio
+async def test_shared_teacher_scores_all_batches_before_returning_to_student(monkeypatch):
+    from relax.engine.rollout import deferred_opd
+    from relax.engine.rollout.deferred import PublicationReceipt, PublicationState
+
+    monkeypatch.setattr(deferred_opd, "deferred_opd_active", lambda args: True)
+    events = []
+
+    async def switch(phase):
+        events.append(phase)
+
+    async def teacher(samples):
+        events.append(("teacher score", samples[0].index))
+        for sample in samples:
+            sample.teacher_log_probs = [-0.1] * sample.response_length
+        return [True] * len(samples)
+
+    async def student(samples, *_):
+        events.append(("student score", samples[0].index))
+
+    async def publish(*args, is_last, operation_id):
+        events.append(("publish", is_last))
+        return PublicationReceipt(operation_id, PublicationState.CONFIRMED)
+
+    args = SimpleNamespace(
+        _inference_phase_coordinator=SimpleNamespace(switch=SimpleNamespace(remote=switch)),
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="teacher",
+        colocate=True,
+        resource={"actor": [1, 1], "rollout": [1, 1], "teacher": [1, 1]},
+    )
+    manager = SimpleNamespace(
+        schema_opd_transfer_data=lambda: ["teacher_log_probs"],
+        prepare_teacher_inputs=AsyncMock(),
+        score_teacher=teacher,
+        needs_student_prefill=True,
+        score_student_at_teacher=student,
+        assemble_transfer=lambda samples: None,
+    )
+    session = DeferredOpdSession.maybe_create(args, 0, None, manager, publish=publish)
+    for index in range(2):
+        sample = Sample(index=index, tokens=[1, 2], response_length=1)
+        await session.transfer(args, [[sample]], index, 0, None, is_last=index == 1)
+    await session.flush()
+    assert events == [
+        "teacher",
+        ("teacher score", 0),
+        ("teacher score", 1),
+        "inference",
+        ("student score", 0),
+        ("student score", 1),
+        ("publish", False),
+        ("publish", True),
+    ]
 
 
 @pytest.mark.asyncio

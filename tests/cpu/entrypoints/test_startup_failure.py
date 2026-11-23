@@ -21,6 +21,7 @@ import pytest
 import yaml
 
 from relax.utils.agentic_obs.run_hooks import RunRecorder
+from tests.cpu.core.controller_test_utils import load_controller_with_stubbed_dependencies
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -556,50 +557,30 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
 
 @pytest.mark.parametrize("mode", ["missing_config", "text_sft", "i2i", "i2i_stop_failure"])
 def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode):
-    tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    methods = [
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name
-        in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm", "_dispose_shared_inference_task"}
-    ]
+    module = load_controller_with_stubbed_dependencies("_test_partial_startup_controller")
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
         sys.modules, "relax.distributed.ray.policy_engine_pool", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     stop_teacher = Mock()
-    ns = {
-        "logger": Mock(),
-        "ROLES": SimpleNamespace(rollout="rollout", sft="sft"),
-        "shutdown_managed_opd_teacher": stop_teacher,
-        "asyncio": asyncio,
-        "run": asyncio.run,
-    }
-    exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
+    monkeypatch.setattr(module, "shutdown_managed_opd_teacher", stop_teacher)
+    monkeypatch.setattr(module, "run", asyncio.run)
     teacher = object()
-    partial_controller = SimpleNamespace(
-        serve_dict={},
-        _teacher_manager=teacher,
-        _shutdown_agentic_rollout_services=Mock(),
-        _close_data_system=Mock(),
-        _cleanup_s3_model_weights_after_init=Mock(),
-    )
-    partial_controller._dispose_shared_inference_task = ns["_dispose_shared_inference_task"].__get__(
-        partial_controller
-    )
-    partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
-    partial_controller._dispose_managed_genrm = ns["_dispose_managed_genrm"].__get__(partial_controller)
+    partial_controller = object.__new__(module.Controller)
+    partial_controller.serve_dict = {}
+    partial_controller._teacher_manager = teacher
+    partial_controller._shutdown_agentic_rollout_services = Mock()
+    partial_controller._close_data_system = Mock()
+    partial_controller._cleanup_s3_model_weights_after_init = Mock()
     stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
     if mode != "missing_config":
         partial_controller.config = SimpleNamespace(
             loss_type="sft", generation_task="i2i" if mode.startswith("i2i") else "t2i"
         )
-        partial_controller.serve_dict["sft"] = SimpleNamespace(
+        partial_controller.serve_dict[module.ROLES.sft] = SimpleNamespace(
             handle=SimpleNamespace(stop=SimpleNamespace(remote=stop_image))
         )
-    ns["shutdown"](partial_controller)
+    partial_controller.shutdown()
     if mode.startswith("i2i"):
         stop_image.assert_awaited_once()
     else:
@@ -631,15 +612,7 @@ def test_tracking_finishes_only_after_confirmed_training_completion(health, outc
 
 @pytest.mark.parametrize("manager_fails", [False, True])
 def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manager_fails):
-    tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    methods = [
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name
-        in {"shutdown", "_dispose_rollout_manager", "_dispose_managed_genrm", "_dispose_shared_inference_task"}
-    ]
+    module = load_controller_with_stubbed_dependencies("_test_rollout_shutdown_controller")
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
         sys.modules, "relax.distributed.ray.policy_engine_pool", SimpleNamespace(stop_launched_routers=stop_routers)
@@ -649,27 +622,17 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
     manager = SimpleNamespace(dispose=SimpleNamespace(remote=dispose_remote))
     service = SimpleNamespace(get_rollout_manager=AsyncMock(return_value=manager))
     ray_get = Mock(side_effect=RuntimeError("Manager unavailable") if manager_fails else None)
-    ns = {
-        "logger": Mock(),
-        "ROLES": SimpleNamespace(rollout="rollout"),
-        "asyncio": asyncio,
-        "run": asyncio.run,
-        "ray": SimpleNamespace(get=ray_get),
-        "shutdown_managed_opd_teacher": Mock(),
-    }
-    exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
-    controller = SimpleNamespace(
-        serve_dict={"rollout": service},
-        _teacher_manager=None,
-        _shutdown_agentic_rollout_services=Mock(),
-        _close_data_system=Mock(),
-        _cleanup_s3_model_weights_after_init=Mock(),
-    )
-    controller._dispose_shared_inference_task = ns["_dispose_shared_inference_task"].__get__(controller)
-    controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(controller)
-    controller._dispose_managed_genrm = ns["_dispose_managed_genrm"].__get__(controller)
+    monkeypatch.setattr(module, "run", asyncio.run)
+    monkeypatch.setattr(module.ray, "get", ray_get)
+    monkeypatch.setattr(module, "shutdown_managed_opd_teacher", Mock())
+    controller = object.__new__(module.Controller)
+    controller.serve_dict = {module.ROLES.rollout: service}
+    controller._teacher_manager = None
+    controller._shutdown_agentic_rollout_services = Mock()
+    controller._close_data_system = Mock()
+    controller._cleanup_s3_model_weights_after_init = Mock()
 
-    ns["shutdown"](controller)
+    controller.shutdown()
 
     dispose_remote.assert_called_once_with()
     ray_get.assert_called_once_with(dispose_ref, timeout=35.0)

@@ -6,6 +6,7 @@ import asyncio
 import gzip
 import pickle
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -81,6 +82,35 @@ async def test_admitted_distributed_post_never_replays_unknown_outcome(monkeypat
             with pytest.raises(httpx.ReadError if outcome == "read_timeout" else RuntimeError):
                 await http_utils.send_distributed_request(request)
         assert len(calls) == (0 if outcome == "actor_error" else 1)
+
+
+@pytest.mark.asyncio
+async def test_poster_failure_before_dispatch_is_reported_as_connection_error(monkeypatch):
+    import ray
+
+    from relax.utils import http_utils
+
+    async def process_info():
+        raise ray.exceptions.ActorDiedError()
+
+    post = Mock()
+    stop = Mock()
+    poster = SimpleNamespace(do_request=SimpleNamespace(remote=post), stop_requests=SimpleNamespace(remote=stop))
+    healthy_send = AsyncMock(return_value=(200, [], b"ok", None))
+    healthy_poster = SimpleNamespace(do_request=SimpleNamespace(remote=healthy_send))
+    monkeypatch.setattr(http_utils, "_post_actors", [poster, healthy_poster])
+    monkeypatch.setattr(http_utils, "_poster_processes", {id(poster): process_info()})
+    request = httpx.Request("POST", "http://engine/generate", json={})
+
+    with pytest.raises(httpx.ConnectError, match="before dispatch"):
+        await http_utils.send_distributed_request(request)
+
+    post.assert_not_called()
+    stop.assert_not_called()
+    for _ in range(2):
+        response = await http_utils.send_distributed_request(request)
+        assert response.content == b"ok"
+    assert healthy_send.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -383,6 +413,32 @@ def test_distributed_post_success_envelope_preserves_payload(monkeypatch):
     monkeypatch.setattr(http_utils, "_post_actors", [actor])
 
     assert asyncio.run(http_utils.post("http://test/generate", {})) == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_requires_process_exit_after_poster_loses_acknowledgement(monkeypatch):
+    import ray
+
+    from relax.utils import http_utils
+
+    async def lost_ack():
+        raise ray.exceptions.ActorDiedError()
+
+    actor = SimpleNamespace(stop_requests=SimpleNamespace(remote=lost_ack))
+    receipt = http_utils._PosterProcess("poster-node", 123, 456, 789)
+    target = http_utils._PosterShutdownTarget(actor, receipt)
+    exited = False
+
+    async def check_process(process):
+        assert process == receipt
+        return exited
+
+    monkeypatch.setattr(http_utils, "_confirm_poster_process_exit", check_process)
+    with pytest.raises(http_utils.DistributedPostUnconfirmed) as error:
+        await http_utils.stop_distributed_poster(target)
+    assert error.value.poster == target
+    exited = True
+    await http_utils.stop_distributed_poster(target)
 
 
 def test_post_does_fall_back_to_local_on_remote_transport_error(monkeypatch):

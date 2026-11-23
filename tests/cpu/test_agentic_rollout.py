@@ -1300,7 +1300,9 @@ def test_agentic_ingress_keeps_requested_port_while_deferring_router(monkeypatch
 
     service.deploy_agentic_chat_api_services(config=args, runtime_env={})
 
-    rollout._start_router.assert_called_once_with(args, has_pd_disaggregation=first_model_pd, force_new=False)
+    rollout._start_router.assert_called_once_with(
+        args, has_pd_disaggregation=first_model_pd, force_new=False, driver_owned=True
+    )
     assert args.sglang_router_ip == endpoint[0]
     assert args.sglang_router_port == 3131
 

@@ -189,7 +189,30 @@ class GenerateState(metaclass=SingletonMeta):
         if rollout abort has been signalled by the time the permit is acquired.
         """
         async with self.inference_permit():
-            return await post(url, payload, headers=headers)
+            if not getattr(self.args, "use_distributed_post", False):
+                return await post(url, payload, headers=headers)
+
+            from relax.utils import http_utils
+
+            client = http_utils._http_client
+            manager = getattr(self.args, "_inference_manager_handle", None)
+            if manager is not None:
+                from relax.engine.inference.executor import InferenceRequestExecutor
+
+                executor = InferenceRequestExecutor(
+                    "rollout", manager, client, send_request=http_utils.send_distributed_request
+                )
+                return await executor.generate_json(payload, headers, url=url)
+
+            response = await http_utils.send_distributed_request(
+                client.build_request("POST", url, json=payload, headers=headers)
+            )
+            try:
+                await response.aread()
+                response.raise_for_status()
+                return response.json()
+            finally:
+                await response.aclose()
 
     def reset(self) -> None:
         self.remaining_batch_size = 0

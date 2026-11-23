@@ -15,6 +15,7 @@ staged samples. The resident Agentic pipeline stages its own transfer batches
 into the same session and flushes them when its step closes.
 """
 
+import asyncio
 import copy
 import math
 from typing import Any
@@ -30,6 +31,7 @@ logger = get_logger(__name__)
 
 # Produced by generation, not by the scorer, so it is never a scoring requirement.
 _GENERATION_OWNED_FIELDS = frozenset({"rollout_log_probs"})
+_StagedBatch = tuple[str, Any, list[Sample], int, int, bool, Any]
 
 
 def deferred_opd_active(args: Any) -> bool:
@@ -87,7 +89,9 @@ class DeferredOpdSession:
                 raise ValueError("Deferred OPD requires a positive vocabulary size")
         self.executor = DeferredExecutor(executor_args)
         self.attempt_id = uuid4().hex
-        self._staged: list[tuple[str, Any, list[Sample], int, int, bool]] = []
+        self._staged: list[_StagedBatch] = []
+        self._scoring_task: asyncio.Task | None = None
+        self._cancelled = False
         self._required = required_scoring_fields(opd_manager)
 
     @classmethod
@@ -186,8 +190,10 @@ class DeferredOpdSession:
         are never coming.
         """
         staged, self._staged = self._staged, []
-        for batch_id, payload, flat, batch_count, rollout_id, is_last, scoring_ids in staged:
-            batch_ref = seal_batch(
+        if not staged:
+            return
+        batch_refs = [
+            seal_batch(
                 self.args,
                 flat,
                 batch_id=batch_id,
@@ -196,6 +202,25 @@ class DeferredOpdSession:
                 policy_version=str(getattr(self.args, "_opd_policy_version", "") or "") or None,
                 scoring_ids=scoring_ids,
             )
+            for batch_id, _, flat, _, rollout_id, _, scoring_ids in staged
+        ]
+        self._scoring_task = asyncio.create_task(self._score_round(staged))
+        try:
+            await self._scoring_task
+        except Exception as exc:
+            raise RuntimeError(f"Deferred rollout {self.rollout_id} did not publish: {exc}") from exc
+        finally:
+            self._scoring_task = None
+
+        async def scored(samples: list[Sample]) -> tuple:
+            # The shared stages have finished. The executor checks the sealed
+            # rows and requires a publication receipt for each original batch.
+            return ()
+
+        for batch, batch_ref in zip(staged, batch_refs, strict=True):
+            if self._cancelled:
+                raise asyncio.CancelledError
+            batch_id, payload, flat, batch_count, rollout_id, is_last, _ = batch
             handle = self.executor.submit_deferred(
                 batch_ref,
                 plan_id=None,
@@ -227,12 +252,7 @@ class DeferredOpdSession:
                     operation_id=publication_id,
                 )
 
-            identities = tuple(ref.identity for ref in batch_ref.samples)
-
-            async def score(samples: list[Sample], ids: tuple[Any, ...] = identities) -> tuple[Any, ...]:
-                return await self._score_batch(samples, ids)
-
-            self.executor.start(handle, score=score, publish=publish)
+            self.executor.start(handle, score=scored, publish=publish)
             try:
                 result = await self.executor.wait_deferred(handle)
             except BaseException:
@@ -251,11 +271,16 @@ class DeferredOpdSession:
     async def cancel(self) -> None:
         """Drop staged batches and stop any batch still scoring or
         publishing."""
+        self._cancelled = True
         self._staged.clear()
+        scoring = self._scoring_task
+        if scoring is not None and not scoring.done():
+            scoring.cancel()
+            await asyncio.gather(scoring, return_exceptions=True)
         await self.executor.cancel()
 
-    async def _score_batch(self, samples: list[Sample], identities: tuple[Any, ...]) -> tuple[Any, ...]:
-        """Score one batch: teacher stage, optional student stage, assemble."""
+    async def _score_round(self, staged: list[_StagedBatch]) -> None:
+        """Run each shared scorer once, keeping per-batch scoring semantics."""
         from relax.engine.inference.phase_plans import PHASE_GENRM, PHASE_TEACHER
         from relax.engine.rollout.scoring_phase import async_scoring_phase
 
@@ -269,35 +294,35 @@ class DeferredOpdSession:
             scoring_args._managed_genrm_scoring_phase = True
             hook = load_function(path)
             async with async_scoring_phase(self.args, PHASE_GENRM):
-                rewards = await run_sync_to_completion(hook, scoring_args, samples)
-            if len(rewards) != len(samples):
-                raise ValueError("Deferred GenRM reward count differs from sealed batch")
-            for sample, reward in zip(samples, rewards, strict=True):
-                if not math.isfinite(float(reward)) or not math.isfinite(float(sample.get_reward_value(self.args))):
-                    raise ValueError(f"Deferred GenRM sample={sample.index} field=reward is not finite")
-                if sample.train_metadata is None:
-                    sample.train_metadata = {}
-                sample.train_metadata["_deferred_genrm_reward"] = reward
+                for _, _, samples, *_ in staged:
+                    rewards = await run_sync_to_completion(hook, scoring_args, samples)
+                    if len(rewards) != len(samples):
+                        raise ValueError("Deferred GenRM reward count differs from sealed batch")
+                    for sample, reward in zip(samples, rewards, strict=True):
+                        if not math.isfinite(float(reward)) or not math.isfinite(
+                            float(sample.get_reward_value(self.args))
+                        ):
+                            raise ValueError(f"Deferred GenRM sample={sample.index} field=reward is not finite")
+                        # Publication reads the cached reward without exporting it as training metadata.
+                        if sample.metadata is None:
+                            sample.metadata = {}
+                        sample.metadata["_deferred_genrm_reward"] = reward
         if self.opd_manager is None or not deferred_opd_active(self.args):
-            return ()
+            return
         async with async_scoring_phase(self.args, PHASE_TEACHER):
-            await self.opd_manager.prepare_teacher_inputs(samples)
-            results = await self.opd_manager.score_teacher(samples)
-        failures = tuple(
-            identity
-            for identity, sample, ok in zip(identities, samples, results, strict=True)
-            if not ok and int(sample.response_length or 0) > 0
-        )
-        if failures:
-            # Stop before the student stage: an incomplete teacher result cannot
-            # produce a publishable batch, and the extra activation would only
-            # move memory around for nothing.
-            return failures
-        if self.opd_manager.needs_student_prefill:
-            # The Teacher phase has already restored generation.
-            await self.opd_manager.score_student_at_teacher(samples, None, self._encode_multimodal_inputs)
-        self.opd_manager.assemble_transfer(samples)
-        return ()
+            for batch_id, _, samples, *_ in staged:
+                await self.opd_manager.prepare_teacher_inputs(samples)
+                results = await self.opd_manager.score_teacher(samples)
+                missing = sum(
+                    not ok and int(sample.response_length or 0) > 0
+                    for sample, ok in zip(samples, results, strict=True)
+                )
+                if missing:
+                    raise ValueError(f"Deferred OPD batch {batch_id}: {missing} sample(s) were not scored")
+        for _, _, samples, *_ in staged:
+            if self.opd_manager.needs_student_prefill:
+                await self.opd_manager.score_student_at_teacher(samples, None, self._encode_multimodal_inputs)
+            self.opd_manager.assemble_transfer(samples)
 
 
 def _flatten(batch_samples: Any) -> list[Sample]:

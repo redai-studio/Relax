@@ -81,6 +81,81 @@ async def test_task_registers_all_models_in_one_request_and_placement_domain(mon
 
 
 @pytest.mark.asyncio
+async def test_dispose_interrupts_a_handoff_waiting_for_unconfirmed_dispatch():
+    from unittest.mock import AsyncMock
+
+    task = InferenceManager.__ray_metadata__.modified_class()
+    pool = task.pool = MemoryPool(Role.ROLLOUT, None, None, {"model_id": "default"})
+    task.memory_ready = task.resident = True
+    task.state = LifecycleState.READY
+    await task.configure_phases({"startup": (), "inference": (("rollout", "default"),)}, "inference")
+    permit = await task.admit_request("rollout", "default")
+    stop = AsyncMock()
+    await task.fail_request_transport(permit, SimpleNamespace(stop_requests=SimpleNamespace(remote=stop)))
+    entered = asyncio.Event()
+    drain = task.ledger.drain
+
+    async def observe_drain(fence, timeout, **kwargs):
+        if fence == "memory":
+            entered.set()
+        return await drain(fence, timeout, **kwargs)
+
+    task.ledger.drain = observe_drain
+    handoff = asyncio.create_task(task.switch("startup"))
+    await asyncio.wait_for(entered.wait(), 1)
+    disposal = asyncio.create_task(task.dispose())
+    try:
+        done, _ = await asyncio.wait((disposal,), timeout=1)
+        assert disposal in done
+        disposal.result()
+        with pytest.raises(RuntimeError, match="manager is closing"):
+            await asyncio.wait_for(handoff, 1)
+        stop.assert_awaited_once()
+        assert pool.disposed and not task.requests.permits
+    finally:
+        await task.complete_request(permit)
+        await asyncio.gather(handoff, disposal, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_dispose_reports_unconfirmed_handoff_and_can_retry(monkeypatch):
+    from threading import Event
+
+    from relax.distributed.ray import inference_manager, static_inference_pool
+    from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed
+
+    monkeypatch.setattr(inference_manager, "_PHASE_CLOSE_TIMEOUT_S", 0.02, raising=False)
+    monkeypatch.setattr(static_inference_pool, "StaticInferencePool", MemoryPool)
+    task = InferenceManager.__ray_metadata__.modified_class()
+    await task.register_static("teacher", None, None, {"model_id": "default"})
+    pool = task.models[(Role.TEACHER, "default")].pool
+    await task.configure_phases({"startup": (), "teacher": (("teacher", "default"),)}, "teacher")
+    entered, release = Event(), Event()
+
+    def offload():
+        entered.set()
+        assert release.wait(3)
+        pool.offload()
+
+    pool.backend.offload = offload
+    handoff = asyncio.create_task(task.switch("startup"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        with pytest.raises(RolloutCleanupUnconfirmed, match="handoff"):
+            await asyncio.wait_for(task.dispose(), 0.5)
+        assert pool.resident and not pool.disposed
+        assert not handoff.done()
+        with pytest.raises(RuntimeError, match="retired"):
+            await task.switch("teacher")
+    finally:
+        release.set()
+        await asyncio.wait_for(handoff, 1)
+
+    await task.dispose()
+    assert pool.disposed
+
+
+@pytest.mark.asyncio
 async def test_phase_handoff_releases_partial_policy_weights_even_from_startup(monkeypatch):
     from relax.distributed.ray import static_inference_pool
 
@@ -261,10 +336,13 @@ async def test_failed_aux_disposal_retires_queued_handoffs_but_allows_cleanup_re
     queued = asyncio.create_task(task.switch("teacher"))
     await asyncio.sleep(0)
     try:
-        with pytest.raises(TimeoutError, match="exit unconfirmed"):
-            await task.dispose()
+        disposal = asyncio.create_task(task.dispose())
+        await asyncio.sleep(0)
+        assert "shutdown" in task.requests.fences
     finally:
         task._phase_switch.release()
+    with pytest.raises(TimeoutError, match="exit unconfirmed"):
+        await disposal
     with pytest.raises(RuntimeError, match="retired"):
         await queued
     with pytest.raises(RuntimeError, match="retired"):
@@ -274,7 +352,8 @@ async def test_failed_aux_disposal_retires_queued_handoffs_but_allows_cleanup_re
     assert onloads == []
     assert not teacher.pool.resident
     assert teacher.pool is not None
-    await task.switch("startup")
+    with pytest.raises(RuntimeError, match="retired"):
+        await task.switch("startup")
     judge.pool.dispose = original_dispose
     await task.dispose()
     assert judge.pool is None and teacher.pool is None

@@ -4,13 +4,16 @@ import asyncio
 import ipaddress
 import json
 import multiprocessing
+import os
 import random
 import re
 import socket
 import threading
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -258,10 +261,28 @@ _post_actors: list[object] = []
 _post_actor_idx: int = 0
 
 
+@dataclass(frozen=True)
+class _PosterProcess:
+    node_id: str
+    pid: int
+    start_ticks: int
+    pid_namespace: int
+
+
+@dataclass(frozen=True)
+class _PosterShutdownTarget:
+    actor: object
+    process: _PosterProcess
+
+
+_poster_processes: dict[int, _PosterProcess | Awaitable[_PosterProcess | None] | None] = {}
+
+
 @dataclass
 class _PosterRequests:
     active: int = 0
     stop: asyncio.Task | None = None
+    process: _PosterProcess | None = None
 
 
 # The RolloutWorker dispatches on one event loop. Keep receipts until the
@@ -394,6 +415,19 @@ def _init_ray_distributed_post(args):
                 self._client, url, payload, max_retries, headers, fail_fast_no_workers
             )
 
+        @ray.method(concurrency_group="control")
+        async def process_info(self) -> _PosterProcess | None:
+            pid = os.getpid()
+            try:
+                return _PosterProcess(
+                    ray.get_runtime_context().get_node_id(),
+                    pid,
+                    _process_start_ticks(pid),
+                    os.stat("/proc/self/ns/pid").st_ino,
+                )
+            except OSError:
+                return None
+
         async def do_request(self, url, body, headers, request_id: str):
             task = asyncio.current_task()
             assert task is not None
@@ -460,6 +494,7 @@ def _init_ray_distributed_post(args):
                 num_cpus=0.001,
             ).remote(per_actor_conc)
             created.append(actor)
+            _poster_processes[id(actor)] = actor.process_info.remote()
 
     _post_actors = created
 
@@ -495,6 +530,23 @@ async def send_distributed_request(request: httpx.Request) -> httpx.Response:
     requests = _poster_requests.setdefault(id(actor), _PosterRequests())
     requests.active += 1
     try:
+        process = _poster_processes.get(id(actor))
+        if requests.process is None and process is not None:
+            if not isinstance(process, _PosterProcess):
+                # The cleanup owner needs a process receipt before the first POST.
+                try:
+                    process = await asyncio.wait_for(process, _POSTER_STOP_TIMEOUT_S)
+                except (ray.exceptions.RayActorError, ray.exceptions.TaskCancelledError, TimeoutError) as exc:
+                    if isinstance(exc, ray.exceptions.ActorDiedError):
+                        if actor in _post_actors:
+                            _post_actors.remove(actor)
+                        _poster_processes.pop(id(actor), None)
+                    raise httpx.ConnectError(
+                        "Distributed HTTP poster was unavailable before dispatch", request=request
+                    ) from exc
+                if id(actor) in _poster_processes:
+                    _poster_processes[id(actor)] = process
+            requests.process = process
         request_id = uuid4().hex
         ref = actor.do_request.remote(str(request.url), body, request.headers.multi_items(), request_id)
         pending = asyncio.ensure_future(ref)
@@ -542,23 +594,76 @@ async def _confirm_poster_stopped(actor: object, requests: _PosterRequests) -> N
     if requests.stop is None:
         if actor in _post_actors:
             _post_actors.remove(actor)
+        _poster_processes.pop(id(actor), None)
         requests.stop = asyncio.create_task(stop_distributed_poster(actor))
     while not requests.stop.done():
         try:
             await asyncio.shield(requests.stop)
         except asyncio.CancelledError:
             continue
+        except DistributedPostUnconfirmed:
+            break
+    target = _PosterShutdownTarget(actor, requests.process) if requests.process is not None else actor
     if requests.stop.cancelled():
-        raise DistributedPostUnconfirmed("HTTP poster stop was cancelled", actor)
-    requests.stop.result()
+        raise DistributedPostUnconfirmed("HTTP poster stop was cancelled", target)
+    try:
+        requests.stop.result()
+    except DistributedPostUnconfirmed as exc:
+        exc.poster = target
+        raise
 
 
-async def stop_distributed_poster(actor: object) -> None:
-    """Wait for the poster itself to acknowledge that dispatch has stopped."""
+def _process_start_ticks(pid: int) -> int:
+    # Field 22 in /proc/<pid>/stat is relative to boot, independent of wall time.
+    stat = Path(f"/proc/{pid}/stat").read_bytes()
+    return int(stat.rsplit(b")", 1)[1].split()[19])
+
+
+def _poster_process_exited(receipt: _PosterProcess) -> bool:
+    import psutil
+
+    from relax.utils.process_utils import process_is_live
+
+    if os.stat("/proc/self/ns/pid").st_ino != receipt.pid_namespace:
+        return False
+    try:
+        process = psutil.Process(receipt.pid)
+        deadline = time.monotonic() + 2
+        while _process_start_ticks(receipt.pid) == receipt.start_ticks and process_is_live(process):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+    except (FileNotFoundError, psutil.NoSuchProcess):
+        return True
+
+
+async def _confirm_poster_process_exit(process: _PosterProcess) -> bool:
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    try:
+        probe = ray.remote(num_cpus=0)(_poster_process_exited).options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=process.node_id, soft=False)
+        )
+        return await asyncio.wait_for(probe.remote(process), timeout=5)
+    except Exception:
+        logger.warning(
+            "Could not verify exit of poster PID %s on node %s", process.pid, process.node_id, exc_info=True
+        )
+        return False
+
+
+async def stop_distributed_poster(poster: object) -> None:
+    """Wait for the poster's acknowledgement or independently verify process
+    exit."""
+    actor = poster.actor if isinstance(poster, _PosterShutdownTarget) else poster
     try:
         await _poster_control_ack(actor.stop_requests.remote)
     except DistributedPostUnconfirmed as exc:
-        exc.poster = actor
+        if isinstance(poster, _PosterShutdownTarget) and await _confirm_poster_process_exit(poster.process):
+            return
+        exc.poster = poster
         raise
 
 

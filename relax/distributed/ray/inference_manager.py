@@ -22,6 +22,7 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+_PHASE_CLOSE_TIMEOUT_S = 30.0
 _WORKER_CLOSE_TIMEOUT_S = 30.0
 
 # Failed rollback owners must outlive the failing factory stack. In particular,
@@ -507,7 +508,7 @@ class _ModelRuntime:
         if method in {"offload", "onload", "onload_weights", "onload_kv"}:
             async with self._transition:
                 if method == "offload":
-                    await self.ledger.drain("memory", timeout=600)
+                    await self.ledger.drain("memory", timeout=600, abort_when=lambda: self._closing)
                     self.state = LifecycleState.DRAINING
                     try:
                         await _blocking(backend.offload)
@@ -524,7 +525,7 @@ class _ModelRuntime:
                         if self.state is LifecycleState.SLEEPING and self.resident:
                             method = "onload_kv"
                     # Close admission before even a partial memory transition.
-                    await self.ledger.drain("memory", timeout=600)
+                    await self.ledger.drain("memory", timeout=600, abort_when=lambda: self._closing)
                     self.state = LifecycleState.ONLOADING
                     self.resident = True
                     try:
@@ -722,9 +723,14 @@ class _ModelRuntime:
                     except ray.exceptions.ActorUnavailableError as exc:
                         raise RolloutCleanupUnconfirmed("Rollout worker cleanup is unconfirmed") from exc
                 await self._confirm_failed_dispatches()
+                try:
+                    await self.ledger.drain("shutdown", timeout=10, ignore_permits=self._stopped_dispatch_permits)
+                except TimeoutError as exc:
+                    if worker_error is not None:
+                        raise worker_error from exc
+                    raise
                 if worker_error is not None:
                     raise worker_error
-                await self.ledger.drain("shutdown", timeout=10, ignore_permits=self._stopped_dispatch_permits)
             except RolloutCleanupUnconfirmed:
                 worker_cleanup_unconfirmed = True
                 raise
@@ -922,13 +928,13 @@ class InferenceManager(_ModelRuntime):
         self._phase_coordinator = PhaseCoordinator(phases, initial_phase, call)
 
     async def switch(self, phase: str) -> None:
-        if (self._closing or not self._startup_valid) and phase != "startup":
+        if self._closing or not self._startup_valid:
             raise RuntimeError("Inference deployment startup has been retired")
         if self._phase_coordinator is None:
             raise RuntimeError("Task phases have not been configured")
         async with self._phase_switch:
             # A queued handoff must re-check retirement after acquiring the lock.
-            if (self._closing or not self._startup_valid) and phase != "startup":
+            if self._closing or not self._startup_valid:
                 raise RuntimeError("Inference deployment startup has been retired")
             if phase not in self._phase_models:
                 raise ValueError(f"Unknown inference phase: {phase}")
@@ -954,15 +960,39 @@ class InferenceManager(_ModelRuntime):
                 self._phase_coordinator._failure = exc
                 raise
 
+    async def confirm_driver_router_exit(self, instance: Any) -> None:
+        async with self._transition:
+            if not self._closing:
+                raise RuntimeError("Cannot record Router exit before the task closes")
+            if self.pool is not None:
+                backend = self.pool.backend
+                if instance is None or getattr(backend.args, "_driver_router_instance", None) != instance:
+                    raise RuntimeError("Driver Router exit does not match this task")
+                backend._stopped_router_instances.add(instance)
+
     async def dispose(self, worker: Any = None) -> None:
         self._startup_valid = False
         self._closing = True
         self.requests.fences.add("shutdown")
         for runtime in self.models.values():
-            await runtime.dispose()
+            runtime._closing = True
+        async with self.requests.changed:
+            self.requests.changed.notify_all()
+
+        async def wait_for_handoff() -> None:
+            async with self._phase_switch:
+                pass
+
+        # Timing out only ends this wait. A handoff may still be mutating an engine.
+        try:
+            await asyncio.wait_for(wait_for_handoff(), timeout=_PHASE_CLOSE_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise RolloutCleanupUnconfirmed("Inference phase handoff is still running during shutdown") from exc
         if worker is None and self.pool is not None:
             worker = getattr(self.pool.backend, "rollout_worker", None)
         await _ModelRuntime.dispose(self, worker)
+        for runtime in self.models.values():
+            await runtime.dispose()
 
 
 @ray.remote(num_cpus=0)

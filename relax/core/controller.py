@@ -1606,7 +1606,6 @@ class Controller:
             return False
         from relax.distributed.ray.inference_manager import rollback_static_inference_manager
 
-        ray.get(coordinator.switch.remote("startup"), timeout=600)
         if self.serve_dict.get(ROLES.rollout) is None or not self._dispose_rollout_manager():
             # A failed deployment may have no usable Serve handle, but its
             # root task handle remains the authoritative cleanup owner.
@@ -1641,6 +1640,39 @@ class Controller:
             except Exception:
                 logger.exception("Could not confirm managed GenRM cleanup")
 
+    def _dispose_inference_for_teardown(self) -> None:
+        try:
+            if not self._dispose_shared_inference_task():
+                self._dispose_rollout_manager()
+                self._dispose_managed_genrm()
+                shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
+        except Exception:
+            # The task cannot terminate Routers launched in this process.
+            # Stop them even when the task still owns unconfirmed cleanup.
+            from relax.distributed.ray.policy_engine_pool import stop_launched_routers
+
+            try:
+                config = getattr(self, "config", None)
+                instance = getattr(config, "_driver_router_instance", None)
+                manager = getattr(config, "_rollout_engine_manager", None)
+                if instance is not None and manager is not None:
+                    if getattr(config, "_stopped_driver_router_instance", None) != instance:
+                        if stop_launched_routers(instance=instance):
+                            config._stopped_driver_router_instance = instance
+                            if (config.sglang_router_ip, config.sglang_router_port) == instance.endpoint:
+                                config.sglang_router_ip = None
+                                config.sglang_router_port = None
+                    if getattr(config, "_stopped_driver_router_instance", None) == instance:
+                        ray.get(manager.confirm_driver_router_exit.remote(instance), timeout=10)
+                        if self._dispose_shared_inference_task():
+                            del config._driver_router_instance
+                            del config._stopped_driver_router_instance
+                            return
+                stop_launched_routers()
+            except Exception:
+                logger.exception("Could not confirm driver-owned Router exit")
+            raise
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1665,10 +1697,7 @@ class Controller:
             except Exception as exc:
                 logger.warning(f"Image SFT producer shutdown failed: {exc}")
 
-        if not self._dispose_shared_inference_task():
-            self._dispose_rollout_manager()
-            self._dispose_managed_genrm()
-            shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
+        self._dispose_inference_for_teardown()
 
         self._shutdown_agentic_rollout_services()
 
@@ -1924,10 +1953,7 @@ class Controller:
         self._cancel_pending_tasks()
 
         # The rollout actor owns router subprocesses; dispose before deleting its handle.
-        if not self._dispose_shared_inference_task():
-            self._dispose_rollout_manager()
-            self._dispose_managed_genrm()
-            shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
+        self._dispose_inference_for_teardown()
         self._teacher_manager = None
         if hasattr(self.config, "_teacher_inference_manager_handle"):
             delattr(self.config, "_teacher_inference_manager_handle")

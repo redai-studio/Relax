@@ -91,11 +91,12 @@ def cluster():
             "--node-ip-address=127.0.0.1",
             "--num-cpus=4",
             "--include-dashboard=false",
+            "--dashboard-agent-listen-port=0",
+            "--min-worker-port=0",
+            "--max-worker-port=0",
             "--disable-usage-stats",
             f"--temp-dir={tempfile.mkdtemp(prefix='r12-', dir='/tmp')}",
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     local = LocalRay(f"127.0.0.1:{port}")
@@ -312,7 +313,8 @@ def check_native_health_and_training_threads_complete_actual_global_restart(clus
                 controller._global_restart_count == 1
                 and not controller._restarting
                 and bool(controller._pending_task_refs)
-            )
+            ),
+            timeout=60,
         )
         if runtime is not None:
             wait_until(lambda: any(e["event_type"] == "recovery_succeeded" for e in runtime.query()["events"]))

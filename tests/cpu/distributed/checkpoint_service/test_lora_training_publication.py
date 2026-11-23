@@ -168,6 +168,7 @@ def test_client_agrees_on_incomplete_initial_pool_and_skips_later_topology(backe
         backend.update_weights_for_rollout = Mock()
         client = object.__new__(CheckpointEngineClient)
         client._backend = backend
+        client.role_info = SimpleNamespace(rank=rank)
         client.coordinator_url = "http://coordinator"
         response = Mock()
         response.json.return_value = topology
@@ -182,12 +183,15 @@ def test_client_agrees_on_incomplete_initial_pool_and_skips_later_topology(backe
         assert_rank_errors(results, "LoRA base")
         assert all(worker.update_weights_for_rollout.call_count == 0 for worker in workers)
         return
-    assert results == [[], []]
+    assert results == [["engine"], []]
     assert [client._http_client.get.call_count for client in clients] == [1, 0]
     for client in clients:
         client._backend._lora_sync.base_sync_done = True
         client._http_client.get.reset_mock()
         client._backend.init_process_group_for_rollout.reset_mock()
-    assert ranks.run(lambda rank: asyncio.run(clients[rank].update_weights_for_rollout(rollout_only=True))) == [[], []]
+    assert ranks.run(lambda rank: asyncio.run(clients[rank].update_weights_for_rollout(rollout_only=True))) == [
+        ["engine"],
+        [],
+    ]
     assert all(client._http_client.get.call_count == 0 for client in clients)
     assert all(client._backend.init_process_group_for_rollout.call_count == 0 for client in clients)

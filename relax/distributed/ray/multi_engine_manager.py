@@ -23,6 +23,7 @@ import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.process_utils import check_server_session_exit
 
 
 logger = get_logger(__name__)
@@ -252,17 +253,8 @@ class MultiEngineManager:
     # ------------------------------------------------------------------
 
     def _confirm_dead_engine_exit(self, rank: int) -> bool:
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-        from relax.utils.process_utils import server_session_exited
-
         info = self._engine_process_info.get(rank)
-        if info is None:
-            return False
-        check = ray.remote(num_cpus=0)(server_session_exited).options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=info["node_id"], soft=False)
-        )
-        return ray.get(check.remote(info["session_id"]), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
+        return info is not None and check_server_session_exit(info, timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
 
     def health_check(self) -> bool:
         """Perform a health check on every engine."""

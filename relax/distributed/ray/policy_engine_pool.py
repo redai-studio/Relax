@@ -5,6 +5,7 @@
 import asyncio
 import dataclasses
 import enum
+import ipaddress
 import multiprocessing
 import os
 import random
@@ -49,6 +50,7 @@ from relax.utils.metrics.rollout_metrics import (
     compute_perf_metrics_from_samples,
 )
 from relax.utils.misc import load_function
+from relax.utils.process_utils import check_server_session_exit
 from relax.utils.s3_model_loader import (
     build_runai_streamer_env_for_load,
 )
@@ -64,6 +66,15 @@ from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
 
 logger = get_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class RouterInstance:
+    endpoint: tuple[str, int]
+    node_id: str
+    pid: int
+    listeners: tuple[int, ...]
+    network_namespace: int
 
 
 def _resolve_rollout_engine_class(args):
@@ -247,6 +258,7 @@ class _EngineInitRecord:
     # Internal cleanup target, not readiness metadata exposed by /engines.
     router_url: str | None = None
     router_cleanup: RouterWorkerCleanup | None = None
+    server_process: ray.ObjectRef | None = None
 
 
 def _get_engine_actor_states() -> Any | None:
@@ -402,7 +414,8 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
+        engine_class = _resolve_rollout_engine_class(self.args)
+        RolloutRayActor = ray.remote(engine_class)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -533,6 +546,11 @@ class EngineGroup:
                     engine._actor_id.hex(),
                     pd_worker_type=self.worker_type if self.require_router_registration else None,
                     bootstrap_port=engine_addr.get("disaggregation_bootstrap_port"),
+                ),
+                server_process=(
+                    engine.get_server_process_info.remote()
+                    if engine_class is SGLangEngine and not self.args.rollout_external
+                    else None
                 ),
             )
             init_handles.append(init_ref)
@@ -893,8 +911,12 @@ class PolicyEnginePool:
         self._seed_sync_receipts: dict[str, tuple[tuple[str, ...], str]] = {}
         self._unconfirmed_rollback_engines: list[Any] = []
         self._strict_rollback_engines: list[Any] = []
+        self._pending_rollback_dcs_removals: set[int] = set()
         self._rollback_router_endpoints: dict[int, tuple[str | None, int | None]] = {}
-        self._stopped_router_endpoints: set[tuple[str, int]] = set()
+        self._rollback_router_instances: dict[int, RouterInstance] = {}
+        self._confirmed_rollback_router_removals: set[int] = set()
+        self._rollback_server_processes: dict[int, ray.ObjectRef] = {}
+        self._stopped_router_instances: set[RouterInstance] = set()
         self._unconfirmed_rollback_placement_groups: list[Any] = []
         self._dynamic_global_batch_size = None
         # Disposal must remain usable if startup fails before creating locks or monitors.
@@ -1036,16 +1058,25 @@ class PolicyEnginePool:
         completes, instead of being orphaned.
         """
         engine_endpoints = {}
+        server_processes = getattr(self, "_rollback_server_processes", {})
+        process_refs = dict(server_processes)
         for srv in self.servers.values():
             for group in srv.engine_groups:
-                for engine in group.all_engines:
+                records = getattr(group, "engine_init_records", {})
+                for slot, engine in enumerate(group.all_engines):
                     if engine is not None:
+                        record = records.get(slot)
+                        if record is not None and record.server_process is not None:
+                            process_refs[id(engine)] = record.server_process
                         endpoint = (getattr(srv, "router_ip", None), getattr(srv, "router_port", None))
                         engine_endpoints[id(engine)] = (engine, endpoint)
 
         retained = getattr(self, "_unconfirmed_rollback_engines", [])
         strict = getattr(self, "_strict_rollback_engines", [])
+        pending_dcs = getattr(self, "_pending_rollback_dcs_removals", set())
         rollback_endpoints = getattr(self, "_rollback_router_endpoints", {})
+        registration_instances = getattr(self, "_rollback_router_instances", {})
+        router_removals = vars(self).setdefault("_confirmed_rollback_router_removals", set())
         for engine in retained:
             identity = id(engine)
             if identity in rollback_endpoints:
@@ -1054,59 +1085,87 @@ class PolicyEnginePool:
                 engine_endpoints.setdefault(identity, (engine, None))
         logger.info(f"[Shutdown] Shutting down {len(engine_endpoints)} SGLang engine(s)...")
 
-        # Stopping an owned Router also stops its in-flight AddWorker jobs,
-        # including jobs whose POST timed out before returning a worker ID.
-        if not hasattr(self, "_stopped_router_endpoints"):
-            self._stopped_router_endpoints = set()
-        stopped = self._stopped_router_endpoints
+        stopped = vars(self).setdefault("_stopped_router_instances", set())
         failures = []
-        pending_endpoints = {endpoint for engine, endpoint in engine_endpoints.values() if engine in strict}
-        for proc in tuple(_LAUNCHED_ROUTER_PROCESSES):
-            endpoint = getattr(proc, "_relax_router_endpoint", None)
-            if endpoint is None or endpoint not in pending_endpoints:
-                continue
+        pending_instances = {
+            registration_instances[id(engine)] for engine in strict if id(engine) in registration_instances
+        }
+        for instance in pending_instances - stopped:
             try:
-                stop_launched_routers(endpoint=endpoint)
+                if stop_launched_routers(instance=instance):
+                    stopped.add(instance)
             except Exception as exc:
                 failures.append(exc)
-            else:
-                stopped.add(endpoint)
+        stopped_endpoints = {instance.endpoint for instance in stopped}
 
         # Retained engines can still have an AddWorker job in flight.
         removals = []
         shutdown_refs = []
         deadline = time.monotonic() + timeout
-        for engine, endpoint in engine_endpoints.values():
+        dcs_refs = {}
+        for identity, (engine, _) in engine_endpoints.items():
+            if identity in pending_dcs:
+                try:
+                    dcs_refs[identity] = engine.unregister_dcs.remote(strict=True)
+                except Exception as e:
+                    failures.append(e)
+        for identity, ref in dcs_refs.items():
             try:
-                if endpoint in stopped:
-                    shutdown_refs.append((engine, engine.shutdown.remote(stopped_router=endpoint)))
-                elif engine in strict:
+                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
+                pending_dcs.remove(identity)
+            except Exception as e:
+                failures.append(e)
+        for engine, endpoint in engine_endpoints.values():
+            if id(engine) in pending_dcs:
+                continue
+            try:
+                router_stopped = (
+                    registration_instances.get(id(engine)) in stopped
+                    if engine in strict
+                    else endpoint in stopped_endpoints
+                )
+                if router_stopped:
+                    shutdown_refs.append((engine, engine.shutdown.remote(stopped_router=endpoint), True))
+                elif engine in strict and id(engine) not in router_removals:
                     ref = engine.unregister_from_router.remote(wait_for_removal=True, timeout=timeout)
                     removals.append((engine, ref))
                 else:
-                    shutdown_refs.append((engine, engine.shutdown.remote()))
+                    router_clean = endpoint == (None, None) or id(engine) in router_removals
+                    shutdown_refs.append((engine, engine.shutdown.remote(), router_clean))
             except Exception as e:
                 failures.append(e)
         for engine, ref in removals:
             try:
                 if ray.get(ref, timeout=max(0.0, deadline - time.monotonic())) is not True:
                     raise RuntimeError("Scale-out rollback Router removal is unconfirmed")
-                shutdown_refs.append((engine, engine.shutdown.remote()))
+                router_removals.add(id(engine))
+                shutdown_refs.append((engine, engine.shutdown.remote(), True))
             except Exception as e:
                 failures.append(e)
 
         # Bound the whole batch so router cleanup can finish before the driver's
         # signal-exit watchdog, even when every engine is unresponsive.
-        for engine, ref in shutdown_refs:
+        for engine, ref, router_clean in shutdown_refs:
             try:
                 ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
-                if engine in strict:
-                    strict.remove(engine)
-                if engine in retained:
-                    retained.remove(engine)
-                    rollback_endpoints.pop(id(engine), None)
             except Exception as e:
-                failures.append(e)
+                receipt_ref = process_refs.get(id(engine))
+                if not (
+                    isinstance(e, ray.exceptions.ActorDiedError)
+                    and router_clean
+                    and receipt_ref is not None
+                    and self._confirm_shutdown_process_exit(receipt_ref, deadline)
+                ):
+                    failures.append(e)
+                    continue
+            if engine in strict:
+                strict.remove(engine)
+            if engine in retained:
+                retained.remove(engine)
+                rollback_endpoints.pop(id(engine), None)
+                registration_instances.pop(id(engine), None)
+                server_processes.pop(id(engine), None)
+                router_removals.discard(id(engine))
         if failures:
             raise RuntimeError(f"Engine resource release is unconfirmed: {failures}")
 
@@ -1115,6 +1174,17 @@ class PolicyEnginePool:
             ray.util.remove_placement_group(groups[-1])
             groups.pop()
         logger.info(f"[Shutdown] All {len(engine_endpoints)} SGLang engine(s) shut down.")
+
+    @staticmethod
+    def _confirm_shutdown_process_exit(receipt_ref: ray.ObjectRef, deadline: float) -> bool:
+        try:
+            receipt = ray.get(receipt_ref, timeout=0)
+            return receipt is not None and check_server_session_exit(
+                receipt, timeout=max(0.0, deadline - time.monotonic())
+            )
+        except Exception:
+            logger.warning("Could not confirm exit of a dead engine's server process", exc_info=True)
+            return False
 
     @property
     def server(self) -> RolloutServer | None:
@@ -2559,12 +2629,43 @@ class PolicyEnginePool:
                 False, reason=ScaleOutFailure(ScaleOutFailureCategory.DCS_REGISTRATION_FAILED, str(e))
             )
 
+        # Only a completed, direct AddWorker RPC can be tied to the owner.
+        endpoint = (srv.router_ip, srv.router_port)
+        instance = getattr(self.args, "_driver_router_instance", None)
+        for process in _LAUNCHED_ROUTER_PROCESSES:
+            if getattr(process, "_relax_router_endpoint", None) == endpoint:
+                local_instance = _observe_router_instance(process, endpoint)
+                if local_instance is not None:
+                    instance = local_instance
+                    break
+        if instance is not None and (
+            instance.endpoint != endpoint or getattr(self.args, "rollout_engine_class_path", None)
+        ):
+            instance = None
+        registration_instances = vars(self).setdefault("_rollback_router_instances", {})
+
+        async def register(engine):
+            if instance is None:
+                return await engine.register_to_router.remote()
+            result = await engine.register_to_router.remote(
+                owned_router_endpoint=instance.endpoint,
+                router_node_id=instance.node_id,
+                router_network_namespace=instance.network_namespace,
+            )
+            registration_instances[id(engine)] = instance
+            return result
+
         # Step 4: Register to router (AFTER weight sync and DCS registration)
         logger.info(f"{log_prefix} {replica_str}: registering to router...")
         try:
-            register_router_handles = [engine.register_to_router.remote() for engine in engines if engine is not None]
+            register_router_handles = [register(engine) for engine in engines if engine is not None]
             if register_router_handles:
-                register_results = await asyncio.wait_for(asyncio.gather(*register_router_handles), timeout=30)
+                # The worker's HTTP timeout is 30 seconds. Give its Ray reply
+                # time to carry the completed attempt back to the owner.
+                reply_timeout = 35 if instance is not None else 30
+                register_results = await asyncio.wait_for(
+                    asyncio.gather(*register_router_handles), timeout=reply_timeout
+                )
                 if not all(result is True for result in register_results):
                     rejected_count = sum(result is not True for result in register_results)
                     raise RuntimeError(f"Router rejected {rejected_count} engine(s)")
@@ -2606,6 +2707,8 @@ class PolicyEnginePool:
             self._health_monitors.append(monitor)
         with self._engine_lifecycle_lock:
             srv.engine_groups.append(engine_group)
+        for engine in engines:
+            registration_instances.pop(id(engine), None)
 
         logger.info(
             f"{log_prefix} {replica_str}: fully registered. "
@@ -3472,8 +3575,14 @@ class PolicyEnginePool:
         Args:
             engines_or_group: List of engines or EngineGroup
         """
+        server_processes = vars(self).setdefault("_rollback_server_processes", {})
+        router_removals = vars(self).setdefault("_confirmed_rollback_router_removals", set())
         if isinstance(engines_or_group, EngineGroup):
             engines = engines_or_group.all_engines
+            for slot, engine in enumerate(engines):
+                record = engines_or_group.engine_init_records.get(slot)
+                if engine is not None and record is not None and record.server_process is not None:
+                    server_processes[id(engine)] = record.server_process
             if router_endpoint is None:
                 router_endpoint = (engines_or_group.router_ip, engines_or_group.router_port)
         else:
@@ -3485,6 +3594,9 @@ class PolicyEnginePool:
         strict = getattr(self, "_strict_rollback_engines", None)
         if strict is None:
             strict = self._strict_rollback_engines = []
+        pending_dcs = getattr(self, "_pending_rollback_dcs_removals", None)
+        if pending_dcs is None:
+            pending_dcs = self._pending_rollback_dcs_removals = set()
         if not hasattr(self, "_rollback_router_endpoints"):
             self._rollback_router_endpoints = {}
         # Register the entire batch before any await, including cancellation.
@@ -3496,6 +3608,7 @@ class PolicyEnginePool:
                 self._rollback_router_endpoints[id(engine)] = router_endpoint
             if confirm_router_removal and engine not in strict:
                 strict.append(engine)
+                pending_dcs.add(id(engine))
 
         async def release(engine: Any) -> None:
             for attempt in range(attempts):
@@ -3512,18 +3625,21 @@ class PolicyEnginePool:
         async def release_once(engine: Any) -> None:
             require_confirmation = engine in strict
             if require_confirmation:
-                await asyncio.wait_for(engine.unregister_dcs.remote(strict=True), timeout=10)
+                if id(engine) in pending_dcs:
+                    await asyncio.wait_for(engine.unregister_dcs.remote(strict=True), timeout=10)
+                    pending_dcs.remove(id(engine))
             else:
                 try:
                     await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
                 except Exception:
                     logger.warning("Failed to unregister DCS for engine during rollback", exc_info=True)
-            if require_confirmation:
+            if require_confirmation and id(engine) not in router_removals:
                 removed = await asyncio.wait_for(
                     engine.unregister_from_router.remote(wait_for_removal=True, timeout=30), timeout=35
                 )
                 if removed is not True:
                     raise RuntimeError("Scale-out rollback Router removal is unconfirmed")
+                router_removals.add(id(engine))
             await asyncio.wait_for(engine.shutdown.remote(), timeout=30)
 
         results = await asyncio.gather(*(release(engine) for engine in engines), return_exceptions=True)
@@ -3532,6 +3648,9 @@ class PolicyEnginePool:
             if result is None:
                 retained.remove(engine)
                 self._rollback_router_endpoints.pop(id(engine), None)
+                getattr(self, "_rollback_router_instances", {}).pop(id(engine), None)
+                server_processes.pop(id(engine), None)
+                router_removals.discard(id(engine))
                 if engine in strict:
                     strict.remove(engine)
         if failures:
@@ -4828,6 +4947,7 @@ def _start_router(
     force_new: bool = False,
     initial_pd_workers: list[dict] | None = None,
     owned_processes: list[Any] | None = None,
+    driver_owned: bool = False,
 ) -> tuple[str | None, int | None]:
     """Start sgl router or slime router and return (router_ip, router_port).
 
@@ -4836,6 +4956,9 @@ def _start_router(
     ``force_new`` is True (multi-model), always allocate a fresh port. Managed
     P2C startup returns ``(None, None)`` until initial workers exist.
     """
+    if driver_owned:
+        vars(args).pop("_driver_router_instance", None)
+        vars(args).pop("_stopped_driver_router_instance", None)
     endpoint = (args.sglang_router_ip, args.sglang_router_port)
     owns_endpoint = getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
     if not force_new and args.sglang_router_ip is not None and not owns_endpoint:
@@ -4934,6 +5057,16 @@ def _start_router(
     registry.append(process)
     time.sleep(3)
     assert process.is_alive()
+    if driver_owned and ray.is_initialized():
+        deadline = time.monotonic() + 25
+        while process.is_alive():
+            instance = _observe_router_instance(process, (router_ip, router_port))
+            if instance is not None:
+                args._driver_router_instance = instance
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
     if initial_pd_workers is not None and not force_new:
         args._relax_managed_pd_router_endpoint = (router_ip, router_port)
     logger.info(f"Router launched locally at {bind_ip}:{router_port} (connection address: {router_ip})")
@@ -5049,7 +5182,49 @@ def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_ne
 _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
 
 
-def stop_launched_routers(*, endpoint: tuple[str, int] | None = None) -> int:
+def _router_listener_identity(process: multiprocessing.Process, endpoint: tuple[str, int]) -> tuple[int, ...] | None:
+    import psutil
+
+    try:
+        if not process.is_alive() or process.pid is None:
+            return None
+        host, port = endpoint
+        address = ipaddress.ip_address(host.strip("[]"))
+        wildcard = str(ipaddress.ip_address(0) if address.version == 4 else ipaddress.IPv6Address(0))
+        listeners = psutil.Process(process.pid).net_connections(kind="tcp")
+        return tuple(
+            sorted(
+                os.stat(f"/proc/{process.pid}/fd/{listener.fd}").st_ino
+                for listener in listeners
+                if listener.status == psutil.CONN_LISTEN
+                and listener.laddr.port == port
+                and listener.laddr.ip in (str(address), wildcard)
+            )
+        )
+    except (OSError, ValueError, psutil.Error):
+        return None
+
+
+def _observe_router_instance(process: multiprocessing.Process, endpoint: tuple[str, int]) -> RouterInstance | None:
+    if not ray.is_initialized() or process.pid is None:
+        return None
+    listeners = _router_listener_identity(process, endpoint)
+    if not listeners:
+        return None
+    instance = getattr(process, "_relax_router_instance", None)
+    if instance is not None:
+        # A running process can still have replaced its original listener.
+        return instance if listeners == instance.listeners else None
+    try:
+        namespace = os.stat(f"/proc/{process.pid}/ns/net").st_ino
+    except OSError:
+        return None
+    instance = RouterInstance(endpoint, ray.get_runtime_context().get_node_id(), process.pid, listeners, namespace)
+    process._relax_router_instance = instance
+    return instance
+
+
+def stop_launched_routers(*, endpoint: tuple[str, int] | None = None, instance: RouterInstance | None = None) -> int:
     """Terminate router processes owned by this process.
 
     Returns the number of processes that were alive and successfully killed —
@@ -5060,6 +5235,12 @@ def stop_launched_routers(*, endpoint: tuple[str, int] | None = None) -> int:
     survivors: list[multiprocessing.Process] = []
     failed = False
     for proc in _LAUNCHED_ROUTER_PROCESSES:
+        if instance is not None and (
+            getattr(proc, "_relax_router_instance", None) != instance
+            or _router_listener_identity(proc, instance.endpoint) != instance.listeners
+        ):
+            survivors.append(proc)
+            continue
         if endpoint is not None and getattr(proc, "_relax_router_endpoint", None) != endpoint:
             survivors.append(proc)
             continue

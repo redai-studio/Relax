@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 import subprocess
 import sys
 import time
@@ -10,15 +11,17 @@ from relax.utils.process_utils import process_is_live, server_session_exited
 
 
 def test_server_session_blocks_release_while_a_real_process_is_live():
+    namespace = os.stat("/proc/self/ns/pid").st_ino
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
     try:
         assert process_is_live(psutil.Process(process.pid))
-        assert not server_session_exited(process.pid)
+        assert not server_session_exited(process.pid, namespace)
         assert process.poll() is None
     finally:
         process.kill()
         process.wait(timeout=5)
-    assert server_session_exited(process.pid)
+    assert server_session_exited(process.pid, namespace)
+    assert not server_session_exited(process.pid, namespace + 1)
 
 
 def test_unreaped_zombie_has_released_its_server_session():

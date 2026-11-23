@@ -30,11 +30,32 @@ class AdmissionLedger:
             self.permits.pop(token, None)
             self.changed.notify_all()
 
-    async def drain(self, fence: str, timeout: float, *, ignore_permits: AbstractSet[str] = frozenset()) -> None:
+    async def wait_drained(
+        self,
+        permits: Callable[[], dict[str, Any]],
+        timeout: float,
+        ignore_permits: AbstractSet[str],
+        abort_when: Callable[[], bool] | None,
+    ) -> None:
+        def drained_or_closing() -> bool:
+            return (abort_when is not None and abort_when()) or not permits().keys() - ignore_permits
+
+        async with self.changed:
+            await asyncio.wait_for(self.changed.wait_for(drained_or_closing), timeout)
+        if abort_when is not None and abort_when():
+            raise RuntimeError("Inference manager is closing")
+
+    async def drain(
+        self,
+        fence: str,
+        timeout: float,
+        *,
+        ignore_permits: AbstractSet[str] = frozenset(),
+        abort_when: Callable[[], bool] | None = None,
+    ) -> None:
         # A failure or cancellation deliberately leaves the fence closed.
         self.fences.add(fence)
-        async with self.changed:
-            await asyncio.wait_for(self.changed.wait_for(lambda: not self.permits.keys() - ignore_permits), timeout)
+        await self.wait_drained(lambda: self.permits, timeout, ignore_permits, abort_when)
 
 
 class AdmissionScope:
@@ -62,12 +83,16 @@ class AdmissionScope:
     async def complete(self, token: str) -> None:
         await self.root.complete(token)
 
-    async def drain(self, fence: str, timeout: float, *, ignore_permits: AbstractSet[str] = frozenset()) -> None:
+    async def drain(
+        self,
+        fence: str,
+        timeout: float,
+        *,
+        ignore_permits: AbstractSet[str] = frozenset(),
+        abort_when: Callable[[], bool] | None = None,
+    ) -> None:
         self.fences.add(fence)
-        async with self.root.changed:
-            await asyncio.wait_for(
-                self.root.changed.wait_for(lambda: not self.permits.keys() - ignore_permits), timeout
-            )
+        await self.root.wait_drained(lambda: self.permits, timeout, ignore_permits, abort_when)
 
 
 def committed_policy_weight_version(actor: Any) -> str:

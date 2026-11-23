@@ -11,7 +11,7 @@ from typing import Any
 
 import ray
 
-from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed, rollout_group_cleanup
+from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed
 from relax.engine.rollout.workload import RolloutWorkload
 from relax.utils.http_utils import init_http_client
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
@@ -44,7 +44,6 @@ class RolloutWorker:
     def __init__(self, args: Any, data_source: Any, manager: Any) -> None:
         self.args = args
         self.manager = manager
-        self._closed = False
         self._startup_ready = False
         self._generation_running = False
         self._generation_failed = False
@@ -79,7 +78,10 @@ class RolloutWorker:
         self.args.num_rollout_per_epoch = num_rollout_per_epoch
 
     async def _run(self, method: str, *args: Any, **kwargs: Any) -> Any:
-        if self._closed:
+        # Resolve the ContextVar inside the worker. Ray serializes actor methods by value.
+        from relax.engine.rollout.base_types import rollout_group_cleanup
+
+        if self._close_task is not None:
             raise RuntimeError("Rollout worker is closed")
         worker_loop = asyncio.get_running_loop()
 
@@ -159,7 +161,7 @@ class RolloutWorker:
         )
 
     def _check_shared_workload(self) -> None:
-        if self._closed:
+        if self._close_task is not None:
             raise RuntimeError("Rollout worker is closed")
         if self._generation_failed:
             raise RuntimeError("Shared generation attempt failed; recovery requires a new RolloutWorker")
@@ -262,7 +264,6 @@ class RolloutWorker:
         await asyncio.to_thread(bind_agentic_lora_runtime, handle)
 
     async def close(self) -> None:
-        self._closed = True
         if self._close_task is None or (
             self._close_task.done() and isinstance(self._close_task.exception(), RolloutCleanupUnconfirmed)
         ):

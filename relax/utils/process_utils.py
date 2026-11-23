@@ -17,13 +17,15 @@ def process_is_live(process: psutil.Process) -> bool:
         return False
 
 
-def server_session_exited(session_id: int) -> bool:
+def server_session_exited(session_id: int, pid_namespace: int | None = None) -> bool:
     """Confirm exit on the server's node, independently of its Ray actor.
 
     Servers start a new session before launching backend children. Reparenting
     does not change session membership. A reused session id conservatively
     prevents recovery; this check never signals another process.
     """
+    if pid_namespace is not None and os.stat("/proc/self/ns/pid").st_ino != pid_namespace:
+        return False
     deadline = time.monotonic() + 5
     empty_scans = 0
     while True:
@@ -43,3 +45,26 @@ def server_session_exited(session_id: int) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
+
+
+def check_server_session_exit(process_info: dict[str, int | str], *, timeout: float) -> bool:
+    """Check an engine session from its original Ray node and PID namespace."""
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    node_id = process_info.get("node_id")
+    session_id = process_info.get("session_id")
+    namespace = process_info.get("pid_namespace")
+    if (
+        not isinstance(node_id, str)
+        or not node_id
+        or type(session_id) is not int
+        or session_id <= 0
+        or type(namespace) is not int
+        or namespace <= 0
+    ):
+        return False
+    probe = ray.remote(num_cpus=0)(server_session_exited).options(
+        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+    )
+    return ray.get(probe.remote(session_id, namespace), timeout=timeout)

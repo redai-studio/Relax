@@ -242,6 +242,13 @@ def test_standard_rollout_selects_managed_path(mode):
     assert use_managed_rollout(SimpleNamespace(**mode))
 
 
+def test_rollout_worker_can_be_exported_to_ray():
+    from relax.distributed.ray.rollout_worker import RolloutWorker
+
+    actor_class = RolloutWorker.__ray_metadata__.modified_class
+    assert ray.cloudpickle.dumps(actor_class)
+
+
 def test_handle_survives_serialization_and_routes_by_owner():
     class Remote:
         def remote(self, *args, **kwargs):
@@ -365,7 +372,10 @@ async def test_shutdown_cancellation_failure_still_disposes_pool():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("confirmed", [False, True])
-async def test_disconnected_poster_requires_stop_receipt_before_returning_permit(monkeypatch, cancelled, confirmed):
+@pytest.mark.parametrize("custom", [False, True])
+async def test_disconnected_poster_requires_stop_receipt_before_returning_permit(
+    monkeypatch, cancelled, confirmed, custom
+):
     import httpx
 
     from relax.engine.inference.executor import InferenceRequestExecutor
@@ -390,7 +400,11 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
     paths = []
     poster_calls = []
     stop_calls = []
-    poster_can_stop = confirmed
+    poster_can_stop = asyncio.Event()
+    if confirmed:
+        poster_can_stop.set()
+    else:
+        monkeypatch.setattr(http_utils, "_POSTER_STOP_TIMEOUT_S", 0.2)
 
     async def do_request(*args):
         poster_calls.append(args)
@@ -401,14 +415,13 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
         raise ray.exceptions.ActorUnavailableError("connection lost", None)
 
     async def no_cancel_receipt(request_id):
-        raise ray.exceptions.ActorDiedError()
+        return False
 
     async def stop_requests():
         stop_calls.append("stop")
         stopping.set()
         await stopped.wait()
-        if not poster_can_stop:
-            raise ray.exceptions.ActorDiedError()
+        await poster_can_stop.wait()
 
     def upstream(request):
         paths.append(request.url.path)
@@ -424,10 +437,23 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
     monkeypatch.setattr(http_utils, "_post_actors", [poster])
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
         monkeypatch.setattr(http_utils, "_http_client", client)
-        executor = InferenceRequestExecutor(
-            Role.ROLLOUT, remote, client, send_request=http_utils.send_distributed_request
-        )
-        generation = asyncio.create_task(executor.generate_json({"text": "generate"}))
+        if custom:
+            from relax.engine.rollout.request_permit import InferencePermitManager
+            from relax.engine.rollout.sglang_rollout import GenerateState
+
+            state = object.__new__(GenerateState)
+            state.args = SimpleNamespace(use_distributed_post=True, _inference_manager_handle=remote)
+            state.aborted = False
+            state.permit_manager = InferencePermitManager(1)
+            url = "http://router/generate?client=custom"
+            call = state.post_generate(url, {"text": "generate"})
+        else:
+            executor = InferenceRequestExecutor(
+                Role.ROLLOUT, remote, client, send_request=http_utils.send_distributed_request
+            )
+            url = "http://router/generate"
+            call = executor.generate_json({"text": "generate"})
+        generation = asyncio.create_task(call)
         await asyncio.wait_for(started.wait(), 1)
         if cancelled:
             generation.cancel()
@@ -440,6 +466,7 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
             )
             await fallback.aclose()
             assert paths == ["/fallback"] and len(poster_calls) == 1
+            assert poster_calls[0][0] == url
         finally:
             stopped.set()
         expected = (
@@ -465,7 +492,7 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
         assert pool.backend.status != "disposed"
         assert len(owner.ledger.permits) == 1
 
-        poster_can_stop = True
+        poster_can_stop.set()
         if cancelled:
             # Once the poster stops, retain its acknowledgement through
             # engine cleanup failures. Drop the permit after pool disposal.
@@ -479,7 +506,7 @@ async def test_disconnected_poster_requires_stop_receipt_before_returning_permit
                 await owner.dispose()
             assert len(owner.ledger.permits) == 1
             monkeypatch.setattr(pool, "dispose", original_dispose)
-            poster_can_stop = False
+            poster_can_stop.clear()
         await owner.dispose()
         assert len(stop_calls) == 3
         assert not owner.ledger.permits
@@ -790,9 +817,26 @@ async def test_worker_close_reuses_cleanup_and_distinguishes_timeouts(monkeypatc
 
     handle = SimpleNamespace(close=SimpleNamespace(remote=close_remote))
     if not lost_ack:
-        finish.set()
+        permit = await owner.admit_request(Role.ROLLOUT, "default")
+        draining = asyncio.Event()
+        drain = owner.ledger.drain
+
+        async def observe_drain(*args, **kwargs):
+            draining.set()
+            await drain(*args, **kwargs)
+
+        monkeypatch.setattr(owner.ledger, "drain", observe_drain)
+        disposal = asyncio.create_task(owner.dispose(handle))
+        try:
+            finish.set()
+            await asyncio.wait_for(draining.wait(), 1)
+            dispose_pool.assert_not_called()
+            assert not disposal.done()
+        finally:
+            await owner.complete_request(permit)
+            await asyncio.gather(disposal, return_exceptions=True)
         with pytest.raises(ray.exceptions.RayTaskError, match="judge close timed out"):
-            await owner.dispose(handle)
+            await disposal
         with pytest.raises(TimeoutError, match="judge close timed out"):
             await worker.close()
     else:
@@ -803,12 +847,16 @@ async def test_worker_close_reuses_cleanup_and_distinguishes_timeouts(monkeypatc
             assert closing.is_set()
             assert events == ["workload closing"]
             dispose_pool.assert_not_called()
+            with pytest.raises(RuntimeError, match="Rollout worker is closed"):
+                await worker.drain_eval_judges()
             monkeypatch.setattr(inference_manager, "_WORKER_CLOSE_TIMEOUT_S", 2.0)
             retry = asyncio.create_task(owner.dispose(handle))
         finally:
             finish.set()
         await asyncio.wait_for(retry, 2)
         await worker.close()
+    with pytest.raises(RuntimeError, match="Rollout worker is closed"):
+        await worker.drain_eval_judges()
     assert events == ["workload closing", "detached", "worker stopped"]
     dispose_pool.assert_called_once_with()
 

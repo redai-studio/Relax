@@ -310,7 +310,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     # (raw_rewards, post_processed_rewards); it now intentionally returns only
     # post_processed_rewards.
     if getattr(args, "_genrm_colocate_with_rollout", False) and getattr(args, "defer_reward_to_post_process", False):
-        cached = [getattr(sample, "train_metadata", None) or {} for sample in samples]
+        cached = [getattr(sample, "metadata", None) or {} for sample in samples]
         if cached and all("_deferred_genrm_reward" in metadata for metadata in cached):
             return [metadata["_deferred_genrm_reward"] for metadata in cached]
     if args.custom_reward_post_process_path is not None:

@@ -684,7 +684,10 @@ def test_external_partial_success_publishes_matching_compressed_refs(monkeypatch
     assert list(new_group.engine_init_records) == [0, 1]
     assert new_group.engine_init_records[0].value is refs[0]
     assert new_group.engine_init_records[1].value is refs[2]
-    manager._rollback_engines.assert_awaited_once_with([engines[1]])
+    server = manager.servers["actor"]
+    manager._rollback_engines.assert_awaited_once_with(
+        [engines[1]], router_endpoint=(server.router_ip, server.router_port)
+    )
     observed = manager.get_engines_info()
     assert observed["observation"]["complete"] is True
     assert [row["rank"] for row in engine_rows(observed, group_index=1)] == [1, 2]

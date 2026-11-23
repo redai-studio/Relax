@@ -3838,6 +3838,7 @@ def deploy_agentic_chat_api_services(
         config,
         has_pd_disaggregation=resolved_config.models[0].has_pd_disaggregation,
         force_new=False,
+        driver_owned=True,
     )
     if router_ip is not None:
         config.sglang_router_ip = router_ip

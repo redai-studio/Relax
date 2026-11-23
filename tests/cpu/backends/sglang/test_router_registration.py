@@ -163,6 +163,34 @@ def _make_engine(sglang_engine_module):
     return engine
 
 
+@pytest.mark.parametrize("role", ["genrm", "teacher"])
+def test_static_engine_rejects_weight_mutation_at_rpc_boundary(monkeypatch, sglang_engine_module, role):
+    args = SimpleNamespace(
+        fully_async=True, rollout_external=False, rollout_num_gpus_per_engine=1, coordinator_url="http://dcs"
+    )
+    engine = sglang_engine_module.SGLangEngine(args, 0, role=role)
+    engine.node_rank, engine.server_host, engine.server_port = 0, "worker", 8000
+
+    def unexpected_io(*args, **kwargs):
+        pytest.fail("A static engine must reject weight mutations before contacting the backend")
+
+    monkeypatch.setattr(sglang_engine_module, "CheckpointEngineClient", unexpected_io)
+    monkeypatch.setattr(
+        sglang_engine_module.ray, "get_runtime_context", lambda: SimpleNamespace(get_actor_id=lambda: role)
+    )
+    monkeypatch.setattr(sglang_engine_module.requests, "post", unexpected_io)
+    for operation in (
+        engine.register_dcs,
+        lambda: engine.update_weights_from_tensor([]),
+        lambda: engine.init_weights_update_group("trainer", 8000, 0, 1, "sync", "nccl"),
+        lambda: engine.update_weights_from_distributed([], [], [], "sync"),
+        lambda: engine.update_weight_version("2"),
+        lambda: engine.unload_lora_adapter("policy"),
+    ):
+        with pytest.raises(RuntimeError, match=f"{role} engines do not support"):
+            operation()
+
+
 def test_registration_rejects_eviction_before_rpc_execution(monkeypatch, sglang_engine_module):
     requests = _RouterRequests()
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
@@ -339,6 +367,42 @@ def test_unregister_uses_registration_worker_id_once(monkeypatch, sglang_engine_
 
     assert requests.posts == ["http://router:30000/workers"]
     assert requests.deletes == ["http://router:30000/workers/physical-worker-id"]
+
+
+def test_owned_router_uses_direct_transport_through_removal(monkeypatch, sglang_engine_module):
+    router = _RouterRequests(worker_lists=[[]])
+
+    class DirectSession:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            pass
+
+        def __getattr__(self, method):
+            def request(url, *, allow_redirects, **kwargs):
+                assert self.trust_env is False
+                assert allow_redirects is False
+                response = getattr(router, method)(url, **kwargs)
+                response.is_redirect = False
+                return response
+
+            return request
+
+    monkeypatch.setattr(sglang_engine_module, "requests", SimpleNamespace(Session=DirectSession))
+    engine = _make_engine(sglang_engine_module)
+    engine.router_ip = "192.0.2.1"
+    engine._skip_router_registration = True
+    endpoint = (engine.router_ip, engine.router_port)
+    assert engine.register_to_router(owned_router_endpoint=endpoint)
+    assert engine.unregister_from_router(wait_for_removal=True)
+    registry = "http://192.0.2.1:30000/workers"
+    worker = f"{registry}/physical-worker-id"
+    assert router.posts == [registry]
+    assert router.gets == [worker, registry]
+    assert router.deletes == [worker]
 
 
 def test_registration_normalizes_numeric_worker_id(monkeypatch, sglang_engine_module):

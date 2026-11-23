@@ -67,6 +67,68 @@ def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_modu
     assert events == ["dispose", "teacher", "agentic", "routers"]
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_failed_shared_task_teardown_stops_driver_router_and_preserves_failure(
+    monkeypatch, controller_module, restart
+):
+    controller = object.__new__(controller_module.Controller)
+    controller.config = SimpleNamespace()
+    controller.serve_dict = {}
+    controller._global_restart_count = 0
+    controller._max_global_restart = 1
+    controller.runtime_env = {}
+    controller._health_manager = SimpleNamespace(_checker=None, stop=Mock())
+    controller._cancel_pending_tasks = Mock()
+    error = RuntimeError("shared inference cleanup is unconfirmed")
+    controller._dispose_shared_inference_task = Mock(side_effect=error)
+    stop_router = Mock(return_value=1)
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.distributed.ray.policy_engine_pool",
+        SimpleNamespace(stop_launched_routers=stop_router),
+    )
+    monkeypatch.setattr(controller_module, "recovery_load_path", Mock())
+    delete = Mock()
+    monkeypatch.setattr(controller_module.serve, "delete", delete)
+
+    with pytest.raises(RuntimeError, match="shared inference cleanup is unconfirmed") as observed:
+        (controller._run_global_restart if restart else controller.shutdown)()
+
+    assert observed.value is error
+    stop_router.assert_called_once_with()
+    delete.assert_not_called()
+
+
+def test_driver_router_exit_allows_shared_teardown_retry(monkeypatch, controller_module):
+    controller = object.__new__(controller_module.Controller)
+    instance = SimpleNamespace(endpoint=("router", 3000))
+    manager = SimpleNamespace(confirm_driver_router_exit=SimpleNamespace(remote=Mock(return_value="exit-ref")))
+    controller.config = SimpleNamespace(
+        _driver_router_instance=instance,
+        _rollout_engine_manager=manager,
+        sglang_router_ip="router",
+        sglang_router_port=3000,
+    )
+    controller.serve_dict = {}
+    dispose = Mock(side_effect=[RuntimeError("registration still pending"), True])
+    controller._dispose_shared_inference_task = dispose
+    stop = Mock(return_value=1)
+    monkeypatch.setitem(
+        sys.modules, "relax.distributed.ray.policy_engine_pool", SimpleNamespace(stop_launched_routers=stop)
+    )
+    get = Mock()
+    monkeypatch.setattr(controller_module.ray, "get", get)
+
+    controller._dispose_inference_for_teardown()
+
+    stop.assert_called_once_with(instance=instance)
+    manager.confirm_driver_router_exit.remote.assert_called_once_with(instance)
+    get.assert_called_once_with("exit-ref", timeout=10)
+    assert dispose.call_count == 2
+    assert controller.config.sglang_router_ip is None
+    assert controller.config.sglang_router_port is None
+
+
 def test_global_restart_disposes_owner_before_deleting_deployments(monkeypatch, controller_module):
     controller = object.__new__(controller_module.Controller)
     controller._global_restart_count = 0

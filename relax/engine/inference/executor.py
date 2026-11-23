@@ -165,15 +165,30 @@ class InferenceRequestExecutor:
         model: str | None = None,
         route_key: str | None = None,
         replica_cursor: int | None = None,
+        target: str | None = None,
     ) -> AdmittedRequest:
         """Resolve a target and take a permit for it.
 
         Raises :class:`RoutingError` when no target resolves or the Manager
         refuses the admission (503, e.g. the model is draining).
         """
-        target, model_id, via_router = await self.resolve(
-            model=model, route_key=route_key, advance=self.role is Role.ROLLOUT, replica_cursor=replica_cursor
-        )
+        if target is None:
+            target, model_id, via_router = await self.resolve(
+                model=model, route_key=route_key, advance=self.role is Role.ROLLOUT, replica_cursor=replica_cursor
+            )
+        else:
+            snapshot = await self.snapshot()
+            selected = next(
+                (
+                    item
+                    for item in snapshot.models
+                    if target == (item.router_url or "").rstrip("/")
+                    or any(target == (replica.base_url or "").rstrip("/") for replica in item.replicas)
+                ),
+                None,
+            ) or resolve_model(snapshot, model=model, route_key=route_key)
+            model_id = selected.model_id
+            via_router = target == (selected.router_url or "").rstrip("/")
         call = asyncio.ensure_future(self.manager_call("admit_request", self.role, model_id, trace_id))
         try:
             permit = await asyncio.shield(call)
@@ -293,14 +308,24 @@ class InferenceRequestExecutor:
         return response
 
     async def generate_json(
-        self, payload: dict[str, Any], headers: dict[str, str] | None = None, *, replica_cursor: int | None = None
+        self,
+        payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        *,
+        replica_cursor: int | None = None,
+        url: str | None = None,
     ) -> Any:
         """Execute internal rollout directly, without re-entering its Serve
         deployment."""
         trace_id = str(payload.get("rid") or uuid.uuid4().hex)
+        target = None
+        if url is not None:
+            upstream = httpx.URL(url)
+            base_path = upstream.path.rpartition("/")[0]
+            target = str(upstream.copy_with(path=base_path, query=None, fragment=None)).rstrip("/")
         while True:
             try:
-                request = await self.admit(trace_id, replica_cursor=replica_cursor)
+                request = await self.admit(trace_id, replica_cursor=replica_cursor, target=target)
                 break
             except RoutingError as exc:
                 if exc.code != "unavailable":
@@ -308,12 +333,14 @@ class InferenceRequestExecutor:
                 # External HTTP remains fail-fast; internal fully-async work
                 # must pause rather than fail during an ordinary weight update.
                 await self.manager_call("wait_ready", self.role, exc.model_id)
-        payload = dict(payload)
-        assign_backend_rids(request, payload)
         try:
+            payload = dict(payload)
+            assign_backend_rids(request, payload)
             response = await self.send(
                 request,
-                lambda target: self.client.build_request("POST", f"{target}/generate", json=payload, headers=headers),
+                lambda target: self.client.build_request(
+                    "POST", url if url is not None else f"{target}/generate", json=payload, headers=headers
+                ),
             )
             await self.read(request, response)
             response.raise_for_status()

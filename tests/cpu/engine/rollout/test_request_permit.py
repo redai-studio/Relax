@@ -352,6 +352,7 @@ class _IntegState:
     tokenizer/processor)."""
 
     def __init__(self, capacity: int = 1) -> None:
+        self.args = SimpleNamespace()
         self.permit_manager = InferencePermitManager(capacity)
         self.semaphore = self.permit_manager.semaphore
         self.aborted = False
