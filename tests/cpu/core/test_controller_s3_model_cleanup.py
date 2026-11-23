@@ -473,6 +473,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
     instance._teacher_manager = None
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()
+    instance._restart_lock = threading.RLock()
     instance._restarting = False
     monkeypatch.setattr(controller, "set_managed_opd_teacher_on_actor_service", lambda *_args: _async_noop())
     monkeypatch.setattr(instance, "_cleanup_s3_model_weights_after_init", lambda: events.append("cleanup"))

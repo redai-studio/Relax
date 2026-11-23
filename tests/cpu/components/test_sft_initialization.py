@@ -4,11 +4,14 @@
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from relax.components.sft import SFT
+from tests.cpu.components.test_sft import _make_args, _make_processed
+from tests.cpu.core.controller_test_utils import load_controller_with_stubbed_dependencies
 
 
 def _service():
@@ -22,6 +25,7 @@ def _service():
     service._eval_dataset = None
     service._logger_instance = MagicMock()
     service._async_run = AsyncMock()
+    service.step = 0
     return service
 
 
@@ -125,3 +129,277 @@ async def test_sft_initialization_failure_is_preserved_for_all_callers():
     service._init_data_pipeline.assert_called_once()
     service._async_run.assert_not_awaited()
     await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_fresh_prepare_prefills_one_batch_and_run_does_not_replay_it():
+    service = _service()
+    service._init_data_pipeline = MagicMock()
+    produced = []
+
+    async def produce():
+        produced.append(service.step)
+        await asyncio.sleep(0.01)
+        service.step += 1
+
+    service._produce_one_step = produce
+    await asyncio.gather(
+        service.prepare(prefetch_first_batch=True), service.prepare(prefetch_first_batch=True), service.run()
+    )
+    await service._run_task
+    assert produced == [0]
+    assert service.step == 1
+    service._async_run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_joins_prefilled_batch_before_releasing_processor():
+    service = _service()
+    service._init_data_pipeline = MagicMock()
+    entered, release = asyncio.Event(), asyncio.Event()
+    pool = MagicMock()
+    service._processor_pool = pool
+
+    async def produce():
+        entered.set()
+        await release.wait()
+        service.step += 1
+
+    service._produce_one_step = produce
+    preparing = asyncio.create_task(service.prepare(prefetch_first_batch=True))
+    await entered.wait()
+    stopping = asyncio.create_task(service.stop())
+    await asyncio.sleep(0.01)
+    pool.shutdown.assert_not_called()
+    release.set()
+    await asyncio.gather(preparing, stopping)
+    pool.shutdown.assert_called_once_with(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_batch_releases_processor_on_stop():
+    service = _service()
+    service._init_data_pipeline = MagicMock()
+    service._produce_one_step = AsyncMock(side_effect=ValueError("invalid first batch"))
+    pool = MagicMock()
+    service._processor_pool = pool
+
+    with pytest.raises(ValueError, match="invalid first batch"):
+        await service.prepare(prefetch_first_batch=True)
+    await service.stop()
+
+    pool.shutdown.assert_called_once_with(wait=True)
+    service._async_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_request_keeps_resource_cleanup_owned():
+    service = _service()
+    service._init_data_pipeline = MagicMock()
+    entered, release = asyncio.Event(), asyncio.Event()
+    pool = MagicMock()
+    service._processor_pool = pool
+
+    async def produce():
+        entered.set()
+        await release.wait()
+
+    service._produce_one_step = produce
+    preparing = asyncio.create_task(service.prepare(prefetch_first_batch=True))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    stopping = asyncio.create_task(service.stop())
+    await asyncio.sleep(0)
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    pool.shutdown.assert_not_called()
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(preparing, service.stop()), timeout=5)
+    pool.shutdown.assert_called_once_with(wait=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finishes_within_budget", [True, False])
+async def test_controller_waits_for_slow_first_batch_before_closing_queue(monkeypatch, finishes_within_budget):
+    controller_module = load_controller_with_stubbed_dependencies("_test_sft_slow_cleanup")
+    entered, release, stop_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    events = []
+
+    class Dataset:
+        async def get_batch_async(self, count):
+            entered.set()
+            await release.wait()
+            return [_make_processed(0)], False
+
+        def stop(self):
+            events.append("dataset-stopped")
+
+    service = _service()
+    service.config = _make_args(global_batch_size=1, num_rollout=1)
+    service._dataset = Dataset()
+    service._tokenizer = MagicMock()
+    service._train_size = 1
+    service._init_data_pipeline = MagicMock()
+    service.data_system_client = MagicMock()
+    service.data_system_client.async_get_partition_list = AsyncMock(return_value=[])
+    service.data_system_client.async_put = AsyncMock(side_effect=lambda **_kwargs: events.append("put"))
+    loop = asyncio.get_running_loop()
+
+    async def owned_stop():
+        stop_started.set()
+        await service.stop()
+
+    async def remote_stop():
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(owned_stop(), loop))
+
+    deployment = SimpleNamespace(
+        _sft_prepare_response=object(), handle=SimpleNamespace(stop=SimpleNamespace(remote=remote_stop))
+    )
+    controller = controller_module.Controller.__new__(controller_module.Controller)
+    controller._tq_owner = object()
+    controller._tq_legacy_init = False
+    controller._sft_early_prepare_issued = True
+    monkeypatch.setattr(controller_module, "close_tq_owner", lambda _owner: events.append("queue-closed"))
+    original_wait_for = asyncio.wait_for
+
+    async def shortened_timeout(awaitable, timeout):
+        return await original_wait_for(awaitable, timeout=0.25 if finishes_within_budget else 0.01)
+
+    monkeypatch.setattr(controller_module.asyncio, "wait_for", shortened_timeout)
+
+    def close_after_stop():
+        controller._stop_prepared_sft(deployment)
+        controller._close_data_system()
+
+    preparing = asyncio.create_task(service.prepare(prefetch_first_batch=True))
+    async with asyncio.timeout(5):
+        await entered.wait()
+        closing = asyncio.create_task(asyncio.to_thread(close_after_stop))
+        try:
+            await stop_started.wait()
+            if finishes_within_budget:
+                await asyncio.sleep(0.05)
+                assert not closing.done()
+            else:
+                await asyncio.wait({closing}, timeout=0.5)
+                assert closing.done(), "A stuck producer must not block failure recovery indefinitely"
+                with pytest.raises(RuntimeError, match="unconfirmed"):
+                    await closing
+                assert not service._prepare_batch_task.done()
+                with pytest.raises(RuntimeError, match="unconfirmed"):
+                    controller._close_data_system()
+            assert "queue-closed" not in events
+        finally:
+            release.set()
+            await asyncio.gather(preparing, closing, service.stop(), return_exceptions=True)
+    assert events == (
+        ["put", "dataset-stopped", "queue-closed"] if finishes_within_budget else ["put", "dataset-stopped"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepare_then_run_publishes_consecutive_partitions_without_replaying_samples():
+    class Dataset:
+        def __init__(self):
+            self.cursor = 0
+
+        async def get_batch_async(self, count):
+            assert count == 1
+            sample = _make_processed(self.cursor)
+            sample.tokens.fill_(self.cursor + 1)
+            self.cursor += 1
+            return [sample], False
+
+        def stop(self):
+            pass
+
+    service = _service()
+    service.config = _make_args(global_batch_size=1, num_rollout=2)
+    service._dataset = Dataset()
+    service._tokenizer = MagicMock()
+    service._train_size = 2
+    service._init_data_pipeline = MagicMock()
+    service._async_run = type(service)._async_run.__get__(service)
+    service.data_system_client = MagicMock()
+    service.data_system_client.async_put = AsyncMock()
+    service.data_system_client.async_get_partition_list = AsyncMock(return_value=[])
+
+    await service.prepare(prefetch_first_batch=True)
+    assert service.step == service._dataset.cursor == 1
+    await service.run()
+    await asyncio.wait_for(service._run_task, timeout=5)
+
+    calls = service.data_system_client.async_put.call_args_list
+    assert [call.kwargs["partition_id"] for call in calls] == ["sft_0", "sft_1"]
+    assert [call.kwargs["data"]["tokens"][0][0].item() for call in calls] == [1, 2]
+    assert service.step == service._dataset.cursor == 2
+    await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+async def test_failed_prepare_shard_keeps_sibling_writer_owned_until_stop(monkeypatch, dispatch_fails):
+    from relax.components import sft as sft_module
+
+    monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
+    service = _service()
+    service.config = _make_args(global_batch_size=2)
+    service.config.sft_async_prepack = True
+    service._init_data_pipeline = MagicMock()
+    service._train_size = 2
+    release = asyncio.Event()
+    events = []
+    first_error = ValueError("first shard failed")
+
+    async def put():
+        await release.wait()
+        events.append("sibling-put-finished")
+        return {"crossed_epoch": False, "epoch": 0}
+
+    writer = asyncio.create_task(put())
+
+    def stopped():
+        events.append("shard-stopped")
+        result = asyncio.get_running_loop().create_future()
+        result.set_result(None)
+        return result
+
+    class Produce:
+        def __init__(self, ref):
+            self.ref = ref
+
+        def remote(self, *_args):
+            if isinstance(self.ref, Exception):
+                raise self.ref
+            return self.ref
+
+    if dispatch_fails:
+        refs = (writer, first_error)
+    else:
+        failed = asyncio.get_running_loop().create_future()
+        failed.set_exception(first_error)
+        refs = (failed, writer)
+    service._batch_producers = [
+        SimpleNamespace(produce_partition=Produce(ref), stop=SimpleNamespace(remote=stopped)) for ref in refs
+    ]
+    # Ray get(list) reports an errored shard immediately, even while another
+    # ObjectRef remains pending. Isolate that external RPC contract here.
+    monkeypatch.setattr(sft_module.ray, "get", lambda refs: refs[0].result())
+    preparing = asyncio.create_task(service.prepare(prefetch_first_batch=True))
+    async with asyncio.timeout(5):
+        while getattr(service, "_prepare_batch_task", None) is None:
+            await asyncio.sleep(0)
+        stopping = asyncio.create_task(service.stop())
+        try:
+            await asyncio.wait({preparing}, timeout=0.5)
+            assert preparing.done(), "The first failure must reach the driver even if a sibling writer is stuck"
+            await asyncio.wait({stopping}, timeout=0.05)
+            assert not stopping.done()
+            assert events == []
+        finally:
+            release.set()
+            results = await asyncio.gather(preparing, stopping, writer, return_exceptions=True)
+    assert results[0] is first_error
+    assert results[1] is None
+    assert events == ["sibling-put-finished", "shard-stopped", "shard-stopped"]
