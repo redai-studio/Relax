@@ -9,6 +9,10 @@ import uuid
 from typing import Optional
 
 
+# Includes router deregistration and the SGLang process-tree exit deadline.
+ENGINE_SHUTDOWN_TIMEOUT_S = 60.0
+
+
 class ScaleOutStatus(str, enum.Enum):
     """Status states for scale-out requests."""
 

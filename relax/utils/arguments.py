@@ -1308,11 +1308,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=30.0,
                 help="Timeout in seconds to wait for in-flight requests to drain before force-aborting. Default: 30s.",
             )
+            from relax.distributed.ray.rollout_scale_types import ENGINE_SHUTDOWN_TIMEOUT_S
+
             parser.add_argument(
                 "--scale-in-shutdown-timeout",
                 type=float,
-                default=30.0,
-                help="Timeout in seconds for graceful SGLang engine shutdown. If exceeded, ray.kill is used. Default: 30s.",
+                default=ENGINE_SHUTDOWN_TIMEOUT_S,
+                help="Seconds to wait for engine shutdown. A timed-out scale-in retains its actors for retry.",
             )
             return parser
 

@@ -406,7 +406,7 @@ K8s sends SIGTERM
 |---|---|---|
 | `terminationGracePeriodSeconds` | 180s | Must be greater than drain timeout + shutdown timeout + polling overhead |
 | `--scale-in-drain-timeout` (Relax) | 30s (default) | Timeout for in-flight requests to finish |
-| `--scale-in-shutdown-timeout` (Relax) | 30s (default) | Graceful engine shutdown timeout |
+| `--scale-in-shutdown-timeout` (Relax) | 60s (default) | Graceful engine shutdown timeout |
 | preStop `MAX_WAIT` | 150s | Must be less than `terminationGracePeriodSeconds` |
 | KEDA `cooldownPeriod` | 300s | Cooldown before scaling to 0; not used when `minReplicaCount` > 0 |
 

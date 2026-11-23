@@ -171,14 +171,11 @@ def test_health_monitor_kill_engine_clears_counter(monkeypatch):
     m._engine_group = _Group([engine])
     m._consecutive_failures[0] = 5  # pretend a stale count is present
 
-    # Stub the Ray remote plumbing inside the real _kill_engine.
-    monkeypatch.setattr(hm.ray, "get", lambda *a, **k: None)
-    monkeypatch.setattr(hm.ray, "kill", lambda *a, **k: None)
-
+    m._engine_group.shutdown_engines = mock.Mock()
     m._kill_engine(rollout_engine_id=0)
 
+    m._engine_group.shutdown_engines.assert_called_once_with({0})
     assert 0 not in m._consecutive_failures
-    assert m._engine_group.all_engines[0] is None
 
 
 # ---------------------------------------------------------------------------
