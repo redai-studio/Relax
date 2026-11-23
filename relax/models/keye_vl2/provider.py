@@ -84,6 +84,15 @@ class KeyeModelProvider(GPTModelProvider):
             raise ValueError("Keye currently supports static context parallelism only")
         if self.context_parallel_size > 1 and args.cp_partition_mode != "zigzag":
             raise ValueError("Keye context parallelism requires zigzag partitioning")
+        if getattr(args, "use_rollout_indexer_replay", False):
+            if getattr(args, "dsa_indexer_loss_coeff", None) not in (None, 0):
+                raise ValueError("Keye indexer replay requires zero indexer loss")
+            self.keye_indexer_loss_coeff = 0.0
+            # The model wrapper applies freezes before DDP and optimizer construction.
+            frozen = getattr(args, "freeze_params_name_list", None) or []
+            indexer_pattern = r"\.sa_indexer\."
+            if indexer_pattern not in frozen:
+                args.freeze_params_name_list = [*frozen, indexer_pattern]
         # TE fused RoPE rounds once; the Keye reference rounds BF16 products separately.
         self.apply_rope_fusion = False
         if args.multimodal_keys:

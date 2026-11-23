@@ -48,7 +48,7 @@ def stub(monkeypatch, name, function_name, function):
 def test_indexer_stages_preserve_order_and_arguments(dispatch, monkeypatch):
     events = []
     native = lambda *args, **kwargs: (events.append("native"), (args, kwargs))[1]
-    owner = SimpleNamespace(_relax_native_forward=native)
+    owner = SimpleNamespace(config=SimpleNamespace(), _relax_native_forward=native)
     for flag in ("CPU_LAYOUT", "RECOMPUTE_REPLAY", "FUSED_SELECTOR"):
         monkeypatch.setenv("RELAX_QWEN38_QSA_" + flag, "1")
     monkeypatch.setenv("RELAX_QWEN38_QSA_COMMUNITY_BACKEND", "mixed")
@@ -82,6 +82,7 @@ def test_indexer_stages_preserve_order_and_arguments(dispatch, monkeypatch):
 
 def test_disabled_paths_call_native_without_optional_modules(dispatch):
     owner = SimpleNamespace(
+        config=SimpleNamespace(),
         _relax_native_forward=lambda value: ("forward", value),
         _relax_native_pool_keys=lambda value: ("pool", value),
         _relax_native_select_blocks=lambda value: ("select", value),
@@ -96,7 +97,7 @@ def test_disabled_paths_call_native_without_optional_modules(dispatch):
 def test_tp_selector_rejects_other_backend_before_import(dispatch, monkeypatch):
     monkeypatch.setenv("RELAX_QWEN38_QSA_TP_SELECTOR", "1")
     with pytest.raises(ValueError, match="mixed"):
-        dispatch.indexer_forward(object(), "hidden")
+        dispatch.indexer_forward(SimpleNamespace(config=SimpleNamespace()), "hidden")
 
 
 def test_fused_fallback_runs_sparse_mask_before_native(dispatch, monkeypatch):

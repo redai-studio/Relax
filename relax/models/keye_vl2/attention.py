@@ -2,6 +2,7 @@
 
 """Chunked reference GQA/DSA with tensor parallelism and zigzag CP."""
 
+from bisect import bisect_left
 from collections.abc import Iterator
 from typing import Any
 
@@ -13,6 +14,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import DSAInde
 from torch import nn
 
 from .indexer import KeyeIndexer, indexer_scores
+from .replay import replay_selection
 from .sparse_attention import compact_indices, sparse_attention
 from .topk import dsa_topk_indices
 
@@ -53,6 +55,7 @@ class KeyeCoreAttention(nn.Module):
     def __init__(self, config: Any, layer_number: int, **kwargs: Any) -> None:
         super().__init__()
         self.config = config
+        self.layer_number = layer_number
         self.tp_size = config.tensor_model_parallel_size
         self.tp_group = getattr(kwargs.get("pg_collection"), "tp", None)
         if self.tp_size > 1 and (not config.sequence_parallel or self.tp_group is None):
@@ -117,6 +120,13 @@ class KeyeCoreAttention(nn.Module):
             key, value, ik = [
                 gdn_cp_gather_full(tensor, boundaries, size, self.cp_group) for tensor in (key, value, ik)
             ]
+        replay = None
+        if getattr(self.config, "relax_use_indexer_replay", False):
+            from relax.distributed.replay_manager.backend.megatron import IndexerReplay
+
+            replay = IndexerReplay.read(self.layer_number)
+            if replay is not None and replay[0].shape[0] != query.shape[0]:
+                raise ValueError("Keye replay query layout does not match the local CP rows")
         outputs = []
         auxiliary = query.new_zeros((), dtype=torch.float32)
         train_indexer = (
@@ -138,14 +148,34 @@ class KeyeCoreAttention(nn.Module):
             chunk_size = getattr(self.config, "keye_attention_chunk_size", 1024)
             for offset, stop, prefix in query_chunks(length, size, rank, chunk_size):
                 lo, hi = local_start + offset, local_start + stop
-                scores = indexer_scores(iq[lo:hi], ik[start : start + prefix], iw[lo:hi])
                 causal = (indices[start : start + prefix][None] <= token_offsets[offset:stop, None]) & valid[
                     start : start + prefix
                 ][None]
-                scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
-                selected = dsa_topk_indices(scores)
-                support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
-                slots, counts = compact_indices(selected, causal.gather(1, selected))
+                missing = getattr(replay[0], "_relax_indexer_missing_rows", None) if replay is not None else None
+                if missing is None or train_indexer:
+                    scores = indexer_scores(iq[lo:hi], ik[start : start + prefix], iw[lo:hi])
+                    scores = scores.masked_fill(~causal, torch.finfo(scores.dtype).min)
+                    selected = dsa_topk_indices(scores)
+                else:
+                    # Recorded rows need neither dense index scores nor top-k.
+                    # Keep exact fallback for uncaptured final tokens/padding.
+                    # ik gather is unchanged on every CP rank.
+                    selected = torch.arange(min(prefix, 2048), device=query.device).expand(hi - lo, -1)
+                    rows = missing[bisect_left(missing, lo) : bisect_left(missing, hi)]
+                    if rows:
+                        local = torch.tensor([row - lo for row in rows], device=query.device)
+                        scores = indexer_scores(iq[lo:hi][local], ik[start : start + prefix], iw[lo:hi][local])
+                        scores = scores.masked_fill(~causal[local], torch.finfo(scores.dtype).min)
+                        selected = selected.clone()
+                        selected[local] = dsa_topk_indices(scores)
+                if replay is None:
+                    support = torch.zeros_like(causal).scatter_(1, selected, True) & causal
+                    selected_valid = causal.gather(1, selected)
+                else:
+                    selected, selected_valid, support = replay_selection(
+                        selected, (replay[0][lo:hi], replay[1][lo:hi]), causal
+                    )
+                slots, counts = compact_indices(selected, selected_valid)
                 chunk_q = q[offset:stop].transpose(0, 1)
                 output = sparse_attention(q[offset:stop], k[:prefix], v[:prefix], slots, counts, support)
                 outputs.append(output.reshape(stop - offset, -1))

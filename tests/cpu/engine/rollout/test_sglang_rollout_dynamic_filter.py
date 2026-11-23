@@ -56,6 +56,7 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
         *,
         drained: tuple[list[Group], list[Group]] | None = None,
         fully_async: bool = False,
+        max_staleness: int = 0,
         partial_rollout: bool = False,
         dynamic_global_batch_size: bool = True,
         reward_key: str | None = None,
@@ -67,7 +68,7 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
             rollout_global_dataset=True,
             dynamic_sampling_filter_path="test_filter" if filter_fn else None,
             fully_async=fully_async,
-            max_staleness=0,
+            max_staleness=max_staleness,
             num_rollout=2,
             rollout_batch_size=rollout_batch_size,
             over_sampling_batch_size=max(rollout_batch_size, len(batches[0])),
@@ -158,6 +159,7 @@ async def test_sglang_rollout_logs_dynamic_filter_drops_and_preserves_timing(
     result = await run_rollout([[rejected], [accepted]], fully_async=fully_async, reward_key=reward_key)
 
     assert result.output.samples == [accepted]
+    assert result.output.partition_complete is (True if fully_async else None)
     assert result.transferred == [accepted]
     assert result.buffered == []
     assert result.fetch.call_count == 2  # A dropped group causes replacement sampling.
@@ -167,6 +169,18 @@ async def test_sglang_rollout_logs_dynamic_filter_drops_and_preserves_timing(
     assert result.logged_metrics["perf_detail/rollout/generate_time/mean"] == 2.0
     assert result.logged_metrics["perf_detail/rollout/generate_time/max"] == 2.0
     assert result.logged_metrics["perf_detail/rollout/get_samples_time/total"] >= 0
+
+
+async def test_async_rollout_reports_debt_when_aborted_group_moves_to_next_step(run_rollout: Callable) -> None:
+    accepted, aborted = _group(0), _group(1)
+    aborted[0].status = Sample.Status.ABORTED
+    result = await run_rollout(
+        [[accepted, aborted]], fully_async=True, max_staleness=1, rollout_batch_size=2, filter_fn=None
+    )
+
+    assert result.transferred == [accepted]
+    assert result.buffered == [aborted]
+    assert result.output.partition_complete is False
 
 
 @pytest.mark.parametrize("filter_kind", ["structured", "legacy", "disabled"])
@@ -278,3 +292,41 @@ async def test_sync_rollout_drain_carries_protected_completion_only_with_partial
     )
     assert result.transferred == result.output.samples == [accepted]
     assert result.buffered == ([protected] if partial_rollout else [])
+
+
+async def test_sync_rollout_releases_replay_for_groups_it_discards(run_rollout: Callable, monkeypatch) -> None:
+    import numpy as np
+
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a")
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(sglang_rollout, "replay_data_manager", manager)
+    aborted = _group(0)
+    aborted[1].status = Sample.Status.ABORTED
+    accepted, surplus, protected = _group(1), _group(2), _group(3)
+    groups = (aborted, accepted, surplus, protected)
+    records = {}
+    try:
+        for group in groups:
+            publication = store.begin_publication(kind="moe", layers=1, topk=1)
+            publication.append(1, lambda _: np.array([[1]], dtype=np.int32))
+            ref = publication.finish([1, 2])
+            group[0].tokens = [1, 2]
+            group[0].rollout_replay_refs = {"moe": ref.to_dict()}
+            records[group[0].group_index] = ref.record
+        output = await run_rollout([[aborted], [accepted, surplus]], drained=([], [protected]), filter_fn=None)
+        assert output.buffered == []
+        (committed,) = output.transferred
+        surviving = records[committed[0].group_index]
+        assert set(inventory.snapshot()["objects"]) == {surviving}
+        assert set(body.blocks) == {surviving + ":0:0"}
+    finally:
+        store._writer.close()

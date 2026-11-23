@@ -1,0 +1,408 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Binary reference manifests, token identity and fixed-width row handles."""
+
+import hashlib
+import json
+import struct
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from .codecs import replay_codec
+
+
+REFERENCE_FIELD = "rollout_replay_refs"
+FIELDS = {"moe": "rollout_routed_experts", "indexer": "rollout_indexer_topk", "mm_embedding": "rollout_mm_embeddings"}
+
+
+def register_kind(kind: str, field: str) -> None:
+    """Register an int32 layered payload in every participating process.
+
+    Custom capture, layout and replay semantics require an explicit adapter.
+    Registration is idempotent; existing kind/field mappings cannot be changed.
+    """
+    if not isinstance(kind, str) or not kind.isidentifier():
+        raise ValueError("Replay kind must be a nonempty identifier")
+    if not isinstance(field, str) or not field.isidentifier() or field == REFERENCE_FIELD:
+        raise ValueError("Replay field must be an identifier distinct from the reference field")
+    if kind in FIELDS:
+        if FIELDS[kind] != field:
+            raise ValueError(f"Replay kind {kind!r} is already registered")
+        return
+    if field in FIELDS.values():
+        raise ValueError(f"Replay field {field!r} is already registered")
+    FIELDS[kind] = field
+
+
+def token_digest(tokens: list[int]) -> str:
+    return hashlib.sha256(struct.pack(f"<{len(tokens)}q", *tokens)).hexdigest()
+
+
+@dataclass(frozen=True)
+class ReplayRef:
+    """Small wire descriptor locating immutable chunks through their run's
+    registered inventory."""
+
+    version: int
+    owner: str
+    run: str
+    record: str
+    kind: str
+    rows: int
+    layers: int
+    topk: int
+    chunk_rows: int
+    tokens: str
+    codec: str = "int32"
+
+    def __post_init__(self) -> None:
+        replay_codec(self.codec).validate(self.kind, self.topk)
+        if self.version not in (1, 2) or self.kind not in FIELDS:
+            raise ValueError("Unsupported replay manifest version or kind")
+        if min(self.rows, self.layers, self.topk, self.chunk_rows) <= 0:
+            raise ValueError("Replay manifest dimensions must be positive")
+        if self.version == 2 and (len(self.record) != 32 or len(self.tokens) != 64):
+            raise ValueError("Binary replay requires a UUID record and SHA256 token identity")
+        for name in ("owner", "run", "record", "tokens"):
+            value = getattr(self, name)
+            if not value or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError(f"Invalid replay identity: {name}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ReplayRef":
+        return cls(**value)
+
+
+def selection_ref(value: dict[str, Any]) -> ReplayRef:
+    """Return the immutable capture identity behind a training-token view."""
+    if "training_tokens" not in value:
+        return ReplayRef.from_dict(value)
+    manifest = value.copy()
+    digest = manifest.pop("training_tokens")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("Invalid normalized replay token digest")
+    return ReplayRef.from_dict(manifest)
+
+
+@dataclass(frozen=True)
+class MoERouteSpan:
+    """The tail of one capture, at its logical positions in the trajectory."""
+
+    ref: ReplayRef
+    start: int
+    stop: int
+    training_tokens: str | None = None
+
+    @property
+    def source_start(self) -> int:
+        return self.ref.rows - (self.stop - self.start)
+
+
+def moe_route_spans(value: dict[str, Any]) -> tuple[MoERouteSpan, ...]:
+    """Read an Agentic trajectory or a single ordinary R3 reference."""
+    if "spans" not in value:
+        ref = selection_ref(value)
+        if ref.kind != "moe":
+            raise ValueError("Expected an MoE replay reference")
+        return (MoERouteSpan(ref, 0, ref.rows, value.get("training_tokens")),)
+    if (
+        set(value) != {"tokens", "spans"}
+        or not isinstance(value["tokens"], str)
+        or len(value["tokens"]) != 64
+        or any(c not in "0123456789abcdef" for c in value["tokens"])
+        or not isinstance(value["spans"], list)
+        or not value["spans"]
+    ):
+        raise ValueError("Invalid MoE replay trajectory")
+    spans = []
+    stop = 0
+    shape = None
+    for item in value["spans"]:
+        if not isinstance(item, dict) or set(item) != {"ref", "start", "stop"}:
+            raise ValueError("Invalid MoE replay span")
+        ref = selection_ref(item["ref"])
+        span = MoERouteSpan(ref, item["start"], item["stop"], item["ref"].get("training_tokens"))
+        ref_shape = (ref.run, ref.owner, ref.layers, ref.topk)
+        if (
+            ref.kind != "moe"
+            or ref.version != 2
+            or type(span.start) is not int
+            or type(span.stop) is not int
+            or not stop == span.start < span.stop
+            or not 0 <= span.source_start <= span.start
+            or (shape is not None and ref_shape != shape)
+        ):
+            raise ValueError("MoE replay spans must cover consecutive rows with matching manifests")
+        shape = ref_shape
+        stop = span.stop
+        spans.append(span)
+    return tuple(spans)
+
+
+def moe_route_manifest(spans: tuple[MoERouteSpan, ...], tokens: list[int]) -> dict[str, Any]:
+    return {
+        "tokens": token_digest(tokens),
+        "spans": [
+            {
+                "ref": span.ref.to_dict()
+                | ({"training_tokens": span.training_tokens} if span.training_tokens else {}),
+                "start": span.start,
+                "stop": span.stop,
+            }
+            for span in spans
+        ],
+    }
+
+
+_MAGIC = b"RPLY"
+_HEADER = struct.Struct("<4sHHI")  # magic, wire version, entry count, total bytes
+_SHAPE = struct.Struct("<IIII")  # rows, layers, topk, chunk rows
+_MAX_WIRE_BYTES = 16 << 20
+
+
+def _text(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    if len(encoded) > 65535:
+        raise ValueError("Replay descriptor string is too large")
+    return struct.pack("<H", len(encoded)) + encoded
+
+
+def encode_refs(value: dict[str, Any]) -> bytes:
+    """Encode a sample's kind manifests with a versioned little-endian schema.
+
+    Uniform chunk ranges are implicit in rows/chunk_rows. A record UUID groups
+    the layer objects; TQ locators are derived by the transport, not pickled
+    here.
+    """
+    if not value or len(value) > 65535:
+        raise ValueError("Invalid replay manifest entry count")
+    has_spans = "spans" in value.get("moe", {})
+    has_view = any("training_tokens" in item for item in value.values())
+    if has_view or has_spans or "mm_embedding" in value:
+        list(iter_refs(value))
+        body = json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        size = _HEADER.size + len(body)
+        if size > _MAX_WIRE_BYTES:
+            raise ValueError("Replay manifest exceeds wire limit")
+        return _HEADER.pack(_MAGIC, 6 if has_view else 5 if has_spans else 4, len(value), size) + body
+    wire_version = 3 if any(item.get("codec", "int32") != "int32" for item in value.values()) else 2
+    entries = []
+    for kind, item in sorted(value.items()):
+        ref = ReplayRef.from_dict(item)
+        if kind != ref.kind or ref.version != 2:
+            raise ValueError("New replay publication must use a matching v2 manifest")
+        entries.append(
+            _text(kind)
+            + _text(ref.owner)
+            + _text(ref.run)
+            + bytes.fromhex(ref.record)
+            + bytes.fromhex(ref.tokens)
+            + _SHAPE.pack(ref.rows, ref.layers, ref.topk, ref.chunk_rows)
+            + (_text(ref.codec) if wire_version == 3 else b"")
+        )
+    body = b"".join(entries)
+    size = _HEADER.size + len(body)
+    if size > _MAX_WIRE_BYTES:
+        raise ValueError("Replay manifest exceeds wire limit")
+    return _HEADER.pack(_MAGIC, wire_version, len(entries), size) + body
+
+
+def decode_refs(payload: bytes) -> dict[str, Any]:
+    """Decode metadata only; legacy JSON is readable but never newly
+    emitted."""
+    if not payload or len(payload) > _MAX_WIRE_BYTES:
+        raise ValueError("Invalid replay manifest size")
+    if payload.startswith(b"{"):
+        result = json.loads(payload)
+        if not isinstance(result, dict) or not result:
+            raise ValueError("Invalid legacy replay manifest")
+        list(iter_refs(result))
+        return result
+    if len(payload) < _HEADER.size:
+        raise ValueError("Truncated replay header")
+    magic, version, count, size = _HEADER.unpack_from(payload)
+    if magic != _MAGIC or version not in (2, 3, 4, 5, 6) or size != len(payload) or not count:
+        raise ValueError("Invalid replay header/version/length")
+    if version in (4, 5, 6):
+        result = json.loads(payload[_HEADER.size :])
+        if not isinstance(result, dict) or len(result) != count:
+            raise ValueError("Invalid replay envelope")
+        if version == 4 and "mm_embedding" not in result:
+            raise ValueError("Invalid multimodal replay envelope")
+        if version == 5 and "spans" not in result.get("moe", {}):
+            raise ValueError("Invalid MoE replay trajectory envelope")
+        list(iter_refs(result))
+        return result
+    offset = _HEADER.size
+
+    def take(size: int) -> bytes:
+        nonlocal offset
+        if offset + size > len(payload):
+            raise ValueError("Truncated replay manifest")
+        value = payload[offset : offset + size]
+        offset += size
+        return value
+
+    def text() -> str:
+        return take(struct.unpack("<H", take(2))[0]).decode("utf-8")
+
+    result = {}
+    for _ in range(count):
+        kind, owner, run = text(), text(), text()
+        record, tokens = take(16).hex(), take(32).hex()
+        rows, layers, topk, chunk = _SHAPE.unpack(take(_SHAPE.size))
+        ref = ReplayRef(
+            2, owner, run, record, kind, rows, layers, topk, chunk, tokens, text() if version == 3 else "int32"
+        )
+        if kind in result:
+            raise ValueError("Duplicate replay kind")
+        result[kind] = ref.to_dict()
+    if offset != len(payload):
+        raise ValueError("Trailing replay manifest bytes")
+    return result
+
+
+class TokenHandle:
+    """Six int32 words: UUID[4], row[1], tag[1]; bit-preserving layout only."""
+
+    RECORD = 0
+    PAD = 1
+    GAP = 2
+    WIDTH = 6
+
+    @staticmethod
+    def expand(ref: ReplayRef):
+        import numpy as np
+
+        if len(ref.record) != 32 or ref.rows >= 2**31:
+            raise ValueError("Replay record cannot be represented by token handles")
+        result = np.zeros((ref.rows, 6), dtype=np.int32)
+        result[:, :4] = np.frombuffer(bytes.fromhex(ref.record), dtype="<i4")
+        result[:, 4] = np.arange(ref.rows, dtype=np.int32)
+        return result
+
+    @classmethod
+    def padding(cls, count: int, *, gap: bool = False):
+        import numpy as np
+
+        result = np.zeros((count, 6), dtype=np.int32)
+        result[:, 4] = np.arange(count, dtype=np.int32)
+        result[:, 5] = cls.GAP if gap else cls.PAD
+        return result
+
+    @classmethod
+    def coordinates(cls, handles, refs: list[ReplayRef]):
+        import numpy as np
+
+        if handles.dtype != np.int32 or handles.ndim != 2 or handles.shape[1] != 6:
+            raise ValueError("Replay handles must be int32 [rows, 6]")
+        if np.any((handles[:, 5] < cls.RECORD) | (handles[:, 5] > cls.GAP)):
+            raise ValueError("Unknown replay handle tag")
+        # A gap must be supplied with explicit per-kind semantics; never silently
+        # convert a missing real token to padding in the current Relax adapter.
+        if np.any(handles[:, 5] == cls.GAP):
+            raise ValueError("Replay gap requires explicit adapter handling")
+        result = np.stack((np.full(len(handles), -1), handles[:, 4].astype(np.int64)), axis=1)
+        found = handles[:, 5] == cls.PAD
+        if np.any(found & np.any(handles[:, :4] != 0, axis=1)) or np.any(handles[:, 4] < 0):
+            raise ValueError("Malformed replay handle")
+        seen = {}
+        for i, ref in enumerate(refs):
+            if ref.record in seen:
+                if seen[ref.record] != ref:
+                    raise ValueError("Conflicting manifests for one replay record")
+                continue  # Repeated identical samples can resolve to the same body.
+            seen[ref.record] = ref
+            words = np.frombuffer(bytes.fromhex(ref.record), dtype="<i4")
+            selected = np.all(handles[:, :4] == words, axis=1) & (handles[:, 5] == cls.RECORD)
+            if np.any(handles[selected, 4] >= ref.rows):
+                raise ValueError("Replay handle row outside manifest")
+            result[selected, 0] = i
+            found |= selected
+        if not np.all(found):
+            raise ValueError("Replay handle has no manifest")
+        return result
+
+
+def validate_sample(value: dict[str, Any], tokens: list[int]) -> None:
+    if not value:
+        raise ValueError("Missing replay reference")
+    for kind, item in value.items():
+        if kind == "mm_embedding":
+            validate_mm_envelope(item)
+            continue
+        if kind == "moe" and "spans" in item:
+            spans = moe_route_spans(item)
+            if spans[-1].stop != len(tokens) - 1 or item["tokens"] != token_digest(tokens):
+                raise ValueError("MoE replay trajectory does not match sample tokens")
+            if any(
+                (span.training_tokens or span.ref.tokens)
+                != token_digest(tokens[span.stop - span.ref.rows : span.stop + 1])
+                for span in spans
+            ):
+                raise ValueError("MoE replay span does not match its sample token range")
+            continue
+        ref = selection_ref(item)
+        if (
+            kind != ref.kind
+            or ref.rows != len(tokens) - 1
+            or item.get("training_tokens", ref.tokens) != token_digest(tokens)
+        ):
+            raise ValueError("Replay reference does not match sample tokens or kind")
+
+
+def validate_mm_envelope(value: dict[str, Any]) -> None:
+    """Validate media-coordinate metadata independently of generated text."""
+    if not isinstance(value, dict) or set(value) != {"version", "media"} or value["version"] != 1:
+        raise ValueError("Invalid MM replay envelope")
+    if not isinstance(value["media"], list):
+        raise ValueError("MM replay media must be a list")
+    for item in value["media"]:
+        if not isinstance(item, dict) or set(item) != {"hash", "modality", "grid", "ref", "lease"}:
+            raise ValueError("Invalid MM replay media entry")
+        image_hash, grid, lease = item["hash"], item["grid"], item["lease"]
+        if (
+            not isinstance(image_hash, str)
+            or len(image_hash) != 64
+            or any(c not in "0123456789abcdef" for c in image_hash)
+            or item["modality"] not in ("image", "video")
+            or not isinstance(grid, list)
+            or len(grid) != 3
+            or any(type(n) is not int or n <= 0 for n in grid)
+            or grid[1] % 2
+            or grid[2] % 2
+            or not isinstance(lease, str)
+            or len(lease) != 32
+            or any(c not in "0123456789abcdef" for c in lease)
+        ):
+            raise ValueError("Invalid MM replay hash, grid or lease")
+        ref = ReplayRef.from_dict(item["ref"])
+        if (
+            ref.kind != "mm_embedding"
+            or ref.codec != "bf16-raw-v1"
+            or ref.layers != 1
+            or ref.topk != 2560
+            or ref.tokens != image_hash
+            or ref.rows != grid[0] * grid[1] * grid[2] // 4
+        ):
+            raise ValueError("MM replay reference differs from its media geometry")
+
+
+def iter_refs(value: dict[str, Any]) -> Iterator[ReplayRef]:
+    """Yield owned bodies from both token selections and media references."""
+    for kind, item in value.items():
+        if kind == "mm_embedding":
+            validate_mm_envelope(item)
+            for media in item["media"]:
+                yield ReplayRef.from_dict(media["ref"])
+        elif kind == "moe" and "spans" in item:
+            yield from (span.ref for span in moe_route_spans(item))
+        else:
+            ref = selection_ref(item)
+            if ref.kind != kind:
+                raise ValueError("Replay kind mismatch")
+            yield ref

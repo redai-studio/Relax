@@ -2,6 +2,7 @@
 
 from argparse import Namespace
 
+from relax.distributed.replay_manager import replay_fields
 from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
@@ -35,12 +36,14 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
+    if getattr(args, "use_rollout_mm_embedding_replay", False):
+        fields.append("rollout_mm_embeddings")
     if getattr(args, "multimodal_keys", None) is not None:
         fields.append("multimodal_train_inputs")
     if agentic_obs_enabled(args):
         # Produced by convert_samples_to_train_data under the same gate.
         fields.extend(OBSERVATION_DATA_FIELDS)
-    return fields
+    return replay_fields(fields)
 
 
 def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
@@ -63,7 +66,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         if is_embedding_sft_mode(args) and "multimodal_train_inputs" not in fields:
             # One TQ row retains both tokenized branches even for text-only PT.
             fields.append("multimodal_train_inputs")
-        return fields
+        return replay_fields(fields)
 
     from relax.algorithms import algorithm_needs_critic
 
@@ -85,7 +88,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
             from relax.utils.opd.opd_utils import consume_opd_train_data
 
             consume_opd_train_data(fields, args)
-        return fields
+        return replay_fields(fields)
 
     fields = _base_rollout_fields(args)
     if getattr(args, "advantage_estimator", None) == "score_centering":
@@ -113,4 +116,4 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         from relax.utils.opd.opd_utils import consume_opd_train_data
 
         consume_opd_train_data(fields, args)
-    return fields
+    return replay_fields(fields)

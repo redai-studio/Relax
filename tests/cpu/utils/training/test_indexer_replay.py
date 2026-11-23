@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from relax.utils.training.indexer_replay import IndexerReplay, maybe_replay_indexer_topk
+from relax.distributed.replay_manager.backend.megatron import IndexerReplay, maybe_replay_indexer_topk
 
 
 @pytest.fixture(autouse=True)

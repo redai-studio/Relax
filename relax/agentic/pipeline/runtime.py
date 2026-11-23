@@ -12,10 +12,11 @@ import uuid
 import zlib
 from argparse import Namespace
 from concurrent.futures import Executor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from io import BytesIO
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple, TypeVar, cast
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple, cast
 
 import httpx
 import numpy as np
@@ -37,8 +38,10 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.distributed.replay_manager import replay_data_manager
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.utils.agentic_obs.records import utc_now
+from relax.utils.async_utils import finish_before_cancellation
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -192,6 +195,7 @@ class BackendGenerateResult:
     new_topk_token_ids: np.ndarray | None = None
     new_topk_log_probs: np.ndarray | None = None
     new_topk_support_complete: np.ndarray | None = None
+    raw_output_ids: list[int] | None = None
 
 
 class BackendContextLengthExceededError(RuntimeError):
@@ -517,30 +521,6 @@ class SGLangMessageCompiler:
         )
 
 
-_Result = TypeVar("_Result")
-
-
-async def finish_before_cancellation(work: Awaitable[_Result], task_name: str) -> _Result:
-    """Finish owned cleanup before forwarding caller cancellation."""
-
-    task = asyncio.ensure_future(work)
-    if isinstance(task, asyncio.Task):
-        task.set_name(task_name)
-    cancellation_received = False
-    while True:
-        try:
-            result = await asyncio.shield(task)
-            break
-        except asyncio.CancelledError:
-            if task.done():
-                task.result()
-                raise
-            cancellation_received = True
-    if cancellation_received:
-        raise asyncio.CancelledError
-    return result
-
-
 def _sanitize_output_tokens(tokens: list[int], tokenizer: Any, processor: Any) -> list[int]:
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     if pad_token_id is None:
@@ -606,6 +586,8 @@ class SGLangBackendAdapter:
         video_data: list[str] | None = None,
         return_logprob: bool = True,
         collect_score_centering: bool = True,
+        evaluation: bool = False,
+        routed_experts_start_len: int = 0,
         fail_fast_no_workers: bool = False,
         lora_path: str | None = None,
         engine_url: str | None = None,
@@ -615,7 +597,7 @@ class SGLangBackendAdapter:
         payload = {
             "input_ids": input_ids,
             "sampling_params": sampling_params,
-            "rid": request_id,
+            "rid": self._wire_request_id(request_id),
             "return_logprob": return_logprob,
         }
         sc_sampling_mode = (
@@ -623,8 +605,12 @@ class SGLangBackendAdapter:
             if return_logprob and collect_score_centering
             else None
         )
-        if self._args.use_rollout_routing_replay:
+        from relax.distributed.replay_manager.config import references_enabled
+
+        if self._args.use_rollout_routing_replay and (not evaluation or not references_enabled()):
             payload["return_routed_experts"] = True
+            if routed_experts_start_len:
+                payload["routed_experts_start_len"] = routed_experts_start_len
         if image_data:
             payload["image_data"] = image_data
         if audio_data:
@@ -667,35 +653,43 @@ class SGLangBackendAdapter:
             raise
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])
-        token_logprobs = list(meta_info.get("output_token_logprobs") or ())
-        tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
-        sampled_logprobs = [float(item[0]) for item in token_logprobs]
-        topk_token_ids = topk_log_probs = support_complete = None
-        if sc_sampling_mode is not None:
-            sc_result = parse_score_centering_response(
-                meta_info,
-                self._args.rollout_top_logprobs_num,
-                sampling_mode=sc_sampling_mode,
-                expected_tokens=tokens,
-                vocab_size=self._args.score_centering_vocab_size,
-                return_support_complete=True,
-            )
-            tokens, sampled_logprobs, topk_token_ids, topk_log_probs, support_complete = sc_result
-        sanitized_tokens = _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
-        if sc_sampling_mode is not None and sanitized_tokens != tokens:
-            raise ValueError(
-                "Score Centering requires the original sampled token IDs; token sanitization changed them."
-            )
-        return BackendGenerateResult(
-            new_tokens=sanitized_tokens,
-            new_log_probs=sampled_logprobs,
-            finish_type=str(meta_info["finish_reason"]["type"]),
-            meta_info=meta_info,
-            elapsed=elapsed,
-            new_topk_token_ids=topk_token_ids,
-            new_topk_log_probs=topk_log_probs,
-            new_topk_support_complete=support_complete,
+        # A sealed body must survive parsing only if its manifest reaches the Session.
+        response = (
+            replay_data_manager.register_producer(("moe",)).response(meta_info, evaluation=evaluation)
+            if isinstance(meta_info.get("routed_experts"), dict)
+            else nullcontext()
         )
+        with response:
+            token_logprobs = list(meta_info.get("output_token_logprobs") or ())
+            tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
+            sampled_logprobs = [float(item[0]) for item in token_logprobs]
+            topk_token_ids = topk_log_probs = support_complete = None
+            if sc_sampling_mode is not None:
+                sc_result = parse_score_centering_response(
+                    meta_info,
+                    self._args.rollout_top_logprobs_num,
+                    sampling_mode=sc_sampling_mode,
+                    expected_tokens=tokens,
+                    vocab_size=self._args.score_centering_vocab_size,
+                    return_support_complete=True,
+                )
+                tokens, sampled_logprobs, topk_token_ids, topk_log_probs, support_complete = sc_result
+            sanitized_tokens = _sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor)
+            if sc_sampling_mode is not None and sanitized_tokens != tokens:
+                raise ValueError(
+                    "Score Centering requires the original sampled token IDs; token sanitization changed them."
+                )
+            return BackendGenerateResult(
+                new_tokens=sanitized_tokens,
+                new_log_probs=sampled_logprobs,
+                finish_type=str(meta_info["finish_reason"]["type"]),
+                meta_info=meta_info,
+                elapsed=elapsed,
+                new_topk_token_ids=topk_token_ids,
+                new_topk_log_probs=topk_log_probs,
+                new_topk_support_complete=support_complete,
+                raw_output_ids=tokens,
+            )
 
     async def _managed_post(self, url: str, payload: dict, *, headers: dict | None, **_kwargs: Any) -> dict:
         # The general post helper may resend through a local client after a
@@ -704,10 +698,21 @@ class SGLangBackendAdapter:
         response.raise_for_status()
         return response.json()
 
+    def _wire_request_id(self, request_id: str) -> str:
+        from relax.distributed.replay_manager.config import references_enabled
+
+        if getattr(self._args, "use_rollout_routing_replay", False) and references_enabled():
+            from relax.distributed.replay_manager.backend.sglang import AGENTIC_R3_REQUEST_PREFIX
+
+            return AGENTIC_R3_REQUEST_PREFIX + request_id
+        return request_id
+
     async def abort_request(self, request_id: str) -> None:
         endpoint = self._request_endpoints.get(request_id)
         urls = [endpoint] if endpoint else await self._worker_urls()
-        await asyncio.gather(*(post(f"{url}/abort_request", {"rid": request_id}) for url in urls))
+        await asyncio.gather(
+            *(post(f"{url}/abort_request", {"rid": self._wire_request_id(request_id)}) for url in urls)
+        )
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""
@@ -1301,7 +1306,14 @@ class RuntimeDomain:
                     cast(SessionExport, session_export_ref.result()) for session_export_ref in session_export_refs
                 ),
             )
-            await self._release_shard_group(stream)
+            try:
+                await self._release_shard_group(stream)
+            except BaseException:
+                # The local slot can disappear before the await returns. The
+                # caller never received the exports, so the shard still owns them.
+                if stream.shard.group_streams.get(stream.group_id) is not stream:
+                    self._schedule_group_cleanup(stream, drop=True)
+                raise
             self._schedule_group_cleanup(stream, drop=False)
             return group
         except BaseException:

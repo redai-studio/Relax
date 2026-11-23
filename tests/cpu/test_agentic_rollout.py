@@ -9,6 +9,7 @@ from argparse import Namespace
 from collections import deque
 from contextlib import asynccontextmanager
 from functools import partial
+from threading import Event
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -613,6 +614,41 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
     assert not prepare._ready_prepare_tasks
 
 
+async def test_cancelled_group_export_releases_shard_ownership(monkeypatch):
+    handle = SimpleNamespace(drop_group=SimpleNamespace(remote=AsyncMock()))
+    shard = SimpleNamespace(actor_name="shard", handle=handle, group_streams={})
+    runtime = RuntimeDomain(Namespace(rollout_global_dataset=False), "train", [shard], concurrency=1)
+    loop = asyncio.get_running_loop()
+    barrier = loop.create_future()
+    barrier.set_result(True)
+    completion = loop.create_future()
+    completion.set_result(SessionExport((SampleExport(name=None, sample=Sample(index=0)),)))
+    stream = runtime_mod.RuntimeGroupStream(
+        group_id="group",
+        shard=shard,
+        first_request_barrier=barrier,
+        session_results=(runtime_mod._SessionResultRef("session", completion),),
+    )
+    shard.group_streams[stream.group_id] = stream
+    await runtime._resident_group_permits.acquire()
+    release = runtime._release_shard_group
+    slot_released = asyncio.Event()
+
+    async def wait_after_release(stream):
+        await release(stream)
+        slot_released.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(runtime, "_release_shard_group", wait_after_release)
+    collector = asyncio.create_task(runtime.collect_group(stream))
+    await slot_released.wait()
+    collector.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await collector
+    await asyncio.gather(*tuple(runtime._cleanup_tasks))
+    handle.drop_group.remote.assert_awaited_once_with(stream.group_id, reason=None)
+
+
 def test_chat_request_validation_and_logprob_payload() -> None:
     normalized = _normalized_chat_request({"messages": [{"role": "user", "content": "hello"}], "logprobs": True})
     assert normalized["logprobs"] is True
@@ -1013,6 +1049,62 @@ async def test_generate_score_centering_candidates_are_training_only(monkeypatch
         assert result.new_topk_token_ids is result.new_topk_log_probs is None
 
 
+@pytest.mark.parametrize("valid_score_centering", [False, True])
+async def test_generate_releases_reference_only_if_parsing_fails(monkeypatch, valid_score_centering) -> None:
+    from relax.distributed.replay_manager.backend.sglang import _wire_ref
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=2)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    monkeypatch.setattr(runtime_mod, "replay_data_manager", manager, raising=False)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    adapter._args.use_rollout_routing_replay = True
+    adapter._args.advantage_estimator = "score_centering"
+    adapter._args.rollout_top_logprobs_num = 2
+    adapter._args.rollout_temperature = 0.7
+    adapter._args.score_centering_vocab_size = 256
+    publication = store.begin_publication(kind="moe", layers=1, topk=1)
+    try:
+        publication.append(2, lambda _: np.array([[2], [3]], dtype=np.int32))
+        ref = publication.finish([10, 11, 97])
+        wire_ref = _wire_ref(ref.to_dict())
+        meta_info = {
+            "output_token_logprobs": [[-1.0, 97, "a"]],
+            "routed_experts": wire_ref,
+            "finish_reason": {"type": "stop"},
+        }
+        if valid_score_centering:
+            meta_info["output_top_logprobs"] = [[[-1.0, 97, "a"], [-2.0, 98, "b"]]]
+        monkeypatch.setattr(runtime_mod, "post", AsyncMock(return_value={"output_ids": [97], "meta_info": meta_info}))
+
+        response = adapter.generate(
+            input_ids=[10, 11],
+            sampling_params={"temperature": 0.7, "max_new_tokens": 3},
+            session_id="session",
+            request_id="request",
+        )
+        if valid_score_centering:
+            result = await response
+            assert result.meta_info["routed_experts"] == wire_ref
+            assert body.blocks
+        else:
+            with pytest.raises(ValueError, match="output_top_logprobs"):
+                await response
+            assert not body.blocks
+    finally:
+        publication.abort()
+        store._writer.close()
+
+
 async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     adapter = _backend_adapter(lifecycle_enabled=True)
     adapter._worker_urls = AsyncMock(return_value=["http://engine-0", "http://engine-1"])
@@ -1036,12 +1128,16 @@ async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     assert posts == []
 
 
-def test_session_shard_actor_class_serialization() -> None:
+def test_session_shard_actor_class_serialization(monkeypatch) -> None:
     from ray import cloudpickle
 
-    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
-    # Ray serializes this class before creating any actor instance.
-    assert cloudpickle.dumps(shard_cls)
+    from relax.distributed.replay_manager import ReplayConfig, replay_data_manager
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+
+    # The driver opens its transport before Ray ships the class to the shard.
+    store = TQReplayStorage(ReplayConfig(delivery="reference", run_id="a"))
+    monkeypatch.setattr(replay_data_manager, "_store_instance", store)
+    assert cloudpickle.dumps(AgenticSessionShard.__ray_metadata__.modified_class)
 
 
 async def test_terminal_session_closes_lifecycle_once() -> None:
@@ -1326,6 +1422,21 @@ def test_agentic_ingress_keeps_requested_port_while_deferring_router(monkeypatch
     assert args.sglang_router_port == 3131
 
 
+def test_session_shard_creation_explicitly_passes_current_replay_run(monkeypatch) -> None:
+    actor = MagicMock()
+    monkeypatch.setattr(service_mod, "AgenticSessionShard", actor)
+    monkeypatch.setattr(service_mod, "_DEFAULT_SESSION_SHARD_COUNT", 1)
+    monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "1")
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "a" * 32)
+
+    service_mod.create_agentic_session_shards(Namespace(), admission_coordinator=None)
+
+    env = actor.options.call_args.kwargs["runtime_env"]["env_vars"]
+    assert env["RELAX_REPLAY_REFERENCES"] == "1"
+    assert env["RELAX_REPLAY_RUN_ID"] == "a" * 32
+    assert env["MALLOC_ARENA_MAX"] == "2"
+
+
 async def test_admission_coordinator_bypasses_protected_and_degraded_requests() -> None:
     coordinator_cls, coordinator = _admission_coordinator()
     protected = await coordinator_cls.acquire(
@@ -1605,6 +1716,52 @@ def _router_recovery_shard():
 
 
 @pytest.mark.asyncio
+async def test_agentic_replay_cleanup_allows_backend_abort_while_storage_is_busy(monkeypatch):
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.core import ReplayInventory
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=8, publication_bytes=4096)
+    body = MemoryBody()
+    deletion_started, release = Event(), Event()
+
+    def delete(keys):
+        deletion_started.set()
+        assert release.wait(2), "Replay deletion blocked the session shard"
+        body.delete(keys)
+
+    inventory = ReplayInventory(config, delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    publication = store.begin_publication(kind="moe", layers=1, topk=1)
+    publication.append(1, lambda _: np.array([[0]], dtype=np.int32))
+    reference = publication.finish([1, 2])
+    monkeypatch.setattr(service_mod.replay_manager, "replay_data_manager", SimpleNamespace(store=lambda: store))
+
+    shard, _group, session, ir = _router_recovery_shard()
+    shard.args.agentic_session_lifecycle = False
+    shard._agent_cleanup_tasks = set()
+    abort_called = asyncio.Event()
+
+    async def abort_request(_request_id):
+        abort_called.set()
+
+    shard._generation_backend = SimpleNamespace(abort_request=abort_request)
+    ir.backend_started = True
+    session.replay_refs[reference.record] = reference
+    shard._schedule_agent_cleanup(session, None)
+    try:
+        assert await asyncio.to_thread(deletion_started.wait, 2)
+        await asyncio.wait_for(abort_called.wait(), 2)
+        assert session.replay_refs == {reference.record: reference}
+    finally:
+        release.set()
+        await asyncio.gather(*tuple(shard._agent_cleanup_tasks))
+    assert not session.replay_refs and not body.blocks
+
+
+@pytest.mark.asyncio
 async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix():
     shard, _group, session, ir = _router_recovery_shard()
     ir.pending_logprob_delta = [-0.5]
@@ -1854,7 +2011,7 @@ async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, 
         sleeps.append(seconds)
 
     shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
-    shard._apply_generate_result = lambda request, result: request.pending_token_delta.extend(result.new_tokens)
+    shard._apply_generate_result = lambda request, result, **_: request.pending_token_delta.extend(result.new_tokens)
     shard._terminal_response_locked = lambda **_kwargs: {"ok": True}
     monkeypatch.setattr(asyncio, "sleep", sleep)
     task = asyncio.create_task(shard._run_ir(session, ir))
@@ -2277,6 +2434,151 @@ async def test_routing_replay_preserves_routes_across_partial_attempts():
             ir,
             BackendGenerateResult(new_tokens=[6], new_log_probs=[-0.1], finish_type="stop", meta_info={}, elapsed=0.1),
         )
+
+
+@pytest.mark.parametrize("cp_size,cp_rank", [(1, 0), (2, 1), pytest.param(0, 0, id="drop-before-transfer")])
+async def test_agentic_reference_r3_resumes_and_transfers_original_routes(monkeypatch, cp_size, cp_rank):
+    from megatron.core import mpu
+
+    from relax.agentic.pipeline import TrainingFieldArtifact
+    from relax.agentic.pipeline import transfer as transfer_mod
+    from relax.distributed.replay_manager.backend.megatron import consumer_batch_layout
+    from relax.distributed.replay_manager.backend.sglang import _wire_ref
+    from relax.distributed.replay_manager.config import ReplayConfig
+    from relax.distributed.replay_manager.consumer import ConsumerLayerReader, ConsumerTensorCache
+    from relax.distributed.replay_manager.core import ReplayInventory, ReplayManager
+    from relax.distributed.replay_manager.ref_data import REFERENCE_FIELD, moe_route_spans
+    from relax.distributed.replay_manager.storage import TQReplayStorage
+    from relax.utils import utils
+    from tests.cpu.distributed.replay_manager.test_reference import MemoryBody
+
+    config = ReplayConfig(delivery="reference", run_id="a", chunk_rows=8, publication_bytes=4096)
+    body = MemoryBody()
+    inventory = ReplayInventory(config, body.delete)
+    store = TQReplayStorage(config, inventory=inventory)
+    store._backend = body
+    manager = ReplayManager(config=config, store_factory=lambda: store)
+    for module in (service_mod.replay_manager, transfer_mod, utils):
+        monkeypatch.setattr(module, "replay_data_manager", manager)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: cp_size)
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: cp_rank)
+
+    shard, group, session, ir = _router_recovery_shard()
+    shard.args.use_rollout_routing_replay = True
+    shard.args.num_layers, shard.args.moe_router_topk = 2, 2
+    ir.history_train_token_prefix = ir.history_rollout_token_prefix = [1, 2, 3]
+    ir.pending_token_delta = []
+    forest, root = _forest_with_initial_obs(
+        session_id=session.session_id,
+        messages=[{"role": "user", "content": "prompt"}],
+        train_token_delta=[1, 2, 3],
+        rollout_token_delta=[1, 2, 3],
+        index=1,
+    )
+
+    def publish(tokens, value):
+        rows = np.full((len(tokens) - 1, 2, 2), value, dtype=np.int32)
+        publication = store.begin_publication(kind="moe", layers=2, topk=2)
+        publication.append(len(rows), lambda layer: rows[:, layer].copy())
+        return publication.finish(tokens)
+
+    async def put(*, data, partition_id, **kwargs):
+        assert partition_id == "train_8"
+        assert "rollout_routed_experts" not in data.keys()
+        decoded = manager.receive(REFERENCE_FIELD, data[REFERENCE_FIELD].unbind(), device="cpu")
+        manager.region(partition_id).validate({REFERENCE_FIELD: decoded})
+        spans = moe_route_spans(decoded[0]["moe"])
+        assert [(s.ref, s.start, s.stop) for s in spans] == [(first, 0, 4), (second, 4, 6)]
+        layout = consumer_batch_layout(
+            Namespace(qkv_format="thd", allgather_cp=False, data_pad_size_multiplier=1),
+            [first, second],
+            [7],
+            sequence_parallel=False,
+            sample_spans=[spans],
+        )
+        with manager.region(partition_id).reader([first, second]) as reader:
+            layer = ConsumerLayerReader(
+                reader, layout, layer=1, kind="moe", device="cpu", num_experts=64, cache=ConsumerTensorCache(0)
+            )
+            try:
+                values = [[10, 10]] * (4 if cp_size == 1 else 2) + [[20, 20]] * 2
+                np.testing.assert_array_equal(layer.read().numpy()[: len(values)], values)
+            finally:
+                layer.release()
+
+    try:
+        first = publish([1, 2, 3, 4, 5], 10)
+        second = publish([5, 6, 7], 20)
+        for result in (
+            BackendGenerateResult([4, 5], [-0.1, -0.1], "abort", {"routed_experts": _wire_ref(first.to_dict())}, 0.1),
+            BackendGenerateResult([], [], "abort", {}, 0.1),
+            BackendGenerateResult([6, 7], [-0.1, -0.1], "stop", {"routed_experts": _wire_ref(second.to_dict())}, 0.1),
+        ):
+            shard._apply_generate_result(ir, result, session=session)
+        response = forest.append_resp(
+            parent_state_hash=root.state_hash,
+            rollout_id=0,
+            abort_count=1,
+            messages_delta=[{"role": "assistant", "content": "response"}],
+            token_delta=ir.pending_token_delta,
+            logprob_delta=ir.pending_logprob_delta,
+            rollout_routed_experts=ir.pending_routed_experts,
+        )
+        sample = forest.build_sample(leaf_state_hash=response.state_hash, tokenizer=_FakeTokenizer())
+        sample.reward = 1.0
+        transport = service_mod.SessionExportTransport(exports=({"sample_payload": sample.to_dict()},))
+        shard._schedule_agent_cleanup = lambda *_: None
+        await shard._finish_session_once(session, transport)
+        assert not session.replay_refs and group.replay_refs == {first, second}
+        if cp_size == 0:
+            shard._trajectory_recorder = SimpleNamespace(record_export_failure=MagicMock())
+            discard_started = asyncio.Event()
+            fail_discard = asyncio.Event()
+
+            async def discard(_refs):
+                discard_started.set()
+                await fail_discard.wait()
+                raise TimeoutError("discard acknowledgement lost")
+
+            with monkeypatch.context() as failure:
+                failure.setattr(store, "discard_async", discard)
+                dropping = asyncio.create_task(shard.drop_group(group.group_id))
+                try:
+                    await asyncio.wait_for(discard_started.wait(), 2)
+                    with pytest.raises(RuntimeGroupError, match="group being discarded"):
+                        await shard.take_session_results(group.group_id, (session.session_id,))
+                    with pytest.raises(RuntimeGroupError, match="group being discarded"):
+                        await shard.release_group(group.group_id)
+                finally:
+                    fail_discard.set()
+                    with pytest.raises(TimeoutError, match="discard acknowledgement lost"):
+                        await dropping
+            assert group.replay_refs == {first, second} and body.blocks
+            await shard.drop_group(group.group_id)
+            assert not body.blocks and not inventory.state["objects"]
+            return
+        await shard.release_group(group.group_id)
+        sample = TrainingFieldArtifact.from_sample(sample).to_sample()
+
+        await transfer_mod._transfer_batch_to_data_system(
+            args=Namespace(
+                use_rollout_routing_replay=True,
+                custom_reward_post_process_path=None,
+                reward_key=None,
+                rewards_normalization=False,
+                multimodal_keys=None,
+                use_opd=False,
+                debug_train_only=False,
+            ),
+            batch_samples=[[sample]],
+            partition_id=8,
+            data_system_client=SimpleNamespace(async_put=put),
+        )
+        store.retire_partition("train_8")
+        assert not body.blocks and not inventory.state["objects"]
+    finally:
+        store._writer.close()
 
 
 def test_routing_replay_preserves_selected_session_branch():

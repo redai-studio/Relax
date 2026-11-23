@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
+from relax.distributed.replay_manager.ref_data import MoERouteSpan, moe_route_manifest
 from relax.utils.types import Sample
 
 
@@ -45,10 +46,28 @@ _EMPTY_PREFIX_CACHE_DELTA = {
 }
 
 
+RoutingReplay = np.ndarray | tuple[MoERouteSpan, ...]
+
+
 def merge_routed_experts(
-    previous: np.ndarray | None, incoming: np.ndarray | None, *, expected_rows: int
-) -> np.ndarray | None:
+    previous: RoutingReplay | None, incoming: RoutingReplay | None, *, expected_rows: int
+) -> RoutingReplay | None:
     """Preserve routes of accepted tokens across resumed attempts and turns."""
+    if isinstance(previous, tuple) or isinstance(incoming, tuple):
+        if isinstance(previous, np.ndarray) or isinstance(incoming, np.ndarray):
+            raise ValueError("Cannot mix inline and reference MoE replay in an Agentic session")
+        previous = previous or ()
+        start = previous[-1].stop if previous else 0
+        end = incoming[-1].stop if incoming else start
+        if not start <= end == expected_rows or (incoming and incoming[0].start > start):
+            raise ValueError("Replay references do not cover the accepted Agentic token rows")
+        if not incoming:
+            return previous
+        return previous + tuple(
+            MoERouteSpan(span.ref, max(span.start, start), span.stop, span.training_tokens)
+            for span in incoming
+            if span.stop > start
+        )
     if incoming is None:
         if previous is None:
             return None
@@ -432,7 +451,7 @@ class MsgNode:
     wall_elapsed_s: float = 0.0
     generation_elapsed_s: float = 0.0
     status: str | None = None
-    rollout_routed_experts: Any = None
+    rollout_routed_experts: RoutingReplay | None = None
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
 
 
@@ -464,9 +483,14 @@ class InflightRequest:
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
     pending_status: str | None = None
-    pending_routed_experts: Any = None
+    pending_routed_experts: RoutingReplay | None = None
     pending_export_metadata_patch: dict[str, Any] = field(default_factory=dict)
     latest_backend_meta: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def referenced_route_rows(self) -> int:
+        routing = self.pending_routed_experts
+        return routing[-1].stop if isinstance(routing, tuple) and routing else 0
 
 
 @dataclass(frozen=True)
@@ -708,7 +732,7 @@ class SessionForest:
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
         status: str = "completed",
-        rollout_routed_experts: Any = None,
+        rollout_routed_experts: RoutingReplay | None = None,
         export_metadata_patch: dict[str, Any] | None = None,
     ) -> MsgNode:
         lineage = self.lineage(parent_state_hash)
@@ -878,6 +902,7 @@ class SessionForest:
         # path) see a single source of truth without having to know about
         # ``agentic_trace``.
         merged_metadata["rollout_turns"] = len(turns)
+        routing = leaf.rollout_routed_experts
         sample = Sample(
             group_index=self.group_index,
             index=self.index,
@@ -896,7 +921,8 @@ class SessionForest:
             rollout_topk_token_ids=np.concatenate(topk_token_ids) if topk_token_ids else None,
             rollout_topk_log_probs=np.concatenate(topk_log_probs) if topk_log_probs else None,
             rollout_topk_support_complete=np.concatenate(topk_support_complete) if topk_support_complete else None,
-            rollout_routed_experts=copy.deepcopy(leaf.rollout_routed_experts),
+            rollout_routed_experts=routing.copy() if isinstance(routing, np.ndarray) else None,
+            rollout_replay_refs={"moe": moe_route_manifest(routing, tokens)} if isinstance(routing, tuple) else None,
             abort_count=leaf.abort_count,
             status=status,
             metadata=merged_metadata,

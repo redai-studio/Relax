@@ -45,12 +45,14 @@ from relax.agentic.stage_recorder import (
     StageRecorder,
 )
 from relax.distributed.ray.rollout import _log_rollout_data, get_local_rollout_manager
+from relax.distributed.replay_manager.core import replay_data_manager
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
+from relax.utils.tq.lifecycle import clear_training_partition
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
@@ -139,6 +141,8 @@ async def _run_group(
             operation=operation,
         )
 
+    group = None
+    retain_for_transfer = False
     try:
         if requires_complete_group:
             group = await runtime_domain.collect_group(stream)
@@ -156,9 +160,14 @@ async def _run_group(
             finally:
                 for task in tasks:
                     task.cancel()
-                await finish_before_cancellation(
-                    asyncio.gather(*tasks, return_exceptions=True), "agentic-group-reward-cleanup"
-                )
+                try:
+                    await finish_before_cancellation(
+                        asyncio.gather(*tasks, return_exceptions=True), "agentic-group-reward-cleanup"
+                    )
+                finally:
+                    collected = tasks[0]
+                    if collected.done() and not collected.cancelled() and collected.exception() is None:
+                        group = collected.result()
         if group is None:
             reward_domain.discard_group_progress(stream)
             await runtime_domain.drop_group(stream)
@@ -223,11 +232,11 @@ async def _run_group(
             if observation is not None:
                 observation.terminal_drop_recorded = True
             return None
-        if opd_manager is None:
-            return scored_group
-        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+        if opd_manager is not None:
+            from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
-        await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
+            await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
+        retain_for_transfer = True
         return scored_group
     except BaseException as error:
         reward_domain.discard_group_progress(stream)
@@ -244,6 +253,9 @@ async def _run_group(
                 category="infra" if isinstance(error, RuntimeGroupError) else "execution",
             )
         raise
+    finally:
+        if group is not None and not retain_for_transfer:
+            await replay_data_manager.discard_async(group.samples)
 
 
 class AgenticResidentPipeline:
@@ -369,7 +381,7 @@ class AgenticResidentPipeline:
                 if self._data_system_client is None:
                     raise RuntimeError("Agentic debug rollout cleanup requires a data system client.")
                 partition_rollout_id = rollout_id - 1 if final_backfill else rollout_id
-                await self._data_system_client.async_clear_partition(partition_id=f"train_{partition_rollout_id}")
+                await clear_training_partition(self._data_system_client, f"train_{partition_rollout_id}")
             output.metrics = metrics
             logger.info(
                 format_agentic_event(
@@ -548,11 +560,22 @@ class AgenticResidentPipeline:
         partition_id, groups, is_last = batch
         if self._stage_recorder.enabled:
             context.observed_group_ids.update(group.group_id for group in groups)
-        task = asyncio.create_task(
-            self._transfer_and_record(context, partition_id, groups, is_last),
-            name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups",
-        )
-        task.add_done_callback(lambda _task: self._changed.set())
+        started = False
+
+        async def transfer() -> None:
+            nonlocal started
+            started = True
+            await self._transfer_and_record(context, partition_id, groups, is_last)
+
+        def transfer_done(task: asyncio.Task) -> None:
+            try:
+                if task.cancelled() and not started:
+                    replay_data_manager.discard([sample for group in groups for sample in group.samples])
+            finally:
+                self._changed.set()
+
+        task = asyncio.create_task(transfer(), name=f"agentic-transfer:train_{partition_id}:{len(groups)}-groups")
+        task.add_done_callback(transfer_done)
         context.tq_put_tasks.append(task)
 
     async def _transfer_and_record(
@@ -607,6 +630,7 @@ class AgenticResidentPipeline:
                     cancelled=isinstance(error, asyncio.CancelledError),
                 )
             else:
+                await replay_data_manager.discard_async([sample for group in groups for sample in group.samples])
                 event = self._stage_recorder.record_groups_dropped(
                     groups,
                     rollout_id=context.rollout_id,
@@ -718,7 +742,11 @@ class AgenticResidentPipeline:
             await self.prepare_domain.discard_step()
 
         await self.runtime_domain.trim_memory()
-        return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
+        return RolloutFnTrainOutput(
+            samples=context.output_groups,
+            metrics={},
+            partition_complete=(self.transfer_domain.total_debt == 0) if self.args.fully_async else None,
+        )
 
     async def _seal_dynamic_partition(self, context: _StepContext) -> None:
         """Seal with the DP-aligned FIFO prefix of completed Group tasks."""
@@ -850,6 +878,7 @@ class AgenticResidentPipeline:
         self._finalized_groups.extend(outcome for outcome in outcomes if isinstance(outcome, GroupExport))
         groups = tuple(self._finalized_groups)
         self._finalized_groups.clear()
+        await replay_data_manager.discard_async([sample for group in groups for sample in group.samples])
         if rollout_id is None:
             rollout_id = self._active_step.rollout_id if self._active_step is not None else -1
         if self._stage_recorder.enabled:
