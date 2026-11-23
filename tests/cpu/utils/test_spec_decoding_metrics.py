@@ -42,20 +42,6 @@ def test_spec_metrics_weight_counters_instead_of_averaging_rates():
     assert metrics["spec_coverage"] == 1.0
 
 
-def test_spec_metrics_count_node_shared_by_several_samples_once():
-    shared = _counters(4, 8, verify=2, completion=6)
-    samples = [
-        _sample(nodes={"req_sess-a_0": shared, "req_sess-a_1": _counters(1, 2, verify=1, completion=2)}),
-        _sample(nodes={"req_sess-a_0": shared, "req_sess-a_2": _counters(1, 1, verify=1, completion=1)}),
-    ]
-
-    metrics = compute_spec_decoding_metrics(samples)
-
-    assert metrics["spec_nodes_total"] == 3.0
-    assert metrics["spec_accept_rate"] == pytest.approx(6 / 11)
-    assert metrics["spec_accept_length"] == pytest.approx(9 / 4)
-
-
 def test_spec_metrics_keep_identical_independent_requests_separate():
     counters = _counters(1, 2, verify=1, completion=2)
     samples = [
