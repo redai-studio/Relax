@@ -593,7 +593,8 @@ class EngineGroup:
         return failed_indices
 
     def shutdown_engines(self, indices: set[int]) -> None:
-        """Keep each actor reachable until its local server processes have exited."""
+        """Keep each actor reachable until its local server processes have
+        exited."""
         for i in indices:
             engine = self.all_engines[i]
             if engine is None:
@@ -657,12 +658,17 @@ class RolloutServer:
     pending_rollbacks: dict = dataclasses.field(default_factory=dict)
 
     def retry_scale_out_cleanup(self):
-        """Release failed replicas' dedicated placement groups after their actors exit."""
+        """Release failed replicas' dedicated placement groups after their
+        actors exit."""
         for pg, group in list(self.pending_rollbacks.items()):
             group.shutdown_engines(group.pending_shutdown.copy())
             if not group.pending_shutdown:
-                ray.util.remove_placement_group(pg)
-                self.pending_rollbacks.pop(pg, None)
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception as error:
+                    logger.warning("Could not release rolled-back placement group %s: %s", pg, error)
+                else:
+                    self.pending_rollbacks.pop(pg, None)
 
     @property
     def engines(self):
@@ -4580,8 +4586,9 @@ class RolloutManager(ReloadableMixin):
 
         # Step 2: Single drain wait for engines that are safe to remove.
         drain_time = timeout if not force else 0
-        if drain_time > 0 and unregistered_engine_infos:
-            engine_ids = [f"group_{g.rank_offset}_engine_{idx}" for g, idx in unregistered_engine_infos]
+        newly_drained = [(g, idx) for g, idx in unregistered_engine_infos if idx not in g.drained_for_removal]
+        if drain_time > 0 and newly_drained:
+            engine_ids = [f"group_{g.rank_offset}_engine_{idx}" for g, idx in newly_drained]
             logger.info(
                 f"[ScaleIn] Draining {len(unregistered_engine_infos)} engines "
                 f"for {drain_time}s (force={force}): {engine_ids}"
