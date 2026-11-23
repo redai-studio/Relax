@@ -37,7 +37,9 @@ SFT 通过 `--loss-type sft` 启用。该模式下，Relax 会启动一个 SFT p
 
 环境需要包含 Qwen4Exp 模型、HybridEP 以及 MCore 的 TE 模块精度配置接口。脚本使用 TP2/PP4/CP1/EP8/ETP1、sequence parallelism 和 `Et*12|t*14|t*14|t*8mL` 布局。可通过 `QWEN38_PP_LAYOUT` 调整各阶段层数，为 PLE 表与视觉模型预留显存。QSA 长文档分支使用 grouped 后端，attention 细节见 [Qwen3.8 QSA](./qwen38-qsa.md)。
 
-[Relax 镜像的 Megatron 补丁](../../../docker/patch/megatron/20260915-4a4de8657.patch) 支持保存 MXFP8 分组层时 TE 2.18 返回的空 extra state。GPU 保存与加载回归见 `tests/backends/megatron/test_qwen38_fp8_precision.py`。
+[Relax 镜像的 Megatron 补丁](../../../docker/patch/megatron/20260915-4a4de8657.patch) 支持保存 MXFP8 分组层时 TE 2.18 返回的空 extra state。
+
+使用本配方的分布式 Adam，从 **Megatron 原生 BF16 checkpoint** 初始化 MXFP8 专家参数时，传入 `--load "$NATIVE_DCP" --no-load-optim --load-main-params-from-ckpt`。这样第一次更新前，优化器直接从保存的 BF16 模型张量初始化 FP32 主权重分片。用 `--finetune` 做此转换时也需要同时传入这两个加载开关。完整原生断点续训应恢复优化器状态。从 HF 基座启动时设置 `MODEL_DIR`，省略 `--load-main-params-from-ckpt`。
 
 在目标 Ray 集群的 head 或 worker 节点上，从仓库根目录启动，并确保本地 Ray 自动发现指向该集群。`ray-job.sh` 会调用 `ray list nodes`，仅设置远端 dashboard 地址不足以从任意机器提交。设置路径及已核实的跨节点通信网卡：
 

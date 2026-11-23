@@ -10,6 +10,7 @@ recomputation.
 """
 
 from argparse import Namespace
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -20,14 +21,32 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def is_qwen_fp8_source(bridge: Any) -> bool:
+    config = getattr(getattr(bridge, "hf_pretrained", None), "config", None)
+    return (
+        getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
+        and (getattr(config, "quantization_config", None) or {}).get("quant_method") == "fp8"
+    )
+
+
+def get_bf16_reference_loader(bridge: Any) -> Callable[[str], torch.Tensor] | None:
+    """Use the HF import scales for MTP or vision weights copied during plain
+    export."""
+    if not is_qwen_fp8_source(bridge):
+        return None
+    model_bridge = bridge._model_bridge
+
+    def load(name: str) -> torch.Tensor:
+        tensor = model_bridge._load_fp8_hf_weight(name, bridge.hf_pretrained.state)
+        return tensor.bfloat16() if tensor.is_floating_point() else tensor
+
+    return load
+
+
 def validate_fp8_hf_import(bridge: Any, optimizer: Any = None) -> bool:
     """Require scale-aware loading for Qwen FP8 sources before copying any
     weights."""
-    config = getattr(getattr(bridge, "hf_pretrained", None), "config", None)
-    if getattr(config, "model_type", None) not in {"qwen4_exp", "qwen4_exp_text"}:
-        return False
-    quantization = getattr(config, "quantization_config", None) or {}
-    if quantization.get("quant_method") != "fp8":
+    if not is_qwen_fp8_source(bridge):
         return False
     if not getattr(bridge._model_bridge, "supports_fp8_hf_import", False):
         raise RuntimeError(

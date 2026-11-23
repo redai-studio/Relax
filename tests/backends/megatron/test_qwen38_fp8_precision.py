@@ -162,8 +162,6 @@ def test_qwen38_fp8_primary_keeps_module_boundary_and_parallel_metadata(runtime)
     for name, parameter in model.named_parameters():
         if name.startswith("decoder."):
             assert isinstance(parameter, MXFP8Tensor)
-            assert parameter._rowwise_data.dtype == torch.uint8
-            assert parameter._columnwise_data.dtype == torch.uint8
             assert parameter is not original[name]
             assert parameter.allreduce is False
             assert parameter.partition_dim == 0
@@ -171,9 +169,18 @@ def test_qwen38_fp8_primary_keeps_module_boundary_and_parallel_metadata(runtime)
             assert parameter is original[name]
             assert not isinstance(parameter, MXFP8Tensor)
     x = torch.randn(32, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    base_weight = original["decoder.shared_experts.linear_fc1.weight"]
+    expected_output = torch.nn.functional.linear(x, base_weight)
     with get_fp8_context(runtime):
         outputs = [block.shared_experts.linear_fc1(x)[0] for block in model.children()]
-    sum(y.float().square().mean() for y in outputs).backward()
+    grad = torch.randn_like(expected_output)
+    expected_dx = torch.autograd.grad(expected_output, x, grad)[0]
+    outputs[0].backward(grad)
+    actual_dx = x.grad.detach()
+    for actual, expected in ((outputs[0], expected_output), (actual_dx, expected_dx)):
+        relative_error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert relative_error < 0.15
+    sum(y.float().square().mean() for y in outputs[1:]).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 

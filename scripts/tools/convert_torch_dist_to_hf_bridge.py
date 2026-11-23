@@ -513,7 +513,10 @@ if __name__ == "__main__":
             raise ValueError("--fp8-device points to CUDA, but torch.cuda.is_available() is false")
 
     print(f"Loading config from {args.origin_hf_dir}")
+    from relax.models.qwen3_8.precision import get_bf16_reference_loader
+
     bridge = AutoBridge.from_hf_pretrained(args.origin_hf_dir, trust_remote_code=True)
+    bf16_reference = get_bf16_reference_loader(bridge) if args.bf16 else None
 
     # Use Bridge's provider so the correct model class is created (e.g., Qwen3VLModel
     # instead of GPTModel). This is needed because MLM checkpoints lack run_config.yaml.
@@ -586,6 +589,7 @@ if __name__ == "__main__":
             args.output_dir,
             reference_hf_dir=args.origin_hf_dir,
             supplement_mtp=allow_missing_mtp_keys,
+            bf16_reference_weight=bf16_reference,
         )
         if reconcile_summary["ghosts"]:
             print(
@@ -616,6 +620,8 @@ if __name__ == "__main__":
     # transformers-4.x consumable, carry the quantization_config over when the weights are
     # quantized, and restore native fields the bridge dropped (guarded by matching
     # model_type + num_hidden_layers). Safe for arch-changed / custom exports.
+    from relax.utils.hf_export import write_bf16_export_config
+
     cfg_path = os.path.join(args.output_dir, "config.json")
     origin_cfg_path = os.path.join(args.origin_hf_dir, "config.json")
     if os.path.isfile(cfg_path):
@@ -623,15 +629,7 @@ if __name__ == "__main__":
             if not os.path.isfile(origin_cfg_path):
                 raise ValueError("--copy-config requires --origin-hf-dir to contain a config.json")
             shutil.copyfile(origin_cfg_path, cfg_path)
-            note = f"[convert] --copy-config: copied origin config.json verbatim -> {cfg_path}"
-            if args.bf16:
-                with open(cfg_path) as f:
-                    c = json.load(f)
-                if c.pop("quantization_config", None) is not None:
-                    with open(cfg_path, "w") as f:
-                        json.dump(c, f, indent=2, ensure_ascii=False)
-                    note += " (removed quantization_config; --bf16 weights are dequantized)"
-            print(note)
+            print(f"[convert] copied origin config.json to {cfg_path}")
         else:
             with open(cfg_path) as f:
                 cfg = json.load(f)
@@ -679,14 +677,15 @@ if __name__ == "__main__":
                         f"[convert] restored {len(restored)} native config field(s) dropped by the "
                         f"bridge: {sorted(restored)}"
                     )
-            if args.bf16:
-                cfg.pop("quantization_config", None)
             with open(cfg_path, "w") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
             print(
                 f"[convert] post-processed {cfg_path} (bridge-config path; pass --copy-config for a "
                 "byte-identical native config)"
             )
+
+        if args.bf16:
+            write_bf16_export_config(cfg_path)
 
     for fname in ("tokenizer_config.json", "vocab.json", "merges.txt"):
         src = os.path.join(args.origin_hf_dir, fname)

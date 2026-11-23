@@ -66,6 +66,13 @@ def configure(model: torch.nn.Module, args: Namespace) -> None:
         or args.megatron_fsdp_main_grads_dtype not in (torch.float32, "fp32")
     ):
         raise ValueError("PLE compact gradients with Megatron FSDP require sharded gradients and FP32 accumulation")
+    # A sharded FSDP main_grad can be the communication buffer itself. Adding
+    # BF16 COO to FP16 promotes the entire dense table to FP32.
+    if getattr(args, "use_megatron_fsdp", False) and getattr(args, "megatron_fsdp_grad_comm_dtype", None) in (
+        torch.float16,
+        "fp16",
+    ):
+        raise ValueError("PLE compact gradients require BF16 or FP32 FSDP gradient communication")
     for owner in model.modules():
         if not isinstance(owner, NGramEmbedding):
             continue

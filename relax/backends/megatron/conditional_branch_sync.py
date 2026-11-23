@@ -217,11 +217,12 @@ def install_conditional_branch_sync(args: argparse.Namespace, model: torch.nn.Mo
             return original_forward(*forward_args, **forward_kwargs)
         device = _first_tensor_device(forward_args, forward_kwargs)
         local_active = _has_local_vision_input(forward_args, forward_kwargs)
-        global_active = _dp_any(local_active, self.pg_collection.dp, device)
-        # Overlapped gradient reduction learns per-parameter hook counts in the
-        # first batch. Trainable vision must participate even in all-text batches.
-        needs_dummy = not local_active and (global_active or bool(getattr(args, "overlap_grad_reduce", False)))
-        dependency = _run_dummy_vision(self, device) if needs_dummy else None
+        # Overlapped gradient reduction learns hook counts in the first batch,
+        # so every rank must run vision even when the whole batch is text.
+        needs_vision = getattr(args, "overlap_grad_reduce", False) or _dp_any(
+            local_active, self.pg_collection.dp, device
+        )
+        dependency = _run_dummy_vision(self, device) if needs_vision and not local_active else None
 
         output = original_forward(*forward_args, **forward_kwargs)
         if dependency is not None:

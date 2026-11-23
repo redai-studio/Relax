@@ -115,7 +115,64 @@ def _check_tp_import(root: Path) -> None:
         torch.testing.assert_close(converted.cpu(), reference, rtol=0, atol=0)
 
 
-def _worker(rank: int, root: str) -> None:
+def _check_compact_muon_sync(model, config, args):
+    # Exercise the native restore sync with compact Muon owning whole matrices and
+    # Adam owning shards of the embedding in the same DDP chunk.
+    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+    from megatron.core.tensor_parallel.layers import set_defaults_if_not_set_tensor_model_parallel_attributes
+    from megatron.training.training import wrap_model_chunks_with_ddp
+
+    from relax.backends.megatron.model import _sync_loaded_mxfp8_params
+    from relax.models.qwen3_8.precision import configure_fp8
+
+    configure_fp8(model, args)
+    for parameter in model.parameters():
+        set_defaults_if_not_set_tensor_model_parallel_attributes(parameter)
+    model.ple.weight.is_embedding_or_output_parameter = True
+    chunks = wrap_model_chunks_with_ddp(
+        [model],
+        config,
+        DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            overlap_grad_reduce=True,
+            fp8_param_gather=True,
+            reuse_grad_buf_for_mxfp8_param_ag=True,
+            use_layer_wise_param_layout=False,
+        ),
+        use_layer_wise_distributed_optimizer=True,
+    )
+    mixed = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer="muon",
+            lr=0.01,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=False,
+            fp8_recipe="mxfp8",
+            reuse_grad_buf_for_mxfp8_param_ag=True,
+            store_param_remainders=False,
+        ),
+        chunks,
+    )
+    assert any(isinstance(owner, LayerWiseDistributedOptimizer) for owner in mixed.chained_optimizers)
+    assert any(isinstance(owner, DistributedOptimizer) for owner in mixed.chained_optimizers)
+    with torch.no_grad():
+        for owner in mixed.chained_optimizers:
+            value = 0.75 if isinstance(owner, LayerWiseDistributedOptimizer) else -0.25
+            for group in owner.param_groups:
+                for master in group["params"]:
+                    master.fill_(value)
+    _sync_loaded_mxfp8_params(mixed)
+    for parameter in model.parameters():
+        expected = -0.25 if parameter is model.ple.weight else 0.75
+        torch.testing.assert_close(parameter.float(), torch.full_like(parameter.float(), expected), rtol=0, atol=0)
+
+
+def _worker(rank: int, root: str, compact_muon: bool) -> None:
     from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
     from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping, ReplicatedMapping, RowParallelMapping
     from megatron.bridge.models.qwen.qwen4_exp_bridge import PLENGramEmbeddingMapping, Qwen4ExpBridge
@@ -143,9 +200,10 @@ def _worker(rank: int, root: str) -> None:
         world_size=4,
         timeout=timedelta(seconds=180),
     )
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
-    _check_tp_import(Path(root))
-    parallel_state.destroy_model_parallel()
+    if not compact_muon:
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=2)
+        _check_tp_import(Path(root))
+        parallel_state.destroy_model_parallel()
     parallel_state.initialize_model_parallel(expert_model_parallel_size=2)
     model_parallel_cuda_manual_seed(1234)
     config = TransformerConfig(
@@ -221,6 +279,12 @@ def _worker(rank: int, root: str) -> None:
             shared = self.mlp.shared_experts.linear_fc1(x)[0]
             positions = torch.arange(x.shape[0], device=x.device) % 32
             return routed + shared + self.vision_model(x) + self.mtp(x) + self.ple(positions)
+
+    if compact_muon:
+        _check_compact_muon_sync(TinyModel(), config, args)
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
+        return
 
     reference = load_file(Path(root) / "reference.safetensors")
     original = {name: weight for name, weight in reference.items() if not name.startswith("expert")}
@@ -404,15 +468,22 @@ def _worker(rank: int, root: str) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four MXFP8-capable GPUs")
-def test_qwen38_fp8_primary_master_updates_and_native_resume(tmp_path):
+@pytest.mark.parametrize("compact_muon", [False, True], ids=["adam-resume", "compact-muon-sync"])
+def test_qwen38_fp8_primary_master_updates_and_native_resume(tmp_path, compact_muon):
     import torch.multiprocessing as mp
     import transformer_engine.pytorch as te
 
     if not te.is_mxfp8_available():
         pytest.skip("Requires MXFP8-capable Blackwell GPUs")
 
-    _write_hf_fixture(tmp_path)
-    context = mp.spawn(_worker, args=(str(tmp_path),), nprocs=4, join=False)
+    if compact_muon:
+        from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
+
+        if not HAVE_EMERGING_OPTIMIZERS:
+            pytest.skip("MCore compact Muon requires emerging-optimizers")
+    else:
+        _write_hf_fixture(tmp_path)
+    context = mp.spawn(_worker, args=(str(tmp_path), compact_muon), nprocs=4, join=False)
     deadline = time.monotonic() + 240
     try:
         while not context.join(timeout=5):

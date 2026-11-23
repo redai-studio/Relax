@@ -241,7 +241,7 @@ def test_hc_inner_recompute_matches_mcore_outer_gradients(
 ):
     from megatron.core.tensor_parallel import random as tp_random
 
-    make, _ = runtime
+    make, original = runtime
     torch.manual_seed(71)
     model = make(combine, hidden_size=hidden_size, rank=320 if hidden_size == 2560 else 32)
     model.config.recompute_granularity = "full"
@@ -272,7 +272,12 @@ def test_hc_inner_recompute_matches_mcore_outer_gradients(
     expected_forward = reference_loss.detach()
     if outer:
         with torch.no_grad():
-            expected_forward = loss(x)
+            block, post = patch.fused_mix(model, x)
+            reference_block, reference_post = original(model, x)
+            _close(block, reference_block)
+            if reference_post is not None:
+                _close(post, reference_post)
+            expected_forward = (block * block_grad).sum() + (0 if post is None else (post * post_grad).sum())
 
     compiled = patch.compiled_mix(hidden_size == 2560)
     calls = []

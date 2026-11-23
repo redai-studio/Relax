@@ -296,64 +296,73 @@ def test_vl_registry_rejects_mixed_mtp_expert_layouts(api):
 @pytest.mark.parametrize(
     "mapping_type", ["ColumnParallelMapping", "RowParallelMapping", "GatedMLPMapping", "AutoMapping"]
 )
-@pytest.mark.parametrize("rank", [0, 1])
-def test_fp32_products_survive_tp_mapping_and_master_capture(api, monkeypatch, tmp_path, mapping_type, rank):
+def test_fp32_products_survive_tp_mapping_and_master_capture(api, monkeypatch, tmp_path, mapping_type):
     weight, scale, full = _quantized()
     name = "mtp.layers.0.mlp.experts.0.down_proj.weight" if mapping_type == "RowParallelMapping" else "weight"
     state = {name: weight, name + "_scale_inv": scale}
     if mapping_type == "GatedMLPMapping":
         state.update(up=weight.clone(), up_scale_inv=scale * 2)
         hf_param = {"gate": name, "up": "up"}
-        local = full[rank * 128 : (rank + 1) * 128]
-        expected = torch.cat((local, local * 2), dim=0)
     else:
         hf_param = name
-        expected = (
-            full[:, rank * 128 : (rank + 1) * 128]
-            if mapping_type == "RowParallelMapping"
-            else full[rank * 128 : (rank + 1) * 128]
-        )
+    dim = 1 if mapping_type == "RowParallelMapping" else 0
+    expected_shards = list(full.chunk(2, dim=dim))
+    if mapping_type == "GatedMLPMapping":
+        expected_shards = [torch.cat((shard, shard * 2), dim=0) for shard in expected_shards]
     save_file(state, tmp_path / "weights.safetensors")
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {key: "weights.safetensors" for key in state}})
     )
     source = api.state.StateDict(api.state.SafeTensorsStateSource(tmp_path))
-    module = torch.nn.Module()
-    module.weight = torch.nn.Parameter(torch.zeros_like(expected, dtype=torch.bfloat16))
-    module.tensor_model_parallel, module.partition_dim = True, 0
-    mapping_class = getattr(api.mapping, mapping_type)
-    mapping = mapping_class("weight", **hf_param) if isinstance(hf_param, dict) else mapping_class("weight", hf_param)
-    group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
-    mapping.set_process_groups_from_pg_collection(SimpleNamespace(tp=group, expt_tp=group))
+    sent = []
 
-    def scatter(output, scatter_list, *, src, group):
-        assert output.dtype == torch.float32
-        if rank == 0:
-            assert all(piece.dtype == output.dtype for piece in scatter_list)
-            output.copy_(scatter_list[rank])
-        else:
-            assert scatter_list is None
-            output.copy_(expected)
+    def load_rank(rank, expected):
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.zeros_like(expected, dtype=torch.bfloat16))
+        module.tensor_model_parallel, module.partition_dim = True, 0
+        mapping_class = getattr(api.mapping, mapping_type)
+        mapping = (
+            mapping_class("weight", **hf_param) if isinstance(hf_param, dict) else mapping_class("weight", hf_param)
+        )
+        tp_group = SimpleNamespace(size=lambda: 2, rank=lambda rank=rank: rank)
+        mapping.set_process_groups_from_pg_collection(SimpleNamespace(tp=tp_group, expt_tp=tp_group))
 
-    monkeypatch.setattr(torch.distributed, "get_global_rank", lambda **kw: 0)
-    monkeypatch.setattr(torch.distributed, "scatter", scatter)
-    bridge = _bridge(api)
-    task = api.bridge.WeightConversionTask(
-        "weight", "weight", mapping, megatron_module=module, param_weight=module.weight
-    )
-    monkeypatch.setattr(bridge, "build_conversion_tasks", lambda *args: [task])
-    monkeypatch.setattr(bridge, "_with_progress_tracking", lambda tasks, description: tasks)
-    monkeypatch.setattr(bridge, "finalize_hf_import", lambda model: None)
-    bridge.export_weight_dtype = "fp8"
-    bridge.load_weights_hf_to_megatron(SimpleNamespace(state=source, model_name_or_path=str(tmp_path)), [module])
-    captured = bridge.unquantized_state_dict["model"]["weight"]
-    assert captured.device.type == "cpu" and captured.dtype == torch.float32
-    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
-    torch.testing.assert_close(module.weight, expected.bfloat16(), rtol=0, atol=0)
-    assert torch.any(captured != module.weight.float())
-    with torch.no_grad():
-        module.weight.zero_()
-    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+        def global_rank(*, group, group_rank):
+            assert group is tp_group and group_rank == 0
+            return 3
+
+        def scatter(output, scatter_list, *, src, group):
+            assert src == 3 and group is tp_group and output.dtype == torch.float32
+            if rank == 0:
+                for piece, reference in zip(scatter_list, expected_shards, strict=True):
+                    torch.testing.assert_close(piece, reference, rtol=0, atol=0)
+                    sent.append(piece.clone())
+            else:
+                assert scatter_list is None
+            output.copy_(sent[rank])
+
+        monkeypatch.setattr(torch.distributed, "get_global_rank", global_rank)
+        monkeypatch.setattr(torch.distributed, "scatter", scatter)
+        bridge = _bridge(api)
+        task = api.bridge.WeightConversionTask(
+            "weight", "weight", mapping, megatron_module=module, param_weight=module.weight
+        )
+        monkeypatch.setattr(bridge, "build_conversion_tasks", lambda *args: [task])
+        monkeypatch.setattr(bridge, "_with_progress_tracking", lambda tasks, description: tasks)
+        monkeypatch.setattr(bridge, "finalize_hf_import", lambda model: None)
+        bridge.export_weight_dtype = "fp8"
+        bridge.load_weights_hf_to_megatron(SimpleNamespace(state=source, model_name_or_path=str(tmp_path)), [module])
+        captured = bridge.unquantized_state_dict["model"]["weight"]
+        assert captured.device.type == "cpu" and captured.dtype == torch.float32
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+        torch.testing.assert_close(module.weight, expected.bfloat16(), rtol=0, atol=0)
+        assert torch.any(captured != module.weight.float())
+        with torch.no_grad():
+            module.weight.zero_()
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+    for rank, expected in enumerate(expected_shards):
+        load_rank(rank, expected)
 
 
 def test_import_dtype_is_scoped_and_restored_on_error(api):

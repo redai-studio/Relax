@@ -895,7 +895,13 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str | None):
             with megatron_bridge_utils.patch_megatron_model(ddp_model):
                 bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
                 fp8_source = validate_fp8_hf_import(bridge, optimizer)
-                capture_original = optimizer is not None and (getattr(args, "fp8_param_gather", False) or fp8_source)
+                capture_original = optimizer is not None and (
+                    fp8_source
+                    or (
+                        getattr(args, "fp8_param_gather", False)
+                        and not getattr(args, "use_layer_wise_distributed_optimizer", False)
+                    )
+                )
                 if capture_original:
                     # Capture the HF values before copying into quantized model
                     # parameters; master weights must not start from FP8 rounding.

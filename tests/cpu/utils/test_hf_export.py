@@ -238,3 +238,29 @@ def test_reference_expects_vision(tmp_path):
     # Unreadable/missing reference must not raise -- save_hf_model relies on this to
     # short-circuit before it ever inspects the model.
     assert reference_expects_vision(str(tmp_path / "does-not-exist")) is False
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text"])
+def test_bf16_config_matches_ple_storage(tmp_path, model_type):
+    from relax.utils.hf_export import write_bf16_export_config
+
+    config = {"model_type": model_type, "quantization_config": {"quant_method": "fp8"}}
+    text_config = config.setdefault("text_config", {}) if model_type == "qwen4_exp" else config
+    text_config.update(ple_embedding_dtype="float8_e4m3fn", hidden_size=128)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    write_bf16_export_config(path)
+    actual = json.loads(path.read_text())
+    assert "quantization_config" not in actual
+    assert actual.get("text_config", actual)["ple_embedding_dtype"] == "bfloat16"
+    assert actual.get("text_config", actual)["hidden_size"] == 128
+
+
+def test_bf16_export_preserves_unquantized_copy_config_bytes(tmp_path):
+    from relax.utils.hf_export import write_bf16_export_config
+
+    path = tmp_path / "config.json"
+    original = b'{"model_type":"llama","hidden_size":128}\n'
+    path.write_bytes(original)
+    write_bf16_export_config(path)
+    assert path.read_bytes() == original

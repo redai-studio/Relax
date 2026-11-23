@@ -37,7 +37,9 @@ The recipe sets `CUDA_MODULE_LOADING=EAGER` through `--train-env-vars` before tr
 
 Use a compatible Megatron/Bridge image containing the Qwen4Exp model, HybridEP, and MCore's TE per-module precision API. The script uses TP2/PP4/CP1/EP8/ETP1, sequence parallelism, and layout `Et*12|t*14|t*14|t*8mL`. Set `QWEN38_PP_LAYOUT` to adjust stage sizes for the PLE table and vision tower. QSA uses the grouped long-document backend. See [Qwen3.8 QSA](./qwen38-qsa.md) for attention details.
 
-The [Megatron patch in the Relax image](../../../docker/patch/megatron/20260915-4a4de8657.patch) handles the empty extra state TE 2.18 returns when saving MXFP8 grouped layers. The GPU save/load regression is in `tests/backends/megatron/test_qwen38_fp8_precision.py`.
+The [Megatron patch in the Relax image](../../../docker/patch/megatron/20260915-4a4de8657.patch) handles the empty extra state TE 2.18 returns when saving MXFP8 grouped layers.
+
+To initialize MXFP8 expert storage from a **native BF16 Megatron checkpoint** with this distributed Adam recipe, pass `--load "$NATIVE_DCP" --no-load-optim --load-main-params-from-ckpt`. These flags initialize FP32 master shards directly from the saved BF16 model tensors before the first update. Include both flags when using `--finetune` for this conversion. For a full native resume, load the saved optimizer state. For a fresh HF import, set `MODEL_DIR` and leave `--load-main-params-from-ckpt` unset.
 
 Launch from the repository root on a head or worker node of the target Ray cluster, with local Ray discovery pointing to that cluster. `ray-job.sh` calls `ray list nodes`; setting a remote dashboard address alone does not support submission from an arbitrary machine. Set paths and the verified cross-node network interface:
 

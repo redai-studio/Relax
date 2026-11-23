@@ -179,15 +179,17 @@ def _fsdp_worker(rank: int, rendezvous: str) -> None:
                     with torch.no_grad():
                         weight.copy_(initial)
                 if compact:
-                    configure(
-                        table,
-                        Namespace(
-                            use_distributed_optimizer=True,
-                            use_megatron_fsdp=True,
-                            data_parallel_sharding_strategy=strategy,
-                            megatron_fsdp_main_grads_dtype=torch.float32,
-                        ),
+                    compact_args = Namespace(
+                        use_distributed_optimizer=True,
+                        use_megatron_fsdp=True,
+                        data_parallel_sharding_strategy=strategy,
+                        megatron_fsdp_main_grads_dtype=torch.float32,
+                        megatron_fsdp_grad_comm_dtype=torch.float16,
                     )
+                    with pytest.raises(ValueError, match="gradient communication"):
+                        configure(table, compact_args)
+                    compact_args.megatron_fsdp_grad_comm_dtype = torch.float32
+                    configure(table, compact_args)
                 set_defaults_if_not_set_tensor_model_parallel_attributes(weight)
                 fsdp = FullyShardedDataParallel(
                     config,
