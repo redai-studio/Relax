@@ -243,6 +243,10 @@ class _TeacherState(str, Enum):
     FAILED = "failed"
 
 
+class _ScoreRejectedError(RuntimeError):
+    """The HTTP server rejected this score without leaving work in flight."""
+
+
 @ray.remote
 class SharedTeacherManager:
     """Dispatch scores and weight switches to shared Teacher engines."""
@@ -265,7 +269,7 @@ class SharedTeacherManager:
         self._wakeup = asyncio.Event()
         self._token_budget = 131072  # per endpoint; a single longer request can still run alone
         self._max_wait_s = 2.0
-        self._queues: dict[str, dict[asyncio.Future, tuple[float, dict]]] = {}
+        self._queues: dict[str, dict[asyncio.Future, tuple[float, dict, int]]] = {}
 
     async def initialize(self) -> None:
         async with self._control:
@@ -284,13 +288,14 @@ class SharedTeacherManager:
                 await self._session.close()
                 raise
 
-    async def score(self, teacher: str, payload: dict) -> dict:
+    async def score(self, teacher: str, payload: dict, *, token_count: int | None = None) -> dict:
         if self._state is not _TeacherState.READY:
             raise RuntimeError(f"Shared Teacher is {self._state.value}")
         teacher = self._teacher_ids[teacher]
 
         reply = asyncio.get_running_loop().create_future()
-        self._queues.setdefault(teacher, {})[reply] = monotonic(), payload
+        length = len(payload["input_ids"]) if token_count is None else token_count
+        self._queues.setdefault(teacher, {})[reply] = monotonic(), payload, length
         self._wakeup.set()
         if self._worker is None:
             self._worker = asyncio.create_task(self._run_batches())
@@ -346,64 +351,75 @@ class SharedTeacherManager:
         from relax.engine.rollout.on_policy_distillation import _aiohttp_json_post_kwargs
 
         async with self._session.post(url, **_aiohttp_json_post_kwargs(payload)) as response:
+            if 400 <= response.status < 500 and response.status != 408:
+                body = await response.text()
+                raise _ScoreRejectedError(
+                    f"Teacher score rejected at {url}: status={response.status}, body={body[:512]}"
+                )
             response.raise_for_status()
             return await response.json()
 
-    def _assign_replicas(self, serving: dict[str, str]) -> dict[str, list[str]]:
+    def _split_queue(self, queue, loads):
+        """Place FIFO requests on the least-loaded eligible replica, returning
+        the unplaced token count."""
+        batches = {url: {} for url in loads}
+        remaining = sum(length for _, _, length in queue.values())
+        for reply, (_, payload, length) in queue.items():
+            url = min(loads, key=loads.__getitem__, default=None)
+            # A single oversized request can run alone. If it won't fit here, it won't fit on any peer.
+            if url is None or (loads[url] and loads[url] + length > self._token_budget):
+                break
+            batches[url][reply] = payload, length
+            loads[url] += length
+            remaining -= length
+        return batches, remaining
+
+    def _plan_batches(self, serving, in_flight):
         idle = [url for url in self.urls if url not in serving]
-        if not self._queues or not idle:
-            return {}
-        tokens = {t: sum(len(payload["input_ids"]) for _, payload in q.values()) for t, q in self._queues.items()}
-        queued_at = {t: next(iter(q.values()))[0] for t, q in self._queues.items()}
-        assigned = {t: [] for t in self._queues}
-        counts = {t: sum(active == t for active in serving.values()) for t in self._queues}
+        counts = Counter(serving.values())
+        drain = None
+        if len(self._queues.keys() - counts.keys()) > len(idle):
+            # An uncovered route needs an occupied engine to drain. Prefer a spare or the lightest one.
+            spare = [url for url, t in serving.items() if t not in self._queues or counts[t] > 1]
+            drain = min(spare or serving, key=in_flight.__getitem__, default=None)
+
+        def split(teacher):
+            loads = {url: in_flight[url] for url, t in serving.items() if t == teacher and url != drain}
+            return self._split_queue(self._queues[teacher], loads)
+
+        plans = {teacher: split(teacher) for teacher in self._queues}
+        queued_at = {t: next(iter(queue.values()))[0] for t, queue in self._queues.items()}
+        assigned = Counter()
         now = monotonic()
         while idle:
-            waiting = [t for t, q in self._queues.items() if len(q) > len(assigned[t])]
+            residents = {self._resident[url] for url in idle}
+            waiting = [
+                t
+                for t, q in self._queues.items()
+                if len(q) > assigned[t] and (not counts[t] or plans[t][1] or t in residents)
+            ]
             if not waiting:
                 break
-            unserved = [t for t in waiting if counts[t] == 0]
+            unserved = [t for t in waiting if not counts[t]]
             if unserved:
-                # Preserve affinity for fresh requests. The oldest overdue, unserved route wins even at saturation.
                 overdue = [t for t in unserved if now - queued_at[t] >= self._max_wait_s]
-                resident = [t for t in unserved if any(self._resident[url] == t for url in idle)]
+                resident = [t for t in unserved if t in residents]
                 teacher = min(overdue or resident or unserved, key=queued_at.__getitem__)
             else:
-                teacher = max(waiting, key=lambda t: (tokens[t] / (counts[t] + 1), -queued_at[t]))
+                teacher = max(waiting, key=lambda t: (plans[t][1] / (counts[t] + 1), -queued_at[t]))
 
-            # Borrow an unused or duplicate resident before displacing another waiting Teacher's only match.
             matching = [url for url in idle if self._resident[url] == teacher]
             unused = [url for url in idle if self._resident[url] not in waiting]
             copies = Counter(self._resident[url] for url in idle)
             spare = [url for url in idle if self._resident[url] not in unserved or copies[self._resident[url]] > 1]
             url = (matching or unused or spare or idle)[0]
             idle.remove(url)
-            assigned[teacher].append(url)
+            serving[url] = teacher
             counts[teacher] += 1
-        return {t: urls for t, urls in assigned.items() if urls}
-
-    def _take_batch(self, teacher: str, replicas_left: int = 1, *, in_flight: int = 0) -> dict[asyncio.Future, dict]:
-        queue = self._queues[teacher]
-        available = self._token_budget - in_flight
-        if replicas_left > 1:
-            # Share a short queue too, reserving at least one request for each remaining replica.
-            total = sum(len(payload["input_ids"]) for _, payload in queue.values())
-            available = min(available, (total + replicas_left - 1) // replicas_left)
-
-        batch = {}
-        for _ in range(len(queue) - replicas_left + 1):
-            reply = next(iter(queue))
-            _, payload = queue[reply]
-            length = len(payload["input_ids"])
-            # An idle replica may take one oversized request. A busy one must wait for space.
-            if length > available and (in_flight or batch):
-                break
-            batch[reply] = payload
-            available -= length
-            del queue[reply]
-        if not queue:
-            del self._queues[teacher]
-        return batch
+            assigned[teacher] += 1
+            # Rebalance only this route's unsent work when it gains a replica.
+            plans[teacher] = split(teacher)
+        return plans
 
     async def _run_batches(self) -> None:
         scoring: dict[asyncio.Task, tuple[str, asyncio.Future, int]] = {}
@@ -412,8 +428,7 @@ class SharedTeacherManager:
             while self._queues or scoring or switching:
                 self._wakeup.clear()
                 self._finish_completed(scoring, switching)
-                serving = self._dispatch_idle_replicas(scoring, switching)
-                self._refill_busy_replicas(scoring, serving)
+                self._dispatch_queued(scoring, switching)
                 if scoring or switching:
                     await self._wakeup.wait()
         except BaseException as exc:
@@ -426,10 +441,16 @@ class SharedTeacherManager:
             if not task.done():
                 continue
             # Keep the reply registered until success so a lost connection fails its caller too.
-            result = task.result()
-            _, reply, _ = scoring.pop(task)
-            if not reply.done():
-                reply.set_result(result)
+            _, reply, _ = scoring[task]
+            try:
+                result = task.result()
+            except _ScoreRejectedError as exc:
+                if not reply.done():
+                    reply.set_exception(exc)
+            else:
+                if not reply.done():
+                    reply.set_result(result)
+            del scoring[task]
 
         for task in tuple(switching):
             if not task.done():
@@ -439,44 +460,42 @@ class SharedTeacherManager:
             self._resident[url] = teacher
             self._dispatch_scores(url, batch, scoring)
 
-    def _dispatch_idle_replicas(self, scoring: dict, switching: dict) -> dict[str, str]:
-        serving = {url: self._resident[url] for url, _, _ in scoring.values()}
-        serving.update((url, teacher) for url, teacher, _ in switching.values())
-        for teacher, urls in self._assign_replicas(serving).items():
-            for index, url in enumerate(urls):
-                batch = self._take_batch(teacher, len(urls) - index)
-                serving[url] = teacher
-                if self._resident[url] == teacher:
-                    self._dispatch_scores(url, batch, scoring)
-                    continue
-                task = self._start_engine_task(self._send_command(url, "switch", teacher))
-                switching[task] = (url, teacher, batch)
-        return serving
-
-    def _refill_busy_replicas(self, scoring: dict, serving: dict[str, str]) -> None:
+    def _dispatch_queued(self, scoring: dict, switching: dict) -> None:
         if not self._queues:
             return
         in_flight = Counter()
         for url, _, length in scoring.values():
             in_flight[url] += length
+        serving = {url: self._resident[url] for url in in_flight}
+        pending = {}
+        for url, teacher, batch in switching.values():
+            serving[url] = teacher
+            pending[url] = batch
+            in_flight[url] = sum(length for reply, (_, length) in batch.items() if not reply.done())
 
-        drain = None
-        if self._queues.keys() - set(serving.values()):
-            # Prefer a spare replica, then the one with the fewest tokens. Pool order breaks ties.
-            counts = Counter(serving.values())
-            active = [url for url in self.urls if url in in_flight]
-            spare = [url for url in active if serving[url] not in self._queues or counts[serving[url]] > 1]
-            drain = min(spare or active, key=in_flight.__getitem__, default=None)
-
-        for url, tokens in in_flight.items():
-            teacher = serving[url]
-            if url != drain and tokens and teacher in self._queues:
-                self._dispatch_scores(url, self._take_batch(teacher, in_flight=tokens), scoring)
+        for teacher, (batches, _) in self._plan_batches(serving, in_flight).items():
+            queue = self._queues[teacher]
+            for url, batch in batches.items():
+                if not batch:
+                    continue
+                for reply in batch:
+                    del queue[reply]
+                if url in pending:
+                    pending[url].update(batch)
+                elif self._resident[url] == teacher:
+                    self._dispatch_scores(url, batch, scoring)
+                else:
+                    task = self._start_engine_task(self._send_command(url, "switch", teacher))
+                    switching[task] = (url, teacher, batch)
+            if not queue:
+                del self._queues[teacher]
 
     def _dispatch_scores(self, url: str, batch: dict, scoring: dict) -> None:
-        for reply, payload in batch.items():
+        for reply, (payload, length) in batch.items():
+            if reply.done():
+                continue
             task = self._start_engine_task(self._generate(url, payload))
-            scoring[task] = (url, reply, len(payload["input_ids"]))
+            scoring[task] = (url, reply, length)
 
     def _start_engine_task(self, coro: Coroutine) -> asyncio.Task:
         task = asyncio.create_task(coro)

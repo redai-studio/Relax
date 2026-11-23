@@ -411,7 +411,10 @@ class OpdManager:
     ) -> opd_main_worker.LogprobResponse:
         import ray
 
-        score_ref = self.args._opd_shared_teacher_manager.score.remote(sample.metadata["teacher_id"], payload)
+        budget = {"token_count": len(expected_input_ids)} if expected_input_ids is not None else {}
+        score_ref = self.args._opd_shared_teacher_manager.score.remote(
+            sample.metadata["teacher_id"], payload, **budget
+        )
         try:
             data = await score_ref
         except asyncio.CancelledError:
@@ -559,6 +562,8 @@ class OpdManager:
                     if native
                     else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
                 )
+        if self.use_shared_teacher and (missing := [name for name, value in fields.items() if value is None]):
+            raise RuntimeError(f"Missing shared Teacher fields for sample_index={sample.index}: {', '.join(missing)}")
         for name, value in fields.items():
             setattr(sample, name, value)
 
@@ -598,15 +603,16 @@ class OpdManager:
         resp_obj = await self._post_logprob(
             session, student_url, payload, sample, "student-at-teacher-topk", sample.tokens if native else None
         )
-        if resp_obj is None:
-            return
-        sample.student_at_teacher_topk_log_probs = (
-            resp_obj.strict_topk(
-                "input_token_ids_logprobs", response_length, self.topk_worker.top_k, teacher_topk_ids
-            )[1]
-            if native
-            else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
-        )
+        if resp_obj is not None:
+            sample.student_at_teacher_topk_log_probs = (
+                resp_obj.strict_topk(
+                    "input_token_ids_logprobs", response_length, self.topk_worker.top_k, teacher_topk_ids
+                )[1]
+                if native
+                else self.topk_worker.parse_prefill_other_topk(resp_obj, response_length)
+            )
+        if self.use_shared_teacher and (resp_obj is None or sample.student_at_teacher_topk_log_probs is None):
+            raise RuntimeError(f"Missing Student scores at Teacher top-k IDs for sample_index={sample.index}")
 
     def _assemble_transfer(self, samples: list[Sample]) -> None:
         if self.topk_worker is None:

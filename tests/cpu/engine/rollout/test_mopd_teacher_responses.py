@@ -6,6 +6,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import numpy as np
+import pybase64
 import pytest
 
 from relax.engine.rollout import on_policy_distillation as opd
@@ -282,7 +284,33 @@ async def test_bad_shared_response_rejects_batch_with_successful_sibling():
 
 
 @pytest.mark.asyncio
-async def test_shared_teacher_topk_queries_student_via_original_router(monkeypatch):
+@pytest.mark.parametrize(
+    ("selection", "missing_key"),
+    [("student_topk", "teacher_at_student_topk_log_probs"), ("teacher_topk", "teacher_topk_token_ids")],
+)
+async def test_shared_text_prefill_rejects_missing_teacher_topk(selection, missing_key):
+    score = AsyncMock(return_value={"meta_info": {"input_token_logprobs": [[None, 1], [-0.5, 2]]}})
+    manager = _shared_manager(
+        score, opd_token_selection=selection, opd_log_prob_top_k=1, opd_kl_coef=1, opd_loss_coef=0
+    )
+    sample = _scoring_sample(manager, "A")
+    sample.student_topk_token_ids = np.array([[3]])
+    with pytest.raises(RuntimeError, match=missing_key):
+        await manager.prefill(sample)
+    assert sample.opd_topk_token_ids is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "student_reply",
+    [
+        {"input_token_ids_logprobs": [None, [[-0.25, 3]]]},
+        {"input_token_ids_logprobs_val_b64": pybase64.b64encode(np.array([-0.25], dtype=np.float32)).decode()},
+        {},
+        None,
+    ],
+)
+async def test_shared_teacher_topk_queries_student_via_original_router(monkeypatch, student_reply):
     score = AsyncMock(
         return_value={
             "meta_info": {"input_token_logprobs": [[None, 1], [-0.5, 2]], "input_top_logprobs": [None, [[-0.2, 3]]]},
@@ -294,13 +322,23 @@ async def test_shared_teacher_topk_queries_student_via_original_router(monkeypat
         opd_log_prob_top_k=1,
         opd_kl_coef=1.0,
         opd_loss_coef=0.0,
+        opd_teacher_response_prefix_token_ids=[17],
         sglang_router_ip="student",
         sglang_router_port=80,
     )
-    direct = AsyncMock(return_value=LogprobResponse({"meta_info": {"input_token_ids_logprobs": [None, [[-0.25, 3]]]}}))
+    direct = AsyncMock(
+        return_value=LogprobResponse({"meta_info": student_reply}) if student_reply is not None else None
+    )
     monkeypatch.setattr(manager, "_post_logprob", direct)
     sample = _scoring_sample(manager, "A")
-    await manager.prefill(sample)
+    if student_reply:
+        await manager.prefill(sample)
+        assert sample.student_at_teacher_topk_log_probs.tolist() == [[-0.25]]
+    else:
+        with pytest.raises(RuntimeError, match="Missing Student scores"):
+            await manager.prefill(sample)
+        assert sample.student_at_teacher_topk_log_probs is None
     assert score.await_count == direct.await_count == 1
+    assert score.await_args.args[1]["input_ids"] == [1, 17, 2]
     assert direct.await_args.args[1] == "http://student:80/generate"
-    assert sample.student_at_teacher_topk_log_probs.tolist() == [[-0.25]]
+    assert direct.await_args.args[2]["input_ids"] == [1, 2]

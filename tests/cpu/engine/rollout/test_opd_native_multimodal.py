@@ -125,6 +125,7 @@ async def test_plain_image_opd_uses_collapsed_ids_raw_images_and_expanded_offset
         assert await manager._teacher_prefill(sample, None)
         route, payload = score.await_args.args
         assert route == "image"
+        assert score.await_args.kwargs == {"token_count": len(sample.tokens)}
     else:
         session = _Session(response)
         assert await _manager()._teacher_prefill(sample, session)
