@@ -15,6 +15,7 @@ from relax.engine.inference.discovery import new_manager_epoch
 from relax.engine.inference.lifecycle import AdmissionLedger, AdmissionScope
 from relax.engine.inference.placement import PlacementPlanner
 from relax.engine.inference.types import LifecycleState, Role, RoleSnapshot, RoutingSpec
+from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed
 from relax.utils.logging_utils import get_logger
 
 
@@ -658,6 +659,7 @@ class _ModelRuntime:
         async with self._transition:
             self._disposed = True
             self.ledger.fences.add("shutdown")
+            worker_cleanup_unconfirmed = False
             try:
                 try:
                     if self.pool is not None:
@@ -679,18 +681,25 @@ class _ModelRuntime:
                         await asyncio.wait_for(worker.close.remote(), timeout=30)
                     except ray.exceptions.ActorDiedError:
                         pass
+                    except RolloutCleanupUnconfirmed:
+                        worker_cleanup_unconfirmed = True
+                        raise
+                    except (asyncio.TimeoutError, ray.exceptions.ActorUnavailableError) as exc:
+                        worker_cleanup_unconfirmed = True
+                        raise RolloutCleanupUnconfirmed("Rollout worker cleanup is unconfirmed") from exc
                 await self.ledger.drain("shutdown", timeout=10)
             finally:
-                try:
-                    if self.pool is not None:
-                        await _blocking(self.pool.dispose)
-                        self.pool = None
-                        self.state = LifecycleState.DEAD
-                        self.memory_ready = False
-                        self.resident = False
-                finally:
-                    if worker is not None:
-                        ray.kill(worker)
+                if not worker_cleanup_unconfirmed:
+                    try:
+                        if self.pool is not None:
+                            await _blocking(self.pool.dispose)
+                            self.pool = None
+                            self.state = LifecycleState.DEAD
+                            self.memory_ready = False
+                            self.resident = False
+                    finally:
+                        if worker is not None:
+                            ray.kill(worker)
 
 
 @ray.remote(num_cpus=1, num_gpus=0, max_concurrency=4096)

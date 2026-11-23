@@ -1,8 +1,22 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+import asyncio
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
+
+
+class RolloutCleanupUnconfirmed(RuntimeError):
+    """The worker may still be using its workload resources."""
+
+
+rollout_group_cleanup: ContextVar[Callable[[asyncio.Future], None] | None] = ContextVar(
+    "rollout_group_cleanup", default=None
+)
 
 
 @dataclass

@@ -26,7 +26,7 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rewards.async_eval import is_eval_reward_pending
 from relax.engine.rollout import on_policy_distillation as opd
-from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, rollout_group_cleanup
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -963,7 +963,10 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
                 # any outstanding inference.
                 for pending in state.pendings:
                     pending.cancel()
-                asyncio.gather(*done, *state.pendings, return_exceptions=True)
+                cleanup = asyncio.gather(*done, *state.pendings, return_exceptions=True)
+                track_cleanup = rollout_group_cleanup.get()
+                if track_cleanup is not None:
+                    track_cleanup(cleanup)
                 state.pendings.clear()
                 raise failure
 

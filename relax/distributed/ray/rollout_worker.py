@@ -6,14 +6,19 @@ GPU handles and Router processes belong to the Manager.
 """
 
 import asyncio
+from concurrent.futures import Future
 from typing import Any
 
 import ray
 
+from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed, rollout_group_cleanup
 from relax.engine.rollout.workload import RolloutWorkload
 from relax.utils.http_utils import init_http_client
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
+
+
+_WORKLOAD_DRAIN_TIMEOUT_S = 20.0
 
 
 class _InferencePort:
@@ -46,7 +51,7 @@ class RolloutWorker:
         self._generation_completed = False
         self._training_ready = False
         self._phase_lock = asyncio.Lock()
-        self._active: set[asyncio.Task] = set()
+        self._active: set[asyncio.Future] = set()
         init_tracking(args, primary=False)
         init_http_client(args)
         client = attach_tq_client(args.tq_config, role="rollout_worker")
@@ -75,7 +80,22 @@ class RolloutWorker:
     async def _run(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self._closed:
             raise RuntimeError("Rollout worker is closed")
-        task = asyncio.create_task(getattr(self.workload, method)(*args, **kwargs))
+        worker_loop = asyncio.get_running_loop()
+
+        def track_cleanup(cleanup: asyncio.Future) -> None:
+            async def wait_for_cleanup() -> None:
+                await cleanup
+
+            # Rollout generation may run on the rollout loop in another
+            # thread. Publish ownership before it can return to the worker.
+            completion = asyncio.run_coroutine_threadsafe(wait_for_cleanup(), cleanup.get_loop())
+            worker_loop.call_soon_threadsafe(self._track_group_cleanup, completion)
+
+        token = rollout_group_cleanup.set(track_cleanup)
+        try:
+            task = asyncio.create_task(getattr(self.workload, method)(*args, **kwargs))
+        finally:
+            rollout_group_cleanup.reset(token)
         self._active.add(task)
         try:
             # A caller cancellation must not hide a still-running generation
@@ -86,6 +106,11 @@ class RolloutWorker:
                 self._active.discard(task)
             else:
                 task.add_done_callback(self._active.discard)
+
+    def _track_group_cleanup(self, completion: Future[None]) -> None:
+        cleanup = asyncio.wrap_future(completion)
+        self._active.add(cleanup)
+        cleanup.add_done_callback(self._active.discard)
 
     async def _activate_generation(self) -> None:
         async def activate() -> None:
@@ -237,9 +262,19 @@ class RolloutWorker:
 
     async def close(self) -> None:
         self._closed = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _WORKLOAD_DRAIN_TIMEOUT_S
+        while self._active:
+            done, pending = await asyncio.wait(tuple(self._active), timeout=max(0.0, deadline - loop.time()))
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+            self._active.difference_update(done)
+            if pending:
+                raise RolloutCleanupUnconfirmed(
+                    f"Rollout worker cleanup is unconfirmed: {len(pending)} active task(s)"
+                )
         try:
-            if self._active:
-                await asyncio.gather(*tuple(self._active), return_exceptions=True)
             try:
                 await self.workload.close()
             finally:

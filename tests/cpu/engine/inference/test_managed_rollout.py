@@ -582,6 +582,114 @@ async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
     assert owner.pool is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("times_out", [False, True])
+async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, times_out):
+    from unittest.mock import AsyncMock
+
+    from relax.distributed.ray import rollout_worker
+    from relax.engine.rollout import sglang_rollout
+    from relax.utils.async_utils import run
+    from relax.utils.http_utils import DistributedPostUnconfirmed
+
+    worker_loop = asyncio.get_running_loop()
+    cleanup_started, closing = asyncio.Event(), asyncio.Event()
+    events = []
+    finish_cleanup = worker_loop.create_future()
+
+    async def abort_rollout(args, rollout_id):
+        assert asyncio.get_running_loop() is not worker_loop
+        state = SimpleNamespace(
+            aborted=False, evaluating=0, protected_pendings=set(), pendings=set(), abort_event=asyncio.Event()
+        )
+
+        async def dispatch_fault():
+            await state.abort_event.wait()
+            raise DistributedPostUnconfirmed("poster stop unconfirmed")
+
+        async def custom_reward():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                worker_loop.call_soon_threadsafe(cleanup_started.set)
+                # Keep cleaning up on the rollout thread after abort() returns.
+                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(wait_for_reward(), worker_loop))
+                events.append("reward cleaned")
+
+        monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+        state.pendings.update(asyncio.create_task(fn()) for fn in (dispatch_fault, custom_reward))
+        await sglang_rollout.abort(args, rollout_id)
+
+    async def wait_for_reward():
+        await finish_cleanup
+
+    async def workers(url):
+        return {"urls": [], "workers": []}
+
+    def generate(args, rollout_id, *unused, evaluation):
+        run(abort_rollout(args, rollout_id))
+
+    def load_function(path):
+        return generate
+
+    owner = manager()
+    args = SimpleNamespace(
+        ci_test=False,
+        custom_convert_samples_to_train_data_path=None,
+        custom_reward_post_process_path=None,
+        eval_function_path="unused",
+        rollout_function_path="unused",
+        sglang_router_ip="router",
+        sglang_router_port=80,
+        tq_config={},
+        use_slime_router=False,
+    )
+    manager_handle = SimpleNamespace(
+        wait_ready=SimpleNamespace(remote=AsyncMock()),
+        begin_rollout=SimpleNamespace(remote=AsyncMock()),
+        pool_call=SimpleNamespace(remote=AsyncMock()),
+    )
+    monkeypatch.setattr(rollout_worker, "init_tracking", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rollout_worker, "init_http_client", lambda *args: None)
+    monkeypatch.setattr(rollout_worker, "attach_tq_client", lambda *args, **kwargs: object())
+    monkeypatch.setattr(rollout_worker, "detach_tq_client", lambda: events.append("detached"))
+    monkeypatch.setattr("relax.engine.rollout.workload.load_function", load_function)
+    monkeypatch.setattr(sglang_rollout, "get", workers)
+    monkeypatch.setattr(ray, "kill", lambda worker: events.append("worker stopped"))
+    worker = rollout_worker.RolloutWorker.__ray_metadata__.modified_class(args, object(), manager_handle)
+
+    async def close():
+        closing.set()
+        await worker.close()
+
+    handle = SimpleNamespace(close=SimpleNamespace(remote=close))
+    try:
+        with pytest.raises(DistributedPostUnconfirmed, match="poster stop unconfirmed"):
+            await asyncio.wait_for(worker.generate(1), 2)
+        await asyncio.wait_for(cleanup_started.wait(), 2)
+
+        if times_out:
+            monkeypatch.setattr(rollout_worker, "_WORKLOAD_DRAIN_TIMEOUT_S", 0.01, raising=False)
+        disposal = asyncio.create_task(owner.dispose(handle))
+        await asyncio.wait_for(closing.wait(), 2)
+        assert not disposal.done()
+        assert not events
+        if times_out:
+            with pytest.raises(RuntimeError, match="Rollout worker cleanup is unconfirmed"):
+                await asyncio.wait_for(disposal, 2)
+            assert not events
+            assert owner.pool is not None
+            monkeypatch.setattr(rollout_worker, "_WORKLOAD_DRAIN_TIMEOUT_S", 2.0)
+            disposal = asyncio.create_task(owner.dispose(handle))
+        finish_cleanup.set_result(None)
+        await asyncio.wait_for(disposal, 2)
+        assert events == ["reward cleaned", "detached", "worker stopped"]
+        assert owner.pool is None
+    finally:
+        if not finish_cleanup.done():
+            finish_cleanup.set_result(None)
+
+
 @pytest.mark.parametrize("role", ["genrm", "teacher"])
 def test_independent_auxiliary_tasks_select_managed_path(role):
     from relax.distributed.ray.inference_handle import use_managed_auxiliary
