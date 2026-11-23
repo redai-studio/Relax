@@ -58,17 +58,6 @@ def enable_grouped_fusion(owner):
         module.disable_parameter_transpose_cache = True
         for p in weights:
             p.overwrite_main_grad = p._gbuf.is_data_distributed
-    native = owner.all_gather_and_wait_parameters_ready
-
-    def wait_and_set_overwrite(params, *args, **kwargs):
-        params = list(params)
-        result = native(params, *args, **kwargs)
-        for p in params:
-            if id(p) in selected:
-                p.overwrite_main_grad = p._gbuf.is_data_distributed
-        return result
-
-    owner.all_gather_and_wait_parameters_ready = wait_and_set_overwrite
     owner._relax_expert_wgrad_installed = True
     return {
         "modules": len(modules),
