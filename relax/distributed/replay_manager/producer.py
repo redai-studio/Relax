@@ -126,10 +126,10 @@ class Producer:
             kind=kind, layers=layers, topk=topk, codec=codec, engine_publisher=engine_publisher
         )
 
-    def _publish_response(self, values: Any, *, kind: str, tokens: list[int]) -> dict:
+    def _publish_response(self, values: Any, *, kind: str, tokens: list[int], codec: str = "int32") -> dict:
         import numpy as np
 
-        publication = self.begin(kind=kind, layers=values.shape[1], topk=values.shape[2])
+        publication = self.begin(kind=kind, layers=values.shape[1], topk=values.shape[2], codec=codec)
         try:
             for start in range(0, len(values), publication.chunk_rows):
                 stop = min(start + publication.chunk_rows, len(values))
@@ -310,14 +310,30 @@ class ProducerPublication:
             else:
                 pending.append(future)
         self._futures = pending
-        byte_payload = self.codec == "bf16-raw-v1"
-        width = self.topk * 2 if byte_payload else (self.topk if self.codec == "int32" else encoded_width)
+        byte_payload = self.codec in {"bf16-raw-v1", "uint8"}
+        width = (
+            self.topk * replay_codec(self.codec).element_bytes
+            if byte_payload
+            else (self.topk if self.codec == "int32" else encoded_width)
+        )
         if not byte_payload and self.codec != "int32":
             replay_codec(self.codec).validate_width(width)
         size = count * width * (1 if byte_payload else 4)
 
         def snapshot(layer: int) -> Any:
             values = snapshot_layer(layer)
+            if self.codec == "uint8":
+                if (
+                    not isinstance(values, np.ndarray)
+                    or values.dtype not in (np.uint8, np.int32, np.int64)
+                    or values.shape != (count, self.topk)
+                ):
+                    raise ValueError("Uint8 MoE replay requires an integer routing snapshot")
+                # These are bounded, completed CPU snapshots. Never narrow GPU
+                # tensors or silently wrap negative / >255 expert indices.
+                if values.min() < 0 or values.max() > 255:
+                    raise ValueError("Uint8 MoE replay expert indices must be in [0, 255]")
+                return values.astype(np.uint8, order="C", copy=True)
             dtype = np.uint8 if byte_payload else np.int32
             if not isinstance(values, np.ndarray) or values.dtype != dtype or values.shape != (count, width):
                 raise ValueError("Replay layer snapshot differs from its codec shape/dtype")
@@ -326,7 +342,9 @@ class ProducerPublication:
         # Amortize RPCs across layers while preserving one key per layer.
         # Admission still happens before snapshots; packing runs on the writer.
         batch_budget = (
-            self.writer.capacity_bytes if self.codec != "int32" else min(self.writer.capacity_bytes, 1 << 20)
+            min(self.writer.capacity_bytes, 1 << 20)
+            if self.codec in {"int32", "uint8"}
+            else self.writer.capacity_bytes
         )
         layers_per_batch = max(1, batch_budget // size)
         for first in range(0, self.layers, layers_per_batch):

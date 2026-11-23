@@ -74,6 +74,31 @@ MM supports Qwen3.5 MoE and multimodal Qwen3.8 checkpoints with visual widths of
 
 Capture occurs after the visual merger. Training loads BF16 outputs on the input PP stage and broadcasts within the TP group, without quantization. Reference R3 requires static CP and excludes combined 1F1B MoE overlap. Use an image with matching SGLang and Megatron patches; these experiments used SGLang 0.5.21.
 
+## DAPO-Math 50k comparison (2026-11-23)
+
+The three runs used the same model, dataset and parallel configuration. Each completed one optimizer step, with every sample generating exactly 50,000 tokens. MM replay was disabled.
+
+| Parameter | Configuration |
+| --- | --- |
+| Model / dataset | Qwen3.5-35B-A3B / DAPO-Math-17k |
+| Hardware / mode | 2 nodes, 16 Blackwell GPUs, colocated Actor and rollout |
+| Training TP / PP / CP / EP / ETP | 2 / 1 / 2 / 8 / 1 |
+| Rollout | 8 TP2 engines, at most 16 requests per engine |
+| Prompts × samples per prompt / GBS | 32 × 16 / 512 |
+| Micro-batch / dynamic token budget per GPU | 1 / 65,536 |
+| Response length / context limit | 50,000 / 65,536 tokens |
+| MTP | NEXTN, draft steps=2, draft tokens=3, top-k=1 |
+| Precision / optimizer | BF16 / Adam, lr=1e-6, CPU offload |
+| Total output per run | 25,600,000 tokens |
+
+| Configuration | End-to-end s | Training s | End-to-end change vs baseline | Mismatch KL | R3 foreground wait s | Status |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| R3 disabled | 1382 | 501.16 | — | 0.000701 | — | Completed |
+| R3 uint8 | 1595 | 674.42 | +15.4% | 0.000491 | 117.76 | Completed |
+| R3 uint8 + CPU cache reclamation and progressive prefetch | 1445 | 522.06 | +4.6% | 0.000494 | 0.048 | Completed |
+
+End-to-end time runs from rollout start through training data cleanup for that step, including checkpoint saving and final weight synchronization. Training time is `perf/train_time`, and R3 foreground wait is `perf/replay_consumer_wait_time`. After the prefetch changes, training time was 4.2% above replay-disabled and mismatch KL was 29.6% lower. Each run covers one complete step.
+
 ## Split-branch experiment record (2026-11-22)
 
 Model: **Qwen3.5-35B-A3B**. Each experiment uses **8 × 280G Blackwell GPUs on one node**. Replay is **R3+MM reference**, without QSA/DSA. Each run has 10 steps and saves no model checkpoint. Values below are arithmetic means over steps 1–9, excluding step 0. Rewards are omitted.

@@ -76,6 +76,31 @@ MM 支持 Qwen3.5 MoE 和 Qwen3.8 多模态 checkpoint，分别要求 2048 和 2
 
 启用 rollout 调试转储后，生产端会在向训练发送样本前复制 MoE 路由，分区清理后仍可读取转储。MM embedding 引用只在当前作业有效。
 
+## DAPO-Math 50k 对比结果（2026-11-23）
+
+三组实验使用相同模型、数据和并行配置，每组完成 1 个优化器步。所有样本均实际生成 50,000 token，MM replay 关闭。
+
+| 参数 | 配置 |
+| --- | --- |
+| 模型 / 数据 | Qwen3.5-35B-A3B / DAPO-Math-17k |
+| 硬件 / 模式 | 2 机 16 张 Blackwell GPU，Actor 与 rollout 共卡 |
+| 训练 TP / PP / CP / EP / ETP | 2 / 1 / 2 / 8 / 1 |
+| Rollout | 8 个 TP2 引擎，每引擎最多 16 个请求 |
+| Prompt 数 × 每题采样数 / GBS | 32 × 16 / 512 |
+| Micro-batch / 每卡动态 token 预算 | 1 / 65,536 |
+| 回复长度 / Context 上限 | 50,000 / 65,536 token |
+| MTP | NEXTN，draft steps=2，draft tokens=3，top-k=1 |
+| 精度 / 优化器 | BF16 / Adam，lr=1e-6，CPU offload |
+| 每组总输出 | 25,600,000 token |
+
+| 配置 | 端到端秒 | 训练秒 | 相对基线的端到端耗时 | Mismatch KL | R3 前台等待秒 | 状态 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| R3 关闭 | 1382 | 501.16 | — | 0.000701 | — | 完成 |
+| R3 uint8 | 1595 | 674.42 | +15.4% | 0.000491 | 117.76 | 完成 |
+| R3 uint8 + CPU 缓存回收与逐层预取 | 1445 | 522.06 | +4.6% | 0.000494 | 0.048 | 完成 |
+
+端到端时间从 rollout 开始计至该步训练数据清理完成，包含 checkpoint 保存和最终权重同步。训练时间为 `perf/train_time`，R3 前台等待为 `perf/replay_consumer_wait_time`。调整后的训练时间比关闭 R3 增加 4.2%，mismatch KL 降低 29.6%。每组只有一个完整步骤。
+
 ## 拆分分支实验记录（2026-11-22）
 
 模型为 **Qwen3.5-35B-A3B**，每个实验独立使用单机 **8 张 280G Blackwell GPU**。Replay 为 **R3+MM reference**，不开 QSA/DSA。每组 10 步，不保存模型；下表为剔除 step 0 后 step 1–9 的算术均值，不报告 reward。

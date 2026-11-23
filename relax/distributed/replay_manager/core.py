@@ -738,10 +738,12 @@ class ReplayInventory:
         if any(key in item["blocks"] for key in keys):
             raise ValueError("Replay blocks are write-once")
         size = count * item["topk"] * 4 * len(keys)
-        if item.get("codec") == "bf16-raw-v1":
-            expected = count * item["topk"] * 2 * len(keys)
+        if item.get("codec") in {"bf16-raw-v1", "uint8"}:
+            from .codecs import replay_codec
+
+            expected = count * item["topk"] * replay_codec(item["codec"]).element_bytes * len(keys)
             if encoded_bytes != expected:
-                raise ValueError("Invalid BF16 byte reservation")
+                raise ValueError("Invalid replay byte reservation")
             size = expected
         elif item.get("codec", "int32") != "int32":
             from .codecs import replay_codec
