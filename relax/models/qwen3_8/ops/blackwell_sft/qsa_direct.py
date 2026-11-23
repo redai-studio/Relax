@@ -109,10 +109,10 @@ def install():
             or selection.compress_ratio != 4
             or selection.selected_ids is None
             or Envs.RELAX_QWEN38_QSA_MIXED_LONG_BACKEND != "grouped"
+            or Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN != -1
+            or Envs.RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN != 0
         ):
             return native(q, k, v, selection, scale, is_thd)
-        if Envs.RELAX_QWEN38_QSA_MIXED_FLASH_MAX_LEN != -1 or Envs.RELAX_QWEN38_QSA_MIXED_FLEX_MAX_LEN != 0:
-            raise RuntimeError("Direct QSA needs its audited document routing")
         ids = selection.selected_ids.view(length, -1)
         positions = selection.positions.view(-1)
         bounds = getattr(selection, "_relax_qsa_mixed_bounds", None)

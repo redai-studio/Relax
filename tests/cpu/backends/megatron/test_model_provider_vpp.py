@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -136,7 +137,9 @@ def _install_fake_megatron(monkeypatch, provider=None):
     misc.resolve_is_vl_model = resolve_is_vl_model
     # Stub the real megatron.training.training.get_megatron_ddp_config: it reads a long tail
     # of Megatron-parser-only args off the namespace, which these fake args don't carry.
-    training_training.get_megatron_ddp_config = lambda args: {"fake_ddp_config_for": args.megatron_to_hf_mode}
+    training_training.get_megatron_ddp_config = Mock(
+        return_value=SimpleNamespace(data_parallel_sharding_strategy="optim_grads_params", overlap_grad_reduce=True)
+    )
 
     modules = {
         "megatron": megatron,
@@ -878,10 +881,12 @@ def test_bridge_distributed_model_uses_megatron_fsdp(monkeypatch):
 
     assert len(model) == 1
     assert len(provider.pre_wrap_hooks) == 1
+    ddp_config = sys.modules["megatron.training.training"].get_megatron_ddp_config.return_value
+    assert provider.distributed_calls[0]["ddp_config"] is ddp_config
     assert provider.distributed_calls == [
         {
             "wrap_with_ddp": True,
-            "ddp_config": {"fake_ddp_config_for": "bridge"},
+            "ddp_config": ddp_config,
             "fp16": False,
             "bf16": True,
             "use_megatron_fsdp": True,

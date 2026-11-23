@@ -160,12 +160,10 @@ def _picklable_config_snapshot(config: Any) -> Any:
     which pickle has no dotted path for). Both exist only because Megatron-FSDP
     built the model, and only surface with PP > 1.
 
-    Whether an attribute is a declared dataclass field says nothing about whether
-    its *value* pickles — ``_pg_collection`` is declared, and filtering on that
-    signal is what let it slip through an earlier fix. Clean nested runtime
-    state with Bridge's helper, then probe remaining attributes empirically
-    to cover opaque state and values beyond its recursion limit. This also
-    supports non-dataclass configs used by custom providers.
+    Declared dataclass fields such as ``_pg_collection`` can hold values that
+    pickle cannot serialize. Clean nested runtime state with Bridge's helper,
+    then probe remaining attributes for opaque values and state beyond its
+    recursion limit. This also supports non-dataclass configs.
 
     Safe to drop: receiving ranks only read hyperparameters off this config
     through a ``SimpleNamespace(config=config)`` shim for tasks with no local

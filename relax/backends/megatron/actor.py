@@ -488,12 +488,10 @@ class MegatronTrainRayActor(TrainRayActor):
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
         patch_checkpoint_write()
-        if role == "reference" or role == "actor_fwd":
-            process_args(args, role)
-            if role == "actor_fwd":
-                from relax.distributed.replay_manager.config import validate_reference_training
+        if role == "actor_fwd":
+            from relax.distributed.replay_manager.config import validate_reference_training
 
-                validate_reference_training(args)
+            validate_reference_training(args)
         super().init(args, role, with_ref, with_opd_teacher)
 
         # Materialize an S3 checkpoint on this node before Megatron init(args)

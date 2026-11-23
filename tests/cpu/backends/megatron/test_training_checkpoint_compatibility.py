@@ -112,7 +112,7 @@ def test_reset_sgd_momentum_prevents_zero_gradient_update(reset):
 
 
 @pytest.mark.parametrize("fsdp,requested_overlap", [(True, False), (True, True), (False, True)])
-def test_train_uses_effective_overlap_and_preserves_last_backward_sync(fsdp, requested_overlap):
+def test_train_uses_effective_overlap_and_preserves_last_backward_sync(monkeypatch, fsdp, requested_overlap):
     args = SimpleNamespace(
         overlap_grad_reduce=requested_overlap,
         align_grad_reduce=True,
@@ -120,9 +120,19 @@ def test_train_uses_effective_overlap_and_preserves_last_backward_sync(fsdp, req
         reset_optimizer_states=False,
     )
     config = SimpleNamespace(no_sync_func=None, grad_sync_func=None)
-    wrapper = SimpleNamespace(
+
+    class DDP(SimpleNamespace):
+        pass
+
+    class FSDP(SimpleNamespace):
+        pass
+
+    adapter = SimpleNamespace(FullyShardedDataParallelV1=FSDP)
+    monkeypatch.setitem(sys.modules, "megatron.core.distributed.fsdp", SimpleNamespace(mcore_fsdp_adapter=adapter))
+    wrapper = (FSDP if fsdp else DDP)(
         ddp_config=SimpleNamespace(overlap_grad_reduce=True, use_megatron_fsdp=fsdp),
         train=Mock(),
+        parameters=lambda: iter(()),
         no_sync=Mock(return_value=nullcontext()),
         start_grad_sync=Mock(),
     )
@@ -135,11 +145,11 @@ def test_train_uses_effective_overlap_and_preserves_last_backward_sync(fsdp, req
 
     module = _load(
         "relax/backends/megatron/model.py",
-        {"train"},
+        {"train", "_get_distributed_wrapper_classes", "_is_distributed_wrapper"},
         {
             "get_args": lambda: args,
             "DataIterator": type("DataIterator", (), {}),
-            "_is_distributed_wrapper": lambda model: True,
+            "DDP": DDP,
             "get_model_config": lambda model: config,
             "finalize_model_grads": Mock(),
             "resident_sft_param_overlap_enabled": lambda args: False,

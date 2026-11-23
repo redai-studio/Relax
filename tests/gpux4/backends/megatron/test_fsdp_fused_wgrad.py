@@ -154,3 +154,91 @@ def _worker(rank: int, rendezvous: str) -> None:
 def test_fsdp_fused_experts_and_shared_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     mp.spawn(_worker, args=(f"file://{tmp_path / 'rdzv'}",), nprocs=4, join=True)
+
+
+def _cold_mtp_worker(rank: int, rendezvous: str) -> None:
+    from megatron.core import parallel_state, tensor_parallel
+    from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import BucketStatus
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    from relax.models.common.chunked_mtp_loss import process_mtp_loss
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(minutes=2))
+    parallel_state.initialize_model_parallel()
+    try:
+        tensor_parallel.model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            gradient_accumulation_fusion=False,
+            perform_initialization=False,
+            mtp_num_layers=1,
+            calculate_per_token_loss=True,
+        )
+        model = torch.nn.Module()
+        model.config = config
+        model.output_layer = ColumnParallelLinear(
+            64, 64, config=config, init_method=lambda w: w, bias=False, skip_bias_add=True
+        ).cuda()
+        generator = torch.Generator(device="cuda").manual_seed(214)
+        weight = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16, generator=generator)
+        with torch.no_grad():
+            model.output_layer.weight.copy_(weight)
+        ddp = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_param_gather=True,
+            overlap_grad_reduce=True,
+            bucket_size=1,
+            suggested_communication_unit_size=1,
+            fsdp_all_gather_in_start_param_sync=False,
+        )
+        owner = FullyShardedDataParallel(config, ddp, model).module
+        owner.start_param_sync()
+        head = model.output_layer
+        bucket_id = owner.param_and_grad_buffer.param_to_param_group[head.weight]
+        pipeline = owner.all_gather_pipeline
+        assert pipeline.bucket_status[pipeline.get_bucket_key(bucket_id, False)] == BucketStatus.EMPTY
+
+        # The untied output head has not run. A detached weight must bind to
+        # the gathered storage before the first native MTP projection.
+        seq_len = 1027  # Cross the default 1024-token MTP chunk boundary.
+        hidden = torch.randn(2 * seq_len, 1, 64, device="cuda", dtype=torch.bfloat16, generator=generator)
+        labels = torch.arange(seq_len, device="cuda").remainder(64).unsqueeze(0)
+        projections = []
+
+        def token_loss(targets, logits):
+            projections.append(logits.detach())
+            return F.cross_entropy(logits.squeeze(1).float(), targets.flatten(), reduction="none").unsqueeze(0)
+
+        process_mtp_loss(
+            hidden,
+            labels,
+            torch.ones_like(labels),
+            head,
+            None,
+            False,
+            False,
+            token_loss,
+            config,
+            cp_group=parallel_state.get_context_parallel_group(),
+            scale_logits_fn=lambda x: x,
+        )
+        torch.testing.assert_close(torch.cat(projections), F.linear(hidden[seq_len:], weight))
+    finally:
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs for a sharded output head")
+def test_native_chunked_mtp_gathers_cold_untied_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    monkeypatch.setenv("RELAX_MTP_CE_IMPL", "native")
+    mp.spawn(_cold_mtp_worker, args=(f"file://{tmp_path / 'cold-mtp'}",), nprocs=2, join=True)

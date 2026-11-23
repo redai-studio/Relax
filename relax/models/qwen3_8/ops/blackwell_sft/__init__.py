@@ -66,7 +66,7 @@ def initialize_mfsdp(args: Namespace) -> None:
     microbatch_order.install(args)
     packed_gdn.install()
     ragged_gemm.install()
-    expanded_dispatch.install(args)
+    expanded_dispatch.install()
     moe_tail.install(args)
     initialize_paired(args)
     qsa_documents.install()

@@ -162,14 +162,4 @@ TRAIN_ARGS=(
     "$@"
 )
 
-qwen38_write_config
-
-: "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs HTTP endpoint}"
-cd "${RELAX}"
-mkdir -p "${SAVE_DIR}/logs"
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS}" \
-    --submission-id "${SUBMISSION_ID}" \
-    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
-    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}" \
-    2>&1 | tee "${SAVE_DIR}/logs/${EXP_NAME}-${now}.log"
+qwen38_submit

@@ -130,6 +130,7 @@ jobs:
         run: |
           read -r -a pytest_args <<< "$PYTEST_ARGS"
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            export RELAX_MEGATRON_PATCHED_SOURCE="${RELAX_MEGATRON_PATCHED_SOURCE:-${RELAX_MEGATRON_ROOT:?}}"
             python -m pytest "$@" -v -ra --tb=short --durations=50 --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           ' bash "${pytest_args[@]}"

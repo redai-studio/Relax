@@ -140,7 +140,7 @@ qwen38_write_config() {
     # Retain the effective argv and worker environment for old/new comparison.
     if [[ "${DRY_RUN:-0}" != 1 ]]; then
     mkdir -p "${SAVE_DIR}/logs"
-    python3 - "${SAVE_DIR}/logs/effective-config.json" "${RUNTIME_ENV_JSON}" "${TRAIN_ARGS[@]}" <<'PYCONFIG'
+    python3 - "${SAVE_DIR}/logs/${EXP_NAME}-${now}.effective-config.json" "${RUNTIME_ENV_JSON}" "${TRAIN_ARGS[@]}" <<'PYCONFIG'
 import json
 import sys
 from pathlib import Path
@@ -163,4 +163,18 @@ print(json.dumps({"runtime_env": json.loads(sys.argv[1]), "argv": sys.argv[2:]},
 PYDRY
     exit 0
     fi
+}
+
+qwen38_submit() {
+    qwen38_write_config
+
+    : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs HTTP endpoint}"
+    cd "${RELAX}"
+    mkdir -p "${SAVE_DIR}/logs"
+    ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS}" \
+        --submission-id "${SUBMISSION_ID}" \
+        ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+        --runtime-env-json="${RUNTIME_ENV_JSON}" \
+        -- python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}" \
+        2>&1 | tee "${SAVE_DIR}/logs/${EXP_NAME}-${now}.log"
 }

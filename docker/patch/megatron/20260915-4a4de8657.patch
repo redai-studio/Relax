@@ -402,7 +402,7 @@ index 2055912..e829d7d 100644
                  flatten_sharded_tensors=False,
              ),
 diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
-index c483f97..685dbf1 100644
+index c483f97..9db6f43 100644
 --- a/megatron/core/extensions/transformer_engine.py
 +++ b/megatron/core/extensions/transformer_engine.py
 @@ -930,6 +930,7 @@ class TELinear(te.pytorch.Linear):
@@ -432,7 +432,7 @@ index c483f97..685dbf1 100644
 +            if (
 +                self.fuse_wgrad_accumulation
 +                and getattr(weight, "__fsdp_param__", False)
-+                and not weight.overwrite_main_grad
++                and not getattr(weight, "overwrite_main_grad", False)
 +                and weight.dtype == torch.bfloat16
 +                and not (self.config.fp8 or self.config.fp4)
 +            ):

@@ -7,6 +7,8 @@ import os
 import torch
 from megatron.core.transformer.moe import token_dispatcher as td
 
+from relax.models.common.deepep_expanded import ExpandedCombine, ExpandedDispatch
+
 
 CAPACITY = 65536
 
@@ -45,87 +47,6 @@ def release():
     _owned_buffer.destroy()
     _owned_buffer = None
     get_logger(__name__).info("Released DeepEPv2 elastic buffer before EP communicator teardown")
-
-
-def _event_args(buffer, asynchronous, allocate):
-    return dict(
-        previous_event=buffer.capture() if asynchronous and allocate else None,
-        async_with_compute_stream=asynchronous,
-        allocate_on_comm_stream=allocate,
-    )
-
-
-class ExpandedDispatch(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, buffer, x, indices, probs, experts, sms, asynchronous, allocate):
-        assert x.ndim == 2 and x.shape[0] <= CAPACITY and x.shape[1] == 2560
-        assert x.dtype == torch.bfloat16 and probs.dtype == torch.float32
-        assert indices.shape == probs.shape and indices.shape == (x.shape[0], 10)
-        out, _, out_probs, handle, event = buffer.dispatch(
-            x.contiguous(),
-            topk_idx=indices,
-            topk_weights=probs,
-            num_experts=experts,
-            num_max_tokens_per_rank=CAPACITY,
-            expert_alignment=1,
-            num_sms=sms,
-            do_expand=True,
-            do_cpu_sync=True,
-            **_event_args(buffer, asynchronous, allocate),
-        )
-        if asynchronous:
-            event.current_stream_wait()
-        counts = tuple(handle.num_recv_tokens_per_expert_list)
-        assert handle.do_expand and handle.num_max_tokens_per_rank == CAPACITY
-        assert out_probs.ndim == 1 and out.shape[0] == out_probs.shape[0] == sum(counts)
-        ctx.buffer, ctx.handle = buffer, handle
-        ctx.asynchronous, ctx.allocate = asynchronous, allocate
-        ctx.set_materialize_grads(False)
-        return out, out_probs, handle, counts
-
-    @staticmethod
-    def backward(ctx, dx, dp, _handle, _counts):
-        # The actual expert path consumes both outputs; fail closed on an untested branch.
-        assert dx is not None and dp is not None
-        assert dp.ndim == 1
-        gx, gp, event = ctx.buffer.combine(
-            dx.contiguous(),
-            ctx.handle,
-            topk_weights=dp.float().contiguous(),
-            num_sms=ctx.handle.num_sms,
-            **_event_args(ctx.buffer, ctx.asynchronous, ctx.allocate),
-        )
-        if ctx.asynchronous:
-            event.current_stream_wait()
-        assert gp.shape == ctx.handle.topk_idx.shape
-        return None, gx, None, gp, None, None, None, None
-
-
-class ExpandedCombine(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, buffer, x, handle, asynchronous, allocate):
-        assert handle.do_expand
-        out, _, event = buffer.combine(
-            x.contiguous(), handle, num_sms=handle.num_sms, **_event_args(buffer, asynchronous, allocate)
-        )
-        if asynchronous:
-            event.current_stream_wait()
-        ctx.buffer, ctx.handle = buffer, handle
-        ctx.asynchronous, ctx.allocate = asynchronous, allocate
-        return out
-
-    @staticmethod
-    def backward(ctx, grad):
-        out, _, _, _, event = ctx.buffer.dispatch(
-            grad.contiguous(),
-            handle=ctx.handle,
-            do_expand=True,
-            num_sms=ctx.handle.num_sms,
-            **_event_args(ctx.buffer, ctx.asynchronous, ctx.allocate),
-        )
-        if ctx.asynchronous:
-            event.current_stream_wait()
-        return None, out, None, None, None
 
 
 class ExpandedManager(td._DeepepV2Manager):
@@ -192,6 +113,8 @@ class ExpandedManager(td._DeepepV2Manager):
             self.num_sms,
             async_finish,
             allocate_on_comm_stream,
+            CAPACITY,
+            self.router_topk,
         )
         self.tokens_per_expert = torch.tensor(counts, dtype=torch.long)
         return hidden
@@ -210,22 +133,21 @@ class ExpandedManager(td._DeepepV2Manager):
         return out
 
 
-def install(args):
+def install():
     from functools import wraps
 
-    from relax.backends.megatron import actor, model
+    from relax.backends.megatron.actor import MegatronTrainRayActor
 
-    native = model.train
-    if actor.train is not native:
-        raise RuntimeError("Expected a shared Megatron training entrypoint")
+    native = MegatronTrainRayActor.train_actor
 
     @wraps(native)
-    def train(rollout_id, *positional, **kwargs):
-        result = native(rollout_id, *positional, **kwargs)
-        if rollout_id + 1 == args.num_rollout:
+    def train_actor(self, rollout_id, *positional, **kwargs):
+        result = native(self, rollout_id, *positional, **kwargs)
+        # The final actor step includes checkpointing and local SFT evaluation.
+        if rollout_id + 1 == self.args.num_rollout:
             release()
         return result
 
-    actor.train = model.train = train
+    MegatronTrainRayActor.train_actor = train_actor
     os.environ["EP_DISABLE_GIN"] = "1"
     td._DeepepV2Manager = ExpandedManager

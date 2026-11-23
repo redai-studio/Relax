@@ -41,7 +41,7 @@ Direct QSA and dynamic pairing increased steady-state throughput by 7.79% on tex
 - MFSDP uses independent all-gather and reduce-scatter communicators. The recipe retains selected BF16 parameter buckets within each optimizer update with 8 GiB and 22 GiB budgets on the two pipeline stages. Unbounded retention ran out of device memory in the third update.
 - Microbatch ordering uses the existing CPU process group to send one schedule within each model-parallel group. Creating additional Gloo subgroups during actor initialization stalled on the four-node release check.
 - The packed GDN and ragged expert kernels handle the measured model dimensions. Expanded DeepEPv2 routing avoids a separate expert permutation and omits verified padding. The main SFT head pools supervised rows across documents and uses 8,192-row loss chunks. Expert weight-gradient fusion is limited to eligible BF16 grouped linears with FP32 gradient buffers.
-- The multimodal path rebuilds images on the stage owning the vision encoder, including nested MFSDP wrappers. An earlier depth-limited check missed this stage and failed on the first update. Checkpoint and optimizer-state experiments that failed recovery and numerical checks were excluded.
+- The multimodal path rebuilds images on the stage that owns the vision encoder. Stage detection follows nested MFSDP wrappers to find the encoder at any depth.
 
 Compare workload counters alongside speed. The PP4 backend comparison uses the matched effective token and image counts per update. The full PP2 recipe uses a different packing policy and pipeline layout.
 

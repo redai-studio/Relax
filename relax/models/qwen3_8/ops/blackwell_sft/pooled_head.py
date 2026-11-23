@@ -8,6 +8,7 @@ from functools import wraps
 
 def install(args):
     from relax.backends.megatron import loss
+    from relax.utils.env import Envs
 
     if args.loss_type != "sft" or args.context_parallel_size != 1 or args.qkv_format != "thd":
         raise RuntimeError("Pooled supervision requires packed CP1 SFT")
@@ -18,7 +19,8 @@ def install(args):
         head = kwargs.get("lm_head_forward")
         original = kwargs["args"]
         if (
-            not callable(getattr(head, "_relax_fused_linear_ce", None))
+            not Envs.RELAX_SFT_FUSED_LINEAR_CE
+            or not callable(getattr(head, "_relax_fused_linear_ce", None))
             or original.allgather_cp
             or kwargs.get("cp_output_is_zigzag")
             or kwargs.get("dynamic_cp_size") not in (None, 1)
