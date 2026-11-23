@@ -311,6 +311,7 @@ def test_mtp_postprocess_contracts_residual_streams_once(gated_mixer, learned):
     else:
         expected = hidden.unflatten(-1, (2, 4)).mean(dim=-2)
 
+    assert output.shape == (2, 1, config.hidden_size)
     torch.testing.assert_close(output, expected)
     torch.testing.assert_close(torch.autograd.grad(output.sum(), hidden), torch.autograd.grad(expected.sum(), hidden))
 

@@ -1327,13 +1327,15 @@ def test_glm_fallback_masks_roles_tools_and_preserves_reasoning(last_turn_only):
             CanonicalMessage("assistant", "reason</think><tool_call>f</tool_call>", True),
             CanonicalMessage("tool", "observation", False),
             CanonicalMessage("assistant", "</think>answer1", True),
-            CanonicalMessage("user", "question2", False),
-            CanonicalMessage("assistant", "final reasoning</think>answer2", True),
+            CanonicalMessage("user", "question2 <|assistant|> PROMPT_ONLY", False),
+            CanonicalMessage("assistant", "final reasoning</think>answer2 <|user|> ANSWER_LITERAL", True),
         ],
         metadata={"source_dataset": "test", "row_index": 0},
     )
-    ids, mask = render_with_loss_mask(sample, tokenizer=_FakeGLMTokenizer(), last_turn_only=last_turn_only)
-    expected = "final reasoning</think>answer2"
+    tokenizer = _FakeGLMTokenizer()
+    ids, mask = render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=last_turn_only)
+    assert ids.tolist() == tokenizer.apply_chat_template(_to_chat_messages(sample))
+    expected = "final reasoning</think>answer2 <|user|> ANSWER_LITERAL"
     if not last_turn_only:
         expected = "reason</think><tool_call>f</tool_call></think>answer1" + expected
     assert _learned_text(ids, mask) == expected

@@ -97,9 +97,10 @@ def _finalize_model_grads_with_memory_release(
     (finalize_grads_func or finalize_model_grads)(*args, **kwargs)
 
 
-def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
-    """Walk DDP / bridge-VL wrappers to the lm_head; None on non-last PP
-    stages.
+def _find_lm_output_layer_owner(model: torch.nn.Module) -> torch.nn.Module | None:
+    """Walk DDP / bridge-VL wrappers to the model that owns the lm_head.
+
+    Return None on non-last PP stages.
 
     ``unwrap_model`` strips Megatron's known wrapper classes (DDP, FP16, ...)
     in one shot. The bounded ``.module``/``.language_model`` walk that follows
@@ -112,7 +113,7 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         # (placeholder); we must return None there so `_bypass_output_layer`
         # is a no-op and the loss never gets called on these ranks.
         if ol is not None and not isinstance(ol, torch.nn.Identity):
-            return ol
+            return module
         # `.module`: any residual DDP / FP16 / FP32 wrapper not stripped by
         # `unwrap_model` (e.g. test fakes, non-Megatron DDP shapes).
         # `.language_model`: Megatron-Bridge multimodal convention — every
@@ -125,6 +126,33 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         if module is None:
             return None
     return None
+
+
+def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
+    owner = _find_lm_output_layer_owner(model)
+    return owner.output_layer if owner is not None else None
+
+
+def _native_mtp_output_calls(args: Namespace, model: torch.nn.Module) -> int:
+    if not getattr(args, "enable_mtp_training", False):
+        return 0
+    owner = _find_lm_output_layer_owner(model)
+    if owner is None or not getattr(owner, "mtp_process", True):
+        return 0
+
+    config = get_model_config(owner)
+    depth = int(getattr(config, "mtp_num_layers", getattr(args, "mtp_num_layers", 0)) or 0)
+    if getattr(config, "mtp_loss_type", "ce") == "e2e_tv":
+        return depth + 1  # The native TV loss also projects the teacher.
+    if args.sft_chunked_logits:
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+        # Core keeps the native head when Hybrid supplies a separate main
+        # hidden tensor, or when CE is fused into the linear projection.
+        fused_linear = config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
+        if not isinstance(owner, HybridModel) and not fused_linear:
+            return 0
+    return depth
 
 
 @contextmanager
@@ -1492,21 +1520,8 @@ def train_one_step(
             # bypasses that main head entirely while preserving the preceding
             # MTP head calls that build the auxiliary-loss autograd graph.
             if should_bypass_main_output_layer(args):
-                # The chunked-MTP patch runs the MTP heads via the class-level
-                # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
-                # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
-                # Exception: under fused-linear CE the patch delegates to upstream
-                # process_mtp_loss, which calls the head through the INSTANCE and so
-                # does consume one intercepted call per depth again.
                 mtp_enabled = getattr(args, "enable_mtp_training", False)
-                head_config = get_model_config(model)
-                fused_linear = (
-                    head_config.cross_entropy_loss_fusion and head_config.cross_entropy_fusion_impl == "linear"
-                )
-                chunked_mtp_on = mtp_enabled and args.sft_chunked_logits and not fused_linear
-                mtp_output_layer_calls = (
-                    0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
-                )
+                mtp_output_layer_calls = _native_mtp_output_calls(args, model)
                 # Chunked SFT returns hidden states. Keep the full sequence in
                 # model precision; the loss upcasts each bounded logits chunk.
                 if args.sft_chunked_logits and (args.fp16 or args.bf16):

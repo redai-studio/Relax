@@ -441,6 +441,19 @@ class _GLMDialect:
 
     _probe_marker = re.compile(r"\x00relax-glm-mask:(\d+):\d+\x00")
 
+    _boundary_marker = "\x00relax-glm-boundary\x00"
+    _delimiters = (*_headers, "<tool_response>", "</tool_response>")
+    _delimiter_pattern = "|".join(map(re.escape, _delimiters))
+    _tagged_delimiters = re.compile(f"({re.escape(_boundary_marker)})?({_delimiter_pattern})")
+
+    def marked_template(self, template: str) -> str:
+        return re.sub(self._delimiter_pattern, lambda match: self._boundary_marker + match[0], template)
+
+    def mask_text(self, marked_text: str) -> str:
+        # Keep only delimiters emitted by the template. Payload positions
+        # still index the original rendering, including any literal delimiters.
+        return self._tagged_delimiters.sub(lambda match: match[2] if match[1] else " " * len(match[2]), marked_text)
+
     def locate_nonassistant_spans(
         self, text: str, messages: list[dict[str, Any]], render: Callable[[list[dict[str, Any]]], str]
     ) -> dict[int, list[_MsgSpan]]:
@@ -476,9 +489,8 @@ class _GLMDialect:
         matches = list(self._probe_marker.finditer(probe))
         if len(matches) != len(expected_markers) or {match[0] for match in matches} != expected_markers:
             raise ValueError("GLM chat template did not render each system or tool payload exactly once")
-        delimiters = (*self._headers, "<tool_response>", "</tool_response>")
-        if any(text.count(tag) != probe.count(tag) for tag in delimiters):
-            raise ValueError("Ambiguous GLM message delimiters in system or tool payloads")
+        if any(text.count(tag) != probe.count(tag) for tag in self._delimiters):
+            raise ValueError("GLM template changed the boundaries while tracing system or tool payloads")
 
         prefix = probe[: matches[0].start()]
         if not text.startswith(prefix):
@@ -735,7 +747,20 @@ def _render_per_message_fallback(
         normalize_qwen38_reasoning=qwen38_template,
         mask_reasoning=mask_reasoning,
     )
-    rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
+    glm = deepseek_dialect if isinstance(deepseek_dialect, _GLMDialect) else None
+    if glm is not None:
+        assert effective_template is not None
+        marked_kwargs = {**extra_kwargs, "chat_template": glm.marked_template(effective_template)}
+
+        def render_marked(messages: list[dict[str, Any]]) -> str:
+            return tokenizer.apply_chat_template(messages, tools=sample.tools, tokenize=False, **marked_kwargs)
+
+        marked_text = render_marked(msgs)
+        rendered_text = marked_text.replace(glm._boundary_marker, "")
+        boundary_text = glm.mask_text(marked_text)
+    else:
+        rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
+        boundary_text = rendered_text
 
     tokenized = tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
     token_ids = tokenized["input_ids"]
@@ -786,15 +811,9 @@ def _render_per_message_fallback(
     last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
     char_mask = bytearray(len(rendered_text))  # zeros
     glm_spans = {}
-    if isinstance(deepseek_dialect, _GLMDialect) and any(
-        msg.learn and msg.role in ("system", "tool") for msg in sample.messages
-    ):
-        glm_spans = deepseek_dialect.locate_nonassistant_spans(
-            rendered_text,
-            msgs,
-            lambda messages: tokenizer.apply_chat_template(
-                messages, tools=sample.tools, tokenize=False, **extra_kwargs
-            ),
+    if glm is not None and any(msg.learn and msg.role in ("system", "tool") for msg in sample.messages):
+        glm_spans = glm.locate_nonassistant_spans(
+            boundary_text, msgs, lambda messages: glm.mask_text(render_marked(messages))
         )
     cursor = 0
     for msg_idx, msg in enumerate(sample.messages):
@@ -805,7 +824,7 @@ def _render_per_message_fallback(
                 cursor = max(cursor, span.next_cursor)
             continue
         if deepseek_dialect.name in ("deepseek_v4", "glm"):
-            span = deepseek_dialect.locate(rendered_text, cursor, msg)
+            span = deepseek_dialect.locate(boundary_text, cursor, msg)
             if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
                 mask_start = cursor if message_selection_only else span.learn_start
                 if mask_reasoning and msg.role == "assistant":

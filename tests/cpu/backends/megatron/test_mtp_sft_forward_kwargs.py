@@ -139,14 +139,22 @@ def test_forward_mask_controls_independent_mtp_gradient(layout, existing_mask, i
 @pytest.mark.parametrize("labels_are_shifted", [False, True])
 def test_hybrid_sft_keeps_mtp_supervision_separate_from_main_labels(monkeypatch, labels_are_shifted):
     from megatron.core.models.hybrid import hybrid_model
-    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+    from megatron.core.transformer import multi_token_prediction as native
+    from megatron.training import global_vars
+
+    from relax.backends.megatron.model import _bypass_output_layer, _native_mtp_output_calls
+
+    args = Namespace(enable_mtp_training=True, sft_chunked_logits=True)
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(native.MTPLossLoggingHelper, "should_collect_acceptance", lambda: False)
+    monkeypatch.setattr(native.MTPLossLoggingHelper, "save_loss_to_tracker", lambda *a, **k: None)
 
     batch = SimpleNamespace(
         tokens=torch.tensor([[1, 2, 3, 4]]),
         shifted_labels=torch.tensor([[8, 7, 6, 0]]),
         mask=torch.tensor([[True, True, False, False]]),
-        conditioning=torch.tensor([[True, False, True, True]]),
-        hidden=torch.ones(4, 1, 2),
+        conditioning=torch.tensor([[True, True, False, True]]),
+        hidden=torch.randn(4, 1, 2, requires_grad=True),
     )
     config = SimpleNamespace(
         fine_grained_activation_offloading=False,
@@ -155,6 +163,10 @@ def test_hybrid_sft_keeps_mtp_supervision_separate_from_main_labels(monkeypatch,
         sequence_parallel=False,
         freeze_base_model_for_mtp=False,
         mtp_num_layers=1,
+        mtp_loss_scaling_factor=1.0,
+        cross_entropy_loss_fusion=False,
+        cuda_graph_impl="none",
+        calculate_per_token_loss=False,
         use_mup=False,
         linear_cp_layout="zigzag",
         attention_cp_layout="zigzag",
@@ -163,26 +175,46 @@ def test_hybrid_sft_keeps_mtp_supervision_separate_from_main_labels(monkeypatch,
     class MTPBlock:
         cp_group = SimpleNamespace(size=lambda: 1)
         sequence_parallel = False
-        prepare_cp_layout = MultiTokenPredictionBlock.prepare_cp_layout
+        prepare_cp_layout = native.MultiTokenPredictionBlock.prepare_cp_layout
 
         def __call__(self, *, input_ids, hidden_states, mtp_input_mask, **kwargs):
             torch.testing.assert_close(input_ids, batch.tokens)
             torch.testing.assert_close(mtp_input_mask, batch.conditioning)
-            return hidden_states
+            return torch.cat([hidden_states, hidden_states + 2])
+
+    class Head(torch.nn.Module):
+        sequence_parallel = False
+        tp_group = object()
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.arange(22).float().reshape(11, 2) / 22)
+
+        def forward(self, hidden, *, weight=None, runtime_gather_output=None):
+            return hidden @ (self.weight if weight is None else weight).T, None
+
+    head = Head()
+    ce_logits = []
+
+    def compute_language_model_loss(labels, logits):
+        ce_logits.append(logits)
+        return torch.nn.functional.cross_entropy(logits[:, 0], labels[0], reduction="none").unsqueeze(0)
 
     def process_mtp_loss(**kwargs):
         torch.testing.assert_close(kwargs["labels"], batch.shifted_labels)
         torch.testing.assert_close(kwargs["loss_mask"], batch.mask)
-        return kwargs["hidden_states"] + 2
+        return native.process_mtp_loss(**kwargs)
 
     def main_output(**kwargs):
         assert kwargs["labels"] is None
-        return kwargs["hidden_states"]
+        return kwargs["output_layer"](kwargs["hidden_states"])[0]
 
     monkeypatch.setattr(hybrid_model, "process_mtp_loss", process_mtp_loss)
     mtp = MTPBlock()
     mtp.config = config
-    model = SimpleNamespace(
+    hybrid = hybrid_model.HybridModel.__new__(hybrid_model.HybridModel)
+    torch.nn.Module.__init__(hybrid)
+    attributes = dict(
         config=config,
         position_embedding_type="none",
         hybrid_layer_config_list=None,
@@ -190,27 +222,34 @@ def test_hybrid_sft_keeps_mtp_supervision_separate_from_main_labels(monkeypatch,
         mtp_process=True,
         mtp=mtp,
         post_process=True,
-        pg_collection=SimpleNamespace(cp=None, dp_cp=None),
+        pg_collection=SimpleNamespace(cp=None, dp_cp=object()),
         tp_group=None,
         decoder=lambda *, hidden_states, **kwargs: hidden_states,
         embedding=None,
-        output_layer=None,
-        compute_language_model_loss=None,
+        output_layer=head,
+        compute_language_model_loss=compute_language_model_loss,
         _scale_logits=None,
         training=True,
     )
-    output = hybrid_model.HybridModel.forward(
-        model,
-        input_ids=batch.tokens,
-        position_ids=None,
-        attention_mask=None,
-        decoder_input=batch.hidden,
-        loss_mask=batch.mask,
-        output_processor=main_output,
-        mtp_kwargs={
-            "mtp_labels": batch.shifted_labels if labels_are_shifted else torch.tensor([[9, 8, 7, 6]]),
-            "labels_are_shifted": labels_are_shifted,
-            "mtp_input_mask": batch.conditioning,
-        },
-    )
-    torch.testing.assert_close(output, torch.full_like(batch.hidden, 3))
+    for name, value in attributes.items():
+        setattr(hybrid, name, value)
+    wrapped = SimpleNamespace(language_model=hybrid)
+    with _bypass_output_layer(wrapped, mtp_output_layer_calls=_native_mtp_output_calls(args, wrapped)) as project:
+        output = hybrid(
+            input_ids=batch.tokens,
+            position_ids=None,
+            attention_mask=None,
+            decoder_input=batch.hidden,
+            loss_mask=batch.mask,
+            output_processor=main_output,
+            mtp_kwargs={
+                "mtp_labels": batch.shifted_labels if labels_are_shifted else torch.tensor([[9, 8, 7, 6]]),
+                "labels_are_shifted": labels_are_shifted,
+                "mtp_input_mask": batch.conditioning,
+            },
+        )
+
+    [mtp_logits] = ce_logits
+    torch.testing.assert_close(mtp_logits, (batch.hidden + 2) @ head.weight.T)
+    torch.testing.assert_close(output, batch.hidden)
+    torch.testing.assert_close(project(output)[0], batch.hidden @ head.weight.T)

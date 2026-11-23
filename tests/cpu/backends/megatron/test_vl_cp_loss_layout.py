@@ -176,6 +176,17 @@ def test_glm_packed_batch_matches_unsplit_next_token_loss(monkeypatch, cp_size, 
     masks = [torch.tensor([0, 0, 1, 0, 1]), torch.zeros(17, dtype=torch.int)]
     expected = [(3, 2), (5, 4)]
     supervised = []
+    if cp_size == 2:
+        monkeypatch.setenv("RELAX_SFT_SELECTIVE_MULTIMODAL_LOGITS", "1")
+        monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
+        monkeypatch.setattr(loss_module, "validate_opd_topk_gather", lambda *_: None)
+
+        def log_probs(logits, tokens, *_, **__):
+            return -F.cross_entropy(logits, tokens, reduction="none").unsqueeze(-1), None
+
+        monkeypatch.setattr(loss_module, "calculate_log_probs_and_entropy", log_probs)
+        weight = torch.linspace(-1, 1, 32).unsqueeze(1)
+        chunked_loss = 0
     for rank in range(cp_size):
         monkeypatch.setattr(data.mpu, "get_context_parallel_rank", lambda r=rank: r)
         batch = dict(
@@ -228,7 +239,31 @@ def test_glm_packed_batch_matches_unsplit_next_token_loss(monkeypatch, cp_size, 
                 zip(labels[mask.bool()].tolist(), predictors[mask.bool()].flatten().tolist(), strict=True)
             )
         assert packed["full_loss_masks"].sum() == sum(mask.sum() for mask in local_masks)
+        if cp_size == 2:
+            projected_rows = []
+
+            def project(hidden):
+                projected_rows.extend(hidden.flatten().tolist())
+                return hidden @ weight.T, None
+
+            reducer = cp_utils.get_sum_of_sample_mean(
+                loss_masks=packed["loss_masks"], qkv_format=args.qkv_format, calculate_per_token_loss=True, **metadata
+            )
+            value, _ = loss_module.sft_loss_function_chunked(
+                args, packed, local_ids.float().unsqueeze(-1), reducer, lm_head_forward=project
+            )
+            chunked_loss = chunked_loss + value
+            # Each rank owns one supervised predictor from the first document
+            # and projects one dummy row for the unsupervised second document.
+            assert len(projected_rows) == 2
+            assert projected_rows[0] == expected[rank][1]
     assert sorted(supervised) == expected
+    if cp_size == 2:
+        targets, predictors = zip(*expected, strict=True)
+        reference = F.cross_entropy(
+            torch.tensor(predictors).float().unsqueeze(1) @ weight.T, torch.tensor(targets), reduction="sum"
+        )
+        torch.testing.assert_close(chunked_loss, reference)
 
 
 def test_glm_cp_vision_matches_full_insertion_and_gradients():

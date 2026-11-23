@@ -268,6 +268,17 @@ def _merge_shard(shard_tensors, targets, adapter, pairs, scaling, device, *, fp8
         if not torch.isfinite(lora_a).all() or not torch.isfinite(lora_b).all():
             raise ValueError(f"Nonfinite adapter: {prefix}")
         if scale is not None:
+            if (
+                lora_a.ndim != 2
+                or lora_b.ndim != 2
+                or lora_a.shape[0] == 0
+                or lora_a.shape[0] != lora_b.shape[1]
+                or (lora_b.shape[0], lora_a.shape[1]) != tuple(base.shape)
+            ):
+                raise ValueError(
+                    f"LoRA shape mismatch for {base_key} {tuple(base.shape)} "
+                    f"(lora_A={tuple(lora_a.shape)}, lora_B={tuple(lora_b.shape)})."
+                )
             if not torch.isfinite(scale).all():
                 raise ValueError(f"Nonfinite FP8 scale: {base_key}")
             if not torch.count_nonzero(lora_b):
