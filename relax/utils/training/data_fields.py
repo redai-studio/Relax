@@ -2,7 +2,8 @@
 
 from argparse import Namespace
 
-from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.distributed.replay_manager import replay_fields, rollout_kinds
+from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
 from relax.utils.agentic_obs import agentic_obs_enabled
 from relax.utils.agentic_obs.records import OBSERVATION_DATA_FIELDS
 from relax.utils.data.image_refs import sft_multimodal_data_fields
@@ -21,7 +22,7 @@ PREFERENCE_DATA_FIELDS = (
 )
 
 
-def _base_rollout_fields(args: Namespace) -> list[str]:
+def base_rollout_fields(args: Namespace) -> list[str]:
     fields = [
         "tokens",
         "total_lengths",
@@ -33,8 +34,6 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "sample_index_mask_sums",
         "group_index",
     ]
-    if getattr(args, "use_rollout_routing_replay", False):
-        fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:
         fields.append("multimodal_train_inputs")
     if agentic_obs_enabled(args):
@@ -60,19 +59,22 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
-        return fields
+        if is_embedding_sft_mode(args) and "multimodal_train_inputs" not in fields:
+            # One TQ row retains both tokenized branches even for text-only PT.
+            fields.append("multimodal_train_inputs")
+        return replay_fields(fields)
 
     from relax.algorithms import algorithm_needs_critic
 
     has_critic = algorithm_needs_critic(args)
 
     if has_critic and consumer == "critic":
-        return _base_rollout_fields(args)
+        return replay_fields(base_rollout_fields(args), kinds=rollout_kinds(args))
 
     if has_critic and consumer == "advantages":
         # PPO colocate never runs actor_fwd, so ref/log_probs are only
         # requested when kl_coef != 0 (i.e. an actor_fwd role is present).
-        fields = _base_rollout_fields(args)
+        fields = base_rollout_fields(args)
         fields.append("values")
         if getattr(args, "kl_coef", 0.0) != 0:
             if not getattr(args, "use_rollout_logprobs", False) and not getattr(args, "true_on_policy_mode", False):
@@ -82,9 +84,9 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
             from relax.utils.opd.opd_utils import consume_opd_train_data
 
             consume_opd_train_data(fields, args)
-        return fields
+        return replay_fields(fields, kinds=rollout_kinds(args))
 
-    fields = _base_rollout_fields(args)
+    fields = base_rollout_fields(args)
     if getattr(args, "advantage_estimator", None) == "score_centering":
         fields.extend(SCORE_CENTERING_TRAIN_FIELDS)
     if getattr(args, "use_rollout_indexer_replay", False):
@@ -93,7 +95,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces
         # ``advantages``/``returns``, actor just pulls the finished tensors.
-        if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+        if args.fully_async and not getattr(args, "hybrid", False):
             fields.extend(["advantages", "returns"])
         else:
             fields.append("values")
@@ -110,4 +112,4 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         from relax.utils.opd.opd_utils import consume_opd_train_data
 
         consume_opd_train_data(fields, args)
-    return fields
+    return replay_fields(fields, kinds=rollout_kinds(args))

@@ -58,6 +58,16 @@ def delta_sync_config(args: Any, quantization_config: Any) -> DeltaSyncConfig | 
             "Delta export retains original FULL for quantized, adapter, draft or external/multinode/inference-DP state"
         )
         return None
+    if getattr(args, "sglang_config", None) and (
+        getattr(args, "fully_async", False) or getattr(args, "hybrid", False)
+    ):
+        from relax.distributed.ray.rollout import _resolve_sglang_config
+
+        # DCS publishes to all registered models. The delta handle lookup
+        # addresses the first model, so keep native DCS for multi-model YAML.
+        if len(_resolve_sglang_config(args).models) > 1:
+            logger.info("Multi-model DCS publication retains original FULL transport")
+            return None
     return config
 
 

@@ -132,17 +132,10 @@ def main() -> None:
         "megatron/core/fusions/linear_cross_entropy/blackwell/fwd_mainloop.py",
         "megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py",
     )
-    operator_patch = Path("/root/Megatron-LM/20261020-model-operators.patch")
+    operator_patch = Path("/root/Megatron-LM/megatron.patch")
     protected_sources = sorted(
         set(protected_sources)
         | {line[6:] for line in operator_patch.read_text().splitlines() if line.startswith("+++ b/")}
-    )
-    protected_sources.extend(
-        [
-            "megatron/core/transformer/per_layer_embedding.py",
-            "megatron/core/transformer/ple_input_halo_cp.py",
-            "megatron/core/models/gpt/gpt_model.py",
-        ]
     )
     report = {
         "deepep_commit": os.environ["DEEP_EP_V2_COMMIT"],
@@ -172,14 +165,12 @@ def main() -> None:
                 "fa4": "/tmp/qwen35-build/56e48e3-fa4-isolated.patch",
                 "flashqla": "/tmp/qwen35-build/0.1.3-kkt-no-tma.patch",
                 "flashqla_cumsum": "/tmp/qwen35-build/0.1.3-cumsum-heads.patch",
-                "megatron": "/root/Megatron-LM/20261020-qwen35-optimized.patch",
-                "model_operators": "/root/Megatron-LM/20261020-model-operators.patch",
-                "checkpoint": "/root/Megatron-LM/20261028-dp-reshardable-checkpoint.patch",
             }.items()
         },
         "gpu_validated": False,
     }
-    report["patch_sha256"]["megatron_base"] = Path("/etc/relax-megatron-patch.sha256").read_text().split()[0]
+    megatron_sha256 = Path("/etc/relax-megatron-patch.sha256").read_text().split()[0]
+    report["patch_sha256"].update(megatron=megatron_sha256, megatron_base=megatron_sha256)
     Path("/etc/relax-qwen35-runtime.json").write_text(json.dumps(report, indent=2) + "\n")
 
 

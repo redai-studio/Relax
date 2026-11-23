@@ -21,6 +21,7 @@ def supports_delta_layout(layout: Mapping, gpu_count: int) -> bool:
     return (
         layout.get("nnodes") == 1
         and layout.get("dp_size") == 1
+        and not layout.get("speculative_algorithm")
         and type(tp) is int
         and tp > 0
         and type(pp) is int
@@ -74,6 +75,8 @@ class DeltaSyncConfig:
         ):
             if type(getattr(config, name)) is not int or getattr(config, name) <= 0:
                 raise ValueError(f"Delta setting {name} must be a positive integer")
+        if config.staging_budget_bytes > config.receiver_gpu_budget_bytes:
+            raise ValueError("Delta staging_budget_bytes exceeds receiver_gpu_budget_bytes")
         if (
             type(config.full_only) is not bool
             or type(config.sender_pipeline) is not bool

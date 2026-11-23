@@ -130,6 +130,26 @@ def test_rank_zero_control_failure_does_not_strand_other_ranks(backends, phase):
     assert all(worker._managed_lora_publisher.publish.call_count == 0 for worker in workers)
 
 
+@pytest.mark.parametrize("phase", ["pause", "flush"])
+def test_delta_pause_failure_reaches_both_ranks_before_payload(backends, phase):
+    ranks, workers = backends
+    for worker in workers:
+        worker._managed_lora_publisher = None
+        worker._lora_adapter_mode = False
+        worker.delta_exporter = Mock()
+        worker._delta_rollout_recipients = lambda: (True, [], [])
+    first = workers[0]
+    if phase == "flush":
+        first.rollout_engines[0].flush_cache.remote.side_effect = RuntimeError("control failed")
+    else:
+        first._batch_request.side_effect = RuntimeError("control failed")
+    results = ranks.run(lambda rank: workers[rank].update_weights_for_rollout(rollout_only=True))
+    assert_rank_errors(results, "DCS delta pause/flush failed: RuntimeError: control failed")
+    for worker in workers:
+        worker.delta_exporter.synchronize.assert_not_called()
+        worker.delta_exporter.commit.assert_not_called()
+
+
 def test_failed_first_publication_does_not_cause_base_resynchronization(backends):
     ranks, workers = backends
     for worker in workers:

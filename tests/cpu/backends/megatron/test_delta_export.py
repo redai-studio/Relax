@@ -798,5 +798,12 @@ def test_requested_delta_admits_single_node_tp_pp_mesh(tmp_path):
     layout = dict(nnodes=1, pp_size=2, tp_size=2, dp_size=1)
     assert supports_delta_layout(layout, 4)
     assert not supports_delta_layout(layout, 2)
-    for changed in [dict(nnodes=2), dict(dp_size=2), dict(pp_size=0), dict(tp_size=False), dict(tp_size=None)]:
+    for changed in [
+        dict(nnodes=2),
+        dict(dp_size=2),
+        dict(pp_size=0),
+        dict(tp_size=False),
+        dict(tp_size=None),
+        dict(speculative_algorithm="NEXTN"),
+    ]:
         assert not supports_delta_layout(dict(layout, **changed), 4)

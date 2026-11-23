@@ -9,6 +9,15 @@ from relax.distributed.weight_sync.codec import encode, tensors, validate_direct
 from relax.distributed.weight_sync.tcp_transport import TcpFrameSource, receive
 
 
+def test_config_rejects_staging_larger_than_receiver_budget(tmp_path):
+    from relax.distributed.weight_sync.config import DeltaSyncConfig
+
+    path = tmp_path / "delta.json"
+    path.write_text('{"stream":"test","receiver_gpu_budget_bytes":16,"staging_budget_bytes":17}')
+    with pytest.raises(ValueError, match="staging_budget_bytes exceeds receiver_gpu_budget_bytes"):
+        DeltaSyncConfig.load(path)
+
+
 @pytest.mark.parametrize("empty", [False, True])
 def test_tcp_delivers_same_immutable_wire_to_all_fixed_recipients(empty):
     positions = torch.empty(0, dtype=torch.int32) if empty else torch.tensor([0, 3], dtype=torch.int32)

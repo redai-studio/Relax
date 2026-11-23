@@ -39,7 +39,9 @@ def _canonical(row):
     )
 
 
-def _render(tokenizer, row, *, preserve_thinking=True, ignore_empty_think=True, last_turn_only=False):
+def _render(
+    tokenizer, row, *, preserve_thinking=True, ignore_empty_think=True, last_turn_only=False, mask_reasoning=False
+):
     original = deepcopy(row)
     sample = _canonical(row)
     kwargs = {"enable_thinking": False, "add_non_thinking_prefix": True}
@@ -51,6 +53,7 @@ def _render(tokenizer, row, *, preserve_thinking=True, ignore_empty_think=True, 
         apply_chat_template_kwargs=kwargs,
         ignore_empty_think=ignore_empty_think,
         last_turn_only=last_turn_only,
+        mask_reasoning=mask_reasoning,
     )
     text = tokenizer.decode(ids)
     learned = tokenizer.decode(ids[mask.bool()])
@@ -83,9 +86,18 @@ def test_tool_turn_keeps_empty_thinking_context_but_excludes_its_loss(tokenizer,
         assert "Search now.\n\n<tool_call>" in learned
 
 
-@pytest.mark.parametrize("content", ["Search now.", ""])
-@pytest.mark.parametrize("ignore_empty_think", [True, False])
-def test_independent_reasoning_and_closing_boundary_are_supervised(tokenizer, content, ignore_empty_think):
+@pytest.mark.parametrize(
+    "content,ignore_empty_think,mask_reasoning",
+    [
+        ("Search now.", True, False),
+        ("", True, False),
+        ("Search now.", False, False),
+        ("", False, False),
+        ("Search now.", False, True),
+        ("", True, True),
+    ],
+)
+def test_independent_reasoning_respects_mask_policy(tokenizer, content, ignore_empty_think, mask_reasoning):
     row = {
         "messages": [
             {"role": "user", "content": "Question"},
@@ -97,9 +109,10 @@ def test_independent_reasoning_and_closing_boundary_are_supervised(tokenizer, co
             },
         ]
     }
-    text, learned = _render(tokenizer, row, ignore_empty_think=ignore_empty_think)
+    text, learned = _render(tokenizer, row, ignore_empty_think=ignore_empty_think, mask_reasoning=mask_reasoning)
     assert text.count("<think>") == text.count("</think>") == 1
-    assert "INDEPENDENT_REASONING" in learned and "</think>" in learned
+    assert ("INDEPENDENT_REASONING" in learned) is not mask_reasoning
+    assert ("</think>" in learned) is not mask_reasoning
     assert "<tool_call>" in learned and "<|im_end|>" in learned
 
 

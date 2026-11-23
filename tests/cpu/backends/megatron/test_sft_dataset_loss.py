@@ -16,6 +16,7 @@ from tests.cpu.backends.megatron.test_score_centering_loss import _backend
 def _args(**overrides):
     values = dict(
         loss_type="sft",
+        task_type="causal_lm",
         advantage_estimator=None,
         qkv_format="thd",
         allgather_cp=False,

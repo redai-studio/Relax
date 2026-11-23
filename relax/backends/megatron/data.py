@@ -16,7 +16,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
-from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.engine.sft.runtime import is_embedding_sft_mode, is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
@@ -85,7 +85,7 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
     if n_samples_per_prompt <= 0:
         raise ValueError(f"n_samples_per_prompt must be positive, got {n_samples_per_prompt}")
 
-    num_rollout_minis = getattr(args, "num_steps_per_rollout", None)
+    num_rollout_minis = args.num_steps_per_rollout
     if num_rollout_minis is None:
         global_batch_size = getattr(args, "global_batch_size", None)
         if global_batch_size is None:
@@ -207,7 +207,7 @@ def _round_up_to_microbatch_group(num_microbatches: torch.Tensor, microbatch_gro
 
 
 def _get_micro_batch_token_capacity(args: Namespace, max_tokens: int, cp_size: int) -> int:
-    if getattr(args, "allgather_cp", False):
+    if args.allgather_cp:
         pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
         if pad_size <= 0 or max_tokens < pad_size:
             raise ValueError(
@@ -363,7 +363,17 @@ def pad_and_flatten(
         return t, [t.size(0)]
 
     if transpose is not None:
-        tensor_list = [t.transpose(*transpose) for t in tensor_list]
+        # Pad time independently of the number of media items/chunks. Using
+        # pad_sequence after transposing would require identical chunk counts
+        # across samples (or incorrectly broadcast a singleton chunk).
+        max_length = max(t.transpose(*transpose).size(0) for t in tensor_list)
+        padded_list = []
+        for tensor in tensor_list:
+            transposed = tensor.transpose(*transpose)
+            padding = [0] * (2 * transposed.ndim)
+            padding[-1] = max_length - transposed.size(0)
+            padded_list.append(F.pad(transposed, padding, value=padding_value).transpose(*transpose))
+        return torch.cat(padded_list, dim=0), [t.size(0) for t in tensor_list]
 
     padded = pad_sequence(
         tensor_list,
@@ -371,10 +381,7 @@ def pad_and_flatten(
         padding_value=padding_value,
     )
 
-    if transpose is not None:
-        padded_list = [t.transpose(*transpose) for t in padded]
-    else:
-        padded_list = [t for t in padded]  # noqa: C416
+    padded_list = [t for t in padded]  # noqa: C416
 
     num_items = [t.size(0) for t in padded_list]
     return torch.cat(padded_list, dim=0), num_items
@@ -421,6 +428,7 @@ def get_batch(
     allgather_cp: bool = False,
     is_vl_model: bool = False,
     pack_device: torch.device | None = None,
+    model_chunk: Any = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -443,10 +451,20 @@ def get_batch(
     """
 
     assert "tokens" in keys
+    replay_mm = False
     if isinstance(data_iterator, DataIterator):
-        batch = data_iterator.get_next(
-            [*keys, "selective_loss_masks_cpu"] if Envs.RELAX_SFT_SELECTIVE_LOGITS else keys
-        )
+        if getattr(get_args(), "use_rollout_mm_embedding_replay", False):
+            from relax.distributed.replay_manager.backend.mm_megatron import bind_mm_replay_batch, uses_native_vision
+
+            replay_mm = not uses_native_vision()
+            if replay_mm and "rollout_replay_refs" not in keys:
+                keys = (*keys, "rollout_replay_refs")
+        extra_keys = []
+        if Envs.RELAX_SFT_SELECTIVE_LOGITS:
+            extra_keys.append("selective_loss_masks_cpu")
+        if "embedding_positions" in data_iterator.rollout_data:
+            extra_keys.append("embedding_positions")
+        batch = data_iterator.get_next([*keys, *extra_keys] if extra_keys else keys)
 
         if getattr(get_args(), "partial_rollout", False) and getattr(
             get_args(), "use_dynamic_global_batch_size", False
@@ -522,7 +540,7 @@ def get_batch(
             raise ValueError("pre-shifted labels are only supported for SFT")
         if cp_size != 1:
             raise ValueError("pre-shifted SFT labels currently require context_parallel_size=1")
-        if getattr(args, "enable_mtp_training", False):
+        if args.enable_mtp_training:
             raise ValueError("pre-shifted SFT labels are incompatible with MTP")
         if any(label.shape != token.shape for label, token in zip(pre_shifted_labels, tokens, strict=True)):
             raise ValueError("pre-shifted labels and tokens must have identical per-sample shapes")
@@ -835,6 +853,8 @@ def get_batch(
             if mm_input_dict is None:
                 continue
             for key, mm_tensor in mm_input_dict.items():
+                if replay_mm and key in ("pixel_values", "pixel_values_videos"):
+                    continue
                 mapped_key = input_key_map.get(key, key)
                 if mapped_key != key and mapped_key in mm_input_dict:
                     raise ValueError(f"Multimodal inputs contain both {key!r} and its mapped key {mapped_key!r}.")
@@ -857,6 +877,9 @@ def get_batch(
 
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
+
+    if replay_mm:
+        bind_mm_replay_batch(batch, model_chunk)
 
     # Dynamic CP: forward_only merged its per-sample outputs back to full-length
     # responses (dynamic_cp_merge_output), so rollout_data stores full fields.
@@ -1219,6 +1242,37 @@ def _get_preference_data_iterator(
     return [iterator], [len(branch_bins)]
 
 
+def _get_embedding_data_iterator(args: Namespace, rollout_data: RolloutBatch) -> tuple[list[DataIterator], list[int]]:
+    """Keep the step's complete DP negative set in one shared-loop
+    microbatch."""
+    local_pairs = int(rollout_data.get("embedding_pair_count", 0))
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    alignment = int(args.data_pad_size_multiplier)
+    tokens = sum(rollout_data["total_lengths"])
+    required_tokens = (tokens + alignment - 1) // alignment * alignment
+    observations = [None] * dp_size
+    dist.all_gather_object(
+        observations,
+        (local_pairs, int(args.global_batch_size), required_tokens, int(args.max_tokens_per_gpu)),
+        group=mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+    )
+    counts = {value[0] for value in observations}
+    declared = {value[1] for value in observations}
+    if len(counts) != 1 or len(declared) != 1 or local_pairs <= 0 or local_pairs * dp_size != args.global_batch_size:
+        raise ValueError("embedding requires equal complete pair rows on all DP ranks and global_batch_size pairs")
+    if any(value[2] > value[3] for value in observations):
+        raise ValueError(
+            "Complete contrastive batch exceeds max_tokens_per_gpu; increase the budget or reduce global_batch_size. "
+            "Splitting it into independent InfoNCE microbatches changes the negative set."
+        )
+    if len(rollout_data["tokens"]) != 2 * local_pairs:
+        raise ValueError("Every embedding pair must expand to exactly two adjacent sequences")
+    rollout_data["dynamic_global_batch_size"] = int(args.global_batch_size)
+    rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = [int(args.global_batch_size)]
+    iterator = DataIterator(rollout_data, micro_batch_indices=[list(range(2 * local_pairs))])
+    return [iterator], [1]
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
@@ -1237,6 +1291,8 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    if is_embedding_sft_mode(args):
+        return _get_embedding_data_iterator(args, rollout_data)
     if is_preference_mode(args):
         return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
 
@@ -1254,7 +1310,7 @@ def get_data_iterator(
 
     num_local_samples = len(rollout_data["total_lengths"])
     step_global_sample_counts = rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY)
-    if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
+    if args.partial_rollout and args.use_dynamic_global_batch_size:
         if step_global_sample_counts is not None:
             if not isinstance(step_global_sample_counts, list) or len(step_global_sample_counts) != 1:
                 raise ValueError(
@@ -1298,7 +1354,7 @@ def get_data_iterator(
     # collectives stay aligned. Explicit rollout-mini boundaries or divisible
     # fixed-size local steps must already produce the same count on every rank;
     # otherwise fail instead of generating empty batches.
-    if getattr(args, "balance_data", False):
+    if args.balance_data:
         local_num_steps_per_rollout = num_steps_per_rollout
         steps_tensor = torch.tensor(
             [num_steps_per_rollout], dtype=torch.int, device=device_utils.make_current_torch_device()
@@ -1374,7 +1430,7 @@ def get_data_iterator(
         micro_batch_token_capacity = _get_micro_batch_token_capacity(args, _max_tokens, cp_size)
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
-        packing_strategy = getattr(args, "sft_packing_strategy", "balanced")
+        packing_strategy = args.sft_packing_strategy
         assert len(samples) == num_local_samples
         # Bridge pads each THD document before CP splitting, including text-only
         # batches of VL models. Plan with those physical lengths as well.
@@ -1383,7 +1439,7 @@ def get_data_iterator(
             or getattr(args, "uses_unsplit_forward", False)
             or rollout_data.get("multimodal_train_inputs") is not None
         )
-        if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
+        if args.qkv_format == "thd" and cp_size > 1 and needs_unsplit_input:
             alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
             samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
@@ -1536,6 +1592,7 @@ def log_rollout_data(
                 "sample_export_ids",
                 "agentic_group_ids",
                 "rollout_routed_experts",
+                "rollout_replay_refs",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
                 "rollout_topk_support_complete",

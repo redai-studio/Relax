@@ -851,7 +851,7 @@ class DeviceDirectBackend(CommBackend):
         delta = getattr(self, "delta_exporter", None) is not None and not actor_fwd_only
         delta_active, delta_engines, delta_counts = self._delta_rollout_recipients() if delta else (False, None, None)
         managed = self.managed_lora_publication_enabled
-        if managed:
+        if managed or delta_active:
             from relax.engine.lora_versions.training import run_on_training_rank_zero
 
         if managed and self._lora_sync.base_sync_done and rollout_only and not actor_fwd_only:
@@ -920,8 +920,9 @@ class DeviceDirectBackend(CommBackend):
                 for rank, engine in self.rollout_engines.items():
                     ray.get(engine.flush_cache.remote())
 
-            if managed:
-                run_on_training_rank_zero(pause_and_flush, phase="initial LoRA base pause")
+            if managed or delta_active:
+                phase = "initial LoRA base pause" if managed else "DCS delta pause/flush"
+                run_on_training_rank_zero(pause_and_flush, phase=phase)
             elif dist.get_rank() == 0:
                 pause_and_flush()
             dist.barrier(group=get_gloo_group())
