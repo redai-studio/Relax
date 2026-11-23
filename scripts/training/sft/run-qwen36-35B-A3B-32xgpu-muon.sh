@@ -5,7 +5,7 @@
 # DRY_RUN=1 renders the command and worker environment without submitting a job.
 # Multimodal SFT is enabled by default. Resume from SAVE_DIR/EXP_NAME when available.
 # Use the unified Blackwell training image with Emerging Optimizers on all nodes.
-# For an existing data checkpoint saved with keep, pass --sft-oversize-strategy keep to resume it.
+# To resume a data cursor saved with keep, pass --sft-oversize-strategy keep. The TP4 length check still applies.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

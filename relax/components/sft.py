@@ -133,6 +133,12 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
     invalid_multimodal_strategy = getattr(config, "sft_invalid_multimodal_strategy", "error")
     oversize_custom_path = getattr(config, "sft_oversize_custom_function_path", None)
     oversize_custom_fn = None
+    if (
+        oversize_strategy == "keep"
+        and oversize_custom_path == "relax.models.qwen3_5.recipe.keep_within_tp4_dispatch_limit"
+    ):
+        # Keep the checkpoint signature on config; enforce the recipe's dispatch limit in the dataset.
+        oversize_strategy = "custom"
     if oversize_strategy == "custom":
         if not oversize_custom_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
