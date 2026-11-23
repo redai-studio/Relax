@@ -193,6 +193,10 @@ class Controller:
         self._fault_events = fault_events
         self._fault_recovery = fault_recovery
         self.config = config
+        if getattr(config, "train_backend", None) == "fsdp_turbo" and config.save is not None:
+            from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_generation
+
+            config._turbo_checkpoint_generation = checkpoint_generation(config.save)
         self.serve_dict = {}
         self._teacher_manager = None
         # Initialize health management system
@@ -1907,6 +1911,10 @@ class Controller:
 
         try:
             # A first checkpoint may finish while old services are shutting down.
+            if getattr(config, "train_backend", None) == "fsdp_turbo" and config.save is not None:
+                from relax.backends.fsdp_turbo.checkpoint_publication import fence_checkpoint_publishers
+
+                fence_checkpoint_publishers(config.save)
             recovery_load_path(config)
             self.__init__(config, runtime_env, fault_events=self._fault_events, fault_recovery=self._fault_recovery)
             self._fault_rebuild_ready = self._fault_recovery

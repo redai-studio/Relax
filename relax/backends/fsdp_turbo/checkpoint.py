@@ -19,6 +19,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from relax.backends.fsdp_turbo.checkpoint_publication import checkpoint_generation, checkpoint_publication
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -548,11 +549,12 @@ def _export_hf_weights(
             )
 
 
-def _publish_checkpoint(output_dir: str, save_root: str, rollout_id: int) -> None:
+def _publish_checkpoint(output_dir: str, save_root: str, rollout_id: int, generation: str) -> None:
     """Make a completed step visible before updating the recovery pointer."""
-    _write_atomic_latest(output_dir, rollout_id)
-    os.rename(output_dir, os.path.join(save_root, str(rollout_id)))
-    _write_atomic_latest(save_root, rollout_id)
+    with checkpoint_publication(save_root, generation):
+        _write_atomic_latest(output_dir, rollout_id)
+        os.rename(output_dir, os.path.join(save_root, str(rollout_id)))
+        _write_atomic_latest(save_root, rollout_id)
 
 
 def save_checkpoint(
@@ -578,6 +580,8 @@ def save_checkpoint(
 
     with _checkpoint_write_phase():
         if rank == 0:
+            if not hasattr(args, "_turbo_checkpoint_generation"):
+                args._turbo_checkpoint_generation = checkpoint_generation(args.save)
             if os.path.lexists(final_dir):
                 raise FileExistsError(f"Refusing to overwrite checkpoint: {final_dir}")
             os.makedirs(args.save, exist_ok=True)
@@ -610,7 +614,7 @@ def save_checkpoint(
                 hf_config.save_pretrained(output_dir)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(output_dir)
-                _publish_checkpoint(output_dir, args.save, rollout_id)
+                _publish_checkpoint(output_dir, args.save, rollout_id, args._turbo_checkpoint_generation)
                 logger.info(
                     f"[fsdp_turbo] saved DCP sharded checkpoint for rollout_id={rollout_id} to {final_dir} "
                     f"({dist.get_world_size()} per-rank shard files; model+optimizer in sharded form, "
@@ -645,7 +649,7 @@ def save_checkpoint(
                 {"optimizer": optimizer_state, "rollout_id": rollout_id},
                 os.path.join(output_dir, "optimizer.pt"),
             )
-            _publish_checkpoint(output_dir, args.save, rollout_id)
+            _publish_checkpoint(output_dir, args.save, rollout_id, args._turbo_checkpoint_generation)
             logger.info(f"[fsdp_turbo] saved checkpoint for rollout_id={rollout_id} to {final_dir}")
     dist.barrier(group=get_gloo_group())
 
