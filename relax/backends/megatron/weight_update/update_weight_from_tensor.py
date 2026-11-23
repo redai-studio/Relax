@@ -325,6 +325,9 @@ class UpdateWeightFromTensor:
             [
                 int(
                     configure is not None
+                    # Routed EDP replicas elect one sender, but FSDP gathers
+                    # require every shard owner to participate.
+                    and not getattr(self.args, "use_megatron_fsdp", False)
                     and torch.cuda.is_available()
                     and torch.version.hip is None
                     and mpu.get_expert_tensor_parallel_world_size() == 1

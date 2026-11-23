@@ -39,6 +39,96 @@ def _install_module(monkeypatch, name: str, **attributes) -> types.ModuleType:
     return module
 
 
+def test_fsdp_dtensor_replacement_and_reset_preserve_mtp_norm_group(tmp_path):
+    """Execute native replacement and optimizer filtering; fake provider tests
+    cannot cover these.
+
+    One CPU/Gloo rank suffices: metadata loss happens locally before any norm
+    collective.
+    """
+    source_root = os.environ.get("RELAX_MEGATRON_PATCHED_SOURCE")
+    if not source_root:
+        pytest.skip("RELAX_MEGATRON_PATCHED_SOURCE must point to isolated patched Megatron source")
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    core = Path(source_root) / "megatron/core"
+    fsdp = core / "distributed/fsdp/src/megatron_fsdp"
+    namespace = {"torch": torch}
+    _load_functions(
+        fsdp / "param_and_grad_buffer.py", {"_init_optimizer_named_parameters"}, namespace, "ParamAndGradBuffer"
+    )
+    _load_functions(fsdp / "megatron_fsdp.py", {"_replace_module_parameter"}, namespace)
+    _load_functions(
+        fsdp / "megatron_fsdp.py",
+        {"_replace_param_with_distributed_if_needed", "_reestablish_shared_weights"},
+        namespace,
+        "MegatronFSDP",
+    )
+    namespace.update(
+        GRAD_NORM_GROUP_ATTR="grad_norm_group",
+        SEPARATE_GRAD_NORM_GROUPS=("mtp",),
+        param_is_not_shared=lambda param: True,
+        tensor_parallel=types.SimpleNamespace(param_is_not_tensor_parallel_duplicate=lambda param, group: True),
+    )
+    _load_functions(
+        core / "optimizer/optimizer.py",
+        {"_get_param_grad_norm_group", "_validate_grad_norm_group", "_is_separate_grad_norm_group"},
+        namespace,
+    )
+    _load_functions(
+        core / "optimizer/optimizer.py",
+        {"_filter_grads_for_norm", "get_grads_for_grad_norm"},
+        namespace,
+        "MegatronOptimizer",
+    )
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    try:
+        mesh = DeviceMesh("cpu", [0])
+        model = torch.nn.Module()
+        model.backbone = torch.nn.Parameter(torch.ones(1))
+        model.mtp = torch.nn.Parameter(torch.ones(1))
+        model.mtp.grad_norm_group = "mtp"
+        original = dict(model.named_parameters())
+        buffer = types.SimpleNamespace(
+            parameter_groups=[types.SimpleNamespace(params=list(model.parameters()), model_weight_buffer=None)],
+            param_to_name={param: name for name, param in original.items()},
+            dist_main_weight={
+                name: DTensor.from_local(param.detach(), mesh, [Shard(0)]) for name, param in original.items()
+            },
+            dist_index=None,
+        )
+        buffer.optimizer_named_parameters = namespace["_init_optimizer_named_parameters"](buffer)
+        wrapper = types.SimpleNamespace(
+            module=model, param_and_grad_buffer=buffer, raw_param=original, is_param_fsdp_distributed=False
+        )
+        wrapper._reestablish_shared_weights = types.MethodType(namespace["_reestablish_shared_weights"], wrapper)
+        namespace["_replace_param_with_distributed_if_needed"](wrapper)
+        for name, param in model.named_parameters():
+            assert isinstance(param, DTensor) and param is not original[name]
+            param.grad = DTensor.from_local(torch.tensor([3.0 if name == "backbone" else 4.0]), mesh, [Shard(0)])
+
+        optimizer = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                use_precision_aware_optimizer_no_fp8_or_ds_fp8=False, use_precision_aware_optimizer=False
+            ),
+            get_parameters=lambda: list(model.parameters()),
+        )
+        optimizer._filter_grads_for_norm = types.MethodType(namespace["_filter_grads_for_norm"], optimizer)
+        for reset in (False, True):
+            if reset:
+                del model.mtp.grad_norm_group
+                model.mtp.reset_attribute()
+            main_grads = namespace["get_grads_for_grad_norm"](optimizer)
+            mtp_grads = namespace["get_grads_for_grad_norm"](optimizer, "mtp")
+            torch.testing.assert_close(torch.linalg.vector_norm(torch.cat(main_grads)), torch.tensor(3.0))
+            torch.testing.assert_close(torch.linalg.vector_norm(torch.cat(mtp_grads)), torch.tensor(4.0))
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.fixture
 def gdn_types(monkeypatch):
     calls = []

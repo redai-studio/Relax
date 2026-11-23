@@ -354,9 +354,15 @@ def process_mtp_loss(
             "must share the same CP-local layout before rolling"
         )
 
-    # Relax controls each detach path separately from upstream mtp_detach_heads.
+    # Chunked projections bypass Module.__call__. Gather once before any
+    # detach or projection: unsharding can rebind the raw parameter's storage.
+    head_weight = output_weight if output_weight is not None else output_layer.weight
+    for param in (head_weight, getattr(output_layer, "bias", None)):
+        owner = getattr(param, "_megatron_fsdp_model", None)
+        if owner is not None:
+            owner.all_gather_and_wait_parameters_ready([param], prefetch=False)
     if getattr(config, "mtp_detach_lm_head", True):
-        output_weight = (output_weight if output_weight is not None else output_layer.weight).detach()
+        output_weight = head_weight.detach()
 
     # per-token count BEFORE rolling (used by the per-token-loss normalization).
     original_num_tokens = loss_mask.sum()

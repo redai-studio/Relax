@@ -194,6 +194,77 @@ def test_hc_fusion_production_width_dynamic_tokens(runtime, combine):
 
 
 @gpu
+@pytest.mark.parametrize("hidden_size,rank", [(128, 32), (2560, 320)])
+def test_hc_fusion_reuses_graphs_across_checkpoint_views(runtime, monkeypatch, request, hidden_size, rank):
+    """Layers and heads must share a bounded cache across checkpoint replay.
+
+    Single-model parity tests miss the accumulated guards from view bases,
+    frozen inputs, heads, and replay. Use short sequences at both GEMM widths.
+    """
+    from torch._dynamo.utils import counters
+
+    make, original = runtime
+    monkeypatch.setenv("RELAX_QWEN38_HC_RECOMPUTE", "0")
+    torch.compiler.reset()
+    patch.compiled_mix.cache_clear()
+    request.addfinalizer(torch.compiler.reset)
+    request.addfinalizer(patch.compiled_mix.cache_clear)
+    models = {combine: make(combine, hidden_size=hidden_size, rank=rank) for combine in (True, False)}
+    width = 4 * hidden_size
+    # First checkpoint input, output head, intermediate HC, frozen input,
+    # strided tokens, checkpointed head, and TP slices with nonzero offset.
+    cases = [
+        ("streams", True, True, True),
+        ("flat", True, False, False),
+        ("matrix", True, True, True),
+        ("flat", False, True, False),
+        ("strided", True, True, True),
+        ("streams", True, False, True),
+        ("matrix", False, False, False),
+        ("offset", True, True, True),
+        ("offset", False, False, False),
+    ]
+    compiled_after_warmup = None
+    for rows in (7, 11, 13):
+        for layout, requires_grad, combine, outer in cases:
+            model = models[combine]
+            params = list(model.parameters())
+            shape = {
+                "streams": (rows, 1, 4, hidden_size),
+                "flat": (rows, 1, width),
+                "matrix": (rows, width),
+                "strided": (2 * rows, 1, width),
+                "offset": (rows + 2, 1, width),
+            }[layout]
+            base = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=requires_grad)
+            if layout == "strided":
+                x = base[::2]
+            elif layout == "offset":
+                x = base[1 : rows + 1]
+            else:
+                x = base.reshape(rows, 1, width)
+            targets = ([base] if requires_grad else []) + params
+            expected = tuple(t for t in original(model, x) if t is not None)
+            upstream = tuple(torch.randn_like(t) * 0.01 for t in expected)
+            reference = torch.autograd.grad(expected, targets, grad_outputs=upstream)
+
+            def run(value):
+                return tuple(t for t in patch.fused_mix(model, value) if t is not None)
+
+            actual = checkpoint(run, x, use_reentrant=True) if outer else run(x)
+            torch.autograd.backward(actual, upstream)
+            for a, b in zip((*actual, *(t.grad for t in targets)), (*expected, *reference)):
+                _close(a, b)
+            for param in params:
+                param.grad = None
+        graphs = counters["stats"]["unique_graphs"]
+        if compiled_after_warmup is None:
+            compiled_after_warmup = graphs
+        else:
+            assert graphs == compiled_after_warmup, "New token counts or view bases triggered recompilation"
+
+
+@gpu
 @pytest.mark.parametrize(
     "combine,rows,outer,enabled,method,hidden_size,expected_calls",
     [
@@ -236,14 +307,14 @@ def test_hc_inner_recompute_matches_mcore_outer_gradients(
     for value in [x, *params]:
         value.grad = None
 
-    compiled = patch.compiled_mix(hidden_size == 2560)
+    compiled = patch.compiled_mix(hidden_size == 2560, combine)
     calls = []
 
     def observed(*args):
         calls.append(torch.is_grad_enabled())
         return compiled(*args)
 
-    monkeypatch.setattr(patch, "compiled_mix", lambda fixed_width: observed)
+    monkeypatch.setattr(patch, "compiled_mix", lambda fixed_width, use_combine: observed)
     monkeypatch.setenv("RELAX_QWEN38_HC_RECOMPUTE", "1" if enabled else "0")
     monkeypatch.setenv("RELAX_QWEN38_HC_OUTER_BYPASS_MAX_LOCAL_ROWS", "8")
     result = tp_random.checkpoint(loss, False, x) if outer else loss(x)

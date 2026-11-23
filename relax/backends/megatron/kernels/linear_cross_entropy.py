@@ -594,6 +594,8 @@ try:
                                 n * self.epi_tile[1] + n_subtile * cute.size(tTMEM_load_rAcc, mode=[0]) + idx
                             )
                             if (block_vocab_left_idx + local_position) < block_vocab_right_idx:
+                                # Native linear writes low-precision logits before FP32 CE.
+                                tTMEM_load_rAcc[idx] = tTMEM_load_rAcc[idx].to(sA.element_type).to(self.acc_dtype)
                                 _max_old = tR2GrMax[0]
                                 tR2GrMax[0] = cute.arch.fmax(tR2GrMax[0], tTMEM_load_rAcc[idx])
                                 exp_logits = cute.exp(tTMEM_load_rAcc[idx] - tR2GrMax[0])
@@ -1153,6 +1155,7 @@ try:
                     )
 
                     for idx in cutlass.range(cute.size(tTMEM_load_rAcc, mode=[0]), unroll_full=True):
+                        tTMEM_load_rAcc[idx] = tTMEM_load_rAcc[idx].to(sA.element_type).to(self.acc_dtype)
                         # exp_logits
                         tTMEM_load_rAcc[idx] = cute.exp(tTMEM_load_rAcc[idx] - tMrMaximum[0])
 
@@ -1638,7 +1641,7 @@ class _LinearCrossEntropy(torch.autograd.Function):
         hidden, weight, labels, maximum, accu = ctx.saved_tensors
         with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):
             dhidden, dweight = _blackwell_backward(
-                dloss, hidden, weight, labels, maximum, accu, ctx.tp_group, ctx.tp_rank, ctx.tp_size
+                dloss.contiguous(), hidden, weight, labels, maximum, accu, ctx.tp_group, ctx.tp_rank, ctx.tp_size
             )
         return dhidden, dweight, None, None
 

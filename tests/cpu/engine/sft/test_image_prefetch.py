@@ -50,3 +50,18 @@ def test_image_prefetch_propagates_decode_error_and_closes():
 def test_image_prefetch_rejects_invalid_bounds(depth, workers):
     with pytest.raises(ValueError):
         ImagePrefetch([], ImageBatchSampler(8, 8, 42), 0, 4, 0, 1, depth, workers)
+
+
+def test_vision_owner_through_nested_wrappers_and_cycles():
+    from types import SimpleNamespace
+
+    from relax.engine.sft.image_prefetch import SFTImagePrefetch
+
+    prefetch = SFTImagePrefetch(SimpleNamespace(is_vl_model=True), lambda *_: ([], 0.0))
+    chunk = SimpleNamespace(pre_process=True)
+    for _ in range(5):
+        chunk = SimpleNamespace(module=chunk)
+    empty_stage = SimpleNamespace(pre_process=False)
+    empty_stage.module = empty_stage
+    assert prefetch.owns_vision([empty_stage, chunk])
+    assert not prefetch.owns_vision(empty_stage)

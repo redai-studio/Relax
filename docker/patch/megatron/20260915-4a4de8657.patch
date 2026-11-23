@@ -1,7 +1,7 @@
 # Pinned Bridge 6862ee170a / MCore 4a4de86579. Apply common, then the selected runtime profile.
 # BEGIN common
 diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge/models/conversion/model_bridge.py
-index a7e4a70..b7118ca 100644
+index a7e4a70..cf094fb 100644
 --- a/megatron/bridge/models/conversion/model_bridge.py
 +++ b/megatron/bridge/models/conversion/model_bridge.py
 @@ -1430,7 +1430,7 @@ class MegatronModelBridge(
@@ -31,6 +31,18 @@ index a7e4a70..b7118ca 100644
              if isinstance(task.param_weight, DTensor):
                  from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                      uneven_dtensor_to_full_tensor,
+@@ -1987,7 +1989,10 @@ class MegatronModelBridge(
+                 else:
+                     assert hasattr(unwrapped_model, "output_layer"), "Output layer not found"
+                     embd_weights = torch.empty_like(unwrapped_model.output_layer.weight.data)
+-                torch.distributed.broadcast(embd_weights, src=embd_group_ranks[0], group=embd_group)
++                # FSDP puts tied embeddings in matching buckets on both stages.
++                # c10d broadcasts the local shard; retain the DTensor for copy_.
++                local_weights = embd_weights.to_local() if isinstance(embd_weights, DTensor) else embd_weights
++                torch.distributed.broadcast(local_weights, src=embd_group_ranks[0], group=embd_group)
+                 if hasattr(unwrapped_model, "output_layer"):
+                     unwrapped_model.output_layer.weight.data.copy_(embd_weights)
+ 
 diff --git a/megatron/bridge/models/gemma/modeling_gemma4.py b/megatron/bridge/models/gemma/modeling_gemma4.py
 index 75f73be..148c991 100644
 --- a/megatron/bridge/models/gemma/modeling_gemma4.py
@@ -390,7 +402,7 @@ index 2055912..e829d7d 100644
                  flatten_sharded_tensors=False,
              ),
 diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
-index c483f97..521ae91 100644
+index c483f97..9db6f43 100644
 --- a/megatron/core/extensions/transformer_engine.py
 +++ b/megatron/core/extensions/transformer_engine.py
 @@ -930,6 +930,7 @@ class TELinear(te.pytorch.Linear):
@@ -409,6 +421,42 @@ index c483f97..521ae91 100644
                              ).view(self.fp8_meta["recipe"].amax_history_len, -1),
                          }
                      )
+@@ -2454,6 +2456,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+             )
+             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+ 
++            # In BF16 a persistent FSDP gradient is zeroed by the optimizer.
++            # Forward and backward microbatch order can differ, so TE must
++            # add even when this was the first forward in a pipeline step.
++            weight = getattr(self, "weight0", None)
++            if (
++                self.fuse_wgrad_accumulation
++                and getattr(weight, "__fsdp_param__", False)
++                and not getattr(weight, "overwrite_main_grad", False)
++                and weight.dtype == torch.bfloat16
++                and not (self.config.fp8 or self.config.fp4)
++            ):
++                _is_first_microbatch = None
+             with quant_context:
+                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+             self.is_first_microbatch = False
+@@ -3571,6 +3585,7 @@ try:
+         out: Optional[torch.Tensor] = None,
+         bias: Optional[torch.Tensor] = None,
+         grad: bool = False,
++        accumulate: bool = False,
+     ) -> List[torch.Tensor]:
+         """
+         Wrapper for TE's general_gemm function.
+@@ -3584,7 +3599,7 @@ try:
+             quantization_params=None,
+             gelu=None,
+             gelu_in=None,
+-            accumulate=False,
++            accumulate=accumulate,
+             layout=layout,
+             out=out,
+             bias=bias,
 diff --git a/megatron/core/fp8_utils.py b/megatron/core/fp8_utils.py
 index ac36d40..490ebed 100644
 --- a/megatron/core/fp8_utils.py
@@ -1852,9 +1900,10 @@ diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/opti
          destination.shared = source.shared
      if hasattr(source, GRAD_NORM_GROUP_ATTR):
 diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+index 3318972..07ea934 100644
 --- a/megatron/core/tensor_parallel/layers.py
 +++ b/megatron/core/tensor_parallel/layers.py
-@@ -98,7 +98,10 @@
+@@ -98,7 +98,10 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
      if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
          return True
      # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
@@ -1866,6 +1915,35 @@ diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_para
          tp_group = expert_tp_group
      # Prefer provided tp_group when available (new explicit path).
      if tp_group is not None:
+@@ -590,6 +593,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+                 # In case of Megatron-FSDP, need to create main grad buffers in-place
+                 if hasattr(weight, "__fsdp_param__"):
+                     weight.main_grad = weight.get_main_grad()
++                    # Repeated projections (e.g. a chunked LM head) write to
++                    # the same full gradient before the bucket is reduced.
++                    accumulate = not weight._gbuf.is_data_distributed or getattr(
++                        weight, "_fsdp_fused_wgrad_written", False
++                    )
++                    weight._fsdp_fused_wgrad_written = True
+                     # Import here to avoid circular import
+                     from megatron.core.extensions.transformer_engine import te_general_gemm
+ 
+@@ -604,9 +613,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+                             layout="NT",
+                             out=weight.main_grad,
+                             grad=True,
++                            accumulate=accumulate,
+                         )
+                     else:
+-                        torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
++                        dst = weight.main_grad
++                        torch.addmm(
++                            dst, grad_output.t().to(dst.dtype), total_input.to(dst.dtype),
++                            beta=int(accumulate), out=dst,
++                        )
+                 else:
+                     if weight.main_grad.dtype == torch.float32:
+                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
 diff --git a/megatron/bridge/peft/recompute.py b/megatron/bridge/peft/recompute.py
 --- a/megatron/bridge/peft/recompute.py
 +++ b/megatron/bridge/peft/recompute.py
@@ -3095,10 +3173,30 @@ index 13c8954e5..7755d527b 100644
 +                + _ple_fp8_source_scale_keys(source)
              ) or None
 diff --git a/megatron/bridge/models/conversion/param_mapping.py b/megatron/bridge/models/conversion/param_mapping.py
-index ace06e225..fdec9fc46 100644
+index ace06e2..f65fe7b 100644
 --- a/megatron/bridge/models/conversion/param_mapping.py
 +++ b/megatron/bridge/models/conversion/param_mapping.py
-@@ -1632,3 +1632,7 @@ class ReplicatedMapping(MegatronParamMapping[torch.Tensor]):
+@@ -1295,13 +1295,11 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
+                 hf_weights = hf_weights.to(target_param.dtype)
+ 
+             actual_dim0_size = hf_weights.shape[0]
+-            # DTensor.shape is already the global shape across TP ranks, while
+-            # a regular Megatron parameter stores only its local TP shard.
+-            expect_dim0_size = target_param.shape[0]
+-            if not isinstance(target_param, DTensor):
+-                expect_dim0_size *= self.tp_size
++            # FSDP DTensor.shape includes TP; orig_param retains the scatter shape.
++            target_shape = target_param.orig_param.shape if isinstance(target_param, DTensor) else target_param.shape
++            expect_dim0_size = target_shape[0] * self.tp_size
+             if actual_dim0_size != expect_dim0_size:
+-                assert self.megatron_param in {"embedding.word_embeddings.weight", "output_layer.weight"}, (
++                assert self.megatron_param.endswith(("embedding.word_embeddings.weight", "output_layer.weight")), (
+                     f"{hf_weights.shape=} {target_param.shape=} {self.tp_size=} {self.megatron_param=} {self.hf_param=}"
+                 )
+                 hf_weights = _pad_right_dim0(hf_weights, pad_size=expect_dim0_size - actual_dim0_size)
+@@ -1630,7 +1628,11 @@ class ReplicatedMapping(MegatronParamMapping[torch.Tensor]):
+         megatron_module: nn.Module,
+     ) -> torch.Tensor:
          """Replicate weight to all TP ranks."""
 -        if hasattr(megatron_module, "weight"):
 +        target_name = str(self.megatron_param).rsplit(".", 1)[-1]
@@ -3107,6 +3205,8 @@ index ace06e225..fdec9fc46 100644
 +            target_device = target.device
 +        elif hasattr(megatron_module, "weight"):
              target_device = megatron_module.weight.device
+         else:
+             # the parameter may not be called "weight"
 diff --git a/megatron/bridge/models/qwen/__init__.py b/megatron/bridge/models/qwen/__init__.py
 index cf091ab08..b9885530d 100644
 --- a/megatron/bridge/models/qwen/__init__.py
@@ -4735,10 +4835,28 @@ index e829d7d5e..f9918cedf 100644
 +            async_writer_kwargs["synchronous"] = True
          state_dict_saver_kwargs = {}
 diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
-index dc7970d14..93d18814f 100644
+index dc7970d..2033c95 100644
 --- a/megatron/core/distributed/finalize_model_grads.py
 +++ b/megatron/core/distributed/finalize_model_grads.py
-@@ -431,61 +431,4 @@ def _allreduce_non_tensor_model_parallel_grads(
+@@ -251,10 +251,13 @@ def _allreduce_embedding_grad(
+         if weight is None and skip_if_none:
+             return
+ 
++        if ddp_config.use_megatron_fsdp:
++            from .fsdp.src.megatron_fsdp.pp_utils import allreduce_fsdp_embedding_grad
++
++            allreduce_fsdp_embedding_grad(weight, embd_group, skip_if_none=skip_if_none)
++            return
+         grad_attr = _get_main_grad_attr(weight)
+         orig_grad = getattr(weight, grad_attr)
+-        if ddp_config.use_megatron_fsdp:
+-            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
+         grad = _unshard_if_dtensor(orig_grad)
+         # When the embedding is frozen, the grad is None.
+         if grad is None and skip_if_none:
+@@ -429,65 +432,8 @@ def _allreduce_non_tensor_model_parallel_grads(
+     gradients from modules with average_gradients_across_tp_domain=True
+     across tensor-model-parallel ranks.
      """
 -    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 -    if tp_group.size() <= 1:
@@ -4802,6 +4920,8 @@ index dc7970d14..93d18814f 100644
 +    from relax.models.common.chunked_grad_coalesce import _allreduce_non_tensor_model_parallel_grads as chunked_reduce
 +    return chunked_reduce(model, config, tp_group)
  
+ 
+ """
 diff --git a/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py b/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py
 index 3178e8c69..4355b76ea 100644
 --- a/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dlogits.py
@@ -7990,10 +8110,12 @@ index 000000000..580cbd961
 +    )
 +    return reduced * loss_coeff
 diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
-index 9b2391562..17b623477 100644
+index 9b23915..eca4c33 100644
 --- a/megatron/core/transformer/hyper_connection.py
 +++ b/megatron/core/transformer/hyper_connection.py
-@@ -906,2 +906,250 @@ class HyperConnectionModule(MegatronModule):
+@@ -904,6 +904,266 @@ class HyperConnectionModule(MegatronModule):
+         return output
+ 
  
 +# ============================================================================
 +# Gated Residual (Qwen4-Exp / Qwen3.8-Flash-Next hyper-connections)
@@ -8019,8 +8141,8 @@ index 9b2391562..17b623477 100644
 +    return normed.to(orig_dtype)
 +
 +
-+class GatedResidualMTPHiddenNorm(MegatronModule):
-+    """Normalize flattened MTP hidden streams, matching the SGLang draft model."""
++class GatedResidualStreamNorm(MegatronModule):
++    """Normalize each backbone residual stream independently, with one gain per feature."""
 +
 +    def __init__(self, config: TransformerConfig, hidden_size: int, eps: float):
 +        super().__init__(config)
@@ -8033,6 +8155,18 @@ index 9b2391562..17b623477 100644
 +        )
 +        if config.sequence_parallel:
 +            setattr(self.weight, "sequence_parallel", True)
++
++    def forward(self, hidden_states: Tensor) -> Tensor:
++        shape = hidden_states.shape
++        assert shape[-2:] == (self.num_streams, self.hidden_size)
++        result = gated_residual_group_rmsnorm(
++            hidden_states.flatten(-2), self.weight, self.num_streams, self.eps
++        )
++        return result.reshape(shape)
++
++
++class GatedResidualMTPHiddenNorm(GatedResidualStreamNorm):
++    """Normalize flattened MTP hidden streams, matching the SGLang draft model."""
 +
 +    def forward(self, hidden_states: Tensor) -> Tensor:
 +        shape = hidden_states.shape
@@ -8081,8 +8215,7 @@ index 9b2391562..17b623477 100644
 +        hc_hidden_size = self.n * self.hidden_size
 +        dtype = config.params_dtype
 +
-+        self.hc_norm = nn.Module()
-+        self.hc_norm.weight = nn.Parameter(torch.zeros(hc_hidden_size, dtype=dtype))
++        self.hc_norm = GatedResidualStreamNorm(config, self.hidden_size, self.norm_eps)
 +        self.input_mix_weight_down = nn.Linear(hc_hidden_size, self.rank, bias=False, dtype=dtype)
 +        self.input_mix_weight_up = nn.Linear(self.rank, hc_hidden_size, bias=False, dtype=dtype)
 +        if use_combine:
@@ -8112,7 +8245,7 @@ index 9b2391562..17b623477 100644
 +                return fused_mix(self, hidden_states)
 +        s, b, nC = hidden_states.shape
 +        n, C = self.n, self.hidden_size
-+        xn = gated_residual_group_rmsnorm(hidden_states, self.hc_norm.weight, n, self.norm_eps)
++        xn = self.hc_norm(hidden_states.unflatten(-1, (n, C))).flatten(-2)
 +        down = F.silu(self.input_mix_weight_down(xn).float() / n)
 +        gate = torch.sigmoid(self.input_mix_weight_up(down.to(xn.dtype)).float())
 +        block_input = (gate.view(s, b, n, C) * xn.float().view(s, b, n, C)).mean(dim=2)
@@ -8236,6 +8369,7 @@ index 9b2391562..17b623477 100644
 +            ), "GatedResidualOutputMixer mixes full hidden streams."
 +        if eps is not None:
 +            self.norm_eps = eps
++            self.hc_norm.eps = eps
 +
 +    def forward(self, hidden_states: Tensor) -> Tensor:  # type: ignore[override]
 +        """[s, b, n*C] streams -> [s, b, C] mixed output."""
@@ -8244,6 +8378,8 @@ index 9b2391562..17b623477 100644
 +
 +
  # ==================== Checkpoint utilities for mHC ====================
+ 
+ 
 diff --git a/megatron/core/transformer/moe/experts.py b/megatron/core/transformer/moe/experts.py
 index c40145219..3abd8b8df 100644
 --- a/megatron/core/transformer/moe/experts.py
@@ -9330,6 +9466,294 @@ index 82f5640ec..c8eac8ade 100644
 +            assert not getattr(args, "use_torch_fsdp2", False)
 +            ddp_config.delay_wgrad_compute = True
          if not getattr(args, "use_torch_fsdp2", False):
+diff --git a/megatron/core/distributed/fsdp/mcore_fsdp_adapter.py b/megatron/core/distributed/fsdp/mcore_fsdp_adapter.py
+index 4e2bc02..07cf136 100644
+--- a/megatron/core/distributed/fsdp/mcore_fsdp_adapter.py
++++ b/megatron/core/distributed/fsdp/mcore_fsdp_adapter.py
+@@ -510,12 +510,25 @@ class FullyShardedDataParallel(_BaseDataParallel):
+         _load_rng_state_dict(broadcast_list[0])
+ 
+ 
++def _get_pipeline_stage_ranks():
++    from .src.megatron_fsdp.pp_utils import stage_local_arange
++
++    pp_group = parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
++    if pp_group is None:
++        return torch.arange(dist.get_world_size(group=dist.group.WORLD))
++    if isinstance(pp_group, (list, tuple)):
++        pp_group = pp_group[0]
++    return stage_local_arange(
++        dist.get_world_size(group=dist.group.WORLD),
++        dist.get_rank(group=dist.group.WORLD),
++        dist.get_process_group_ranks(pp_group),
++    )
++
++
+ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
+     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
+-    world_size = dist.get_world_size()
+-
+     mesh = einops.rearrange(
+-        torch.arange(world_size),
++        _get_pipeline_stage_ranks(),
+         "(outer_fsdp_dp fsdp ep tp) -> ep outer_fsdp_dp fsdp tp",
+         outer_fsdp_dp=outer_fsdp_dp_group.size(),
+         tp=tp_group.size(),
+@@ -581,12 +594,10 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
+ 
+ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
+     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
+-    world_size = dist.get_world_size()
+-
+     tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+     # TODO: Supports configurable (dp, cp, ep, tp) order.
+     mesh = einops.rearrange(
+-        torch.arange(world_size),
++        _get_pipeline_stage_ranks(),
+         "(dp_cp ep tp) -> ep dp_cp tp",
+         dp_cp=dp_cp_group.size(),
+         tp=tp_size,
+diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+index 9c6cbdf..d67d588 100644
+--- a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
++++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+@@ -500,11 +500,10 @@ class MegatronFSDP(torch.nn.Module):
+             # This setting is needed to have this attribute present after every
+             # un-shard of the FSDP params.
+             param.__fsdp_param__ = True
+-            # Transformer Engine accumulates gradient on top of the `main_grad`
+-            # buffer when gradient accumulation fusion in enabled. But with FSDP,
+-            # we want to overwrite the `main_grad` which is enabled by this
+-            # attribute.
+-            param.overwrite_main_grad = True
++            # A sharded gradient bucket is scratch until reduce-scatter.
++            # An unsharded buffer holds the running sum across microbatches.
++            grad_buffer = getattr(param, "_gbuf", None)
++            param.overwrite_main_grad = grad_buffer is not None and grad_buffer.is_data_distributed
+ 
+     def _register_fsdp_hooks(self, root_module):
+         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
+@@ -1145,7 +1144,7 @@ class MegatronFSDP(torch.nn.Module):
+                 module, _root_pre_backward
+             )
+         self._root_pre_backward_hook_handle = create_custom_backward_hook(
+-            module, _root_pre_backward
++            root_module, _root_pre_backward
+         )
+ 
+         # Register post load state_dict hook to ensure that the module parameters
+diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
+index 7732941..fd47e25 100644
+--- a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
++++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
+@@ -34,6 +34,7 @@ from .mixed_precision import (
+     is_float8tensor,
+     is_te_min_version,
+ )
++from .pp_utils import make_tp_dtensor
+ from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
+ from .utils import (
+     _MODEL_PARALLEL_RNG_TRACKER_NAME,
+@@ -62,6 +63,7 @@ def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
+ 
+ try:
+     # Default to Megatron-LM FW.
++    from megatron.core import parallel_state
+     from megatron.core.distributed.distributed_data_parallel_config import (
+         DistributedDataParallelConfig,
+     )
+@@ -1529,6 +1531,8 @@ class DataParallelBuffer:
+         for param in self.params:
+             if hasattr(param, "main_grad"):
+                 param.main_grad = None
++            if hasattr(param, "_fsdp_fused_wgrad_written"):
++                param._fsdp_fused_wgrad_written = False
+ 
+     def _get_item_slice_in_shard(self, item_id: int) -> Tuple[int, int]:
+         """
+@@ -3453,6 +3457,7 @@ class ParamAndGradBuffer:
+                             "requires_grad",
+                             "sequence_parallel",
+                             "shared",
++                            "grad_norm_group",
+                             "tensor_model_parallel",
+                             "partition_dim",
+                             "partition_stride",
+@@ -5291,12 +5296,18 @@ def make_fsdp_dtensor(
+             placements = [Shard(tp_dim)]
+             global_shape[tp_dim] *= tp_mesh.mesh.numel()
+ 
+-        # Construct TP-sharded DTensor using Megatron-style placement
+-        param = DTensor.from_local(
++        # PP stages own different parameter lists; metadata collectives must
++        # not run on WORLD. Keep TP replica broadcasts and uneven validation.
++        param = make_tp_dtensor(
+             local_tensor=local_tensor,
+             device_mesh=tp_mesh,
+             placements=placements,
+             run_check=run_check,
++            pipeline_parallel_size=(
++                parallel_state.get_pipeline_model_parallel_world_size()
++                if HAVE_MCORE and parallel_state.model_parallel_is_initialized()
++                else 1
++            ),
+             shape=tuple(global_shape),
+             stride=torch.empty(global_shape).stride(),
+         )
+diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/pp_utils.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/pp_utils.py
+new file mode 100644
+index 0000000..789b8cd
+--- /dev/null
++++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/pp_utils.py
+@@ -0,0 +1,124 @@
++# Copyright (c) 2026 Relax Authors. All Rights Reserved.
++
++"""Pipeline-parallel helpers for Megatron-FSDP's local shards."""
++
++import re
++from collections.abc import Sequence
++
++import torch
++import torch.distributed as dist
++from torch.distributed.tensor import DTensor
++
++
++def pp_stage_window(world_size: int, rank: int, pp_ranks: Sequence[int]) -> tuple[int, int]:
++    """Return the contiguous stage block for Megatron's default PP-last rank order."""
++    pp_ranks = list(pp_ranks)
++    if not pp_ranks:
++        raise ValueError("Empty pipeline-model-parallel rank list")
++    if world_size % len(pp_ranks):
++        raise ValueError(f"World size {world_size} not divisible by PP size {len(pp_ranks)}")
++    if rank not in pp_ranks:
++        raise ValueError(f"Rank {rank} is not a member of its PP group {pp_ranks}")
++    stage_size = world_size // len(pp_ranks)
++    ordered = sorted(pp_ranks)
++    if ordered != [ordered[0] + i * stage_size for i in range(len(pp_ranks))]:
++        raise RuntimeError(
++            "Megatron-FSDP requires contiguous PP stage blocks; --use-tp-pp-dp-mapping with PP > 1 is not supported"
++        )
++    return (rank // stage_size) * stage_size, stage_size
++
++
++def stage_local_arange(world_size: int, rank: int, pp_ranks: Sequence[int]) -> torch.Tensor:
++    base, size = pp_stage_window(world_size, rank, pp_ranks)
++    return torch.arange(size) + base
++
++
++def make_tp_dtensor(
++    local_tensor: torch.Tensor,
++    device_mesh,
++    placements,
++    *,
++    shape: tuple,
++    stride: tuple,
++    run_check: bool,
++    pipeline_parallel_size: int,
++) -> DTensor:
++    """Avoid world-wide metadata collectives between different PP parameter lists.
++
++    DTensor's run_check also synchronizes Replicate placements. Preserve that
++    broadcast on the one-dimensional TP mesh when skipping the metadata check.
++    PP=1 and callers not requesting validation retain their original behavior.
++    """
++    check_metadata = run_check and pipeline_parallel_size <= 1
++    if run_check and not check_metadata and placements[0].is_replicate():
++        group = device_mesh.get_group()
++        local_tensor = local_tensor.contiguous()
++        with torch.no_grad():
++            dist.broadcast(local_tensor, src=dist.get_process_group_ranks(group)[0], group=group)
++    return DTensor.from_local(
++        local_tensor,
++        device_mesh=device_mesh,
++        placements=placements,
++        shape=shape,
++        stride=stride,
++        run_check=check_metadata,
++    )
++
++
++def allreduce_fsdp_embedding_grad(weight: torch.nn.Parameter, group, skip_if_none: bool = True) -> None:
++    """Reduce corresponding local shards without losing their DTensor metadata."""
++    grad_attr = (
++        "decoupled_grad"
++        if hasattr(weight, "decoupled_grad")
++        else ("main_grad" if hasattr(weight, "main_grad") else "grad")
++    )
++    original = getattr(weight, grad_attr)
++    if original is None and skip_if_none:
++        return
++    local_grad = original._local_tensor
++    if local_grad is None and skip_if_none:
++        return
++    dist.all_reduce(local_grad, group=group)
++    # The original DTensor aliases this shard; retain its metadata and identity.
++
++
++
++_LAYER_INDEX_RE = re.compile(r"layers\.(\d+)")
++
++
++def rename_layers_to_global(state_dict: dict, offset: int) -> None:
++    """Rename decoder keys in place, retaining independent MTP layer numbering."""
++    if offset == 0:
++        return
++    renames = []
++    for key, value in state_dict.items():
++        if "mtp" in key:
++            continue
++        match = _LAYER_INDEX_RE.search(key)
++        if match is not None:
++            new_key = _LAYER_INDEX_RE.sub(f"layers.{int(match.group(1)) + offset}", key, count=1)
++            renames.append((key, new_key, value))
++    for key, _, _ in renames:
++        del state_dict[key]
++    for _, key, value in renames:
++        state_dict[key] = value
++
++
++def globalize_fsdp_checkpoint_keys(state_dict: dict, offset: int, has_mtp: bool) -> dict:
++    """Run after native layout transforms; preserve load-time local-name snapshots.
++
++    Only copy dictionaries: DCP must populate the original tensors and optimizer
++    group metadata in place. Non-MTP group metadata retains its existing schema.
++    """
++    state_dict = state_dict.copy()
++    state_dict["model"] = state_dict["model"].copy()
++    rename_layers_to_global(state_dict["model"], offset)
++    if "optimizer" in state_dict:
++        state_dict["optimizer"] = state_dict["optimizer"].copy()
++        fields = ("state", "param_to_group_meta") if has_mtp else ("state",)
++        for field in fields:
++            if field in state_dict["optimizer"]:
++                values = state_dict["optimizer"][field].copy()
++                rename_layers_to_global(values, offset)
++                state_dict["optimizer"][field] = values
++    return state_dict
+diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
+index ecfe188..b1617db 100644
+--- a/megatron/training/checkpointing.py
++++ b/megatron/training/checkpointing.py
+@@ -1392,6 +1392,19 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
+         state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
+     preprocess_state_dict_for_uneven_dtensor(state_dict)
+ 
++    if args.pipeline_model_parallel_size > 1:
++        from megatron.core.distributed.fsdp.src.megatron_fsdp.pp_utils import (
++            globalize_fsdp_checkpoint_keys,
++        )
++        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
++
++        if (getattr(args, "virtual_pipeline_model_parallel_size", None) or 1) > 1:
++            raise RuntimeError("fsdp_dtensor PP checkpointing supports only one model chunk per rank")
++        state_dict = globalize_fsdp_checkpoint_keys(
++            state_dict,
++            get_transformer_layer_offset(model.config),
++            has_mtp=bool(getattr(args, "mtp_num_layers", None)),
++        )
+     return state_dict
+ 
+ 
 # END common
 # BEGIN cu13
 diff --git a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py

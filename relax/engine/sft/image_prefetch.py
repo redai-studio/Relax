@@ -140,9 +140,9 @@ class SFTImagePrefetch:
         chunks = model if isinstance(model, list) else [model]
         for chunk in chunks:
             module = chunk
-            for _ in range(3):  # DDP / Float16Module wrappers
-                if module is None:
-                    break
+            seen: set[int] = set()
+            while module is not None and id(module) not in seen:
+                seen.add(id(module))
                 if getattr(module, "pre_process", False):
                     return True
                 module = getattr(module, "module", None)
