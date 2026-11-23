@@ -1086,7 +1086,12 @@ class SGLangEngine(RayActor):
             time.sleep(0.05)
         return {"node_id": ray.get_runtime_context().get_node_id(), "session_id": process.pid}
 
-    def shutdown(self):
+    def shutdown(self, *, stopped_router: tuple[str, int] | None = None) -> None:
+        if stopped_router is not None:
+            endpoint = (getattr(self, "router_ip", None), getattr(self, "router_port", None))
+            if endpoint not in (stopped_router, (None, None)):
+                raise RuntimeError("Stopped Router does not match the engine's Router")
+            self.router_ip, self.router_port = None, None
         if self.args.rollout_external:
             if self.unregister_from_router(wait_for_removal=True, timeout=5.0) is False:
                 raise RuntimeError("External worker router removal is unconfirmed")

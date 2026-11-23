@@ -21,6 +21,8 @@ from relax.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+_WORKER_CLOSE_TIMEOUT_S = 30.0
+
 # Failed rollback owners must outlive the failing factory stack. In particular,
 # unnamed Teacher actors would otherwise lose their last driver reference.
 _FAILED_ROLLBACK_OWNERS: dict[int, Any] = {}
@@ -678,13 +680,20 @@ class _ModelRuntime:
                     logger.exception("Could not abort residual requests during shutdown")
                 if worker is not None:
                     try:
-                        await asyncio.wait_for(worker.close.remote(), timeout=30)
+                        closing = asyncio.ensure_future(worker.close.remote())
+                        done, _ = await asyncio.wait((closing,), timeout=_WORKER_CLOSE_TIMEOUT_S)
+                        if not done:
+                            closing.cancel()
+                            raise RolloutCleanupUnconfirmed("Rollout worker close acknowledgement timed out")
+                        closing.result()
                     except ray.exceptions.ActorDiedError:
                         pass
                     except RolloutCleanupUnconfirmed:
                         worker_cleanup_unconfirmed = True
                         raise
-                    except (asyncio.TimeoutError, ray.exceptions.ActorUnavailableError) as exc:
+                    except ray.exceptions.RayTaskError:
+                        raise
+                    except ray.exceptions.ActorUnavailableError as exc:
                         worker_cleanup_unconfirmed = True
                         raise RolloutCleanupUnconfirmed("Rollout worker cleanup is unconfirmed") from exc
                 await self.ledger.drain("shutdown", timeout=10)

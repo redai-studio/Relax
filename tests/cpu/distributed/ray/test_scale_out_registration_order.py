@@ -223,6 +223,56 @@ async def test_failed_native_scale_out_reports_cleanup_failure_and_keeps_placeme
 
 
 @pytest.mark.asyncio
+async def test_shutdown_stops_owned_router_before_releasing_strict_rollback(monkeypatch, patch_ray_get):
+    from relax.distributed.ray import policy_engine_pool as policy
+
+    local, external, active = (make_mock_engine() for _ in range(3))
+    endpoint = ("owned-router", 3000)
+    external_endpoint = ("user-router", 3001)
+    manager = create_test_manager(
+        servers={
+            "local": make_rollout_server(
+                engine_groups=[make_engine_group(engines=[active])], router_ip=endpoint[0], router_port=endpoint[1]
+            )
+        }
+    )
+    pg = object()
+    remove_pg = MagicMock()
+    monkeypatch.setattr(policy.ray.util, "remove_placement_group", remove_pg)
+    manager._unconfirmed_rollback_placement_groups.append(pg)
+    for engine, address in ((local, endpoint), (external, external_endpoint)):
+        engine.unregister_from_router.remote.return_value = AwaitableValue(False)
+        group = make_engine_group(engines=[engine], router_ip=address[0], router_port=address[1])
+        with pytest.raises(RuntimeError, match="Router removal is unconfirmed"):
+            await manager._rollback_engines(group, confirm_router_removal=True)
+
+    router = MagicMock(_relax_router_endpoint=endpoint)
+    router.is_alive.return_value = True
+    router.terminate.side_effect = OSError("process exit unknown")
+    monkeypatch.setattr(policy, "_LAUNCHED_ROUTER_PROCESSES", [router])
+
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        manager._shutdown_all_engines()
+    local.shutdown.remote.assert_not_called()
+    external.shutdown.remote.assert_not_called()
+    remove_pg.assert_not_called()
+
+    router.terminate.side_effect = lambda: setattr(router.is_alive, "return_value", False)
+    with pytest.raises(RuntimeError, match="release is unconfirmed"):
+        manager._shutdown_all_engines()
+    local.shutdown.remote.assert_called_once_with(stopped_router=endpoint)
+    active.shutdown.remote.assert_called_with(stopped_router=endpoint)
+    external.shutdown.remote.assert_not_called()
+    remove_pg.assert_not_called()
+
+    external.unregister_from_router.remote.return_value = AwaitableValue(True)
+    manager._shutdown_all_engines()
+    active.shutdown.remote.assert_called_with(stopped_router=endpoint)
+    external.shutdown.remote.assert_called_once_with()
+    remove_pg.assert_called_once_with(pg)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_during_wait", [False, True])
 async def test_unused_scale_out_pg_is_retained_when_removal_fails(monkeypatch, patch_ray_get, cancel_during_wait):
     from relax.distributed.ray import policy_engine_pool as policy

@@ -52,6 +52,7 @@ class RolloutWorker:
         self._training_ready = False
         self._phase_lock = asyncio.Lock()
         self._active: set[asyncio.Future] = set()
+        self._close_task: asyncio.Task | None = None
         init_tracking(args, primary=False)
         init_http_client(args)
         client = attach_tq_client(args.tq_config, role="rollout_worker")
@@ -262,6 +263,13 @@ class RolloutWorker:
 
     async def close(self) -> None:
         self._closed = True
+        if self._close_task is None or (
+            self._close_task.done() and isinstance(self._close_task.exception(), RolloutCleanupUnconfirmed)
+        ):
+            self._close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _WORKLOAD_DRAIN_TIMEOUT_S
         while self._active:

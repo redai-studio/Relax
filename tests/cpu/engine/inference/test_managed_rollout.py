@@ -585,7 +585,7 @@ async def test_concurrent_dispose_closes_worker_only_once(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("times_out", [False, True])
 async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, times_out):
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
 
     from relax.distributed.ray import rollout_worker
     from relax.engine.rollout import sglang_rollout
@@ -633,6 +633,8 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
         return generate
 
     owner = manager()
+    dispose_pool = Mock(wraps=owner.pool.dispose)
+    monkeypatch.setattr(owner.pool, "dispose", dispose_pool)
     args = SimpleNamespace(
         ci_test=False,
         custom_convert_samples_to_train_data_path=None,
@@ -679,15 +681,81 @@ async def test_worker_owns_cancelled_groups_after_rollout_fault(monkeypatch, tim
                 await asyncio.wait_for(disposal, 2)
             assert not events
             assert owner.pool is not None
+            dispose_pool.assert_not_called()
             monkeypatch.setattr(rollout_worker, "_WORKLOAD_DRAIN_TIMEOUT_S", 2.0)
             disposal = asyncio.create_task(owner.dispose(handle))
         finish_cleanup.set_result(None)
         await asyncio.wait_for(disposal, 2)
         assert events == ["reward cleaned", "detached", "worker stopped"]
         assert owner.pool is None
+        dispose_pool.assert_called_once_with()
     finally:
         if not finish_cleanup.done():
             finish_cleanup.set_result(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_ack", [False, True])
+async def test_worker_close_reuses_cleanup_and_distinguishes_timeouts(monkeypatch, lost_ack):
+    from unittest.mock import Mock
+
+    from relax.distributed.ray import inference_manager, rollout_worker
+    from relax.engine.rollout.base_types import RolloutCleanupUnconfirmed
+
+    closing, finish = asyncio.Event(), asyncio.Event()
+    events = []
+
+    async def close_workload():
+        events.append("workload closing")
+        closing.set()
+        await finish.wait()
+        if not lost_ack:
+            raise TimeoutError("judge close timed out")
+
+    monkeypatch.setattr(rollout_worker, "init_tracking", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rollout_worker, "init_http_client", lambda *args: None)
+    monkeypatch.setattr(rollout_worker, "attach_tq_client", lambda *args, **kwargs: object())
+    monkeypatch.setattr(rollout_worker, "detach_tq_client", lambda: events.append("detached"))
+    monkeypatch.setattr(rollout_worker, "RolloutWorkload", lambda *args: SimpleNamespace(close=close_workload))
+    monkeypatch.setattr(ray, "kill", lambda worker: events.append("worker stopped"))
+    worker = rollout_worker.RolloutWorker.__ray_metadata__.modified_class(
+        SimpleNamespace(tq_config={}), object(), object()
+    )
+    owner = manager()
+    dispose_pool = Mock(wraps=owner.pool.dispose)
+    monkeypatch.setattr(owner.pool, "dispose", dispose_pool)
+
+    async def close_remote():
+        try:
+            await worker.close()
+        except TimeoutError as error:
+            raise ray.exceptions.RayTaskError(
+                "close", f"worker traceback: {error}", error
+            ).as_instanceof_cause() from error
+
+    handle = SimpleNamespace(close=SimpleNamespace(remote=close_remote))
+    if not lost_ack:
+        finish.set()
+        with pytest.raises(ray.exceptions.RayTaskError, match="judge close timed out"):
+            await owner.dispose(handle)
+        with pytest.raises(TimeoutError, match="judge close timed out"):
+            await worker.close()
+    else:
+        monkeypatch.setattr(inference_manager, "_WORKER_CLOSE_TIMEOUT_S", 0.05, raising=False)
+        try:
+            with pytest.raises(RolloutCleanupUnconfirmed, match="timed out"):
+                await owner.dispose(handle)
+            assert closing.is_set()
+            assert events == ["workload closing"]
+            dispose_pool.assert_not_called()
+            monkeypatch.setattr(inference_manager, "_WORKER_CLOSE_TIMEOUT_S", 2.0)
+            retry = asyncio.create_task(owner.dispose(handle))
+        finally:
+            finish.set()
+        await asyncio.wait_for(retry, 2)
+        await worker.close()
+    assert events == ["workload closing", "detached", "worker stopped"]
+    dispose_pool.assert_called_once_with()
 
 
 @pytest.mark.parametrize("role", ["genrm", "teacher"])
