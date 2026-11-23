@@ -330,6 +330,8 @@ def test_export_id_column_is_gated_on_the_flag(tmp_path) -> None:
         "debug_train_only": True,
         "n_samples_per_prompt": 1,
         "loss_type": "grpo",
+        "task_type": "causal_lm",
+        "hybrid": False,
     }
     export_ids = [(15 << 56) | 1, (15 << 56) | 2]
     samples = [

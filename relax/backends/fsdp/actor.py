@@ -356,7 +356,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # policy module), but before fsdp2_wrap (once fully_shard has run every
         # parameter is a DTensor and PEFT's nn.Linear surgery no longer applies)
         # and before the optimizer, which snapshots the trainable parameter list.
-        self._trainable_mode = getattr(args, "fsdp_trainable_mode", "full")
+        self._trainable_mode = args.fsdp_trainable_mode
         self._lora_target_modules: List[str] = []
         self._lora_plan = None
         if self._trainable_mode == "lora":
@@ -384,7 +384,7 @@ class FSDPTrainRayActor(TrainRayActor):
             reduce_dtype=args.fsdp_reduce_dtype,
             reshard_after_forward=args.fsdp_reshard_after_forward,
             cpu_offload=args.fsdp_cpu_offload,
-            activation_checkpointing=getattr(args, "fsdp_activation_checkpointing", False),
+            activation_checkpointing=args.fsdp_activation_checkpointing,
             master_dtype=getattr(args, "fsdp_master_dtype", None),
             cast_root_forward_inputs=is_i2i_sft(args) or self._sampling_cfg().get("algorithm", "grpo") != "art",
         )
@@ -611,7 +611,7 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _hash_base_model(self, args) -> str:
-        seed = f"{args.model_path}:{getattr(args, 'model_revision', None)}"
+        seed = f"{args.model_path}:{args.model_revision}"
         return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def _named_trainable_params(self):
@@ -965,7 +965,7 @@ class FSDPTrainRayActor(TrainRayActor):
         self._ratio_min_local = float("inf")
         num_updates = max(1, int(getattr(self.args, "num_updates_per_batch", 1)))
         clip_grad = getattr(self.args, "clip_grad", 1.0)
-        clip_eps = float(getattr(self.args, "eps_clip", 0.2))
+        clip_eps = float(self.args.eps_clip)
         # Gradient accumulation: ONE optimizer step covers the whole global
         # batch. Every micro-batch (= one prompt group) contributes a
         # 1/N-scaled backward and the step fires after the last one, so
@@ -1094,7 +1094,7 @@ class FSDPTrainRayActor(TrainRayActor):
             raise RuntimeError(
                 "ART actor has a failed acquisition; restore the last committed checkpoint before retry."
             )
-        if getattr(self, "_resume_initial_sync_pending", False) and not getattr(self.args, "debug_train_only", False):
+        if getattr(self, "_resume_initial_sync_pending", False) and not self.args.debug_train_only:
             raise RuntimeError("ART resume must publish the restored live policy before acquiring new data.")
         if "train_wait" in Timer().start_time:
             Timer().end("train_wait")
@@ -1593,7 +1593,7 @@ class FSDPTrainRayActor(TrainRayActor):
     def update_weights(self, *, offload_after_sync: bool = True) -> bool:
         """Stream the full transformer to every rollout engine (design doc
         10.3)."""
-        if getattr(self.args, "debug_train_only", False):
+        if self.args.debug_train_only:
             return False
 
         previous_version = self.policy_version
@@ -1895,7 +1895,7 @@ class FSDPTrainRayActor(TrainRayActor):
     # -- internals ------------------------------------------------------------
 
     def _sampling_cfg(self) -> Mapping[str, Any]:
-        return getattr(self.args, "sampling_config", None) or {}
+        return self.args.sampling_config or {}
 
     def sampling_fingerprint(self) -> str:
         import json

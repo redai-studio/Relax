@@ -35,6 +35,7 @@ def test_get_log_probs_and_entropy_wires_entropy_grad(
         entropy_coef=entropy_coef,
         log_probs_chunk_size=-1,
         loss_type="grpo",
+        advantage_estimator=None,
         opd_log_prob_top_k=0,
         qkv_format="thd",
         rollout_temperature=1.0,
@@ -76,6 +77,7 @@ def test_policy_checkpoint_entropy_matches_eager(monkeypatch, coef, reentrant, r
     monkeypatch.setattr(loss_module, "calculate_log_probs_and_entropy", kernel)
     args = Namespace(
         loss_type="policy_loss",
+        task_type="causal_lm",
         advantage_estimator="grpo",
         true_on_policy_mode=True,
         use_opsm=False,
@@ -140,6 +142,7 @@ def test_sft_chunked_lm_head_matches_log_softmax_gradients(monkeypatch: pytest.M
         allgather_cp=False,
         entropy_coef=0.0,
         loss_type="sft",
+        advantage_estimator=None,
         opd_log_prob_top_k=0,
         qkv_format="thd",
         rollout_temperature=temperature,
@@ -190,6 +193,7 @@ def test_sft_chunked_allgather_cp_padding_rank_keeps_graph(monkeypatch: pytest.M
         allgather_cp=True,
         entropy_coef=0.0,
         loss_type="sft",
+        advantage_estimator=None,
         opd_log_prob_top_k=0,
         qkv_format="thd",
         rollout_temperature=1.0,
