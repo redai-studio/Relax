@@ -135,8 +135,18 @@ def test_train_resolves_r3_delivery_before_ray_workers_start(monkeypatch, settin
     ns["post_process_env"] = post_process_env
     ns["Controller"] = Controller
     ns["_hard_exit"] = Mock(side_effect=SystemExit)
-    args = SimpleNamespace(train_backend="megatron", colocate=True, use_rollout_routing_replay=True)
+    args = SimpleNamespace(
+        train_backend="megatron",
+        colocate=True,
+        use_rollout_routing_replay=True,
+        fully_async=False,
+        hybrid=False,
+        polling_mode=True,
+    )
     vars(args).update(overrides)
+    if args.fully_async and not args.hybrid:
+        # Restore the driver's process-wide TQ timeout after this startup.
+        monkeypatch.setattr("transfer_queue.controller.TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1)
     with pytest.raises(SystemExit):
         ns["main"](args)
 

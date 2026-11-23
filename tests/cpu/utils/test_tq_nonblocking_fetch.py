@@ -41,7 +41,7 @@ def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkey
     module = pytest.importorskip("transfer_queue.controller")
     # Ray exports the already-imported driver's controller class to the worker.
     monkeypatch.setattr(module, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", 3)
-    assert _configure_timeout(monkeypatch) == 0
+    worker_timeout = _configure_timeout(monkeypatch)
     controller_type = module.TransferQueueController.__ray_metadata__.modified_class
     controller = object.__new__(controller_type)
     partition = module.DataPartitionStatus("train_0")
@@ -70,7 +70,7 @@ def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkey
     def blocked_request_thread(_seconds):
         pytest.fail("An empty fetch blocked the controller's shared request thread")
 
-    monkeypatch.setattr(module.time, "sleep", blocked_request_thread)
+    monkeypatch.setattr(module, "time", SimpleNamespace(time=lambda: 100.0, sleep=blocked_request_thread))
     meta = controller.get_metadata(
         data_fields=["tokens"],
         partition_id="train_0",
@@ -80,6 +80,7 @@ def test_token_budget_empty_fetch_returns_without_blocking_request_thread(monkey
         sampling_config={"dp_rank": 0, "batch_index": 0, "rollout_mini_index": 0, "window_quota": 128},
     )
     assert meta.size == 0
+    assert worker_timeout == -1
     expected = (
         {"dummy_round": True}
         if state == "dummy"

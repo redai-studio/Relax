@@ -1271,6 +1271,8 @@ def configure_training_replay(args: Any, runtime_env: dict) -> None:
     if kinds and replay_data_manager.uses_references and args.fully_async and not args.hybrid and args.polling_mode:
         from transfer_queue import controller as tq_controller
 
-        # Ray serializes get_metadata with the timeout imported on the driver.
-        tq_controller.TQ_CONTROLLER_GET_METADATA_TIMEOUT = 0
-        runtime_env["env_vars"]["TQ_CONTROLLER_GET_METADATA_TIMEOUT"] = "0"
+        # TQ 9784ad0 checks elapsed > timeout. With equal clock readings, zero
+        # sleeps for another poll interval; -1 returns the empty batch immediately.
+        # Ray serializes the driver's timeout, so set it on both sides.
+        tq_controller.TQ_CONTROLLER_GET_METADATA_TIMEOUT = -1
+        runtime_env["env_vars"]["TQ_CONTROLLER_GET_METADATA_TIMEOUT"] = "-1"
