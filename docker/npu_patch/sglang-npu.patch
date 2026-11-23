@@ -8,7 +8,7 @@ Subject: [PATCH] sglang optimize for qwen3.5 9B&35B
  python/sglang/srt/environ.py                  |  42 ++
  .../npu/attention/ascend_gdn_backend.py       | 190 +++++--
  .../ascend_hybrid_linear_attn_backend.py      |  61 +-
- .../attention/full_attention_fusion_npu.py    | 473 ++++++++++++++++
+ .../attention/full_attention_fusion_npu.py    | 468 ++++++++++++++++
  .../npu/graph_runner/npu_cudagraph_backend.py |  18 +-
  .../srt/hardware_backend/npu/moe/topk.py      |  53 +-
  .../npu/moe_weight_prefetch.py                | 363 ++++++++++++
@@ -35,7 +35,7 @@ Subject: [PATCH] sglang optimize for qwen3.5 9B&35B
  .../srt/utils/torch_memory_saver_adapter.py   |   9 +-
  .../layers/test_conv_weight_cache_refresh.py  | 109 ++++
  .../layers/test_sampler_attach_logprobs.py    | 156 ++++++
- 31 files changed, 3139 insertions(+), 240 deletions(-)
+ 31 files changed, 3134 insertions(+), 240 deletions(-)
  create mode 100644 python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
  create mode 100644 python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
  create mode 100644 python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
@@ -492,10 +492,10 @@ index 2a628c286d..cc3a655ad9 100644
                  dtype=torch.int32,
 diff --git a/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py b/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
 new file mode 100644
-index 0000000000..1f34046887
+index 0000000000..4751217a5e
 --- /dev/null
 +++ b/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
-@@ -0,0 +1,473 @@
+@@ -0,0 +1,468 @@
 +# Qwen3.5-35B-A3B NPU decode 全注意力段融合 kernel（full_attention 优化点 A1b/A2/A3a）。
 +#
 +#   A1b split_qkvgate_v4_scatter：split q/gate/k/v + q/k gemma rmsnorm + rope
@@ -610,9 +610,6 @@ index 0000000000..1f34046887
 +# ---------------------------------------------------------------------------
 +# A2：sigmoid(gate) * attn 融合（替代 torch.sigmoid + mul_ 两个 kernel）
 +# ---------------------------------------------------------------------------
-+_SIGMOID_MUL_BLOCK = 512
-+
-+
 +@triton.jit
 +def sigmoid_mul_kernel(
 +    attn_ptr,
@@ -644,9 +641,6 @@ index 0000000000..1f34046887
 +        return False
 +    if attn_output.shape != gate.shape:
 +        return False
-+    # Ascend kernel launches permit at most 65535 blocks.
-+    if not 0 < triton.cdiv(attn_output.numel(), _SIGMOID_MUL_BLOCK) <= 65535:
-+        return False
 +    return attn_output.is_contiguous() and gate.is_contiguous()
 +
 +
@@ -655,8 +649,9 @@ index 0000000000..1f34046887
 +    调用前须过 fa_sigmoid_mul_supported。"""
 +    out = torch.empty_like(attn)
 +    numel = attn.numel()
-+    sigmoid_mul_kernel[(triton.cdiv(numel, _SIGMOID_MUL_BLOCK),)](
-+        attn, gate, out, numel, BLOCK=_SIGMOID_MUL_BLOCK, BITWISE=True
++    BLOCK = 512
++    sigmoid_mul_kernel[(triton.cdiv(numel, BLOCK),)](
++        attn, gate, out, numel, BLOCK=BLOCK, BITWISE=True
 +    )
 +    return out
 +
