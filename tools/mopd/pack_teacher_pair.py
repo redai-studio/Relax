@@ -64,7 +64,7 @@ def _write_package(path, captures, header):
         stream.write(metadata.ljust(_HEADER_BYTES, b" "))
 
 
-_CAPTURE_LOADER = "examples.on_policy_distillation.mopd.pack_teacher_pair.capture_teacher"
+_CAPTURE_LOADER = "tools.mopd.pack_teacher_pair.capture_teacher"
 
 
 def capture_teacher(model, named_tensors):

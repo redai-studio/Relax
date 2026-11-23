@@ -2,15 +2,16 @@
 
 import json
 import struct
+from pkgutil import resolve_name
 
 import numpy as np
 import pytest
 import torch
 
-from examples.on_policy_distillation.mopd import pack_teacher_pair as pack
 from relax.backends.sglang.adts import package_teacher_ids
 from relax.backends.sglang.adts.bitpack import encode_frame
 from relax.backends.sglang.adts_teacher_loader import _verify_base
+from tools.mopd import pack_teacher_pair as pack
 
 
 def test_initial_teacher_route_is_independent_of_route_order(tmp_path):
@@ -67,7 +68,7 @@ def checkpoint_captures(tmp_path, monkeypatch):
                 monkeypatch.setattr(
                     "sglang.srt.distributed.get_tp_group", Mock(return_value=Mock(rank_in_group=rank)), raising=False
                 )
-                pack.capture_teacher(model, named_tensors)
+                resolve_name(load_format)(model, named_tensors)
             return True, ""
 
         engine.update_weights_from_tensor.side_effect = update
