@@ -20,6 +20,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
+from relax.distributed.replay_manager import (
+    ReplayConfig,
+    ReplayManager,
+    configure_training_replay,
+    reference_environment,
+)
+from relax.distributed.replay_manager.core import ReplayInventory
+from relax.distributed.replay_manager.storage import TQReplayStorage
 from relax.utils.agentic_obs.run_hooks import RunRecorder
 
 
@@ -41,6 +49,7 @@ def _load_definitions(path, names, namespace):
 def _train_namespace():
     namespace = {
         "asyncio": asyncio,
+        "configure_training_replay": Mock(),
         "os": os,
         "sys": sys,
         "signal": Mock(SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT, Signals=signal.Signals),
@@ -68,6 +77,89 @@ def _train_namespace():
         "_NORMAL_SHUTDOWN_TIMEOUT_SEC": 1800,
     }
     return _load_definitions("relax/entrypoints/train.py", {"main", "_hard_exit", "_graceful_shutdown"}, namespace)
+
+
+@pytest.mark.parametrize(
+    ("setting", "overrides", "expected_reference"),
+    [
+        pytest.param(None, {}, True, id="default"),
+        pytest.param(None, {"colocate": False, "fully_async": True}, True, id="fully-async"),
+        pytest.param(None, {"fully_async": True, "hybrid": True}, True, id="hybrid"),
+        pytest.param("1", {}, True, id="explicit-reference"),
+        pytest.param("0", {}, False, id="explicit-full"),
+        pytest.param(
+            None, {"use_rollout_routing_replay": False, "use_routing_replay": True}, False, id="training-only"
+        ),
+        pytest.param(None, {"rollout_function_path": "relax.agentic.rollout.generate_rollout"}, True, id="agentic"),
+        pytest.param(None, {"colocate": False}, False, id="separate"),
+        pytest.param(None, {"sglang_pp_size": 2}, False, id="local-rollout-pp"),
+        pytest.param(None, {"dynamic_context_parallel": True}, False, id="dynamic-cp"),
+        pytest.param(None, {"debug_train_only": True}, False, id="debug-load"),
+        pytest.param(None, {"load_forge_rollout_data": "0.pt"}, False, id="forge-load"),
+        pytest.param(
+            None,
+            {"custom_generate_function_path": "examples.deepeyes.rollout.generate"},
+            False,
+            id="custom-generation",
+        ),
+    ],
+)
+def test_train_resolves_r3_delivery_before_ray_workers_start(monkeypatch, setting, overrides, expected_reference):
+    monkeypatch.setenv("RELAX_REPLAY_RUN_ID", "")
+    if setting is None:
+        monkeypatch.setenv("RELAX_REPLAY_REFERENCES", "")
+        monkeypatch.delenv("RELAX_REPLAY_REFERENCES")
+    else:
+        monkeypatch.setenv("RELAX_REPLAY_REFERENCES", setting)
+    monkeypatch.delenv("RELAX_REPLAY_RUN_ID", raising=False)
+    monkeypatch.delenv("RELAX_KERNEL_CACHE_DIR", raising=False)
+    manager = ReplayManager(config=ReplayConfig.from_env())
+    monkeypatch.setattr("relax.distributed.replay_manager.core.replay_data_manager", manager)
+    manager.register_storage(
+        lambda: TQReplayStorage(manager.config, inventory=ReplayInventory(manager.config, lambda _: None))
+    )
+    ns = _train_namespace()
+    ns["configure_training_replay"] = configure_training_replay
+    ns["ray"].is_initialized.return_value = False
+
+    def post_process_env(args, env):
+        env["env_vars"].update(reference_environment())
+        return env
+
+    class Controller:
+        def __init__(self, _args, _runtime_env):
+            pass
+
+        training_loop = Mock()
+        shutdown = Mock()
+
+    ns["post_process_env"] = post_process_env
+    ns["Controller"] = Controller
+    ns["_hard_exit"] = Mock(side_effect=SystemExit)
+    args = SimpleNamespace(
+        train_backend="megatron",
+        colocate=True,
+        use_rollout_routing_replay=True,
+        fully_async=False,
+        hybrid=False,
+        polling_mode=True,
+    )
+    vars(args).update(overrides)
+    if args.fully_async and not args.hybrid:
+        # Restore the driver's process-wide TQ timeout after this startup.
+        monkeypatch.setattr("transfer_queue.controller.TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1)
+    with pytest.raises(SystemExit):
+        ns["main"](args)
+
+    env = ns["ray"].init.call_args.kwargs["runtime_env"]["env_vars"]
+    assert manager.uses_references is expected_reference
+    if expected_reference:
+        assert env["RELAX_REPLAY_RUN_ID"] == manager.store().run
+        assert env["RELAX_REPLAY_REFERENCES"] == "1"
+    else:
+        assert env.get("RELAX_REPLAY_REFERENCES") == setting
+        assert "RELAX_REPLAY_RUN_ID" not in env
+    ns["_hard_exit"].assert_called_once_with(0)
 
 
 @pytest.mark.parametrize("fail_at", ["startup", "training", None])
@@ -291,8 +383,7 @@ ns['_run_recorder'] = recorder
 ns["_SHUTDOWN_TIMEOUT_SEC"] = 0.05
 ns["_NORMAL_SHUTDOWN_TIMEOUT_SEC"] = 0.05
 if {hang_at!r} == "controller":
-    ns["_ctrl"] = ns["Controller"].return_value
-    ns["_ctrl"].shutdown.side_effect = threading.Event().wait
+    ns["_ctrl"] = SimpleNamespace(shutdown=threading.Event().wait)
 else:
     ns["serve"].shutdown.side_effect = threading.Event().wait
 ns["_graceful_shutdown"](exit_code={exit_code})
@@ -562,7 +653,8 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"shutdown", "_shutdown_services", "_dispose_rollout_manager"}
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
@@ -585,6 +677,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch, mode
         _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
+    partial_controller._shutdown_services = ns["_shutdown_services"].__get__(partial_controller)
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
     stop_image = AsyncMock(side_effect=RuntimeError("producer unavailable") if mode == "i2i_stop_failure" else None)
     if mode != "missing_config":
@@ -631,7 +724,8 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"shutdown", "_shutdown_services", "_dispose_rollout_manager"}
     ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
@@ -658,6 +752,7 @@ def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manag
         _close_data_system=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
+    controller._shutdown_services = ns["_shutdown_services"].__get__(controller)
     controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(controller)
 
     ns["shutdown"](controller)

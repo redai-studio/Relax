@@ -17,7 +17,7 @@ from relax.utils.types import Sample
 
 class ReToolAgenticDataSource(DataSource):
     def __init__(self, args: Any) -> None:
-        self.hybrid = bool(getattr(args, "hybrid", False))
+        self.hybrid = bool(args.hybrid)
         if getattr(args, "partial_rollout", False) or (
             not self.hybrid and any(getattr(args, key, False) for key in ("agentic_prelaunch", "fully_async"))
         ):

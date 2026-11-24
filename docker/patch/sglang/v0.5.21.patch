@@ -5379,10 +5379,42 @@ index 103e1600..d3ac4655 100644
          self.pre_fc_norm_embedding = GemmaRMSNorm(
              config.hidden_size, eps=config.rms_norm_eps
 diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
-index 7b9e979f..cad03306 100644
+index 7b9e979..9c6824b 100644
 --- a/python/sglang/srt/multimodal/processors/base_processor.py
 +++ b/python/sglang/srt/multimodal/processors/base_processor.py
-@@ -1395,6 +1395,20 @@ class BaseMultimodalProcessor(ABC):
+@@ -1252,6 +1252,31 @@ class BaseMultimodalProcessor(ABC):
+                 audios=list(audio_data or []),
+             )
+ 
++        # Native Qwen histories may quote the legacy <image> sentinel in
++        # assistant/tool text. When native markers already account for every
++        # image, that text is not another media item. Keep the legacy contract
++        # for text prompts, sentinel-only IDs and mixed native/legacy inputs.
++        if (
++            input_ids is not None
++            and image_data
++            and multimodal_tokens.image_token
++            == "<|vision_start|><|image_pad|><|vision_end|>"
++        ):
++            native_images = sum(
++                previous == getattr(self, "IM_START_TOKEN_ID", None)
++                and current == multimodal_tokens.image_token_id
++                for previous, current in zip(input_ids, input_ids[1:])
++            )
++            if native_images == len(image_data):
++                # Never mutate shared token rules: tokenizer requests overlap.
++                multimodal_tokens = dataclasses.replace(
++                    multimodal_tokens,
++                    image_token_regex=re.compile(
++                        r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
++                    ),
++                    combined_regex=None,
++                )
++
+         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
+         if isinstance(prompt, list) and return_text:
+             assert len(prompt) and isinstance(prompt[0], int)
+@@ -1395,6 +1420,20 @@ class BaseMultimodalProcessor(ABC):
              len(audios),
          )
  

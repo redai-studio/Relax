@@ -586,3 +586,28 @@ def test_failed_replacement_retries_original_actor_before_recovery(monkeypatch, 
     assert not group.pending_shutdown and not server.pending_rollbacks
     kill.assert_called_once_with(engine)
     remove_pg.assert_called_once_with(pg)
+
+
+def test_external_recovery_reports_pending_shutdown_on_first_attempt(monkeypatch, rollout_module):
+    from conftest import make_rollout_server
+
+    unhealthy, healthy = make_mock_engine(), make_mock_engine()
+    group = make_engine_group(engines=[unhealthy, healthy])
+    server = make_rollout_server(engine_groups=[group])
+    unhealthy.health_generate.remote.side_effect = RuntimeError("offline")
+    unhealthy.shutdown.remote.side_effect = [TimeoutError("retirement pending"), None]
+    monkeypatch.setattr(rollout_module.ray, "get", mock_ray_get)
+    kill = Mock()
+    monkeypatch.setattr(rollout_module.ray, "kill", kill)
+
+    with pytest.raises(RuntimeError, match="Engine shutdown pending"):
+        server.recover()
+    assert group.all_engines == [unhealthy, healthy]
+    assert group.pending_shutdown == {0}
+    assert server.num_new_engines == 0
+    kill.assert_not_called()
+
+    server.recover()
+    assert group.all_engines == [None, healthy]
+    assert not group.pending_shutdown
+    kill.assert_called_once_with(unhealthy)

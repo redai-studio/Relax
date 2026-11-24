@@ -318,7 +318,7 @@ class TestSelectEnginesForRemoval:
         assert group.eviction_requested is True
         assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
         release_probe.set()
-        assert await resolve_task == [(group, 0, engine)]
+        assert await resolve_task == [(group, 0, engine, "http://elastic:1")]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mutation", ["replace_actor", "remove_group"])
@@ -721,13 +721,18 @@ class TestRemoveEngine:
         group.pg = (MagicMock(), [], [])
         server = make_rollout_server(engine_groups=[group])
         manager = create_test_manager(servers={"default": server})
-        second.shutdown.remote.side_effect = [TimeoutError("child still exiting"), AwaitableValue(None)]
+        from ray.exceptions import ActorDiedError
+
+        loop = asyncio.get_running_loop()
+        waiting = loop.create_future()
+        manager.args.scale_in_shutdown_timeout = 0.02
+        second.shutdown.remote.side_effect = [waiting, AwaitableValue(None)]
 
         async def remove(request_id):
             request = ScaleInRequest(
                 request_id=request_id, status=ScaleInStatus.PENDING, engine_urls=["http://node-0:8000"], force=True
             )
-            await manager._scale_in(request)
+            await asyncio.wait_for(manager._scale_in(request), timeout=2)
             return request
 
         first.get_url.remote.side_effect = lambda: AwaitableValue("http://node-0:8000")
@@ -739,12 +744,17 @@ class TestRemoveEngine:
             assert server.engine_groups == [group]
             assert group.lifecycle_status == EngineGroupLifecycle.DRAINING
             remove_pg.assert_not_called()
+            assert waiting.cancelled()
+            first.get_url.remote.side_effect = ActorDiedError()
+            first.shutdown.remote.side_effect = ActorDiedError()
             retry = await remove("retry")
             assert retry.status == ScaleInStatus.COMPLETED
             assert retry.removed_engines == ["group_0_engine_0"] and not retry.failed_engines
             assert group.all_engines == [None, None]
             assert not server.engine_groups
             first.unregister_from_router.remote.assert_called_once()
+            first.get_url.remote.assert_called_once()
+            assert second.shutdown.remote.call_count == 2
             remove_pg.assert_called_once_with(group.pg[0])
             kill.assert_not_called()
 
