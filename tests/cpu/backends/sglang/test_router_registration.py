@@ -171,13 +171,21 @@ def test_registration_rejects_eviction_before_rpc_execution(monkeypatch, sglang_
     assert requests.posts == []
 
 
-def test_dead_worker_cleanup_confirms_removal_and_is_idempotent(monkeypatch, sglang_engine_module):
-    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+@pytest.mark.parametrize("actor_confirmed_dead", [False, True])
+def test_dead_worker_cleanup_confirms_removal_and_is_idempotent(
+    monkeypatch, sglang_engine_module, actor_confirmed_dead
+):
+    old = {
+        "id": "old",
+        "url": "http://worker:8000",
+        "is_healthy": actor_confirmed_dead,
+        "metadata": {"relax_actor_id": "A"},
+    }
     other = {"id": "other", "url": "http://other:8000", "is_healthy": False}
     requests = _RouterRequests(worker_lists=[[old, other], [other]])
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
     cleanup = sglang_engine_module.remove_dead_router_worker
-    state = sglang_engine_module.RouterWorkerCleanup("A")
+    state = sglang_engine_module.RouterWorkerCleanup("A", actor_confirmed_dead=actor_confirmed_dead)
     assert cleanup("http://router:30000", old["url"], state)
     assert cleanup("http://router:30000", old["url"], state)
     assert state.worker_id == "old"
