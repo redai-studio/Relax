@@ -246,22 +246,41 @@ async def generate_and_write_predictions(
 async def score_predictions(rollout_manager: Any, config: Any, train_step: int, samples: list["Sample"]) -> None:
     """Reuse the eval reward executor, background queue and result
     reporting."""
-    from relax.engine.rewards import async_rm, batched_async_rm
+    from relax.engine.rewards import async_rm, batched_async_rm, resolve_sample_reward
     from relax.engine.rewards.async_eval import collect_eval_rewards
     from relax.engine.rollout.base_types import RolloutFnEvalOutput
     from relax.utils.types import Sample
 
-    async def score_sample(sample: Sample) -> None:
+    routes = [None] * len(samples)
+    if getattr(config, "offload_rollout", False) and getattr(config, "_genrm_instances_resolved", None):
+        if getattr(config, "custom_rm_path", None):
+            uses_judge = not getattr(config, "defer_reward_to_post_process", False)
+        else:
+            routes = [resolve_sample_reward(config, sample) for sample in samples]
+            uses_judge = any(route.rm_type == "dapo-genrm" for route in routes)
+        if uses_judge:
+            from ray import serve
+
+            from relax.core.optional_roles import GENRM_ROLE
+
+            # Record ownership before onload: even a partial resume needs release.
+            judge = rollout_manager._sft_predict_judge = serve.get_app_handle(GENRM_ROLE)
+            await judge.onload.remote()
+
+    async def score_sample(sample: Sample, route) -> None:
+        kwargs = {"_resolved_route": route} if route is not None else {}
         if getattr(config, "group_rm", False):
-            rewards = await batched_async_rm(config, [sample], evaluation=True)
+            rewards = await batched_async_rm(config, [sample], evaluation=True, **kwargs)
             if len(rewards) != 1:
                 raise ValueError("SFT group reward must return one reward for its single-response prompt group")
             sample.reward = rewards[0]
         else:
-            sample.reward = await async_rm(config, sample, evaluation=True)
+            sample.reward = await async_rm(config, sample, evaluation=True, **kwargs)
 
     with collect_eval_rewards(config) as pending:
-        tasks = [asyncio.create_task(score_sample(sample)) for sample in samples]
+        tasks = [
+            asyncio.create_task(score_sample(sample, route)) for sample, route in zip(samples, routes, strict=True)
+        ]
         try:
             await asyncio.gather(*tasks)
         finally:

@@ -12,9 +12,11 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
+import psutil
 import ray
 import requests
 import sglang_router
@@ -176,6 +178,8 @@ def remove_dead_router_worker(
 # the downstream offload barrier) indefinitely.
 _GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
 _GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
+# Leave time for router removal and the reply within the manager's 60 s shutdown RPC.
+_SERVER_SHUTDOWN_TIMEOUT_S = 30.0
 _SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
 _MIN_HTTP_TIMEOUT_S = 1.0
 
@@ -342,6 +346,11 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, refere
     if os.getppid() != parent_pid:
         return
 
+    if os.environ.get("RELAX_WEIGHT_VERSION_PLUGIN") == "1":
+        from relax.distributed.weight_sync.sglang_http import install_http_extension
+
+        install_http_extension()
+
     if reference_publication:
         from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
 
@@ -385,7 +394,9 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs, *, reference_publication: bool = False) -> multiprocessing.Process:
+def launch_server_process(
+    server_args: ServerArgs, *, reference_publication: bool = False, on_started=None
+) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -404,6 +415,8 @@ def launch_server_process(server_args: ServerArgs, *, reference_publication: boo
         target=_launch_server_with_patches, args=(server_args, os.getpid(), reference_publication)
     )
     p.start()
+    if on_started is not None:
+        on_started(p)
 
     if server_args.node_rank != 0:
         return p
@@ -449,7 +462,8 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
         while True:
             _check_deadline("health_generate")
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers, timeout=_REQUEST_TIMEOUT)
+                health_path = "health" if os.environ.get("RELAX_WEIGHT_VERSION_PLUGIN") == "1" else "health_generate"
+                response = session.get(f"{base_url}/{health_path}", headers=headers, timeout=_REQUEST_TIMEOUT)
                 if response.status_code == 200:
                     break
             except requests.RequestException:
@@ -459,6 +473,11 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
+
+        if os.environ.get("RELAX_WEIGHT_VERSION_PLUGIN") == "1":
+            # Generation starts closed. The installation adapter flushes caches
+            # after loading the selected version, before opening admission.
+            return
 
         # use flush_cache to make sure the working queue is empty, so that we can do offload
         while True:
@@ -486,8 +505,12 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        weight_consumer: bool = False,
     ):
         self.args = args
+        self.process: multiprocessing.Process | None = None
+        self._stopping_processes: set[psutil.Process] = set()
+        self._weight_consumer_enabled = weight_consumer
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -597,6 +620,8 @@ class SGLangEngine(RayActor):
         # with the training loop.
         self.checkpoint_engine_client = None
         if self.args.rollout_external or init_external_kwargs:
+            if getattr(self, "_weight_consumer_enabled", False):
+                raise ValueError("Start a managed engine with the version-consumer extension before connecting it")
             if not init_external_kwargs:
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
@@ -614,6 +639,8 @@ class SGLangEngine(RayActor):
         return {"url": self.get_url(), **self.get_pid_and_node_id()}
 
     def register_dcs(self):
+        if getattr(self, "_weight_consumer_enabled", False):
+            return
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
             effective_num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
@@ -712,12 +739,30 @@ class SGLangEngine(RayActor):
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
+        if getattr(self, "_weight_consumer_enabled", False):
+            if server_args_dict.get("nnodes", 1) != 1:
+                raise ValueError("The node-local version consumer requires one node per engine")
+            if server_args_dict.get("tokenizer_worker_num", 1) != 1:
+                raise ValueError("The version admission gate requires one HTTP tokenizer worker")
+            server_args_dict["skip_server_warmup"] = True
         server_args = ServerArgs(**server_args_dict)
+        self._weight_version_server_args = server_args
         self._router_bootstrap_port = (
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
-        self.process = launch_server_process(server_args, reference_publication=reference_publication)
+
+        def own_process(process):
+            self.process = process
+
+        if getattr(self, "_weight_consumer_enabled", False):
+            from relax.distributed.weight_sync.sglang_plugin import version_plugin_environment
+
+            launch_environment = version_plugin_environment()
+        else:
+            launch_environment = nullcontext()
+        with launch_environment:
+            launch_server_process(server_args, reference_publication=reference_publication, on_started=own_process)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
@@ -742,8 +787,25 @@ class SGLangEngine(RayActor):
         """
         if self.node_rank != 0:
             return
+        if getattr(self, "_weight_consumer_enabled", False):
+            from relax.distributed.weight_sync.deadline import operation_remaining, remaining
+
+            timeout = operation_remaining(120, endpoint) if timeout is None else remaining(timeout, endpoint)
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {}, timeout=timeout)
+        request_options = {}
+        if getattr(self, "_weight_consumer_enabled", False) and endpoint in (
+            "release_memory_occupation",
+            "resume_memory_occupation",
+            "flush_cache",
+        ):
+            from relax.distributed.weight_sync.store import canonical
+
+            group = self._get_version_consumer().session.engines
+            request_options["headers"] = {
+                **group.control_headers,
+                "X-Relax-Installation": canonical(group.installation_identity).decode(),
+            }
+        response = requests.post(url, json=payload or {}, timeout=timeout, **request_options)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -1034,17 +1096,31 @@ class SGLangEngine(RayActor):
             return
         deadline = time.monotonic() + timeout_s
         connect_errors = 0
+        request_options = {}
+        if getattr(self, "_weight_consumer_enabled", False):
+            from relax.distributed.weight_sync.store import canonical
+
+            group = self._get_version_consumer().session.engines
+            request_options["headers"] = {
+                **group.control_headers,
+                "X-Relax-Installation": canonical(group.installation_identity).decode(),
+            }
         # flush cache will not return status_code 200 when there are pending requests
         while True:
             try:
                 response = requests.get(
                     f"http://{self.server_host}:{self.server_port}/flush_cache",
                     timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S,
+                    **request_options,
                 )
                 if response.status_code == 200:
                     break
+                if request_options and response.status_code != 400:
+                    response.raise_for_status()
                 # 400 = running/waiting requests present; wait and retry below.
                 connect_errors = 0
+            except requests.exceptions.HTTPError:
+                raise
             except requests.exceptions.ConnectionError as e:
                 connect_errors += 1
                 logger.warning(
@@ -1064,17 +1140,54 @@ class SGLangEngine(RayActor):
                 raise TimeoutError("Timeout while flushing cache.")
             time.sleep(1)
 
+    def _stop_server_process(self):
+        process = self.process
+        if process is None:
+            return
+        pending = self._stopping_processes
+        if process.is_alive():
+            try:
+                pending.add(psutil.Process(process.pid))
+            except psutil.NoSuchProcess:
+                pass
+        # Keep process identities across attempts: after the parent exits its
+        # children can no longer be found by traversing the original PID.
+        for parent in tuple(pending):
+            try:
+                pending.update(parent.children(recursive=True))
+            except psutil.NoSuchProcess:
+                pass
+        for proc in pending:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+        deadline = time.monotonic() + _SERVER_SHUTDOWN_TIMEOUT_S
+        while pending:
+            for proc in tuple(pending):
+                try:
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        continue
+                except psutil.NoSuchProcess:
+                    pass
+                pending.remove(proc)
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"SGLang processes still running: {sorted(p.pid for p in pending)}")
+                time.sleep(min(0.1, remaining))
+        process.join(timeout=0)
+        self.process = None
+
     def shutdown(self):
         if self.args.rollout_external:
             return
-
-        logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         try:
-            self.unregister_from_router(timeout=5.0)
+            if getattr(self, "server_host", None) is not None and getattr(self, "server_port", None) is not None:
+                self.unregister_from_router(timeout=5.0)
         finally:
-            process = getattr(self, "process", None)
-            if process is not None:
-                kill_process_tree(process.pid)
+            self._stop_server_process()
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -1409,15 +1522,30 @@ class SGLangEngine(RayActor):
         return response.json()["weight_version"]
 
     def release_memory_occupation(self):
+        if hasattr(self, "_version_consumer"):
+            self._version_consumer.session.suspend()
         self.flush_cache()
-        return self._make_request("release_memory_occupation")
+        result = self._make_request("release_memory_occupation")
+        if getattr(self, "_weight_consumer_enabled", False):
+            from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
+
+            self._version_offloaded_tags = set(GPU_MEMORY_ALL_TYPES)
+        return result
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """Available tags for multi-stage resume: weights, kv_cache."""
-        return self._make_request(
+        if getattr(self, "_weight_consumer_enabled", False):
+            released = getattr(self, "_version_offloaded_tags", set())
+            tags = sorted(released if not tags else released.intersection(tags))
+            if not tags:
+                return None
+        result = self._make_request(
             "resume_memory_occupation",
             {"tags": tags},
         )
+        if getattr(self, "_weight_consumer_enabled", False):
+            self._version_offloaded_tags.difference_update(tags)
+        return result
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
@@ -1750,6 +1878,45 @@ class SGLangEngine(RayActor):
         )
         response.raise_for_status()
         return response
+
+    def _get_version_consumer(self):
+        if not getattr(self, "_weight_consumer_enabled", False) or not getattr(
+            self.args, "weight_consumer_config", None
+        ):
+            raise ValueError("Set --weight-consumer-config for independent version consumption")
+        if not hasattr(self, "_version_consumer"):
+            from relax.distributed.weight_sync.ray_consumer import create_actor_consumer
+
+            self._version_consumer = create_actor_consumer(self)
+        return self._version_consumer
+
+    def published_weight_versions(self, after: int = -1, limit: int = 100, newest_first: bool = False):
+        consumer = self._get_version_consumer()
+        return consumer.transport.versions(consumer.stream, after=after, limit=limit, newest_first=newest_first)
+
+    def consume_weight_version(self, version: int, full: bool = False):
+        from relax.distributed.weight_sync.deadline import time_budget
+
+        consumer = self._get_version_consumer()
+        with time_budget(consumer.operation_timeout):
+            if getattr(self.args, "offload_rollout", False):
+                # The installation probe needs KV storage as well as weights.
+                # Admission stays closed until the complete checkpoint is verified.
+                self.resume_memory_occupation()
+        return consumer.apply_through(version, full=full)
+
+    def weight_version_status(self):
+        consumer = getattr(self, "_version_consumer", None)
+        if consumer is None:
+            return {
+                "status": "NOT_INITIALIZED",
+                "enabled": getattr(self, "_weight_consumer_enabled", False),
+                "action": "consume_target_to_initialize",
+            }
+        return consumer.status()
+
+    def recover_weight_version(self):
+        return self._get_version_consumer().recover_active()
 
     def continue_generation(self, timeout: float | None = None):
         response = requests.post(

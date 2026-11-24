@@ -171,6 +171,26 @@ def test_fanout_reraises_non_dead_exceptions(_patch_ray, monkeypatch):
         manager._fanout("release_memory_occupation")
 
 
+def test_failed_resume_settles_other_engines_and_allows_offload(_patch_ray, monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=2)
+    manager.offload()
+    get = mem.ray.get
+
+    def fail_first_resume(ref, **kwargs):
+        if isinstance(ref, tuple) and ref == (manager.all_engines[0], "resume_memory_occupation"):
+            raise ValueError("judge resume failed")
+        return get(ref, **kwargs)
+
+    monkeypatch.setattr(mem.ray, "get", fail_first_resume)
+    with pytest.raises(ValueError, match="judge resume failed"):
+        manager.onload()
+    manager.offload()
+    assert manager.all_engines[1].calls[-2:] == ["resume_memory_occupation", "release_memory_occupation"]
+    assert not manager.is_onloaded()
+
+
 def test_offload_onload_are_idempotent_when_state_unchanged(_patch_ray):
     manager = _FakeManager(num_slots=2)
     for engine in manager.all_engines:
@@ -370,3 +390,69 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
     assert manager.all_engines == [None, None, *healthy_engines]
     assert set(manager._engine_placements) == {2, 3}
     assert all(engine not in _patch_ray.killed for engine in healthy_engines)
+
+
+def test_mixed_fanout_retires_dead_group_before_raising(_patch_ray, monkeypatch):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=3, owns_pg=True)
+    dead, failed, healthy = manager.all_engines
+    removed = []
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed.append)
+    get = mem.ray.get
+
+    def mixed(ref, **kwargs):
+        if isinstance(ref, tuple) and ref[1] == "release_memory_occupation":
+            if ref[0] is dead:
+                raise ConnectionError("dead engine")
+            if ref[0] is failed:
+                raise ValueError("release RPC failed")
+        return get(ref, **kwargs)
+
+    monkeypatch.setattr(mem.ray, "get", mixed)
+    with pytest.raises(ValueError, match="release RPC failed"):
+        manager.offload()
+    assert manager.all_engines == [None, failed, healthy]
+    assert removed == ["pg-0"]
+    assert healthy.calls[-1] == "release_memory_occupation"
+    manager.onload()
+    assert manager.all_engines[0] is not None and manager.all_engines[0] is not dead
+
+
+@pytest.mark.parametrize("failed_step", ["shutdown", "kill"])
+def test_offload_retries_unconfirmed_follower_before_releasing_placement(_patch_ray, monkeypatch, failed_step):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=4, nodes_per_engine=2)
+    head, follower, *healthy = manager.all_engines
+    head.dead_methods = {"release_memory_occupation"}
+    group = ("shared-pg", [0, 1], [0, 1])
+    manager._engine_placements.update({0: (group, True), 1: (group, False)})
+    removed = []
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed.append)
+    get, kill = mem.ray.get, mem.ray.kill
+    fail = True
+
+    def shutdown(ref, **kwargs):
+        if fail and failed_step == "shutdown" and ref == (follower, "shutdown"):
+            raise TimeoutError("shutdown not confirmed")
+        return get(ref, **kwargs)
+
+    def kill_actor(engine):
+        if fail and engine is follower:
+            raise RuntimeError("kill not confirmed")
+        kill(engine)
+
+    monkeypatch.setattr(mem.ray, "get", shutdown)
+    monkeypatch.setattr(mem.ray, "kill", kill_actor)
+    with pytest.raises(Exception, match="not confirmed"):
+        manager.offload()
+    assert manager.all_engines[1] is follower
+    assert manager._engine_placements[0] == (group, True)
+    assert removed == []
+    assert manager._onloaded is None
+    fail = False
+    manager.offload()
+    assert manager.all_engines == [None, None, *healthy]
+    assert removed == ["shared-pg"]
+    assert manager._onloaded is False

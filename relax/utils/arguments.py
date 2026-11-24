@@ -1146,6 +1146,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             # update weight
+            from relax.distributed.weight_sync.config import add_weight_version_arguments
+
+            parser = add_weight_version_arguments(parser)
             parser.add_argument(
                 "--update-weight-buffer-size",
                 type=int,
@@ -1305,11 +1308,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=30.0,
                 help="Timeout in seconds to wait for in-flight requests to drain before force-aborting. Default: 30s.",
             )
+            from relax.distributed.ray.rollout_scale_types import ENGINE_SHUTDOWN_TIMEOUT_S
+
             parser.add_argument(
                 "--scale-in-shutdown-timeout",
                 type=float,
-                default=30.0,
-                help="Timeout in seconds for graceful SGLang engine shutdown. If exceeded, ray.kill is used. Default: 30s.",
+                default=ENGINE_SHUTDOWN_TIMEOUT_S,
+                help="Seconds to wait for engine shutdown. A timed-out scale-in retains its actors for retry.",
             )
             return parser
 
@@ -3226,6 +3231,10 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
     relax_validate_args(args)
+
+    from relax.distributed.weight_sync.config import validate_weight_version_arguments
+
+    validate_weight_version_arguments(args, offline_training=is_offline_mode(args))
 
     if args.train_backend == "fsdp":
         from relax.backends.fsdp.arguments import validate_generative_config
