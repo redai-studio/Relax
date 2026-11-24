@@ -170,23 +170,6 @@ class KimiK3VLModel(MegatronModule):
         if self.pre_process:
             self.vision_tower, self.mm_projector = _build_vision_modules(config)
 
-    def initialize_config_weights(self, *, seed: int) -> None:
-        """Initialize the KDA decay state left empty by Bridge."""
-        from megatron.bridge.models.kimi.kimi_k3_layers import KimiK3Attention
-
-        from .initialization import initialize_kda_decay
-
-        for attention in self.language_model.modules():
-            if isinstance(attention, KimiK3Attention) and attention.is_kda:
-                initialize_kda_decay(
-                    attention.A_log,
-                    attention.dt_bias,
-                    seed=seed,
-                    layer=attention.layer_idx,
-                    tp_rank=attention.tp_group.rank(),
-                    tp_size=attention.tp_size,
-                )
-
     def shared_embedding_or_output_weight(self) -> Tensor | None:
         return self.language_model.shared_embedding_or_output_weight()
 

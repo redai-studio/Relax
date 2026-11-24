@@ -570,18 +570,6 @@ def setup_model_and_optimizer(
         wrap_with_ddp=role in ["actor", "critic"],
     )
     finalize_lora_models([_unwrap_module(chunk) for chunk in model], args)
-    if random_init:
-        for model_chunk in model:
-            initialize = getattr(_unwrap_module(model_chunk), "initialize_config_weights", None)
-            if initialize is not None:
-                initialize(seed=args.seed)
-            # Match checkpoint startup's router buffer precision before the first snapshot.
-            for module in model_chunk.modules():
-                maintain = getattr(module, "_maintain_float32_expert_bias", None)
-                if maintain is not None:
-                    maintain()
-            if isinstance(model_chunk, DDP):
-                model_chunk.broadcast_params()
     validate_mtp_only_trainable_params(args, model)
     _configure_chunked_head_grad_sync(args, model)
     for model_chunk in model:
@@ -2552,8 +2540,6 @@ def initialize_model_and_optimizer(
     # Recovery can supply a checkpoint after initial argument validation.
     if args.load is None and role in ("actor", "actor_fwd") and getattr(args, "random_init", False):
         iteration = 0
-        if optimizer is not None and (args.fp16 or args.bf16):
-            optimizer.reload_model_params()
         logger.info("Initialized %s from config with seed=%s; checkpoint loading disabled", role, args.seed)
     else:
         iteration, _ = load_checkpoint(
